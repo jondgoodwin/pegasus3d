@@ -1,0 +1,79 @@
+/** Xyz and Mat4 definition and operations
+ * @file
+ *
+ * This source file is part of the Pegasus3d browser.
+ * See Copyright Notice in pegasus3d.h
+*/
+
+#ifndef xyzmath_h
+#define xyzmath_h 1
+
+// GLEW Headers - for OpenGL GLfloat
+#define GL3_PROTOTYPES 1
+#include <GL/glew.h>
+#include <math.h>
+
+/** Structure for an Xyz value */
+typedef struct Xyz {
+	GLfloat x;	//!< x
+	GLfloat y;	//!< y
+	GLfloat z;	//!< z
+} Xyz;
+
+/** Is the value an Xyz value?  This is a bit of a hack */
+#define isXyz(val) (isStr(val) && getSize(val)==sizeof(Xyz))
+
+/** Inline calculation of length of xyz vector */
+#define xyzLen(xyz) \
+	(sqrt((xyz)->x*(xyz)->x + (xyz)->y*(xyz)->y + (xyz)->z*(xyz)->z))
+
+/** Return a new Xyz value that is the unit equivalent to self */
+#define xyzNorm(newxyz, xyz) \
+	{GLfloat len = xyzLen(xyz); \
+	(newxyz)->x = (xyz)->x/len; \
+	(newxyz)->y = (xyz)->y/len; \
+	(newxyz)->z = (xyz)->z/len;}
+
+/** Return a new Xyz value that is the addition of xyz1 and xyz2 */
+#define xyzAdd(newxyz, xyz1, xyz2) \
+	{(newxyz)->x = (xyz1)->x + (xyz2)->x; \
+	(newxyz)->y = (xyz1)->y + (xyz2)->y; \
+	(newxyz)->z = (xyz1)->z + (xyz2)->z;}
+
+/** Return a new Xyz value that is the cross product of two Xyz values */
+#define xyzCross(newxyz, xyz1, xyz2) \
+	{(newxyz)->x = (xyz1)->y*(xyz2)->z - (xyz1)->z*(xyz2)->y; \
+	(newxyz)->y = (xyz1)->z*(xyz2)->x - (xyz1)->x*(xyz2)->z; \
+	(newxyz)->z = (xyz1)->x*(xyz2)->y - (xyz1)->y*(xyz2)->x;}
+
+#define xyzDot(xyz1, xyz2) \
+	((xyz1)->x*(xyz2)->x + (xyz1)->y*(xyz2)->y + (xyz1)->z*(xyz2)->z)
+
+// ***********************************************************
+
+/** 4x4 floating point Matrix operations for right-hand orientation.
+   The matrix's single-precision floating point numbers are stored in "column-first order", matching OpenGL.
+     0   4   8  12
+	 1   5   9  13
+	 2   6  10  14
+	 3   7  11  15
+*/
+typedef GLfloat Mat4[16];
+
+/** Build an identity matrix */
+#define mat4Identity(matrix) \
+	(*matrix)[1] = (*matrix)[2] = (*matrix)[3] = \
+	(*matrix)[4] = (*matrix)[6] = (*matrix)[7] = \
+	(*matrix)[8] = (*matrix)[9] = (*matrix)[11] = \
+	(*matrix)[12] = (*matrix)[13] = (*matrix)[14] = (GLfloat)0.0; \
+	(*matrix)[0] = (*matrix)[5] = (*matrix)[10] = (*matrix)[15] = (GLfloat) 1.0;
+
+void mat4Pos(Mat4 *mat, GLfloat x, GLfloat y, GLfloat z);
+void mat4Mult(Mat4 *md, Mat4 *m1, Mat4 *m2);
+void mat4Perspective(Mat4 *mat, GLfloat fov, GLfloat near, GLfloat far, GLfloat aspratio);
+void mat4HeightPerspective(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat aspratio);
+void mat4Ortho(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat aspratio);
+void mat4Lookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up);
+void mat4Print(Mat4 *mat, const char *matnm);
+
+#endif
