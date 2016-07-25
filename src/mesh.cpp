@@ -16,7 +16,7 @@ int mesh_new(Value th) {
 /** Render the mesh */
 int mesh_render(Value th) {
 	// Load the shader into the rendering pipeline */
-	pushSym(th, "render");
+	pushSym(th, "_render");
 	pushMember(th, 0, "shader");
 	pushLocal(th, 1);
 	methodCall(th, 2, 0);
@@ -87,6 +87,6 @@ void mesh_init(Value th) {
 		pushCMethod(th, mesh_new);
 		popMember(th, 0, "new");
 		pushCMethod(th, mesh_render);
-		popMember(th, 0, "render");
+		popMember(th, 0, "_render");
 	popGloVar(th, "Mesh");
 }

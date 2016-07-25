@@ -24,15 +24,15 @@ int camera_new(Value th) {
 	return 1;
 }
 
-/** Return perspective matrix calculated from fov, minDist and maxDist variables
+/** Return perspective matrix calculated from fov, near and far variables
     and viewheight, viewwidth from passed context */
 int persp_getmatrix(Value th) {
 	// Get the variables
 	GLfloat aspratio = (getTop(th)>1)? ((GLfloat)toAint(pushMember(th, 1, "viewWidth")))/((GLfloat)toAint(pushMember(th, 1, "viewHeight"))) : 1.0f;
 	bool perspflag = !isFalse(pushProperty(th, 0, "perspective?"));
 	GLfloat fovht = toAfloat(pushProperty(th, 0, perspflag? "fov" : "viewHeight"));
-	GLfloat mindist = toAfloat(pushProperty(th, 0, "minDist"));
-	GLfloat maxdist = toAfloat(pushProperty(th, 0, "maxDist"));
+	GLfloat mindist = toAfloat(pushProperty(th, 0, "near"));
+	GLfloat maxdist = toAfloat(pushProperty(th, 0, "far"));
 
 	// Calculate perspective matrix within closure variable and return it
 	Mat4 *mat = (Mat4*) toStr(pushCloVar(th, 2));
@@ -84,7 +84,7 @@ void camera_init(Value th) {
 		pushCMethod(th, camera_new);
 		popMember(th, 0, "new");
 		pushCMethod(th, camera_render);
-		popMember(th, 0, "render");
+		popMember(th, 0, "_render");
 	popGloVar(th, "Camera");
 
 	// Create a PerspectiveProjection mixin
@@ -94,9 +94,9 @@ void camera_init(Value th) {
 		pushValue(th, aFloat(10.0));  // Orthogonal view height
 		popMember(th, 0, "viewHeight");
 		pushValue(th, aFloat(0.1f)); // minimum distance
-		popMember(th, 0, "minDist");
+		popMember(th, 0, "near");
 		pushValue(th, aFloat(1000.0)); // maximum distance
-		popMember(th, 0, "maxDist");
+		popMember(th, 0, "far");
 		pushValue(th, aTrue);
 		popMember(th, 0, "perspective?");
 		pushCMethod(th, persp_getmatrix);

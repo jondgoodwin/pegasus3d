@@ -10,14 +10,14 @@
 char vertexshader[] =
 	"// Vertex shader for a self-lit mesh where each vertex has its own color\n"
 	"#version 130\n"
-	"uniform mat4 mvpmatrix;\n"	
-	"in  vec3 position;\n"
-	"in  vec4 color;\n"
-	"out vec4 vert_color;\n"	
-	"void main(void) {\n"
-		"gl_Position = mvpmatrix * vec4(position, 1.0);\n"
-		"vert_color = color;\n"
-	"}\n";
+	"uniform mat4 mvpmatrix;"	
+	"in  vec3 position;"
+	"in  vec4 color;"
+	"out vec4 vert_color;"	
+	"void main(void) {"
+		"gl_Position = mvpmatrix * vec4(position, 1.0);"
+		"vert_color = color;"
+	"}";
 
 char fragmentshader[] =
 	"// Fragment shader passes along interpolated, full opacity vec3 color from vertex shader\n"

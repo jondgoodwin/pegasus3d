@@ -173,13 +173,13 @@ int display_render(Value th) {
 	setTop(th, getTop(th)-3);
 
 	// $.camera.render(context) - adds attributes to context
-	pushSym(th, "render");
+	pushSym(th, "_render");
 	pushValue(th, camera);
 	pushValue(th, contextv);
 	methodCall(th, 2, 0);
 
 	// $.scene.render(context)
-	pushSym(th, "render");
+	pushSym(th, "_render");
 	pushValue(th, scene);
 	pushValue(th, contextv);
 	methodCall(th, 2, 0);
@@ -200,7 +200,7 @@ void display_init(Value th) {
 			pushClosure(th, 2);
 			popMember(th, 1, "fullscreen");
 			pushCMethod(th, display_render);
-			popMember(th, 1, "render");
+			popMember(th, 1, "_render");
 		popMember(th, 0, "newtype");
 		pushCMethod(th, display_new);
 		popMember(th, 0, "new");

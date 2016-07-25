@@ -79,7 +79,7 @@ int main(int argc, char *argv[])
 		methodCall(th, 2, 0);
 
 		// $display.render (uses $.camera and $.scene)
-		pushSym(th, "render");
+		pushSym(th, "_render");
 		pushGloVar(th, "$display");
 		methodCall(th, 1, 0);
 

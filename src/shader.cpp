@@ -145,7 +145,7 @@ int shader_render(Value th) {
 	Value pgmv = pushMember(th, 0, "_program");
 	if (pgmv==aNull) {
 		// If it does not exist, compile and bind it based on info
-		Value pgmtype = pushProperty(th, 0, "_programtype");
+		Value pgmtype = pushProperty(th, 0, "_compiledtype");
 		pgmv = pushCData(th, pgmtype, sizeof(ShaderPgm));
 		if (aNull != (pgmv = shader_make(th, pgmv)))
 			popMember(th, 0, "_program");
@@ -188,10 +188,10 @@ void shader_init(Value th) {
 		pushCMethod(th, shader_new);
 		popMember(th, 0, "new");
 		pushCMethod(th, shader_render);
-		popMember(th, 0, "render");
+		popMember(th, 0, "_render");
 		Value pgmmmixin = pushMixin(th, aNull, aNull, 4);
 			pushCMethod(th, shader_closepgm);
 			popMember(th, 1, "_finalizer");
-		popMember(th, 0, "_programtype");
+		popMember(th, 0, "_compiledtype");
 	popGloVar(th, "Shader");
 }

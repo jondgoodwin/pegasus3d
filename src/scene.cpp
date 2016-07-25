@@ -55,7 +55,7 @@ int scene_render(Value th) {
 	if (isArr(parts)) {
 		Aint sz = getSize(parts);
 		for (Aint i=0; i<sz; i++) {
-			pushSym(th, "render");
+			pushSym(th, "_render");
 			pushValue(th, arrGet(th, parts, i));
 			pushLocal(th, 1);
 			methodCall(th, 2, 0);
@@ -74,7 +74,7 @@ void scene_init(Value th) {
 		pushCMethod(th, scene_new);
 		popMember(th, 0, "new");
 		pushCMethod(th, scene_render);
-		popMember(th, 0, "render");
+		popMember(th, 0, "_render");
 		// background: +Closure(., ., +Color(0,0,0))
 		pushCMethod(th, scene_getbackground);
 		pushCMethod(th, scene_setbackground);

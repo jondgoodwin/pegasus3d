@@ -1,17 +1,29 @@
 # Pegasus3D Browser
+Surf and explore open, Internet-based 3D worlds using the Pegasus3D browser.
+Like traditional browsers, Pegasus3D renders a site's content based on its URL address.
+It also supports hyperlink navigation from one world to another.
 
-The Pegasus3D Browser supports the surfing and exploration of 3D worlds across the Internet,
-much the way a traditional browser supports the surfing and exploration of pages.
-The worlds exist as Internet resources written in Acorn, a dynamic object-oriented language.
-The browser is built on top of the Acorn Virtual Machine.
+Instead of flat pages, however, the Pegasus3D browser delivers interactive, three-dimensional worlds.
+Pegasus3D worlds are built using modular resources written in Acorn,
+a powerful, lightweight, dynamic, object-oriented language specifically designed to make it 
+easier to define rich, immersive 3D worlds.
 
-## Documentation
+The [Pegasus 3D website][web3d] provides helpful detail about the 3D Internet vision,
+the browser's place in it, reference information on the Acorn language and types, 
+and an introduction to the software architecture.
 
-[Doxygen][] can be used to generate [documentation][doc] from the source code.
-The pegasus3d.conf Doxygen configuration file may be used to accomplish this.
+## Architecture
 
-This [website][web3d] offers additional information about the 3D Internet vision,
-the browser's place in it, and architectural information.
+The Pegasus3D browser is written in C. Its code uses these libraries:
+
+- [Acorn VM][acornvm] - A reentrant C library, able to compile and run Acorn programs in its own virtual machine.
+- [Simple Directmedia Layer][sdl2] - An operating system-independent API for managing media and other resources.
+- [OpenGL][opengl] - An open API for high-performance graphics processing.
+
+In addition, Pegasus3D dynamically loads shared libraries that implement additional Acorn types,
+written using the C API. These libraries may have dependencies on additional code libraries,
+such as [Asio][asio] (for Http and Udp), [libjpeg][jpeg] (for Jpeg), [giflib][gif] (for Gif), and [zlib][zip]
+(for ZipFile).
 
 ## Building (Linux)
 
@@ -24,6 +36,11 @@ To build the library:
 A Visual C++ 2010 solutions file can be created using the project files. 
 The generated object, library, and executable files are created relative to the location of the 
 solutions file.
+
+## Documentation
+
+Use [Doxygen][] to generate [documentation][doc] from the source code,
+as guided by the pegasus3d.conf configuration file.
 
 ## License
 
@@ -46,3 +63,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 [doc]: http://web3d.jondgoodwin.com/pegasusdoc
 [web3d]: http://web3d.jondgoodwin.com
 [doxygen]: http://doxygen.org
+[acornvm]: http://web3d.jondgoodwin.com/arch/avmindex.html
+[sdl2]: http://www.libsdl.org
+[opengl]: http://www.opengl.org
+[asio]: http://think-async.com/
+[jpeg]: http://libjpeg.sourceforge.net/
+[gif]: http://giflib.sourceforge.net/gif_lib.html
+[zip]: http://www.zlib.net
