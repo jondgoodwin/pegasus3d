@@ -35,19 +35,18 @@ int mesh_render(Value th) {
 	glGenVertexArrays(1, &vao); /* Allocate */
 	glBindVertexArray(vao); /* Bind as currently used */
 
-    /* Allocate and assign two Vertex Buffer Objects to our handle */
+    /* Allocate and assign as many Vertex Buffer Objects to our handle as we have attributes */
     glGenBuffers(nattrs, vbo);
 
 	for (int i=0; i<nattrs; i++) {
 		Value buffer = tblGet(th, getLocal(th, 0), arrGet(th, vertattrlistv, i));
-		BufferHeader *buffhdr = (BufferHeader *) toStr(buffer);
 
 		glBindBuffer(GL_ARRAY_BUFFER, vbo[i]); /* Bind as active */
-		glBufferData(GL_ARRAY_BUFFER, buffhdr->nbrValues * buffhdr->valspace, (GLfloat *)(buffhdr+1), GL_STATIC_DRAW); /* Copy data */
-		glVertexAttribPointer(i, buffhdr->itemcount, GL_FLOAT, GL_FALSE, 0, 0); 
+		glBufferData(GL_ARRAY_BUFFER, getSize(buffer), toStr(buffer), GL_STATIC_DRAW); /* Copy data */
+		glVertexAttribPointer(i, getNVals(buffer), GL_FLOAT, GL_FALSE, 0, 0); 
 		glEnableVertexAttribArray(i); /* Enable as used */
 
-		nitems = buffhdr->nbrValues / buffhdr->itemcount;
+		nitems = getNStructs(buffer);
 	}
 
 	/* Draw */

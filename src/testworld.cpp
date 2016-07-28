@@ -66,18 +66,16 @@ void test_init(Value th) {
 		Aint mesh = getTop(th)-1;
 			// Populate new mesh
 			pushSym(th, "new");
-			pushGloVar(th, "Buffer");
-			pushGloVar(th, "Xyz");
-			pushValue(th, anInt(12));
-			methodCall(th, 3, 1);
+			pushGloVar(th, "Xyzs");
+			pushValue(th, anInt(4));
+			methodCall(th, 2, 1);
 			populateBuffer(th, diamondpts, 12);
 			popMember(th, mesh, "position");
 
 			pushSym(th, "new");
-			pushGloVar(th, "Buffer");
-			pushGloVar(th, "Color");
-			pushValue(th, anInt(16));
-			methodCall(th, 3, 1);
+			pushGloVar(th, "Colors");
+			pushValue(th, anInt(4));
+			methodCall(th, 2, 1);
 			populateBuffer(th, diamondcols, 16);
 			popMember(th, mesh, "color");
 

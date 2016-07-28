@@ -121,14 +121,14 @@ Value shader_make(Value th, Value pgmv) {
     }
 
 	// Remember compiled program, then return as success
-	ShaderPgm* p = (ShaderPgm*) toStr(pgmv);
+	ShaderPgm* p = (ShaderPgm*) toHeader(pgmv);
 	p->program = shaderprogram;
 	return pgmv;
 }
 
 /** Close out a shader that is no longer referenced anywhere */
 int shader_closepgm(Value shaderpgm) {
-	ShaderPgm *pgm = (ShaderPgm*) toStr(shaderpgm);
+	ShaderPgm *pgm = (ShaderPgm*) toHeader(shaderpgm);
 	glDeleteProgram(pgm->program);
 	return 1;
 }
@@ -146,7 +146,7 @@ int shader_render(Value th) {
 	if (pgmv==aNull) {
 		// If it does not exist, compile and bind it based on info
 		Value pgmtype = pushProperty(th, 0, "_compiledtype");
-		pgmv = pushCData(th, pgmtype, sizeof(ShaderPgm));
+		pgmv = pushCData(th, pgmtype, 0, sizeof(ShaderPgm)); // Is small enough to stick in header
 		if (aNull != (pgmv = shader_make(th, pgmv)))
 			popMember(th, 0, "_program");
 		else
@@ -155,7 +155,7 @@ int shader_render(Value th) {
 
     /* Load the shader into the rendering pipeline */
 	if (pgmv != aNull) {
-		ShaderPgm *pgmdata = (ShaderPgm*) toStr(pgmv);
+		ShaderPgm *pgmdata = (ShaderPgm*) toHeader(pgmv);
 		glUseProgram(pgmdata->program);
 
 		// Load all the shader's named "uniform" values from the context
@@ -164,7 +164,7 @@ int shader_render(Value th) {
 			for (AuintIdx i=0; i < getSize(uniformlist); i++) {
 				Value uninamev = arrGet(th, uniformlist, i);
 				Value unival = getProperty(th, getLocal(th, 1), uninamev);
-				switch (getSize(unival)) {
+				switch (sizeof(Mat4) /*getSize(unival)*/) { // Hack!! Fix it!!
 				case sizeof(Mat4):
 					glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toStr(unival));
 					break;

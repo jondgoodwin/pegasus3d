@@ -10,7 +10,7 @@
 
 /** Create a new identity Matrix4 value. */
 int mat4_new(Value th) {
-	Value matv = pushStringl(th, pushMember(th, 0, "newtype"), NULL, sizeof(Mat4));
+	Value matv = pushNumbers(th, pushMember(th, 0, "newtype"), 1, 16, sizeof(GLfloat), 0);
 	Mat4 *mat = (Mat4*) toStr(matv);
 	mat4Identity(mat);
 	return 1;

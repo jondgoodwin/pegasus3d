@@ -46,15 +46,4 @@ using namespace avm;
 // SDL2 Headers
 #include <SDL.h>
 
-/** Structure of info at start of the buffer's data. The items follow immediately after.
-   Note: It includes a Value, which should generally never be held in a cdata, because
-   the garbage collector cannot see it. In this case, we take the risk that the 
-   type value will never be collected. */
-struct BufferHeader {
-	Value itemtype;		//!< The type of each item (which may contain several values)
-	AintIdx nbrValues;	//!< The number of items held
-	short unsigned itemcount;	//!< Number of values found in an item
-	short unsigned valspace;		//!< How many bytes an item's value occupies
-};
-
 #endif

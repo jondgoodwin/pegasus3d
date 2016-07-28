@@ -11,7 +11,7 @@
 /** Create a new Xyz value, with passed x,y,z values.
   Defaults: 0.0 where no passed values. */
 int xyz_new(Value th) {
-	Value xyzv = pushStringl(th, pushMember(th, 0, "newtype"), NULL, sizeof(Xyz));
+	Value xyzv = pushNumbers(th, pushMember(th, 0, "newtype"), 1, 3, sizeof(GLfloat), 0);
 	Xyz *xyz = (Xyz*) toStr(xyzv);
 	xyz->x = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : 0.0f;
 	xyz->y = getTop(th)>2 && isFloat(getLocal(th,2))? toAfloat(getLocal(th, 2)) : 0.0f;
@@ -126,14 +126,40 @@ int xyz_dot(Value th) {
 	return 1;
 }
 
+/** Create a new Buffer value, with number of Xyz structures. */
+int xyzs_new(Value th) {
+	// Get nStructs parameter
+	if (getTop(th)<2) {
+		pushValue(th, aNull);
+		return 1;
+	}
+	AintIdx nStructs = 0;
+	if (isInt(getLocal(th, 1)))
+		nStructs = toAint(getLocal(th, 1));
+
+	// Create the number array
+	Value bufv = pushNumbers(th, pushMember(th, 0, "newtype"), nStructs, 3, sizeof(GLfloat), 0);
+	return 1;
+}
+
+/* Append a single Xyz value to the end of the array */
+int xyzs_append(Value th) {
+	if (getTop(th)<2)
+		return 1;
+	Value toadd = getLocal(th,1);
+	if (isFloat(toadd)) {
+		GLfloat afloat = toAfloat(toadd);
+		strAppend(th, getLocal(th, 0), (const char*)(&afloat), sizeof(GLfloat));
+	}
+	else if (isStr(toadd))
+		strAppend(th, getLocal(th, 0), toStr(toadd), getSize(toadd));
+	return 1;
+}
+
 /** Initialize Xyz type and mixin */
 void xyz_init(Value th) {
 	Value Xyz = pushType(th, aNull, 2);
 		pushMixin(th, aNull, aNull, 16);
-			pushValue(th, anInt(3));
-			popMember(th, 1, "itemcount");
-			pushValue(th, anInt(sizeof(GLfloat)));
-			popMember(th, 1, "valuespace");
 			pushCMethod(th, xyz_set);
 			popMember(th, 1, "set");
 			pushCMethod(th, xyz_unpack);
@@ -156,4 +182,13 @@ void xyz_init(Value th) {
 		pushCMethod(th, xyz_new);
 		popMember(th, 0, "new");
 	popGloVar(th, "Xyz");
+
+	pushType(th, aNull, 2);
+		pushMixin(th, aNull, aNull, 16);
+			pushCMethod(th, xyzs_append);
+			popMember(th, 1, "<<");
+		popMember(th, 0, "newtype");
+		pushCMethod(th, xyzs_new);
+		popMember(th, 0, "new");
+	popGloVar(th, "Xyzs");
 }

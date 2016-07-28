@@ -114,15 +114,15 @@ void printSDL_GL_Attributes()
 /** Create a new display instance using SDL2 & OpenGL within a window */
 int display_new(Value th) {
 	pushMember(th, 0, "newtype"); // get the mixin type for instance
-	Value dispinst = pushCData(th, popValue(th), sizeof(struct DisplayInfo));
-	di = (struct DisplayInfo*) toStr(dispinst);
+	Value dispinst = pushCData(th, popValue(th), 0, sizeof(struct DisplayInfo));
+	di = (struct DisplayInfo*) toHeader(dispinst);
 	display_newOpenGLWindow(di);
 	return 1;
 }
 
 /** Close down OpenGL, window and SDL2 */
 int display_finalizer(Value cdata) {
-	struct DisplayInfo *di = (struct DisplayInfo *)(toStr(cdata));
+	struct DisplayInfo *di = (struct DisplayInfo *)(toHeader(cdata));
 
 	// Delete our OpengL context
 	SDL_GL_DeleteContext(di->mainContext);
@@ -137,14 +137,14 @@ int display_finalizer(Value cdata) {
 
 /** Return aTrue if fullscreen, aFalse if windowed */
 int display_getfullscreen(Value th) {
-	DisplayInfo *di = (struct DisplayInfo*) toStr(getLocal(th, 0));
+	DisplayInfo *di = (struct DisplayInfo*) toHeader(getLocal(th, 0));
 	pushValue(th, di->fullscreen? aTrue : aFalse);
 	return 1;
 }
 
 /** If true, set to fullscreen, otherwise windowed */
 int display_setfullscreen(Value th) {
-	DisplayInfo *di = (struct DisplayInfo*) toStr(getLocal(th, 0));
+	DisplayInfo *di = (struct DisplayInfo*) toHeader(getLocal(th, 0));
 	di->fullscreen = !(getTop(th)<2 || isFalse(getLocal(th, 1)));
 	SDL_SetWindowFullscreen(di->mainWindow, di->fullscreen? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 	return 1;
@@ -152,7 +152,7 @@ int display_setfullscreen(Value th) {
 
 /** Render $.scene from the point of view of $.camera */
 int display_render(Value th) {
-	DisplayInfo *di = (struct DisplayInfo*) toStr(getLocal(th, 0));
+	DisplayInfo *di = (struct DisplayInfo*) toHeader(getLocal(th, 0));
 
 	// Create render context
 	int contexti = getTop(th);

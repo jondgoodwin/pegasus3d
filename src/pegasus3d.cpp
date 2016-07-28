@@ -16,7 +16,6 @@ Value vm;
 void color_init(Value th);
 void xyz_init(Value th);
 void mat4_init(Value th);
-void buffer_init(Value th);
 void display_init(Value th);
 void world_init(Value th);
 void camera_init(Value th);
@@ -32,7 +31,6 @@ void initTypes(Value th) {
 	color_init(th);
 	xyz_init(th);
 	mat4_init(th);
-	buffer_init(th);
 
 	// World types - the order to initialize matters
 	display_init(th);
@@ -46,6 +44,8 @@ void initTypes(Value th) {
 // Initialize, run main loop, close up shop
 int main(int argc, char *argv[])
 {
+	freopen("pegasus3d.log", "w", stderr);
+
 	// Start Acorn VM and load its types
 	Value th = newVM();
 	initTypes(th);
