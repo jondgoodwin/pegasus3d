@@ -46,7 +46,7 @@ void populateBuffer(Value th, GLfloat *floats, int count) {
 		pushSym(th, "<<");
 		pushLocal(th, buffindex);
 		pushValue(th, aFloat(*floats++));
-		methodCall(th, 2, 0);
+		getCall(th, 2, 0);
 	}
 }
 
@@ -58,50 +58,50 @@ void test_init(Value th) {
 	// $.scene.parts {+Mesh}
 	pushGloVar(th, "$");
 	int sceneidx = getTop(th);
-	pushMember(th, getTop(th)-1, "scene");
+	pushProperty(th, getTop(th)-1, "scene");
 	Value parts = pushArray(th, aNull, 1);
 		pushSym(th, "new");
 		pushGloVar(th, "Mesh");
-		methodCall(th, 1, 1);
+		getCall(th, 1, 1);
 		Aint mesh = getTop(th)-1;
 			// Populate new mesh
 			pushSym(th, "new");
 			pushGloVar(th, "Xyzs");
 			pushValue(th, anInt(4));
-			methodCall(th, 2, 1);
+			getCall(th, 2, 1);
 			populateBuffer(th, diamondpts, 12);
-			popMember(th, mesh, "position");
+			popProperty(th, mesh, "position");
 
 			pushSym(th, "new");
 			pushGloVar(th, "Colors");
 			pushValue(th, anInt(4));
-			methodCall(th, 2, 1);
+			getCall(th, 2, 1);
 			populateBuffer(th, diamondcols, 16);
-			popMember(th, mesh, "color");
+			popProperty(th, mesh, "color");
 
 			pushSym(th, "new");
 			pushGloVar(th, "Shader");
-			methodCall(th, 1, 1);
+			getCall(th, 1, 1);
 			Aint shader = getTop(th)-1;
 				// Populate shader
 				pushString(th, aNull, vertexshader);
-				popMember(th, shader, "vertex");
+				popProperty(th, shader, "vertex");
 				pushString(th, aNull, fragmentshader);
-				popMember(th, shader, "fragment");
+				popProperty(th, shader, "fragment");
 				pushSym(th, "new");
 				pushGloVar(th, "List");
 				pushSym(th, "mvpmatrix");
-				methodCall(th, 2, 1);
-				popMember(th, shader, "uniform");
+				getCall(th, 2, 1);
+				popProperty(th, shader, "uniform");
 				pushSym(th, "new");
 				pushGloVar(th, "List");
 				pushSym(th, "position");
 				pushSym(th, "color");
-				methodCall(th, 3, 1);
-				popMember(th, shader, "in");
-			popMember(th, mesh, "shader");
+				getCall(th, 3, 1);
+				popProperty(th, shader, "in");
+			popProperty(th, mesh, "shader");
 		arrSet(th, parts, 0, popValue(th));
-	popMember(th, sceneidx, "parts");
+	popProperty(th, sceneidx, "parts");
 
 	setTop(th, topmark);
 }

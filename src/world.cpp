@@ -31,7 +31,7 @@ void world_stoprunning(Value th) {
 	pushSym(th, "running?");
 	pushLocal(th, 0);
 	pushValue(th, aFalse);
-	methodSetCall(th, 2, 0);
+	setCall(th, 2, 0);
 }
 
 /** Default method for updating the world's state every tick.
@@ -44,7 +44,7 @@ int world_update(Value th) {
 
 	// Move the camera slowly up
 	pushGloVar(th, "$");
-	pushMember(th, getTop(th)-1, "camera");
+	pushProperty(th, getTop(th)-1, "camera");
 	Value posv = pushProperty(th, getTop(th)-1, "position");
 	if (isXyz(posv)) {
 		Xyz *posxyz = (Xyz *)toStr(posv);
@@ -86,10 +86,10 @@ int world_handleInput(Value th)
 				pushGloVar(th, "$display");
 				pushSym(th, "fullscreen");
 				pushGloVar(th, "$display");
-				methodCall(th, 1, 1);
+				getCall(th, 1, 1);
 				{Value val = getFromTop(th, 0);}
 				pushValue(th, isFalse(popValue(th))? aTrue : aFalse);
-				methodSetCall(th, 2, 0);
+				setCall(th, 2, 0);
 				break;
 			default:
 				break;
@@ -103,21 +103,21 @@ int world_handleInput(Value th)
 void world_init(Value th) {
 	Value World = pushType(th, aNull, 6);
 		pushCMethod(th, world_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 		pushCMethod(th, world_getrunning);
 		pushCMethod(th, world_setrunning);
 		pushValue(th, aTrue);
 		pushClosure(th, 3);
-		popMember(th, 0, "running?");
+		popProperty(th, 0, "running?");
 		pushCMethod(th, world_handleInput);
-		popMember(th, 0, "handleInput");
+		popProperty(th, 0, "handleInput");
 		pushCMethod(th, world_update);
-		popMember(th, 0, "updateState");
+		popProperty(th, 0, "updateState");
 	popGloVar(th, "World");
 
 	// $ = +World
 	pushSym(th, "new");
 	pushValue(th, World);
-	methodCall(th, 1, 1);
+	getCall(th, 1, 1);
 	popGloVar(th, "$");
 }

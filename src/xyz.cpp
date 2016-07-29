@@ -11,7 +11,7 @@
 /** Create a new Xyz value, with passed x,y,z values.
   Defaults: 0.0 where no passed values. */
 int xyz_new(Value th) {
-	Value xyzv = pushNumbers(th, pushMember(th, 0, "newtype"), 1, 3, sizeof(GLfloat), 0);
+	Value xyzv = pushNumbers(th, pushProperty(th, 0, "newtype"), 1, 3, sizeof(GLfloat), 0);
 	Xyz *xyz = (Xyz*) toStr(xyzv);
 	xyz->x = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : 0.0f;
 	xyz->y = getTop(th)>2 && isFloat(getLocal(th,2))? toAfloat(getLocal(th, 2)) : 0.0f;
@@ -50,7 +50,7 @@ int xyz_len(Value th) {
 /** Return a new Xyz value that is the unit equivalent to self */
 int xyz_norm(Value th) {
 	Xyz *xyz = (Xyz*) toStr(getLocal(th, 0));
-	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushMember(th, 0, "newtype"), NULL, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushProperty(th, 0, "newtype"), NULL, sizeof(Xyz)));
 	xyzNorm(newxyz, xyz);
 	return 1;
 }
@@ -80,7 +80,7 @@ int xyz_add(Value th) {
 	}
 	Xyz *xyz1 = (Xyz*) toStr(getLocal(th, 0));
 	Xyz *xyz2 = (Xyz*) toStr(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushMember(th, 0, "newtype"), NULL, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushProperty(th, 0, "newtype"), NULL, sizeof(Xyz)));
 	xyzAdd(newxyz, xyz1, xyz2);
 	return 1;
 }
@@ -93,7 +93,7 @@ int xyz_subtract(Value th) {
 	}
 	Xyz *xyz1 = (Xyz*) toStr(getLocal(th, 0));
 	Xyz *xyz2 = (Xyz*) toStr(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushMember(th, 0, "newtype"), NULL, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushProperty(th, 0, "newtype"), NULL, sizeof(Xyz)));
 	newxyz->x = xyz1->x - xyz2->x;
 	newxyz->y = xyz1->y - xyz2->y;
 	newxyz->z = xyz1->z - xyz2->z;
@@ -108,7 +108,7 @@ int xyz_cross(Value th) {
 	}
 	Xyz *xyz1 = (Xyz*) toStr(getLocal(th, 0));
 	Xyz *xyz2 = (Xyz*) toStr(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushMember(th, 0, "newtype"), NULL, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toStr(pushStringl(th, pushProperty(th, 0, "newtype"), NULL, sizeof(Xyz)));
 	xyzCross(newxyz, xyz1, xyz2);
 	return 1;
 }
@@ -138,7 +138,7 @@ int xyzs_new(Value th) {
 		nStructs = toAint(getLocal(th, 1));
 
 	// Create the number array
-	Value bufv = pushNumbers(th, pushMember(th, 0, "newtype"), nStructs, 3, sizeof(GLfloat), 0);
+	Value bufv = pushNumbers(th, pushProperty(th, 0, "newtype"), nStructs, 3, sizeof(GLfloat), 0);
 	return 1;
 }
 
@@ -161,34 +161,34 @@ void xyz_init(Value th) {
 	Value Xyz = pushType(th, aNull, 2);
 		pushMixin(th, aNull, aNull, 16);
 			pushCMethod(th, xyz_set);
-			popMember(th, 1, "set");
+			popProperty(th, 1, "set");
 			pushCMethod(th, xyz_unpack);
-			popMember(th, 1, "unpack");
+			popProperty(th, 1, "unpack");
 			pushCMethod(th, xyz_len);
-			popMember(th, 1, "length");
+			popProperty(th, 1, "length");
 			pushCMethod(th, xyz_norm);
-			popMember(th, 1, "unit");
+			popProperty(th, 1, "unit");
 			pushCMethod(th, xyz_addto);
-			popMember(th, 1, "add!");
+			popProperty(th, 1, "add!");
 			pushCMethod(th, xyz_add);
-			popMember(th, 1, "+");
+			popProperty(th, 1, "+");
 			pushCMethod(th, xyz_subtract);
-			popMember(th, 1, "-");
+			popProperty(th, 1, "-");
 			pushCMethod(th, xyz_cross);
-			popMember(th, 1, "*");
+			popProperty(th, 1, "*");
 			pushCMethod(th, xyz_dot);
-			popMember(th, 1, "dot");
-		popMember(th, 0, "newtype");
+			popProperty(th, 1, "dot");
+		popProperty(th, 0, "newtype");
 		pushCMethod(th, xyz_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 	popGloVar(th, "Xyz");
 
 	pushType(th, aNull, 2);
 		pushMixin(th, aNull, aNull, 16);
 			pushCMethod(th, xyzs_append);
-			popMember(th, 1, "<<");
-		popMember(th, 0, "newtype");
+			popProperty(th, 1, "<<");
+		popProperty(th, 0, "newtype");
 		pushCMethod(th, xyzs_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 	popGloVar(th, "Xyzs");
 }

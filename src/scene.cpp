@@ -39,8 +39,8 @@ int scene_render(Value th) {
 	pushSym(th, "unpack");
 	pushSym(th, "background");
 	pushLocal(th, 0);
-	methodCall(th, 1, 1);
-	methodCall(th, 1, 4);
+	getCall(th, 1, 1);
+	getCall(th, 1, 4);
 	a = toAfloat(popValue(th));
 	b = toAfloat(popValue(th));
 	g = toAfloat(popValue(th));
@@ -51,14 +51,14 @@ int scene_render(Value th) {
     glDepthFunc(GL_LESS); // Closer objects obscure further objects
 
 	// Render each of the scene's parts, in order
-	Value parts = pushMember(th, 0, "parts");
+	Value parts = pushProperty(th, 0, "parts");
 	if (isArr(parts)) {
 		Aint sz = getSize(parts);
 		for (Aint i=0; i<sz; i++) {
 			pushSym(th, "_render");
 			pushValue(th, arrGet(th, parts, i));
 			pushLocal(th, 1);
-			methodCall(th, 2, 0);
+			getCall(th, 2, 0);
 		}
 	}
 
@@ -72,9 +72,9 @@ int scene_render(Value th) {
 void scene_init(Value th) {
 	Value Scene = pushType(th, aNull, 16);
 		pushCMethod(th, scene_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 		pushCMethod(th, scene_render);
-		popMember(th, 0, "_render");
+		popProperty(th, 0, "_render");
 		// background: +Closure(., ., +Color(0,0,0))
 		pushCMethod(th, scene_getbackground);
 		pushCMethod(th, scene_setbackground);
@@ -83,16 +83,16 @@ void scene_init(Value th) {
 		pushValue(th, aFloat(0.0));
 		pushValue(th, aFloat(0.0));
 		pushValue(th, aFloat(0.0));
-		methodCall(th, 4, 1);
+		getCall(th, 4, 1);
 		pushClosure(th, 3);
-		popMember(th, 0, "background");
+		popProperty(th, 0, "background");
 	popGloVar(th, "Scene");
 
 	// $.scene = +Scene
 	pushGloVar(th, "$");
 	pushSym(th, "new");
 	pushValue(th, Scene);
-	methodCall(th, 1, 1);
-	popMember(th, getTop(th)-2, "scene");
+	getCall(th, 1, 1);
+	popProperty(th, getTop(th)-2, "scene");
 	popValue(th);
 }

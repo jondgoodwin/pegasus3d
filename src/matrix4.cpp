@@ -10,7 +10,7 @@
 
 /** Create a new identity Matrix4 value. */
 int mat4_new(Value th) {
-	Value matv = pushNumbers(th, pushMember(th, 0, "newtype"), 1, 16, sizeof(GLfloat), 0);
+	Value matv = pushNumbers(th, pushProperty(th, 0, "newtype"), 1, 16, sizeof(GLfloat), 0);
 	Mat4 *mat = (Mat4*) toStr(matv);
 	mat4Identity(mat);
 	return 1;
@@ -20,8 +20,8 @@ int mat4_new(Value th) {
 void mat4_init(Value th) {
 	Value Xyz = pushType(th, aNull, 2);
 		pushMixin(th, aNull, aNull, 16);
-		popMember(th, 0, "newtype");
+		popProperty(th, 0, "newtype");
 		pushCMethod(th, mat4_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 	popGloVar(th, "Matrix4");
 }

@@ -50,13 +50,19 @@ int main(int argc, char *argv[])
 	Value th = newVM();
 	initTypes(th);
 	
-	test_init(th);	// temporary hack
+	test_init(th);	// temporary hack for building a test world
+
+	// Load and run the world whose url was passed as first parameter
+	pushSym(th, "()");
+	pushGloVar(th, "Resource");
+	pushString(th, aNull, argc>1? argv[1] : "file://./test.acn");
+	getCall(th, 2, 0);
 
 	// Get current world from "$" (and its running state)
 	Value curworld = pushGloVar(th, "$"); popValue(th);
 	pushSym(th, "running?");
 	pushValue(th, curworld);
-	methodCall(th, 1, 1);
+	getCall(th, 1, 1);
 	Value isrunning = popValue(th);
 
 	Uint32 thisTime = SDL_GetTicks();
@@ -68,7 +74,7 @@ int main(int argc, char *argv[])
 		// Process all queued input
 		pushSym(th, "handleInput");
 		pushValue(th, curworld);
-		methodCall(th, 1, 0);
+		getCall(th, 1, 0);
 
 		// Update the state each tick
 		lastTime = thisTime;
@@ -76,18 +82,18 @@ int main(int argc, char *argv[])
 		pushSym(th, "updateState");
 		pushValue(th, curworld);
 		pushValue(th, aFloat(((Afloat)(thisTime-lastTime))/1000.0f));
-		methodCall(th, 2, 0);
+		getCall(th, 2, 0);
 
 		// $display.render (uses $.camera and $.scene)
 		pushSym(th, "_render");
 		pushGloVar(th, "$display");
-		methodCall(th, 1, 0);
+		getCall(th, 1, 0);
 
 		// Refresh getting current world and its running state
 		curworld = pushGloVar(th, "$"); popValue(th);
 		pushSym(th, "running?");
 		pushValue(th, curworld);
-		methodCall(th, 1, 1);
+		getCall(th, 1, 1);
 		isrunning = popValue(th);
 	}
 

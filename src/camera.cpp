@@ -19,8 +19,8 @@ int camera_new(Value th) {
 	// Create a placeholder for the calculated view/projection matrix
 	pushSym(th, "new");
 	pushGloVar(th, "Matrix4");
-	methodCall(th, 1, 1);
-	popMember(th, newcam, "mvpmatrix");
+	getCall(th, 1, 1);
+	popProperty(th, newcam, "mvpmatrix");
 	return 1;
 }
 
@@ -28,7 +28,7 @@ int camera_new(Value th) {
     and viewheight, viewwidth from passed context */
 int persp_getmatrix(Value th) {
 	// Get the variables
-	GLfloat aspratio = (getTop(th)>1)? ((GLfloat)toAint(pushMember(th, 1, "viewWidth")))/((GLfloat)toAint(pushMember(th, 1, "viewHeight"))) : 1.0f;
+	GLfloat aspratio = (getTop(th)>1)? ((GLfloat)toAint(pushProperty(th, 1, "viewWidth")))/((GLfloat)toAint(pushProperty(th, 1, "viewHeight"))) : 1.0f;
 	bool perspflag = !isFalse(pushProperty(th, 0, "perspective?"));
 	GLfloat fovht = toAfloat(pushProperty(th, 0, perspflag? "fov" : "viewHeight"));
 	GLfloat mindist = toAfloat(pushProperty(th, 0, "near"));
@@ -65,16 +65,16 @@ int camera_render(Value th) {
 	pushSym(th, "projMatrix");
 	pushLocal(th, 0);
 	pushLocal(th, 1);
-	methodCall(th, 2, 1);
+	getCall(th, 2, 1);
 	Mat4 *pmat = (Mat4*) toStr(getFromTop(th, 0));
 	pushSym(th, "viewMatrix");
 	pushLocal(th, 0);
 	pushLocal(th, 1);
-	methodCall(th, 2, 1);
+	getCall(th, 2, 1);
 	Mat4 *vmat = (Mat4*) toStr(getFromTop(th, 0));
-	Mat4 *mat = (Mat4*) toStr(pushMember(th, 0, "mvpmatrix"));
+	Mat4 *mat = (Mat4*) toStr(pushProperty(th, 0, "mvpmatrix"));
 	mat4Mult(mat, pmat, vmat);
-	popMember(th, 1, "mvpmatrix");
+	popProperty(th, 1, "mvpmatrix");
 	return 1;
 }
 
@@ -82,30 +82,30 @@ int camera_render(Value th) {
 void camera_init(Value th) {
 	Value Camera = pushType(th, aNull, 16);
 		pushCMethod(th, camera_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 		pushCMethod(th, camera_render);
-		popMember(th, 0, "_render");
+		popProperty(th, 0, "_render");
 	popGloVar(th, "Camera");
 
 	// Create a PerspectiveProjection mixin
 	Value perspectivemixin = pushMixin(th, aNull, aNull, 5);
 		pushValue(th, aFloat(50.0)); // fov
-		popMember(th, 0, "fov");
+		popProperty(th, 0, "fov");
 		pushValue(th, aFloat(10.0));  // Orthogonal view height
-		popMember(th, 0, "viewHeight");
+		popProperty(th, 0, "viewHeight");
 		pushValue(th, aFloat(0.1f)); // minimum distance
-		popMember(th, 0, "near");
+		popProperty(th, 0, "near");
 		pushValue(th, aFloat(1000.0)); // maximum distance
-		popMember(th, 0, "far");
+		popProperty(th, 0, "far");
 		pushValue(th, aTrue);
-		popMember(th, 0, "perspective?");
+		popProperty(th, 0, "perspective?");
 		pushCMethod(th, persp_getmatrix);
 		pushValue(th, aNull);
 		pushSym(th, "new");
 		pushGloVar(th, "Matrix4");
-		methodCall(th, 1, 1);
+		getCall(th, 1, 1);
 		pushClosure(th, 3);
-		popMember(th, 0, "projMatrix");
+		popProperty(th, 0, "projMatrix");
 	popGloVar(th, "PerspectiveProjection");
 
 	// Create a lookat mixin
@@ -115,29 +115,29 @@ void camera_init(Value th) {
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(3.0f));
-		methodCall(th, 4, 1);
-		popMember(th, 0, "position");
+		getCall(th, 4, 1);
+		popProperty(th, 0, "position");
 		pushSym(th, "new");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
-		methodCall(th, 4, 1);
-		popMember(th, 0, "lookat");
+		getCall(th, 4, 1);
+		popProperty(th, 0, "lookat");
 		pushSym(th, "new");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(1.0f));
 		pushValue(th, aFloat(0.0f));
-		methodCall(th, 4, 1);
-		popMember(th, 0, "up");
+		getCall(th, 4, 1);
+		popProperty(th, 0, "up");
 		pushCMethod(th, lookat_getmatrix);
 		pushValue(th, aNull);
 		pushSym(th, "new");
 		pushGloVar(th, "Matrix4");
-		methodCall(th, 1, 1);
+		getCall(th, 1, 1);
 		pushClosure(th, 3);
-		popMember(th, 0, "viewMatrix");
+		popProperty(th, 0, "viewMatrix");
 	popGloVar(th, "LookatView");
 
 	// $.camera = +Camera
@@ -146,7 +146,7 @@ void camera_init(Value th) {
 	pushValue(th, Camera);
 	pushValue(th, lookatmixin);
 	pushValue(th, perspectivemixin);
-	methodCall(th, 3, 1);
-	popMember(th, getTop(th)-2, "camera");
+	getCall(th, 3, 1);
+	popProperty(th, getTop(th)-2, "camera");
 	popValue(th);
 }

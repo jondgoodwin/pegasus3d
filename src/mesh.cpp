@@ -17,9 +17,9 @@ int mesh_new(Value th) {
 int mesh_render(Value th) {
 	// Load the shader into the rendering pipeline */
 	pushSym(th, "_render");
-	pushMember(th, 0, "shader");
+	pushProperty(th, 0, "shader");
 	pushLocal(th, 1);
-	methodCall(th, 2, 0);
+	getCall(th, 2, 0);
 
 	// Draw the vertexes using the vertex attribute buffers
 	GLuint vao;
@@ -84,8 +84,8 @@ int mesh_render(Value th) {
 void mesh_init(Value th) {
 	Value Mesh = pushType(th, aNull, 16);
 		pushCMethod(th, mesh_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 		pushCMethod(th, mesh_render);
-		popMember(th, 0, "_render");
+		popProperty(th, 0, "_render");
 	popGloVar(th, "Mesh");
 }

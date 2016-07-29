@@ -113,7 +113,7 @@ void printSDL_GL_Attributes()
 
 /** Create a new display instance using SDL2 & OpenGL within a window */
 int display_new(Value th) {
-	pushMember(th, 0, "newtype"); // get the mixin type for instance
+	pushProperty(th, 0, "newtype"); // get the mixin type for instance
 	Value dispinst = pushCData(th, popValue(th), 0, sizeof(struct DisplayInfo));
 	di = (struct DisplayInfo*) toHeader(dispinst);
 	display_newOpenGLWindow(di);
@@ -162,27 +162,27 @@ int display_render(Value th) {
 	SDL_Rect display_rect;
 	SDL_GetDisplayBounds(0, &display_rect);
 	pushValue(th, anInt(display_rect.h));
-	popMember(th, contexti, "viewHeight");
+	popProperty(th, contexti, "viewHeight");
 	pushValue(th, anInt(display_rect.w));
-	popMember(th, contexti, "viewWidth");
+	popProperty(th, contexti, "viewWidth");
 
 	// Get $.camera and $.scene
 	pushGloVar(th, "$");
-	Value camera = pushMember(th, getTop(th)-1, "camera");
-	Value scene = pushMember(th, getTop(th)-2, "scene");
+	Value camera = pushProperty(th, getTop(th)-1, "camera");
+	Value scene = pushProperty(th, getTop(th)-2, "scene");
 	setTop(th, getTop(th)-3);
 
 	// $.camera.render(context) - adds attributes to context
 	pushSym(th, "_render");
 	pushValue(th, camera);
 	pushValue(th, contextv);
-	methodCall(th, 2, 0);
+	getCall(th, 2, 0);
 
 	// $.scene.render(context)
 	pushSym(th, "_render");
 	pushValue(th, scene);
 	pushValue(th, contextv);
-	methodCall(th, 2, 0);
+	getCall(th, 2, 0);
 
 	// Swap buffers to display finished image
 	SDL_GL_SwapWindow(di->mainWindow);
@@ -194,22 +194,22 @@ void display_init(Value th) {
 	Value Display = pushType(th, aNull, 6);
 		pushMixin(th, aNull, aNull, 5);
 			pushCMethod(th, display_finalizer);
-			popMember(th, 1, "_finalizer");
+			popProperty(th, 1, "_finalizer");
 			pushCMethod(th, display_getfullscreen);
 			pushCMethod(th, display_setfullscreen);
 			pushClosure(th, 2);
-			popMember(th, 1, "fullscreen");
+			popProperty(th, 1, "fullscreen");
 			pushCMethod(th, display_render);
-			popMember(th, 1, "_render");
-		popMember(th, 0, "newtype");
+			popProperty(th, 1, "_render");
+		popProperty(th, 0, "newtype");
 		pushCMethod(th, display_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 	popGloVar(th, "Display");
 
 	// $display = +Display
 	pushSym(th, "new");
 	pushValue(th, Display);
-	methodCall(th, 1, 1);
+	getCall(th, 1, 1);
 	getFromTop(th, 0);
 	popGloVar(th, "$display");
 }

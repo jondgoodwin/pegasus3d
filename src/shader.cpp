@@ -64,9 +64,9 @@ Value shader_make(Value th, Value pgmv) {
     int maxLength;
     char *shaderProgramInfoLog;
 
-	Value vertex = pushMember(th, 0, "vertex"); popValue(th);
+	Value vertex = pushProperty(th, 0, "vertex"); popValue(th);
 	vshader = shader_compile(toStr(vertex), GL_VERTEX_SHADER);
-	Value fragment = pushMember(th, 0, "fragment"); popValue(th);
+	Value fragment = pushProperty(th, 0, "fragment"); popValue(th);
 	fshader = shader_compile(toStr(fragment), GL_FRAGMENT_SHADER);
 	if (vshader==0 || fshader==0)
 		return aNull;
@@ -82,7 +82,7 @@ Value shader_make(Value th, Value pgmv) {
     glAttachShader(shaderprogram, fshader);
 
     /* Bind "in" attributes in listed order. Binding must happen before a link. */
-	Value inlist = pushMember(th, 0, "in"); popValue(th);
+	Value inlist = pushProperty(th, 0, "in"); popValue(th);
 	if (isArr(inlist)) {
 		for (AuintIdx i=0; i < getSize(inlist); i++) {
 			glBindAttribLocation(shaderprogram, i, toStr(arrGet(th, inlist, i)));
@@ -142,13 +142,13 @@ int shader_new(Value th) {
 /** Render the shader */
 int shader_render(Value th) {
 	// Get compiled shader, if it exists
-	Value pgmv = pushMember(th, 0, "_program");
+	Value pgmv = pushProperty(th, 0, "_program");
 	if (pgmv==aNull) {
 		// If it does not exist, compile and bind it based on info
 		Value pgmtype = pushProperty(th, 0, "_compiledtype");
 		pgmv = pushCData(th, pgmtype, 0, sizeof(ShaderPgm)); // Is small enough to stick in header
 		if (aNull != (pgmv = shader_make(th, pgmv)))
-			popMember(th, 0, "_program");
+			popProperty(th, 0, "_program");
 		else
 			popValue(th);
 	}
@@ -159,7 +159,7 @@ int shader_render(Value th) {
 		glUseProgram(pgmdata->program);
 
 		// Load all the shader's named "uniform" values from the context
-		Value uniformlist = pushMember(th, 0, "uniform"); popValue(th);
+		Value uniformlist = pushProperty(th, 0, "uniform"); popValue(th);
 		if (isArr(uniformlist)) {
 			for (AuintIdx i=0; i < getSize(uniformlist); i++) {
 				Value uninamev = arrGet(th, uniformlist, i);
@@ -176,8 +176,8 @@ int shader_render(Value th) {
 
 		// Put the shader's "in" list on the context as "vertexAttributes"
 		pushLocal(th, 1); popValue(th);
-		pushMember(th, 0, "in");
-		popMember(th, 1, "vertexAttributes");
+		pushProperty(th, 0, "in");
+		popProperty(th, 1, "vertexAttributes");
 	}
 	return 1;
 }
@@ -186,12 +186,12 @@ int shader_render(Value th) {
 void shader_init(Value th) {
 	Value Shader = pushType(th, aNull, 16);
 		pushCMethod(th, shader_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 		pushCMethod(th, shader_render);
-		popMember(th, 0, "_render");
+		popProperty(th, 0, "_render");
 		Value pgmmmixin = pushMixin(th, aNull, aNull, 4);
 			pushCMethod(th, shader_closepgm);
-			popMember(th, 1, "_finalizer");
-		popMember(th, 0, "_compiledtype");
+			popProperty(th, 1, "_finalizer");
+		popProperty(th, 0, "_compiledtype");
 	popGloVar(th, "Shader");
 }

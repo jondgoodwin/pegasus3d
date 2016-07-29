@@ -17,7 +17,7 @@ struct ColorInfo {
 /** Create a new color value, with passed red, green, blue and alpha values.
   Defaults: White if no passed values, Gray scale if 1 passed value, 1.0 if no alpha. */
 int color_new(Value th) {
-	Value colorv = pushNumbers(th, pushMember(th, 0, "newtype"), 1, 4, sizeof(GLfloat), 0);
+	Value colorv = pushNumbers(th, pushProperty(th, 0, "newtype"), 1, 4, sizeof(GLfloat), 0);
 	ColorInfo *color = (struct ColorInfo*) toStr(colorv);
 	float default = 1.0f;
 	color->red = default = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : default;
@@ -63,7 +63,7 @@ int colors_new(Value th) {
 		nStructs = toAint(getLocal(th, 1));
 
 	// Create the number array
-	Value bufv = pushNumbers(th, pushMember(th, 0, "newtype"), nStructs, 4, sizeof(GLfloat), 0);
+	Value bufv = pushNumbers(th, pushProperty(th, 0, "newtype"), nStructs, 4, sizeof(GLfloat), 0);
 	return 1;
 }
 
@@ -86,20 +86,20 @@ void color_init(Value th) {
 	Value Camera = pushType(th, aNull, 2);
 		pushMixin(th, aNull, aNull, 16);
 			pushCMethod(th, color_set);
-			popMember(th, 1, "set");
+			popProperty(th, 1, "set");
 			pushCMethod(th, color_unpack);
-			popMember(th, 1, "unpack");
-		popMember(th, 0, "newtype");
+			popProperty(th, 1, "unpack");
+		popProperty(th, 0, "newtype");
 		pushCMethod(th, color_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 	popGloVar(th, "Color");
 
 	pushType(th, aNull, 2);
 		pushMixin(th, aNull, aNull, 16);
 			pushCMethod(th, colors_append);
-			popMember(th, 1, "<<");
-		popMember(th, 0, "newtype");
+			popProperty(th, 1, "<<");
+		popProperty(th, 0, "newtype");
 		pushCMethod(th, colors_new);
-		popMember(th, 0, "new");
+		popProperty(th, 0, "new");
 	popGloVar(th, "Colors");
 }
