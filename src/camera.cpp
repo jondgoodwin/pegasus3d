@@ -80,15 +80,15 @@ int camera_render(Value th) {
 
 /** Initialize Camera type and create an instance in $.camera */
 void camera_init(Value th) {
-	Value Camera = pushType(th, aNull, 16);
+	pushType(th, aNull, 16);
 		pushCMethod(th, camera_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, camera_render);
-		popProperty(th, 0, "_render");
+		popProperty(th, 0, "render");
 	popGloVar(th, "Camera");
 
 	// Create a PerspectiveProjection mixin
-	Value perspectivemixin = pushMixin(th, aNull, aNull, 5);
+	pushMixin(th, aNull, aNull, 5);
 		pushValue(th, aFloat(50.0)); // fov
 		popProperty(th, 0, "fov");
 		pushValue(th, aFloat(10.0));  // Orthogonal view height
@@ -109,7 +109,7 @@ void camera_init(Value th) {
 	popGloVar(th, "PerspectiveProjection");
 
 	// Create a lookat mixin
-	Value lookatmixin = pushMixin(th, aNull, aNull, 5);
+	pushMixin(th, aNull, aNull, 5);
 		pushSym(th, "new");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
@@ -139,14 +139,4 @@ void camera_init(Value th) {
 		pushClosure(th, 3);
 		popProperty(th, 0, "viewMatrix");
 	popGloVar(th, "LookatView");
-
-	// $.camera = +Camera
-	pushGloVar(th, "$");
-	pushSym(th, "new");
-	pushValue(th, Camera);
-	pushValue(th, lookatmixin);
-	pushValue(th, perspectivemixin);
-	getCall(th, 3, 1);
-	popProperty(th, getTop(th)-2, "camera");
-	popValue(th);
 }

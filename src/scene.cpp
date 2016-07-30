@@ -55,7 +55,7 @@ int scene_render(Value th) {
 	if (isArr(parts)) {
 		Aint sz = getSize(parts);
 		for (Aint i=0; i<sz; i++) {
-			pushSym(th, "_render");
+			pushSym(th, "render");
 			pushValue(th, arrGet(th, parts, i));
 			pushLocal(th, 1);
 			getCall(th, 2, 0);
@@ -70,11 +70,11 @@ int scene_render(Value th) {
 
 /** Initialize Scene type and create an instance in $.scene */
 void scene_init(Value th) {
-	Value Scene = pushType(th, aNull, 16);
+	pushType(th, aNull, 16);
 		pushCMethod(th, scene_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, scene_render);
-		popProperty(th, 0, "_render");
+		popProperty(th, 0, "render");
 		// background: +Closure(., ., +Color(0,0,0))
 		pushCMethod(th, scene_getbackground);
 		pushCMethod(th, scene_setbackground);
@@ -87,12 +87,4 @@ void scene_init(Value th) {
 		pushClosure(th, 3);
 		popProperty(th, 0, "background");
 	popGloVar(th, "Scene");
-
-	// $.scene = +Scene
-	pushGloVar(th, "$");
-	pushSym(th, "new");
-	pushValue(th, Scene);
-	getCall(th, 1, 1);
-	popProperty(th, getTop(th)-2, "scene");
-	popValue(th);
 }

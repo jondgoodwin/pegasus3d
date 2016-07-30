@@ -9,11 +9,11 @@
 
 #include <stdio.h>
 
-/** C properties describing the display */
-struct DisplayInfo {
+/** C properties describing the window */
+struct WindowInfo {
 	SDL_Window *mainWindow;		//!< 3D display window, via SDL
 	SDL_GLContext mainContext;	//!< OpenGL context, via SDL
-	bool fullscreen;			//!< Is display fullscreen (vs. windowed)?
+	bool fullscreen;			//!< Are we fullscreen (vs. windowed)?
 } *di;
 
 // function prototypes
@@ -22,7 +22,7 @@ void handleSDLError(int line);
 void printSDL_GL_Attributes();
 
 /** Initialize SDL, main window, OpenGL, and GLEW */
-bool display_newOpenGLWindow(DisplayInfo *di)
+bool window_newOpenGLWindow(WindowInfo *di)
 {
 	// Initialize SDL's Video subsystem
 	if (SDL_Init(SDL_INIT_VIDEO) < 0)
@@ -33,10 +33,10 @@ bool display_newOpenGLWindow(DisplayInfo *di)
 
 	// Create centered, resizable window
 	di->fullscreen = false;
-	SDL_Rect display_rect;
-	SDL_GetDisplayBounds(0, &display_rect);
+	SDL_Rect window_rect;
+	SDL_GetDisplayBounds(0, &window_rect);
 	di->mainWindow = SDL_CreateWindow(PEG_NAME, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-		display_rect.w*3/4, display_rect.h*3/4, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+		window_rect.w*3/4, window_rect.h*3/4, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
 
 	// Check that everything worked out okay
 	if (!di->mainWindow)
@@ -111,18 +111,18 @@ void printSDL_GL_Attributes()
 	printf("SDL_GL_CONTEXT_MINOR_VERSION: %d\n", value);
 }
 
-/** Create a new display instance using SDL2 & OpenGL within a window */
-int display_new(Value th) {
+/** Create a new window instance using SDL2 & OpenGL within a window */
+int window_new(Value th) {
 	pushProperty(th, 0, "newtype"); // get the mixin type for instance
-	Value dispinst = pushCData(th, popValue(th), 0, sizeof(struct DisplayInfo));
-	di = (struct DisplayInfo*) toHeader(dispinst);
-	display_newOpenGLWindow(di);
+	Value dispinst = pushCData(th, popValue(th), 0, sizeof(struct WindowInfo));
+	di = (struct WindowInfo*) toHeader(dispinst);
+	window_newOpenGLWindow(di);
 	return 1;
 }
 
 /** Close down OpenGL, window and SDL2 */
-int display_finalizer(Value cdata) {
-	struct DisplayInfo *di = (struct DisplayInfo *)(toHeader(cdata));
+int window_finalizer(Value cdata) {
+	struct WindowInfo *di = (struct WindowInfo *)(toHeader(cdata));
 
 	// Delete our OpengL context
 	SDL_GL_DeleteContext(di->mainContext);
@@ -136,80 +136,70 @@ int display_finalizer(Value cdata) {
 }
 
 /** Return aTrue if fullscreen, aFalse if windowed */
-int display_getfullscreen(Value th) {
-	DisplayInfo *di = (struct DisplayInfo*) toHeader(getLocal(th, 0));
+int window_getfullscreen(Value th) {
+	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
 	pushValue(th, di->fullscreen? aTrue : aFalse);
 	return 1;
 }
 
 /** If true, set to fullscreen, otherwise windowed */
-int display_setfullscreen(Value th) {
-	DisplayInfo *di = (struct DisplayInfo*) toHeader(getLocal(th, 0));
+int window_setfullscreen(Value th) {
+	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
 	di->fullscreen = !(getTop(th)<2 || isFalse(getLocal(th, 1)));
 	SDL_SetWindowFullscreen(di->mainWindow, di->fullscreen? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 	return 1;
 }
 
-/** Render $.scene from the point of view of $.camera */
-int display_render(Value th) {
-	DisplayInfo *di = (struct DisplayInfo*) toHeader(getLocal(th, 0));
+/** Render scene (2nd parm) from the point of view of camera (1st parm) */
+int window_render(Value th) {
+	if (getTop(th)<3)
+		return 1;
+
+	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
 
 	// Create render context
 	int contexti = getTop(th);
 	Value contextv = pushType(th, aNull, 16);
 
 	// Put viewHeight and viewWidth into context
-	SDL_Rect display_rect;
-	SDL_GetDisplayBounds(0, &display_rect);
-	pushValue(th, anInt(display_rect.h));
+	SDL_Rect window_rect;
+	SDL_GetDisplayBounds(0, &window_rect);
+	pushValue(th, anInt(window_rect.h));
 	popProperty(th, contexti, "viewHeight");
-	pushValue(th, anInt(display_rect.w));
+	pushValue(th, anInt(window_rect.w));
 	popProperty(th, contexti, "viewWidth");
 
-	// Get $.camera and $.scene
-	pushGloVar(th, "$");
-	Value camera = pushProperty(th, getTop(th)-1, "camera");
-	Value scene = pushProperty(th, getTop(th)-2, "scene");
-	setTop(th, getTop(th)-3);
-
 	// $.camera.render(context) - adds attributes to context
-	pushSym(th, "_render");
-	pushValue(th, camera);
+	pushSym(th, "render");
+	pushValue(th, getLocal(th, 1)); // camera
 	pushValue(th, contextv);
 	getCall(th, 2, 0);
 
 	// $.scene.render(context)
-	pushSym(th, "_render");
-	pushValue(th, scene);
+	pushSym(th, "render");
+	pushValue(th, getLocal(th, 2)); // scene
 	pushValue(th, contextv);
 	getCall(th, 2, 0);
 
-	// Swap buffers to display finished image
+	// Swap buffers to window's finished image
 	SDL_GL_SwapWindow(di->mainWindow);
 	return 1;
 }
 
-/** Initialize the Display type and '$display'*/
-void display_init(Value th) {
-	Value Display = pushType(th, aNull, 6);
+/** Initialize the Window type and '$window'*/
+void window_init(Value th) {
+	pushType(th, aNull, 6);
 		pushMixin(th, aNull, aNull, 5);
-			pushCMethod(th, display_finalizer);
+			pushCMethod(th, window_finalizer);
 			popProperty(th, 1, "_finalizer");
-			pushCMethod(th, display_getfullscreen);
-			pushCMethod(th, display_setfullscreen);
+			pushCMethod(th, window_getfullscreen);
+			pushCMethod(th, window_setfullscreen);
 			pushClosure(th, 2);
 			popProperty(th, 1, "fullscreen");
-			pushCMethod(th, display_render);
-			popProperty(th, 1, "_render");
+			pushCMethod(th, window_render);
+			popProperty(th, 1, "render");
 		popProperty(th, 0, "newtype");
-		pushCMethod(th, display_new);
+		pushCMethod(th, window_new);
 		popProperty(th, 0, "new");
-	popGloVar(th, "Display");
-
-	// $display = +Display
-	pushSym(th, "new");
-	pushValue(th, Display);
-	getCall(th, 1, 1);
-	getFromTop(th, 0);
-	popGloVar(th, "$display");
+	popGloVar(th, "Window");
 }

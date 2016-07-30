@@ -188,7 +188,7 @@ void shader_init(Value th) {
 		pushCMethod(th, shader_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, shader_render);
-		popProperty(th, 0, "_render");
+		popProperty(th, 0, "render");
 		Value pgmmmixin = pushMixin(th, aNull, aNull, 4);
 			pushCMethod(th, shader_closepgm);
 			popProperty(th, 1, "_finalizer");

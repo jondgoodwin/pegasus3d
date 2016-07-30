@@ -8,7 +8,7 @@
 #include "pegasus3d.h"
 
 char vertexshader[] =
-	"// Vertex shader for a self-lit mesh where each vertex has its own color\n"
+	"// Vertex shader for a self-lit shape where each vertex has its own color\n"
 	"#version 130\n"
 	"uniform mat4 mvpmatrix;"	
 	"in  vec3 position;"
@@ -55,29 +55,29 @@ void populateBuffer(Value th, GLfloat *floats, int count) {
 void test_init(Value th) {
 	int topmark = getTop(th);
 
-	// $.scene.parts {+Mesh}
+	// $.scene.parts {+Shape}
 	pushGloVar(th, "$");
 	int sceneidx = getTop(th);
 	pushProperty(th, getTop(th)-1, "scene");
 	Value parts = pushArray(th, aNull, 1);
 		pushSym(th, "new");
-		pushGloVar(th, "Mesh");
+		pushGloVar(th, "Shape");
 		getCall(th, 1, 1);
-		Aint mesh = getTop(th)-1;
-			// Populate new mesh
+		Aint shape = getTop(th)-1;
+			// Populate new shape
 			pushSym(th, "new");
 			pushGloVar(th, "Xyzs");
 			pushValue(th, anInt(4));
 			getCall(th, 2, 1);
 			populateBuffer(th, diamondpts, 12);
-			popProperty(th, mesh, "position");
+			popProperty(th, shape, "position");
 
 			pushSym(th, "new");
 			pushGloVar(th, "Colors");
 			pushValue(th, anInt(4));
 			getCall(th, 2, 1);
 			populateBuffer(th, diamondcols, 16);
-			popProperty(th, mesh, "color");
+			popProperty(th, shape, "color");
 
 			pushSym(th, "new");
 			pushGloVar(th, "Shader");
@@ -99,7 +99,7 @@ void test_init(Value th) {
 				pushSym(th, "color");
 				getCall(th, 3, 1);
 				popProperty(th, shader, "in");
-			popProperty(th, mesh, "shader");
+			popProperty(th, shape, "shader");
 		arrSet(th, parts, 0, popValue(th));
 	popProperty(th, sceneidx, "parts");
 

@@ -34,6 +34,31 @@ void world_stoprunning(Value th) {
 	setCall(th, 2, 0);
 }
 
+/** Do a full frame: handleInput, send ticks and render
+ * dt is passed as the parameter. */
+int world_nextframe(Value th) {
+	// Default dt, just in case
+	if (getTop(th)<2)
+		pushValue(th, aFloat(0.013333f));
+
+	// Process all queued input
+	pushSym(th, "handleInput");
+	pushValue(th, getLocal(th, 0));
+	getCall(th, 1, 0);
+
+	// Update the state each tick
+	pushSym(th, "updateState");
+	pushValue(th, getLocal(th,0));
+	pushValue(th, getLocal(th,1));
+	getCall(th, 2, 0);
+
+	// $window.render (uses $.camera and $.scene)
+	pushSym(th, "render");
+	pushValue(th, getLocal(th, 0));
+	getCall(th, 1, 0);
+	return 1;
+}
+
 /** Default method for updating the world's state every tick.
     dt is first parameter (delta time since last update in seconds). */
 int world_update(Value th) {
@@ -81,16 +106,19 @@ int world_handleInput(Value th)
 			case SDLK_ESCAPE:
 				world_stoprunning(th);
 				break;
+
+			// Toggle fullscreen mode for world's window
 			case SDLK_F11:
+				{
 				pushSym(th, "fullscreen");
-				pushGloVar(th, "$display");
+				Value window = pushProperty(th, 0, "window");
 				pushSym(th, "fullscreen");
-				pushGloVar(th, "$display");
+				pushValue(th, window);
 				getCall(th, 1, 1);
 				{Value val = getFromTop(th, 0);}
 				pushValue(th, isFalse(popValue(th))? aTrue : aFalse);
 				setCall(th, 2, 0);
-				break;
+				} break;
 			default:
 				break;
 			}
@@ -99,9 +127,19 @@ int world_handleInput(Value th)
 	return 1;
 }
 
+/** Render the world's scene via .camera to .window */
+int world_render(Value th) {
+	pushSym(th, "render");
+	pushProperty(th, 0, "window");
+	pushProperty(th, 0, "camera");
+	pushProperty(th, 0, "scene");
+	getCall(th, 3, 0);
+	return 1;
+}
+
 /** Initialize the World type and '$'*/
 void world_init(Value th) {
-	Value World = pushType(th, aNull, 6);
+	pushType(th, aNull, 6);
 		pushCMethod(th, world_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, world_getrunning);
@@ -109,15 +147,13 @@ void world_init(Value th) {
 		pushValue(th, aTrue);
 		pushClosure(th, 3);
 		popProperty(th, 0, "running?");
+		pushCMethod(th, world_nextframe);
+		popProperty(th, 0, "nextFrame");
 		pushCMethod(th, world_handleInput);
 		popProperty(th, 0, "handleInput");
 		pushCMethod(th, world_update);
 		popProperty(th, 0, "updateState");
+		pushCMethod(th, world_render);
+		popProperty(th, 0, "render");
 	popGloVar(th, "World");
-
-	// $ = +World
-	pushSym(th, "new");
-	pushValue(th, World);
-	getCall(th, 1, 1);
-	popGloVar(th, "$");
 }

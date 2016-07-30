@@ -1,4 +1,4 @@
-/** Mesh type - Handles a 3-D geometry
+/** Shape type - Handles a 3-D geometry
  * @file
  *
  * This source file is part of the Pegasus3d browser.
@@ -7,16 +7,16 @@
 
 #include "pegasus3d.h"
 
-/** Create a new mesh */
-int mesh_new(Value th) {
-	pushType(th, getLocal(th, 0), 16); // Create prototype of self (Mesh)
+/** Create a new shape */
+int shape_new(Value th) {
+	pushType(th, getLocal(th, 0), 16); // Create prototype of self (Shape)
 	return 1;
 }
 
-/** Render the mesh */
-int mesh_render(Value th) {
+/** Render the shape */
+int shape_render(Value th) {
 	// Load the shader into the rendering pipeline */
-	pushSym(th, "_render");
+	pushSym(th, "render");
 	pushProperty(th, 0, "shader");
 	pushLocal(th, 1);
 	getCall(th, 2, 0);
@@ -80,12 +80,12 @@ int mesh_render(Value th) {
 	);
  */
 
-/** Initialize mesh type */
-void mesh_init(Value th) {
-	Value Mesh = pushType(th, aNull, 16);
-		pushCMethod(th, mesh_new);
+/** Initialize shape type */
+void shape_init(Value th) {
+	Value Shape = pushType(th, aNull, 16);
+		pushCMethod(th, shape_new);
 		popProperty(th, 0, "new");
-		pushCMethod(th, mesh_render);
-		popProperty(th, 0, "_render");
-	popGloVar(th, "Mesh");
+		pushCMethod(th, shape_render);
+		popProperty(th, 0, "render");
+	popGloVar(th, "Shape");
 }
