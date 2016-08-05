@@ -27,17 +27,17 @@ char fragmentshader[] =
 		"gl_FragColor = vert_color;\n"
 	"}\n";
 
+char diamondptstr[] = 
+     "0.0,  1.0, 0.0 ,"
+     "1.0,  0.0, 0.0 ,"
+     "0.0, -1.0, 0.0 ,"
+    "-1.0,  0.0, 0.0  ";
 
-GLfloat diamondpts[4 * 3] = {
-     0.0,  1.0, 0.0 , /* Top point */
-     1.0,  0.0, 0.0 , /* Right point */
-     0.0, -1.0, 0.0 , /* Bottom point */
-    -1.0,  0.0, 0.0  }; /* Left point */
-GLfloat diamondcols[4 * 4] = {
-    1.0,  0.0,  0.0, 1.0, /* Red */
-    0.0,  1.0,  0.0, 1.0, /* Green */
-    0.0,  0.0,  1.0, 1.0, /* Blue */
-    1.0,  1.0,  1.0, 1.0 }; /* White */
+char diamondcolstr[] =
+    "1.0,  0.0,  0.0, 1.0,"
+    "0.0,  1.0,  0.0, 1.0,"
+    "0.0,  0.0,  1.0, 1.0,"
+    "1.0,  1.0,  1.0, 1.0 ";
 
 /* Populate a buffer with several floating point numbers */
 void populateBuffer(Value th, GLfloat *floats, int count) {
@@ -65,18 +65,19 @@ void test_init(Value th) {
 		getCall(th, 1, 1);
 		Aint shape = getTop(th)-1;
 			// Populate new shape
+			pushSym(th, "Polygon");
+			popSetActProp(th, shape, "draw");
+
 			pushSym(th, "new");
 			pushGloVar(th, "Xyzs");
-			pushValue(th, anInt(4));
+			pushString(th, aNull, diamondptstr);
 			getCall(th, 2, 1);
-			populateBuffer(th, diamondpts, 12);
 			popProperty(th, shape, "position");
 
 			pushSym(th, "new");
 			pushGloVar(th, "Colors");
-			pushValue(th, anInt(4));
+			pushString(th, aNull, diamondcolstr);
 			getCall(th, 2, 1);
-			populateBuffer(th, diamondcols, 16);
 			popProperty(th, shape, "color");
 
 			pushSym(th, "new");
@@ -92,13 +93,13 @@ void test_init(Value th) {
 				pushGloVar(th, "List");
 				pushSym(th, "mvpmatrix");
 				getCall(th, 2, 1);
-				popProperty(th, shader, "uniform");
+				popProperty(th, shader, "uniforms");
 				pushSym(th, "new");
 				pushGloVar(th, "List");
 				pushSym(th, "position");
 				pushSym(th, "color");
 				getCall(th, 3, 1);
-				popProperty(th, shader, "in");
+				popProperty(th, shader, "attributes");
 			popProperty(th, shape, "shader");
 		arrSet(th, parts, 0, popValue(th));
 	popProperty(th, sceneidx, "parts");

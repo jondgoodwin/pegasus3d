@@ -11,16 +11,24 @@
 
 /** Create a new camera, based on the View and Matrix mixins */
 int camera_new(Value th) {
-	int newcam = getTop(th);
-	pushType(th, getLocal(th, 0), 16); // Create prototype of self (Camera)
-	addMixin(th, getFromTop(th, 0), getLocal(th, 1));
-	if (getTop(th)>2)
-		addMixin(th, getFromTop(th, 0), getLocal(th, 2));
-	// Create a placeholder for the calculated view/projection matrix
+	// Ensure parameters have at least the default mixins
+	if (getTop(th)<2)
+		pushGloVar(th, "LookatView");
+	if (getTop(th)<3)
+		pushGloVar(th, "PerspectiveProjection");
+
+	int newcamidx = getTop(th);
+	Value newcam = pushType(th, getLocal(th, 0), 16); // Create camera as subtype of Camera
+
+	// Add view and perspective mixins from parameters
+	addMixin(th, newcam, getLocal(th, 1));
+	addMixin(th, newcam, getLocal(th, 2));
+
+	// Create mvpmatrix property to hold the calculated view/projection matrix
 	pushSym(th, "new");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	popProperty(th, newcam, "mvpmatrix");
+	popProperty(th, newcamidx, "mvpmatrix");
 	return 1;
 }
 

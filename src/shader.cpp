@@ -24,32 +24,26 @@ GLuint shader_compile(const char *shadersource, GLenum shadertype) {
 	int maxLength;
     char *InfoLog;
 
-    /* This is the handle used to reference the shader */
+    // This is the handle used to reference the shader
     GLuint shader;
 
-    /* Create an empty vertex shader handle */
+    // Create an empty vertex shader handle
     shader = glCreateShader(shadertype);
 
-    /* Send the vertex shader source code to GL */
-    /* Note that the source code is NULL character terminated. */
-    /* GL will automatically detect that therefore the length info can be 0 in this case (the last parameter) */
+    // Send the vertex shader source code to GL 
+    // Note that the source code is NULL character terminated.
+    // GL will automatically detect that therefore the length info can be 0 in this case (the last parameter)
     glShaderSource(shader, 1, (const GLchar**)&shadersource, 0);
 
-    /* Compile the vertex shader */
+    // Compile the vertex shader and check for errors
     glCompileShader(shader);
-
     glGetShaderiv(shader, GL_COMPILE_STATUS, &IsCompiled);
     if(IsCompiled == GL_FALSE)
     {
        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &maxLength);
-
-       /* The maxLength includes the NULL character */
        InfoLog = (char *)malloc(maxLength);
-
        glGetShaderInfoLog(shader, maxLength, &maxLength, InfoLog);
-
-       /* Handle the error in an appropriate way such as displaying a message or writing to a log file. */
-       /* In this simple program, we'll just leave */
+	   vmLog("Shader compilation failure: %s", InfoLog);
        free(InfoLog);
        return 0;
     }
@@ -71,51 +65,36 @@ Value shader_make(Value th, Value pgmv) {
 	if (vshader==0 || fshader==0)
 		return aNull;
 
-    /* If we reached this point it means the vertex and fragment shaders compiled and are syntax error free. */
-    /* We must link them together to make a GL shader program */
-    /* GL shader programs are monolithic. It is a single piece made of 1 vertex shader and 1 fragment shader. */
-    /* Assign our program handle a "name" */
+    // Link the shaders together to create a GL shader program
     GLuint shaderprogram = glCreateProgram();
-
-    /* Attach our shaders to our program */
     glAttachShader(shaderprogram, vshader);
     glAttachShader(shaderprogram, fshader);
 
-    /* Bind "in" attributes in listed order. Binding must happen before a link. */
-	Value inlist = pushProperty(th, 0, "in"); popValue(th);
+    // Bind "attributes" in listed order.
+	Value inlist = pushProperty(th, 0, "attributes"); popValue(th);
 	if (isArr(inlist)) {
 		for (AuintIdx i=0; i < getSize(inlist); i++) {
 			glBindAttribLocation(shaderprogram, i, toStr(arrGet(th, inlist, i)));
 		}
 	}
 
-    /* Link our program */
-    /* At this stage, the vertex and fragment programs are inspected, optimized and a binary code is generated for the shader. */
-    /* The binary code is uploaded to the GPU, if there is no error. */
+    // Link the program, then upload it to the GPU.
     glLinkProgram(shaderprogram);
     glDetachShader(shaderprogram, vshader);
     glDetachShader(shaderprogram, fshader);
     glDeleteShader(vshader);
     glDeleteShader(fshader);
 
-    /* Again, we must check and make sure that it linked. If it fails, it would mean either there is a mismatch between the vertex */
-    /* and fragment shaders. It might be that you have surpassed your GPU's abilities. Perhaps too many ALU operations or */
-    /* too many texel fetch instructions or too many interpolators or dynamic loops. */
-
+    // Check for linkage errors, e.g.: a mismatch between the vertex and fragment shaders.
+    // Also possible: surpassed your GPU's abilities, too many ALU operations,
+    // too many texel fetch instructions or too many interpolators or dynamic loops.
     glGetProgramiv(shaderprogram, GL_LINK_STATUS, (int *)&IsLinked);
     if (IsLinked == GL_FALSE)
     {
-       /* Noticed that glGetProgramiv is used to get the length for a shader program, not glGetShaderiv. */
        glGetProgramiv(shaderprogram, GL_INFO_LOG_LENGTH, &maxLength);
-
-       /* The maxLength includes the NULL character */
        shaderProgramInfoLog = (char *)malloc(maxLength);
-
-       /* Notice that glGetProgramInfoLog, not glGetShaderInfoLog. */
        glGetProgramInfoLog(shaderprogram, maxLength, &maxLength, shaderProgramInfoLog);
-
-       /* Handle the error in an appropriate way such as displaying a message or writing to a log file. */
-       /* In this simple program, we'll just leave */
+	   vmLog("Shader program linkage error: %s", shaderProgramInfoLog);
        free(shaderProgramInfoLog);
        return aNull;
     }
@@ -159,24 +138,41 @@ int shader_render(Value th) {
 		glUseProgram(pgmdata->program);
 
 		// Load all the shader's named "uniform" values from the context
-		Value uniformlist = pushProperty(th, 0, "uniform"); popValue(th);
+		Value uniformlist = pushProperty(th, 0, "uniforms"); popValue(th);
 		if (isArr(uniformlist)) {
 			for (AuintIdx i=0; i < getSize(uniformlist); i++) {
 				Value uninamev = arrGet(th, uniformlist, i);
 				Value unival = getProperty(th, getLocal(th, 1), uninamev);
-				switch (sizeof(Mat4) /*getSize(unival)*/) { // Hack!! Fix it!!
-				case sizeof(Mat4):
-					glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toStr(unival));
-					break;
-				default:
-					assert(false && "Unsupported uniform type!!!");
+				if (nbrIsMatrix(unival)) {
+					switch (nbrGetNVals(unival)) {
+					case  4: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
+					case  9: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
+					case 16: glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
+					default: assert(false && "Unsupported uniform type!!!");
+					}
+				} else if (nbrIsInteger(unival)) {
+					switch (nbrGetNVals(unival)) {
+					case 1: glUniform1iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+					case 2: glUniform2iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+					case 3: glUniform3iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+					case 4: glUniform4iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+					default: assert(false && "Unsupported uniform type!!!");
+					}
+				} else {
+					switch (nbrGetNVals(unival)) {
+					case 1: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+					case 2: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+					case 3: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+					case 4: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+					default: assert(false && "Unsupported uniform type!!!");
+					}
 				}
 			}
 		}
 
-		// Put the shader's "in" list on the context as "vertexAttributes"
+		// Put the shader's "attributes" list on the context
 		pushLocal(th, 1); popValue(th);
-		pushProperty(th, 0, "in");
+		pushProperty(th, 0, "attributes");
 		popProperty(th, 1, "vertexAttributes");
 	}
 	return 1;

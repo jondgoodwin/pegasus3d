@@ -23,6 +23,8 @@ void scene_init(Value th);
 void shape_init(Value th);
 void shader_init(Value th);
 
+void http_init(Value th);
+
 void test_init(Value th);
 
 /** Initialize World Types and environment global variables. */
@@ -39,6 +41,8 @@ void initTypes(Value th) {
 	scene_init(th);
 	shape_init(th);
 	shader_init(th);
+
+	http_init(th);
 }
 
 /** Initialize $ to be a blank world */
@@ -48,20 +52,6 @@ void initWorld(Value th) {
 	pushSym(th, "new");
 	pushGloVar(th, "World");
 	getCall(th, 1, 1);
-
-	// $.window = +Window
-	pushSym(th, "new");
-	pushGloVar(th, "Window");
-	getCall(th, 1, 1);
-	popProperty(th, curworld, "window");
-
-	// $.camera = +Camera
-	pushSym(th, "new");
-	pushGloVar(th, "Camera");
-	pushGloVar(th, "LookatView");
-	pushGloVar(th, "PerspectiveProjection");
-	getCall(th, 3, 1);
-	popProperty(th, curworld, "camera");
 
 	// $.scene = +Scene
 	pushSym(th, "new");
@@ -78,6 +68,12 @@ int main(int argc, char *argv[])
 {
 	freopen("pegasus3d.log", "w", stderr);
 
+	// Initialize SDL's Video subsystem
+	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+		vmLog("Failed to initialize SDL2's Video subsystem\n");
+		return 1;
+	}
+
 	// Start Acorn VM and load its types
 	Value th = newVM();
 	initTypes(th);
@@ -89,7 +85,7 @@ int main(int argc, char *argv[])
 	// Load and run the world whose url was passed as first parameter
 	pushSym(th, "()");
 	pushGloVar(th, "Resource");
-	pushString(th, aNull, argc>1? argv[1] : "file://./test.acn");
+	pushString(th, aNull, argc>1? argv[1] : "http://./test.acn");
 	getCall(th, 2, 0);
 
 	// Initialize timer count and running state
@@ -115,7 +111,8 @@ int main(int argc, char *argv[])
 		isrunning = popValue(th);
 	}
 
-	vm_close(th);
+	vmClose(th); // Shutdown Acorn VM
+	SDL_Quit(); // Shutdown SDL2
 
 	return 0;
 }

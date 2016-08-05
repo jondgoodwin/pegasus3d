@@ -129,9 +129,24 @@ int world_handleInput(Value th)
 
 /** Render the world's scene via .camera to .window */
 int world_render(Value th) {
+	// Render to the world's window, creating it if needed
 	pushSym(th, "render");
-	pushProperty(th, 0, "window");
-	pushProperty(th, 0, "camera");
+	if (pushProperty(th, 0, "window")==aNull) {
+		popValue(th);
+		pushSym(th, "new");
+		pushGloVar(th, "Window");
+		getCall(th, 1, 1);
+		pushValue(th, getFromTop(th, 0));
+		popProperty(th, 0, "window");
+	}
+	// Create camera also, if needed, using default view
+	if (pushProperty(th, 0, "camera")==aNull) {
+		pushSym(th, "new");
+		pushGloVar(th, "Camera");
+		getCall(th, 1, 1);
+		pushValue(th, getFromTop(th, 0));
+		popProperty(th, 0, "camera");
+	}
 	pushProperty(th, 0, "scene");
 	getCall(th, 3, 0);
 	return 1;

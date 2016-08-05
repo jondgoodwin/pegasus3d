@@ -6,6 +6,7 @@
 */
 
 #include "pegasus3d.h"
+#include <math.h>
 
 struct ColorInfo {
 	float red;
@@ -17,7 +18,7 @@ struct ColorInfo {
 /** Create a new color value, with passed red, green, blue and alpha values.
   Defaults: White if no passed values, Gray scale if 1 passed value, 1.0 if no alpha. */
 int color_new(Value th) {
-	Value colorv = pushNumbers(th, pushProperty(th, 0, "newtype"), 1, 4, sizeof(GLfloat), 0);
+	Value colorv = pushNumbers(th, pushProperty(th, 0, "newtype"), 1, 4, sizeof(GLfloat), false, false, 0);
 	ColorInfo *color = (struct ColorInfo*) toStr(colorv);
 	float default = 1.0f;
 	color->red = default = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : default;
@@ -58,12 +59,37 @@ int colors_new(Value th) {
 		pushValue(th, aNull);
 		return 1;
 	}
+	Value parm1 = getLocal(th, 1);
 	AintIdx nStructs = 0;
-	if (isInt(getLocal(th, 1)))
-		nStructs = toAint(getLocal(th, 1));
+	if (isInt(parm1))
+		nStructs = toAint(parm1);
+	else if (isStr(parm1)) {
+		// number of floats is one more than the number of commas
+		const char *scanp = toStr(parm1);
+		while (*scanp) {
+			if (*scanp++==',') 
+				nStructs++;
+		}
+		nStructs++; 
+	}
 
 	// Create the number array
-	Value bufv = pushNumbers(th, pushProperty(th, 0, "newtype"), nStructs, 4, sizeof(GLfloat), 0);
+	Value bufv = pushNumbers(th, pushProperty(th, 0, "newtype"), nStructs, 4, sizeof(GLfloat), false, false, 0);
+
+	// Fill the number array with floating point numbers converted from ascii
+	if (isStr(parm1)) {
+		const char *scanp = toStr(parm1);
+		while (*scanp) {
+			if ((*scanp>='0' && *scanp<='9')||*scanp=='-') {
+				float afloat = atof(scanp);
+				strAppend(th, bufv, (const char*)(&afloat), sizeof(GLfloat));
+				while ((*scanp>='0' && *scanp<='9') || *scanp=='.' || *scanp=='e' || *scanp=='E' || *scanp=='-')
+					scanp++;
+			}
+			else
+				scanp++;
+		}
+	}
 	return 1;
 }
 
