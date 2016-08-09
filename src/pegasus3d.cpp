@@ -6,6 +6,7 @@
 */
 
 #include "pegasus3d.h"
+#include "curl/curl.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -82,10 +83,15 @@ int main(int argc, char *argv[])
 	initWorld(th);
 	test_init(th);	// temporary hack for building a test world
 
-	// Load and run the world whose url was passed as first parameter
+	// Load and run the world whose url was passed as first parameter	
+	curl_global_init(CURL_GLOBAL_WIN32);
 	pushSym(th, "()");
 	pushGloVar(th, "Resource");
-	pushString(th, aNull, argc>1? argv[1] : "http://./test.acn");
+#ifdef _DEBUG
+	pushString(th, aNull, argc>1? argv[1] : "file://./test.acn");
+#else
+	pushString(th, aNull, argc>1? argv[1] : "http://ddd.jondgoodwin.com/world.acn");
+#endif
 	getCall(th, 2, 0);
 
 	// Initialize timer count and running state
@@ -111,6 +117,7 @@ int main(int argc, char *argv[])
 		isrunning = popValue(th);
 	}
 
+	curl_global_cleanup(); // Shutdown curl
 	vmClose(th); // Shutdown Acorn VM
 	SDL_Quit(); // Shutdown SDL2
 

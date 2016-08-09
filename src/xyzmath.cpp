@@ -90,7 +90,7 @@ void mat4Lookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up) {
 
 	(*mat)[0]  = nthird.x; // New x-axis
 	(*mat)[4]  = nthird.y;
-	(*mat)[8]  = nthird.y;
+	(*mat)[8]  = nthird.z;
 	(*mat)[12]  = -xyzDot(&nthird, eye);
 	(*mat)[1]  = nup.x; // New y-axis
 	(*mat)[5]  = nup.y;

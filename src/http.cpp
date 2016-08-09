@@ -9,11 +9,25 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <boost/asio.hpp>
+#include "curl/curl.h"
 
-using boost::asio::ip::tcp;
+/** Callback structure for resource accumulation */
+struct StringState {
+	Value th;	//!< Preserve the thread pointer
+	Value resource;	//!< The string holding the resource's contents
+};
 
-/** '()': Get contents for passed filename path string */
+/** Callback from perform that assembles the retrieved resource into a string */
+size_t http_write_callback(char *ptr, size_t size, size_t nmemb, void *udata) {
+	struct StringState *ss = (struct StringState*)udata;
+	if (ss->resource==aNull)
+		ss->resource = pushStringl(ss->th, aNull, ptr, size*nmemb);
+	else
+		strAppend(ss->th, ss->resource, ptr, size*nmemb);
+	return size*nmemb;
+}
+
+/** '()': Get contents for passed http:// url string */
 int http_get(Value th) {
 	// Get string value of filename path
 	Value fnval;
@@ -21,58 +35,25 @@ int http_get(Value th) {
 		pushValue(th, aNull);
 		return 1;
 	}
-	const char *fn = toStr(fnval);
-	if (0==strncmp(fn, "http://", 7))
-		fn+=7;
+	const char *url = toStr(fnval);
 
-    boost::asio::io_service io_service;
-    boost::system::error_code error;
+	// Set up the GET request
+	struct StringState udata = {th, aNull};
+ 	CURL *curl = curl_easy_init();
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *) &udata);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_write_callback);
+#ifdef _DEBUG
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+#endif
 
-	// Find host using boost
-	tcp::resolver resolver(io_service);
-    tcp::resolver::query query(tcp::v4(), "web3d.jondgoodwin.com", "80");
-    tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
-	tcp::resolver::iterator end;
-
-	tcp::socket socket(io_service);
-	error = boost::asio::error::host_not_found;
-	
-	// Connect socket to host
-	while (error && endpoint_iterator != end) {
-	   	socket.close();
-	   	socket.connect(*endpoint_iterator++, error);
-	}
-
-	if (error) {
-	    throw boost::system::system_error(error);
-	}
-
-	char request[] =
-		"GET /world.acn HTTP/1.0 \r\n"
-		"Host: web3d.jondgoodwin.com\r\n"
-		"\r\n";
-
-	// Make request
-	boost::system::error_code ignored_error;
-	boost::asio::write(socket, boost::asio::buffer(request), boost::asio::transfer_all(), ignored_error);
-
-    // Read content
-    std::string response = "";
-    boost::asio::streambuf response_buf;
-	std::stringstream response_stream;
-    while(boost::asio::read(socket, response_buf, boost::asio::transfer_at_least(1), error)) {
-      	response_stream << &response_buf;
-    }
-
-	response = response_stream.str();
-	//remove_response_headers(response);
-	response = response.substr(response.find("\r\n\r\n") + 4);
-
-	AuintIdx bufsize = response.length();
-
-	// Create the string buffer (which will be returned)
-	Value strbuf = pushStringl(th, aNull, response.c_str(), bufsize);
-
+	// Do GET request and get response in callback
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK)
+		vmLog("Failed to load %s. Curl error: %s", url, curl_easy_strerror(res));
+ 
+    curl_easy_cleanup(curl);
+	pushValue(th, udata.resource);
 	return 1;
 }
 

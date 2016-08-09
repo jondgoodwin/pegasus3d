@@ -59,6 +59,11 @@ int world_nextframe(Value th) {
 	return 1;
 }
 
+float camDist = 5.0f;
+float camAngle = 0.0f;
+float camDistVel = 0.0f;
+float camAngleVel = 0.0f;
+
 /** Default method for updating the world's state every tick.
     dt is first parameter (delta time since last update in seconds). */
 int world_update(Value th) {
@@ -73,7 +78,13 @@ int world_update(Value th) {
 	Value posv = pushProperty(th, getTop(th)-1, "position");
 	if (isXyz(posv)) {
 		Xyz *posxyz = (Xyz *)toStr(posv);
-		posxyz->y += dt;
+		// posxyz->y += dt;
+		if (camDist+camDistVel < 0.0)
+			camDistVel = 0.0f;
+		camDist+=camDistVel;
+		camAngle+=camAngleVel;
+		posxyz->x = camDist * sin(camAngle);
+		posxyz->z = camDist * cos(camAngle);
 	}
 	setTop(th, 1);
 	return 1;
@@ -99,6 +110,22 @@ int world_handleInput(Value th)
 		}
 
 		// Keyboard events
+		else if (event.type == SDL_KEYUP)
+		{
+			switch (event.key.keysym.sym)
+			{
+			case SDLK_UP:
+			case SDLK_DOWN:
+				camDistVel = 0;
+				break;
+			case SDLK_LEFT:
+			case SDLK_RIGHT:
+				camAngleVel = 0;
+				break;
+			}
+		}
+
+		// Keyboard events
 		if (event.type == SDL_KEYDOWN)
 		{
 			switch (event.key.keysym.sym)
@@ -119,6 +146,20 @@ int world_handleInput(Value th)
 				pushValue(th, isFalse(popValue(th))? aTrue : aFalse);
 				setCall(th, 2, 0);
 				} break;
+
+			case SDLK_UP:
+				camDistVel = -0.04f;
+				break;
+			case SDLK_DOWN:
+				camDistVel = 0.04f;
+				break;
+			case SDLK_LEFT:
+				camAngleVel = -0.04f;
+				break;
+			case SDLK_RIGHT:
+				camAngleVel = 0.04f;
+				break;
+
 			default:
 				break;
 			}
