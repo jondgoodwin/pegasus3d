@@ -105,41 +105,48 @@ int window_setfullscreen(Value th) {
 	return 1;
 }
 
-/** Render scene (2nd parm) from the point of view of camera (1st parm) */
+/** Render scene from the point of view of camera, context as first parameter */
 int window_render(Value th) {
-	if (getTop(th)<3)
-		return 1;
 
+	// Switch OpenGL to work within this window and clear the buffers
 	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
 	SDL_GL_MakeCurrent(di->sdlWindow, di->sdlContext);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS); // Closer objects obscure further objects
 
-	// Create render context
-	int contexti = getTop(th);
-	Value contextv = pushType(th, aNull, 16);
+	// The first parameter is the context
+	int contextidx = 1;
+	int i = getTop(th);
+	Value c = getLocal(th, contextidx);
+
+	// Initialize OpenGL rendering style
+	glUseProgram(0); // No shader
 
 	// Put viewHeight and viewWidth into context
 	SDL_Rect window_rect;
 	SDL_GetDisplayBounds(0, &window_rect);
 	pushValue(th, anInt(window_rect.h));
-	popProperty(th, contexti, "viewHeight");
+	popProperty(th, contextidx, "viewHeight");
 	pushValue(th, anInt(window_rect.w));
-	popProperty(th, contexti, "viewWidth");
+	popProperty(th, contextidx, "viewWidth");
 
-	// $.camera.render(context) - adds attributes to context
-	pushSym(th, "render");
-	pushValue(th, getLocal(th, 1)); // camera
-	pushValue(th, contextv);
+	// context.camera._Render(context) - adds attributes to context
+	pushSym(th, "_Render");
+	pushProperty(th, contextidx, "camera"); // camera
+	pushLocal(th, contextidx);
 	getCall(th, 2, 0);
 
-	// $.scene.render(context)
-	pushSym(th, "render");
-	pushValue(th, getLocal(th, 2)); // scene
-	pushValue(th, contextv);
+	// context.scene._Render(context)
+	pushSym(th, "_Render");
+	pushProperty(th, contextidx, "scene");
+	pushLocal(th, contextidx);
 	getCall(th, 2, 0);
 
-	// Swap buffers to window's finished image
+	// Swap buffers to display window's finished image
 	SDL_GL_SwapWindow(di->sdlWindow);
-	return 1;
+	return 0;
 }
 
 /** Initialize the Window type and '$window'*/
@@ -153,7 +160,7 @@ void window_init(Value th) {
 			pushClosure(th, 2);
 			popProperty(th, 1, "fullscreen");
 			pushCMethod(th, window_render);
-			popProperty(th, 1, "render");
+			popProperty(th, 1, "_Render");
 		popProperty(th, 0, "newtype");
 		pushCMethod(th, window_new);
 		popProperty(th, 0, "new");

@@ -40,60 +40,71 @@ int shape_new(Value th) {
 
 /** Render the shape */
 int shape_render(Value th) {
-	// Load the shader into the rendering pipeline */
-	pushSym(th, "render");
-	pushProperty(th, 0, "shader");
-	pushLocal(th, 1);
-	getCall(th, 2, 0);
+	int selfidx = 0;
+	int contextidx = 1;
 
-	// Draw the vertexes using the vertex attribute buffers
-	GLuint vao;
-	GLuint vbo[100];
-	int nverts = -1;
+	// Create new context that inherits from old
+	int newcontextidx = getTop(th);
+	pushSym(th, "new");
+	pushLocal(th, contextidx);
+	getCall(th, 1, 1);
 
-	// Get the list of attributes
-	Value vertattsym = pushSym(th, "vertexAttributes"); popValue(th);
-	Value vertattrlistv = getProperty(th, getLocal(th, 1), vertattsym);
-	int nattrs = getSize(vertattrlistv);
+	// Ask if we should render it? (and augment context)
+	pushProperty(th, selfidx, "render?"); // Assume it is method
+	pushLocal(th, newcontextidx); // make new context self to render? method
+	getCall(th, 1, 1);
+	Value torender = popValue(th);
+	if (torender!=aFalse) {
 
-	/* Set up Vertex Array Object */
-	glGenVertexArrays(1, &vao); /* Allocate */
-	glBindVertexArray(vao); /* Bind as currently used */
+		// Draw the vertexes using the vertex attribute buffers
+		GLuint vao;
+		GLuint vbo[100];
+		int nverts = -1;
 
-    /* Allocate and assign as many Vertex Buffer Objects to our handle as we have attributes */
-    glGenBuffers(nattrs, vbo);
+		// Get the list of attributes
+		Value vertattsym = pushSym(th, "vertexAttributes"); popValue(th);
+		Value vertattrlistv = getProperty(th, getLocal(th, newcontextidx), vertattsym);
+		int nattrs = getSize(vertattrlistv);
 
-	for (int i=0; i<nattrs; i++) {
-		Value buffer = tblGet(th, getLocal(th, 0), arrGet(th, vertattrlistv, i));
+		/* Set up Vertex Array Object */
+		glGenVertexArrays(1, &vao); /* Allocate */
+		glBindVertexArray(vao); /* Bind as currently used */
 
-		// Bind as active, copy, define and enable the OpenGL buffer
-		glBindBuffer(GL_ARRAY_BUFFER, vbo[i]);
-		glBufferData(GL_ARRAY_BUFFER, getSize(buffer), toStr(buffer), GL_STATIC_DRAW); /* Copy data */
-		if (nbrIsInteger(buffer)) {
-			switch (nbrGetValSz(buffer)) {
-			case 1: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_UNSIGNED_BYTE, GL_FALSE, 0, 0);
-			case 2: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_UNSIGNED_SHORT, GL_FALSE, 0, 0);
-			case 4: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_INT, GL_FALSE, 0, 0);
+		/* Allocate and assign as many Vertex Buffer Objects to our handle as we have attributes */
+		glGenBuffers(nattrs, vbo);
+
+		for (int i=0; i<nattrs; i++) {
+			Value buffer = tblGet(th, getLocal(th, selfidx), arrGet(th, vertattrlistv, i));
+
+			// Bind as active, copy, define and enable the OpenGL buffer
+			glBindBuffer(GL_ARRAY_BUFFER, vbo[i]);
+			glBufferData(GL_ARRAY_BUFFER, getSize(buffer), toStr(buffer), GL_STATIC_DRAW); /* Copy data */
+			if (nbrIsInteger(buffer)) {
+				switch (nbrGetValSz(buffer)) {
+				case 1: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_UNSIGNED_BYTE, GL_FALSE, 0, 0);
+				case 2: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_UNSIGNED_SHORT, GL_FALSE, 0, 0);
+				case 4: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_INT, GL_FALSE, 0, 0);
+				}
 			}
+			else
+				glVertexAttribPointer(i, nbrGetNVals(buffer), GL_FLOAT, GL_FALSE, 0, 0); 
+			glEnableVertexAttribArray(i);
+
+			// Remember the smallest number of vertices we found in the buffers
+			nverts = (nverts < 0 || nverts>nbrGetNStructs(buffer))? nbrGetNStructs(buffer) : nverts;
 		}
-		else
-			glVertexAttribPointer(i, nbrGetNVals(buffer), GL_FLOAT, GL_FALSE, 0, 0); 
-		glEnableVertexAttribArray(i);
 
-		// Remember the smallest number of vertices we found in the buffers
-		nverts = (nverts < 0 || nverts>nbrGetNStructs(buffer))? nbrGetNStructs(buffer) : nverts;
+		/* Draw specified primitives using vertices defined by buffers */
+		glDrawArrays(toAint(pushGetActProp(th, selfidx, "draw")), 0, nverts);
+		popValue(th);
+
+		/* Clean up alloc	ated array and buffers */
+		for (int i=0; i<nattrs; i++) {
+			glDisableVertexAttribArray(i);
+		}
+		glDeleteBuffers(nattrs, vbo);
+		glDeleteVertexArrays(1, &vao);
 	}
-
-	/* Draw specified primitives using vertices defined by buffers */
-    glDrawArrays(toAint(pushGetActProp(th, 0, "draw")), 0, nverts);
-	popValue(th);
-
-	/* Clean up allocated array and buffers */
-	for (int i=0; i<nattrs; i++) {
-		glDisableVertexAttribArray(i);
-	}
-    glDeleteBuffers(nattrs, vbo);
-    glDeleteVertexArrays(1, &vao);
 	return 1;
 }
 
@@ -122,7 +133,7 @@ void shape_init(Value th) {
 		pushCMethod(th, shape_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, shape_render);
-		popProperty(th, 0, "render");
+		popProperty(th, 0, "_Render");
 		pushTbl(th, aNull, 15);
 			pushValue(th, anInt(GL_POINTS));
 			popTblSet(th, 1, "Points");

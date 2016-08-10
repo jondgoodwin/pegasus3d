@@ -17,6 +17,7 @@ Value vm;
 void color_init(Value th);
 void xyz_init(Value th);
 void mat4_init(Value th);
+void render_init(Value th);
 void window_init(Value th);
 void world_init(Value th);
 void camera_init(Value th);
@@ -36,6 +37,7 @@ void initTypes(Value th) {
 	mat4_init(th);
 
 	// World types
+	render_init(th);
 	world_init(th);
 	window_init(th);
 	camera_init(th);
@@ -56,7 +58,7 @@ void initWorld(Value th) {
 
 	// $.scene = +Scene
 	pushSym(th, "new");
-	pushGloVar(th, "Scene");
+	pushGloVar(th, "Group");
 	getCall(th, 1, 1);
 	popProperty(th, curworld, "scene");
 
@@ -88,7 +90,7 @@ int main(int argc, char *argv[])
 	pushSym(th, "()");
 	pushGloVar(th, "Resource");
 #ifdef _DEBUG
-	pushString(th, aNull, argc>1? argv[1] : "file://./test.acn");
+	pushString(th, aNull, argc>1? argv[1] : "file://./world.acn");
 #else
 	pushString(th, aNull, argc>1? argv[1] : "http://ddd.jondgoodwin.com/world.acn");
 #endif

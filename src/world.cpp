@@ -53,7 +53,7 @@ int world_nextframe(Value th) {
 	getCall(th, 2, 0);
 
 	// $window.render (uses $.camera and $.scene)
-	pushSym(th, "render");
+	pushSym(th, "_Render");
 	pushValue(th, getLocal(th, 0));
 	getCall(th, 1, 0);
 	return 1;
@@ -170,30 +170,46 @@ int world_handleInput(Value th)
 
 /** Render the world's scene via .camera to .window */
 int world_render(Value th) {
-	// Render to the world's window, creating it if needed
-	pushSym(th, "render");
-	if (pushProperty(th, 0, "window")==aNull) {
+	int selfidx = 0;
+
+	// Set up a render of the world's window, creating it if needed
+	pushSym(th, "_Render");
+	if (pushProperty(th, selfidx, "window")==aNull) {
 		popValue(th);
 		pushSym(th, "new");
 		pushGloVar(th, "Window");
 		getCall(th, 1, 1);
 		pushValue(th, getFromTop(th, 0));
-		popProperty(th, 0, "window");
+		popProperty(th, selfidx, "window");
 	}
-	// Create camera also, if needed, using default view
-	if (pushProperty(th, 0, "camera")==aNull) {
+
+	// Create render context
+	int contextidx = getTop(th);
+	pushSym(th, "new");
+	pushGloVar(th, "RenderContext");
+	getCall(th, 1, 1);
+
+	// Store scene in the context
+	pushProperty(th, selfidx, "scene");
+	popProperty(th, contextidx, "scene");
+
+	// Store camera in the context, creating if needed using default view
+	if (pushProperty(th, selfidx, "camera")==aNull) {
+		popValue(th);
 		pushSym(th, "new");
 		pushGloVar(th, "Camera");
 		getCall(th, 1, 1);
 		pushValue(th, getFromTop(th, 0));
-		popProperty(th, 0, "camera");
+		popProperty(th, selfidx, "camera");
 	}
-	pushProperty(th, 0, "scene");
-	getCall(th, 3, 0);
-	return 1;
+	popProperty(th, contextidx, "camera");
+
+	// Render the window, passing context
+	getCall(th, 2, 0);
+	return 0;
 }
 
-/** Initialize the World type and '$'*/
+/** Initialize the World type */
 void world_init(Value th) {
 	pushType(th, aNull, 6);
 		pushCMethod(th, world_new);
@@ -210,6 +226,6 @@ void world_init(Value th) {
 		pushCMethod(th, world_update);
 		popProperty(th, 0, "updateState");
 		pushCMethod(th, world_render);
-		popProperty(th, 0, "render");
+		popProperty(th, 0, "_Render");
 	popGloVar(th, "World");
 }

@@ -66,7 +66,7 @@ int lookat_getmatrix(Value th) {
 /** Add camera's attributes to passed context (parm 1) */
 int camera_render(Value th) {
 	if (getTop(th)<2)
-		return 1; // Context must be passed
+		return 0; // Context must be passed
 
 	// Store "mvpmatrix" in context, calculated by multiplying
 	// the calculated projection and view matrices
@@ -83,7 +83,7 @@ int camera_render(Value th) {
 	Mat4 *mat = (Mat4*) toStr(pushProperty(th, 0, "mvpmatrix"));
 	mat4Mult(mat, pmat, vmat);
 	popProperty(th, 1, "mvpmatrix");
-	return 1;
+	return 0;
 }
 
 /** Initialize Camera type and create an instance in $.camera */
@@ -92,7 +92,7 @@ void camera_init(Value th) {
 		pushCMethod(th, camera_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, camera_render);
-		popProperty(th, 0, "render");
+		popProperty(th, 0, "_Render");
 	popGloVar(th, "Camera");
 
 	// Create a PerspectiveProjection mixin

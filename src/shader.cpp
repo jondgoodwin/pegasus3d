@@ -52,15 +52,16 @@ GLuint shader_compile(const char *shadersource, GLenum shadertype) {
 
 /** Compile and bind shaders into a shader program */
 Value shader_make(Value th, Value pgmv) {
+	int selfidx = 0;
 	GLuint vshader;
 	GLuint fshader;
     int IsLinked;
     int maxLength;
     char *shaderProgramInfoLog;
 
-	Value vertex = pushProperty(th, 0, "vertex"); popValue(th);
+	Value vertex = pushProperty(th, selfidx, "vertex"); popValue(th);
 	vshader = shader_compile(toStr(vertex), GL_VERTEX_SHADER);
-	Value fragment = pushProperty(th, 0, "fragment"); popValue(th);
+	Value fragment = pushProperty(th, selfidx, "fragment"); popValue(th);
 	fshader = shader_compile(toStr(fragment), GL_FRAGMENT_SHADER);
 	if (vshader==0 || fshader==0)
 		return aNull;
@@ -70,13 +71,14 @@ Value shader_make(Value th, Value pgmv) {
     glAttachShader(shaderprogram, vshader);
     glAttachShader(shaderprogram, fshader);
 
-    // Bind "attributes" in listed order.
-	Value inlist = pushProperty(th, 0, "attributes"); popValue(th);
+	// Bind "attributes" in listed order.
+	Value inlist = pushProperty(th, selfidx, "attributes");
 	if (isArr(inlist)) {
 		for (AuintIdx i=0; i < getSize(inlist); i++) {
 			glBindAttribLocation(shaderprogram, i, toStr(arrGet(th, inlist, i)));
 		}
 	}
+	popValue(th);
 
     // Link the program, then upload it to the GPU.
     glLinkProgram(shaderprogram);
@@ -118,53 +120,62 @@ int shader_new(Value th) {
 	return 1;
 }
 
-/** Render the shader */
+/** Render the shader, retrieving uniforms from context as parameter 1 */
 int shader_render(Value th) {
+	int selfidx = 0;
+	int contextidx = 1;
+
 	// Get compiled shader, if it exists
-	Value pgmv = pushProperty(th, 0, "_program");
+	Value pgmv = pushProperty(th, selfidx, "_program");
 	if (pgmv==aNull) {
 		// If it does not exist, compile and bind it based on info
-		Value pgmtype = pushProperty(th, 0, "_compiledtype");
+		Value pgmtype = pushProperty(th, selfidx, "_compiledtype");
 		pgmv = pushCData(th, pgmtype, 0, sizeof(ShaderPgm)); // Is small enough to stick in header
 		if (aNull != (pgmv = shader_make(th, pgmv)))
-			popProperty(th, 0, "_program");
+			popProperty(th, selfidx, "_program");
 		else
 			popValue(th);
 	}
 
-    /* Load the shader into the rendering pipeline */
+	/* Load the shader into the rendering pipeline */
 	if (pgmv != aNull) {
 		ShaderPgm *pgmdata = (ShaderPgm*) toHeader(pgmv);
 		glUseProgram(pgmdata->program);
 
 		// Load all the shader's named "uniform" values from the context
-		Value uniformlist = pushProperty(th, 0, "uniforms"); popValue(th);
+		Value uniformlist = pushProperty(th, selfidx, "uniforms"); popValue(th);
 		if (isArr(uniformlist)) {
 			for (AuintIdx i=0; i < getSize(uniformlist); i++) {
 				Value uninamev = arrGet(th, uniformlist, i);
-				Value unival = getProperty(th, getLocal(th, 1), uninamev);
-				if (nbrIsMatrix(unival)) {
-					switch (nbrGetNVals(unival)) {
-					case  4: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
-					case  9: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
-					case 16: glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
-					default: assert(false && "Unsupported uniform type!!!");
-					}
-				} else if (nbrIsInteger(unival)) {
-					switch (nbrGetNVals(unival)) {
-					case 1: glUniform1iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-					case 2: glUniform2iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-					case 3: glUniform3iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-					case 4: glUniform4iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-					default: assert(false && "Unsupported uniform type!!!");
-					}
-				} else {
-					switch (nbrGetNVals(unival)) {
-					case 1: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-					case 2: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-					case 3: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-					case 4: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-					default: assert(false && "Unsupported uniform type!!!");
+				Value unival = getProperty(th, getLocal(th, contextidx), uninamev);
+				if (isFloat(unival))
+					glUniform1f(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAfloat(unival));
+				else if (isInt(unival))
+					glUniform1i(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAint(unival));
+				else if (isStr(unival)) {
+					if (nbrIsMatrix(unival)) {
+						switch (nbrGetNVals(unival)) {
+						case  4: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
+						case  9: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
+						case 16: glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
+						default: assert(false && "Unsupported uniform type!!!");
+						}
+					} else if (nbrIsInteger(unival)) {
+						switch (nbrGetNVals(unival)) {
+						case 1: glUniform1iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+						case 2: glUniform2iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+						case 3: glUniform3iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+						case 4: glUniform4iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
+						default: assert(false && "Unsupported uniform type!!!");
+						}
+					} else {
+						switch (nbrGetNVals(unival)) {
+						case 1: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+						case 2: glUniform2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+						case 3: glUniform3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+						case 4: glUniform4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
+						default: assert(false && "Unsupported uniform type!!!");
+						}
 					}
 				}
 			}
@@ -172,10 +183,13 @@ int shader_render(Value th) {
 
 		// Put the shader's "attributes" list on the context
 		pushLocal(th, 1); popValue(th);
-		pushProperty(th, 0, "attributes");
-		popProperty(th, 1, "vertexAttributes");
+		pushProperty(th, selfidx, "attributes");
+		popProperty(th, contextidx, "vertexAttributes");
 	}
-	return 1;
+	else
+		glUseProgram(0);
+
+	return 0;
 }
 
 /** Initialize shader type */
@@ -184,7 +198,7 @@ void shader_init(Value th) {
 		pushCMethod(th, shader_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, shader_render);
-		popProperty(th, 0, "render");
+		popProperty(th, 0, "_Render");
 		Value pgmmmixin = pushMixin(th, aNull, aNull, 4);
 			pushCMethod(th, shader_closepgm);
 			popProperty(th, 1, "_finalizer");
