@@ -75,11 +75,15 @@ int camera_render(Value th) {
 	pushLocal(th, 1);
 	getCall(th, 2, 1);
 	Mat4 *pmat = (Mat4*) toStr(getFromTop(th, 0));
+
 	pushSym(th, "viewMatrix");
 	pushLocal(th, 0);
 	pushLocal(th, 1);
 	getCall(th, 2, 1);
 	Mat4 *vmat = (Mat4*) toStr(getFromTop(th, 0));
+	pushValue(th, getFromTop(th,0));
+	popProperty(th, 1, "mvmatrix");
+
 	Mat4 *mat = (Mat4*) toStr(pushProperty(th, 0, "mvpmatrix"));
 	mat4Mult(mat, pmat, vmat);
 	popProperty(th, 1, "mvpmatrix");

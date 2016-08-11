@@ -17,6 +17,7 @@ Value vm;
 void color_init(Value th);
 void xyz_init(Value th);
 void mat4_init(Value th);
+void integers_init(Value th);
 void render_init(Value th);
 void window_init(Value th);
 void world_init(Value th);
@@ -35,6 +36,7 @@ void initTypes(Value th) {
 	color_init(th);
 	xyz_init(th);
 	mat4_init(th);
+	integers_init(th);
 
 	// World types
 	render_init(th);

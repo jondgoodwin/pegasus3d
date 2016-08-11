@@ -5,6 +5,118 @@
  * See Copyright Notice in pegasus3d.h
 */
 #include "pegasus3d.h"
+#include <math.h>
+
+/** Generate a sphere shape, passing radius and nsegments */
+int shape_sphere(Value th) {
+	// Obtain and validate parameters
+	float radius = getTop(th)>=2 && isFloat(getLocal(th, 1))? toAfloat(getLocal(th,1)) : 1.0f;
+	int nsegments = getTop(th)>=3 && isInt(getLocal(th, 2))? toAint(getLocal(th,2)) : 15;
+	int nverts = nsegments * (nsegments-2) + 2;
+	int nindices = 6*nsegments*nsegments;
+	if (nsegments<=2 || nverts>=65536) {
+		pushValue(th, aNull);
+		return 1;
+	}
+
+	// Push a new Shape on the stack and give it buffer properties
+	int sphereidx = getTop(th);
+	pushSym(th, "new");
+	pushGloVar(th, "Shape");
+	getCall(th, 1, 1);
+	pushSym(th, "new");
+	pushGloVar(th, "Xyzs");
+	pushValue(th, anInt(nverts));
+	getCall(th, 2, 1);
+	Value posval = getFromTop(th, 0);
+	popProperty(th, sphereidx, "position");
+	pushSym(th, "new");
+	pushGloVar(th, "Xyzs");
+	pushValue(th, anInt(nverts));
+	getCall(th, 2, 1);
+	Value normval = getFromTop(th, 0);
+	popProperty(th, sphereidx, "normal");
+	pushSym(th, "new");
+	pushGloVar(th, "Integers");
+	pushValue(th, anInt(nindices));
+	getCall(th, 2, 1);
+	Value indxval = getFromTop(th, 0);
+	popProperty(th, sphereidx, "vertices");
+
+    // Top pole vertex
+	GLfloat zero = 0.f;
+	GLfloat one = 1.f;
+	strAppend(th, posval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, posval, (const char*)(&radius), sizeof(GLfloat));
+	strAppend(th, posval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, normval, (const char*)(&one), sizeof(GLfloat));
+	strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
+
+    // each vertex,  vertically and then around the circle
+	int v0, v1, v2, v3;
+	for (int i=1; i<nsegments; i++) {
+		GLfloat mang = (GLfloat)M_PI * ((GLfloat)i) / ((GLfloat)(nsegments));
+		for (int j=0; j<nsegments; j++) {
+			GLfloat nang = 2.0f * (GLfloat)M_PI * ((GLfloat)j) / ((GLfloat)nsegments); 
+			GLfloat x = -cos(nang)*sin(mang);
+			GLfloat y = cos(mang);
+			GLfloat z = sin(nang)*sin(mang);
+
+			strAppend(th, normval, (const char*)(&x), sizeof(GLfloat));
+			strAppend(th, normval, (const char*)(&y), sizeof(GLfloat));
+			strAppend(th, normval, (const char*)(&z), sizeof(GLfloat));
+			x *= radius;
+			y *= radius;
+			z *= radius;
+			strAppend(th, posval, (const char*)(&x), sizeof(GLfloat));
+			strAppend(th, posval, (const char*)(&y), sizeof(GLfloat));
+			strAppend(th, posval, (const char*)(&z), sizeof(GLfloat));
+
+			// Generate two triangles per segment
+			if (i==1) {
+				v0 = 0;
+				v1 = (j==nsegments-1)? 1 : j+2;
+				v2 = j+1;
+				strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v1), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
+			} else {
+				v0 = ((i-2)*nsegments)+j+1;
+				v1 = ((i-2)*nsegments)+((j==nsegments-1)? 1 : j+2);
+				v2 = ((i-1)*nsegments)+((j==nsegments-1)? 1 : j+2);
+				v3 = ((i-1)*nsegments)+j+1;
+				strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v3), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v1), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
+			}
+		}
+	}
+
+	// Bottom pole vertex
+	radius = -radius;
+	one = -one;
+	strAppend(th, posval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, posval, (const char*)(&radius), sizeof(GLfloat));
+	strAppend(th, posval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, normval, (const char*)(&one), sizeof(GLfloat));
+	strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
+
+	for (int j=0; j<nsegments; j++) {
+		v0 = ((nsegments-2)*nsegments)+j+1;
+		v1 = (j==nsegments-1)? ((nsegments-2)*nsegments)+1 : ((nsegments-2)*nsegments)+j+2;
+		v2 = ((nsegments-1)*nsegments)+1;
+		strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
+		strAppend(th, indxval, (const char*)(&v1), sizeof(unsigned short));
+		strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
+	}
+
+	return 1;
+}
 
 /** Get the draw property's closure value: OpenGL integer value */
 int shape_getDraw(Value th) {
@@ -59,20 +171,20 @@ int shape_render(Value th) {
 		// Draw the vertexes using the vertex attribute buffers
 		GLuint vao;
 		GLuint vbo[100];
-		int nverts = -1;
+		unsigned int nverts = -1;
 
-		// Get the list of attributes
+		// Get the list of vertex attributes
 		Value vertattsym = pushSym(th, "vertexAttributes"); popValue(th);
 		Value vertattrlistv = getProperty(th, getLocal(th, newcontextidx), vertattsym);
 		int nattrs = getSize(vertattrlistv);
 
-		/* Set up Vertex Array Object */
-		glGenVertexArrays(1, &vao); /* Allocate */
-		glBindVertexArray(vao); /* Bind as currently used */
+		// Set up Vertex Array Object
+		glGenVertexArrays(1, &vao);
+		glBindVertexArray(vao);
 
-		/* Allocate and assign as many Vertex Buffer Objects to our handle as we have attributes */
+		// Allocate and assign as many Vertex Buffer Objects to our handle as we have attributes
+		// then load and activate each one. 
 		glGenBuffers(nattrs, vbo);
-
 		for (int i=0; i<nattrs; i++) {
 			Value buffer = tblGet(th, getLocal(th, selfidx), arrGet(th, vertattrlistv, i));
 
@@ -94,9 +206,27 @@ int shape_render(Value th) {
 			nverts = (nverts < 0 || nverts>nbrGetNStructs(buffer))? nbrGetNStructs(buffer) : nverts;
 		}
 
-		/* Draw specified primitives using vertices defined by buffers */
-		glDrawArrays(toAint(pushGetActProp(th, selfidx, "draw")), 0, nverts);
+		// How shall we draw them?
+		Value drawprop = pushGetActProp(th, selfidx, "draw");
+		int drawmode = isInt(drawprop)? toAint(drawprop) : GL_TRIANGLES;
 		popValue(th);
+
+		/* Do we have a "vertices" property with vertex indices? Use it */
+		Value vertices = pushProperty(th, selfidx, "vertices");
+		if (isStr(vertices)) {
+			// Generate a buffer for the indices
+			GLuint elementbuffer;
+			glGenBuffers(1, &elementbuffer);
+			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, elementbuffer);
+			glBufferData(GL_ELEMENT_ARRAY_BUFFER, getSize(vertices), toStr(vertices), GL_STATIC_DRAW);
+
+			// Draw the vertices using the indices as a guide
+			glDrawElements(drawmode, nbrGetNStructs(vertices), GL_UNSIGNED_SHORT, (void*)0);
+		}
+		/* Otherwise, draw specified primitives using vertices defined by attribute buffers */
+		else
+			glDrawArrays(drawmode, 0, nverts);
+		popValue(th); // vertices
 
 		/* Clean up alloc	ated array and buffers */
 		for (int i=0; i<nattrs; i++) {
@@ -134,6 +264,8 @@ void shape_init(Value th) {
 		popProperty(th, 0, "new");
 		pushCMethod(th, shape_render);
 		popProperty(th, 0, "_Render");
+		pushCMethod(th, shape_sphere);
+		popProperty(th, 0, "NewSphere");
 		pushTbl(th, aNull, 15);
 			pushValue(th, anInt(GL_POINTS));
 			popTblSet(th, 1, "Points");

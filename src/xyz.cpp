@@ -144,7 +144,8 @@ int xyzs_new(Value th) {
 			if (*scanp++==',') 
 				nStructs++;
 		}
-		nStructs++; 
+		nStructs++;
+		nStructs /= 3;
 	}
 
 	// Create the number array
@@ -155,7 +156,7 @@ int xyzs_new(Value th) {
 		const char *scanp = toStr(parm1);
 		while (*scanp) {
 			if ((*scanp>='0' && *scanp<='9')||*scanp=='-') {
-				float afloat = atof(scanp);
+				GLfloat afloat = (GLfloat) atof(scanp);
 				strAppend(th, bufv, (const char*)(&afloat), sizeof(GLfloat));
 				while ((*scanp>='0' && *scanp<='9') || *scanp=='.' || *scanp=='e' || *scanp=='E' || *scanp=='-')
 					scanp++;
