@@ -72,7 +72,7 @@ void test_init(Value th) {
 			pushGloVar(th, "Xyzs");
 			pushString(th, aNull, diamondptstr);
 			getCall(th, 2, 1);
-			popProperty(th, shape, "position");
+			popProperty(th, shape, "location");
 
 			pushSym(th, "new");
 			pushGloVar(th, "Colors");
@@ -96,7 +96,7 @@ void test_init(Value th) {
 				popProperty(th, shader, "uniforms");
 				pushSym(th, "new");
 				pushGloVar(th, "List");
-				pushSym(th, "position");
+				pushSym(th, "location");
 				pushSym(th, "color");
 				getCall(th, 3, 1);
 				popProperty(th, shader, "attributes");

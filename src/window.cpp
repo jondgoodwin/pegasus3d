@@ -133,7 +133,7 @@ int window_render(Value th) {
 	popProperty(th, contextidx, "viewWidth");
 
 	// context.camera._Render(context) - adds attributes to context
-	pushSym(th, "_Render");
+	pushSym(th, "_RenderIt");
 	pushProperty(th, contextidx, "camera"); // camera
 	pushLocal(th, contextidx);
 	getCall(th, 2, 0);

@@ -10,6 +10,11 @@
 #include <stdio.h>
 #include "xyzmath.h"
 
+/** Copy numbers from mat to to mat */
+void mat4Set(Mat4 *tomat, Mat4 *frommat) {
+	memcpy((void*)tomat, (void*)frommat, 16*sizeof(float));
+}
+
 /** Translation matrix */
 void mat4Pos(Mat4 *mat, GLfloat x, GLfloat y, GLfloat z) {
 	mat4Identity(mat);
@@ -104,6 +109,85 @@ void mat4Lookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up) {
 	(*mat)[7] = 0.0;
 	(*mat)[11] = 0.0;
 	(*mat)[15] = 1.0;
+}
+
+/** Calculate a rotation view matrix using euler angles.
+	Equivalent to Translate*Rotz*Roty*Rotz*Scale */
+void mat4Rotate(Mat4 *mat, Xyz *pos, Xyz *rot, Xyz *scale) {
+	(*mat)[ 0] = scale->x * cos(rot->y)*cos(rot->z);
+	(*mat)[ 1] = scale->x * cos(rot->y)*sin(rot->z);
+	(*mat)[ 2] = scale->x * sin(rot->y);
+	(*mat)[ 3] = 0.0f;
+	(*mat)[ 4] = scale->y * (-cos(rot->x)*sin(rot->z) - sin(rot->x)*sin(rot->y)*cos(rot->z));
+	(*mat)[ 5] = scale->y * (cos(rot->x)*cos(rot->z) - sin(rot->x)*sin(rot->y)*sin(rot->z));
+	(*mat)[ 6] = scale->y * sin(rot->x)*cos(rot->y);
+	(*mat)[ 7] = 0.0f;
+	(*mat)[ 8] = scale->z * (sin(rot->x)*sin(rot->z) - cos(rot->x)*sin(rot->y)*cos(rot->z));
+	(*mat)[ 9] = scale->z * (-sin(rot->x)*cos(rot->z) - cos(rot->x)*sin(rot->y)*sin(rot->z));
+	(*mat)[10] = scale->z * cos(rot->x)*cos(rot->y);
+	(*mat)[11] = 0.0f;
+	(*mat)[12] = pos->x;
+	(*mat)[13] = pos->y;
+	(*mat)[14] = pos->z;
+	(*mat)[15] = 1.0f;
+}
+
+/** Invert a matrix, for use in calculating camera's matrix.
+	Note: this is a simplified solution which assumes bottom row is always 0,0,0,1*/
+void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
+	float det = (*fmat)[0]*(*fmat)[5]*(*fmat)[10] 
+		+ (*fmat)[4]*(*fmat)[9]*(*fmat)[2] 
+		+ (*fmat)[4]*(*fmat)[1]*(*fmat)[6] 
+		- (*fmat)[0]*(*fmat)[9]*(*fmat)[6] 
+		- (*fmat)[4]*(*fmat)[5]*(*fmat)[10] 
+		- (*fmat)[8]*(*fmat)[5]*(*fmat)[2];
+
+	(*tmat)[0]  = ((*fmat)[ 5]*(*fmat)[10] - (*fmat)[ 9]*(*fmat)[ 6])/det;
+	(*tmat)[4]  = ((*fmat)[ 8]*(*fmat)[ 6] - (*fmat)[ 4]*(*fmat)[10])/det;
+	(*tmat)[8]  = ((*fmat)[ 4]*(*fmat)[ 9] - (*fmat)[ 4]*(*fmat)[ 5])/det;
+	(*tmat)[1]  = ((*fmat)[ 9]*(*fmat)[ 2] - (*fmat)[ 1]*(*fmat)[10])/det;
+	(*tmat)[5]  = ((*fmat)[ 0]*(*fmat)[10] - (*fmat)[ 8]*(*fmat)[ 2])/det;
+	(*tmat)[9]  = ((*fmat)[ 8]*(*fmat)[ 1] - (*fmat)[ 0]*(*fmat)[ 9])/det;
+	(*tmat)[2]  = ((*fmat)[ 1]*(*fmat)[ 6] - (*fmat)[ 5]*(*fmat)[ 2])/det;
+	(*tmat)[6]  = ((*fmat)[ 4]*(*fmat)[ 2] - (*fmat)[ 0]*(*fmat)[ 6])/det;
+	(*tmat)[10] = ((*fmat)[ 0]*(*fmat)[ 5] - (*fmat)[ 4]*(*fmat)[ 1])/det;
+
+	(*tmat)[12] = ((*fmat)[4]*(*fmat)[13]*(*fmat)[10] 
+		+ (*fmat)[8]*(*fmat)[5]*(*fmat)[14] 
+		+ (*fmat)[12]*(*fmat)[9]*(*fmat)[6] 
+		- (*fmat)[4]*(*fmat)[9]*(*fmat)[14] 
+		- (*fmat)[8]*(*fmat)[13]*(*fmat)[6] 
+		- (*fmat)[12]*(*fmat)[5]*(*fmat)[10])/det;
+	(*tmat)[13] = ((*fmat)[0]*(*fmat)[9]*(*fmat)[14] 
+		+ (*fmat)[8]*(*fmat)[9]*(*fmat)[2] 
+		+ (*fmat)[12]*(*fmat)[1]*(*fmat)[12] 
+		- (*fmat)[0]*(*fmat)[13]*(*fmat)[10] 
+		- (*fmat)[8]*(*fmat)[1]*(*fmat)[14] 
+		- (*fmat)[12]*(*fmat)[9]*(*fmat)[2])/det;
+	(*tmat)[14] = ((*fmat)[0]*(*fmat)[13]*(*fmat)[6] 
+		+ (*fmat)[4]*(*fmat)[1]*(*fmat)[14] 
+		+ (*fmat)[12]*(*fmat)[5]*(*fmat)[2] 
+		- (*fmat)[0]*(*fmat)[5]*(*fmat)[14] 
+		- (*fmat)[4]*(*fmat)[13]*(*fmat)[2] 
+		- (*fmat)[12]*(*fmat)[1]*(*fmat)[6])/det;
+/*
+b11 = a22a33 - a23a32
+b12 = a13a32 - a12a33
+b13 = a12a23 - a12a22
+b14 = a12a24a33 + a13a22a34 + a14a23a32 - a12a23a34 - a13a24a32 - a14a22a33
+b21 = a23a31 - a21a33
+b22 = a11a33 - a13a31
+b23 = a13a21 - a11a23
+b24 = a11a23a34 + a13a23a31 + a14a21a33 - a11a24a33 - a13a21a34 - a14a23a31
+b31 = a21a32 - a22a31
+b32 = a12a31 - a11a32
+b33 = a11a22 - a12a21
+b34 = a11a24a32 + a12a21a34 + a14a22a31 - a11a22a34 - a12a24a31 - a14a21a32
+*/
+	(*tmat)[3] = 0.0f;
+	(*tmat)[7] = 0.0f;
+	(*tmat)[11] = 0.0f;
+	(*tmat)[15] = 1.0f;
 }
 
 /** Print out a matrix, for diagnostics */

@@ -22,7 +22,7 @@ void render_init(Value th);
 void window_init(Value th);
 void world_init(Value th);
 void camera_init(Value th);
-void scene_init(Value th);
+void group_init(Value th);
 void shape_init(Value th);
 void shader_init(Value th);
 
@@ -43,7 +43,7 @@ void initTypes(Value th) {
 	world_init(th);
 	window_init(th);
 	camera_init(th);
-	scene_init(th);
+	group_init(th);
 	shape_init(th);
 	shader_init(th);
 

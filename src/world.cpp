@@ -75,7 +75,7 @@ int world_update(Value th) {
 	// Move the camera slowly up
 	pushGloVar(th, "$");
 	pushProperty(th, getTop(th)-1, "camera");
-	Value posv = pushProperty(th, getTop(th)-1, "position");
+	Value posv = pushProperty(th, getTop(th)-1, "location");
 	if (isXyz(posv)) {
 		Xyz *posxyz = (Xyz *)toStr(posv);
 		// posxyz->y += dt;

@@ -68,12 +68,15 @@ typedef GLfloat Mat4[16];
 	(*matrix)[12] = (*matrix)[13] = (*matrix)[14] = (GLfloat)0.0; \
 	(*matrix)[0] = (*matrix)[5] = (*matrix)[10] = (*matrix)[15] = (GLfloat) 1.0;
 
+void mat4Set(Mat4 *tomat, Mat4 *frommat);
 void mat4Pos(Mat4 *mat, GLfloat x, GLfloat y, GLfloat z);
 void mat4Mult(Mat4 *md, Mat4 *m1, Mat4 *m2);
 void mat4Perspective(Mat4 *mat, GLfloat fov, GLfloat near, GLfloat far, GLfloat aspratio);
 void mat4HeightPerspective(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat aspratio);
 void mat4Ortho(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat aspratio);
 void mat4Lookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up);
+void mat4Rotate(Mat4 *mat, Xyz *pos, Xyz *rot, Xyz *scale);
+void mat4Inverse(Mat4 *tmat, Mat4 *fmat);
 void mat4Print(Mat4 *mat, const char *matnm);
 
 #endif

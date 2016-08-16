@@ -180,11 +180,6 @@ int shader_render(Value th) {
 				}
 			}
 		}
-
-		// Put the shader's "attributes" list on the context
-		pushLocal(th, 1); popValue(th);
-		pushProperty(th, selfidx, "attributes");
-		popProperty(th, contextidx, "vertexAttributes");
 	}
 	else
 		glUseProgram(0);

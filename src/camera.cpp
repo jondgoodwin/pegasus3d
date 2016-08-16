@@ -9,84 +9,101 @@
 #include "pegasus3d.h"
 #include "xyzmath.h"
 
-/** Create a new camera, based on the View and Matrix mixins */
+/** Create a new camera */
 int camera_new(Value th) {
-	// Ensure parameters have at least the default mixins
-	if (getTop(th)<2)
-		pushGloVar(th, "LookatView");
-	if (getTop(th)<3)
-		pushGloVar(th, "PerspectiveProjection");
+	pushType(th, getLocal(th, 0), 16); // Create camera as subtype of Camera
+	return 1;
+}
 
-	int newcamidx = getTop(th);
-	Value newcam = pushType(th, getLocal(th, 0), 16); // Create camera as subtype of Camera
+/** Calculate new perspective projection matrix using self/context properties and store in mvpmatrix.
+	Put identity matrix in mvmatrix */
+int camera_perspective(Value th) {
+	int selfidx = 0;
+	int contextidx = 1;
+	// Retrieve needed properties for calculating perspective matrix
+	Value fovv = pushProperty(th, selfidx, "fov");
+	Value mindistv = pushProperty(th, selfidx, "near");
+	Value maxdistv = pushProperty(th, selfidx, "far");
+	GLfloat fovht = isFloat(fovv)? toAfloat(fovv) : 50.0f;
+	GLfloat mindist = isFloat(mindistv)? toAfloat(mindistv) : 0.1f;
+	GLfloat maxdist = isFloat(maxdistv)? toAfloat(maxdistv) : 1000.0f;
 
-	// Add view and perspective mixins from parameters
-	addMixin(th, newcam, getLocal(th, 1));
-	addMixin(th, newcam, getLocal(th, 2));
+	// Calculate window aspect ratio using context's view size properties 
+	GLfloat aspratio = ((GLfloat)toAint(pushProperty(th, contextidx, "viewWidth")))/((GLfloat)toAint(pushProperty(th, contextidx, "viewHeight")));
 
-	// Create mvpmatrix property to hold the calculated view/projection matrix
+	// Create calculated perspective matrix and store as mvpmatrix
 	pushSym(th, "new");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	popProperty(th, newcamidx, "mvpmatrix");
+	Mat4 *mat = (Mat4*) toStr(getFromTop(th, 0));
+	mat4Perspective(mat, fovht, mindist, maxdist, aspratio);
+	popProperty(th, contextidx, "mvpmatrix");
+
+	// Create identity matrix and store as mvmatrix
+	pushSym(th, "new");
+	pushGloVar(th, "Matrix4");
+	getCall(th, 1, 1);
+	popProperty(th, contextidx, "mvmatrix");
+	popValue(th);
 	return 1;
 }
 
-/** Return perspective matrix calculated from fov, near and far variables
-    and viewheight, viewwidth from passed context */
-int persp_getmatrix(Value th) {
-	// Get the variables
-	GLfloat aspratio = (getTop(th)>1)? ((GLfloat)toAint(pushProperty(th, 1, "viewWidth")))/((GLfloat)toAint(pushProperty(th, 1, "viewHeight"))) : 1.0f;
-	bool perspflag = !isFalse(pushProperty(th, 0, "perspective?"));
-	GLfloat fovht = toAfloat(pushProperty(th, 0, perspflag? "fov" : "viewHeight"));
-	GLfloat mindist = toAfloat(pushProperty(th, 0, "near"));
-	GLfloat maxdist = toAfloat(pushProperty(th, 0, "far"));
+/** Calculate orthogonal projection matrix using context properties and store in mvpmatrix.
+	Put identity matrix in mvmatrix */
+int camera_orthogonal(Value th) {
+	int selfidx = 0;
+	int contextidx = 1;
 
-	// Calculate perspective matrix within closure variable and return it
-	Mat4 *mat = (Mat4*) toStr(pushCloVar(th, 2));
-	if (perspflag)
-		mat4Perspective(mat, fovht, mindist, maxdist, aspratio);
-	else
-		mat4Ortho(mat, fovht, mindist, maxdist, aspratio);
-	return 1;
-}
+	// Retrieve needed properties for calculating orthogonal matrix
+	Value fovv = pushProperty(th, selfidx, "viewHeight");
+	Value mindistv = pushProperty(th, selfidx, "near");
+	Value maxdistv = pushProperty(th, selfidx, "far");
+	GLfloat fovht = isFloat(fovv)? toAfloat(fovv) : 10.0f;
+	GLfloat mindist = isFloat(mindistv)? toAfloat(mindistv) : 0.1f;
+	GLfloat maxdist = isFloat(maxdistv)? toAfloat(maxdistv) : 1000.0f;
 
-/** Return view matrix calculated from position, lookat and up Xyz values */
-int lookat_getmatrix(Value th) {
-	// Get the variables
-	Xyz *position = (Xyz*) toStr(pushProperty(th, 0, "position"));
-	Xyz *lookat = (Xyz*) toStr(pushProperty(th, 0, "lookat"));
-	Xyz *up = (Xyz*) toStr(pushProperty(th, 0, "up"));
+	// Calculate window aspect ratio using context's view size properties 
+	GLfloat aspratio = ((GLfloat)toAint(pushProperty(th, contextidx, "viewWidth")))/((GLfloat)toAint(pushProperty(th, contextidx, "viewHeight")));
 
-	// Calculate view matrix within closure variable and return it
-	mat4Lookat((Mat4*) toStr(pushCloVar(th, 2)), position, lookat, up);
+	// Create calculated orthogonal matrix and store as mvpmatrix
+	pushSym(th, "new");
+	pushGloVar(th, "Matrix4");
+	getCall(th, 1, 1);
+	Mat4 *mat = (Mat4*) toStr(getFromTop(th, 0));
+	mat4Ortho(mat, fovht, mindist, maxdist, aspratio);
+	popProperty(th, contextidx, "mvpmatrix");
+
+	// Create identity matrix and store as mvmatrix
+	pushSym(th, "new");
+	pushGloVar(th, "Mattrix4");
+	getCall(th, 1, 1);
+	popProperty(th, contextidx, "mvmatrix");
 	return 1;
 }
 
 /** Add camera's attributes to passed context (parm 1) */
 int camera_render(Value th) {
+	int camidx = 0;
+	int contextidx = 1;
 	if (getTop(th)<2)
 		return 0; // Context must be passed
 
-	// Store "mvpmatrix" in context, calculated by multiplying
-	// the calculated projection and view matrices
-	pushSym(th, "projMatrix");
-	pushLocal(th, 0);
-	pushLocal(th, 1);
-	getCall(th, 2, 1);
-	Mat4 *pmat = (Mat4*) toStr(getFromTop(th, 0));
+	// Calculate designated projection matrix into context
+	Value projmeth = getProperty(th, getLocal(th, camidx), "projection");
+	if (projmeth!=aNull) pushValue(th, projmeth);
+	else pushSym(th, "Perspective");
+	pushLocal(th, camidx);
+	pushLocal(th, contextidx);
+	getCall(th, 2, 0);
 
-	pushSym(th, "viewMatrix");
-	pushLocal(th, 0);
-	pushLocal(th, 1);
-	getCall(th, 2, 1);
-	Mat4 *vmat = (Mat4*) toStr(getFromTop(th, 0));
-	pushValue(th, getFromTop(th,0));
-	popProperty(th, 1, "mvmatrix");
+	// Adjust context matrices with calculated view matrix
+	Value viewmeth = getProperty(th, getLocal(th, camidx), "view");
+	if (viewmeth!=aNull) pushValue(th, viewmeth);
+	else pushSym(th, "Lookat");
+	pushLocal(th, contextidx);
+	pushLocal(th, camidx);
+	getCall(th, 2, 0);
 
-	Mat4 *mat = (Mat4*) toStr(pushProperty(th, 0, "mvpmatrix"));
-	mat4Mult(mat, pmat, vmat);
-	popProperty(th, 1, "mvpmatrix");
 	return 0;
 }
 
@@ -96,11 +113,14 @@ void camera_init(Value th) {
 		pushCMethod(th, camera_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, camera_render);
-		popProperty(th, 0, "_Render");
-	popGloVar(th, "Camera");
+		popProperty(th, 0, "_RenderIt");
 
-	// Create a PerspectiveProjection mixin
-	pushMixin(th, aNull, aNull, 5);
+		pushCMethod(th, camera_perspective);
+		popProperty(th, 0, "Perspective");
+		pushCMethod(th, camera_orthogonal);
+		popProperty(th, 0, "Orthogonal");
+		pushSym(th, "Perspective");
+		popProperty(th, 0, "projection");
 		pushValue(th, aFloat(50.0)); // fov
 		popProperty(th, 0, "fov");
 		pushValue(th, aFloat(10.0));  // Orthogonal view height
@@ -109,26 +129,16 @@ void camera_init(Value th) {
 		popProperty(th, 0, "near");
 		pushValue(th, aFloat(1000.0)); // maximum distance
 		popProperty(th, 0, "far");
-		pushValue(th, aTrue);
-		popProperty(th, 0, "perspective?");
-		pushCMethod(th, persp_getmatrix);
-		pushValue(th, aNull);
-		pushSym(th, "new");
-		pushGloVar(th, "Matrix4");
-		getCall(th, 1, 1);
-		pushClosure(th, 3);
-		popProperty(th, 0, "projMatrix");
-	popGloVar(th, "PerspectiveProjection");
 
-	// Create a lookat mixin
-	pushMixin(th, aNull, aNull, 5);
+		pushSym(th, "Lookat");
+		popProperty(th, 0, "view");
 		pushSym(th, "new");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(3.0f));
+		pushValue(th, aFloat(5.0f));
 		getCall(th, 4, 1);
-		popProperty(th, 0, "position");
+		popProperty(th, 0, "location");
 		pushSym(th, "new");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
@@ -143,12 +153,6 @@ void camera_init(Value th) {
 		pushValue(th, aFloat(0.0f));
 		getCall(th, 4, 1);
 		popProperty(th, 0, "up");
-		pushCMethod(th, lookat_getmatrix);
-		pushValue(th, aNull);
-		pushSym(th, "new");
-		pushGloVar(th, "Matrix4");
-		getCall(th, 1, 1);
-		pushClosure(th, 3);
-		popProperty(th, 0, "viewMatrix");
-	popGloVar(th, "LookatView");
+	popGloVar(th, "Camera");
+
 }

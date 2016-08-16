@@ -46,4 +46,7 @@ using namespace avm;
 // SDL2 Headers
 #include <SDL.h>
 
+/* Generic logic for rendering placed things */
+int shared_render(Value th);
+
 #endif
