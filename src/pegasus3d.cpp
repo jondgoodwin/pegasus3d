@@ -21,6 +21,7 @@ void integers_init(Value th);
 void render_init(Value th);
 void window_init(Value th);
 void world_init(Value th);
+void region_init(Value th);
 void camera_init(Value th);
 void group_init(Value th);
 void shape_init(Value th);
@@ -41,6 +42,7 @@ void initTypes(Value th) {
 	// World types
 	render_init(th);
 	world_init(th);
+	region_init(th);
 	window_init(th);
 	camera_init(th);
 	group_init(th);

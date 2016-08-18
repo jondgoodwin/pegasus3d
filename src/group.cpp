@@ -35,11 +35,13 @@ int group_renderit(Value th) {
 
 /** Initialize Group type */
 void group_init(Value th) {
-	pushType(th, aNull, 16);
+	// Group is a new Region
+	pushSym(th, "new");
+	pushGloVar(th, "Region");
+	getCall(th, 1, 1);
+	Value Group = getFromTop(th, 0);
 		pushCMethod(th, group_new);
 		popProperty(th, 0, "new");
-		pushCMethod(th, shared_render);
-		popProperty(th, 0, "_Render");
 		pushCMethod(th, group_renderit);
 		popProperty(th, 0, "_RenderIt");
 	popGloVar(th, "Group");

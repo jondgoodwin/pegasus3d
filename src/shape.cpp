@@ -126,7 +126,7 @@ int shape_getDraw(Value th) {
 
 /** Set the draw property's closure value using symbols */
 int shape_setDraw(Value th) {
-	Value primtbl = pushProperty(th, 0, "DrawPrimitives");
+	Value primtbl = pushProperty(th, 0, "_$drawPrimitives");
 	Value drawprim = pushValue(th, tblGet(th, primtbl, getLocal(th, 1)));
 	if (drawprim == aNull) {
 		pushValue(th, anInt(GL_TRIANGLES));
@@ -172,6 +172,12 @@ int shape_renderit(Value th) {
 	popValue(th); // symbol
 	int nattrs = getSize(vertattrlistv);
 
+	// Figure out who to get attributes from
+	Value attrsource = pushProperty(th, selfidx, "shape");
+	if (attrsource == aNull)
+		attrsource = getLocal(th, selfidx);
+	popValue(th);
+
 	// Set up Vertex Array Object
 	glGenVertexArrays(1, &vao);
 	glBindVertexArray(vao);
@@ -180,7 +186,7 @@ int shape_renderit(Value th) {
 	// then load and activate each one. 
 	glGenBuffers(nattrs, vbo);
 	for (int i=0; i<nattrs; i++) {
-		Value buffer = tblGet(th, getLocal(th, selfidx), arrGet(th, vertattrlistv, i));
+		Value buffer = getProperty(th, attrsource, arrGet(th, vertattrlistv, i));
 
 		// Bind as active, copy, define and enable the OpenGL buffer
 		glBindBuffer(GL_ARRAY_BUFFER, vbo[i]);
@@ -206,7 +212,9 @@ int shape_renderit(Value th) {
 	popValue(th);
 
 	/* Do we have a "indices" property with vertex indices? Use it */
-	Value vertices = pushProperty(th, selfidx, "indices");
+	Value indicesym = pushSym(th, "indices");
+	Value vertices = getProperty(th, attrsource, indicesym);
+	popValue(th);
 	if (isStr(vertices)) {
 		// Generate a buffer for the indices
 		GLuint elementbuffer;
@@ -231,32 +239,15 @@ int shape_renderit(Value th) {
 	return 1;
 }
 
-/* What to do for indexed vertices ...
-	unsigned short indices;
-	// Load indices
-
-	// Generate a buffer for the indices
-	GLuint elementbuffer;
-	glGenBuffers(1, &elementbuffer);
-	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, elementbuffer);
-	glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned short), &indices[0], GL_STATIC_DRAW);
-
-	// Draw the triangles
-	glDrawElements(
-		GL_TRIANGLES,      // mode
-		indices.size(),    // count
-		GL_UNSIGNED_SHORT,   // type
-		(void*)0           // element array buffer offset
-	);
- */
-
 /** Initialize shape type */
 void shape_init(Value th) {
-	Value Shape = pushType(th, aNull, 8);
+	// Shape is a new Region
+	pushSym(th, "new");
+	pushGloVar(th, "Region");
+	getCall(th, 1, 1);
+	Value Shape = getFromTop(th, 0);
 		pushCMethod(th, shape_new);
 		popProperty(th, 0, "new");
-		pushCMethod(th, shared_render);
-		popProperty(th, 0, "_Render");
 		pushCMethod(th, shape_renderit);
 		popProperty(th, 0, "_RenderIt");
 		pushCMethod(th, shape_sphere);
@@ -288,6 +279,6 @@ void shape_init(Value th) {
 			popTblSet(th, 1, "Patches");
 			pushValue(th, anInt(GL_POLYGON));
 			popTblSet(th, 1, "Polygon");
-		popProperty(th, 0, "DrawPrimitives");
+		popProperty(th, 0, "_$drawPrimitives");
 	popGloVar(th, "Shape");
 }

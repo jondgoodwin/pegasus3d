@@ -46,6 +46,13 @@ void mat4Mult(Mat4 *md, Mat4 *m1, Mat4 *m2) {
 	(*md)[15] = (*m1)[3]*(*m2)[12] + (*m1)[7]*(*m2)[13] + (*m1)[11]*(*m2)[14] + (*m1)[15]*(*m2)[15];
 }
 
+/** Multiple a matrix by a vector (whose w is presumed to be 1) */
+void mat4MultVec(Xyz *newxyz, Mat4 *mat, Xyz *xyz) {
+	newxyz->x = (*mat)[0]*xyz->x + (*mat)[4]*xyz->y + (*mat)[8]*xyz->z + (*mat)[12];
+	newxyz->y = (*mat)[1]*xyz->x + (*mat)[5]*xyz->y + (*mat)[9]*xyz->z + (*mat)[13];
+	newxyz->z = (*mat)[2]*xyz->x + (*mat)[6]*xyz->y + (*mat)[10]*xyz->z + (*mat)[14];
+}
+
 /** Perspective Frustum matrix */
 void mat4Perspective(Mat4 *mat, GLfloat fov, GLfloat near, GLfloat far, GLfloat aspratio) {
 	GLfloat tanhalffov = tanf(fov * (GLfloat)M_PI / (GLfloat)360.0);
@@ -81,7 +88,41 @@ void mat4Ortho(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat asp
 	(*mat)[14] = (far+near)/(near-far);
 }
 
-void mat4Lookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up) {
+/** Create lookat matrix using location, center of what we look at, and the up direction.
+	This one translates from local/eye to parent/world coordinates */
+void mat4Lookat(Mat4 *mat, Xyz *loc, Xyz *at, Xyz *up) {
+	Xyz disp, ndisp, third, nthird, nup;
+
+	disp.x=at->x-loc->x;
+	disp.y=at->y-loc->y;
+	disp.z=at->z-loc->z;
+	xyzNorm(&ndisp, &disp);
+	
+	xyzCross(&third, &ndisp, up);
+	xyzNorm(&nthird, &third);
+	xyzCross(&nup, &nthird, &ndisp);
+
+	(*mat)[0]  = nthird.x; // New x-axis
+	(*mat)[1]  = nthird.y;
+	(*mat)[2]  = nthird.z;
+	(*mat)[12]  = loc->x;
+	(*mat)[4]  = nup.x; // New y-axis
+	(*mat)[5]  = nup.y;
+	(*mat)[6]  = nup.z;
+	(*mat)[13]  = loc->y;
+	(*mat)[8]  = -ndisp.x; // New x-axis
+	(*mat)[9]  = -ndisp.y;
+	(*mat)[10] = -ndisp.z;
+	(*mat)[14] = loc->z;
+	(*mat)[3] = 0.0;
+	(*mat)[7] = 0.0;
+	(*mat)[11] = 0.0;
+	(*mat)[15] = 1.0;
+}
+
+/** Create lookat matrix using eye, center of what we look at, and the up direction.
+	This one (used by cameras) translates from world to eye/camera coordinates */
+void mat4InverseLookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up) {
 	Xyz disp, ndisp, third, nthird, nup;
 
 	disp.x=center->x-eye->x;
@@ -170,20 +211,7 @@ void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
 		- (*fmat)[0]*(*fmat)[5]*(*fmat)[14] 
 		- (*fmat)[4]*(*fmat)[13]*(*fmat)[2] 
 		- (*fmat)[12]*(*fmat)[1]*(*fmat)[6])/det;
-/*
-b11 = a22a33 - a23a32
-b12 = a13a32 - a12a33
-b13 = a12a23 - a12a22
-b14 = a12a24a33 + a13a22a34 + a14a23a32 - a12a23a34 - a13a24a32 - a14a22a33
-b21 = a23a31 - a21a33
-b22 = a11a33 - a13a31
-b23 = a13a21 - a11a23
-b24 = a11a23a34 + a13a23a31 + a14a21a33 - a11a24a33 - a13a21a34 - a14a23a31
-b31 = a21a32 - a22a31
-b32 = a12a31 - a11a32
-b33 = a11a22 - a12a21
-b34 = a11a24a32 + a12a21a34 + a14a22a31 - a11a22a34 - a12a24a31 - a14a21a32
-*/
+
 	(*tmat)[3] = 0.0f;
 	(*tmat)[7] = 0.0f;
 	(*tmat)[11] = 0.0f;

@@ -47,6 +47,6 @@ using namespace avm;
 #include <SDL.h>
 
 /* Generic logic for rendering placed things */
-int shared_render(Value th);
+int region_render(Value th);
 
 #endif

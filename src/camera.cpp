@@ -109,7 +109,11 @@ int camera_render(Value th) {
 
 /** Initialize Camera type and create an instance in $.camera */
 void camera_init(Value th) {
-	pushType(th, aNull, 16);
+	// Camera is a new Region
+	pushSym(th, "new");
+	pushGloVar(th, "Region");
+	getCall(th, 1, 1);
+	Value Camera = getFromTop(th, 0);
 		pushCMethod(th, camera_new);
 		popProperty(th, 0, "new");
 		pushCMethod(th, camera_render);
@@ -154,5 +158,4 @@ void camera_init(Value th) {
 		getCall(th, 4, 1);
 		popProperty(th, 0, "up");
 	popGloVar(th, "Camera");
-
 }
