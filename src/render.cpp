@@ -38,46 +38,6 @@ int render_cameraXyz(Value th) {
 	return 1;
 }
 
-/** Multiply/adjust mvpmatrix and mvmatrix using calculated lookat view matrix */
-int render_lookat(Value th) {
-	int contextidx = 0;
-	int objidx = 1;
-	static Xyz defaultpos = {0.0f, 0.0f, 0.0f};
-	static Xyz defaultat = {0.0f, 0.0f, -1.0f};
-	static Xyz defaultup = {0.0f, 1.0f, 0.0f};
-	Mat4 viewmat;
-
-	// Get the properties needed for calculation
-	Value positionv = pushProperty(th, objidx, "location");
-	Value lookatv = pushProperty(th, objidx, "lookat");
-	Value upv = pushProperty(th, objidx, "up");
-	Xyz *position = isStr(positionv)? (Xyz*) toStr(positionv) : &defaultpos;
-	Xyz *lookat = isStr(lookatv)? (Xyz*) toStr(lookatv) : &defaultat;
-	Xyz *up = isStr(upv)? (Xyz*) toStr(upv) : &defaultup;
-
-	// Calculate view matrix 
-	mat4InverseLookat(&viewmat, position, lookat, up);
-
-	// mvpmatrix *= viewmat
-	pushSym(th, "new");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	Mat4 *newmat = (Mat4*) toStr(getFromTop(th, 0));
-	Value mvpmatrix = pushProperty(th, contextidx, "mvpmatrix"); popValue(th);
-	mat4Mult(newmat, (Mat4*) toStr(mvpmatrix), &viewmat);
-	popProperty(th, contextidx, "mvpmatrix");
-
-	// mvmatrix *= viewmat
-	pushSym(th, "new");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	newmat = (Mat4*) toStr(getFromTop(th, 0));
-	Value mvmatrix = pushProperty(th, contextidx, "mvmatrix"); popValue(th);
-	mat4Mult(newmat, (Mat4*) toStr(mvmatrix), &viewmat);
-	popProperty(th, contextidx, "mvmatrix");
-	return 0;
-}
-
 /** Initialize the RenderContext type */
 void render_init(Value th) {
 	pushType(th, aNull, 6);
@@ -85,7 +45,5 @@ void render_init(Value th) {
 		popProperty(th, 0, "new");
 		pushCMethod(th, render_cameraXyz);
 		popProperty(th, 0, "CameraXyz");
-		pushCMethod(th, render_lookat);
-		popProperty(th, 0, "Lookat");
 	popGloVar(th, "RenderContext");
 }

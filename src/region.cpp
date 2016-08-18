@@ -43,20 +43,11 @@ int region_render(Value th) {
 	getCall(th, 1, 1);
 	Mat4 *viewmat = (Mat4*) toStr(getFromTop(th, 0));
 
-	// Context: mvpmatrix *= viewmat
-	pushSym(th, "new");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	Mat4 *newmat = (Mat4*) toStr(getFromTop(th, 0));
-	Value mvpmatrix = pushProperty(th, newcontextidx, "mvpmatrix"); popValue(th);
-	mat4Mult(newmat, (Mat4*) toStr(mvpmatrix), viewmat);
-	popProperty(th, newcontextidx, "mvpmatrix");
-
 	// Context: mvmatrix *= viewmat
 	pushSym(th, "new");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	newmat = (Mat4*) toStr(getFromTop(th, 0));
+	Mat4 *newmat = (Mat4*) toStr(getFromTop(th, 0));
 	Value mvmatrix = pushProperty(th, newcontextidx, "mvmatrix"); popValue(th);
 	mat4Mult(newmat, (Mat4*) toStr(mvmatrix), viewmat);
 	popProperty(th, newcontextidx, "mvmatrix");

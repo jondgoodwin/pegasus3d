@@ -5,6 +5,7 @@
  * See Copyright Notice in pegasus3d.h
 */
 #include "pegasus3d.h"
+#include "xyzmath.h"
 #include <math.h>
 
 /** Generate a sphere shape, passing radius and nsegments */

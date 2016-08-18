@@ -59,10 +59,9 @@ int world_nextframe(Value th) {
 	return 1;
 }
 
-float camDist = 5.0f;
-float camAngle = 0.0f;
-float camDistVel = 0.0f;
-float camAngleVel = 0.0f;
+float camYRotation = 0.0f;
+float camVelocity = 0.0f;
+float camYRotRate = 0.0f;
 
 /** Default method for updating the world's state every tick.
     dt is first parameter (delta time since last update in seconds). */
@@ -74,17 +73,24 @@ int world_update(Value th) {
 
 	// Move the camera slowly up
 	pushGloVar(th, "$");
+	int camidx = getTop(th);
 	pushProperty(th, getTop(th)-1, "camera");
-	Value posv = pushProperty(th, getTop(th)-1, "location");
+	Value posv = pushProperty(th, camidx, "location");
 	if (isXyz(posv)) {
 		Xyz *posxyz = (Xyz *)toStr(posv);
 		// posxyz->y += dt;
-		if (camDist+camDistVel < 0.0)
-			camDistVel = 0.0f;
-		camDist+=camDistVel;
-		camAngle+=camAngleVel;
-		posxyz->x = camDist * sin(camAngle);
-		posxyz->z = camDist * cos(camAngle);
+		camYRotation+=camYRotRate;
+		if (camYRotation<0.0)
+			camYRotation+=(float)M_PI * 2.0f;
+		if (camYRotation>2*M_PI)
+			camYRotation-=(float)M_PI * 2.0f;
+		posxyz->x += camVelocity * sin(camYRotation);
+		posxyz->z += -camVelocity * cos(camYRotation);
+	}
+	Value rotv = pushProperty(th, camidx, "rotation");
+	if (isXyz(rotv)) {
+		Xyz *rotxyz = (Xyz *)toStr(rotv);
+		rotxyz->y = camYRotation;
 	}
 	setTop(th, 1);
 	return 1;
@@ -116,11 +122,11 @@ int world_handleInput(Value th)
 			{
 			case SDLK_UP:
 			case SDLK_DOWN:
-				camDistVel = 0;
+				camVelocity = 0;
 				break;
 			case SDLK_LEFT:
 			case SDLK_RIGHT:
-				camAngleVel = 0;
+				camYRotRate = 0;
 				break;
 			}
 		}
@@ -148,16 +154,16 @@ int world_handleInput(Value th)
 				} break;
 
 			case SDLK_UP:
-				camDistVel = -0.04f;
+				camVelocity = 0.08f;
 				break;
 			case SDLK_DOWN:
-				camDistVel = 0.04f;
+				camVelocity = -0.08f;
 				break;
 			case SDLK_LEFT:
-				camAngleVel = -0.04f;
+				camYRotRate = -0.08f;
 				break;
 			case SDLK_RIGHT:
-				camAngleVel = 0.04f;
+				camYRotRate = 0.08f;
 				break;
 
 			default:

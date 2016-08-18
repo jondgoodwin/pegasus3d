@@ -176,6 +176,12 @@ void mat4Rotate(Mat4 *mat, Xyz *pos, Xyz *rot, Xyz *scale) {
 /** Invert a matrix, for use in calculating camera's matrix.
 	Note: this is a simplified solution which assumes bottom row is always 0,0,0,1*/
 void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
+	Mat4 tempmat;
+	if (fmat==tmat) {
+		memcpy(tempmat, fmat, sizeof(Mat4));
+		fmat = &tempmat;
+	}
+
 	float det = (*fmat)[0]*(*fmat)[5]*(*fmat)[10] 
 		+ (*fmat)[4]*(*fmat)[9]*(*fmat)[2] 
 		+ (*fmat)[4]*(*fmat)[1]*(*fmat)[6] 
@@ -185,7 +191,7 @@ void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
 
 	(*tmat)[0]  = ((*fmat)[ 5]*(*fmat)[10] - (*fmat)[ 9]*(*fmat)[ 6])/det;
 	(*tmat)[4]  = ((*fmat)[ 8]*(*fmat)[ 6] - (*fmat)[ 4]*(*fmat)[10])/det;
-	(*tmat)[8]  = ((*fmat)[ 4]*(*fmat)[ 9] - (*fmat)[ 4]*(*fmat)[ 5])/det;
+	(*tmat)[8]  = ((*fmat)[ 4]*(*fmat)[ 9] - (*fmat)[ 8]*(*fmat)[ 5])/det;
 	(*tmat)[1]  = ((*fmat)[ 9]*(*fmat)[ 2] - (*fmat)[ 1]*(*fmat)[10])/det;
 	(*tmat)[5]  = ((*fmat)[ 0]*(*fmat)[10] - (*fmat)[ 8]*(*fmat)[ 2])/det;
 	(*tmat)[9]  = ((*fmat)[ 8]*(*fmat)[ 1] - (*fmat)[ 0]*(*fmat)[ 9])/det;

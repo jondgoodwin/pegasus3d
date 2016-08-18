@@ -142,6 +142,16 @@ int shader_render(Value th) {
 		ShaderPgm *pgmdata = (ShaderPgm*) toHeader(pgmv);
 		glUseProgram(pgmdata->program);
 
+		// Calculate mvpmatrix = pmatrix * mvmatrix
+		pushSym(th, "new");
+		pushGloVar(th, "Matrix4");
+		getCall(th, 1, 1);
+		Mat4 *mvp = (Mat4*) toStr(getFromTop(th, 0));
+		Value pmatrix = pushProperty(th, contextidx, "pmatrix"); popValue(th);
+		Value mvmatrix = pushProperty(th, contextidx, "mvmatrix"); popValue(th);
+		mat4Mult(mvp, (Mat4*) toStr(pmatrix), (Mat4*) toStr(mvmatrix));
+		popProperty(th, contextidx, "mvpmatrix");
+
 		// Load all the shader's named "uniform" values from the context
 		Value uniformlist = pushProperty(th, selfidx, "uniforms"); popValue(th);
 		if (isArr(uniformlist)) {

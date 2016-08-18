@@ -15,8 +15,7 @@ int camera_new(Value th) {
 	return 1;
 }
 
-/** Calculate new perspective projection matrix using self/context properties and store in mvpmatrix.
-	Put identity matrix in mvmatrix */
+/** Calculate and return new perspective projection matrix using self/context properties */
 int camera_perspective(Value th) {
 	int selfidx = 0;
 	int contextidx = 1;
@@ -37,19 +36,10 @@ int camera_perspective(Value th) {
 	getCall(th, 1, 1);
 	Mat4 *mat = (Mat4*) toStr(getFromTop(th, 0));
 	mat4Perspective(mat, fovht, mindist, maxdist, aspratio);
-	popProperty(th, contextidx, "mvpmatrix");
-
-	// Create identity matrix and store as mvmatrix
-	pushSym(th, "new");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	popProperty(th, contextidx, "mvmatrix");
-	popValue(th);
 	return 1;
 }
 
-/** Calculate orthogonal projection matrix using context properties and store in mvpmatrix.
-	Put identity matrix in mvmatrix */
+/** Calculate and return orthogonal projection matrix using context properties */
 int camera_orthogonal(Value th) {
 	int selfidx = 0;
 	int contextidx = 1;
@@ -71,13 +61,6 @@ int camera_orthogonal(Value th) {
 	getCall(th, 1, 1);
 	Mat4 *mat = (Mat4*) toStr(getFromTop(th, 0));
 	mat4Ortho(mat, fovht, mindist, maxdist, aspratio);
-	popProperty(th, contextidx, "mvpmatrix");
-
-	// Create identity matrix and store as mvmatrix
-	pushSym(th, "new");
-	pushGloVar(th, "Mattrix4");
-	getCall(th, 1, 1);
-	popProperty(th, contextidx, "mvmatrix");
 	return 1;
 }
 
@@ -94,15 +77,18 @@ int camera_render(Value th) {
 	else pushSym(th, "Perspective");
 	pushLocal(th, camidx);
 	pushLocal(th, contextidx);
-	getCall(th, 2, 0);
+	getCall(th, 2, 1);
+	popProperty(th, contextidx, "pmatrix");
 
-	// Adjust context matrices with calculated view matrix
+	// Calculate camera's view matrix, invert and put in "mvmatrix"
 	Value viewmeth = getProperty(th, getLocal(th, camidx), "view");
 	if (viewmeth!=aNull) pushValue(th, viewmeth);
-	else pushSym(th, "Lookat");
-	pushLocal(th, contextidx);
+	else pushSym(th, "Rotate");
 	pushLocal(th, camidx);
-	getCall(th, 2, 0);
+	getCall(th, 1, 1);
+	Mat4 *vmat = (Mat4*) toStr(getFromTop(th, 0));
+	mat4Inverse(vmat, vmat); // Because we want world->camera
+	popProperty(th, contextidx, "mvmatrix");
 
 	return 0;
 }
@@ -143,6 +129,13 @@ void camera_init(Value th) {
 		pushValue(th, aFloat(5.0f));
 		getCall(th, 4, 1);
 		popProperty(th, 0, "location");
+		pushSym(th, "new");
+		pushGloVar(th, "Xyz");
+		pushValue(th, aFloat(0.0f));
+		pushValue(th, aFloat(0.0f));
+		pushValue(th, aFloat(0.0f));
+		getCall(th, 4, 1);
+		popProperty(th, 0, "rotation");
 		pushSym(th, "new");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
