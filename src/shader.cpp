@@ -130,7 +130,7 @@ int shader_render(Value th) {
 	if (pgmv==aNull) {
 		// If it does not exist, compile and bind it based on info
 		Value pgmtype = pushProperty(th, selfidx, "_compiledtype");
-		pgmv = pushCData(th, pgmtype, 0, sizeof(ShaderPgm)); // Is small enough to stick in header
+		pgmv = strHasFinalizer(pushCData(th, pgmtype, PegShaderPgm, 0, sizeof(ShaderPgm))); // Is small enough to stick in header
 		if (aNull != (pgmv = shader_make(th, pgmv)))
 			popProperty(th, selfidx, "_program");
 		else
@@ -146,10 +146,10 @@ int shader_render(Value th) {
 		pushSym(th, "new");
 		pushGloVar(th, "Matrix4");
 		getCall(th, 1, 1);
-		Mat4 *mvp = (Mat4*) toStr(getFromTop(th, 0));
+		Mat4 *mvp = (Mat4*) toHeader(getFromTop(th, 0));
 		Value pmatrix = pushProperty(th, contextidx, "pmatrix"); popValue(th);
 		Value mvmatrix = pushProperty(th, contextidx, "mvmatrix"); popValue(th);
-		mat4Mult(mvp, (Mat4*) toStr(pmatrix), (Mat4*) toStr(mvmatrix));
+		mat4Mult(mvp, (Mat4*) toHeader(pmatrix), (Mat4*) toHeader(mvmatrix));
 		popProperty(th, contextidx, "mvpmatrix");
 
 		// Load all the shader's named "uniform" values from the context
@@ -162,30 +162,21 @@ int shader_render(Value th) {
 					glUniform1f(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAfloat(unival));
 				else if (isInt(unival))
 					glUniform1i(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAint(unival));
-				else if (isStr(unival)) {
-					if (nbrIsMatrix(unival)) {
-						switch (nbrGetNVals(unival)) {
-						case  4: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
-						case  9: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
-						case 16: glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), GL_FALSE, (GLfloat *) toStr(unival)); break;
-						default: assert(false && "Unsupported uniform type!!!");
-						}
-					} else if (nbrIsInteger(unival)) {
-						switch (nbrGetNVals(unival)) {
-						case 1: glUniform1iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-						case 2: glUniform2iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-						case 3: glUniform3iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-						case 4: glUniform4iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLint *) toStr(unival)); break;
-						default: assert(false && "Unsupported uniform type!!!");
-						}
-					} else {
-						switch (nbrGetNVals(unival)) {
-						case 1: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-						case 2: glUniform2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-						case 3: glUniform3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-						case 4: glUniform4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), nbrGetNStructs(unival), (GLfloat *) toStr(unival)); break;
-						default: assert(false && "Unsupported uniform type!!!");
-						}
+				else if (isCData(unival)) {
+					switch(getCDataType(unival)) {
+					case PegMat2: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					case PegMat3: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					case PegMat4: 
+						glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					//case PegUint32: glUniform1iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), univalhdr->nStructs, (GLint *) toCData(unival)); break;
+					case PegFloat: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toCData(unival)); break;
+					case PegVec2: glUniform2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toHeader(unival)); break;
+					case PegVec3: glUniform3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toHeader(unival)); break;
+					case PegVec4: 
+						glUniform4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toHeader(unival)); break;
+					default: 
+						//const char *x = toStr(uninamev);
+						assert(false && "Unsupported uniform type!!!");
 					}
 				}
 			}

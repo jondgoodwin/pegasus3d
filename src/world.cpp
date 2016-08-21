@@ -76,8 +76,8 @@ int world_update(Value th) {
 	int camidx = getTop(th);
 	pushProperty(th, getTop(th)-1, "camera");
 	Value posv = pushProperty(th, camidx, "location");
-	if (isXyz(posv)) {
-		Xyz *posxyz = (Xyz *)toStr(posv);
+	if (isCData(posv)) {
+		Xyz *posxyz = (Xyz *)toHeader(posv);
 		// posxyz->y += dt;
 		camYRotation+=camYRotRate;
 		if (camYRotation<0.0)
@@ -88,8 +88,8 @@ int world_update(Value th) {
 		posxyz->z += -camVelocity * cos(camYRotation);
 	}
 	Value rotv = pushProperty(th, camidx, "rotation");
-	if (isXyz(rotv)) {
-		Xyz *rotxyz = (Xyz *)toStr(rotv);
+	if (isCData(rotv)) {
+		Xyz *rotxyz = (Xyz *)toHeader(rotv);
 		rotxyz->y = camYRotation;
 	}
 	setTop(th, 1);

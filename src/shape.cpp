@@ -188,23 +188,27 @@ int shape_renderit(Value th) {
 	glGenBuffers(nattrs, vbo);
 	for (int i=0; i<nattrs; i++) {
 		Value buffer = getProperty(th, attrsource, arrGet(th, vertattrlistv, i));
+		if (!isCData(buffer))
+			continue;
+		ArrayHeader *buffhdr = (ArrayHeader*) toHeader(buffer);
 
 		// Bind as active, copy, define and enable the OpenGL buffer
 		glBindBuffer(GL_ARRAY_BUFFER, vbo[i]);
-		glBufferData(GL_ARRAY_BUFFER, getSize(buffer), toStr(buffer), GL_STATIC_DRAW); /* Copy data */
-		if (nbrIsInteger(buffer)) {
-			switch (nbrGetValSz(buffer)) {
-			case 1: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_UNSIGNED_BYTE, GL_FALSE, 0, 0);
-			case 2: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_UNSIGNED_SHORT, GL_FALSE, 0, 0);
-			case 4: glVertexAttribPointer(i, nbrGetNVals(buffer), GL_INT, GL_FALSE, 0, 0);
-			}
+		glBufferData(GL_ARRAY_BUFFER, getSize(buffer), toCData(buffer), GL_STATIC_DRAW); /* Copy data */
+		AuintIdx n = getSize(buffer);
+		float *f = (float *)toCData(buffer);
+		switch (buffhdr->mbrType) {
+		case PegUint8: glVertexAttribPointer(i, buffhdr->structSz, GL_UNSIGNED_BYTE, GL_FALSE, 0, 0); break;
+		case PegUint16: glVertexAttribPointer(i, buffhdr->structSz, GL_UNSIGNED_SHORT, GL_FALSE, 0, 0); break;
+		case PegUint32: glVertexAttribPointer(i, buffhdr->structSz, GL_INT, GL_FALSE, 0, 0); break;
+		case PegFloat: case PegVec2: case PegVec3: case PegVec4:
+			glVertexAttribPointer(i, buffhdr->structSz, GL_FLOAT, GL_FALSE, 0, 0); break;
+		default: ;
 		}
-		else
-			glVertexAttribPointer(i, nbrGetNVals(buffer), GL_FLOAT, GL_FALSE, 0, 0); 
 		glEnableVertexAttribArray(i);
 
 		// Remember the smallest number of vertices we found in the buffers
-		nverts = (nverts < 0 || nverts>nbrGetNStructs(buffer))? nbrGetNStructs(buffer) : nverts;
+		nverts = (nverts < 0 || nverts>buffhdr->nStructs)? buffhdr->nStructs : nverts;
 	}
 
 	// How shall we draw them?
@@ -216,15 +220,16 @@ int shape_renderit(Value th) {
 	Value indicesym = pushSym(th, "indices");
 	Value vertices = getProperty(th, attrsource, indicesym);
 	popValue(th);
-	if (isStr(vertices)) {
+	if (isCData(vertices)) {
+		ArrayHeader *verthdr = (ArrayHeader*)toHeader(vertices);
 		// Generate a buffer for the indices
 		GLuint elementbuffer;
 		glGenBuffers(1, &elementbuffer);
 		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, elementbuffer);
-		glBufferData(GL_ELEMENT_ARRAY_BUFFER, getSize(vertices), toStr(vertices), GL_STATIC_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, getSize(vertices), toCData(vertices), GL_STATIC_DRAW);
 
 		// Draw the vertices using the indices as a guide
-		glDrawElements(drawmode, nbrGetNStructs(vertices), GL_UNSIGNED_SHORT, (void*)0);
+		glDrawElements(drawmode, verthdr->nStructs, GL_UNSIGNED_SHORT, (void*)0);
 	}
 	/* Otherwise, draw specified primitives using vertices defined by attribute buffers */
 	else

@@ -34,7 +34,7 @@ int camera_perspective(Value th) {
 	pushSym(th, "new");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	Mat4 *mat = (Mat4*) toStr(getFromTop(th, 0));
+	Mat4 *mat = (Mat4*) toHeader(getFromTop(th, 0));
 	mat4Perspective(mat, fovht, mindist, maxdist, aspratio);
 	return 1;
 }
@@ -59,7 +59,7 @@ int camera_orthogonal(Value th) {
 	pushSym(th, "new");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	Mat4 *mat = (Mat4*) toStr(getFromTop(th, 0));
+	Mat4 *mat = (Mat4*) toHeader(getFromTop(th, 0));
 	mat4Ortho(mat, fovht, mindist, maxdist, aspratio);
 	return 1;
 }
@@ -83,10 +83,10 @@ int camera_render(Value th) {
 	// Calculate camera's view matrix, invert and put in "mvmatrix"
 	Value viewmeth = getProperty(th, getLocal(th, camidx), "view");
 	if (viewmeth!=aNull) pushValue(th, viewmeth);
-	else pushSym(th, "Rotate");
+	else pushSym(th, "Rotation");
 	pushLocal(th, camidx);
 	getCall(th, 1, 1);
-	Mat4 *vmat = (Mat4*) toStr(getFromTop(th, 0));
+	Mat4 *vmat = (Mat4*) toHeader(getFromTop(th, 0));
 	mat4Inverse(vmat, vmat); // Because we want world->camera
 	popProperty(th, contextidx, "mvmatrix");
 

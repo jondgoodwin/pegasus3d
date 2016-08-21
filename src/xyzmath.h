@@ -21,7 +21,7 @@ typedef struct Xyz {
 } Xyz;
 
 /** Is the value an Xyz value?  This is a bit of a hack */
-#define isXyz(val) (isStr(val) && getSize(val)==sizeof(Xyz))
+//#define isXyz(val) (isStr(val) && getSize(val)==sizeof(Xyz))
 
 /** Inline calculation of length of xyz vector */
 #define xyzLen(xyz) \

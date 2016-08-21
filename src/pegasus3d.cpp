@@ -17,6 +17,7 @@ Value vm;
 void color_init(Value th);
 void xyz_init(Value th);
 void mat4_init(Value th);
+void array_init(Value th);
 void integers_init(Value th);
 void render_init(Value th);
 void window_init(Value th);
@@ -28,6 +29,7 @@ void shape_init(Value th);
 void shader_init(Value th);
 
 void http_init(Value th);
+void image_init(Value th);
 
 void test_init(Value th);
 
@@ -37,6 +39,7 @@ void initTypes(Value th) {
 	color_init(th);
 	xyz_init(th);
 	mat4_init(th);
+	array_init(th);
 	integers_init(th);
 
 	// World types
@@ -50,6 +53,7 @@ void initTypes(Value th) {
 	shader_init(th);
 
 	http_init(th);
+	image_init(th);
 }
 
 /** Initialize $ to be a blank world */

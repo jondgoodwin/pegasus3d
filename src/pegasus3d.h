@@ -46,7 +46,30 @@ using namespace avm;
 // SDL2 Headers
 #include <SDL.h>
 
-/* Generic logic for rendering placed things */
-int region_render(Value th);
+enum PegCDataTypes {
+	PegVec2,
+	PegVec3,
+	PegVec4,
+	PegMat2,
+	PegMat3,
+	PegMat4,
+
+	PegArray,
+	PegShaderPgm,
+	PegWindow,
+
+	// Only needed in PegArray
+	PegFloat,
+	PegUint8,
+	PegUint16,
+	PegUint32
+};
+
+struct ArrayHeader {
+	AuintIdx nStructs;	//!< number of structures in the array
+	char mbrType;		//!< float/int and number of bytes in a number
+	char structSz;		//!< How many numbers in a structure
+};
+
 
 #endif

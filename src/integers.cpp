@@ -29,7 +29,11 @@ int integers_new(Value th) {
 	}
 
 	// Create the integer array
-	Value bufv = pushNumbers(th, pushProperty(th, 0, "newtype"), nStructs, 1, sizeof(GLshort), false, false, 0);
+	Value bufv = pushCData(th, pushProperty(th, 0, "newtype"), PegArray, nStructs*sizeof(short), sizeof(ArrayHeader));
+	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
+	hdr->mbrType = PegUint16;
+	hdr->structSz = 1;
+	hdr->nStructs = nStructs;
 
 	// Fill the array with integers converted from ascii
 	if (isStr(parm1)) {

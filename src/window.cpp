@@ -71,7 +71,7 @@ bool window_newOpenGLWindow(WindowInfo *di)
 /** Create a new window instance using SDL2 & OpenGL within a window */
 int window_new(Value th) {
 	pushProperty(th, 0, "newtype"); // get the mixin type for instance
-	Value dispinst = pushCData(th, popValue(th), 0, sizeof(struct WindowInfo));
+	Value dispinst = strHasFinalizer(pushCData(th, popValue(th), PegWindow, 0, sizeof(struct WindowInfo)));
 	di = (struct WindowInfo*) toHeader(dispinst);
 	window_newOpenGLWindow(di);
 	return 1;

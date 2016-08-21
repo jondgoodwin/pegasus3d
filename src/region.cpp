@@ -38,18 +38,18 @@ int region_render(Value th) {
 	// Use "view"'s method to calculate 'mmodel'
 	Value viewmeth = pushProperty(th, selfidx, "view"); popValue(th);
 	if (viewmeth!=aNull) pushValue(th, viewmeth);
-	else pushSym(th, "Rotate");
+	else pushSym(th, "Rotation");
 	pushLocal(th, selfidx);
 	getCall(th, 1, 1);
-	Mat4 *viewmat = (Mat4*) toStr(getFromTop(th, 0));
+	Mat4 *viewmat = (Mat4*) toHeader(getFromTop(th, 0));
 
 	// Context: mvmatrix *= viewmat
 	pushSym(th, "new");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	Mat4 *newmat = (Mat4*) toStr(getFromTop(th, 0));
+	Mat4 *newmat = (Mat4*) toHeader(getFromTop(th, 0));
 	Value mvmatrix = pushProperty(th, newcontextidx, "mvmatrix"); popValue(th);
-	mat4Mult(newmat, (Mat4*) toStr(mvmatrix), viewmat);
+	mat4Mult(newmat, (Mat4*) toHeader(mvmatrix), viewmat);
 	popProperty(th, newcontextidx, "mvmatrix");
 
 	// Ask if we should render it? (and augment context)
@@ -78,14 +78,14 @@ int region_rotation(Value th) {
 	Value positionv = pushProperty(th, objidx, "location");
 	Value rotv = pushProperty(th, objidx, "rotation");
 	Value scalev = pushProperty(th, objidx, "scale");
-	Xyz *position = isStr(positionv)? (Xyz*) toStr(positionv) : &defaultpos;
-	Xyz *rotate = isStr(rotv)? (Xyz*) toStr(rotv) : &defaultrot;
-	Xyz *scale = isStr(scalev)? (Xyz*) toStr(scalev) : &defaultscale;
+	Xyz *position = isCData(positionv)? (Xyz*) toHeader(positionv) : &defaultpos;
+	Xyz *rotate = isCData(rotv)? (Xyz*) toHeader(rotv) : &defaultrot;
+	Xyz *scale = isCData(scalev)? (Xyz*) toHeader(scalev) : &defaultscale;
 
 	// Calculate view matrix, storing it in 'mmatrix'
 	Value modelmatrix = pushProperty(th, objidx, "mmatrix");
-	if (isStr(modelmatrix))
-		mat4Rotate((Mat4*)toStr(modelmatrix), position, rotate, scale);
+	if (isCData(modelmatrix))
+		mat4Rotate((Mat4*)toHeader(modelmatrix), position, rotate, scale);
 	
 	return 1;
 }
@@ -101,14 +101,14 @@ int region_lookat(Value th) {
 	Value positionv = pushProperty(th, objidx, "location");
 	Value lookatv = pushProperty(th, objidx, "lookat");
 	Value upv = pushProperty(th, objidx, "up");
-	Xyz *position = isStr(positionv)? (Xyz*) toStr(positionv) : &defaultpos;
-	Xyz *lookat = isStr(lookatv)? (Xyz*) toStr(lookatv) : &defaultat;
-	Xyz *up = isStr(upv)? (Xyz*) toStr(upv) : &defaultup;
+	Xyz *position = isCData(positionv)? (Xyz*) toHeader(positionv) : &defaultpos;
+	Xyz *lookat = isCData(lookatv)? (Xyz*) toHeader(lookatv) : &defaultat;
+	Xyz *up = isCData(upv)? (Xyz*) toHeader(upv) : &defaultup;
 
 	// Calculate view matrix, storing it in 'mmatrix'
 	Value modelmatrix = pushProperty(th, objidx, "mmatrix");
-	if (isStr(modelmatrix))
-		mat4Lookat((Mat4*)toStr(modelmatrix), position, lookat, up);
+	if (isCData(modelmatrix))
+		mat4Lookat((Mat4*)toHeader(modelmatrix), position, lookat, up);
 
 	return 1;
 }
@@ -121,7 +121,7 @@ void region_init(Value th) {
 		pushCMethod(th, region_render);
 		popProperty(th, 0, "_Render");
 		pushCMethod(th, region_rotation);
-		popProperty(th, 0, "Rotate");
+		popProperty(th, 0, "Rotation");
 		pushCMethod(th, region_lookat);
 		popProperty(th, 0, "Lookat");
 	popGloVar(th, "Region");

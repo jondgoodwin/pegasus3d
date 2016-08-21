@@ -17,22 +17,22 @@ int render_new(Value th) {
 /** Convert an Xyz vector from local to camera (eye) coordinates using mvmatrix */
 int render_cameraXyz(Value th) {
 	Value oldxyzv;
-	if (getTop(th)<2 || !isStr(oldxyzv = getLocal(th, 1))) {
+	if (getTop(th)<2 || !isCData(oldxyzv = getLocal(th, 1))) {
 		pushValue(th, aNull);
 		return 1;
 	}
-	Xyz *oldxyz = (Xyz*) toStr(oldxyzv);
+	Xyz *oldxyz = (Xyz*) toHeader(oldxyzv);
 
 	// Obtain 'mvmatrix' from context
 	pushProperty(th, 0, "mvmatrix");
-	Mat4 *mvmat = (Mat4*) toStr(getFromTop(th, 0));
+	Mat4 *mvmat = (Mat4*) toHeader(getFromTop(th, 0));
 	popValue(th);
 
 	// Create placeholder for new, calculated Xyz
 	pushSym(th, "new");
 	pushGloVar(th, "Xyz");
 	getCall(th, 1, 1);
-	Xyz *newxyz = (Xyz*) toStr(getFromTop(th, 0));
+	Xyz *newxyz = (Xyz*) toHeader(getFromTop(th, 0));
 
 	mat4MultVec(newxyz, mvmat, oldxyz);
 	return 1;
