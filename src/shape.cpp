@@ -173,12 +173,6 @@ int shape_renderit(Value th) {
 	popValue(th); // symbol
 	int nattrs = getSize(vertattrlistv);
 
-	// Figure out who to get attributes from
-	Value attrsource = pushProperty(th, selfidx, "shape");
-	if (attrsource == aNull)
-		attrsource = getLocal(th, selfidx);
-	popValue(th);
-
 	// Set up Vertex Array Object
 	glGenVertexArrays(1, &vao);
 	glBindVertexArray(vao);
@@ -186,6 +180,7 @@ int shape_renderit(Value th) {
 	// Allocate and assign as many Vertex Buffer Objects to our handle as we have attributes
 	// then load and activate each one. 
 	glGenBuffers(nattrs, vbo);
+	Value attrsource = getLocal(th, selfidx);
 	for (int i=0; i<nattrs; i++) {
 		Value buffer = getProperty(th, attrsource, arrGet(th, vertattrlistv, i));
 		if (!isCData(buffer))

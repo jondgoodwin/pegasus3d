@@ -25,7 +25,7 @@
 #define PEG_VERSION_MAJOR	"0"		//!< Major version number
 #define PEG_VERSION_MINOR	"1"		//!< Minor version number
 #define PEG_VERSION_NUM		0		//!< Version number
-#define PEG_VERSION_RELEASE	"3"		//!< Version release
+#define PEG_VERSION_RELEASE	"4"		//!< Version release
 
 #define PEG_NAME "Pegasus3d Browser"
 #define PEG_VERSION	PEG_NAME " " PEG_VERSION_MAJOR "." PEG_VERSION_MINOR		//!< Full version string
@@ -57,6 +57,7 @@ enum PegCDataTypes {
 	PegArray,
 	PegShaderPgm,
 	PegWindow,
+	PegImage,
 
 	// Only needed in PegArray
 	PegFloat,
@@ -71,5 +72,11 @@ struct ArrayHeader {
 	char structSz;		//!< How many numbers in a structure
 };
 
+struct ImageHeader {
+	AuintIdx x;
+	AuintIdx y;
+	AuintIdx z;
+	unsigned char nbytes;
+};
 
 #endif

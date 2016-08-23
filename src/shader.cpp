@@ -124,6 +124,7 @@ int shader_new(Value th) {
 int shader_render(Value th) {
 	int selfidx = 0;
 	int contextidx = 1;
+	int texunit = 0;
 
 	// Get compiled shader, if it exists
 	Value pgmv = pushProperty(th, selfidx, "_program");
@@ -177,6 +178,17 @@ int shader_render(Value th) {
 					default: 
 						//const char *x = toStr(uninamev);
 						assert(false && "Unsupported uniform type!!!");
+					}
+				} else if (isType(unival)) {
+					pushSym(th, "name");
+					Value name = getProperty(th, unival, getFromTop(th, 0));
+					popValue(th);
+					if (isEqStr(name, "Texture")) {
+						pushSym(th, "_Render");
+						pushValue(th, unival);
+						pushLocal(th, contextidx);
+						getCall(th, 2, 1);
+						glUniform1i(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAint(popValue(th)));
 					}
 				}
 			}

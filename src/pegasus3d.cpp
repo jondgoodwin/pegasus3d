@@ -27,6 +27,7 @@ void camera_init(Value th);
 void group_init(Value th);
 void shape_init(Value th);
 void shader_init(Value th);
+void texture_init(Value th);
 
 void http_init(Value th);
 void image_init(Value th);
@@ -51,6 +52,7 @@ void initTypes(Value th) {
 	group_init(th);
 	shape_init(th);
 	shader_init(th);
+	texture_init(th);
 
 	http_init(th);
 	image_init(th);
