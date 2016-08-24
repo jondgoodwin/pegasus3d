@@ -68,6 +68,52 @@ int xyzs_append(Value th) {
 	return 1;
 }
 
+/** Create a new Buffer value, with number of Uv structures. */
+int uvs_new(Value th) {
+	// Get nStructs parameter
+	if (getTop(th)<2) {
+		pushValue(th, aNull);
+		return 1;
+	}
+	Value parm1 = getLocal(th, 1);
+	AintIdx nStructs = 0;
+	if (isInt(parm1))
+		nStructs = toAint(parm1);
+	else if (isStr(parm1)) {
+		// number of floats is one more than the number of commas
+		const char *scanp = toStr(parm1);
+		while (*scanp) {
+			if (*scanp++==',') 
+				nStructs++;
+		}
+		nStructs++;
+		nStructs /= 2;
+	}
+
+	// Create the number array
+	Value bufv = pushCData(th, pushProperty(th, 0, "newtype"), PegArray, nStructs*3*sizeof(float), sizeof(ArrayHeader));
+	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
+	hdr->mbrType = PegVec3;
+	hdr->structSz = 2;
+	hdr->nStructs = nStructs;
+
+	// Fill the array with floating point numbers converted from ascii
+	if (isStr(parm1)) {
+		const char *scanp = (const char*) toStr(parm1);
+		while (*scanp) {
+			if ((*scanp>='0' && *scanp<='9')||*scanp=='-') {
+				GLfloat afloat = (GLfloat) atof(scanp);
+				strAppend(th, bufv, (const char*)(&afloat), sizeof(GLfloat));
+				while ((*scanp>='0' && *scanp<='9') || *scanp=='.' || *scanp=='e' || *scanp=='E' || *scanp=='-')
+					scanp++;
+			}
+			else
+				scanp++;
+		}
+	}
+	return 1;
+}
+
 /** Create a new Buffer value, with number of Xyz structures. */
 int colors_new(Value th) {
 	// Get nStructs parameter
@@ -137,6 +183,15 @@ void array_init(Value th) {
 		pushCMethod(th, xyzs_new);
 		popProperty(th, 0, "new");
 	popGloVar(th, "Xyzs");
+
+	pushType(th, aNull, 2);
+		pushMixin(th, aNull, aNull, 16);
+			//pushCMethod(th, uvs_append);
+			//popProperty(th, 1, "<<");
+		popProperty(th, 0, "newtype");
+		pushCMethod(th, uvs_new);
+		popProperty(th, 0, "new");
+	popGloVar(th, "Uvs");
 
 	pushType(th, aNull, 2);
 		pushMixin(th, aNull, aNull, 16);

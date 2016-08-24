@@ -8,12 +8,15 @@
 #include "xyzmath.h"
 #include <math.h>
 
-/** Generate a sphere shape, passing radius and nsegments */
+/** Generate a sphere shape centered at (0,0,0), passing radius and nsegments.
+	The geometry is via longitude and latitude divisions. 
+	Normals extend outwards. 
+	The top point's uv is (0,1) with u wrapping horizontally around the latitudes. */
 int shape_sphere(Value th) {
 	// Obtain and validate parameters
 	float radius = getTop(th)>=2 && isFloat(getLocal(th, 1))? toAfloat(getLocal(th,1)) : 1.0f;
 	int nsegments = getTop(th)>=3 && isInt(getLocal(th, 2))? toAint(getLocal(th,2)) : 15;
-	int nverts = nsegments * (nsegments-2) + 2;
+	int nverts = (nsegments+1) * (nsegments-2) + 2;
 	int nindices = 6*nsegments*nsegments;
 	if (nsegments<=2 || nverts>=65536) {
 		pushValue(th, aNull);
@@ -38,6 +41,12 @@ int shape_sphere(Value th) {
 	Value normval = getFromTop(th, 0);
 	popProperty(th, sphereidx, "normals");
 	pushSym(th, "new");
+	pushGloVar(th, "Uvs");
+	pushValue(th, anInt(nverts));
+	getCall(th, 2, 1);
+	Value uvval = getFromTop(th, 0);
+	popProperty(th, sphereidx, "uvs");
+	pushSym(th, "new");
 	pushGloVar(th, "Integers");
 	pushValue(th, anInt(nindices));
 	getCall(th, 2, 1);
@@ -53,6 +62,8 @@ int shape_sphere(Value th) {
 	strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
 	strAppend(th, normval, (const char*)(&one), sizeof(GLfloat));
 	strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, uvval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, uvval, (const char*)(&one), sizeof(GLfloat));
 
     // each vertex,  vertically and then around the circle
 	int v0, v1, v2, v3;
@@ -73,19 +84,23 @@ int shape_sphere(Value th) {
 			strAppend(th, posval, (const char*)(&x), sizeof(GLfloat));
 			strAppend(th, posval, (const char*)(&y), sizeof(GLfloat));
 			strAppend(th, posval, (const char*)(&z), sizeof(GLfloat));
+			GLfloat uv1 = (GLfloat)j/(GLfloat)nsegments;
+			GLfloat uv2 = (GLfloat)(nsegments-i)/(GLfloat)nsegments;
+			strAppend(th, uvval, (const char*)(&uv1), sizeof(GLfloat));
+			strAppend(th, uvval, (const char*)(&uv2), sizeof(GLfloat));
 
 			// Generate two triangles per segment
 			if (i==1) {
 				v0 = 0;
-				v1 = (j==nsegments-1)? 1 : j+2;
+				v1 = j+2;
 				v2 = j+1;
 				strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
 				strAppend(th, indxval, (const char*)(&v1), sizeof(unsigned short));
 				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
 			} else {
 				v0 = ((i-2)*nsegments)+j+1;
-				v1 = ((i-2)*nsegments)+((j==nsegments-1)? 1 : j+2);
-				v2 = ((i-1)*nsegments)+((j==nsegments-1)? 1 : j+2);
+				v1 = ((i-2)*nsegments)+(j+2);
+				v2 = ((i-1)*nsegments)+(j+2);
 				v3 = ((i-1)*nsegments)+j+1;
 				strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
 				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
@@ -95,9 +110,27 @@ int shape_sphere(Value th) {
 				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
 			}
 		}
+		GLfloat x = -sin(mang);
+		GLfloat y = cos(mang);
+		GLfloat z = 0.0f;
+		strAppend(th, normval, (const char*)(&x), sizeof(GLfloat));
+		strAppend(th, normval, (const char*)(&y), sizeof(GLfloat));
+		strAppend(th, normval, (const char*)(&z), sizeof(GLfloat));
+		x *= radius;
+		y *= radius;
+		z *= radius;
+		strAppend(th, posval, (const char*)(&x), sizeof(GLfloat));
+		strAppend(th, posval, (const char*)(&y), sizeof(GLfloat));
+		strAppend(th, posval, (const char*)(&z), sizeof(GLfloat));
+		GLfloat uv1 = 1.0f;
+		GLfloat uv2 = (GLfloat)(nsegments-i)/(GLfloat)nsegments;
+		strAppend(th, uvval, (const char*)(&uv1), sizeof(GLfloat));
+		strAppend(th, uvval, (const char*)(&uv2), sizeof(GLfloat));
 	}
 
 	// Bottom pole vertex
+	strAppend(th, uvval, (const char*)(&zero), sizeof(GLfloat));
+	strAppend(th, uvval, (const char*)(&zero), sizeof(GLfloat));
 	radius = -radius;
 	one = -one;
 	strAppend(th, posval, (const char*)(&zero), sizeof(GLfloat));
@@ -114,6 +147,130 @@ int shape_sphere(Value th) {
 		strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
 		strAppend(th, indxval, (const char*)(&v1), sizeof(unsigned short));
 		strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
+	}
+
+	return 1;
+}
+
+/** Generate a plane surface shape centered on (0,0,0), passing nsegments.
+	The plane is flat to y, and extends between -1 and 1 in x and z.
+	The plane normal is positive y. 
+	The uv coordinate of 0,0 is the corner at (-1, 0, 1) */
+int shape_plane(Value th) {
+	// Obtain and validate parameters
+	int nsegments = getTop(th)>=2 && isInt(getLocal(th, 1))? toAint(getLocal(th,1)) : 1;
+	GLfloat uvrepeat = getTop(th)>=3 && isFloat(getLocal(th, 2))? toAfloat(getLocal(th,2)) : 1.0f;
+	int nverts = (nsegments+1) * (nsegments+1);
+	int nindices = 6*nsegments*nsegments;
+	if (nsegments<1 || nverts>=65536) {
+		pushValue(th, aNull);
+		return 1;
+	}
+
+	// Push a new Shape on the stack and give it buffer properties
+	int planeidx = getTop(th);
+	pushSym(th, "new");
+	pushGloVar(th, "Shape");
+	getCall(th, 1, 1);
+	pushSym(th, "new");
+	pushGloVar(th, "Xyzs");
+	pushValue(th, anInt(nverts));
+	getCall(th, 2, 1);
+	Value posval = getFromTop(th, 0);
+	popProperty(th, planeidx, "positions");
+	pushSym(th, "new");
+	pushGloVar(th, "Xyzs");
+	pushValue(th, anInt(nverts));
+	getCall(th, 2, 1);
+	Value normval = getFromTop(th, 0);
+	popProperty(th, planeidx, "normals");
+	pushSym(th, "new");
+	pushGloVar(th, "Uvs");
+	pushValue(th, anInt(nverts));
+	getCall(th, 2, 1);
+	Value uvval = getFromTop(th, 0);
+	popProperty(th, planeidx, "uvs");
+	pushSym(th, "new");
+	pushGloVar(th, "Integers");
+	pushValue(th, anInt(nindices));
+	getCall(th, 2, 1);
+	Value indxval = getFromTop(th, 0);
+	popProperty(th, planeidx, "indices");
+
+    // each vertex,  vertically and then horizontally
+	int v0, v1, v2, v3;
+	GLfloat zero = 0.0f;
+	GLfloat one = 1.0f;
+	for (int segz=0; segz<=nsegments; segz++) {
+		for (int segx=0; segx<=nsegments; segx++) {
+			GLfloat x = 2.0f * (GLfloat)segx/(GLfloat)nsegments - 1.0f;
+			GLfloat z = 2.0f * (GLfloat)segz/(GLfloat)nsegments - 1.0f;
+			strAppend(th, posval, (const char*)(&x), sizeof(GLfloat));
+			strAppend(th, posval, (const char*)(&zero), sizeof(GLfloat));
+			strAppend(th, posval, (const char*)(&z), sizeof(GLfloat));
+			strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
+			strAppend(th, normval, (const char*)(&one), sizeof(GLfloat));
+			strAppend(th, normval, (const char*)(&zero), sizeof(GLfloat));
+			GLfloat uv1 = uvrepeat * (GLfloat)segx/(GLfloat)nsegments;
+			GLfloat uv2 = uvrepeat * (1.0f - (GLfloat)segz/(GLfloat)nsegments);
+			strAppend(th, uvval, (const char*)(&uv1), sizeof(GLfloat));
+			strAppend(th, uvval, (const char*)(&uv2), sizeof(GLfloat));
+
+			// Generate two triangles per segment
+			if (segx>0 && segz>0) {
+				v0 = ((segz-1)*(nsegments+1))+segx-1;
+				v1 = ((segz-1)*(nsegments+1))+segx;
+				v2 = (segz*(nsegments+1))+segx;
+				v3 = (segz*(nsegments+1))+segx-1;
+				strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v3), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v0), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v1), sizeof(unsigned short));
+				strAppend(th, indxval, (const char*)(&v2), sizeof(unsigned short));
+			}
+		}
+	}
+	return 1;
+}
+
+const GLfloat cube_positions[] = {
+	-1., 1., -1.,  1., 1., -1.,  1., 1., 1.,  -1., 1., 1.,
+	-1., -1., -1.,  1., -1., -1.,  1., -1., 1.,  -1., -1., 1.,
+	-1., 1., -1.,  1., 1., -1.,  1., -1., -1.,  -1., -1., -1.,
+	-1., 1., 1.,  1., 1., 1.,  1., -1., 1.,  -1., -1., 1.,
+	-1., -1., -1.,  -1., 1., -1.,  -1., 1., 1.,  -1., -1., 1.,
+	1., -1., -1.,  1., 1., -1.,  1., 1., 1.,  1., -1., 1.
+};
+const char cube_indices[] = 
+	"0,1,2, 0,2,3, 4,5,6, 4,6,7, 8,9,10, 8,10,11, 12,13,14, 12,14,15, 16,17,18, 16,18,19, 20,21,22, 20,22,23";
+
+/** Generate a cube centered at 0.0.0. Parameter specifies its size. It has no uvs or normals. */
+int shape_cube(Value th) {
+	// Obtain and validate parameters
+	GLfloat cubesize = getTop(th)>=2 && isFloat(getLocal(th, 1))? toAfloat(getLocal(th,1)) : 1.0f;
+	int nverts = 72;
+
+	// Push a new Shape on the stack and give it buffer properties
+	int cubeidx = getTop(th);
+	pushSym(th, "new");
+	pushGloVar(th, "Shape");
+	getCall(th, 1, 1);
+	pushSym(th, "new");
+	pushGloVar(th, "Xyzs");
+	pushValue(th, anInt(nverts));
+	getCall(th, 2, 1);
+	Value posval = getFromTop(th, 0);
+	popProperty(th, cubeidx, "positions");
+	pushSym(th, "new");
+	pushGloVar(th, "Integers");
+	pushString(th, aNull, cube_indices);
+	getCall(th, 2, 1);
+	popProperty(th, cubeidx, "indices");
+
+	for (int v = 0; v<nverts; v++) {
+		GLfloat pos = cubesize * cube_positions[v];
+		strAppend(th, posval, (const char*)(&pos), sizeof(GLfloat));
 	}
 
 	return 1;
@@ -253,6 +410,10 @@ void shape_init(Value th) {
 		popProperty(th, 0, "_RenderIt");
 		pushCMethod(th, shape_sphere);
 		popProperty(th, 0, "NewSphere");
+		pushCMethod(th, shape_plane);
+		popProperty(th, 0, "NewPlane");
+		pushCMethod(th, shape_cube);
+		popProperty(th, 0, "NewCube");
 		pushTbl(th, aNull, 15);
 			pushValue(th, anInt(GL_POINTS));
 			popTblSet(th, 1, "Points");
