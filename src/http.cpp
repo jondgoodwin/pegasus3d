@@ -60,6 +60,8 @@ int http_get(Value th) {
 /** Initialize the Http type */
 void http_init(Value th) {
 	Value typ = pushType(th, aNull, 1);
+		pushSym(th, "Http");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, http_get);
 		popProperty(th, 0, "()");
 	popGloVar(th, "Http");

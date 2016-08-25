@@ -62,12 +62,12 @@ void initTypes(Value th) {
 void initWorld(Value th) {
 	// $ = +World
 	int curworld = getTop(th);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "World");
 	getCall(th, 1, 1);
 
 	// $.scene = +Scene
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Group");
 	getCall(th, 1, 1);
 	popProperty(th, curworld, "scene");

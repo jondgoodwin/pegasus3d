@@ -18,7 +18,7 @@ struct ColorInfo {
 /** Create a new color value, with passed red, green, blue and alpha values.
   Defaults: White if no passed values, Gray scale if 1 passed value, 1.0 if no alpha. */
 int color_new(Value th) {
-	Value colorv = pushCData(th, pushProperty(th, 0, "newtype"), PegVec4, 0, sizeof(ColorInfo));
+	Value colorv = pushCData(th, pushProperty(th, 0, "_newtype"), PegVec4, 0, sizeof(ColorInfo));
 	ColorInfo *color = (struct ColorInfo*) toHeader(colorv);
 	float default = 1.0f;
 	color->red = default = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : default;
@@ -55,13 +55,17 @@ int color_unpack(Value th) {
 /** Initialize Color type and mixin */
 void color_init(Value th) {
 	Value Camera = pushType(th, aNull, 2);
+		pushSym(th, "Color");
+		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 16);
+			pushSym(th, "*Color");
+			popProperty(th, 1, "_name");
 			pushCMethod(th, color_set);
 			popProperty(th, 1, "set");
 			pushCMethod(th, color_unpack);
 			popProperty(th, 1, "unpack");
-		popProperty(th, 0, "newtype");
+		popProperty(th, 0, "_newtype");
 		pushCMethod(th, color_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Color");
 }

@@ -28,24 +28,26 @@ int image_new(Value th) {
 	AuintIdx size = comp * x * y;
 
 	// Allocate buffers and populate header
-	Value imagev = pushCData(th, aNull, PegImage, size, sizeof(ImageHeader));
+	Value imagev = pushCData(th, aNull, PegImage, 0, sizeof(ImageHeader));
 	ImageHeader *imghdr = (ImageHeader*) toHeader(imagev);
 	imghdr->x = x;
 	imghdr->y = y;
 	imghdr->z = 0;
 	imghdr->nbytes = (unsigned char) comp;
 
-	// Copy over image content and free original
-	strAppend(th, imagev, image, size);	// TBD. Improve performance later by not copying
-	stbi_image_free(image);
+	// Give decoded image data to AcornVM instead of copying lots of data into a newly allocated area
+	// AcornVM will free it when done, so we should not do so now
+	strSwapBuffer(th, imagev, image, size);
 	return 1;
 }
 
 /** Initialize Image type and plug into Resource */
 void image_init(Value th) {
 	Value Image = pushType(th, aNull, 2);
+		pushSym(th, "Image");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, image_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Image");
 
 	// Register this type as Resource's 'acn' extension

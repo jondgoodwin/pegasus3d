@@ -70,7 +70,7 @@ bool window_newOpenGLWindow(WindowInfo *di)
 
 /** Create a new window instance using SDL2 & OpenGL within a window */
 int window_new(Value th) {
-	pushProperty(th, 0, "newtype"); // get the mixin type for instance
+	pushProperty(th, 0, "_newtype"); // get the mixin type for instance
 	Value dispinst = strHasFinalizer(pushCData(th, popValue(th), PegWindow, 0, sizeof(struct WindowInfo)));
 	di = (struct WindowInfo*) toHeader(dispinst);
 	window_newOpenGLWindow(di);
@@ -152,7 +152,11 @@ int window_render(Value th) {
 /** Initialize the Window type and '$window'*/
 void window_init(Value th) {
 	pushType(th, aNull, 6);
+		pushSym(th, "Window");
+		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 5);
+			pushSym(th, "*Window");
+			popProperty(th, 1, "_name");
 			pushCMethod(th, window_finalizer);
 			popProperty(th, 1, "_finalizer");
 			pushCMethod(th, window_getfullscreen);
@@ -161,8 +165,8 @@ void window_init(Value th) {
 			popProperty(th, 1, "fullscreen");
 			pushCMethod(th, window_render);
 			popProperty(th, 1, "_Render");
-		popProperty(th, 0, "newtype");
+		popProperty(th, 0, "_newtype");
 		pushCMethod(th, window_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Window");
 }

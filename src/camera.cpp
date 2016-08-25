@@ -31,7 +31,7 @@ int camera_perspective(Value th) {
 	GLfloat aspratio = ((GLfloat)toAint(pushProperty(th, contextidx, "viewWidth")))/((GLfloat)toAint(pushProperty(th, contextidx, "viewHeight")));
 
 	// Create calculated perspective matrix and store as mvpmatrix
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
 	Mat4 *mat = (Mat4*) toHeader(getFromTop(th, 0));
@@ -56,7 +56,7 @@ int camera_orthogonal(Value th) {
 	GLfloat aspratio = ((GLfloat)toAint(pushProperty(th, contextidx, "viewWidth")))/((GLfloat)toAint(pushProperty(th, contextidx, "viewHeight")));
 
 	// Create calculated orthogonal matrix and store as mvpmatrix
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
 	Mat4 *mat = (Mat4*) toHeader(getFromTop(th, 0));
@@ -96,12 +96,14 @@ int camera_render(Value th) {
 /** Initialize Camera type and create an instance in $.camera */
 void camera_init(Value th) {
 	// Camera is a new Region
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Region");
 	getCall(th, 1, 1);
 	Value Camera = getFromTop(th, 0);
+		pushSym(th, "Camera");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, camera_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 		pushCMethod(th, camera_render);
 		popProperty(th, 0, "_RenderIt");
 
@@ -122,28 +124,28 @@ void camera_init(Value th) {
 
 		pushSym(th, "Lookat");
 		popProperty(th, 0, "view");
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(5.0f));
 		getCall(th, 4, 1);
 		popProperty(th, 0, "location");
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
 		getCall(th, 4, 1);
 		popProperty(th, 0, "rotation");
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(0.0f));
 		getCall(th, 4, 1);
 		popProperty(th, 0, "lookat");
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Xyz");
 		pushValue(th, aFloat(0.0f));
 		pushValue(th, aFloat(1.0f));

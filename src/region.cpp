@@ -14,7 +14,7 @@ int region_new(Value th) {
 	pushType(th, getLocal(th, 0), 16);
 
 	// Create storage place for the render-calculated view matrix
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
 	popProperty(th, region, "mmatrix");
@@ -31,7 +31,7 @@ int region_render(Value th) {
 
 	// Create new context that inherits from old
 	int newcontextidx = getTop(th);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushLocal(th, contextidx);
 	getCall(th, 1, 1);
 
@@ -44,7 +44,7 @@ int region_render(Value th) {
 	Mat4 *viewmat = (Mat4*) toHeader(getFromTop(th, 0));
 
 	// Context: mvmatrix *= viewmat
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
 	Mat4 *newmat = (Mat4*) toHeader(getFromTop(th, 0));
@@ -116,8 +116,10 @@ int region_lookat(Value th) {
 /** Initialize the RenderContext type */
 void region_init(Value th) {
 	pushType(th, aNull, 6);
+		pushSym(th, "Region");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, region_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 		pushCMethod(th, region_render);
 		popProperty(th, 0, "_Render");
 		pushCMethod(th, region_rotation);

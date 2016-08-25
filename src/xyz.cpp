@@ -11,7 +11,7 @@
 /** Create a new Xyz value, with passed x,y,z values.
   Defaults: 0.0 where no passed values. */
 int xyz_new(Value th) {
-	Value xyzv = pushCData(th, pushProperty(th, 0, "newtype"), PegVec3, 0, sizeof(Xyz));
+	Value xyzv = pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz));
 	Xyz *xyz = (Xyz*) toHeader(xyzv);
 	xyz->x = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : 0.0f;
 	xyz->y = getTop(th)>2 && isFloat(getLocal(th,2))? toAfloat(getLocal(th, 2)) : 0.0f;
@@ -50,7 +50,7 @@ int xyz_len(Value th) {
 /** Return a new Xyz value that is the unit equivalent to self */
 int xyz_norm(Value th) {
 	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "newtype"), PegVec3, 0, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
 	xyzNorm(newxyz, xyz);
 	return 1;
 }
@@ -80,7 +80,7 @@ int xyz_add(Value th) {
 	}
 	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
 	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "newtype"), PegVec3, 0, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
 	xyzAdd(newxyz, xyz1, xyz2);
 	return 1;
 }
@@ -93,7 +93,7 @@ int xyz_subtract(Value th) {
 	}
 	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
 	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "newtype"), PegVec3, 0, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
 	newxyz->x = xyz1->x - xyz2->x;
 	newxyz->y = xyz1->y - xyz2->y;
 	newxyz->z = xyz1->z - xyz2->z;
@@ -108,7 +108,7 @@ int xyz_cross(Value th) {
 	}
 	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
 	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "newtype"), PegVec3, 0, sizeof(Xyz)));
+	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
 	xyzCross(newxyz, xyz1, xyz2);
 	return 1;
 }
@@ -129,7 +129,11 @@ int xyz_dot(Value th) {
 /** Initialize Xyz type and mixin */
 void xyz_init(Value th) {
 	Value Xyz = pushType(th, aNull, 2);
+		pushSym(th, "Xyz");
+		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 16);
+			pushSym(th, "*Xyz");
+			popProperty(th, 1, "_name");
 			pushCMethod(th, xyz_set);
 			popProperty(th, 1, "set");
 			pushCMethod(th, xyz_unpack);
@@ -148,8 +152,8 @@ void xyz_init(Value th) {
 			popProperty(th, 1, "*");
 			pushCMethod(th, xyz_dot);
 			popProperty(th, 1, "dot");
-		popProperty(th, 0, "newtype");
+		popProperty(th, 0, "_newtype");
 		pushCMethod(th, xyz_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Xyz");
 }

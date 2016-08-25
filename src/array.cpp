@@ -31,7 +31,7 @@ int xyzs_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "newtype"), PegArray, nStructs*3*sizeof(float), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*3*sizeof(float), sizeof(ArrayHeader));
 	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
 	hdr->mbrType = PegVec3;
 	hdr->structSz = 3;
@@ -91,7 +91,7 @@ int uvs_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "newtype"), PegArray, nStructs*3*sizeof(float), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*3*sizeof(float), sizeof(ArrayHeader));
 	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
 	hdr->mbrType = PegVec3;
 	hdr->structSz = 2;
@@ -137,7 +137,7 @@ int colors_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "newtype"), PegArray, nStructs*4*sizeof(float), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*4*sizeof(float), sizeof(ArrayHeader));
 	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
 	hdr->mbrType = PegVec4;
 	hdr->structSz = 4;
@@ -176,29 +176,41 @@ int colors_append(Value th) {
 
 void array_init(Value th) {
 	pushType(th, aNull, 2);
+		pushSym(th, "Xyzs");
+		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 16);
+			pushSym(th, "*Xyzs");
+			popProperty(th, 1, "_name");
 			pushCMethod(th, xyzs_append);
 			popProperty(th, 1, "<<");
-		popProperty(th, 0, "newtype");
+		popProperty(th, 0, "_newtype");
 		pushCMethod(th, xyzs_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Xyzs");
 
 	pushType(th, aNull, 2);
+		pushSym(th, "Uvs");
+		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 16);
+			pushSym(th, "*Uvs");
+			popProperty(th, 1, "_name");
 			//pushCMethod(th, uvs_append);
 			//popProperty(th, 1, "<<");
-		popProperty(th, 0, "newtype");
+		popProperty(th, 0, "_newtype");
 		pushCMethod(th, uvs_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Uvs");
 
 	pushType(th, aNull, 2);
+		pushSym(th, "Colors");
+		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 16);
+			pushSym(th, "*Colors");
+			popProperty(th, 1, "_name");
 			pushCMethod(th, colors_append);
 			popProperty(th, 1, "<<");
-		popProperty(th, 0, "newtype");
+		popProperty(th, 0, "_newtype");
 		pushCMethod(th, colors_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Colors");
 }

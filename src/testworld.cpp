@@ -60,7 +60,7 @@ void test_init(Value th) {
 	int sceneidx = getTop(th);
 	pushProperty(th, getTop(th)-1, "scene");
 	Value parts = pushArray(th, aNull, 1);
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Shape");
 		getCall(th, 1, 1);
 		Aint shape = getTop(th)-1;
@@ -68,19 +68,19 @@ void test_init(Value th) {
 			pushSym(th, "Polygon");
 			popSetActProp(th, shape, "draw");
 
-			pushSym(th, "new");
+			pushSym(th, "New");
 			pushGloVar(th, "Xyzs");
 			pushString(th, aNull, diamondptstr);
 			getCall(th, 2, 1);
 			popProperty(th, shape, "location");
 
-			pushSym(th, "new");
+			pushSym(th, "New");
 			pushGloVar(th, "Colors");
 			pushString(th, aNull, diamondcolstr);
 			getCall(th, 2, 1);
 			popProperty(th, shape, "color");
 
-			pushSym(th, "new");
+			pushSym(th, "New");
 			pushGloVar(th, "Shader");
 			getCall(th, 1, 1);
 			Aint shader = getTop(th)-1;
@@ -89,12 +89,12 @@ void test_init(Value th) {
 				popProperty(th, shader, "vertex");
 				pushString(th, aNull, fragmentshader);
 				popProperty(th, shader, "fragment");
-				pushSym(th, "new");
+				pushSym(th, "New");
 				pushGloVar(th, "List");
 				pushSym(th, "mvpmatrix");
 				getCall(th, 2, 1);
 				popProperty(th, shader, "uniforms");
-				pushSym(th, "new");
+				pushSym(th, "New");
 				pushGloVar(th, "List");
 				pushSym(th, "location");
 				pushSym(th, "color");

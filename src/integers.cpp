@@ -29,7 +29,7 @@ int integers_new(Value th) {
 	}
 
 	// Create the integer array
-	Value bufv = pushCData(th, pushProperty(th, 0, "newtype"), PegArray, nStructs*sizeof(short), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*sizeof(short), sizeof(ArrayHeader));
 	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
 	hdr->mbrType = PegUint16;
 	hdr->structSz = 1;
@@ -71,11 +71,15 @@ int integers_append(Value th) {
 /** Initialize Color type and mixin */
 void integers_init(Value th) {
 	pushType(th, aNull, 2);
+		pushSym(th, "Integers");
+		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 16);
+			pushSym(th, "*Integers");
+			popProperty(th, 1, "_name");
 			pushCMethod(th, integers_append);
 			popProperty(th, 1, "<<");
-		popProperty(th, 0, "newtype");
+		popProperty(th, 0, "_newtype");
 		pushCMethod(th, integers_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 	popGloVar(th, "Integers");
 }

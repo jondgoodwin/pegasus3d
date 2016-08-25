@@ -29,7 +29,7 @@ int render_cameraXyz(Value th) {
 	popValue(th);
 
 	// Create placeholder for new, calculated Xyz
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Xyz");
 	getCall(th, 1, 1);
 	Xyz *newxyz = (Xyz*) toHeader(getFromTop(th, 0));
@@ -41,8 +41,10 @@ int render_cameraXyz(Value th) {
 /** Initialize the RenderContext type */
 void render_init(Value th) {
 	pushType(th, aNull, 6);
+		pushSym(th, "RenderContext");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, render_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 		pushCMethod(th, render_cameraXyz);
 		popProperty(th, 0, "CameraXyz");
 	popGloVar(th, "RenderContext");

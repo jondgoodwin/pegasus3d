@@ -182,7 +182,7 @@ int world_render(Value th) {
 	pushSym(th, "_Render");
 	if (pushProperty(th, selfidx, "window")==aNull) {
 		popValue(th);
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Window");
 		getCall(th, 1, 1);
 		pushValue(th, getFromTop(th, 0));
@@ -191,7 +191,7 @@ int world_render(Value th) {
 
 	// Create render context
 	int contextidx = getTop(th);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "RenderContext");
 	getCall(th, 1, 1);
 
@@ -202,7 +202,7 @@ int world_render(Value th) {
 	// Store camera in the context, creating if needed using default view
 	if (pushProperty(th, selfidx, "camera")==aNull) {
 		popValue(th);
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Camera");
 		getCall(th, 1, 1);
 		pushValue(th, getFromTop(th, 0));
@@ -218,8 +218,10 @@ int world_render(Value th) {
 /** Initialize the World type */
 void world_init(Value th) {
 	pushType(th, aNull, 6);
+		pushSym(th, "World");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, world_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 		pushCMethod(th, world_getrunning);
 		pushCMethod(th, world_setrunning);
 		pushValue(th, aTrue);

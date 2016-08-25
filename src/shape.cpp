@@ -25,28 +25,28 @@ int shape_sphere(Value th) {
 
 	// Push a new Shape on the stack and give it buffer properties
 	int sphereidx = getTop(th);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Shape");
 	getCall(th, 1, 1);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Xyzs");
 	pushValue(th, anInt(nverts));
 	getCall(th, 2, 1);
 	Value posval = getFromTop(th, 0);
 	popProperty(th, sphereidx, "positions");
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Xyzs");
 	pushValue(th, anInt(nverts));
 	getCall(th, 2, 1);
 	Value normval = getFromTop(th, 0);
 	popProperty(th, sphereidx, "normals");
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Uvs");
 	pushValue(th, anInt(nverts));
 	getCall(th, 2, 1);
 	Value uvval = getFromTop(th, 0);
 	popProperty(th, sphereidx, "uvs");
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Integers");
 	pushValue(th, anInt(nindices));
 	getCall(th, 2, 1);
@@ -169,28 +169,28 @@ int shape_plane(Value th) {
 
 	// Push a new Shape on the stack and give it buffer properties
 	int planeidx = getTop(th);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Shape");
 	getCall(th, 1, 1);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Xyzs");
 	pushValue(th, anInt(nverts));
 	getCall(th, 2, 1);
 	Value posval = getFromTop(th, 0);
 	popProperty(th, planeidx, "positions");
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Xyzs");
 	pushValue(th, anInt(nverts));
 	getCall(th, 2, 1);
 	Value normval = getFromTop(th, 0);
 	popProperty(th, planeidx, "normals");
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Uvs");
 	pushValue(th, anInt(nverts));
 	getCall(th, 2, 1);
 	Value uvval = getFromTop(th, 0);
 	popProperty(th, planeidx, "uvs");
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Integers");
 	pushValue(th, anInt(nindices));
 	getCall(th, 2, 1);
@@ -253,16 +253,16 @@ int shape_cube(Value th) {
 
 	// Push a new Shape on the stack and give it buffer properties
 	int cubeidx = getTop(th);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Shape");
 	getCall(th, 1, 1);
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Xyzs");
 	pushValue(th, anInt(nverts));
 	getCall(th, 2, 1);
 	Value posval = getFromTop(th, 0);
 	popProperty(th, cubeidx, "positions");
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Integers");
 	pushString(th, aNull, cube_indices);
 	getCall(th, 2, 1);
@@ -400,12 +400,14 @@ int shape_renderit(Value th) {
 /** Initialize shape type */
 void shape_init(Value th) {
 	// Shape is a new Region
-	pushSym(th, "new");
+	pushSym(th, "New");
 	pushGloVar(th, "Region");
 	getCall(th, 1, 1);
 	Value Shape = getFromTop(th, 0);
+		pushSym(th, "Shape");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, shape_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 		pushCMethod(th, shape_renderit);
 		popProperty(th, 0, "_RenderIt");
 		pushCMethod(th, shape_sphere);
@@ -415,6 +417,8 @@ void shape_init(Value th) {
 		pushCMethod(th, shape_cube);
 		popProperty(th, 0, "NewCube");
 		pushTbl(th, aNull, 15);
+			pushSym(th, "*Shape");
+			popProperty(th, 1, "_name");
 			pushValue(th, anInt(GL_POINTS));
 			popTblSet(th, 1, "Points");
 			pushValue(th, anInt(GL_LINE_STRIP));

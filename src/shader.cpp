@@ -144,7 +144,7 @@ int shader_render(Value th) {
 		glUseProgram(pgmdata->program);
 
 		// Calculate mvpmatrix = pmatrix * mvmatrix
-		pushSym(th, "new");
+		pushSym(th, "New");
 		pushGloVar(th, "Matrix4");
 		getCall(th, 1, 1);
 		Mat4 *mvp = (Mat4*) toHeader(getFromTop(th, 0));
@@ -203,11 +203,15 @@ int shader_render(Value th) {
 /** Initialize shader type */
 void shader_init(Value th) {
 	Value Shader = pushType(th, aNull, 16);
+		pushSym(th, "Shader");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, shader_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 		pushCMethod(th, shader_render);
 		popProperty(th, 0, "_Render");
 		Value pgmmmixin = pushMixin(th, aNull, aNull, 4);
+			pushSym(th, "*Shader");
+			popProperty(th, 1, "_name");
 			pushCMethod(th, shader_closepgm);
 			popProperty(th, 1, "_finalizer");
 		popProperty(th, 0, "_compiledtype");

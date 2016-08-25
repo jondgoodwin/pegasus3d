@@ -145,8 +145,10 @@ int texture_render(Value th) {
 /** Initialize Texture type */
 void texture_init(Value th) {
 	Value Image = pushType(th, aNull, 2);
+		pushSym(th, "Texture");
+		popProperty(th, 0, "_name");
 		pushCMethod(th, texture_new);
-		popProperty(th, 0, "new");
+		popProperty(th, 0, "New");
 		pushSym(th, "Texture");
 		popProperty(th, 0, "name");
 		pushCMethod(th, texture_render);
