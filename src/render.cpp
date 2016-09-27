@@ -23,10 +23,11 @@ int render_cameraXyz(Value th) {
 	}
 	Xyz *oldxyz = (Xyz*) toHeader(oldxyzv);
 
-	// Obtain 'mvmatrix' from context
-	pushProperty(th, 0, "mvmatrix");
-	Mat4 *mvmat = (Mat4*) toHeader(getFromTop(th, 0));
-	popValue(th);
+	// Calculate 'mvmatrix' from context
+	Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, 0, "mmatrix")); popValue(th);
+	Mat4 *vmatrix = (Mat4*) toHeader(pushProperty(th, 0, "vmatrix")); popValue(th);
+	Mat4 mvmatrix;
+	mat4Mult(&mvmatrix, vmatrix, mmatrix);
 
 	// Create placeholder for new, calculated Xyz
 	pushSym(th, "New");
@@ -34,7 +35,7 @@ int render_cameraXyz(Value th) {
 	getCall(th, 1, 1);
 	Xyz *newxyz = (Xyz*) toHeader(getFromTop(th, 0));
 
-	mat4MultVec(newxyz, mvmat, oldxyz);
+	mat4MultVec(newxyz, &mvmatrix, oldxyz);
 	return 1;
 }
 

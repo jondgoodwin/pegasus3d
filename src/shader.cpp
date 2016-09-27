@@ -124,7 +124,7 @@ int shader_new(Value th) {
 int shader_render(Value th) {
 	int selfidx = 0;
 	int contextidx = 1;
-	int texunit = 0;
+	int shapeidx = 2;
 
 	// Get compiled shader, if it exists
 	Value pgmv = pushProperty(th, selfidx, "_program");
@@ -143,38 +143,56 @@ int shader_render(Value th) {
 		ShaderPgm *pgmdata = (ShaderPgm*) toHeader(pgmv);
 		glUseProgram(pgmdata->program);
 
-		// Calculate mvpmatrix = pmatrix * mvmatrix
-		pushSym(th, "New");
-		pushGloVar(th, "Matrix4");
-		getCall(th, 1, 1);
-		Mat4 *mvp = (Mat4*) toHeader(getFromTop(th, 0));
-		Value pmatrix = pushProperty(th, contextidx, "pmatrix"); popValue(th);
-		Value mvmatrix = pushProperty(th, contextidx, "mvmatrix"); popValue(th);
-		mat4Mult(mvp, (Mat4*) toHeader(pmatrix), (Mat4*) toHeader(mvmatrix));
-		popProperty(th, contextidx, "mvpmatrix");
+		// Calculate mvpmatrix = pmatrix * (mvmatrix = vmatrix * mmatrix)
+		Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, contextidx, "mmatrix")); popValue(th);
+		Mat4 *vmatrix = (Mat4*) toHeader(pushProperty(th, contextidx, "vmatrix")); popValue(th);
+		Mat4 *pmatrix = (Mat4*) toHeader(pushProperty(th, contextidx, "pmatrix")); popValue(th);
+		Mat4 mvpmatrix, mvmatrix;
+		mat4Mult(&mvmatrix, vmatrix, mmatrix);
+		mat4Mult(&mvpmatrix, pmatrix, &mvmatrix);
 
-		// Load all the shader's named "uniform" values from the context
+		// Load all the shader's named "uniform" values from the shape or context
 		Value uniformlist = pushProperty(th, selfidx, "uniforms"); popValue(th);
 		if (isArr(uniformlist)) {
 			for (AuintIdx i=0; i < getSize(uniformlist); i++) {
 				Value uninamev = arrGet(th, uniformlist, i);
-				Value unival = getProperty(th, getLocal(th, contextidx), uninamev);
+				if (!isSym(uninamev)) continue;
+
+				// Is the uniform a matrix we just calculated?
+				const char *uninamestr = toStr(uninamev);
+				if (0==strcmp("mvpmatrix", uninamestr)) {
+					glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *)&mvpmatrix);
+					continue;
+				}
+				else if (0==strcmp("mvmatrix", uninamestr)) {
+					glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *)&mvmatrix);
+					continue;
+				}
+				else if (0==strcmp("mmatrix", uninamestr)) {
+					glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *)mmatrix);
+					continue;
+				}
+
+				// Get and process a uniform value from the shape or render context
+				Value unival = getProperty(th, getLocal(th, shapeidx), uninamev);
+				if (unival == aNull)
+					unival = getProperty(th, getLocal(th, contextidx), uninamev);
 				if (isFloat(unival))
-					glUniform1f(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAfloat(unival));
+					glUniform1f(glGetUniformLocation(pgmdata->program, uninamestr), toAfloat(unival));
 				else if (isInt(unival))
-					glUniform1i(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAint(unival));
+					glUniform1i(glGetUniformLocation(pgmdata->program, uninamestr), toAint(unival));
 				else if (isCData(unival)) {
 					switch(getCDataType(unival)) {
-					case PegMat2: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
-					case PegMat3: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					case PegMat2: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					case PegMat3: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
 					case PegMat4: 
-						glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
-					//case PegUint32: glUniform1iv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), univalhdr->nStructs, (GLint *) toCData(unival)); break;
-					case PegFloat: glUniform1fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toCData(unival)); break;
-					case PegVec2: glUniform2fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toHeader(unival)); break;
-					case PegVec3: glUniform3fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toHeader(unival)); break;
+						glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					//case PegUint32: glUniform1iv(glGetUniformLocation(pgmdata->program, uninamestr), univalhdr->nStructs, (GLint *) toCData(unival)); break;
+					case PegFloat: glUniform1fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toCData(unival)); break;
+					case PegVec2: glUniform2fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
+					case PegVec3: glUniform3fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
 					case PegVec4: 
-						glUniform4fv(glGetUniformLocation(pgmdata->program, toStr(uninamev)), 1, (GLfloat *) toHeader(unival)); break;
+						glUniform4fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
 					default: 
 						//const char *x = toStr(uninamev);
 						assert(false && "Unsupported uniform type!!!");
@@ -183,12 +201,13 @@ int shader_render(Value th) {
 					pushSym(th, "name");
 					Value name = getProperty(th, unival, getFromTop(th, 0));
 					popValue(th);
+					// If it is a texture, render it to get its texture unit value
 					if (isEqStr(name, "Texture")) {
 						pushSym(th, "_Render");
 						pushValue(th, unival);
 						pushLocal(th, contextidx);
 						getCall(th, 2, 1);
-						glUniform1i(glGetUniformLocation(pgmdata->program, toStr(uninamev)), toAint(popValue(th)));
+						glUniform1i(glGetUniformLocation(pgmdata->program, uninamestr), toAint(popValue(th)));
 					}
 				}
 			}

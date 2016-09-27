@@ -72,23 +72,34 @@ int camera_render(Value th) {
 		return 0; // Context must be passed
 
 	// Calculate designated projection matrix into context
-	Value projmeth = getProperty(th, getLocal(th, camidx), "projection");
-	if (projmeth!=aNull) pushValue(th, projmeth);
-	else pushSym(th, "Perspective");
+	Value projmeth = pushProperty(th, camidx, "projection");
+	if (projmeth==aNull) {
+		popValue(th);
+		pushSym(th, "Perspective");
+	}
 	pushLocal(th, camidx);
 	pushLocal(th, contextidx);
 	getCall(th, 2, 1);
 	popProperty(th, contextidx, "pmatrix");
 
 	// Calculate camera's view matrix, invert and put in "mvmatrix"
-	Value viewmeth = getProperty(th, getLocal(th, camidx), "view");
-	if (viewmeth!=aNull) pushValue(th, viewmeth);
-	else pushSym(th, "Rotation");
+	Value viewmeth = pushProperty(th, camidx, "view");
+	if (viewmeth==aNull) {
+		popValue(th);
+		pushSym(th, "Rotation");
+	}
 	pushLocal(th, camidx);
 	getCall(th, 1, 1);
 	Mat4 *vmat = (Mat4*) toHeader(getFromTop(th, 0));
 	mat4Inverse(vmat, vmat); // Because we want world->camera
-	popProperty(th, contextidx, "mvmatrix");
+	popProperty(th, contextidx, "vmatrix");
+
+	// Put identity matrix for world coordinates in context as "mmatrix"
+	pushSym(th, "New");
+	pushGloVar(th, "Matrix4");
+	getCall(th, 1, 1);
+	Value retval = getFromTop(th, 0);
+	popProperty(th, contextidx, "mmatrix");
 
 	return 0;
 }
@@ -122,7 +133,7 @@ void camera_init(Value th) {
 		pushValue(th, aFloat(1000.0)); // maximum distance
 		popProperty(th, 0, "far");
 
-		pushSym(th, "Lookat");
+		pushSym(th, "Rotation");
 		popProperty(th, 0, "view");
 		pushSym(th, "New");
 		pushGloVar(th, "Xyz");

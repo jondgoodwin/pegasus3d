@@ -92,13 +92,112 @@ int world_update(Value th) {
 		Xyz *rotxyz = (Xyz *)toHeader(rotv);
 		rotxyz->y = camYRotation;
 	}
+
+	pushSym(th, "animate");
+	pushLocal(th, 0);
+	pushLocal(th, 1);
+	getCall(th, 2, 0);
+
 	setTop(th, 1);
 	return 1;
+}
+
+void pushKeySym(Value th, SDL_Scancode key) {
+	switch(key) {
+	case SDL_SCANCODE_0: pushSym(th, "key_0"); break;
+	case SDL_SCANCODE_1: pushSym(th, "key_1"); break;
+	case SDL_SCANCODE_2: pushSym(th, "key_2"); break;
+	case SDL_SCANCODE_3: pushSym(th, "key_3"); break;
+	case SDL_SCANCODE_4: pushSym(th, "key_4"); break;
+	case SDL_SCANCODE_5: pushSym(th, "key_5"); break;
+	case SDL_SCANCODE_6: pushSym(th, "key_6"); break;
+	case SDL_SCANCODE_7: pushSym(th, "key_7"); break;
+	case SDL_SCANCODE_8: pushSym(th, "key_8"); break;
+	case SDL_SCANCODE_9: pushSym(th, "key_9"); break;
+	case SDL_SCANCODE_A: pushSym(th, "key_A"); break;
+	case SDL_SCANCODE_B: pushSym(th, "key_B"); break;
+	case SDL_SCANCODE_C: pushSym(th, "key_C"); break;
+	case SDL_SCANCODE_D: pushSym(th, "key_D"); break;
+	case SDL_SCANCODE_E: pushSym(th, "key_E"); break;
+	case SDL_SCANCODE_F: pushSym(th, "key_F"); break;
+	case SDL_SCANCODE_G: pushSym(th, "key_G"); break;
+	case SDL_SCANCODE_H: pushSym(th, "key_H"); break;
+	case SDL_SCANCODE_I: pushSym(th, "key_I"); break;
+	case SDL_SCANCODE_J: pushSym(th, "key_J"); break;
+	case SDL_SCANCODE_K: pushSym(th, "key_K"); break;
+	case SDL_SCANCODE_L: pushSym(th, "key_L"); break;
+	case SDL_SCANCODE_M: pushSym(th, "key_M"); break;
+	case SDL_SCANCODE_N: pushSym(th, "key_N"); break;
+	case SDL_SCANCODE_O: pushSym(th, "key_O"); break;
+	case SDL_SCANCODE_P: pushSym(th, "key_P"); break;
+	case SDL_SCANCODE_Q: pushSym(th, "key_Q"); break;
+	case SDL_SCANCODE_R: pushSym(th, "key_R"); break;
+	case SDL_SCANCODE_S: pushSym(th, "key_S"); break;
+	case SDL_SCANCODE_T: pushSym(th, "key_T"); break;
+	case SDL_SCANCODE_U: pushSym(th, "key_U"); break;
+	case SDL_SCANCODE_V: pushSym(th, "key_V"); break;
+	case SDL_SCANCODE_W: pushSym(th, "key_W"); break;
+	case SDL_SCANCODE_X: pushSym(th, "key_X"); break;
+	case SDL_SCANCODE_Y: pushSym(th, "key_Y"); break;
+	case SDL_SCANCODE_Z: pushSym(th, "key_Z"); break;
+
+	case SDL_SCANCODE_F1: pushSym(th, "key_f1"); break;
+	case SDL_SCANCODE_F2: pushSym(th, "key_f2"); break;
+	case SDL_SCANCODE_F3: pushSym(th, "key_f3"); break;
+	case SDL_SCANCODE_F4: pushSym(th, "key_f4"); break;
+	case SDL_SCANCODE_F5: pushSym(th, "key_f5"); break;
+	case SDL_SCANCODE_F6: pushSym(th, "key_f6"); break;
+	case SDL_SCANCODE_F7: pushSym(th, "key_f7"); break;
+	case SDL_SCANCODE_F8: pushSym(th, "key_f8"); break;
+	case SDL_SCANCODE_F9: pushSym(th, "key_f9"); break;
+	case SDL_SCANCODE_F10: pushSym(th, "key_f10"); break;
+	case SDL_SCANCODE_F11: pushSym(th, "key_f11"); break;
+	case SDL_SCANCODE_F12: pushSym(th, "key_f12"); break;
+
+	case SDL_SCANCODE_APOSTROPHE: pushSym(th, "key_apostrophe"); break;
+	case SDL_SCANCODE_BACKSLASH: pushSym(th, "key_backslash"); break;
+	case SDL_SCANCODE_BACKSPACE: pushSym(th, "key_backspace"); break;
+	case SDL_SCANCODE_CAPSLOCK: pushSym(th, "key_capslock"); break;
+	case SDL_SCANCODE_COMMA: pushSym(th, "key_comma"); break;
+	case SDL_SCANCODE_DELETE: pushSym(th, "key_delete"); break;
+	case SDL_SCANCODE_DOWN: pushSym(th, "key_down"); break;
+	case SDL_SCANCODE_EQUALS: pushSym(th, "key_equals"); break;
+	case SDL_SCANCODE_ESCAPE: pushSym(th, "key_escape"); break;
+	case SDL_SCANCODE_GRAVE: pushSym(th, "key_grave"); break;
+	case SDL_SCANCODE_END: pushSym(th, "key_end"); break;
+	case SDL_SCANCODE_HOME: pushSym(th, "key_home"); break;
+	case SDL_SCANCODE_INSERT: pushSym(th, "key_insert"); break;
+	case SDL_SCANCODE_LALT: pushSym(th, "key_lalt"); break;
+	case SDL_SCANCODE_LCTRL: pushSym(th, "key_lctrl"); break;
+	case SDL_SCANCODE_LEFT: pushSym(th, "key_left"); break;
+	case SDL_SCANCODE_LSHIFT: pushSym(th, "key_lshift"); break;
+	case SDL_SCANCODE_MINUS: pushSym(th, "key_minus"); break;
+	case SDL_SCANCODE_PAGEDOWN: pushSym(th, "key_pagedown"); break;
+	case SDL_SCANCODE_PAGEUP: pushSym(th, "key_pageup"); break;
+	case SDL_SCANCODE_PAUSE: pushSym(th, "key_pause"); break;
+	case SDL_SCANCODE_PERIOD: pushSym(th, "key_period"); break;
+	case SDL_SCANCODE_PRINTSCREEN: pushSym(th, "key_printscreen"); break;
+	case SDL_SCANCODE_RALT: pushSym(th, "key_ralt"); break;
+	case SDL_SCANCODE_RCTRL: pushSym(th, "key_rctrl"); break;
+	case SDL_SCANCODE_RETURN: pushSym(th, "key_return"); break;
+	case SDL_SCANCODE_RIGHT: pushSym(th, "key_right"); break;
+	case SDL_SCANCODE_RIGHTBRACKET: pushSym(th, "key_rightbracket"); break;
+	case SDL_SCANCODE_RSHIFT: pushSym(th, "key_rshift"); break;
+	case SDL_SCANCODE_SEMICOLON: pushSym(th, "key_semicolon"); break;
+	case SDL_SCANCODE_SLASH: pushSym(th, "key_slash"); break;
+	case SDL_SCANCODE_SPACE: pushSym(th, "key_space"); break;
+	case SDL_SCANCODE_SYSREQ: pushSym(th, "key_sysreq"); break;
+	case SDL_SCANCODE_TAB: pushSym(th, "key_tab"); break;
+	case SDL_SCANCODE_UP: pushSym(th, "key_up"); break;
+	default: pushValue(th, aNull);
+	}
 }
 
 /** Check for any input, and then handle appropriately */
 int world_handleInput(Value th)
 {
+	int inputIdx = getTop(th);
+	Value inputContext = pushProperty(th, 0, "input");
 	SDL_Event event;
 	while (SDL_PollEvent(&event))
 	{
@@ -128,6 +227,16 @@ int world_handleInput(Value th)
 			case SDLK_RIGHT:
 				camYRotRate = 0;
 				break;
+			default:
+				if (inputContext!=aNull && event.key.repeat==0) {
+					Value keydown = pushProperty(th, inputIdx, "keyUp");
+					pushKeySym(th, event.key.keysym.scancode);
+					pushValue(th, getProperty(th, keydown, getFromTop(th, 0)));
+					pushValue(th, aNull);
+					getCall(th, 1, 1);
+					popValue(th);
+					popValue(th);
+				}
 			}
 		}
 
@@ -167,11 +276,21 @@ int world_handleInput(Value th)
 				break;
 
 			default:
+				if (inputContext!=aNull && event.key.repeat==0) {
+					Value keydown = pushProperty(th, inputIdx, "keyDown");
+					pushKeySym(th, event.key.keysym.scancode);
+					pushValue(th, getProperty(th, keydown, getFromTop(th, 0)));
+					pushValue(th, aNull);
+					getCall(th, 1, 1);
+					popValue(th);
+					popValue(th);
+				}
 				break;
 			}
 		}
 	}
-	return 1;
+	popValue(th);
+	return 0;
 }
 
 /** Render the world's scene via .camera to .window */

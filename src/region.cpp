@@ -35,22 +35,24 @@ int region_render(Value th) {
 	pushLocal(th, contextidx);
 	getCall(th, 1, 1);
 
-	// Use "view"'s method to calculate 'mmodel'
-	Value viewmeth = pushProperty(th, selfidx, "view"); popValue(th);
-	if (viewmeth!=aNull) pushValue(th, viewmeth);
-	else pushSym(th, "Rotation");
+	// Use region's "view" method to calculate regionmatrix
+	if (aNull == pushProperty(th, selfidx, "view")) {
+		popValue(th);
+		pushSym(th, "Rotation");
+	}
 	pushLocal(th, selfidx);
 	getCall(th, 1, 1);
-	Mat4 *viewmat = (Mat4*) toHeader(getFromTop(th, 0));
+	Mat4 *regionmatrix = (Mat4*) toHeader(getFromTop(th, 0));
+	popProperty(th, selfidx, "_matrix");
 
-	// Context: mvmatrix *= viewmat
+	// Context: mmatrix *= regionmatrix
 	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
 	Mat4 *newmat = (Mat4*) toHeader(getFromTop(th, 0));
-	Value mvmatrix = pushProperty(th, newcontextidx, "mvmatrix"); popValue(th);
-	mat4Mult(newmat, (Mat4*) toHeader(mvmatrix), viewmat);
-	popProperty(th, newcontextidx, "mvmatrix");
+	Value mmatrix = pushProperty(th, newcontextidx, "mmatrix"); popValue(th);
+	mat4Mult(newmat, (Mat4*) toHeader(mmatrix), regionmatrix);
+	popProperty(th, newcontextidx, "mmatrix");
 
 	// Ask if we should render it? (and augment context)
 	pushProperty(th, selfidx, "render?"); // Assume it is method

@@ -30,9 +30,12 @@ typedef struct Xyz {
 /** Return a new Xyz value that is the unit equivalent to self */
 #define xyzNorm(newxyz, xyz) \
 	{GLfloat len = xyzLen(xyz); \
-	(newxyz)->x = (xyz)->x/len; \
-	(newxyz)->y = (xyz)->y/len; \
-	(newxyz)->z = (xyz)->z/len;}
+	 if (len>0.0f) { \
+		len = 1.0f/len; \
+		(newxyz)->x = (xyz)->x*len; \
+		(newxyz)->y = (xyz)->y*len; \
+		(newxyz)->z = (xyz)->z*len;} \
+	else {(newxyz)->x = 1.0f; (newxyz)->y = (newxyz)->z = 0.0f;}}
 
 /** Return a new Xyz value that is the addition of xyz1 and xyz2 */
 #define xyzAdd(newxyz, xyz1, xyz2) \
@@ -40,11 +43,18 @@ typedef struct Xyz {
 	(newxyz)->y = (xyz1)->y + (xyz2)->y; \
 	(newxyz)->z = (xyz1)->z + (xyz2)->z;}
 
+/** Return a new Xyz value that is the subtraction of xyz1 and xyz2 */
+#define xyzSub(newxyz, xyz1, xyz2) \
+	{(newxyz)->x = (xyz1)->x - (xyz2)->x; \
+	(newxyz)->y = (xyz1)->y - (xyz2)->y; \
+	(newxyz)->z = (xyz1)->z - (xyz2)->z;}
+
 /** Return a new Xyz value that is the cross product of two Xyz values */
 #define xyzCross(newxyz, xyz1, xyz2) \
-	{(newxyz)->x = (xyz1)->y*(xyz2)->z - (xyz1)->z*(xyz2)->y; \
-	(newxyz)->y = (xyz1)->z*(xyz2)->x - (xyz1)->x*(xyz2)->z; \
-	(newxyz)->z = (xyz1)->x*(xyz2)->y - (xyz1)->y*(xyz2)->x;}
+	{float x = (xyz1)->x; float y = (xyz1)->y; float z = (xyz1)->z; \
+	(newxyz)->x = y*(xyz2)->z - z*(xyz2)->y; \
+	(newxyz)->y = z*(xyz2)->x - x*(xyz2)->z; \
+	(newxyz)->z = x*(xyz2)->y - y*(xyz2)->x;}
 
 #define xyzDot(xyz1, xyz2) \
 	((xyz1)->x*(xyz2)->x + (xyz1)->y*(xyz2)->y + (xyz1)->z*(xyz2)->z)

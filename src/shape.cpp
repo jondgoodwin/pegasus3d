@@ -276,35 +276,42 @@ int shape_cube(Value th) {
 	return 1;
 }
 
-/** Get the draw property's closure value: OpenGL integer value */
+/** Get the draw property (symbol) */
 int shape_getDraw(Value th) {
-	pushCloVar(th, 2);
+	pushProperty(th, 0, "_drawsym");
 	return 1;
 }
 
 /** Set the draw property's closure value using symbols */
 int shape_setDraw(Value th) {
-	Value primtbl = pushProperty(th, 0, "_$drawPrimitives");
-	Value drawprim = pushValue(th, tblGet(th, primtbl, getLocal(th, 1)));
-	if (drawprim == aNull) {
-		pushValue(th, anInt(GL_TRIANGLES));
+	GLint draw = GL_TRIANGLES;
+	Value drawsym = getLocal(th, 1);
+	if (isSym(drawsym)) {
+		const char *drawstr = toStr(drawsym);
+		if (strcmp("Triangles", drawstr)==0) draw=GL_TRIANGLES;
+		else if (strcmp("TriangleStrip", drawstr)==0) draw=GL_TRIANGLE_STRIP;
+		else if (strcmp("TriangleFan", drawstr)==0) draw=GL_TRIANGLE_FAN;
+		else if (strcmp("TrianglesAdjacency", drawstr)==0) draw=GL_TRIANGLES_ADJACENCY;
+		else if (strcmp("TriangleStripAdjacency", drawstr)==0) draw=GL_TRIANGLE_STRIP_ADJACENCY;
+		else if (strcmp("Patches", drawstr)==0) draw=GL_PATCHES;
+		else if (strcmp("Lines", drawstr)==0) draw=GL_LINES;
+		else if (strcmp("LineStrip", drawstr)==0) draw=GL_LINE_STRIP;
+		else if (strcmp("LineLoop", drawstr)==0) draw=GL_LINE_LOOP;
+		else if (strcmp("LinesAdjacency", drawstr)==0) draw=GL_LINES_ADJACENCY;
+		else if (strcmp("LineStripAdjacency", drawstr)==0) draw=GL_LINE_STRIP_ADJACENCY;
+		else if (strcmp("Points", drawstr)==0) draw=GL_POINTS;
+		else if (strcmp("Polygon", drawstr)==0) draw=GL_POLYGON; // TriangleFan
 	}
-	popCloVar(th, 2);
-	return 1;
+	pushValue(th, anInt(draw));
+	popProperty(th, 0, "_draw");
+	pushValue(th, drawsym);
+	popProperty(th, 0, "_drawsym");
+	return 0;
 }
 
 /** Create a new shape */
 int shape_new(Value th) {
-	AuintIdx newShapeIdx = getTop(th);
 	pushType(th, getLocal(th, 0), 16); // subtype from Shape
-
-	// Create a new closure for 'draw', to lookup primitive only on set
-	pushCMethod(th, shape_getDraw);
-	pushCMethod(th, shape_setDraw);
-	pushValue(th, anInt(GL_TRIANGLES));
-	pushClosure(th, 3);
-	popProperty(th, newShapeIdx, "draw");
-
 	return 1;
 }
 
@@ -315,9 +322,14 @@ int shape_renderit(Value th) {
 
 	// Render the shader, loading it and its uniforms
 	pushSym(th, "_Render");
-	Value shader = pushProperty(th, contextidx, "shader");
+	Value shader = pushProperty(th, selfidx, "shader");
+	if (shader == aNull) {
+		popValue(th);
+		shader = pushProperty(th, contextidx, "shader");
+	}
 	pushLocal(th, contextidx);
-	getCall(th, 2, 0);
+	pushLocal(th, selfidx);
+	getCall(th, 3, 0);
 
 	// Draw the vertexes using the vertex attribute buffers
 	GLuint vao;
@@ -363,8 +375,8 @@ int shape_renderit(Value th) {
 		nverts = (nverts < 0 || nverts>buffhdr->nStructs)? buffhdr->nStructs : nverts;
 	}
 
-	// How shall we draw them?
-	Value drawprop = pushGetActProp(th, selfidx, "draw");
+	// How shall we draw the primitives?
+	Value drawprop = pushGetActProp(th, selfidx, "_draw");
 	int drawmode = isInt(drawprop)? toAint(drawprop) : GL_TRIANGLES;
 	popValue(th);
 
@@ -382,13 +394,14 @@ int shape_renderit(Value th) {
 
 		// Draw the vertices using the indices as a guide
 		glDrawElements(drawmode, verthdr->nStructs, GL_UNSIGNED_SHORT, (void*)0);
+		glDeleteBuffers(1, &elementbuffer);
 	}
 	/* Otherwise, draw specified primitives using vertices defined by attribute buffers */
 	else
 		glDrawArrays(drawmode, 0, nverts);
 	popValue(th); // vertices
 
-	/* Clean up alloc	ated array and buffers */
+	/* Clean up allocated array and buffers */
 	for (int i=0; i<nattrs; i++) {
 		glDisableVertexAttribArray(i);
 	}
@@ -416,35 +429,10 @@ void shape_init(Value th) {
 		popProperty(th, 0, "NewPlane");
 		pushCMethod(th, shape_cube);
 		popProperty(th, 0, "NewCube");
-		pushTbl(th, aNull, 15);
-			pushSym(th, "*Shape");
-			popProperty(th, 1, "_name");
-			pushValue(th, anInt(GL_POINTS));
-			popTblSet(th, 1, "Points");
-			pushValue(th, anInt(GL_LINE_STRIP));
-			popTblSet(th, 1, "LineStrip");
-			pushValue(th, anInt(GL_LINE_LOOP));
-			popTblSet(th, 1, "LineLoop");
-			pushValue(th, anInt(GL_LINES));
-			popTblSet(th, 1, "Lines");
-			pushValue(th, anInt(GL_LINE_STRIP_ADJACENCY));
-			popTblSet(th, 1, "LineStripAdjacency");
-			pushValue(th, anInt(GL_LINES_ADJACENCY));
-			popTblSet(th, 1, "LinesAdjacency");
-			pushValue(th, anInt(GL_TRIANGLE_STRIP));
-			popTblSet(th, 1, "TriangleStrip");
-			pushValue(th, anInt(GL_TRIANGLE_FAN));
-			popTblSet(th, 1, "TriangleFan");
-			pushValue(th, anInt(GL_TRIANGLES));
-			popTblSet(th, 1, "Triangles");
-			pushValue(th, anInt(GL_TRIANGLE_STRIP_ADJACENCY));
-			popTblSet(th, 1, "TriangleStripAdjacency");
-			pushValue(th, anInt(GL_TRIANGLES_ADJACENCY));
-			popTblSet(th, 1, "TrianglesAdjacency");
-			pushValue(th, anInt(GL_PATCHES));
-			popTblSet(th, 1, "Patches");
-			pushValue(th, anInt(GL_POLYGON));
-			popTblSet(th, 1, "Polygon");
-		popProperty(th, 0, "_$drawPrimitives");
+
+		pushCMethod(th, shape_getDraw);
+		pushCMethod(th, shape_setDraw);
+		pushClosure(th, 2);
+		popProperty(th, 0, "draw");
 	popGloVar(th, "Shape");
 }

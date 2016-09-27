@@ -20,10 +20,10 @@ struct ColorInfo {
 int color_new(Value th) {
 	Value colorv = pushCData(th, pushProperty(th, 0, "_newtype"), PegVec4, 0, sizeof(ColorInfo));
 	ColorInfo *color = (struct ColorInfo*) toHeader(colorv);
-	float default = 1.0f;
-	color->red = default = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : default;
-	color->green = getTop(th)>2 && isFloat(getLocal(th,2))? toAfloat(getLocal(th, 2)) : default;
-	color->blue = getTop(th)>3 && isFloat(getLocal(th,3))? toAfloat(getLocal(th, 3)) : default;
+	float defcolor = 1.0f;
+	color->red = defcolor = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : defcolor;
+	color->green = getTop(th)>2 && isFloat(getLocal(th,2))? toAfloat(getLocal(th, 2)) : defcolor;
+	color->blue = getTop(th)>3 && isFloat(getLocal(th,3))? toAfloat(getLocal(th, 3)) : defcolor;
 	color->alpha = getTop(th)>4 && isFloat(getLocal(th,4))? toAfloat(getLocal(th, 4)) : 1.0f;
 	return 1;
 }

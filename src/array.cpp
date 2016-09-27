@@ -68,6 +68,50 @@ int xyzs_append(Value th) {
 	return 1;
 }
 
+int xyzs_getx(Value th) {
+	if (getTop(th)<2 || !isInt(getLocal(th, 1)))
+		return 0;
+	pushValue(th, aFloat(((float *)toCData(getLocal(th, 0)))[3*toAint(getLocal(th, 1))]));
+	return 1;
+}
+
+int xyzs_setx(Value th) {
+	if (getTop(th)<3 || !isInt(getLocal(th, 2))  || !isFloat(getLocal(th, 1)))
+		return 0;
+	((float *)toCData(getLocal(th, 0)))[3*toAint(getLocal(th, 1))] = toAfloat(getLocal(th, 1));
+	return 0;
+}
+
+int xyzs_gety(Value th) {
+	if (getTop(th)<2 || !isInt(getLocal(th, 1)))
+		return 0;
+	pushValue(th, aFloat(((float *)toCData(getLocal(th, 0)))[1+3*toAint(getLocal(th, 1))]));
+	return 1;
+}
+
+int xyzs_sety(Value th) {
+	int mmm = 1+3*toAint(getLocal(th, 2));
+	float nnn = toAfloat(getLocal(th, 1));
+	if (getTop(th)<3 || !isInt(getLocal(th, 2))  || !isFloat(getLocal(th, 1)))
+		return 0;
+	((float *)toCData(getLocal(th, 0)))[1+3*toAint(getLocal(th, 2))] = toAfloat(getLocal(th, 1));
+	return 0;
+}
+
+int xyzs_getz(Value th) {
+	if (getTop(th)<2 || !isInt(getLocal(th, 1)))
+		return 0;
+	pushValue(th, aFloat(((float *)toCData(getLocal(th, 0)))[2+3*toAint(getLocal(th, 1))]));
+	return 1;
+}
+
+int xyzs_setz(Value th) {
+	if (getTop(th)<3 || !isInt(getLocal(th, 2))  || !isFloat(getLocal(th, 1)))
+		return 0;
+	((float *)toCData(getLocal(th, 0)))[2+3*toAint(getLocal(th, 1))] = toAfloat(getLocal(th, 1));
+	return 0;
+}
+
 /** Create a new Buffer value, with number of Uv structures. */
 int uvs_new(Value th) {
 	// Get nStructs parameter
@@ -183,6 +227,18 @@ void array_init(Value th) {
 			popProperty(th, 1, "_name");
 			pushCMethod(th, xyzs_append);
 			popProperty(th, 1, "<<");
+			pushCMethod(th, xyzs_getx);
+			pushCMethod(th, xyzs_setx);
+			pushClosure(th, 2);
+			popProperty(th, 1, "x");
+			pushCMethod(th, xyzs_gety);
+			pushCMethod(th, xyzs_sety);
+			pushClosure(th, 2);
+			popProperty(th, 1, "y");
+			pushCMethod(th, xyzs_getz);
+			pushCMethod(th, xyzs_setz);
+			pushClosure(th, 2);
+			popProperty(th, 1, "z");
 		popProperty(th, 0, "_newtype");
 		pushCMethod(th, xyzs_new);
 		popProperty(th, 0, "New");
