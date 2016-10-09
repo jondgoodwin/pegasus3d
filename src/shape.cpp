@@ -331,6 +331,13 @@ int shape_renderit(Value th) {
 	pushLocal(th, selfidx);
 	getCall(th, 3, 0);
 
+	Value transparent = pushProperty(th, selfidx, "transparent");
+	popValue(th);
+	if (!isFalse(transparent)) {
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	}
+
 	// Draw the vertexes using the vertex attribute buffers
 	GLuint vao;
 	GLuint vbo[100];
@@ -407,6 +414,10 @@ int shape_renderit(Value th) {
 	}
 	glDeleteBuffers(nattrs, vbo);
 	glDeleteVertexArrays(1, &vao);
+
+	if (!isFalse(transparent))
+		glDisable(GL_BLEND);
+
 	return 1;
 }
 
