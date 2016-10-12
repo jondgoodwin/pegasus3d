@@ -315,6 +315,54 @@ int xyz_scale(Value th) {
 	return 1;
 }
 
+/** Return the Xyz value obtained from multiplying two values.
+	If the second parm is an Xyz, it is the Xyz value used on the right side of the multiplication, otherwise self is used as the right-hand term.
+	The first parameter (left-hand term) can be a Float scalar, Xyz scalar, Quaternion or matrix. */
+int xyz_mult(Value th) {
+	if (getTop(th)<2)
+		return 0;
+	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
+	Value leftval = getLocal(th,1);
+	Xyz rxyz;
+	if (getTop(th)>2 && isCDataType(getLocal(th, 2), PegVec3)) {
+		Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 2));
+		rxyz.x = xyz2->x;
+		rxyz.y = xyz2->y;
+		rxyz.z = xyz2->z;
+	} else {
+		rxyz.x = self->x;
+		rxyz.y = self->y;
+		rxyz.z = self->z;
+	}
+
+	if (isFloat(leftval)) {
+		Afloat scalar = toAfloat(leftval);
+		self->x = scalar * rxyz.x;
+		self->y = scalar * rxyz.y;
+		self->z = scalar * rxyz.z;
+	} else if (isCDataType(leftval,PegVec3)) {
+		Xyz *scale = (Xyz*) toHeader(leftval);
+		self->x = scale->x * rxyz.x;
+		self->y = scale->y * rxyz.y;
+		self->z = scale->z * rxyz.z;
+	} else if (isCDataType(leftval, PegVec4)) {
+		Quat *quat = (Quat*) toHeader(leftval);
+		Quat iq;
+		iq.x = quat->w * rxyz.x + quat->y * rxyz.z - quat->z * rxyz.y;
+		iq.y = quat->w * rxyz.y + quat->z * rxyz.x - quat->x * rxyz.z;
+		iq.z = quat->w * rxyz.z + quat->x * rxyz.y - quat->y * rxyz.x;
+		iq.w = -quat->w * rxyz.x - quat->y * rxyz.y - quat->z * rxyz.z;
+		self->x = iq.x * quat->w - iq.w * quat->x - iq.y * quat->z + iq.z * quat->y;
+		self->y = iq.y * quat->w - iq.w * quat->y - iq.z * quat->x + iq.x * quat->z;
+		self->z = iq.z * quat->w - iq.w * quat->z - iq.x * quat->y + iq.y * quat->x;
+	} else if (isCDataType(leftval, PegMat4)) {
+		Mat4 *mat4 = (Mat4*) toHeader(leftval);
+		mat4MultVec(self, mat4, &rxyz);
+	}
+	setTop(th, 1);
+	return 1;
+}
+
 /** Return a new Xyz value that is scaled by a float or Xyz value */
 int xyz_multop(Value th) {
 	if (getTop(th)<2 || !(isFloat(getLocal(th,1)) || isCDataType(getLocal(th, 1), PegVec3)))
@@ -405,6 +453,8 @@ void xyz_init(Value th) {
 			popProperty(th, 1, "LengthSquared");
 			pushCMethod(th, xyz_lerp);
 			popProperty(th, 1, "Lerp");
+			pushCMethod(th, xyz_mult);
+			popProperty(th, 1, "Mult");
 			pushCMethod(th, xyz_negate);
 			popProperty(th, 1, "Negate");
 			pushCMethod(th, xyz_normalize);

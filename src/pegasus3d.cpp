@@ -16,6 +16,7 @@ Value vm;
 
 void color_init(Value th);
 void xyz_init(Value th);
+void quat_init(Value th);
 void mat4_init(Value th);
 void array_init(Value th);
 void integers_init(Value th);
@@ -39,6 +40,7 @@ void initTypes(Value th) {
 	// Pure data types
 	color_init(th);
 	xyz_init(th);
+	quat_init(th);
 	mat4_init(th);
 	array_init(th);
 	integers_init(th);

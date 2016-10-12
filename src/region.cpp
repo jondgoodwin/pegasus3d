@@ -92,6 +92,30 @@ int region_rotation(Value th) {
 	return 1;
 }
 
+/** Calculate Quaternion view matrix */
+int region_quat(Value th) {
+	int objidx = 0;
+
+	// Get the properties needed for calculation
+	Value positionv = pushProperty(th, objidx, "location");
+	Value orientv = pushProperty(th, objidx, "orientation");
+	Value scalev = pushProperty(th, objidx, "scale");
+	Value modelmatrix = pushProperty(th, objidx, "mmatrix");
+
+	if (isCData(modelmatrix)) {
+		Mat4 *mat4 = (Mat4*) toHeader(modelmatrix);
+		if (orientv!=aNull)
+			mat4Quat(mat4, (Quat*)toHeader(orientv));
+		else
+			mat4Identity(mat4);
+		if (scalev!=aNull)
+			mat4Scale(mat4, (Xyz*)toHeader(scalev));
+		if (positionv!=aNull)
+			mat4SetPos(mat4, (Xyz*)toHeader(positionv));
+	}
+	return 1;
+}
+
 /** Calculate lookat view matrix */
 int region_lookat(Value th) {
 	int objidx = 0;
@@ -115,6 +139,53 @@ int region_lookat(Value th) {
 	return 1;
 }
 
+/** Set orientation property to a quaternion that looks at passed Xyz location */
+int region_orient(Value th) {
+	int selfidx = 0;
+
+	// Get destination quat in "orientation" property
+	Value orientv = pushProperty(th, selfidx, "orientation");
+	if (!isCDataType(orientv, PegVec4)) {
+		pushSym(th, "New");
+		pushGloVar(th, "Quat");
+		getCall(th, 1, 1);
+		orientv = getFromTop(th, 0);
+		popProperty(th, selfidx, "orientation");
+	}
+	Quat *quat = (Quat*) toHeader(orientv);
+
+	// Calculate normalized vector pointing from self to target
+	if (getTop(th)<2 || !isCDataType(getLocal(th,1), PegVec3))
+		return 0;
+	Xyz toxyz;
+	Xyz* toxyz2 = (Xyz*) toHeader(getLocal(th,1));
+	toxyz.x = toxyz2->x; toxyz.y = toxyz2->y; toxyz.z = toxyz2->z; 
+	Value locationv = pushProperty(th, selfidx, "location");
+	if (isCDataType(locationv,PegVec3)) {
+		Xyz *selfxyz = (Xyz*) toHeader(locationv);
+		toxyz.x -= selfxyz->x;
+		toxyz.y -= selfxyz->y;
+		toxyz.z -= selfxyz->z;
+	}
+	xyzNorm(&toxyz, &toxyz);
+
+	// Calculate quaternion to rotate from -z axis to toxyz
+    if ((quat->w = 1 - toxyz.z) < 1.e-6f)
+    {
+        // For plus z, rotate 180 degrees around arbitrary axis.
+        quat->w = quat->x = quat->z = 0.0f;
+		quat->y = 1.0f;
+    }
+    else {
+		float inorm2 = 1.0f/sqrt(quat->w*quat->w + toxyz.y*toxyz.y + toxyz.x*toxyz.x);
+		quat->x = toxyz.y * inorm2;
+		quat->y = -toxyz.x * inorm2;
+		quat->z = 0.0f;
+		quat->w *= inorm2;
+	}
+	return 0;
+}
+
 /** Initialize the RenderContext type */
 void region_init(Value th) {
 	pushType(th, aNull, 6);
@@ -126,7 +197,11 @@ void region_init(Value th) {
 		popProperty(th, 0, "_Render");
 		pushCMethod(th, region_rotation);
 		popProperty(th, 0, "Rotation");
+		pushCMethod(th, region_quat);
+		popProperty(th, 0, "Quat");
 		pushCMethod(th, region_lookat);
 		popProperty(th, 0, "Lookat");
+		pushCMethod(th, region_orient);
+		popProperty(th, 0, "OrientTo");
 	popGloVar(th, "Region");
 }

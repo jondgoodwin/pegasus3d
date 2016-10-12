@@ -16,11 +16,10 @@ void mat4Set(Mat4 *tomat, Mat4 *frommat) {
 }
 
 /** Translation matrix */
-void mat4Pos(Mat4 *mat, GLfloat x, GLfloat y, GLfloat z) {
-	mat4Identity(mat);
-	(*mat)[12]=x;
-	(*mat)[13]=y;
-	(*mat)[14]=z;
+void mat4SetPos(Mat4 *mat, Xyz *xyz) {
+	(*mat)[12]=xyz->x;
+	(*mat)[13]=xyz->y;
+	(*mat)[14]=xyz->z;
 }
 
 /** Multiply two matrices m1 and m2. Put result in md. */
@@ -86,6 +85,46 @@ void mat4Ortho(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat asp
 	(*mat)[5] = (GLfloat)1.0/height;
 	(*mat)[10] = -(GLfloat)2.0/(near-far);
 	(*mat)[14] = (far+near)/(near-far);
+}
+
+/** Scale existing matrix by xyz scaling (can use after creating rotation) */
+void mat4Scale(Mat4 *mat, Xyz *s) {
+	(*mat)[0] *= s->x;
+	(*mat)[1] *= s->x;
+	(*mat)[2] *= s->x;
+
+	(*mat)[4] *= s->y;
+	(*mat)[5] *= s->y;
+	(*mat)[6] *= s->y;
+
+	(*mat)[8] *= s->z;
+	(*mat)[9] *= s->z;
+	(*mat)[10] *= s->z;
+}
+
+/** Create matrix based on a quaternion's rotation */
+void mat4Quat(Mat4 *mat, Quat *q) {
+	float x = q->x, y = q->y, z = q->z, w = q->w;
+	float x2 = x + x, y2 = y + y, z2 = z + z;
+	float xx = x * x2, xy = x * y2, xz = x * z2;
+	float yy = y * y2, yz = y * z2, zz = z * z2;
+	float wx = w * x2, wy = w * y2, wz = w * z2;
+
+	(*mat)[0] = 1.f - ( yy + zz );
+	(*mat)[1] = xy + wz;
+	(*mat)[2] = xz - wy;
+
+	(*mat)[4] = xy - wz;
+	(*mat)[5] = 1.f - ( xx + zz );
+	(*mat)[6] = yz + wx;
+
+	(*mat)[8] = xz + wy;
+	(*mat)[9] = yz - wx;
+	(*mat)[10] = 1.f - ( xx + yy );
+
+	(*mat)[12] = (*mat)[13] = (*mat)[14] = 0.f;
+	(*mat)[3] = (*mat)[7] = (*mat)[11] = 0.f;
+	(*mat)[15] = 1.f;
 }
 
 /** Create lookat matrix using location, center of what we look at, and the up direction.

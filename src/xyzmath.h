@@ -20,9 +20,6 @@ typedef struct Xyz {
 	GLfloat z;	//!< z
 } Xyz;
 
-/** Is the value an Xyz value?  This is a bit of a hack */
-//#define isXyz(val) (isStr(val) && getSize(val)==sizeof(Xyz))
-
 /** Inline calculation of length of xyz vector */
 #define xyzLen(xyz) \
 	(sqrt((xyz)->x*(xyz)->x + (xyz)->y*(xyz)->y + (xyz)->z*(xyz)->z))
@@ -61,6 +58,16 @@ typedef struct Xyz {
 
 // ***********************************************************
 
+/** Structure for a Quat(ernion) value */
+typedef struct Quat {
+	GLfloat x;	//!< x
+	GLfloat y;	//!< y
+	GLfloat z;	//!< z
+	GLfloat w;  //!< w
+} Quat;
+
+// ***********************************************************
+
 /** 4x4 floating point Matrix operations for right-hand orientation.
    The matrix's single-precision floating point numbers are stored in "column-first order", matching OpenGL.
      0   4   8  12
@@ -71,23 +78,25 @@ typedef struct Xyz {
 typedef GLfloat Mat4[16];
 
 /** Build an identity matrix */
-#define mat4Identity(matrix) \
+#define mat4Identity(matrix) {\
 	(*matrix)[1] = (*matrix)[2] = (*matrix)[3] = \
 	(*matrix)[4] = (*matrix)[6] = (*matrix)[7] = \
 	(*matrix)[8] = (*matrix)[9] = (*matrix)[11] = \
 	(*matrix)[12] = (*matrix)[13] = (*matrix)[14] = (GLfloat)0.0; \
-	(*matrix)[0] = (*matrix)[5] = (*matrix)[10] = (*matrix)[15] = (GLfloat) 1.0;
+	(*matrix)[0] = (*matrix)[5] = (*matrix)[10] = (*matrix)[15] = (GLfloat) 1.0;}
 
 void mat4Set(Mat4 *tomat, Mat4 *frommat);
-void mat4Pos(Mat4 *mat, GLfloat x, GLfloat y, GLfloat z);
+void mat4SetPos(Mat4 *mat, Xyz *xyz);
 void mat4Mult(Mat4 *md, Mat4 *m1, Mat4 *m2);
 void mat4MultVec(Xyz *newxyz, Mat4 *mat, Xyz *xyz);
 void mat4Perspective(Mat4 *mat, GLfloat fov, GLfloat near, GLfloat far, GLfloat aspratio);
 void mat4HeightPerspective(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat aspratio);
 void mat4Ortho(Mat4 *mat, GLfloat height, GLfloat near, GLfloat far, GLfloat aspratio);
+void mat4Scale(Mat4 *mat, Xyz *s);
+void mat4Quat(Mat4 *mat, Quat *q);
 void mat4Lookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up);
 void mat4InverseLookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up);
-	void mat4Rotate(Mat4 *mat, Xyz *pos, Xyz *rot, Xyz *scale);
+void mat4Rotate(Mat4 *mat, Xyz *pos, Xyz *rot, Xyz *scale);
 void mat4Inverse(Mat4 *tmat, Mat4 *fmat);
 void mat4Print(Mat4 *mat, const char *matnm);
 
