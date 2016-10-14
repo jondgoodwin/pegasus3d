@@ -75,7 +75,7 @@ int world_update(Value th) {
 	pushGloVar(th, "$");
 	int camidx = getTop(th);
 	pushProperty(th, getTop(th)-1, "camera");
-	Value posv = pushProperty(th, camidx, "location");
+	Value posv = pushProperty(th, camidx, "origin");
 	if (isCData(posv)) {
 		Xyz *posxyz = (Xyz *)toHeader(posv);
 		// posxyz->y += dt;
@@ -87,11 +87,13 @@ int world_update(Value th) {
 		posxyz->x += camVelocity * sin(camYRotation);
 		posxyz->z += -camVelocity * cos(camYRotation);
 	}
-	Value rotv = pushProperty(th, camidx, "rotation");
-	if (isCData(rotv)) {
-		Xyz *rotxyz = (Xyz *)toHeader(rotv);
-		rotxyz->y = camYRotation;
-	}
+	pushSym(th, "SetAngleAxis");
+	pushProperty(th, camidx, "orientation");
+	pushValue(th, aFloat(-camYRotation));
+	pushValue(th, aFloat(0.f));
+	pushValue(th, aFloat(1.f));
+	pushValue(th, aFloat(0.f));
+	getCall(th, 5, 0);
 
 	pushSym(th, "animate");
 	pushLocal(th, 0);

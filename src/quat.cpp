@@ -64,10 +64,10 @@ int quat_setAxis(Value th) {
 	if (getTop(th)>2 && isCDataType(getLocal(th,2),PegVec3)) {
 		Xyz *axis = (Xyz*) toHeader(getLocal(th,2));
 		axisx = axis->x; axisy = axis->y; axisz = axis->z;
-	} else if (getTop(th)>5 && isFloat(getLocal(th,2)) && isFloat(getLocal(th,3)) && isFloat(getLocal(th,4))) {
-		axisx = toAfloat(getLocal(th,1));
-		axisy = toAfloat(getLocal(th,2));
-		axisz = toAfloat(getLocal(th,3));
+	} else if (getTop(th)>4 && isFloat(getLocal(th,2)) && isFloat(getLocal(th,3)) && isFloat(getLocal(th,4))) {
+		axisx = toAfloat(getLocal(th,2));
+		axisy = toAfloat(getLocal(th,3));
+		axisz = toAfloat(getLocal(th,4));
 	} else
 		return 0;
 	float sinangle = sin(angle * 0.5f);

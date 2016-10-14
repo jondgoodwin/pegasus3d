@@ -11,7 +11,31 @@
 
 /** Create a new camera */
 int camera_new(Value th) {
+	int camidx = getTop(th);
 	pushType(th, getLocal(th, 0), 16); // Create camera as subtype of Camera
+
+	pushSym(th, "Perspective");
+	popProperty(th, camidx, "projection");
+	pushValue(th, aFloat(50.0)); // fov
+	popProperty(th, camidx, "fov");
+	pushValue(th, aFloat(10.0));  // Orthogonal view height
+	popProperty(th, camidx, "viewHeight");
+	pushValue(th, aFloat(0.1f)); // minimum distance
+	popProperty(th, camidx, "near");
+	pushValue(th, aFloat(1000.0)); // maximum distance
+	popProperty(th, camidx, "far");
+
+	pushSym(th, "New");
+	pushGloVar(th, "Xyz");
+	pushValue(th, aFloat(0.0f));
+	pushValue(th, aFloat(0.0f));
+	pushValue(th, aFloat(5.0f));
+	getCall(th, 4, 1);
+	popProperty(th, camidx, "origin");
+	pushSym(th, "New");
+	pushGloVar(th, "Quat");
+	getCall(th, 1, 1);
+	popProperty(th, camidx, "orientation");
 	return 1;
 }
 
@@ -82,17 +106,23 @@ int camera_render(Value th) {
 	getCall(th, 2, 1);
 	popProperty(th, contextidx, "pmatrix");
 
-	// Calculate camera's view matrix, invert and put in "mvmatrix"
-	Value viewmeth = pushProperty(th, camidx, "view");
-	if (viewmeth==aNull) {
+	// Calculate camera's view matrix, invert and put in "vmatrix"
+	pushSym(th, "Set");
+	pushProperty(th, contextidx, "vmatrix");
+	if (getFromTop(th, 0)==aNull) {
 		popValue(th);
-		pushSym(th, "Rotation");
+		pushSym(th, "New");
+		pushGloVar(th, "Matrix4");
+		getCall(th, 1, 1);
+		pushValue(th, getFromTop(th, 0));
+		popProperty(th, contextidx, "vmatrix");
 	}
-	pushLocal(th, camidx);
-	getCall(th, 1, 1);
+	pushProperty(th, camidx, "origin");
+	pushProperty(th, camidx, "orientation");
+	pushProperty(th, camidx, "scale");
+	getCall(th, 4, 1);
 	Mat4 *vmat = (Mat4*) toHeader(getFromTop(th, 0));
 	mat4Inverse(vmat, vmat); // Because we want world->camera
-	popProperty(th, contextidx, "vmatrix");
 
 	// Put identity matrix for world coordinates in context as "mmatrix"
 	pushSym(th, "New");
@@ -104,7 +134,7 @@ int camera_render(Value th) {
 	return 0;
 }
 
-/** Initialize Camera type and create an instance in $.camera */
+/** Initialize Camera type */
 void camera_init(Value th) {
 	// Camera is a new Region
 	pushSym(th, "New");
@@ -122,46 +152,5 @@ void camera_init(Value th) {
 		popProperty(th, 0, "Perspective");
 		pushCMethod(th, camera_orthogonal);
 		popProperty(th, 0, "Orthogonal");
-		pushSym(th, "Perspective");
-		popProperty(th, 0, "projection");
-		pushValue(th, aFloat(50.0)); // fov
-		popProperty(th, 0, "fov");
-		pushValue(th, aFloat(10.0));  // Orthogonal view height
-		popProperty(th, 0, "viewHeight");
-		pushValue(th, aFloat(0.1f)); // minimum distance
-		popProperty(th, 0, "near");
-		pushValue(th, aFloat(1000.0)); // maximum distance
-		popProperty(th, 0, "far");
-
-		pushSym(th, "Rotation");
-		popProperty(th, 0, "view");
-		pushSym(th, "New");
-		pushGloVar(th, "Xyz");
-		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(5.0f));
-		getCall(th, 4, 1);
-		popProperty(th, 0, "location");
-		pushSym(th, "New");
-		pushGloVar(th, "Xyz");
-		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(0.0f));
-		getCall(th, 4, 1);
-		popProperty(th, 0, "rotation");
-		pushSym(th, "New");
-		pushGloVar(th, "Xyz");
-		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(0.0f));
-		getCall(th, 4, 1);
-		popProperty(th, 0, "lookat");
-		pushSym(th, "New");
-		pushGloVar(th, "Xyz");
-		pushValue(th, aFloat(0.0f));
-		pushValue(th, aFloat(1.0f));
-		pushValue(th, aFloat(0.0f));
-		getCall(th, 4, 1);
-		popProperty(th, 0, "up");
 	popGloVar(th, "Camera");
 }

@@ -194,17 +194,17 @@ void mat4InverseLookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up) {
 /** Calculate a rotation view matrix using euler angles.
 	Equivalent to Translate*Rotz*Roty*Rotz*Scale */
 void mat4Rotate(Mat4 *mat, Xyz *pos, Xyz *rot, Xyz *scale) {
-	(*mat)[ 0] = scale->x * cos(rot->y)*cos(rot->z);
-	(*mat)[ 1] = scale->x * cos(rot->y)*sin(rot->z);
-	(*mat)[ 2] = scale->x * sin(rot->y);
+	(*mat)[ 0] = scale->x * cos(-rot->y)*cos(rot->z);
+	(*mat)[ 1] = scale->x * cos(-rot->y)*sin(rot->z);
+	(*mat)[ 2] = scale->x * sin(-rot->y);
 	(*mat)[ 3] = 0.0f;
-	(*mat)[ 4] = scale->y * (-cos(rot->x)*sin(rot->z) - sin(rot->x)*sin(rot->y)*cos(rot->z));
-	(*mat)[ 5] = scale->y * (cos(rot->x)*cos(rot->z) - sin(rot->x)*sin(rot->y)*sin(rot->z));
-	(*mat)[ 6] = scale->y * sin(rot->x)*cos(rot->y);
+	(*mat)[ 4] = scale->y * (-cos(rot->x)*sin(rot->z) - sin(rot->x)*sin(-rot->y)*cos(rot->z));
+	(*mat)[ 5] = scale->y * (cos(rot->x)*cos(rot->z) - sin(rot->x)*sin(-rot->y)*sin(rot->z));
+	(*mat)[ 6] = scale->y * sin(rot->x)*cos(-rot->y);
 	(*mat)[ 7] = 0.0f;
-	(*mat)[ 8] = scale->z * (sin(rot->x)*sin(rot->z) - cos(rot->x)*sin(rot->y)*cos(rot->z));
-	(*mat)[ 9] = scale->z * (-sin(rot->x)*cos(rot->z) - cos(rot->x)*sin(rot->y)*sin(rot->z));
-	(*mat)[10] = scale->z * cos(rot->x)*cos(rot->y);
+	(*mat)[ 8] = scale->z * (sin(rot->x)*sin(rot->z) - cos(rot->x)*sin(-rot->y)*cos(rot->z));
+	(*mat)[ 9] = scale->z * (-sin(rot->x)*cos(rot->z) - cos(rot->x)*sin(-rot->y)*sin(rot->z));
+	(*mat)[10] = scale->z * cos(rot->x)*cos(-rot->y);
 	(*mat)[11] = 0.0f;
 	(*mat)[12] = pos->x;
 	(*mat)[13] = pos->y;
