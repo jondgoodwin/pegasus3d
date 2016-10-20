@@ -66,6 +66,9 @@ typedef struct Quat {
 	GLfloat w;  //!< w
 } Quat;
 
+#define quatDot(q1, q2) \
+	((q1)->x*(q2)->x + (q1)->y*(q2)->y + (q1)->z*(q2)->z + (q1)->w*(q2)->w)
+void quatSlerp(Quat *q, Quat *q1, Quat *q2, Afloat scalar);
 // ***********************************************************
 
 /** 4x4 floating point Matrix operations for right-hand orientation.

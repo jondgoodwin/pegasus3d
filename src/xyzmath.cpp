@@ -10,6 +10,51 @@
 #include <stdio.h>
 #include "xyzmath.h"
 
+/* Pre-calculated constants for fast approximation of spherical linear interpolation */
+Afloat quatSlerpU[8]={
+	0.333333333333333f, 0.100000000000000f, 0.047619047619048f, 0.027777777777778f,
+	0.018181818181818f, 0.012820512820513f, 0.009523809523810f, 0.013978731275863f};
+Afloat quatSlerpV[8]={
+	0.333333333333333f, 0.400000000000000f, 0.428571428571429f, 0.444444444444444f,
+	0.454545454545455f, 0.461538461538462f, 0.466666666666667f, 0.894638801655200f};
+
+/** Calculate and return Quat value spherically/linearly interpolated between two Quat values by a scalar from 0 to 1 */
+/* Faster slerp approimation algorithm from David Eberly, adapted from Cesium.js, accurate to 10 e -6. */
+void quatSlerp(Quat *q, Quat *q1, Quat *q2, Afloat scalar) {
+	
+	Afloat dot = quatDot(q1, q2);
+	Afloat sign;
+	if (dot>=0)
+		sign = 1.0f;
+	else {
+		sign = -1.0f;
+		dot = -dot;
+	}
+
+	Afloat dotm1 = dot - 1.0f;
+	Afloat scalarOpp = 1.0f - scalar;
+	Afloat sqrScalar = scalar * scalar;
+	Afloat sqrScalarOpp = scalarOpp * scalarOpp;
+
+	Afloat bT[8], bD[8];
+	for (int i = 7; i>=0; --i) {
+		bT[i] = (quatSlerpU[i] * sqrScalar - quatSlerpV[i]) * dotm1;
+		bD[i] = (quatSlerpU[i] * sqrScalarOpp - quatSlerpV[i]) * dotm1;
+	}
+
+	Afloat cT = sign * scalar * (
+		1.0f + bT[0] * (1.0f + bT[1] * (1.0f + bT[2] * (1.0f + bT[3] * (
+	    1.0f + bT[4] * (1.0f + bT[5] * (1.0f + bT[6] * (1.0f + bT[7]))))))));
+    Afloat cD = scalarOpp * (
+        1.0f + bD[0] * (1.0f + bD[1] * (1.0f + bD[2] * (1.0f + bD[3] * (
+        1.0f + bD[4] * (1.0f + bD[5] * (1.0f + bD[6] * (1.0f + bD[7]))))))));
+
+	q->x = cD*q1->x + cT*q2->x;
+	q->y = cD*q1->y + cT*q2->y;
+	q->z = cD*q1->z + cT*q2->z;
+	q->w = cD*q1->w + cT*q2->w;
+}
+
 /** Copy numbers from mat to to mat */
 void mat4Set(Mat4 *tomat, Mat4 *frommat) {
 	memcpy((void*)tomat, (void*)frommat, 16*sizeof(float));
@@ -24,6 +69,11 @@ void mat4SetPos(Mat4 *mat, Xyz *xyz) {
 
 /** Multiply two matrices m1 and m2. Put result in md. */
 void mat4Mult(Mat4 *md, Mat4 *m1, Mat4 *m2) {
+	Mat4 tempmat;
+	if (md==m1) {
+		memcpy(tempmat, md, sizeof(Mat4));
+		m1 = &tempmat;
+	}
 	(*md)[0] = (*m1)[0]*(*m2)[0] + (*m1)[4]*(*m2)[1] + (*m1)[ 8]*(*m2)[2] + (*m1)[12]*(*m2)[3];
 	(*md)[1] = (*m1)[1]*(*m2)[0] + (*m1)[5]*(*m2)[1] + (*m1)[ 9]*(*m2)[2] + (*m1)[13]*(*m2)[3];
 	(*md)[2] = (*m1)[2]*(*m2)[0] + (*m1)[6]*(*m2)[1] + (*m1)[10]*(*m2)[2] + (*m1)[14]*(*m2)[3];

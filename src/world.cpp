@@ -66,35 +66,6 @@ float camYRotRate = 0.0f;
 /** Default method for updating the world's state every tick.
     dt is first parameter (delta time since last update in seconds). */
 int world_update(Value th) {
-	// Get dt
-	GLfloat dt = 0.01333f;
-	if (getTop(th)>1 && isFloat(getLocal(th, 1)))
-		dt = toAfloat(getLocal(th, 1));
-
-	// Move the camera slowly up
-	pushGloVar(th, "$");
-	int camidx = getTop(th);
-	pushProperty(th, getTop(th)-1, "camera");
-	Value posv = pushProperty(th, camidx, "origin");
-	if (isCData(posv)) {
-		Xyz *posxyz = (Xyz *)toHeader(posv);
-		// posxyz->y += dt;
-		camYRotation+=camYRotRate;
-		if (camYRotation<0.0)
-			camYRotation+=(float)M_PI * 2.0f;
-		if (camYRotation>2*M_PI)
-			camYRotation-=(float)M_PI * 2.0f;
-		posxyz->x += camVelocity * sin(camYRotation);
-		posxyz->z += -camVelocity * cos(camYRotation);
-	}
-	pushSym(th, "SetAngleAxis");
-	pushProperty(th, camidx, "orientation");
-	pushValue(th, aFloat(-camYRotation));
-	pushValue(th, aFloat(0.f));
-	pushValue(th, aFloat(1.f));
-	pushValue(th, aFloat(0.f));
-	getCall(th, 5, 0);
-
 	pushSym(th, "animate");
 	pushLocal(th, 0);
 	pushLocal(th, 1);
@@ -221,21 +192,13 @@ int world_handleInput(Value th)
 		{
 			switch (event.key.keysym.sym)
 			{
-			case SDLK_UP:
-			case SDLK_DOWN:
-				camVelocity = 0;
-				break;
-			case SDLK_LEFT:
-			case SDLK_RIGHT:
-				camYRotRate = 0;
-				break;
 			default:
 				if (inputContext!=aNull && event.key.repeat==0) {
 					Value keydown = pushProperty(th, inputIdx, "keyUp");
 					pushKeySym(th, event.key.keysym.scancode);
 					pushValue(th, getProperty(th, keydown, getFromTop(th, 0)));
 					pushValue(th, aNull);
-					getCall(th, 1, 1);
+					getCall(th, 1, 0);
 					popValue(th);
 					popValue(th);
 				}
@@ -264,26 +227,13 @@ int world_handleInput(Value th)
 				setCall(th, 2, 0);
 				} break;
 
-			case SDLK_UP:
-				camVelocity = 0.08f;
-				break;
-			case SDLK_DOWN:
-				camVelocity = -0.08f;
-				break;
-			case SDLK_LEFT:
-				camYRotRate = -0.08f;
-				break;
-			case SDLK_RIGHT:
-				camYRotRate = 0.08f;
-				break;
-
 			default:
 				if (inputContext!=aNull && event.key.repeat==0) {
 					Value keydown = pushProperty(th, inputIdx, "keyDown");
 					pushKeySym(th, event.key.keysym.scancode);
 					pushValue(th, getProperty(th, keydown, getFromTop(th, 0)));
 					pushValue(th, aNull);
-					getCall(th, 1, 1);
+					getCall(th, 1, 0);
 					popValue(th);
 					popValue(th);
 				}

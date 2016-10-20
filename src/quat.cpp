@@ -322,6 +322,18 @@ int quat_mult(Value th) {
 	return 1;
 }
 
+/** Calculate and return Quat value spherically/linearly interpolated between two Quat values by a scalar from 0 to 1 */
+int quat_slerp(Value th) {
+	if (getTop(th)<4 || !isCDataType(getLocal(th, 1), PegVec4) || !isCDataType(getLocal(th, 2), PegVec4) || !isFloat(getLocal(th, 3)))
+		return 0;
+	Quat *self = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat2 = (Quat*) toHeader(getLocal(th, 1));
+	Quat *quat3 = (Quat*) toHeader(getLocal(th, 2));
+	float scalar = toAfloat(getLocal(th, 3));
+	quatSlerp(self, quat2, quat3, scalar);
+	return 1;
+}
+
 /** Initialize Quat type and mixin */
 void quat_init(Value th) {
 	Value Quat = pushType(th, aNull, 4);
@@ -362,6 +374,8 @@ void quat_init(Value th) {
 			popProperty(th, 1, "Inverse");
 			pushCMethod(th, quat_mult);
 			popProperty(th, 1, "Mult");
+			pushCMethod(th, quat_slerp);
+			popProperty(th, 1, "Slerp");
 		popProperty(th, 0, "_newtype");
 		pushCMethod(th, quat_new);
 		popProperty(th, 0, "New");
