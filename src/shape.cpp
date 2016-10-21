@@ -311,7 +311,10 @@ int shape_setDraw(Value th) {
 
 /** Create a new shape */
 int shape_new(Value th) {
-	pushType(th, getLocal(th, 0), 16); // subtype from Shape
+	pushSym(th, "New");
+	pushGloVar(th, "Region");
+	getCall(th, 1, 1);
+	setType(th, getFromTop(th, 0), getLocal(th, 0));
 	return 1;
 }
 
@@ -331,6 +334,7 @@ int shape_renderit(Value th) {
 	pushLocal(th, selfidx);
 	getCall(th, 3, 0);
 
+	// Turn on blending for shapes that use translucent colors
 	Value transparent = pushProperty(th, selfidx, "transparent");
 	popValue(th);
 	if (!isFalse(transparent)) {

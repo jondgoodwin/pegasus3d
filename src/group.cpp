@@ -9,7 +9,10 @@
 
 /** Create a new group */
 int group_new(Value th) {
-	pushType(th, getLocal(th, 0), 8); // Inherit from creating prototype
+	pushSym(th, "New");
+	pushGloVar(th, "Region");
+	getCall(th, 1, 1);
+	setType(th, getFromTop(th, 0), getLocal(th, 0));
 	return 1;
 }
 
@@ -26,7 +29,8 @@ int group_renderit(Value th) {
 			pushSym(th, "_Render");
 			pushValue(th, arrGet(th, parts, i));
 			pushLocal(th, contextidx);
-			getCall(th, 2, 0);
+			pushProperty(th, selfidx, "mmatrix");
+			getCall(th, 3, 0);
 		}
 	}
 

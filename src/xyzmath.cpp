@@ -315,7 +315,7 @@ void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
 
 /** Print out a matrix, for diagnostics */
 void mat4Print(Mat4 *mat, const char *matnm) {
-	printf("%s\n", matnm);
+	printf("%s %p\n", matnm, mat);
 	printf("  %.5f %.5f %.5f %.5f\n", (*mat)[0], (*mat)[4], (*mat)[8], (*mat)[12]);
 	printf("  %.5f %.5f %.5f %.5f\n", (*mat)[1], (*mat)[5], (*mat)[9], (*mat)[13]);
 	printf("  %.5f %.5f %.5f %.5f\n", (*mat)[2], (*mat)[6], (*mat)[10], (*mat)[14]);

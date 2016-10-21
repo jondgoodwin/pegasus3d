@@ -142,7 +142,8 @@ int window_render(Value th) {
 	pushSym(th, "_Render");
 	pushProperty(th, contextidx, "scene");
 	pushLocal(th, contextidx);
-	getCall(th, 2, 0);
+	pushValue(th, aNull);
+	getCall(th, 3, 0);
 
 	// Swap buffers to display window's finished image
 	SDL_GL_SwapWindow(di->sdlWindow);

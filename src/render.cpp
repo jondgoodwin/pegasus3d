@@ -17,14 +17,12 @@ int render_new(Value th) {
 /** Convert an Xyz vector from local to camera (eye) coordinates using mvmatrix */
 int render_cameraXyz(Value th) {
 	Value oldxyzv;
-	if (getTop(th)<2 || !isCData(oldxyzv = getLocal(th, 1))) {
-		pushValue(th, aNull);
-		return 1;
-	}
+	if (getTop(th)<3 || !isCDataType(oldxyzv = getLocal(th, 1), PegVec3) )
+		return 0;
 	Xyz *oldxyz = (Xyz*) toHeader(oldxyzv);
 
 	// Calculate 'mvmatrix' from context
-	Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, 0, "mmatrix")); popValue(th);
+	Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, 2, "mmatrix")); popValue(th);
 	Mat4 *vmatrix = (Mat4*) toHeader(pushProperty(th, 0, "vmatrix")); popValue(th);
 	Mat4 mvmatrix;
 	mat4Mult(&mvmatrix, vmatrix, mmatrix);

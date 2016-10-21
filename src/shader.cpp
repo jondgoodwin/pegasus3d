@@ -144,7 +144,7 @@ int shader_render(Value th) {
 		glUseProgram(pgmdata->program);
 
 		// Calculate mvpmatrix = pmatrix * (mvmatrix = vmatrix * mmatrix)
-		Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, contextidx, "mmatrix")); popValue(th);
+		Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, shapeidx, "mmatrix")); popValue(th);
 		Mat4 *vmatrix = (Mat4*) toHeader(pushProperty(th, contextidx, "vmatrix")); popValue(th);
 		Mat4 *pmatrix = (Mat4*) toHeader(pushProperty(th, contextidx, "pmatrix")); popValue(th);
 		Mat4 mvpmatrix, mvmatrix;

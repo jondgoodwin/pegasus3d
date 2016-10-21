@@ -10,14 +10,18 @@
 
 /** Create a new region */
 int region_new(Value th) {
-	int region = getTop(th);
+	int selfidx = getTop(th);
 	pushType(th, getLocal(th, 0), 16);
 
-	// Create storage place for the render-calculated view matrix
+	// Create storage place for the render-calculated matrices
 	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	popProperty(th, region, "mmatrix");
+	popProperty(th, selfidx, "mmatrix");
+	pushSym(th, "New");
+	pushGloVar(th, "Matrix4");
+	getCall(th, 1, 1);
+	popProperty(th, selfidx, "tmatrix");
 
 	return 1;
 }
@@ -26,8 +30,11 @@ int region_new(Value th) {
 int region_render(Value th) {
 	int selfidx = 0;
 	int contextidx = 1;
-	if (getTop(th)<2)
-		return 0; // Context must be passed
+	int parentmatidx = 2;
+	if (getTop(th)<3)
+		return 0; // Context & parent matrix must be passed
+
+	Value parentMatV = getLocal(th, parentmatidx);
 
 	// Create new context that inherits from old
 	int newcontextidx = getTop(th);
@@ -35,36 +42,29 @@ int region_render(Value th) {
 	pushLocal(th, contextidx);
 	getCall(th, 1, 1);
 
-	// Calculate mmatrix
+	// Calculate object's transformation matrix
 	pushSym(th, "Set");
-	pushProperty(th, selfidx, "mmatrix");
-	if (getFromTop(th, 0)==aNull) {
-		popValue(th);
-		pushSym(th, "New");
-		pushGloVar(th, "Matrix4");
-		getCall(th, 1, 1);
-		pushValue(th, getFromTop(th, 0));
-		popProperty(th, selfidx, "mmatrix");
-	}
+	pushProperty(th, selfidx, "tmatrix");
 	pushProperty(th, selfidx, "origin");
 	pushProperty(th, selfidx, "orientation");
 	pushProperty(th, selfidx, "scale");
 	getCall(th, 4, 1);
-	Mat4 *regmat4 = (Mat4*) toHeader(getFromTop(th, 0));
+	Mat4 *tmat4 = (Mat4*) toHeader(getFromTop(th, 0));
 
-	// Context: mmatrix *= regionmatrix
-	pushSym(th, "New");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	Mat4 *newmat = (Mat4*) toHeader(getFromTop(th, 0));
-	Value mmatrix = pushProperty(th, newcontextidx, "mmatrix"); popValue(th);
-	mat4Mult(newmat, (Mat4*) toHeader(mmatrix), regmat4);
-	popProperty(th, newcontextidx, "mmatrix");
+	// mmatrix = parent_mmatrix * objectmatrix
+	Mat4 *newmat = (Mat4*) toHeader(pushProperty(th, selfidx, "mmatrix"));
+	if (parentMatV!=aNull) {
+		Mat4 *parentmat = (Mat4*) toHeader(parentMatV);
+		mat4Mult(newmat, parentmat, tmat4);
+	}
+	else
+		mat4Set(newmat, tmat4);
 
 	// Ask if we should render it? (and augment context)
 	pushProperty(th, selfidx, "render?"); // Assume it is method
 	pushLocal(th, newcontextidx); // make new context self to render? method
-	getCall(th, 1, 1);
+	pushLocal(th, selfidx);
+	getCall(th, 2, 1);
 	Value torender = popValue(th);
 	if (torender!=aFalse) {
 		pushSym(th, "_RenderIt");
