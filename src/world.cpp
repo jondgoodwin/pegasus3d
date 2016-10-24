@@ -250,7 +250,6 @@ int world_render(Value th) {
 	int selfidx = 0;
 
 	// Set up a render of the world's window, creating it if needed
-	pushSym(th, "_Render");
 	if (pushProperty(th, selfidx, "window")==aNull) {
 		popValue(th);
 		pushSym(th, "New");
@@ -259,18 +258,10 @@ int world_render(Value th) {
 		pushValue(th, getFromTop(th, 0));
 		popProperty(th, selfidx, "window");
 	}
+	popValue(th);
 
-	// Create render context
-	int contextidx = getTop(th);
-	pushSym(th, "New");
-	pushGloVar(th, "RenderContext");
-	getCall(th, 1, 1);
-
-	// Store scene in the context
-	pushProperty(th, selfidx, "scene");
-	popProperty(th, contextidx, "scene");
-
-	// Store camera in the context, creating if needed using default view
+	// Render camera (creating if needed)
+	pushSym(th, "_RenderIt");
 	if (pushProperty(th, selfidx, "camera")==aNull) {
 		popValue(th);
 		pushSym(th, "New");
@@ -279,10 +270,12 @@ int world_render(Value th) {
 		pushValue(th, getFromTop(th, 0));
 		popProperty(th, selfidx, "camera");
 	}
-	popProperty(th, contextidx, "camera");
+	getCall(th, 1, 0);
 
-	// Render the window, passing context
-	getCall(th, 2, 0);
+	// Render the window by swapping buffers
+	pushSym(th, "SwapBuffers");
+	pushProperty(th, 0, "window");
+	getCall(th, 1, 0);
 	return 0;
 }
 

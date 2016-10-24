@@ -101,6 +101,7 @@ void mat4Lookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up);
 void mat4InverseLookat(Mat4 *mat, Xyz *eye, Xyz *center, Xyz *up);
 void mat4Rotate(Mat4 *mat, Xyz *pos, Xyz *rot, Xyz *scale);
 void mat4Inverse(Mat4 *tmat, Mat4 *fmat);
+void mat4Place(Mat4 *mat, Xyz *origin, Quat *orient, Xyz *scale);
 void mat4Print(Mat4 *mat, const char *matnm);
 
 #endif

@@ -20,7 +20,6 @@ void quat_init(Value th);
 void mat4_init(Value th);
 void array_init(Value th);
 void integers_init(Value th);
-void render_init(Value th);
 void window_init(Value th);
 void world_init(Value th);
 void region_init(Value th);
@@ -46,7 +45,6 @@ void initTypes(Value th) {
 	integers_init(th);
 
 	// World types
-	render_init(th);
 	world_init(th);
 	region_init(th);
 	window_init(th);

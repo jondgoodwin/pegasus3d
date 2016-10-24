@@ -87,7 +87,7 @@ int window_finalizer(Value cdata) {
 	// Destroy our window
 	SDL_DestroyWindow(di->sdlWindow);
 
-	return 1;
+	return 0;
 }
 
 /** Return aTrue if fullscreen, aFalse if windowed */
@@ -102,50 +102,18 @@ int window_setfullscreen(Value th) {
 	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
 	di->fullscreen = !(getTop(th)<2 || isFalse(getLocal(th, 1)));
 	SDL_SetWindowFullscreen(di->sdlWindow, di->fullscreen? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-	return 1;
+	return 0;
 }
 
-/** Render scene from the point of view of camera, context as first parameter */
-int window_render(Value th) {
-
-	// Switch OpenGL to work within this window and clear the buffers
+/** Attach current OpenGL context to this window */
+int window_makecurrent(Value th) {
 	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
 	SDL_GL_MakeCurrent(di->sdlWindow, di->sdlContext);
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS); // Closer objects obscure further objects
+	return 0;
+}
 
-	// The first parameter is the context
-	int contextidx = 1;
-	int i = getTop(th);
-	Value c = getLocal(th, contextidx);
-
-	// Initialize OpenGL rendering style
-	glUseProgram(0); // No shader
-
-	// Put viewHeight and viewWidth into context
-	SDL_Rect window_rect;
-	SDL_GetDisplayBounds(0, &window_rect);
-	pushValue(th, anInt(window_rect.h));
-	popProperty(th, contextidx, "viewHeight");
-	pushValue(th, anInt(window_rect.w));
-	popProperty(th, contextidx, "viewWidth");
-
-	// context.camera._Render(context) - adds attributes to context
-	pushSym(th, "_RenderIt");
-	pushProperty(th, contextidx, "camera"); // camera
-	pushLocal(th, contextidx);
-	getCall(th, 2, 0);
-
-	// context.scene._Render(context)
-	pushSym(th, "_Render");
-	pushProperty(th, contextidx, "scene");
-	pushLocal(th, contextidx);
-	pushValue(th, aNull);
-	getCall(th, 3, 0);
-
-	// Swap buffers to display window's finished image
+/** Swap window's buffers, displaying what we have rendered. */
+int window_swapbuffers(Value th) {
 	SDL_GL_SwapWindow(di->sdlWindow);
 	return 0;
 }
@@ -164,8 +132,10 @@ void window_init(Value th) {
 			pushCMethod(th, window_setfullscreen);
 			pushClosure(th, 2);
 			popProperty(th, 1, "fullscreen");
-			pushCMethod(th, window_render);
-			popProperty(th, 1, "_Render");
+			pushCMethod(th, window_makecurrent);
+			popProperty(th, 1, "MakeCurrent");
+			pushCMethod(th, window_swapbuffers);
+			popProperty(th, 1, "SwapBuffers");
 		popProperty(th, 0, "_newtype");
 		pushCMethod(th, window_new);
 		popProperty(th, 0, "New");

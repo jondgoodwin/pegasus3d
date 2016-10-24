@@ -12,18 +12,59 @@
 int region_new(Value th) {
 	int selfidx = getTop(th);
 	pushType(th, getLocal(th, 0), 16);
-
-	// Create storage place for the render-calculated matrices
-	pushSym(th, "New");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	popProperty(th, selfidx, "mmatrix");
-	pushSym(th, "New");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	popProperty(th, selfidx, "tmatrix");
-
 	return 1;
+}
+
+/** Calculate object's world "mmatrix" from origin, orientation, scale,
+	relative to passed (parent's) world mmatrix */
+int region_calcmatrix(Value th) {
+	int selfidx = 0;
+	int parentmatidx = 1;
+	if (getTop(th)<2)
+		return 0; // Parent matrix must be passed
+
+	// Get storage location for object's world matrix (mmatrix),
+	// creating it if not found
+	Value mmatv = pushProperty(th, selfidx, "mmatrix"); popValue(th);
+	if (mmatv == aNull) {
+		pushSym(th, "New");
+		pushGloVar(th, "Matrix4");
+		getCall(th, 1, 1);
+		mmatv = getFromTop(th, 0);
+		popProperty(th, selfidx, "mmatrix");
+	}
+	Mat4 *mmat = (Mat4*) toHeader(mmatv);
+
+	// Get object's origin. If it points to another object, use its mmatrix
+	Value originv = pushProperty(th, selfidx, "origin"); popValue(th);
+	if (originv!=aNull && !isCDataType(originv, PegVec3)) {
+		pushSym(th, "mmatrix");
+		pushValue(th, originv);
+		getCall(th, 1, 1);
+		Value objmatv = getFromTop(th, 0);
+		if (isCDataType(objmatv, PegMat4)) {
+			mat4Set(mmat, (Mat4*) toHeader(objmatv));
+			return 0;
+		}
+	}
+
+	// Get orientation and scale, then calculate mmatrix
+	Mat4 selfmat;
+	Value orientv = pushProperty(th, selfidx, "orientation"); popValue(th);
+	Value scalev = pushProperty(th, selfidx, "scale"); popValue(th);
+	mat4Place(&selfmat, isCDataType(originv, PegVec3)? (Xyz*)toHeader(originv) : NULL,
+		isCDataType(orientv, PegVec4)? (Quat*)toHeader(orientv) : NULL,
+		isCDataType(scalev, PegVec3)? (Xyz*)toHeader(scalev) : NULL);
+
+	// mmatrix = parent_mmatrix * selfmatrix
+	Value parentMatV = getLocal(th, parentmatidx);
+	if (parentMatV!=aNull) {
+		Mat4 *parentmat = (Mat4*) toHeader(parentMatV);
+		mat4Mult(mmat, parentmat, &selfmat);
+	}
+	else
+		mat4Set(mmat, &selfmat);
+	return 0;
 }
 
 /** Generic logic for rendering placed things */
@@ -34,31 +75,17 @@ int region_render(Value th) {
 	if (getTop(th)<3)
 		return 0; // Context & parent matrix must be passed
 
-	Value parentMatV = getLocal(th, parentmatidx);
+	// Calculate mmatrix from origin, orientation, scale relative to parent
+	pushSym(th, "CalcMatrix");
+	pushLocal(th, selfidx);
+	pushLocal(th, parentmatidx);
+	getCall(th, 2, 0);
 
 	// Create new context that inherits from old
 	int newcontextidx = getTop(th);
 	pushSym(th, "New");
 	pushLocal(th, contextidx);
 	getCall(th, 1, 1);
-
-	// Calculate object's transformation matrix
-	pushSym(th, "Set");
-	pushProperty(th, selfidx, "tmatrix");
-	pushProperty(th, selfidx, "origin");
-	pushProperty(th, selfidx, "orientation");
-	pushProperty(th, selfidx, "scale");
-	getCall(th, 4, 1);
-	Mat4 *tmat4 = (Mat4*) toHeader(getFromTop(th, 0));
-
-	// mmatrix = parent_mmatrix * objectmatrix
-	Mat4 *newmat = (Mat4*) toHeader(pushProperty(th, selfidx, "mmatrix"));
-	if (parentMatV!=aNull) {
-		Mat4 *parentmat = (Mat4*) toHeader(parentMatV);
-		mat4Mult(newmat, parentmat, tmat4);
-	}
-	else
-		mat4Set(newmat, tmat4);
 
 	// Ask if we should render it? (and augment context)
 	pushProperty(th, selfidx, "render?"); // Assume it is method
@@ -134,5 +161,7 @@ void region_init(Value th) {
 		popProperty(th, 0, "_Render");
 		pushCMethod(th, region_orient);
 		popProperty(th, 0, "OrientTo");
+		pushCMethod(th, region_calcmatrix);
+		popProperty(th, 0, "CalcMatrix");
 	popGloVar(th, "Region");
 }

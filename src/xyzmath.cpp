@@ -313,6 +313,19 @@ void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
 	(*tmat)[15] = 1.0f;
 }
 
+/** Calculate matrix values based on origin, orientation and scale,
+	any of which can be set to NULL */
+void mat4Place(Mat4 *mat, Xyz *origin, Quat *orient, Xyz *scale) {
+	if (orient!=NULL)
+		mat4Quat(mat, orient);
+	else
+		mat4Identity(mat);
+	if (scale!=NULL)
+		mat4Scale(mat, scale);
+	if (origin!=NULL)
+		mat4SetPos(mat, origin);
+}
+
 /** Print out a matrix, for diagnostics */
 void mat4Print(Mat4 *mat, const char *matnm) {
 	printf("%s %p\n", matnm, mat);

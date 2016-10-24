@@ -88,49 +88,92 @@ int camera_orthogonal(Value th) {
 	return 1;
 }
 
+/** Convert an Xyz vector from local to camera (eye) coordinates using mvmatrix */
+int camera_cameraXyz(Value th) {
+	Value oldxyzv;
+	if (getTop(th)<3 || !isCDataType(oldxyzv = getLocal(th, 1), PegVec3) )
+		return 0;
+	Xyz *oldxyz = (Xyz*) toHeader(oldxyzv);
+
+	// Calculate 'mvmatrix' from context
+	Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, 2, "mmatrix")); popValue(th);
+	Mat4 *vmatrix = (Mat4*) toHeader(pushProperty(th, 0, "vmatrix")); popValue(th);
+	Mat4 mvmatrix;
+	mat4Mult(&mvmatrix, vmatrix, mmatrix);
+
+	// Create placeholder for new, calculated Xyz
+	pushSym(th, "New");
+	pushGloVar(th, "Xyz");
+	getCall(th, 1, 1);
+	Xyz *newxyz = (Xyz*) toHeader(getFromTop(th, 0));
+
+	mat4MultVec(newxyz, &mvmatrix, oldxyz);
+	return 1;
+}
+
 /** Add camera's attributes to passed context (parm 1) */
 int camera_render(Value th) {
-	int camidx = 0;
-	int contextidx = 1;
-	if (getTop(th)<2)
-		return 0; // Context must be passed
+	int selfidx = 0;
+	int worldidx = getTop(th);
+	pushGloVar(th, "$");
+
+	// Put viewHeight and viewWidth into context
+	SDL_Rect window_rect;
+	SDL_GetDisplayBounds(0, &window_rect);
+	pushValue(th, anInt(window_rect.h));
+	popProperty(th, selfidx, "viewHeight");
+	pushValue(th, anInt(window_rect.w));
+	popProperty(th, selfidx, "viewWidth");
+
+	// Switch OpenGL to work within this window and clear the buffers
+	pushSym(th, "MakeCurrent");
+	pushProperty(th, worldidx, "window");
+	getCall(th, 1, 0);
+	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS); // Closer objects obscure further objects
+
+	// Initialize OpenGL rendering style
+	glUseProgram(0); // No shader
 
 	// Calculate designated projection matrix into context
-	Value projmeth = pushProperty(th, camidx, "projection");
+	Value projmeth = pushProperty(th, selfidx, "projection");
 	if (projmeth==aNull) {
 		popValue(th);
 		pushSym(th, "Perspective");
 	}
-	pushLocal(th, camidx);
-	pushLocal(th, contextidx);
+	pushLocal(th, selfidx);
+	pushLocal(th, selfidx);
 	getCall(th, 2, 1);
-	popProperty(th, contextidx, "pmatrix");
+	popProperty(th, selfidx, "pmatrix");
 
 	// Calculate camera's view matrix, invert and put in "vmatrix"
 	pushSym(th, "Set");
-	pushProperty(th, contextidx, "vmatrix");
+	pushProperty(th, selfidx, "vmatrix");
 	if (getFromTop(th, 0)==aNull) {
 		popValue(th);
 		pushSym(th, "New");
 		pushGloVar(th, "Matrix4");
 		getCall(th, 1, 1);
 		pushValue(th, getFromTop(th, 0));
-		popProperty(th, contextidx, "vmatrix");
+		popProperty(th, selfidx, "vmatrix");
 	}
-	pushProperty(th, camidx, "origin");
-	pushProperty(th, camidx, "orientation");
-	pushProperty(th, camidx, "scale");
+	pushProperty(th, selfidx, "origin");
+	pushProperty(th, selfidx, "orientation");
+	pushProperty(th, selfidx, "scale");
 	getCall(th, 4, 1);
 	Mat4 *vmat = (Mat4*) toHeader(getFromTop(th, 0));
 	mat4Inverse(vmat, vmat); // Because we want world->camera
 
-	// Put identity matrix for world coordinates in context as "mmatrix"
-	pushSym(th, "New");
-	pushGloVar(th, "Matrix4");
-	getCall(th, 1, 1);
-	Value retval = getFromTop(th, 0);
-	popProperty(th, contextidx, "mmatrix");
+	// $.scene._Render(context)
+	pushSym(th, "_Render");
+	pushProperty(th, worldidx, "scene");
+	pushLocal(th, selfidx);
+	pushValue(th, aNull);
+	getCall(th, 3, 0);
 
+	popValue(th); // '$'
 	return 0;
 }
 
@@ -152,5 +195,7 @@ void camera_init(Value th) {
 		popProperty(th, 0, "Perspective");
 		pushCMethod(th, camera_orthogonal);
 		popProperty(th, 0, "Orthogonal");
+		pushCMethod(th, camera_cameraXyz);
+		popProperty(th, 0, "CameraXyz");
 	popGloVar(th, "Camera");
 }
