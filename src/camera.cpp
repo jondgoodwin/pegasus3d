@@ -127,7 +127,7 @@ int camera_render(Value th) {
 
 	// Switch OpenGL to work within this window and clear the buffers
 	pushSym(th, "MakeCurrent");
-	pushProperty(th, worldidx, "window");
+	pushGloVar(th, "$window");
 	getCall(th, 1, 0);
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);

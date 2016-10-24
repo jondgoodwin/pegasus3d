@@ -218,7 +218,7 @@ int world_handleInput(Value th)
 			case SDLK_F11:
 				{
 				pushSym(th, "fullscreen");
-				Value window = pushProperty(th, 0, "window");
+				Value window = pushGloVar(th, "$window");
 				pushSym(th, "fullscreen");
 				pushValue(th, window);
 				getCall(th, 1, 1);
@@ -249,17 +249,6 @@ int world_handleInput(Value th)
 int world_render(Value th) {
 	int selfidx = 0;
 
-	// Set up a render of the world's window, creating it if needed
-	if (pushProperty(th, selfidx, "window")==aNull) {
-		popValue(th);
-		pushSym(th, "New");
-		pushGloVar(th, "Window");
-		getCall(th, 1, 1);
-		pushValue(th, getFromTop(th, 0));
-		popProperty(th, selfidx, "window");
-	}
-	popValue(th);
-
 	// Render camera (creating if needed)
 	pushSym(th, "_RenderIt");
 	if (pushProperty(th, selfidx, "camera")==aNull) {
@@ -274,7 +263,7 @@ int world_render(Value th) {
 
 	// Render the window by swapping buffers
 	pushSym(th, "SwapBuffers");
-	pushProperty(th, 0, "window");
+	pushGloVar(th, "$window");
 	getCall(th, 1, 0);
 	return 0;
 }

@@ -14,6 +14,11 @@
 /** Handle for Acorn VM context */
 Value vm;
 
+// For creating and destroying browser's shared window
+void window_newMainWindow(void);
+void window_destroyMainWindow(void);
+
+// World type initializers
 void color_init(Value th);
 void xyz_init(Value th);
 void quat_init(Value th);
@@ -81,11 +86,12 @@ int main(int argc, char *argv[])
 {
 	freopen("pegasus3d.log", "w", stderr);
 
-	// Initialize SDL's Video subsystem
+	// Initialize SDL's Video subsystem and create sharable main window
 	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
 		vmLog("Failed to initialize SDL2's Video subsystem\n");
 		return 1;
 	}
+	window_newMainWindow();
 
 	// Start Acorn VM and load its types
 	Value th = newVM();
@@ -131,6 +137,7 @@ int main(int argc, char *argv[])
 
 	curl_global_cleanup(); // Shutdown curl
 	vmClose(th); // Shutdown Acorn VM
+	window_destroyMainWindow();
 	SDL_Quit(); // Shutdown SDL2
 
 	return 0;

@@ -1,4 +1,4 @@
-/** Manage the 3D display window
+/** Manage the 3D display window, including main window ($window)
  * @file
  *
  * This source file is part of the Pegasus3d browser.
@@ -14,7 +14,7 @@ struct WindowInfo {
 	SDL_Window *sdlWindow;		//!< 3D display window, via SDL
 	SDL_GLContext sdlContext;	//!< OpenGL context, via SDL
 	bool fullscreen;			//!< Are we fullscreen (vs. windowed)?
-} *di;
+};
 
 /** Print out the received SDL error */
 void logSDLError(const char *message)
@@ -72,50 +72,63 @@ bool window_newOpenGLWindow(WindowInfo *di)
 int window_new(Value th) {
 	pushProperty(th, 0, "_newtype"); // get the mixin type for instance
 	Value dispinst = strHasFinalizer(pushCData(th, popValue(th), PegWindow, 0, sizeof(struct WindowInfo)));
-	di = (struct WindowInfo*) toHeader(dispinst);
-	window_newOpenGLWindow(di);
+	WindowInfo *wininfo = (struct WindowInfo*) toHeader(dispinst);
+	window_newOpenGLWindow(wininfo);
 	return 1;
 }
 
 /** Close down OpenGL, window and SDL2 */
 int window_finalizer(Value cdata) {
-	struct WindowInfo *di = (struct WindowInfo *)(toHeader(cdata));
+	struct WindowInfo *wininfo = (struct WindowInfo *)(toHeader(cdata));
 
 	// Delete our OpengL context
-	SDL_GL_DeleteContext(di->sdlContext);
+	SDL_GL_DeleteContext(wininfo->sdlContext);
 
 	// Destroy our window
-	SDL_DestroyWindow(di->sdlWindow);
+	SDL_DestroyWindow(wininfo->sdlWindow);
 
 	return 0;
 }
 
 /** Return aTrue if fullscreen, aFalse if windowed */
 int window_getfullscreen(Value th) {
-	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
-	pushValue(th, di->fullscreen? aTrue : aFalse);
+	WindowInfo *wininfo = (struct WindowInfo*) toHeader(getLocal(th, 0));
+	pushValue(th, wininfo->fullscreen? aTrue : aFalse);
 	return 1;
 }
 
 /** If true, set to fullscreen, otherwise windowed */
 int window_setfullscreen(Value th) {
-	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
-	di->fullscreen = !(getTop(th)<2 || isFalse(getLocal(th, 1)));
-	SDL_SetWindowFullscreen(di->sdlWindow, di->fullscreen? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+	WindowInfo *wininfo = (struct WindowInfo*) toHeader(getLocal(th, 0));
+	wininfo->fullscreen = !(getTop(th)<2 || isFalse(getLocal(th, 1)));
+	SDL_SetWindowFullscreen(wininfo->sdlWindow, wininfo->fullscreen? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 	return 0;
 }
 
 /** Attach current OpenGL context to this window */
 int window_makecurrent(Value th) {
-	WindowInfo *di = (struct WindowInfo*) toHeader(getLocal(th, 0));
-	SDL_GL_MakeCurrent(di->sdlWindow, di->sdlContext);
+	WindowInfo *wininfo = (struct WindowInfo*) toHeader(getLocal(th, 0));
+	SDL_GL_MakeCurrent(wininfo->sdlWindow, wininfo->sdlContext);
 	return 0;
 }
 
 /** Swap window's buffers, displaying what we have rendered. */
 int window_swapbuffers(Value th) {
-	SDL_GL_SwapWindow(di->sdlWindow);
+	WindowInfo *wininfo = (struct WindowInfo*) toHeader(getLocal(th, 0));
+	SDL_GL_SwapWindow(wininfo->sdlWindow);
 	return 0;
+}
+
+/** Browser's main window */
+struct WindowInfo mainWindow;
+/** Create main window */
+void window_newMainWindow(void) {
+	window_newOpenGLWindow(&mainWindow);
+}
+/** Destroy main window */
+void window_destroyMainWindow(void) {
+	SDL_GL_DeleteContext(mainWindow.sdlContext);
+	SDL_DestroyWindow(mainWindow.sdlWindow);
 }
 
 /** Initialize the Window type and '$window'*/
@@ -123,7 +136,7 @@ void window_init(Value th) {
 	pushType(th, aNull, 6);
 		pushSym(th, "Window");
 		popProperty(th, 0, "_name");
-		pushMixin(th, aNull, aNull, 5);
+		Value newtype = pushMixin(th, aNull, aNull, 5);
 			pushSym(th, "*Window");
 			popProperty(th, 1, "_name");
 			pushCMethod(th, window_finalizer);
@@ -140,4 +153,13 @@ void window_init(Value th) {
 		pushCMethod(th, window_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Window");
+
+	// Create $window for main window
+	pushValue(th, newtype); // get the mixin type for a Window
+	Value windowv = pushCData(th, popValue(th), PegWindow, 0, sizeof(struct WindowInfo));
+	WindowInfo *wininfo = (struct WindowInfo*) toHeader(windowv);
+	wininfo->sdlWindow = mainWindow.sdlWindow;
+	wininfo->sdlContext = mainWindow.sdlContext;
+	wininfo->fullscreen = mainWindow.fullscreen;
+	popGloVar(th, "$window");
 }
