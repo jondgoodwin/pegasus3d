@@ -8,13 +8,6 @@
 #include "pegasus3d.h"
 #include <math.h>
 
-struct ColorInfo {
-	float red;
-	float green;
-	float blue;
-	float alpha;
-};
-
 /** Create a new color value, with passed red, green, blue and alpha values.
   Defaults: White if no passed values, Gray scale if 1 passed value, 1.0 if no alpha. */
 int color_new(Value th) {

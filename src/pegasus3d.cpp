@@ -19,6 +19,7 @@ void window_newMainWindow(void);
 void window_destroyMainWindow(void);
 
 // World type initializers
+void rect_init(Value th);
 void color_init(Value th);
 void xyz_init(Value th);
 void quat_init(Value th);
@@ -42,6 +43,7 @@ void test_init(Value th);
 /** Initialize World Types and environment global variables. */
 void initTypes(Value th) {
 	// Pure data types
+	rect_init(th);
 	color_init(th);
 	xyz_init(th);
 	quat_init(th);

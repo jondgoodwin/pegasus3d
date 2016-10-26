@@ -63,7 +63,9 @@ enum PegCDataTypes {
 	PegFloat,
 	PegUint8,
 	PegUint16,
-	PegUint32
+	PegUint32,
+
+	PegRect
 };
 
 struct ArrayHeader {
@@ -77,6 +79,21 @@ struct ImageHeader {
 	AuintIdx y;
 	AuintIdx z;
 	unsigned char nbytes;
+};
+
+/** Structure for a 2d image rectangle */
+typedef struct Rect {
+	int x;  //!< x position
+	int y;  //!< y position
+	int w;  //!< width
+	int h;	//!< height
+} Rect;
+
+struct ColorInfo {
+	float red;
+	float green;
+	float blue;
+	float alpha;
 };
 
 #endif

@@ -295,9 +295,9 @@ void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
 		- (*fmat)[8]*(*fmat)[13]*(*fmat)[6] 
 		- (*fmat)[12]*(*fmat)[5]*(*fmat)[10])/det;
 	(*tmat)[13] = ((*fmat)[0]*(*fmat)[9]*(*fmat)[14] 
-		+ (*fmat)[8]*(*fmat)[9]*(*fmat)[2] 
-		+ (*fmat)[12]*(*fmat)[1]*(*fmat)[12] 
-		- (*fmat)[0]*(*fmat)[13]*(*fmat)[10] 
+		+ (*fmat)[8]*(*fmat)[13]*(*fmat)[2]
+		+ (*fmat)[12]*(*fmat)[1]*(*fmat)[10]
+		- (*fmat)[0]*(*fmat)[13]*(*fmat)[10]
 		- (*fmat)[8]*(*fmat)[1]*(*fmat)[14] 
 		- (*fmat)[12]*(*fmat)[9]*(*fmat)[2])/det;
 	(*tmat)[14] = ((*fmat)[0]*(*fmat)[13]*(*fmat)[6] 

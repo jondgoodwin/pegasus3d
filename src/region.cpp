@@ -35,21 +35,9 @@ int region_calcmatrix(Value th) {
 	}
 	Mat4 *mmat = (Mat4*) toHeader(mmatv);
 
-	// Get object's origin. If it points to another object, use its mmatrix
-	Value originv = pushProperty(th, selfidx, "origin"); popValue(th);
-	if (originv!=aNull && !isCDataType(originv, PegVec3)) {
-		pushSym(th, "mmatrix");
-		pushValue(th, originv);
-		getCall(th, 1, 1);
-		Value objmatv = getFromTop(th, 0);
-		if (isCDataType(objmatv, PegMat4)) {
-			mat4Set(mmat, (Mat4*) toHeader(objmatv));
-			return 0;
-		}
-	}
-
-	// Get orientation and scale, then calculate mmatrix
+	// Get origin, orientation and scale, then calculate mmatrix
 	Mat4 selfmat;
+	Value originv = pushProperty(th, selfidx, "origin"); popValue(th);
 	Value orientv = pushProperty(th, selfidx, "orientation"); popValue(th);
 	Value scalev = pushProperty(th, selfidx, "scale"); popValue(th);
 	mat4Place(&selfmat, isCDataType(originv, PegVec3)? (Xyz*)toHeader(originv) : NULL,

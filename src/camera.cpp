@@ -36,13 +36,18 @@ int camera_new(Value th) {
 	pushGloVar(th, "Quat");
 	getCall(th, 1, 1);
 	popProperty(th, camidx, "orientation");
+
+	pushSym(th, "New");
+	pushGloVar(th, "Rect");
+	getCall(th, 1, 1);
+	popProperty(th, camidx, "targetRect");
 	return 1;
 }
 
-/** Calculate and return new perspective projection matrix using self/context properties */
+/** Calculate and return new perspective projection matrix using self properties */
 int camera_perspective(Value th) {
 	int selfidx = 0;
-	int contextidx = 1;
+
 	// Retrieve needed properties for calculating perspective matrix
 	Value fovv = pushProperty(th, selfidx, "fov");
 	Value mindistv = pushProperty(th, selfidx, "near");
@@ -51,8 +56,13 @@ int camera_perspective(Value th) {
 	GLfloat mindist = isFloat(mindistv)? toAfloat(mindistv) : 0.1f;
 	GLfloat maxdist = isFloat(maxdistv)? toAfloat(maxdistv) : 1000.0f;
 
-	// Calculate window aspect ratio using context's view size properties 
-	GLfloat aspratio = ((GLfloat)toAint(pushProperty(th, contextidx, "viewWidth")))/((GLfloat)toAint(pushProperty(th, contextidx, "viewHeight")));
+	GLfloat aspratio = 1.0f;
+	Value targetrectv = pushProperty(th, selfidx, "targetRect");
+	Rect *targetrect;
+	if (isCDataType(targetrectv, PegRect)) {
+		targetrect = (Rect*) toHeader(targetrectv);
+		aspratio = ((GLfloat)targetrect->w) / ((GLfloat) targetrect->h);
+	}
 
 	// Create calculated perspective matrix and store as mvpmatrix
 	pushSym(th, "New");
@@ -63,21 +73,25 @@ int camera_perspective(Value th) {
 	return 1;
 }
 
-/** Calculate and return orthogonal projection matrix using context properties */
+/** Calculate and return orthogonal projection matrix using self properties */
 int camera_orthogonal(Value th) {
 	int selfidx = 0;
-	int contextidx = 1;
 
 	// Retrieve needed properties for calculating orthogonal matrix
-	Value fovv = pushProperty(th, selfidx, "viewHeight");
+	Value fovhtv = pushProperty(th, selfidx, "viewHeight");
 	Value mindistv = pushProperty(th, selfidx, "near");
 	Value maxdistv = pushProperty(th, selfidx, "far");
-	GLfloat fovht = isFloat(fovv)? toAfloat(fovv) : 10.0f;
+	GLfloat fovht = isFloat(fovhtv)? toAfloat(fovhtv) : 10.0f;
 	GLfloat mindist = isFloat(mindistv)? toAfloat(mindistv) : 0.1f;
 	GLfloat maxdist = isFloat(maxdistv)? toAfloat(maxdistv) : 1000.0f;
 
-	// Calculate window aspect ratio using context's view size properties 
-	GLfloat aspratio = ((GLfloat)toAint(pushProperty(th, contextidx, "viewWidth")))/((GLfloat)toAint(pushProperty(th, contextidx, "viewHeight")));
+	GLfloat aspratio = 1.0f;
+	Value targetrectv = pushProperty(th, selfidx, "targetRect");
+	Rect *targetrect;
+	if (isCDataType(targetrectv, PegRect)) {
+		targetrect = (Rect*) toHeader(targetrectv);
+		aspratio = ((GLfloat)targetrect->w) / ((GLfloat) targetrect->h);
+	}
 
 	// Create calculated orthogonal matrix and store as mvpmatrix
 	pushSym(th, "New");
@@ -117,24 +131,37 @@ int camera_render(Value th) {
 	int worldidx = getTop(th);
 	pushGloVar(th, "$");
 
-	// Put viewHeight and viewWidth into context
-	SDL_Rect window_rect;
-	SDL_GetDisplayBounds(0, &window_rect);
-	pushValue(th, anInt(window_rect.h));
-	popProperty(th, selfidx, "viewHeight");
-	pushValue(th, anInt(window_rect.w));
-	popProperty(th, selfidx, "viewWidth");
-
-	// Switch OpenGL to work within this window and clear the buffers
+	// Switch OpenGL to work within the target (or $window)
 	pushSym(th, "MakeCurrent");
-	pushGloVar(th, "$window");
-	getCall(th, 1, 0);
-	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+	if (pushProperty(th, selfidx, "target")==aNull) {
+		popValue(th);
+		pushGloVar(th, "$window");
+	}
+	Value targetrectv = pushProperty(th, selfidx, "targetRect");
+	getCall(th, 2, 0);
+	Rect *targetrect = (Rect*) toHeader(targetrectv);
+
+	// Define an OpenGL viewport within target, if specified
+	Value viewportv = pushProperty(th, selfidx, "viewport"); popValue(th);
+	if (isCDataType(viewportv, PegRect)) {
+		Rect *viewport = (Rect*) toHeader(viewportv);
+		glViewport(viewport->x, viewport->y, viewport->w, viewport->h);
+		targetrect->h = viewport->h;
+		targetrect->w = viewport->w;
+	}
+
+	// Retrieve background fill color
+	static ColorInfo black = {0.0f, 0.0f, 0.0f, 1.0f};
+	ColorInfo *background = &black;
+	Value backv = pushProperty(th, selfidx, "background"); popValue(th);
+	if (isCDataType(backv, PegVec4))
+		background = (ColorInfo*) toHeader(backv);
+
+	// OpenGL: Clear target buffers for 3D rendering
+	glClearColor(background->red, background->green, background->blue, background->alpha);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS); // Closer objects obscure further objects
-
-	// Initialize OpenGL rendering style
 	glUseProgram(0); // No shader
 
 	// Calculate designated projection matrix into context
@@ -144,33 +171,64 @@ int camera_render(Value th) {
 		pushSym(th, "Perspective");
 	}
 	pushLocal(th, selfidx);
-	pushLocal(th, selfidx);
-	getCall(th, 2, 1);
+	getCall(th, 1, 1);
 	popProperty(th, selfidx, "pmatrix");
 
-	// Calculate camera's view matrix, invert and put in "vmatrix"
-	pushSym(th, "Set");
-	pushProperty(th, selfidx, "vmatrix");
-	if (getFromTop(th, 0)==aNull) {
-		popValue(th);
+	// Obtain "vmatrix" property storage for camera's view matrix
+	Value vmatv = pushProperty(th, selfidx, "vmatrix"); popValue(th);
+	if (vmatv==aNull) {
 		pushSym(th, "New");
 		pushGloVar(th, "Matrix4");
 		getCall(th, 1, 1);
-		pushValue(th, getFromTop(th, 0));
+		vmatv = getFromTop(th, 0);
 		popProperty(th, selfidx, "vmatrix");
 	}
-	pushProperty(th, selfidx, "origin");
-	pushProperty(th, selfidx, "orientation");
-	pushProperty(th, selfidx, "scale");
-	getCall(th, 4, 1);
-	Mat4 *vmat = (Mat4*) toHeader(getFromTop(th, 0));
-	mat4Inverse(vmat, vmat); // Because we want world->camera
+	Mat4 *vmat = (Mat4*) toHeader(vmatv);
 
-	// $.scene._Render(context)
+	// Calculate camera's matrix, able to convert from camera coordinates to world coordinates
+	Mat4 cammat;
+	Value originv = pushProperty(th, selfidx, "origin"); popValue(th);
+	Value orientv = pushProperty(th, selfidx, "orientation"); popValue(th);
+	Value scalev = pushProperty(th, selfidx, "scale"); popValue(th);
+	mat4Place(&cammat, isCDataType(originv, PegVec3)? (Xyz*)toHeader(originv) : NULL,
+		isCDataType(orientv, PegVec4)? (Quat*)toHeader(orientv) : NULL,
+		isCDataType(scalev, PegVec3)? (Xyz*)toHeader(scalev) : NULL);
+
+	// If camera follows a 3D object, get its "mmatrix" so that camera coordinates are relative to its eye
+	int followidx = getTop(th);
+	pushProperty(th, selfidx, "following");
+	Value followmatv = pushProperty(th, followidx, "mmatrix"); popValue(th);
+	if (followmatv!=aNull) {
+		Mat4 eyemat;
+		Mat4 *followmat = (Mat4*) toHeader(followmatv);
+		Value eyev = pushProperty(th, followidx, "eye"); popValue(th);
+		if (isCDataType(eyev, PegVec3)) {
+			mat4Set(&eyemat, followmat);
+			followmat = &eyemat;
+			Xyz *eye = (Xyz*) toHeader(eyev);
+			Xyz followeye;
+			mat4MultVec(&followeye, followmat, eye);
+			(*followmat)[12] = followeye.x;
+			(*followmat)[13] = followeye.y;
+			(*followmat)[14] = followeye.z;
+		}
+		mat4Mult(vmat, followmat, &cammat);
+	}
+	else
+		mat4Set(vmat, &cammat);
+	popValue(th);
+
+	// Invert camera's matrix so it transforms from world coordinates to camera
+	mat4Inverse(vmat, vmat);
+
+	// Render camera's (or world's) scene
 	pushSym(th, "_Render");
-	pushProperty(th, worldidx, "scene");
+	if (pushProperty(th, selfidx, "scene")==aNull) {
+		popValue(th);
+		pushProperty(th, worldidx, "scene");
+	}
 	pushLocal(th, selfidx);
-	pushValue(th, aNull);
+	pushValue(th, aNull); // Default for identity matrix
 	getCall(th, 3, 0);
 
 	popValue(th); // '$'

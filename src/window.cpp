@@ -109,6 +109,11 @@ int window_setfullscreen(Value th) {
 int window_makecurrent(Value th) {
 	WindowInfo *wininfo = (struct WindowInfo*) toHeader(getLocal(th, 0));
 	SDL_GL_MakeCurrent(wininfo->sdlWindow, wininfo->sdlContext);
+	if (getTop(th)>1 && isCDataType(getLocal(th, 1), PegRect)) {
+		Rect *winrect = (Rect*) toHeader(getLocal(th,1));
+		winrect->x = winrect->y = 0;
+		SDL_GetWindowSize(wininfo->sdlWindow, &winrect->w, &winrect->h);
+	}
 	return 0;
 }
 
