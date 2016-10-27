@@ -9,15 +9,35 @@
 
 /** Create a new group */
 int group_new(Value th) {
-	pushSym(th, "New");
-	pushGloVar(th, "Region");
-	getCall(th, 1, 1);
-	setType(th, getFromTop(th, 0), getLocal(th, 0));
+	pushType(th, getLocal(th, 0), 16);
 	return 1;
 }
 
+/** Recursively traverse a scene graph's group, preparing it for rendering */
+int group_renderprep(Value th) {
+	int selfidx = 0;
+	int cameraidx = 1;
+
+	Value nodematv = pushProperty(th, selfidx, "mmatrix");
+
+	// Recursively traverse this node's parts
+	Value parts = pushProperty(th, selfidx, "parts");
+	if (isArr(parts)) {
+		Aint sz = getSize(parts);
+		for (Aint i=0; i<sz; i++) {
+			pushSym(th, "_RenderPrep");
+			pushLocal(th, cameraidx);
+			pushValue(th, arrGet(th, parts, i));
+			pushValue(th, nodematv);
+			getCall(th, 3, 0);
+		}
+	}
+
+	return 0;
+}
+
 /** Render group using passed context (parm 1) */
-int group_renderit(Value th) {
+int group_render(Value th) {
 	int selfidx = 0;
 	int contextidx = 1;
 
@@ -39,16 +59,16 @@ int group_renderit(Value th) {
 
 /** Initialize Group type */
 void group_init(Value th) {
-	// Group is a new Region
-	pushSym(th, "New");
-	pushGloVar(th, "Region");
-	getCall(th, 1, 1);
-	Value Group = getFromTop(th, 0);
+	Value Group = pushType(th, aNull, 16);
+		Value Placement = pushGloVar(th, "Placement"); popValue(th);
+		addMixin(th, Group, Placement);
 		pushSym(th, "Group");
 		popProperty(th, 0, "_name");
 		pushCMethod(th, group_new);
 		popProperty(th, 0, "New");
-		pushCMethod(th, group_renderit);
-		popProperty(th, 0, "_RenderIt");
+		pushCMethod(th, group_render);
+		popProperty(th, 0, "_Render");
+		pushCMethod(th, group_renderprep);
+		popProperty(th, 0, "_RenderPrep");
 	popGloVar(th, "Group");
 }

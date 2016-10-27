@@ -174,9 +174,15 @@ int shader_render(Value th) {
 				}
 
 				// Get and process a uniform value from the shape or render context
-				Value unival = getProperty(th, getLocal(th, shapeidx), uninamev);
-				if (unival == aNull)
-					unival = getProperty(th, getLocal(th, contextidx), uninamev);
+				Value unival;
+				if (0==strcmp("cameraOrigin", uninamestr)) {
+					unival = pushProperty(th, contextidx, "origin"); popValue(th);
+				}
+				else {
+					unival = getProperty(th, getLocal(th, shapeidx), uninamev);
+					if (unival == aNull)
+						unival = getProperty(th, getLocal(th, contextidx), uninamev);
+				}
 				if (isFloat(unival))
 					glUniform1f(glGetUniformLocation(pgmdata->program, uninamestr), toAfloat(unival));
 				else if (isInt(unival))

@@ -311,15 +311,20 @@ int shape_setDraw(Value th) {
 
 /** Create a new shape */
 int shape_new(Value th) {
-	pushSym(th, "New");
-	pushGloVar(th, "Region");
-	getCall(th, 1, 1);
-	setType(th, getFromTop(th, 0), getLocal(th, 0));
+	pushType(th, getLocal(th, 0), 16);
 	return 1;
 }
 
+/** Prepare a shape for rendering */
+int shape_renderprep(Value th) {
+	int selfidx = 0;
+	int cameraidx = 1;
+
+	return 0;
+}
+
 /** Render the shape */
-int shape_renderit(Value th) {
+int shape_render(Value th) {
 	int selfidx = 0;
 	int contextidx = 1;
 
@@ -427,17 +432,17 @@ int shape_renderit(Value th) {
 
 /** Initialize shape type */
 void shape_init(Value th) {
-	// Shape is a new Region
-	pushSym(th, "New");
-	pushGloVar(th, "Region");
-	getCall(th, 1, 1);
-	Value Shape = getFromTop(th, 0);
+	Value Shape = pushType(th, aNull, 16);
+		Value Placement = pushGloVar(th, "Placement"); popValue(th);
+		addMixin(th, Shape, Placement);
 		pushSym(th, "Shape");
 		popProperty(th, 0, "_name");
 		pushCMethod(th, shape_new);
 		popProperty(th, 0, "New");
-		pushCMethod(th, shape_renderit);
-		popProperty(th, 0, "_RenderIt");
+		pushCMethod(th, shape_render);
+		popProperty(th, 0, "_Render");
+		pushCMethod(th, shape_renderprep);
+		popProperty(th, 0, "_RenderPrep");
 		pushCMethod(th, shape_sphere);
 		popProperty(th, 0, "NewSphere");
 		pushCMethod(th, shape_plane);

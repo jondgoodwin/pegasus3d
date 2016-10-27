@@ -250,7 +250,7 @@ int world_render(Value th) {
 	int selfidx = 0;
 
 	// Render camera (creating if needed)
-	pushSym(th, "_RenderIt");
+	pushSym(th, "_Render");
 	if (pushProperty(th, selfidx, "camera")==aNull) {
 		popValue(th);
 		pushSym(th, "New");

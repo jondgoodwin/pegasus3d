@@ -125,6 +125,27 @@ int camera_cameraXyz(Value th) {
 	return 1;
 }
 
+/** Prepare a scene node for rendering */
+int camera_renderprep(Value th) {
+	int selfidx = 0;
+	int nodeidx = 1;
+	int parentmatidx = 2;
+
+	// Calculate mmatrix from origin, orientation, scale relative to parent
+	pushSym(th, "CalcMatrix");
+	pushLocal(th, nodeidx);
+	pushLocal(th, parentmatidx);
+	getCall(th, 2, 0);
+
+	// Node-specific render preparation
+	pushSym(th, "_RenderPrep");
+	pushLocal(th, nodeidx);
+	pushLocal(th, selfidx);
+	getCall(th, 2, 0);
+
+	return 0;
+}
+
 /** Add camera's attributes to passed context (parm 1) */
 int camera_render(Value th) {
 	int selfidx = 0;
@@ -163,6 +184,17 @@ int camera_render(Value th) {
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS); // Closer objects obscure further objects
 	glUseProgram(0); // No shader
+
+
+	// Traverse the scene graph's nodes, preparing for the render
+	pushSym(th, "_RenderPrep");
+	pushLocal(th, selfidx);
+	if (pushProperty(th, selfidx, "scene")==aNull) {
+		popValue(th);
+		pushProperty(th, worldidx, "scene");
+	}
+	pushValue(th, aNull); // Default for identity matrix
+	getCall(th, 3, 0);
 
 	// Calculate designated projection matrix into context
 	Value projmeth = pushProperty(th, selfidx, "projection");
@@ -237,17 +269,17 @@ int camera_render(Value th) {
 
 /** Initialize Camera type */
 void camera_init(Value th) {
-	// Camera is a new Region
-	pushSym(th, "New");
-	pushGloVar(th, "Region");
-	getCall(th, 1, 1);
-	Value Camera = getFromTop(th, 0);
+	Value Camera = pushType(th, aNull, 16);
+		Value Placement = pushGloVar(th, "Placement"); popValue(th);
+		addMixin(th, Camera, Placement);
 		pushSym(th, "Camera");
 		popProperty(th, 0, "_name");
 		pushCMethod(th, camera_new);
 		popProperty(th, 0, "New");
 		pushCMethod(th, camera_render);
-		popProperty(th, 0, "_RenderIt");
+		popProperty(th, 0, "_Render");
+		pushCMethod(th, camera_renderprep);
+		popProperty(th, 0, "_RenderPrep");
 
 		pushCMethod(th, camera_perspective);
 		popProperty(th, 0, "Perspective");

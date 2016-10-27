@@ -1,4 +1,4 @@
-/** Abstract type used by types that occupy a 3D region in world space.
+/** Mixin for objects having origin, orientation and scale
  * @file
  *
  * This source file is part of the Pegasus3d browser.
@@ -8,16 +8,9 @@
 #include "pegasus3d.h"
 #include "xyzmath.h"
 
-/** Create a new region */
-int region_new(Value th) {
-	int selfidx = getTop(th);
-	pushType(th, getLocal(th, 0), 16);
-	return 1;
-}
-
-/** Calculate object's world "mmatrix" from origin, orientation, scale,
+/** Calculate and return an object's world "mmatrix" from origin, orientation, scale,
 	relative to passed (parent's) world mmatrix */
-int region_calcmatrix(Value th) {
+int placement_calcmatrix(Value th) {
 	int selfidx = 0;
 	int parentmatidx = 1;
 	if (getTop(th)<2)
@@ -25,12 +18,12 @@ int region_calcmatrix(Value th) {
 
 	// Get storage location for object's world matrix (mmatrix),
 	// creating it if not found
-	Value mmatv = pushProperty(th, selfidx, "mmatrix"); popValue(th);
+	Value mmatv = pushProperty(th, selfidx, "mmatrix");
 	if (mmatv == aNull) {
 		pushSym(th, "New");
 		pushGloVar(th, "Matrix4");
 		getCall(th, 1, 1);
-		mmatv = getFromTop(th, 0);
+		mmatv = pushValue(th, getFromTop(th, 0));
 		popProperty(th, selfidx, "mmatrix");
 	}
 	Mat4 *mmat = (Mat4*) toHeader(mmatv);
@@ -52,47 +45,11 @@ int region_calcmatrix(Value th) {
 	}
 	else
 		mat4Set(mmat, &selfmat);
-	return 0;
-}
-
-/** Generic logic for rendering placed things */
-int region_render(Value th) {
-	int selfidx = 0;
-	int contextidx = 1;
-	int parentmatidx = 2;
-	if (getTop(th)<3)
-		return 0; // Context & parent matrix must be passed
-
-	// Calculate mmatrix from origin, orientation, scale relative to parent
-	pushSym(th, "CalcMatrix");
-	pushLocal(th, selfidx);
-	pushLocal(th, parentmatidx);
-	getCall(th, 2, 0);
-
-	// Create new context that inherits from old
-	int newcontextidx = getTop(th);
-	pushSym(th, "New");
-	pushLocal(th, contextidx);
-	getCall(th, 1, 1);
-
-	// Ask if we should render it? (and augment context)
-	pushProperty(th, selfidx, "render?"); // Assume it is method
-	pushLocal(th, newcontextidx); // make new context self to render? method
-	pushLocal(th, selfidx);
-	getCall(th, 2, 1);
-	Value torender = popValue(th);
-	if (torender!=aFalse) {
-		pushSym(th, "_RenderIt");
-		pushLocal(th, selfidx);
-		pushLocal(th, newcontextidx);
-		getCall(th, 2, 0);
-	}
-
 	return 1;
 }
 
 /** Set orientation property to a quaternion that looks at passed Xyz location */
-int region_orient(Value th) {
+int placement_orient(Value th) {
 	int selfidx = 0;
 
 	// Get destination quat in "orientation" property
@@ -139,17 +96,13 @@ int region_orient(Value th) {
 }
 
 /** Initialize the RenderContext type */
-void region_init(Value th) {
+void placement_init(Value th) {
 	pushType(th, aNull, 6);
-		pushSym(th, "Region");
+		pushSym(th, "Placement");
 		popProperty(th, 0, "_name");
-		pushCMethod(th, region_new);
-		popProperty(th, 0, "New");
-		pushCMethod(th, region_render);
-		popProperty(th, 0, "_Render");
-		pushCMethod(th, region_orient);
+		pushCMethod(th, placement_orient);
 		popProperty(th, 0, "OrientTo");
-		pushCMethod(th, region_calcmatrix);
+		pushCMethod(th, placement_calcmatrix);
 		popProperty(th, 0, "CalcMatrix");
-	popGloVar(th, "Region");
+	popGloVar(th, "Placement");
 }
