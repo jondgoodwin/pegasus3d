@@ -190,18 +190,14 @@ int world_handleInput(Value th)
 		// Keyboard events
 		else if (event.type == SDL_KEYUP)
 		{
-			switch (event.key.keysym.sym)
-			{
-			default:
-				if (inputContext!=aNull && event.key.repeat==0) {
-					Value keydown = pushProperty(th, inputIdx, "keyUp");
-					pushKeySym(th, event.key.keysym.scancode);
-					pushValue(th, getProperty(th, keydown, getFromTop(th, 0)));
-					pushValue(th, aNull);
-					getCall(th, 1, 0);
-					popValue(th);
-					popValue(th);
-				}
+			if (inputContext!=aNull && event.key.repeat==0) {
+				Value keydown = pushProperty(th, inputIdx, "keyUp");
+				pushKeySym(th, event.key.keysym.scancode);
+				pushValue(th, getProperty(th, keydown, getFromTop(th, 0)));
+				pushValue(th, aNull);
+				getCall(th, 1, 0);
+				popValue(th);
+				popValue(th);
 			}
 		}
 
@@ -249,19 +245,33 @@ int world_handleInput(Value th)
 int world_render(Value th) {
 	int selfidx = 0;
 
-	// Render camera (creating if needed)
-	pushSym(th, "_Render");
-	if (pushProperty(th, selfidx, "camera")==aNull) {
+	// Get 'render' property (creating it with +Camera, if needed)
+	Value renderv;
+	if ((renderv = pushProperty(th, selfidx, "render"))==aNull) {
 		popValue(th);
 		pushSym(th, "New");
 		pushGloVar(th, "Camera");
 		getCall(th, 1, 1);
-		pushValue(th, getFromTop(th, 0));
-		popProperty(th, selfidx, "camera");
+		pushValue(th, renderv = getFromTop(th, 0));
+		popProperty(th, selfidx, "render");
 	}
-	getCall(th, 1, 0);
 
-	// Render the window by swapping buffers
+	// Perform the rendering
+	if (isArr(renderv)) {
+		Aint sz = getSize(renderv);
+		for (Aint i=0; i<sz; i++) {
+			pushSym(th, "_Render");
+			pushValue(th, arrGet(th, renderv, i));
+			getCall(th, 1, 0);
+		}
+	}
+	else {
+		pushSym(th, "_Render");
+		pushValue(th, renderv);
+		getCall(th, 1, 0);
+	}
+
+	// Swap buffers to show the rendered main window
 	pushSym(th, "SwapBuffers");
 	pushGloVar(th, "$window");
 	getCall(th, 1, 0);

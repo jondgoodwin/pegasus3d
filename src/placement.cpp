@@ -26,21 +26,21 @@ int placement_calcmatrix(Value th) {
 		mmatv = pushValue(th, getFromTop(th, 0));
 		popProperty(th, selfidx, "mmatrix");
 	}
-	Mat4 *mmat = (Mat4*) toHeader(mmatv);
+	Mat4 *mmat = toMat4(mmatv);
 
 	// Get origin, orientation and scale, then calculate mmatrix
 	Mat4 selfmat;
 	Value originv = pushProperty(th, selfidx, "origin"); popValue(th);
 	Value orientv = pushProperty(th, selfidx, "orientation"); popValue(th);
 	Value scalev = pushProperty(th, selfidx, "scale"); popValue(th);
-	mat4Place(&selfmat, isCDataType(originv, PegVec3)? (Xyz*)toHeader(originv) : NULL,
-		isCDataType(orientv, PegVec4)? (Quat*)toHeader(orientv) : NULL,
-		isCDataType(scalev, PegVec3)? (Xyz*)toHeader(scalev) : NULL);
+	mat4Place(&selfmat, isXyz(originv)? toXyz(originv) : NULL,
+		isQuat(orientv)? toQuat(orientv) : NULL,
+		isXyz(scalev)? toXyz(scalev) : NULL);
 
 	// mmatrix = parent_mmatrix * selfmatrix
 	Value parentMatV = getLocal(th, parentmatidx);
 	if (parentMatV!=aNull) {
-		Mat4 *parentmat = (Mat4*) toHeader(parentMatV);
+		Mat4 *parentmat = toMat4(parentMatV);
 		mat4Mult(mmat, parentmat, &selfmat);
 	}
 	else
@@ -54,24 +54,24 @@ int placement_orient(Value th) {
 
 	// Get destination quat in "orientation" property
 	Value orientv = pushProperty(th, selfidx, "orientation");
-	if (!isCDataType(orientv, PegVec4)) {
+	if (!isQuat(orientv)) {
 		pushSym(th, "New");
 		pushGloVar(th, "Quat");
 		getCall(th, 1, 1);
 		orientv = getFromTop(th, 0);
 		popProperty(th, selfidx, "orientation");
 	}
-	Quat *quat = (Quat*) toHeader(orientv);
+	Quat *quat = toQuat(orientv);
 
 	// Calculate normalized vector pointing from self to target
-	if (getTop(th)<2 || !isCDataType(getLocal(th,1), PegVec3))
+	if (getTop(th)<2 || !isXyz(getLocal(th,1)))
 		return 0;
 	Xyz toxyz;
-	Xyz* toxyz2 = (Xyz*) toHeader(getLocal(th,1));
+	Xyz *toxyz2 = toXyz(getLocal(th,1));
 	toxyz.x = toxyz2->x; toxyz.y = toxyz2->y; toxyz.z = toxyz2->z; 
 	Value originv = pushProperty(th, selfidx, "origin");
-	if (isCDataType(originv,PegVec3)) {
-		Xyz *selfxyz = (Xyz*) toHeader(originv);
+	if (isXyz(originv)) {
+		Xyz *selfxyz = toXyz(originv);
 		toxyz.x -= selfxyz->x;
 		toxyz.y -= selfxyz->y;
 		toxyz.z -= selfxyz->z;

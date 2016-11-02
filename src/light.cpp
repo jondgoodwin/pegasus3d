@@ -20,7 +20,7 @@ int light_renderprep(Value th) {
 
 	// Gather properties we need to calculate
 	Value mmatrixv = pushProperty(th, selfidx, "mmatrix"); popValue(th);
-	if (isCDataType(mmatrixv, PegMat4)) {
+	if (isMat4(mmatrixv)) {
 
 		// Obtain storage spot to put camera coordinates for light's origin
 		Value lightoriginv = pushProperty(th, cameraidx, "lightOrigin");
@@ -33,8 +33,8 @@ int light_renderprep(Value th) {
 		}
 
 		// Calculate camera's coordinates for light's origin
-		Xyz *lightorigin = (Xyz*) toHeader(lightoriginv);
-		Mat4 *mmat = (Mat4*) toHeader(mmatrixv);
+		Xyz *lightorigin = toXyz(lightoriginv);
+		Mat4 *mmat = toMat4(mmatrixv);
 		lightorigin->x = (*mmat)[12];
 		lightorigin->y = (*mmat)[13];
 		lightorigin->z = (*mmat)[14];

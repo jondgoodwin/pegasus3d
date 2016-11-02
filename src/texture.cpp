@@ -70,7 +70,7 @@ int texture_render(Value th) {
 	if (mapping == GL_TEXTURE_2D) {
 		// Only need a single image
 		Value image = pushProperty(th, 0, "image");
-		ImageHeader *imghdr = (ImageHeader*)toHeader(image);
+		ImageHeader *imghdr = toImageHeader(image);
 		int format = imghdr->nbytes>3? GL_RGBA : GL_RGB;
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, imghdr->x, imghdr->y, 0, format, GL_UNSIGNED_BYTE, toCData(image));
 		popValue(th);
@@ -127,7 +127,7 @@ int texture_render(Value th) {
 		// Get an image for each side of cube
 		for (int i=0; i<6; i++) {
 			Value image = pushProperty(th, 0, texture_cubepropnm[i]);
-			ImageHeader *imghdr = (ImageHeader*)toHeader(image);
+			ImageHeader *imghdr = toImageHeader(image);
 			int format = imghdr->nbytes>3? GL_RGBA : GL_RGB;
 			glTexImage2D(texture_cubetarget[i], 0, GL_RGB, imghdr->x, imghdr->y, 0, format, GL_UNSIGNED_BYTE, toCData(image));
 			popValue(th);

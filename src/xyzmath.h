@@ -1,4 +1,4 @@
-/** Xyz and Mat4 definition and operations
+/** Spatial math: Xyz, Quaternion and Matrix operations
  * @file
  *
  * This source file is part of the Pegasus3d browser.
@@ -12,13 +12,6 @@
 #define GL3_PROTOTYPES 1
 #include <GL/glew.h>
 #include <math.h>
-
-/** Structure for an Xyz value */
-typedef struct Xyz {
-	GLfloat x;	//!< x
-	GLfloat y;	//!< y
-	GLfloat z;	//!< z
-} Xyz;
 
 /** Inline calculation of length of xyz vector */
 #define xyzLen(xyz) \
@@ -58,14 +51,6 @@ typedef struct Xyz {
 
 // ***********************************************************
 
-/** Structure for a Quat(ernion) value */
-typedef struct Quat {
-	GLfloat x;	//!< x
-	GLfloat y;	//!< y
-	GLfloat z;	//!< z
-	GLfloat w;  //!< w
-} Quat;
-
 #define quatDot(q1, q2) \
 	((q1)->x*(q2)->x + (q1)->y*(q2)->y + (q1)->z*(q2)->z + (q1)->w*(q2)->w)
 void quatSlerp(Quat *q, Quat *q1, Quat *q2, Afloat scalar);
@@ -78,7 +63,6 @@ void quatSlerp(Quat *q, Quat *q1, Quat *q2, Afloat scalar);
 	 2   6  10  14
 	 3   7  11  15
 */
-typedef GLfloat Mat4[16];
 
 /** Build an identity matrix */
 #define mat4Identity(matrix) {\

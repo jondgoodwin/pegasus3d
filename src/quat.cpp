@@ -12,10 +12,10 @@
 /** Create a new Quat value. Its xyzw components are initialized by another Xyzw or up to 4 Floats as parameters.
   otherwise they are initialized to 0.0 (the zero vector). */
 int quat_new(Value th) {
-	Value quatv = pushCData(th, pushProperty(th, 0, "_newtype"), PegVec4, 0, sizeof(Quat));
-	Quat *quat = (Quat*) toHeader(quatv);
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec4)) {
-		Quat *other = (Quat*) toHeader(getLocal(th,1));
+	Value quatv = pushCData(th, pushProperty(th, 0, "_newtype"), QuatValue, 0, sizeof(Quat));
+	Quat *quat = toQuat(quatv);
+	if (getTop(th)>1 && isQuat(getLocal(th,1))) {
+		Quat *other = toQuat(getLocal(th,1));
 		quat->x = other->x;
 		quat->y = other->y;
 		quat->z = other->z;
@@ -32,9 +32,9 @@ int quat_new(Value th) {
 
 /** Update Quat value's x,y,z,w with components from passed Xyz or passed x,y,z,w Floats */
 int quat_set(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec4)) {
-		Quat *other = (Quat*) toHeader(getLocal(th,1));
+	Quat *quat = toQuat(getLocal(th, 0));
+	if (getTop(th)>1 && isQuat(getLocal(th,1))) {
+		Quat *other = toQuat(getLocal(th,1));
 		quat->x = other->x;
 		quat->y = other->y;
 		quat->z = other->z;
@@ -56,13 +56,13 @@ int quat_set(Value th) {
 
 /** Set Quat's x,y,z,w to correspond with float angle and Xyz or floats axis */
 int quat_setAxis(Value th) {
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
+	Quat *self = toQuat(getLocal(th, 0));
 	if (getTop(th) < 2 || !isFloat(getLocal(th,1)))
 		return 0;
 	float angle = toAfloat(getLocal(th, 1));
 	float axisx, axisy, axisz;
-	if (getTop(th)>2 && isCDataType(getLocal(th,2),PegVec3)) {
-		Xyz *axis = (Xyz*) toHeader(getLocal(th,2));
+	if (getTop(th)>2 && isXyz(getLocal(th,2))) {
+		Xyz *axis = toXyz(getLocal(th,2));
 		axisx = axis->x; axisy = axis->y; axisz = axis->z;
 	} else if (getTop(th)>4 && isFloat(getLocal(th,2)) && isFloat(getLocal(th,3)) && isFloat(getLocal(th,4))) {
 		axisx = toAfloat(getLocal(th,2));
@@ -81,10 +81,10 @@ int quat_setAxis(Value th) {
 
 /** Set Quat's x,y,z,w to correspond with Euler rotations: first X, then Y, then Z */
 int quat_setRotateXyz(Value th) {
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
+	Quat *self = toQuat(getLocal(th, 0));
 	float rotx,roty,rotz;
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec3)) {
-		Xyz *rots = (Xyz*) toHeader(getLocal(th,1));
+	if (getTop(th)>1 && isXyz(getLocal(th,1))) {
+		Xyz *rots = toXyz(getLocal(th,1));
 		rotx = rots->x; roty = rots->y; rotz = rots->z;
 	} else if (getTop(th)>1 && isFloat(getLocal(th,1))) {
 		rotx = toAfloat(getLocal(th,1));
@@ -108,10 +108,10 @@ int quat_setRotateXyz(Value th) {
 
 /** Set Quat's x,y,z,w to correspond with Euler rotations: first Y, then X, then Z */
 int quat_setRotateYxz(Value th) {
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
+	Quat *self = toQuat(getLocal(th, 0));
 	float rotx,roty,rotz;
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec3)) {
-		Xyz *rots = (Xyz*) toHeader(getLocal(th,1));
+	if (getTop(th)>1 && isXyz(getLocal(th,1))) {
+		Xyz *rots = toXyz(getLocal(th,1));
 		rotx = rots->x; roty = rots->y; rotz = rots->z;
 	} else if (getTop(th)>1 && isFloat(getLocal(th,1))) {
 		rotx = toAfloat(getLocal(th,1));
@@ -135,11 +135,11 @@ int quat_setRotateYxz(Value th) {
 
 /** Calculate and Set Quat's able to rotate a vector from u vector to v vector */
 int quat_setVectors(Value th) {
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
-	if (getTop(th) < 3 || !isCDataType(getLocal(th,1),PegVec3) || !isCDataType(getLocal(th,2),PegVec3))
+	Quat *self = toQuat(getLocal(th, 0));
+	if (getTop(th) < 3 || !isXyz(getLocal(th,1)) || !isXyz(getLocal(th,2)))
 		return 0;
-	Xyz *u = (Xyz*) toHeader(getLocal(th,1));
-	Xyz *v = (Xyz*) toHeader(getLocal(th,2));
+	Xyz *u = toXyz(getLocal(th,1));
+	Xyz *v = toXyz(getLocal(th,2));
 	Xyz w;
 	// Adapted from http://lolengine.net/blog/2014/02/24/quaternion-from-two-vectors-final
 	float norm_u_norm_v = sqrt(xyzDot(u, u) * xyzDot(v, v));
@@ -166,13 +166,13 @@ int quat_setVectors(Value th) {
 
 /** Get x component */
 int quat_xget(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	pushValue(th, aFloat(quat->x));
 	return 1;
 }
 /** Set x component */
 int quat_xset(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	if (getTop(th)>1)
 		quat->x = toAfloat(getLocal(th,1));
 	return 0;
@@ -180,13 +180,13 @@ int quat_xset(Value th) {
 
 /** Get y component */
 int quat_yget(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	pushValue(th, aFloat(quat->y));
 	return 1;
 }
 /** Set y component */
 int quat_yset(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	if (getTop(th)>1)
 		quat->y = toAfloat(getLocal(th,1));
 	return 0;
@@ -194,13 +194,13 @@ int quat_yset(Value th) {
 
 /** Get z component */
 int quat_zget(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	pushValue(th, aFloat(quat->z));
 	return 1;
 }
 /** Set z component */
 int quat_zset(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	if (getTop(th)>1)
 		quat->z = toAfloat(getLocal(th,1));
 	return 0;
@@ -208,13 +208,13 @@ int quat_zset(Value th) {
 
 /** Get w component */
 int quat_wget(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	pushValue(th, aFloat(quat->w));
 	return 1;
 }
 /** Set w component */
 int quat_wset(Value th) {
-	Quat *quat = (Quat*) toHeader(getLocal(th, 0));
+	Quat *quat = toQuat(getLocal(th, 0));
 	if (getTop(th)>1)
 		quat->w = toAfloat(getLocal(th,1));
 	return 0;
@@ -224,9 +224,9 @@ int quat_wset(Value th) {
 	If an Quat value is passed, put its conjugate in self.
 	Otherwise do it to self. */
 int quat_conjugate(Value th) {
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec4)) {
-		Quat *quat2 = (Quat*) toHeader(getLocal(th, 1));
+	Quat *self = toQuat(getLocal(th, 0));
+	if (getTop(th)>1 && isQuat(getLocal(th,1))) {
+		Quat *quat2 = toQuat(getLocal(th, 1));
 		self->x = -quat2->x;
 		self->y = -quat2->y;
 		self->z = -quat2->z;
@@ -244,7 +244,7 @@ int quat_conjugate(Value th) {
 
 /** Normalize and return an Quat value. */
 int quat_normalize(Value th) {
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
+	Quat *self = toQuat(getLocal(th, 0));
     float norm2 = sqrt(self->x*self->x + self->y*self->y + self->z*self->z + self->w*self->w);
 	if (norm2==0.0f)
 		self->x = self->y = self->z = self->w = 0.f;
@@ -263,9 +263,9 @@ int quat_normalize(Value th) {
 	If an Quat value is passed, put its inverse in self.
 	Otherwise invert self. */
 int quat_inverse(Value th) {
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec4)) {
-		Quat *quat2 = (Quat*) toHeader(getLocal(th, 1));
+	Quat *self = toQuat(getLocal(th, 0));
+	if (getTop(th)>1 && isQuat(getLocal(th,1))) {
+		Quat *quat2 = toQuat(getLocal(th, 1));
 		self->x = quat2->x;
 		self->y = quat2->y;
 		self->z = quat2->z;
@@ -287,14 +287,14 @@ int quat_inverse(Value th) {
 /** Return a Quat value that is the result of multiplying two quaternions.
 	Either self*parm or parm1*parm2. */
 int quat_mult(Value th) {
-	if (getTop(th)<2 || !(isFloat(getLocal(th,1)) || isCDataType(getLocal(th, 1), PegVec4)))
+	if (getTop(th)<2 || !(isFloat(getLocal(th,1)) || isQuat(getLocal(th, 1))))
 		return 0;
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
-	Quat *quat2 = (Quat*) toHeader(getLocal(th, 1));
+	Quat *self = toQuat(getLocal(th, 0));
+	Quat *quat2 = toQuat(getLocal(th, 1));
 	Xyz va, vb, vaxb;
 	float wa, wb;
 	if (getTop(th)>2) {
-		Quat *quat3 = (Quat*) toHeader(getLocal(th, 2));
+		Quat *quat3 = toQuat(getLocal(th, 2));
 		va.x = quat2->x;
 		va.y = quat2->y;
 		va.z = quat2->z;
@@ -324,11 +324,11 @@ int quat_mult(Value th) {
 
 /** Calculate and return Quat value spherically/linearly interpolated between two Quat values by a scalar from 0 to 1 */
 int quat_slerp(Value th) {
-	if (getTop(th)<4 || !isCDataType(getLocal(th, 1), PegVec4) || !isCDataType(getLocal(th, 2), PegVec4) || !isFloat(getLocal(th, 3)))
+	if (getTop(th)<4 || !isQuat(getLocal(th, 1)) || !isQuat(getLocal(th, 2)) || !isFloat(getLocal(th, 3)))
 		return 0;
-	Quat *self = (Quat*) toHeader(getLocal(th, 0));
-	Quat *quat2 = (Quat*) toHeader(getLocal(th, 1));
-	Quat *quat3 = (Quat*) toHeader(getLocal(th, 2));
+	Quat *self = toQuat(getLocal(th, 0));
+	Quat *quat2 = toQuat(getLocal(th, 1));
+	Quat *quat3 = toQuat(getLocal(th, 2));
 	float scalar = toAfloat(getLocal(th, 3));
 	quatSlerp(self, quat2, quat3, scalar);
 	return 1;

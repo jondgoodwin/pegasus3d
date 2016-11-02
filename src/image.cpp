@@ -28,8 +28,8 @@ int image_new(Value th) {
 	AuintIdx size = comp * x * y;
 
 	// Allocate buffers and populate header
-	Value imagev = pushCData(th, aNull, PegImage, 0, sizeof(ImageHeader));
-	ImageHeader *imghdr = (ImageHeader*) toHeader(imagev);
+	Value imagev = pushCData(th, aNull, ImageValue, 0, sizeof(ImageHeader));
+	ImageHeader *imghdr = toImageHeader(imagev);
 	imghdr->x = x;
 	imghdr->y = y;
 	imghdr->z = 0;

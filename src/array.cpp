@@ -31,9 +31,9 @@ int xyzs_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*3*sizeof(float), sizeof(ArrayHeader));
-	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
-	hdr->mbrType = PegVec3;
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*3*sizeof(float), sizeof(ArrayHeader));
+	ArrayHeader *hdr = toArrayHeader(bufv);
+	hdr->mbrType = XyzValue;
 	hdr->structSz = 3;
 	hdr->nStructs = nStructs;
 
@@ -135,9 +135,9 @@ int uvs_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*3*sizeof(float), sizeof(ArrayHeader));
-	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
-	hdr->mbrType = PegVec3;
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*3*sizeof(float), sizeof(ArrayHeader));
+	ArrayHeader *hdr = toArrayHeader(bufv);
+	hdr->mbrType = XyzValue;
 	hdr->structSz = 2;
 	hdr->nStructs = nStructs;
 
@@ -181,9 +181,9 @@ int colors_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*4*sizeof(float), sizeof(ArrayHeader));
-	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
-	hdr->mbrType = PegVec4;
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*4*sizeof(float), sizeof(ArrayHeader));
+	ArrayHeader *hdr = toArrayHeader(bufv);
+	hdr->mbrType = ColorValue;
 	hdr->structSz = 4;
 	hdr->nStructs = nStructs;
 

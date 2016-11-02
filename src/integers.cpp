@@ -29,9 +29,9 @@ int integers_new(Value th) {
 	}
 
 	// Create the integer array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), PegArray, nStructs*sizeof(short), sizeof(ArrayHeader));
-	ArrayHeader *hdr = (ArrayHeader*) toHeader(bufv);
-	hdr->mbrType = PegUint16;
+	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*sizeof(short), sizeof(ArrayHeader));
+	ArrayHeader *hdr = toArrayHeader(bufv);
+	hdr->mbrType = Uint16Nbr;
 	hdr->structSz = 1;
 	hdr->nStructs = nStructs;
 

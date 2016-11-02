@@ -47,39 +47,63 @@ using namespace avm;
 #include <SDL.h>
 
 enum PegCDataTypes {
-	PegVec2,
-	PegVec3,
-	PegVec4,
-	PegMat2,
-	PegMat3,
-	PegMat4,
+	Vec2Value,
+	XyzValue,
+	QuatValue,
+	ColorValue,
+	Mat2Value,
+	Mat3Value,
+	Mat4Value,
 
-	PegArray,
-	PegShaderPgm,
-	PegWindow,
-	PegImage,
+	RectValue,
+	ArrayValue,
+	ShaderValue,
+	WindowValue,
+	ImageValue,
 
-	// Only needed in PegArray
-	PegFloat,
-	PegUint8,
-	PegUint16,
-	PegUint32,
-
-	PegRect
+	// Only needed in Array
+	FloatNbr,
+	Uint8Nbr,
+	Uint16Nbr,
+	Uint32Nbr
 };
 
-struct ArrayHeader {
-	AuintIdx nStructs;	//!< number of structures in the array
-	char mbrType;		//!< float/int and number of bytes in a number
-	char structSz;		//!< How many numbers in a structure
+/** Structure for an Xyz value */
+typedef struct Xyz {
+	GLfloat x;	//!< x
+	GLfloat y;	//!< y
+	GLfloat z;	//!< z
+} Xyz;
+
+#define toXyz(value) ((Xyz*) toHeader(value)) //<! Point to value's Xyz data
+#define isXyz(value) (isCDataType(value, XyzValue)) //<! Does value contain Xyz data
+
+/** Structure for a Quat(ernion) value */
+typedef struct Quat {
+	GLfloat x;	//!< x
+	GLfloat y;	//!< y
+	GLfloat z;	//!< z
+	GLfloat w;  //!< w
+} Quat;
+
+#define toQuat(value) ((Quat*) toHeader(value)) //<! Point to value's Quat data
+#define isQuat(value) (isCDataType(value, QuatValue)) //<! Does value contain Quat data
+
+/** Structure for a Color value */
+struct ColorInfo {
+	float red;		//!< red component (0-1)
+	float green;	//!< green component (0-1)
+	float blue;		//!< blue component (0-1)
+	float alpha;	//!< alpha component (0=invisible, 1=opaque)
 };
 
-struct ImageHeader {
-	AuintIdx x;
-	AuintIdx y;
-	AuintIdx z;
-	unsigned char nbytes;
-};
+#define toColor(value) ((ColorInfo*) toHeader(value)) //<! Point to value's Color data
+#define isColor(value) (isCDataType(value, ColorValue)) //<! Does value contain Color data
+
+/** Structure for a 4x4 matrix */
+typedef GLfloat Mat4[16];
+#define toMat4(value) ((Mat4*) toHeader(value)) //<! Point to value's Mat4 data
+#define isMat4(value) (isCDataType(value, Mat4Value)) //<! Does value contain Mat4 data
 
 /** Structure for a 2d image rectangle */
 typedef struct Rect {
@@ -89,11 +113,26 @@ typedef struct Rect {
 	int h;	//!< height
 } Rect;
 
-struct ColorInfo {
-	float red;
-	float green;
-	float blue;
-	float alpha;
+#define toRect(value) ((Rect*) toHeader(value)) //<! Point to value's Rect data
+#define isRect(value) (isCDataType(value, RectValue)) //<! Does value contain Rect data
+
+/** Structure for the header for a collection of number structures */
+struct ArrayHeader {
+	AuintIdx nStructs;	//!< number of structures in the array
+	char mbrType;		//!< float/int and number of bytes in a number
+	char structSz;		//!< How many numbers in a structure
 };
+
+#define toArrayHeader(value) ((ArrayHeader*) toHeader(value)) //<! Point to value's ArrayHeader data
+
+/** Structure for an Image value's header */
+struct ImageHeader {
+	AuintIdx x;
+	AuintIdx y;
+	AuintIdx z;
+	unsigned char nbytes;
+};
+
+#define toImageHeader(value) ((ImageHeader*) toHeader(value)) //<! Point to value's ImageHeader data
 
 #endif

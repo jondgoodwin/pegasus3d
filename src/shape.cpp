@@ -370,7 +370,7 @@ int shape_render(Value th) {
 		Value buffer = getProperty(th, attrsource, arrGet(th, vertattrlistv, i));
 		if (!isCData(buffer))
 			continue;
-		ArrayHeader *buffhdr = (ArrayHeader*) toHeader(buffer);
+		ArrayHeader *buffhdr = toArrayHeader(buffer);
 
 		// Bind as active, copy, define and enable the OpenGL buffer
 		glBindBuffer(GL_ARRAY_BUFFER, vbo[i]);
@@ -378,10 +378,10 @@ int shape_render(Value th) {
 		AuintIdx n = getSize(buffer);
 		float *f = (float *)toCData(buffer);
 		switch (buffhdr->mbrType) {
-		case PegUint8: glVertexAttribPointer(i, buffhdr->structSz, GL_UNSIGNED_BYTE, GL_FALSE, 0, 0); break;
-		case PegUint16: glVertexAttribPointer(i, buffhdr->structSz, GL_UNSIGNED_SHORT, GL_FALSE, 0, 0); break;
-		case PegUint32: glVertexAttribPointer(i, buffhdr->structSz, GL_INT, GL_FALSE, 0, 0); break;
-		case PegFloat: case PegVec2: case PegVec3: case PegVec4:
+		case Uint8Nbr: glVertexAttribPointer(i, buffhdr->structSz, GL_UNSIGNED_BYTE, GL_FALSE, 0, 0); break;
+		case Uint16Nbr: glVertexAttribPointer(i, buffhdr->structSz, GL_UNSIGNED_SHORT, GL_FALSE, 0, 0); break;
+		case Uint32Nbr: glVertexAttribPointer(i, buffhdr->structSz, GL_INT, GL_FALSE, 0, 0); break;
+		case FloatNbr: case Vec2Value: case XyzValue: case ColorValue: case QuatValue:
 			glVertexAttribPointer(i, buffhdr->structSz, GL_FLOAT, GL_FALSE, 0, 0); break;
 		default: ;
 		}
@@ -401,7 +401,7 @@ int shape_render(Value th) {
 	Value vertices = getProperty(th, attrsource, indicesym);
 	popValue(th);
 	if (isCData(vertices)) {
-		ArrayHeader *verthdr = (ArrayHeader*)toHeader(vertices);
+		ArrayHeader *verthdr = toArrayHeader(vertices);
 		// Generate a buffer for the indices
 		GLuint elementbuffer;
 		glGenBuffers(1, &elementbuffer);

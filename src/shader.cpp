@@ -131,7 +131,7 @@ int shader_render(Value th) {
 	if (pgmv==aNull) {
 		// If it does not exist, compile and bind it based on info
 		Value pgmtype = pushProperty(th, selfidx, "_compiledtype");
-		pgmv = strHasFinalizer(pushCData(th, pgmtype, PegShaderPgm, 0, sizeof(ShaderPgm))); // Is small enough to stick in header
+		pgmv = strHasFinalizer(pushCData(th, pgmtype, ShaderValue, 0, sizeof(ShaderPgm))); // Is small enough to stick in header
 		if (aNull != (pgmv = shader_make(th, pgmv)))
 			popProperty(th, selfidx, "_program");
 		else
@@ -189,15 +189,15 @@ int shader_render(Value th) {
 					glUniform1i(glGetUniformLocation(pgmdata->program, uninamestr), toAint(unival));
 				else if (isCData(unival)) {
 					switch(getCDataType(unival)) {
-					case PegMat2: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
-					case PegMat3: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
-					case PegMat4: 
+					case Mat2Value: glUniformMatrix2fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					case Mat3Value: glUniformMatrix3fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
+					case Mat4Value: 
 						glUniformMatrix4fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, GL_FALSE, (GLfloat *) toHeader(unival)); break;
 					//case PegUint32: glUniform1iv(glGetUniformLocation(pgmdata->program, uninamestr), univalhdr->nStructs, (GLint *) toCData(unival)); break;
-					case PegFloat: glUniform1fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toCData(unival)); break;
-					case PegVec2: glUniform2fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
-					case PegVec3: glUniform3fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
-					case PegVec4: 
+					case FloatNbr: glUniform1fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toCData(unival)); break;
+					case Vec2Value: glUniform2fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
+					case XyzValue: glUniform3fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
+					case ColorValue: case QuatValue:
 						glUniform4fv(glGetUniformLocation(pgmdata->program, uninamestr), 1, (GLfloat *) toHeader(unival)); break;
 					default: 
 						//const char *x = toStr(uninamev);

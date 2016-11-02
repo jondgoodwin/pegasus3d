@@ -42,6 +42,7 @@ bool window_newOpenGLWindow(WindowInfo *di)
 
 	// Create opengl context and attach it to the window
 	di->sdlContext = SDL_GL_CreateContext(di->sdlWindow);
+	SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
 
 	// Initialize OpenGL attributes
 	// SDL_GL_CONTEXT_CORE gives us only the newer version, deprecated functions are disabled
@@ -71,7 +72,7 @@ bool window_newOpenGLWindow(WindowInfo *di)
 /** Create a new window instance using SDL2 & OpenGL within a window */
 int window_new(Value th) {
 	pushProperty(th, 0, "_newtype"); // get the mixin type for instance
-	Value dispinst = strHasFinalizer(pushCData(th, popValue(th), PegWindow, 0, sizeof(struct WindowInfo)));
+	Value dispinst = strHasFinalizer(pushCData(th, popValue(th), WindowValue, 0, sizeof(struct WindowInfo)));
 	WindowInfo *wininfo = (struct WindowInfo*) toHeader(dispinst);
 	window_newOpenGLWindow(wininfo);
 	return 1;
@@ -109,8 +110,8 @@ int window_setfullscreen(Value th) {
 int window_makecurrent(Value th) {
 	WindowInfo *wininfo = (struct WindowInfo*) toHeader(getLocal(th, 0));
 	SDL_GL_MakeCurrent(wininfo->sdlWindow, wininfo->sdlContext);
-	if (getTop(th)>1 && isCDataType(getLocal(th, 1), PegRect)) {
-		Rect *winrect = (Rect*) toHeader(getLocal(th,1));
+	if (getTop(th)>1 && isRect(getLocal(th, 1))) {
+		Rect *winrect = toRect(getLocal(th,1));
 		winrect->x = winrect->y = 0;
 		SDL_GetWindowSize(wininfo->sdlWindow, &winrect->w, &winrect->h);
 	}
@@ -161,7 +162,7 @@ void window_init(Value th) {
 
 	// Create $window for main window
 	pushValue(th, newtype); // get the mixin type for a Window
-	Value windowv = pushCData(th, popValue(th), PegWindow, 0, sizeof(struct WindowInfo));
+	Value windowv = pushCData(th, popValue(th), WindowValue, 0, sizeof(struct WindowInfo));
 	WindowInfo *wininfo = (struct WindowInfo*) toHeader(windowv);
 	wininfo->sdlWindow = mainWindow.sdlWindow;
 	wininfo->sdlContext = mainWindow.sdlContext;

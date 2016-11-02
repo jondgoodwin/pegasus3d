@@ -11,8 +11,8 @@
 /** Create a new color value, with passed red, green, blue and alpha values.
   Defaults: White if no passed values, Gray scale if 1 passed value, 1.0 if no alpha. */
 int color_new(Value th) {
-	Value colorv = pushCData(th, pushProperty(th, 0, "_newtype"), PegVec4, 0, sizeof(ColorInfo));
-	ColorInfo *color = (struct ColorInfo*) toHeader(colorv);
+	Value colorv = pushCData(th, pushProperty(th, 0, "_newtype"), ColorValue, 0, sizeof(ColorInfo));
+	ColorInfo *color = toColor(colorv);
 	float defcolor = 1.0f;
 	color->red = defcolor = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : defcolor;
 	color->green = getTop(th)>2 && isFloat(getLocal(th,2))? toAfloat(getLocal(th, 2)) : defcolor;
@@ -23,7 +23,7 @@ int color_new(Value th) {
 
 /** Update color value with passed red, green, blue and alpha values */
 int color_set(Value th) {
-	ColorInfo *color = (struct ColorInfo*) toHeader(getLocal(th, 0));
+	ColorInfo *color = toColor(getLocal(th, 0));
 	if (getTop(th)>1 && isFloat(getLocal(th,1)))
 		color->red = toAfloat(getLocal(th, 1));
 	if (getTop(th)>2 && isFloat(getLocal(th,2)))
@@ -37,7 +37,7 @@ int color_set(Value th) {
 
 /** Return 4 values: red, green, blue and alpha */
 int color_unpack(Value th) {
-	ColorInfo *color = (struct ColorInfo*) toHeader(getLocal(th, 0));
+	ColorInfo *color = toColor(getLocal(th, 0));
 	pushValue(th, aFloat(color->red));
 	pushValue(th, aFloat(color->green));
 	pushValue(th, aFloat(color->blue));

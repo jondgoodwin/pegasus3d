@@ -59,8 +59,8 @@ int camera_perspective(Value th) {
 	GLfloat aspratio = 1.0f;
 	Value targetrectv = pushProperty(th, selfidx, "targetRect");
 	Rect *targetrect;
-	if (isCDataType(targetrectv, PegRect)) {
-		targetrect = (Rect*) toHeader(targetrectv);
+	if (isRect(targetrectv)) {
+		targetrect = toRect(targetrectv);
 		aspratio = ((GLfloat)targetrect->w) / ((GLfloat) targetrect->h);
 	}
 
@@ -68,7 +68,7 @@ int camera_perspective(Value th) {
 	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	Mat4 *mat = (Mat4*) toHeader(getFromTop(th, 0));
+	Mat4 *mat = toMat4(getFromTop(th, 0));
 	mat4Perspective(mat, fovht, mindist, maxdist, aspratio);
 	return 1;
 }
@@ -88,8 +88,8 @@ int camera_orthogonal(Value th) {
 	GLfloat aspratio = 1.0f;
 	Value targetrectv = pushProperty(th, selfidx, "targetRect");
 	Rect *targetrect;
-	if (isCDataType(targetrectv, PegRect)) {
-		targetrect = (Rect*) toHeader(targetrectv);
+	if (isRect(targetrectv)) {
+		targetrect = toRect(targetrectv);
 		aspratio = ((GLfloat)targetrect->w) / ((GLfloat) targetrect->h);
 	}
 
@@ -97,7 +97,7 @@ int camera_orthogonal(Value th) {
 	pushSym(th, "New");
 	pushGloVar(th, "Matrix4");
 	getCall(th, 1, 1);
-	Mat4 *mat = (Mat4*) toHeader(getFromTop(th, 0));
+	Mat4 *mat = toMat4(getFromTop(th, 0));
 	mat4Ortho(mat, fovht, mindist, maxdist, aspratio);
 	return 1;
 }
@@ -105,13 +105,13 @@ int camera_orthogonal(Value th) {
 /** Convert an Xyz vector from local to camera (eye) coordinates using mvmatrix */
 int camera_cameraXyz(Value th) {
 	Value oldxyzv;
-	if (getTop(th)<3 || !isCDataType(oldxyzv = getLocal(th, 1), PegVec3) )
+	if (getTop(th)<3 || !isXyz(oldxyzv = getLocal(th, 1)) )
 		return 0;
-	Xyz *oldxyz = (Xyz*) toHeader(oldxyzv);
+	Xyz *oldxyz = toXyz(oldxyzv);
 
 	// Calculate 'mvmatrix' from context
-	Mat4 *mmatrix = (Mat4*) toHeader(pushProperty(th, 2, "mmatrix")); popValue(th);
-	Mat4 *vmatrix = (Mat4*) toHeader(pushProperty(th, 0, "vmatrix")); popValue(th);
+	Mat4 *mmatrix = toMat4(pushProperty(th, 2, "mmatrix")); popValue(th);
+	Mat4 *vmatrix = toMat4(pushProperty(th, 0, "vmatrix")); popValue(th);
 	Mat4 mvmatrix;
 	mat4Mult(&mvmatrix, vmatrix, mmatrix);
 
@@ -119,7 +119,7 @@ int camera_cameraXyz(Value th) {
 	pushSym(th, "New");
 	pushGloVar(th, "Xyz");
 	getCall(th, 1, 1);
-	Xyz *newxyz = (Xyz*) toHeader(getFromTop(th, 0));
+	Xyz *newxyz = toXyz(getFromTop(th, 0));
 
 	mat4MultVec(newxyz, &mvmatrix, oldxyz);
 	return 1;
@@ -153,30 +153,35 @@ int camera_render(Value th) {
 	pushGloVar(th, "$");
 
 	// Switch OpenGL to work within the target (or $window)
+	Value targetv;
 	pushSym(th, "MakeCurrent");
-	if (pushProperty(th, selfidx, "target")==aNull) {
+	if ((targetv=pushProperty(th, selfidx, "target"))==aNull) {
 		popValue(th);
 		pushGloVar(th, "$window");
 	}
 	Value targetrectv = pushProperty(th, selfidx, "targetRect");
 	getCall(th, 2, 0);
-	Rect *targetrect = (Rect*) toHeader(targetrectv);
+	Rect *targetrect = toRect(targetrectv);
 
 	// Define an OpenGL viewport within target, if specified
 	Value viewportv = pushProperty(th, selfidx, "viewport"); popValue(th);
-	if (isCDataType(viewportv, PegRect)) {
-		Rect *viewport = (Rect*) toHeader(viewportv);
+	if (isRect(viewportv)) {
+		Rect *viewport = toRect(viewportv);
 		glViewport(viewport->x, viewport->y, viewport->w, viewport->h);
 		targetrect->h = viewport->h;
 		targetrect->w = viewport->w;
+		glScissor(viewport->x, viewport->y, viewport->w, viewport->h);
+		glEnable(GL_SCISSOR_TEST);
 	}
+	else
+		glViewport(0, 0, targetrect->w, targetrect->h); // just in case
 
 	// Retrieve background fill color
 	static ColorInfo black = {0.0f, 0.0f, 0.0f, 1.0f};
 	ColorInfo *background = &black;
 	Value backv = pushProperty(th, selfidx, "background"); popValue(th);
-	if (isCDataType(backv, PegVec4))
-		background = (ColorInfo*) toHeader(backv);
+	if (isColor(backv))
+		background = toColor(backv);
 
 	// OpenGL: Clear target buffers for 3D rendering
 	glClearColor(background->red, background->green, background->blue, background->alpha);
@@ -184,7 +189,8 @@ int camera_render(Value th) {
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS); // Closer objects obscure further objects
 	glUseProgram(0); // No shader
-
+	if (viewportv!=aNull)
+		glDisable(GL_SCISSOR_TEST);
 
 	// Traverse the scene graph's nodes, preparing for the render
 	pushSym(th, "_RenderPrep");
@@ -215,16 +221,16 @@ int camera_render(Value th) {
 		vmatv = getFromTop(th, 0);
 		popProperty(th, selfidx, "vmatrix");
 	}
-	Mat4 *vmat = (Mat4*) toHeader(vmatv);
+	Mat4 *vmat = toMat4(vmatv);
 
 	// Calculate camera's matrix, able to convert from camera coordinates to world coordinates
 	Mat4 cammat;
 	Value originv = pushProperty(th, selfidx, "origin"); popValue(th);
 	Value orientv = pushProperty(th, selfidx, "orientation"); popValue(th);
 	Value scalev = pushProperty(th, selfidx, "scale"); popValue(th);
-	mat4Place(&cammat, isCDataType(originv, PegVec3)? (Xyz*)toHeader(originv) : NULL,
-		isCDataType(orientv, PegVec4)? (Quat*)toHeader(orientv) : NULL,
-		isCDataType(scalev, PegVec3)? (Xyz*)toHeader(scalev) : NULL);
+	mat4Place(&cammat, isXyz(originv)? toXyz(originv) : NULL,
+		isQuat(orientv)? toQuat(orientv) : NULL,
+		isXyz(scalev)? toXyz(scalev) : NULL);
 
 	// If camera follows a 3D object, get its "mmatrix" so that camera coordinates are relative to its eye
 	int followidx = getTop(th);
@@ -232,12 +238,12 @@ int camera_render(Value th) {
 	Value followmatv = pushProperty(th, followidx, "mmatrix"); popValue(th);
 	if (followmatv!=aNull) {
 		Mat4 eyemat;
-		Mat4 *followmat = (Mat4*) toHeader(followmatv);
+		Mat4 *followmat = toMat4(followmatv);
 		Value eyev = pushProperty(th, followidx, "eye"); popValue(th);
-		if (isCDataType(eyev, PegVec3)) {
+		if (isXyz(eyev)) {
 			mat4Set(&eyemat, followmat);
 			followmat = &eyemat;
-			Xyz *eye = (Xyz*) toHeader(eyev);
+			Xyz *eye = toXyz(eyev);
 			Xyz followeye;
 			mat4MultVec(&followeye, followmat, eye);
 			(*followmat)[12] = followeye.x;
@@ -262,6 +268,13 @@ int camera_render(Value th) {
 	pushLocal(th, selfidx);
 	pushValue(th, aNull); // Default for identity matrix
 	getCall(th, 3, 0);
+
+	// Swap buffers to display the rendered target
+	if (targetv!=aNull) {
+		pushSym(th, "SwapBuffers");
+		pushValue(th, targetv);
+		getCall(th, 1, 0);
+	}
 
 	popValue(th); // '$'
 	return 0;

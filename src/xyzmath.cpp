@@ -1,4 +1,4 @@
-/** Matrix operations
+/** Spatial math: Xyz, Quaternion and Matrix operations
  * @file
  *
  * This source file is part of the Pegasus3d browser.

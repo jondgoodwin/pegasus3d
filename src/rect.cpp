@@ -10,10 +10,10 @@
 
 /** Create a new Rect */
 int rect_new(Value th) {
-	Value rectv = pushCData(th, pushProperty(th, 0, "_newtype"), PegRect, 0, sizeof(Rect));
-	Rect *rect = (Rect*) toHeader(rectv);
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegRect)) {
-		Rect *other = (Rect*) toHeader(getLocal(th,1));
+	Value rectv = pushCData(th, pushProperty(th, 0, "_newtype"), RectValue, 0, sizeof(Rect));
+	Rect *rect = toRect(rectv);
+	if (getTop(th)>1 && isRect(getLocal(th,1))) {
+		Rect *other = toRect(getLocal(th,1));
 		rect->x = other->x;
 		rect->y = other->y;
 		rect->h = other->h;

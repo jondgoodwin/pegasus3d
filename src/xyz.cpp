@@ -12,10 +12,10 @@
 /** Create a new Xyz value. Its xyz components are initialized by another Xyz or up to 3 Floats as parameters.
   otherwise they are initialized to 0.0 (the zero vector). */
 int xyz_new(Value th) {
-	Value xyzv = pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz));
-	Xyz *xyz = (Xyz*) toHeader(xyzv);
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec3)) {
-		Xyz *other = (Xyz*) toHeader(getLocal(th,1));
+	Value xyzv = pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz));
+	Xyz *xyz = toXyz(xyzv);
+	if (getTop(th)>1 && isXyz(getLocal(th,1))) {
+		Xyz *other = toXyz(getLocal(th,1));
 		xyz->x = other->x;
 		xyz->y = other->y;
 		xyz->z = other->z;
@@ -30,7 +30,7 @@ int xyz_new(Value th) {
 
 /** Set xyz components to 0.0 */
 int xyz_zero(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	xyz->x = xyz->y = xyz->z = 0.0;
 	setTop(th, 1);
 	return 1;
@@ -38,9 +38,9 @@ int xyz_zero(Value th) {
 
 /** Update Xyz value's x,y,z with components from passed Xyz or passed x,y,z Floats */
 int xyz_set(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
-	if (getTop(th)>1 && !isCDataType(getLocal(th,1),PegVec3)) {
-		Xyz *other = (Xyz*) toHeader(getLocal(th,1));
+	Xyz *xyz = toXyz(getLocal(th, 0));
+	if (getTop(th)>1 && !isXyz(getLocal(th,1))) {
+		Xyz *other = toXyz(getLocal(th,1));
 		xyz->x = other->x;
 		xyz->y = other->y;
 		xyz->z = other->z;
@@ -59,7 +59,7 @@ int xyz_set(Value th) {
 
 /** Return 3 values: x, y, z */
 int xyz_unpack(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	pushValue(th, aFloat(xyz->x));
 	pushValue(th, aFloat(xyz->y));
 	pushValue(th, aFloat(xyz->z));
@@ -68,13 +68,13 @@ int xyz_unpack(Value th) {
 
 /** Get x component */
 int xyz_xget(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	pushValue(th, aFloat(xyz->x));
 	return 1;
 }
 /** Set x component */
 int xyz_xset(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	if (getTop(th)>1)
 		xyz->x = toAfloat(getLocal(th,1));
 	return 0;
@@ -82,13 +82,13 @@ int xyz_xset(Value th) {
 
 /** Get y component */
 int xyz_yget(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	pushValue(th, aFloat(xyz->y));
 	return 1;
 }
 /** Set y component */
 int xyz_yset(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	if (getTop(th)>1)
 		xyz->y = toAfloat(getLocal(th,1));
 	return 0;
@@ -96,13 +96,13 @@ int xyz_yset(Value th) {
 
 /** Get z component */
 int xyz_zget(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	pushValue(th, aFloat(xyz->z));
 	return 1;
 }
 /** Set z component */
 int xyz_zset(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	if (getTop(th)>1)
 		xyz->z = toAfloat(getLocal(th,1));
 	return 0;
@@ -120,38 +120,38 @@ bool almostequal(Afloat a, Afloat b) {
 
 /** Compare self to another Xyz value. Return true if equal, false if not equal, null otherwise. */
 int xyz_isequal(Value th) {
-	if (getTop(th)<2 || !isCDataType(getLocal(th,1),PegVec3))
+	if (getTop(th)<2 || !isXyz(getLocal(th,1)))
 		return 0;
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *other = (Xyz*) toHeader(getLocal(th, 1));
+	Xyz *self = toXyz(getLocal(th, 0));
+	Xyz *other = toXyz(getLocal(th, 1));
 	pushValue(th, almostequal(self->x, other->x) && almostequal(self->y, other->y) && almostequal(self->z, other->z)? aTrue : aFalse);
 	return 1;
 }
 
 /** Compare self to zero vector. Return true if equal, false if not equal, null otherwise. */
 int xyz_iszero(Value th) {
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *self = toXyz(getLocal(th, 0));
 	pushValue(th, almostequal(self->x, 0.0) && almostequal(self->y, 0.0) && almostequal(self->z, 0.0)? aTrue : aFalse);
 	return 1;
 }
 
 /** Return a float for the length of the Xyz vector */
 int xyz_len(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	pushValue(th, aFloat(xyzLen(xyz)));
 	return 1;
 }
 
 /** Return a float for the square of the length of the Xyz vector */
 int xyz_len2(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	pushValue(th, aFloat(xyz->x*xyz->x + xyz->y*xyz->y + xyz->z*xyz->z));
 	return 1;
 }
 
 /** Normalize (and return) self's Xyz value to its unit equivalent */
 int xyz_normalize(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	xyzNorm(xyz, xyz);
 	setTop(th, 1);
 	return 1;
@@ -159,22 +159,22 @@ int xyz_normalize(Value th) {
 
 /** Populate a passed or return a new Xyz value that holds the unit equivalent to self */
 int xyz_unit(Value th) {
-	Xyz *xyz = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *xyz = toXyz(getLocal(th, 0));
 	Xyz *target;
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec3))
-		target = (Xyz*) toHeader(getLocal(th, 1));
+	if (getTop(th)>1 && isXyz(getLocal(th,1)))
+		target = toXyz(getLocal(th, 1));
 	else
-		target = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
+		target = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
 	xyzNorm(target, xyz);
 	return 1;
 }
 
 /** Return a float representing the distance between two Xyz values. */
 int xyz_distance(Value th) {
-	if (getTop(th)<2 || !isCDataType(getLocal(th, 1), PegVec3))
+	if (getTop(th)<2 || !isXyz(getLocal(th, 1)))
 		return 0;
-	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
+	Xyz *xyz1 = toXyz(getLocal(th, 0));
+	Xyz *xyz2 = toXyz(getLocal(th, 1));
 	Xyz dist;
 	xyzSub(&dist, xyz1, xyz2);
 	pushValue(th, aFloat(xyzLen(&dist)));
@@ -183,10 +183,10 @@ int xyz_distance(Value th) {
 
 /** Return a float representing the squared distance between two Xyz values. */
 int xyz_distance2(Value th) {
-	if (getTop(th)<2 || !isCDataType(getLocal(th, 1), PegVec3))
+	if (getTop(th)<2 || !isXyz(getLocal(th, 1)))
 		return 0;
-	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
+	Xyz *xyz1 = toXyz(getLocal(th, 0));
+	Xyz *xyz2 = toXyz(getLocal(th, 1));
 	Xyz dist;
 	xyzSub(&dist, xyz1, xyz2);
 	pushValue(th, aFloat(dist.x*dist.x + dist.y*dist.y + dist.z*dist.z));
@@ -196,12 +196,12 @@ int xyz_distance2(Value th) {
 /** Return a float representing the dot product of two Xyz values.
 	Warning: it does not normalize the Xyz values. */
 int xyz_dot(Value th) {
-	if (getTop(th)<2 || !isCDataType(getLocal(th, 1), PegVec3)) {
+	if (getTop(th)<2 || !isXyz(getLocal(th, 1))) {
 		pushValue(th, aNull);
 		return 1;
 	}
-	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
+	Xyz *xyz1 = toXyz(getLocal(th, 0));
+	Xyz *xyz2 = toXyz(getLocal(th, 1));
 	pushValue(th, aFloat(xyzDot(xyz1, xyz2)));
 	return 1;
 }
@@ -210,9 +210,9 @@ int xyz_dot(Value th) {
 	If an Xyz value is passed, put its negative in self.
 	Otherwise negate self. */
 int xyz_negate(Value th) {
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
-	if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec3)) {
-		Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
+	Xyz *self = toXyz(getLocal(th, 0));
+	if (getTop(th)>1 && isXyz(getLocal(th,1))) {
+		Xyz *xyz2 = toXyz(getLocal(th, 1));
 		self->x = -xyz2->x;
 		self->y = -xyz2->y;
 		self->z = -xyz2->z;
@@ -231,16 +231,16 @@ int xyz_negate(Value th) {
 	If two Xyz values are passed, their addition is stored in self.
 	If a scalar Float is also passed, it is multiplied to the latter Xyz value. */
  int xyz_add(Value th) {
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *self = toXyz(getLocal(th, 0));
 	if (getTop(th)>3 && isFloat(getLocal(th,1)) && isFloat(getLocal(th,2)) && isFloat(getLocal(th,3))) {
 		self->x += toAfloat(getLocal(th, 1));
 		self->y += toAfloat(getLocal(th, 2));
 		self->z += toAfloat(getLocal(th, 3));
 	}
-	else if (getTop(th)>1 && isCDataType(getLocal(th,1),PegVec3)) {
-		Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-		if (getTop(th)>2 && isCDataType(getLocal(th, 2), PegVec3)) {
-			Xyz *xyz3 = (Xyz*) toHeader(getLocal(th, 2));
+	else if (getTop(th)>1 && isXyz(getLocal(th,1))) {
+		Xyz *xyz2 = toXyz(getLocal(th, 1));
+		if (getTop(th)>2 && isXyz(getLocal(th, 2))) {
+			Xyz *xyz3 = toXyz(getLocal(th, 2));
 			if (isFloat(getLocal(th, 3))) {
 				Afloat dt = toAfloat(getLocal(th, 3));
 				self->x = xyz2->x + dt * xyz3->x;
@@ -267,26 +267,26 @@ int xyz_negate(Value th) {
 
 /** Return a new Xyz value that adds two Xyz values */
 int xyz_addop(Value th) {
-	if (getTop(th)<2 || !isCDataType(getLocal(th, 1), PegVec3)) {
+	if (getTop(th)<2 || !isXyz(getLocal(th, 1))) {
 		pushValue(th, aNull);
 		return 1;
 	}
-	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
+	Xyz *xyz1 = toXyz(getLocal(th, 0));
+	Xyz *xyz2 = toXyz(getLocal(th, 1));
+	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
 	xyzAdd(newxyz, xyz1, xyz2);
 	return 1;
 }
 
 /** Return a new Xyz value that subtracts two Xyz values */
 int xyz_subtractop(Value th) {
-	if (getTop(th)<2 || !isCDataType(getLocal(th, 1), PegVec3)) {
+	if (getTop(th)<2 || !isXyz(getLocal(th, 1))) {
 		pushValue(th, aNull);
 		return 1;
 	}
-	Xyz *xyz1 = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
+	Xyz *xyz1 = toXyz(getLocal(th, 0));
+	Xyz *xyz2 = toXyz(getLocal(th, 1));
+	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
 	newxyz->x = xyz1->x - xyz2->x;
 	newxyz->y = xyz1->y - xyz2->y;
 	newxyz->z = xyz1->z - xyz2->z;
@@ -295,7 +295,7 @@ int xyz_subtractop(Value th) {
 
 /** Return the Xyz value after scaling it up by a scalar or passed x,y,z values. */
 int xyz_scale(Value th) {
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *self = toXyz(getLocal(th, 0));
 	if (getTop(th)>3 && isFloat(getLocal(th,1)) && isFloat(getLocal(th,2)) && isFloat(getLocal(th,3))) {
 		self->x *= toAfloat(getLocal(th, 1));
 		self->y *= toAfloat(getLocal(th, 2));
@@ -307,8 +307,8 @@ int xyz_scale(Value th) {
 		self->y *= scale;
 		self->z *= scale;
 	}
-	else if (getTop(th)>1 && isCDataType(getLocal(th, 1), PegVec3)) {
-		Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
+	else if (getTop(th)>1 && isXyz(getLocal(th, 1))) {
+		Xyz *xyz2 = toXyz(getLocal(th, 1));
 		self->x *= xyz2->x; self->y *= xyz2->y; self->z *= xyz2->z;
 	}
 	setTop(th, 1);
@@ -321,11 +321,11 @@ int xyz_scale(Value th) {
 int xyz_mult(Value th) {
 	if (getTop(th)<2)
 		return 0;
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *self = toXyz(getLocal(th, 0));
 	Value leftval = getLocal(th,1);
 	Xyz rxyz;
-	if (getTop(th)>2 && isCDataType(getLocal(th, 2), PegVec3)) {
-		Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 2));
+	if (getTop(th)>2 && isXyz(getLocal(th, 2))) {
+		Xyz *xyz2 = toXyz(getLocal(th, 2));
 		rxyz.x = xyz2->x;
 		rxyz.y = xyz2->y;
 		rxyz.z = xyz2->z;
@@ -340,13 +340,13 @@ int xyz_mult(Value th) {
 		self->x = scalar * rxyz.x;
 		self->y = scalar * rxyz.y;
 		self->z = scalar * rxyz.z;
-	} else if (isCDataType(leftval,PegVec3)) {
-		Xyz *scale = (Xyz*) toHeader(leftval);
+	} else if (isXyz(leftval)) {
+		Xyz *scale = toXyz(leftval);
 		self->x = scale->x * rxyz.x;
 		self->y = scale->y * rxyz.y;
 		self->z = scale->z * rxyz.z;
-	} else if (isCDataType(leftval, PegVec4)) {
-		Quat *quat = (Quat*) toHeader(leftval);
+	} else if (isQuat(leftval)) {
+		Quat *quat = toQuat(leftval);
 		Quat iq;
 		iq.x = quat->w * rxyz.x + quat->y * rxyz.z - quat->z * rxyz.y;
 		iq.y = quat->w * rxyz.y + quat->z * rxyz.x - quat->x * rxyz.z;
@@ -355,8 +355,8 @@ int xyz_mult(Value th) {
 		self->x = iq.x * quat->w - iq.w * quat->x - iq.y * quat->z + iq.z * quat->y;
 		self->y = iq.y * quat->w - iq.w * quat->y - iq.z * quat->x + iq.x * quat->z;
 		self->z = iq.z * quat->w - iq.w * quat->z - iq.x * quat->y + iq.y * quat->x;
-	} else if (isCDataType(leftval, PegMat4)) {
-		Mat4 *mat4 = (Mat4*) toHeader(leftval);
+	} else if (isMat4(leftval)) {
+		Mat4 *mat4 = toMat4(leftval);
 		mat4MultVec(self, mat4, &rxyz);
 	}
 	setTop(th, 1);
@@ -365,17 +365,17 @@ int xyz_mult(Value th) {
 
 /** Return a new Xyz value that is scaled by a float or Xyz value */
 int xyz_multop(Value th) {
-	if (getTop(th)<2 || !(isFloat(getLocal(th,1)) || isCDataType(getLocal(th, 1), PegVec3)))
+	if (getTop(th)<2 || !(isFloat(getLocal(th,1)) || isXyz(getLocal(th, 1))))
 		return 0;
-	Xyz *newxyz = (Xyz*) toHeader(pushCData(th, pushProperty(th, 0, "_newtype"), PegVec3, 0, sizeof(Xyz)));
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
+	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
+	Xyz *self = toXyz(getLocal(th, 0));
 	if (isFloat(getLocal(th,1))) {
 		Afloat scale = toAfloat(getLocal(th, 1));
 		self->x *= scale;
 		self->y *= scale;
 		self->z *= scale;
 	} else {
-		Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
+		Xyz *xyz2 = toXyz(getLocal(th, 1));
 		self->x *= xyz2->x; self->y *= xyz2->y; self->z *= xyz2->z;
 	}
 	return 1;
@@ -383,12 +383,12 @@ int xyz_multop(Value th) {
 
 /** Return the Xyz value after calculating into it the cross-product of two Xyz vectors. */
 int xyz_cross(Value th) {
-	if (getTop(th)<2 || !isCDataType(getLocal(th, 1), PegVec3))
+	if (getTop(th)<2 || !isXyz(getLocal(th, 1)))
 		return 0;
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-	if (getTop(th)>2 && isCDataType(getLocal(th, 2), PegVec3)) {
-		Xyz *xyz3 = (Xyz*) toHeader(getLocal(th, 2));
+	Xyz *self = toXyz(getLocal(th, 0));
+	Xyz *xyz2 = toXyz(getLocal(th, 1));
+	if (getTop(th)>2 && isXyz(getLocal(th, 2))) {
+		Xyz *xyz3 = toXyz(getLocal(th, 2));
 		xyzCross(self, xyz2, xyz3);
 	}
 	else
@@ -399,11 +399,11 @@ int xyz_cross(Value th) {
 
 /** Calculate and return Xyz value linearly interpolated between two Xyz values by a scalar from 0 to 1 */
 int xyz_lerp(Value th) {
-	if (getTop(th)<4 || !isCDataType(getLocal(th, 1), PegVec3) || !isCDataType(getLocal(th, 2), PegVec3) || !isFloat(getLocal(th, 3)))
+	if (getTop(th)<4 || !isXyz(getLocal(th, 1)) || !isXyz(getLocal(th, 2)) || !isFloat(getLocal(th, 3)))
 		return 0;
-	Xyz *self = (Xyz*) toHeader(getLocal(th, 0));
-	Xyz *xyz2 = (Xyz*) toHeader(getLocal(th, 1));
-	Xyz *xyz3 = (Xyz*) toHeader(getLocal(th, 2));
+	Xyz *self = toXyz(getLocal(th, 0));
+	Xyz *xyz2 = toXyz(getLocal(th, 1));
+	Xyz *xyz3 = toXyz(getLocal(th, 2));
 	float scalar = toAfloat(getLocal(th, 3));
 	self->x = (1.0f - scalar)*xyz2->x + scalar*xyz3->x;
 	self->y = (1.0f - scalar)*xyz2->y + scalar*xyz3->y;
