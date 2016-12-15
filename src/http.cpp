@@ -11,24 +11,44 @@
 
 #include "curl/curl.h"
 
-/** Callback structure for resource accumulation */
-struct StringState {
-	Value th;	//!< Preserve the thread pointer
-	Value resource;	//!< The string holding the resource's contents
+CURLM *multi_handle;
+struct ResourceBuffer {
+	void *buffer;
+	size_t bufsize;
 };
 
-/** Callback from perform that assembles the retrieved resource into a string */
-size_t http_write_callback(char *ptr, size_t size, size_t nmemb, void *udata) {
-	struct StringState *ss = (struct StringState*)udata;
-	if (ss->resource==aNull)
-		ss->resource = pushStringl(ss->th, aNull, ptr, size*nmemb);
-	else
-		strAppend(ss->th, ss->resource, ptr, size*nmemb);
-	return size*nmemb;
+// Set up Internet resource access via libcurl
+void resource_init() {
+	curl_global_init(CURL_GLOBAL_WIN32);	// Use CURL_GLOBAL_DEFAULT when SSL is desired
+	multi_handle = curl_multi_init();
 }
 
-/** '()': Get contents for passed http:// url string */
+// Clean up the Internet resource access capability
+void resource_close(void) {
+	curl_multi_cleanup(multi_handle);
+	curl_global_cleanup();
+}
+
+/** Callback that assembles the retrieved resource into a growing allocated buffer */
+size_t http_write_callback(char *ptr, size_t size, size_t nmemb, void *udata) {
+	struct ResourceBuffer *resbuf = (struct ResourceBuffer *) udata;
+	size_t newsize = size*nmemb;
+	if (resbuf->buffer==NULL) {
+		resbuf->buffer = malloc(resbuf->bufsize = newsize);
+		memcpy(resbuf->buffer, ptr, resbuf->bufsize);
+	}
+	else {
+		resbuf->buffer = realloc(resbuf->buffer, resbuf->bufsize+newsize);
+		memcpy(&((char*)resbuf->buffer)[resbuf->bufsize], ptr, newsize);
+		resbuf->bufsize += newsize;
+	}
+	return newsize;
+}
+
+/** 'Get': Get contents for passed http:// url string */
 int http_get(Value th) {
+	int nparms = getTop(th);
+
 	// Get string value of filename path
 	Value fnval;
 	if (getTop(th)<2 || (!isStr(fnval = getLocal(th,1)) && !isSym(fnval))) {
@@ -38,7 +58,7 @@ int http_get(Value th) {
 	const char *url = toStr(fnval);
 
 	// Set up the GET request
-	struct StringState udata = {th, aNull};
+	struct ResourceBuffer udata = {NULL, 0};
  	CURL *curl = curl_easy_init();
     curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *) &udata);
@@ -49,12 +69,28 @@ int http_get(Value th) {
 
 	// Do GET request and get response in callback
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK)
-		vmLog("Failed to load %s. Curl error: %s", url, curl_easy_strerror(res));
- 
+    if (res != CURLE_OK) {
+		// Call the failure method, passing it an error diagnostic
+		if (nparms>2 && isCallable(getLocal(th,2))) {
+			pushLocal(th, 2);
+			pushValue(th, aNull);
+			pushValue(th, aNull);
+			pushString(th, aNull, curl_easy_strerror(res));
+			getCall(th, 3, 0);
+		}
+	    curl_easy_cleanup(curl);
+		return 0;
+	}
     curl_easy_cleanup(curl);
-	pushValue(th, udata.resource);
-	return 1;
+
+	// Call the success method, passing it the stream
+	if (nparms>2 && isCallable(getLocal(th,2))) {
+		pushLocal(th, 2);
+		pushValue(th, aNull);
+		pushStringl(th, aNull, (char*) udata.buffer, udata.bufsize);
+		getCall(th, 2, 0);
+	}
+	return 0;
 }
 
 /** Initialize the Http type */
@@ -63,7 +99,7 @@ void http_init(Value th) {
 		pushSym(th, "Http");
 		popProperty(th, 0, "_name");
 		pushCMethod(th, http_get);
-		popProperty(th, 0, "()");
+		popProperty(th, 0, "Get");
 	popGloVar(th, "Http");
 
 	// Register this type as Resource's 'http' scheme

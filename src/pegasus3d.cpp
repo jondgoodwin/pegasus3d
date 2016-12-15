@@ -6,7 +6,6 @@
 */
 
 #include "pegasus3d.h"
-#include "curl/curl.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +16,8 @@ Value vm;
 // For creating and destroying browser's shared window
 void window_newMainWindow(void);
 void window_destroyMainWindow(void);
+void resource_init(void);
+void resource_close(void);
 
 // World type initializers
 void rect_init(Value th);
@@ -89,6 +90,7 @@ void initWorld(Value th) {
 int main(int argc, char *argv[])
 {
 	freopen("pegasus3d.log", "w", stderr);
+	resource_init();
 
 	// Initialize SDL's Video subsystem and create sharable main window
 	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -106,15 +108,16 @@ int main(int argc, char *argv[])
 	test_init(th);	// temporary hack for building a test world
 
 	// Load and run the world whose url was passed as first parameter	
-	curl_global_init(CURL_GLOBAL_WIN32);
-	pushSym(th, "()");
+	pushSym(th, "Load");
+	pushSym(th, "New");
 	pushGloVar(th, "Resource");
 #ifdef _DEBUG
 	pushString(th, aNull, argc>1? argv[1] : "file://./world.acn");
 #else
 	pushString(th, aNull, argc>1? argv[1] : "http://ddd.jondgoodwin.com/world.acn");
 #endif
-	getCall(th, 2, 0);
+	getCall(th, 2, 1);
+	getCall(th, 1, 0);
 
 	// Initialize timer count and running state
 	Value isrunning = aTrue;
@@ -139,10 +142,10 @@ int main(int argc, char *argv[])
 		isrunning = popValue(th);
 	}
 
-	curl_global_cleanup(); // Shutdown curl
 	vmClose(th); // Shutdown Acorn VM
 	window_destroyMainWindow();
 	SDL_Quit(); // Shutdown SDL2
+	resource_close(); // Shutdown http
 
 	return 0;
 }

@@ -39,11 +39,15 @@ int integers_new(Value th) {
 	if (isStr(parm1)) {
 		const char *scanp = toStr(parm1);
 		while (*scanp) {
-			if ((*scanp>='0' && *scanp<='9')||*scanp=='-') {
-				short ival = atoi(scanp);
+			int neg = 0;
+			if (*scanp=='-') {neg = 1; ++scanp;}
+			if (*scanp>='0' && *scanp<='9') {
+				Aint val = 0;
+			    for ( char c; ( c = *scanp ^ '0' ) <= 9; ++scanp ) 
+					val = val * 10 + c;
+				if (neg) val = -val;
+				short ival = val;
 				strAppend(th, bufv, (const char*)(&ival), sizeof(GLshort));
-				while ((*scanp>='0' && *scanp<='9') || *scanp=='.' || *scanp=='e' || *scanp=='E' || *scanp=='-')
-					scanp++;
 			}
 			else
 				scanp++;
