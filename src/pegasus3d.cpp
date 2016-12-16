@@ -18,6 +18,7 @@ void window_newMainWindow(void);
 void window_destroyMainWindow(void);
 void resource_init(void);
 void resource_close(void);
+void resource_poll(void);
 
 // World type initializers
 void rect_init(Value th);
@@ -127,6 +128,9 @@ int main(int argc, char *argv[])
 	// Do the event loop forever, until someone stops it
 	while (!isFalse(isrunning))
 	{
+		// Perform any asynchronous Internet transfers as needed
+		resource_poll();
+
 		// Do next frame (passing dt)
 		pushSym(th, "nextFrame");
 		pushGloVar(th, "$");
