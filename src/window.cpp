@@ -71,7 +71,7 @@ bool window_newOpenGLWindow(WindowInfo *di)
 
 /** Create a new window instance using SDL2 & OpenGL within a window */
 int window_new(Value th) {
-	pushProperty(th, 0, "_newtype"); // get the mixin type for instance
+	pushProperty(th, 0, "traits"); // get the mixin type for instance
 	Value dispinst = strHasFinalizer(pushCData(th, popValue(th), WindowValue, 0, sizeof(struct WindowInfo)));
 	WindowInfo *wininfo = (struct WindowInfo*) toHeader(dispinst);
 	window_newOpenGLWindow(wininfo);
@@ -155,7 +155,7 @@ void window_init(Value th) {
 			popProperty(th, 1, "MakeCurrent");
 			pushCMethod(th, window_swapbuffers);
 			popProperty(th, 1, "SwapBuffers");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, window_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Window");

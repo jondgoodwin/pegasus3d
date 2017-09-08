@@ -12,7 +12,7 @@
 /** Create a new Quat value. Its xyzw components are initialized by another Xyzw or up to 4 Floats as parameters.
   otherwise they are initialized to 0.0 (the zero vector). */
 int quat_new(Value th) {
-	Value quatv = pushCData(th, pushProperty(th, 0, "_newtype"), QuatValue, 0, sizeof(Quat));
+	Value quatv = pushCData(th, pushProperty(th, 0, "traits"), QuatValue, 0, sizeof(Quat));
 	Quat *quat = toQuat(quatv);
 	if (getTop(th)>1 && isQuat(getLocal(th,1))) {
 		Quat *other = toQuat(getLocal(th,1));
@@ -376,7 +376,7 @@ void quat_init(Value th) {
 			popProperty(th, 1, "Mult");
 			pushCMethod(th, quat_slerp);
 			popProperty(th, 1, "Slerp");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, quat_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Quat");

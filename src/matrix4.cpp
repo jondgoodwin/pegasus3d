@@ -10,7 +10,7 @@
 
 /** Create a new identity Matrix4 value. */
 int matrix4_new(Value th) {
-	Value matv = pushCData(th, pushProperty(th, 0, "_newtype"), Mat4Value, 0, sizeof(Mat4));
+	Value matv = pushCData(th, pushProperty(th, 0, "traits"), Mat4Value, 0, sizeof(Mat4));
 	Mat4 *mat = toMat4(matv);
 	mat4Identity(mat);
 	return 1;
@@ -106,14 +106,14 @@ void mat4_init(Value th) {
 			pushCMethod(th, matrix4_getcell);
 			pushCMethod(th, matrix4_setcell);
 			pushClosure(th, 2);
-			popProperty(th, 1, "()");
+			popProperty(th, 1, "[]");
 			pushCMethod(th, matrix4_inverse);
 			popProperty(th, 1, "Inverse");
 			pushCMethod(th, matrix4_set);
 			popProperty(th, 1, "Set");
 			pushCMethod(th, matrix4_mult);
 			popProperty(th, 1, "Mult");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, matrix4_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Matrix4");

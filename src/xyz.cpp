@@ -12,7 +12,7 @@
 /** Create a new Xyz value. Its xyz components are initialized by another Xyz or up to 3 Floats as parameters.
   otherwise they are initialized to 0.0 (the zero vector). */
 int xyz_new(Value th) {
-	Value xyzv = pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz));
+	Value xyzv = pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz));
 	Xyz *xyz = toXyz(xyzv);
 	if (getTop(th)>1 && isXyz(getLocal(th,1))) {
 		Xyz *other = toXyz(getLocal(th,1));
@@ -39,7 +39,7 @@ int xyz_zero(Value th) {
 /** Update Xyz value's x,y,z with components from passed Xyz or passed x,y,z Floats */
 int xyz_set(Value th) {
 	Xyz *xyz = toXyz(getLocal(th, 0));
-	if (getTop(th)>1 && !isXyz(getLocal(th,1))) {
+	if (getTop(th)>1 && isXyz(getLocal(th,1))) {
 		Xyz *other = toXyz(getLocal(th,1));
 		xyz->x = other->x;
 		xyz->y = other->y;
@@ -164,7 +164,7 @@ int xyz_unit(Value th) {
 	if (getTop(th)>1 && isXyz(getLocal(th,1)))
 		target = toXyz(getLocal(th, 1));
 	else
-		target = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
+		target = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
 	xyzNorm(target, xyz);
 	return 1;
 }
@@ -273,7 +273,7 @@ int xyz_addop(Value th) {
 	}
 	Xyz *xyz1 = toXyz(getLocal(th, 0));
 	Xyz *xyz2 = toXyz(getLocal(th, 1));
-	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
+	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
 	xyzAdd(newxyz, xyz1, xyz2);
 	return 1;
 }
@@ -286,7 +286,7 @@ int xyz_subtractop(Value th) {
 	}
 	Xyz *xyz1 = toXyz(getLocal(th, 0));
 	Xyz *xyz2 = toXyz(getLocal(th, 1));
-	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
+	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
 	newxyz->x = xyz1->x - xyz2->x;
 	newxyz->y = xyz1->y - xyz2->y;
 	newxyz->z = xyz1->z - xyz2->z;
@@ -367,7 +367,7 @@ int xyz_mult(Value th) {
 int xyz_multop(Value th) {
 	if (getTop(th)<2 || !(isFloat(getLocal(th,1)) || isXyz(getLocal(th, 1))))
 		return 0;
-	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "_newtype"), XyzValue, 0, sizeof(Xyz)));
+	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
 	Xyz *self = toXyz(getLocal(th, 0));
 	if (isFloat(getLocal(th,1))) {
 		Afloat scale = toAfloat(getLocal(th, 1));
@@ -471,7 +471,7 @@ void xyz_init(Value th) {
 			popProperty(th, 1, "Zero?");
 			pushCMethod(th, xyz_zero);
 			popProperty(th, 1, "Zero");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, xyz_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Xyz");

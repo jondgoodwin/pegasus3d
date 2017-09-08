@@ -271,11 +271,11 @@ void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
 		fmat = &tempmat;
 	}
 
-	float det = (*fmat)[0]*(*fmat)[5]*(*fmat)[10] 
-		+ (*fmat)[4]*(*fmat)[9]*(*fmat)[2] 
-		+ (*fmat)[4]*(*fmat)[1]*(*fmat)[6] 
-		- (*fmat)[0]*(*fmat)[9]*(*fmat)[6] 
-		- (*fmat)[4]*(*fmat)[5]*(*fmat)[10] 
+	float det = (*fmat)[0]*(*fmat)[5]*(*fmat)[10]
+		+ (*fmat)[4]*(*fmat)[9]*(*fmat)[2]
+		+ (*fmat)[8]*(*fmat)[1]*(*fmat)[6]
+		- (*fmat)[0]*(*fmat)[9]*(*fmat)[6]
+		- (*fmat)[4]*(*fmat)[1]*(*fmat)[10]
 		- (*fmat)[8]*(*fmat)[5]*(*fmat)[2];
 
 	(*tmat)[0]  = ((*fmat)[ 5]*(*fmat)[10] - (*fmat)[ 9]*(*fmat)[ 6])/det;
@@ -288,23 +288,23 @@ void mat4Inverse(Mat4 *tmat, Mat4 *fmat) {
 	(*tmat)[6]  = ((*fmat)[ 4]*(*fmat)[ 2] - (*fmat)[ 0]*(*fmat)[ 6])/det;
 	(*tmat)[10] = ((*fmat)[ 0]*(*fmat)[ 5] - (*fmat)[ 4]*(*fmat)[ 1])/det;
 
-	(*tmat)[12] = ((*fmat)[4]*(*fmat)[13]*(*fmat)[10] 
-		+ (*fmat)[8]*(*fmat)[5]*(*fmat)[14] 
-		+ (*fmat)[12]*(*fmat)[9]*(*fmat)[6] 
-		- (*fmat)[4]*(*fmat)[9]*(*fmat)[14] 
-		- (*fmat)[8]*(*fmat)[13]*(*fmat)[6] 
+	(*tmat)[12] = ((*fmat)[4]*(*fmat)[13]*(*fmat)[10]
+		+ (*fmat)[8]*(*fmat)[5]*(*fmat)[14]
+		+ (*fmat)[12]*(*fmat)[9]*(*fmat)[6]
+		- (*fmat)[4]*(*fmat)[9]*(*fmat)[14]
+		- (*fmat)[8]*(*fmat)[13]*(*fmat)[6]
 		- (*fmat)[12]*(*fmat)[5]*(*fmat)[10])/det;
-	(*tmat)[13] = ((*fmat)[0]*(*fmat)[9]*(*fmat)[14] 
+	(*tmat)[13] = ((*fmat)[0]*(*fmat)[9]*(*fmat)[14]
 		+ (*fmat)[8]*(*fmat)[13]*(*fmat)[2]
 		+ (*fmat)[12]*(*fmat)[1]*(*fmat)[10]
 		- (*fmat)[0]*(*fmat)[13]*(*fmat)[10]
-		- (*fmat)[8]*(*fmat)[1]*(*fmat)[14] 
+		- (*fmat)[8]*(*fmat)[1]*(*fmat)[14]
 		- (*fmat)[12]*(*fmat)[9]*(*fmat)[2])/det;
-	(*tmat)[14] = ((*fmat)[0]*(*fmat)[13]*(*fmat)[6] 
-		+ (*fmat)[4]*(*fmat)[1]*(*fmat)[14] 
-		+ (*fmat)[12]*(*fmat)[5]*(*fmat)[2] 
-		- (*fmat)[0]*(*fmat)[5]*(*fmat)[14] 
-		- (*fmat)[4]*(*fmat)[13]*(*fmat)[2] 
+	(*tmat)[14] = ((*fmat)[0]*(*fmat)[13]*(*fmat)[6]
+		+ (*fmat)[4]*(*fmat)[1]*(*fmat)[14]
+		+ (*fmat)[12]*(*fmat)[5]*(*fmat)[2]
+		- (*fmat)[0]*(*fmat)[5]*(*fmat)[14]
+		- (*fmat)[4]*(*fmat)[13]*(*fmat)[2]
 		- (*fmat)[12]*(*fmat)[1]*(*fmat)[6])/det;
 
 	(*tmat)[3] = 0.0f;

@@ -10,7 +10,7 @@
 
 /** Create a new Rect */
 int rect_new(Value th) {
-	Value rectv = pushCData(th, pushProperty(th, 0, "_newtype"), RectValue, 0, sizeof(Rect));
+	Value rectv = pushCData(th, pushProperty(th, 0, "traits"), RectValue, 0, sizeof(Rect));
 	Rect *rect = toRect(rectv);
 	if (getTop(th)>1 && isRect(getLocal(th,1))) {
 		Rect *other = toRect(getLocal(th,1));
@@ -34,7 +34,7 @@ void rect_init(Value th) {
 		pushSym(th, "Rect");
 		popProperty(th, 0, "_name");
 		pushMixin(th, aNull, aNull, 16);
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, rect_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Rect");

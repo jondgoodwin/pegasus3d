@@ -19,11 +19,8 @@ The Pegasus3D browser is written in C. Its code uses these libraries:
 - [Acorn VM][acornvm] - A reentrant C library, able to compile and run Acorn programs in its own virtual machine.
 - [Simple Directmedia Layer][sdl2] - An operating system-independent API for managing media and other resources.
 - [OpenGL][opengl] - An open API for high-performance graphics processing.
-
-In addition, Pegasus3D dynamically loads shared libraries that implement additional Acorn types,
-written using the C API. These libraries may have dependencies on additional code libraries,
-such as [Asio][asio] (for Http and Udp), [libjpeg][jpeg] (for Jpeg), [giflib][gif] (for Gif), and [zlib][zip]
-(for ZipFile).
+- [libcurl][libcurl] - the multi-protocol file transfer library.
+- [stb-image][stb-image] - image loader	
 
 ## Building (Linux)
 
@@ -44,21 +41,10 @@ as guided by the pegasus3d.conf configuration file.
 
 ## License
 
-Copyright (C) 2016  Jonathan Goodwin
+Copyright (C) 2017  Jonathan Goodwin
 
- This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU Lesser General Public
-License as published by the Free Software Foundation; either
-version 2.1 of the License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-Lesser General Public License for more details.
-
-You should have received a copy of the GNU Lesser General Public
-License along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+The Pegasus3D browser (pegasus3d) is distributed under the terms of the MIT license. 
+See LICENSE and COPYRIGHT for details.
 
 [doc]: http://web3d.jondgoodwin.com/pegasusdoc
 [web3d]: http://web3d.jondgoodwin.com
@@ -66,7 +52,5 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 [acornvm]: http://web3d.jondgoodwin.com/arch/avmindex.html
 [sdl2]: http://www.libsdl.org
 [opengl]: http://www.opengl.org
-[asio]: http://think-async.com/
-[jpeg]: http://libjpeg.sourceforge.net/
-[gif]: http://giflib.sourceforge.net/gif_lib.html
-[zip]: http://www.zlib.net
+[libcurl]: https://curl.haxx.se/libcurl
+[stb-image]: https://github.com/nothings/stb/blob/master/stb_image.h

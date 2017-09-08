@@ -9,42 +9,6 @@
 #include <math.h>
 #include <stdlib.h>
 
-static float const exp_table[]
-	= { 1e-20f, 1e-19f, 1e-18f, 1e-17f, 1e-16f, 1e-15f, 1e-14f, 1e-13f, 1e-12f, 1e-11f, 1e-10f, 1e-9f, 1e-8f, 1e-7f, 1e-6f, 1e-5f, 1e-4f, 1e-3f, 1e-2f, 0.1f,
-		1.f, 10.f, 1e2f, 1e3f, 1e4f, 1e5f, 1e6f, 1e7f, 1e8f, 1e9f, 1e10f, 1e11f, 1e12f, 1e13f, 1e14f, 1e15f, 1e16f, 1e17f, 1e18f, 1e19f, 1e20f},
-	*exp_lookup = &exp_table[ 20 ];
-float strtof_fast(const char *scanp, char **pos) {
-	int neg = 0;
-	if (*scanp=='-') {neg = 1; ++scanp;}
-	Aint val = 0, exp = 0;
-	for ( char c; ( c = *scanp ^ '0' ) <= 9; ++scanp )
-		val = val * 10 + c;
-	if (*scanp == '.') {
-		char const *fracp = ++scanp;
-		for ( char c; ( c = *scanp ^ '0' ) <= 9; ++scanp )
-			val = val * 10 + c;
-		exp = fracp - scanp;
-	}
-	if ((*scanp | ('E'^'e')) == 'e') {
-		int eval = 0, eneg = 0;
-		if (*++scanp=='-') {eneg = 1; ++scanp;}
-		for ( char c; ( c = *scanp ^ '0' ) <= 9; ++scanp )
-			eval = eval * 10 + c;
-		exp += eneg? -eval : eval;
-	}
-	GLfloat afloat;
-	if (exp==0)
-		afloat = float(val);
-	else if (exp>=-20 && exp<=20)
-		afloat = val * exp_lookup[exp];
-	else
-		afloat = val * (float)pow(10.0, exp);
-	if (neg) afloat = -afloat;
-	if (pos!=NULL)
-		*pos = (char*) scanp;
-	return afloat;
-}
-
 /** Create a new Buffer value, with number of Xyz structures. */
 int xyzs_new(Value th) {
 	// Get nStructs parameter
@@ -68,7 +32,7 @@ int xyzs_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*3*sizeof(float), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "traits"), ArrayValue, nStructs*3*sizeof(float), sizeof(ArrayHeader));
 	ArrayHeader *hdr = toArrayHeader(bufv);
 	hdr->mbrType = XyzValue;
 	hdr->structSz = 3;
@@ -170,7 +134,7 @@ int uvs_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*3*sizeof(float), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "traits"), ArrayValue, nStructs*3*sizeof(float), sizeof(ArrayHeader));
 	ArrayHeader *hdr = toArrayHeader(bufv);
 	hdr->mbrType = XyzValue;
 	hdr->structSz = 2;
@@ -214,7 +178,7 @@ int colors_new(Value th) {
 	}
 
 	// Create the number array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*4*sizeof(float), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "traits"), ArrayValue, nStructs*4*sizeof(float), sizeof(ArrayHeader));
 	ArrayHeader *hdr = toArrayHeader(bufv);
 	hdr->mbrType = ColorValue;
 	hdr->structSz = 4;
@@ -270,7 +234,7 @@ void array_init(Value th) {
 			pushCMethod(th, xyzs_setz);
 			pushClosure(th, 2);
 			popProperty(th, 1, "z");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, xyzs_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Xyzs");
@@ -283,7 +247,7 @@ void array_init(Value th) {
 			popProperty(th, 1, "_name");
 			//pushCMethod(th, uvs_append);
 			//popProperty(th, 1, "<<");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, uvs_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Uvs");
@@ -296,7 +260,7 @@ void array_init(Value th) {
 			popProperty(th, 1, "_name");
 			pushCMethod(th, colors_append);
 			popProperty(th, 1, "<<");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, colors_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Colors");

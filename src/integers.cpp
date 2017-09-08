@@ -29,7 +29,7 @@ int integers_new(Value th) {
 	}
 
 	// Create the integer array
-	Value bufv = pushCData(th, pushProperty(th, 0, "_newtype"), ArrayValue, nStructs*sizeof(short), sizeof(ArrayHeader));
+	Value bufv = pushCData(th, pushProperty(th, 0, "traits"), ArrayValue, nStructs*sizeof(short), sizeof(ArrayHeader));
 	ArrayHeader *hdr = toArrayHeader(bufv);
 	hdr->mbrType = Uint16Nbr;
 	hdr->structSz = 1;
@@ -82,7 +82,7 @@ void integers_init(Value th) {
 			popProperty(th, 1, "_name");
 			pushCMethod(th, integers_append);
 			popProperty(th, 1, "<<");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, integers_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Integers");

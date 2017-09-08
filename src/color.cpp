@@ -11,7 +11,7 @@
 /** Create a new color value, with passed red, green, blue and alpha values.
   Defaults: White if no passed values, Gray scale if 1 passed value, 1.0 if no alpha. */
 int color_new(Value th) {
-	Value colorv = pushCData(th, pushProperty(th, 0, "_newtype"), ColorValue, 0, sizeof(ColorInfo));
+	Value colorv = pushCData(th, pushProperty(th, 0, "traits"), ColorValue, 0, sizeof(ColorInfo));
 	ColorInfo *color = toColor(colorv);
 	float defcolor = 1.0f;
 	color->red = defcolor = getTop(th)>1 && isFloat(getLocal(th,1))? toAfloat(getLocal(th, 1)) : defcolor;
@@ -57,7 +57,7 @@ void color_init(Value th) {
 			popProperty(th, 1, "set");
 			pushCMethod(th, color_unpack);
 			popProperty(th, 1, "unpack");
-		popProperty(th, 0, "_newtype");
+		popProperty(th, 0, "traits");
 		pushCMethod(th, color_new);
 		popProperty(th, 0, "New");
 	popGloVar(th, "Color");

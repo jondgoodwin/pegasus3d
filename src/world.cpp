@@ -127,6 +127,17 @@ void pushKeySym(Value th, SDL_Scancode key) {
 	case SDL_SCANCODE_F11: pushSym(th, "key_f11"); break;
 	case SDL_SCANCODE_F12: pushSym(th, "key_f12"); break;
 
+	case SDL_SCANCODE_KP_0: pushSym(th, "key_kp_0"); break;
+	case SDL_SCANCODE_KP_1: pushSym(th, "key_kp_1"); break;
+	case SDL_SCANCODE_KP_2: pushSym(th, "key_kp_2"); break;
+	case SDL_SCANCODE_KP_3: pushSym(th, "key_kp_3"); break;
+	case SDL_SCANCODE_KP_4: pushSym(th, "key_kp_4"); break;
+	case SDL_SCANCODE_KP_5: pushSym(th, "key_kp_5"); break;
+	case SDL_SCANCODE_KP_6: pushSym(th, "key_kp_6"); break;
+	case SDL_SCANCODE_KP_7: pushSym(th, "key_kp_7"); break;
+	case SDL_SCANCODE_KP_8: pushSym(th, "key_kp_8"); break;
+	case SDL_SCANCODE_KP_9: pushSym(th, "key_kp_0"); break;
+
 	case SDL_SCANCODE_APOSTROPHE: pushSym(th, "key_apostrophe"); break;
 	case SDL_SCANCODE_BACKSLASH: pushSym(th, "key_backslash"); break;
 	case SDL_SCANCODE_BACKSPACE: pushSym(th, "key_backspace"); break;
