@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "pegasus3d.h"
 #include "xyzmath.h"
@@ -100,6 +101,18 @@ Value shader_make(Value th, Value pgmv) {
        free(shaderProgramInfoLog);
        return aNull;
     }
+
+	// Every listed attribute must be an input of the GLSL program under the same name.
+	// Otherwise the driver picks its own locations and vertex data lands in the wrong inputs.
+	inlist = pushProperty(th, selfidx, "attributes");
+	if (isArr(inlist)) {
+		for (AuintIdx i=0; i < getSize(inlist); i++) {
+			const char *attrname = toStr(arrGet(th, inlist, i));
+			if (glGetAttribLocation(shaderprogram, attrname) < 0)
+				vmLog("Shader attribute '%s' is not an input of the GLSL program; vertex data will be misassigned", attrname);
+		}
+	}
+	popValue(th);
 
 	// Remember compiled program, then return as success
 	ShaderPgm* p = (ShaderPgm*) toHeader(pgmv);
