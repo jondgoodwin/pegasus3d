@@ -164,7 +164,7 @@ int xyz_unit(Value th) {
 	if (getTop(th)>1 && isXyz(getLocal(th,1)))
 		target = toXyz(getLocal(th, 1));
 	else
-		target = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
+		target = toXyz(pushCData(th, getType(th, getLocal(th, 0)), XyzValue, 0, sizeof(Xyz)));
 	xyzNorm(target, xyz);
 	return 1;
 }
@@ -273,7 +273,7 @@ int xyz_addop(Value th) {
 	}
 	Xyz *xyz1 = toXyz(getLocal(th, 0));
 	Xyz *xyz2 = toXyz(getLocal(th, 1));
-	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
+	Xyz *newxyz = toXyz(pushCData(th, getType(th, getLocal(th, 0)), XyzValue, 0, sizeof(Xyz)));
 	xyzAdd(newxyz, xyz1, xyz2);
 	return 1;
 }
@@ -286,7 +286,7 @@ int xyz_subtractop(Value th) {
 	}
 	Xyz *xyz1 = toXyz(getLocal(th, 0));
 	Xyz *xyz2 = toXyz(getLocal(th, 1));
-	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
+	Xyz *newxyz = toXyz(pushCData(th, getType(th, getLocal(th, 0)), XyzValue, 0, sizeof(Xyz)));
 	newxyz->x = xyz1->x - xyz2->x;
 	newxyz->y = xyz1->y - xyz2->y;
 	newxyz->z = xyz1->z - xyz2->z;
@@ -367,16 +367,16 @@ int xyz_mult(Value th) {
 int xyz_multop(Value th) {
 	if (getTop(th)<2 || !(isFloat(getLocal(th,1)) || isXyz(getLocal(th, 1))))
 		return 0;
-	Xyz *newxyz = toXyz(pushCData(th, pushProperty(th, 0, "traits"), XyzValue, 0, sizeof(Xyz)));
+	Xyz *newxyz = toXyz(pushCData(th, getType(th, getLocal(th, 0)), XyzValue, 0, sizeof(Xyz)));
 	Xyz *self = toXyz(getLocal(th, 0));
 	if (isFloat(getLocal(th,1))) {
 		Afloat scale = toAfloat(getLocal(th, 1));
-		self->x *= scale;
-		self->y *= scale;
-		self->z *= scale;
+		newxyz->x = self->x * scale;
+		newxyz->y = self->y * scale;
+		newxyz->z = self->z * scale;
 	} else {
 		Xyz *xyz2 = toXyz(getLocal(th, 1));
-		self->x *= xyz2->x; self->y *= xyz2->y; self->z *= xyz2->z;
+		newxyz->x = self->x * xyz2->x; newxyz->y = self->y * xyz2->y; newxyz->z = self->z * xyz2->z;
 	}
 	return 1;
 }
