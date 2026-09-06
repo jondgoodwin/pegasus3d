@@ -6,6 +6,7 @@
 */
 
 #include "pegasus3d.h"
+#include <string.h>
 
 /** Create a new texture */
 int texture_new(Value th) {

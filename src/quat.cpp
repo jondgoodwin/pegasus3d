@@ -8,6 +8,7 @@
 #include "pegasus3d.h"
 #include "xyzmath.h"
 #include <float.h>
+#include <cmath>
 
 /** Create a new Quat value. Its xyzw components are initialized by another Xyzw or up to 4 Floats as parameters.
   otherwise they are initialized to 0.0 (the zero vector). */

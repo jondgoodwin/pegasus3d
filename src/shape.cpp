@@ -7,6 +7,7 @@
 #include "pegasus3d.h"
 #include "xyzmath.h"
 #include <math.h>
+#include <string.h>
 
 /** Generate a sphere shape centered at (0,0,0), passing radius and nsegments.
 	The geometry is via longitude and latitude divisions. 

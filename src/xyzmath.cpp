@@ -8,6 +8,7 @@
 
 #include "pegasus3d.h"
 #include <stdio.h>
+#include <string.h>
 #include "xyzmath.h"
 
 /* Pre-calculated constants for fast approximation of spherical linear interpolation */
