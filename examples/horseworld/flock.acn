@@ -1,28 +1,31 @@
-# A flock of small flamingos flying as boids. Each bird steers by separation,
-# alignment and cohesion with its neighbours, wanders a little on its own, and
-# the whole flock is drawn toward a point ahead of its centre on a ring around
-# the paddock, so the group keeps circling the pen while jostling within itself.
+# A flock of flamingos flying as boids. Flamingos are big, steady flyers that
+# travel in loose lines and echelons rather than dense balls, so alignment is
+# weighted well above cohesion, birds keep a few wingspans apart, and each bird
+# takes a slot behind and to one side of the nearest bird ahead of it. Every
+# bird also steers toward a point a little ahead of it on a ring around the
+# paddock, so the line keeps circling the pen.
 +Group
 	origin: +Xyz(0., 0., 0.)
 	nbirds: 10
-	radius: 9.          # radius of the ring the flock circles
-	height: 5.          # cruising height
-	speed: 3.           # preferred airspeed
-	nearby: 4.          # how far a bird looks for flockmates
-	tooclose: 1.        # closer than this and birds push apart
+	radius: 14.         # radius of the ring the flock circles
+	height: 6.          # cruising height
+	speed: 4.           # preferred airspeed
+	nearby: 8.          # how far a bird looks for flockmates
+	tooclose: 3.        # closer than this and birds push apart
+	slotback: 2.5       # how far behind the bird ahead a follower sits
+	slotside: 2.        # and how far to one side
 	time: 0.            # elapsed time, drives each bird's wander
 
-	# The birds start as a loose cluster on the ring, all flying along it
+	# The birds start as a loose bunch on the ring, all flying along it
 	parts: +List
 		each i in 0 .. 9
-			local a = i.Float * 0.12
-			local r = 8. + (i % 3).Float * 0.9
-			local h = 4.5 + (i % 4).Float * 0.4
+			local a = i.Float * 0.14 - 2.5    # a quarter lap short of the camera's view
+			local r = 13. + (i % 3).Float * 1.2
+			local h = 5.5 + (i % 4).Float * 0.5
 			local bird = +@flamingo
 				origin: +Xyz(r * a.Cos, h, r * a.Sin)
 				orientation: +Quat
-				velocity: +Xyz(-3. * a.Sin, 0., 3. * a.Cos)
-				scale: +Xyz(0.0005, 0.0005, 0.0005)
+				velocity: +Xyz(-4. * a.Sin, 0., 4. * a.Cos)
 				modelnbr: i % 14
 				phase: i.Float * 0.7
 			<< bird
@@ -32,52 +35,68 @@
 		local last = .nbirds - 1
 		.time = .time + dt
 		local t = .time
-
-		# Where the flock is, and where on the ring it should head next
-		local middle = +Xyz(0., 0., 0.)
-		each i in 0 .. last
-			middle.Add(birds[i].origin)
-		middle.Scale(1. / .nbirds.Float)
-		local a = middle.z.Atan2(middle.x) + 0.4
-		local target = +Xyz(.radius * a.Cos, .height, .radius * a.Sin)
-
 		each i in 0 .. last
 			local bird = birds[i]
+			local v = bird.velocity
+			local fwd = +Xyz(v)
+			fwd.Normalize
+			local right = +Xyz(fwd.z, 0., 0. - fwd.x)
 			local center = +Xyz(0., 0., 0.)
 			local heading = +Xyz(0., 0., 0.)
 			local push = +Xyz(0., 0., 0.)
 			local n = 0
+			local leaddist = 1000.
+			local leader = bird
+			local side = 1.
 			each j in 0 .. last
 				local other = birds[j]
-				local d = bird.origin.Distance(other.origin)
+				local off = other.origin - bird.origin
+				local d = off.Length
 				if d > 0.01 and d < .nearby
 					center.Add(other.origin)
 					heading.Add(other.velocity)
 					n = n + 1
 					if d < .tooclose
 						# Push away from the neighbour, harder the closer it is
-						push.Add(bird.origin - other.origin, (.tooclose - d) / d)
+						push.Add(off, (d - .tooclose) / d)
+					# The nearest bird clearly ahead is the one to follow
+					if off.Dot(fwd) > 0.5 and d < leaddist
+						leaddist = d
+						leader = other
+						side = 1.
+						if off.Dot(right) < 0.
+							side = -1.
 			local accel = +Xyz(0., 0., 0.)
 			if n > 0
 				center.Scale(1. / n.Float)
-				accel.Add(center - bird.origin, 0.6)       # cohesion
+				accel.Add(center - bird.origin, 0.15)     # cohesion, weak
 				heading.Scale(1. / n.Float)
-				accel.Add(heading - bird.velocity, 0.8)   # alignment
-				accel.Add(push, 3.)                       # separation
-			# The flock's shared goal on the ring, and each bird's own wander
-			accel.Add(target - bird.origin, 0.9)
+				accel.Add(heading - bird.velocity, 1.2)   # alignment, strong
+				accel.Add(push, 2.)                       # separation
+			if leaddist < 1000.
+				# Take up a slot behind and beside the leader, on the side we are already on
+				local lfwd = +Xyz(leader.velocity)
+				lfwd.Normalize
+				local slot = +Xyz(leader.origin)
+				slot.Add(lfwd, 0. - .slotback)
+				slot.Add(+Xyz(lfwd.z, 0., 0. - lfwd.x), side * .slotside)
+				accel.Add(slot - bird.origin, 0.5)
+			# Steer toward a point a little way ahead on the ring, at cruising height
+			local a = bird.origin.z.Atan2(bird.origin.x) + 0.3
+			local target = +Xyz(.radius * a.Cos, .height, .radius * a.Sin)
+			accel.Add(target - bird.origin, 1.0)
+			# A little wander of its own, so the line breathes
 			local p = bird.phase
-			accel.Add((t * 1.3 + p).Sin, 0.5 * (t * 0.9 + p).Cos, (t * 1.1 + p).Cos)
+			accel.Add(0.4 * (t * 0.7 + p).Sin, 0.2 * (t * 0.5 + p).Cos, 0.4 * (t * 0.6 + p).Cos)
 			bird.velocity.Add(accel, dt)
 			# Keep the airspeed within bounds of the preferred speed
 			local sp = bird.velocity.Length
-			if sp > .speed * 1.3
-				bird.velocity.Scale(.speed * 1.3 / sp)
-			if sp < .speed * 0.7
-				bird.velocity.Scale(.speed * 0.7 / sp)
+			if sp > .speed * 1.25
+				bird.velocity.Scale(.speed * 1.25 / sp)
+			if sp < .speed * 0.75
+				bird.velocity.Scale(.speed * 0.75 / sp)
 			bird.origin.Add(bird.velocity, dt)
 			# Face along the velocity: yaw from x and z, pitch from the climb
-			local v = bird.velocity
 			local yaw = v.x.Atan2(v.z)
 			local pitch = 0. - (v.y / v.Length).Asin
 			bird.orientation.SetRotateYxz(pitch, yaw, 0.)
