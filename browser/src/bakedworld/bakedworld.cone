@@ -21,13 +21,17 @@
 // THE OBJECTS, in metres on the plane (y up; the viewer starts at (0, 8)
 // facing -z):
 //   a chess rook, 1.4 m        (sculpt's rook: a lathe and three booleans)
-//   an urn, 1 m                (sculpt's vase: a lathe, a lattice, a wall)
-//   a flower, 1.8 m across     (sculpt's flower: a petal swept, arrayed, subdivided)
+//   an amphora, 1.5 m          (a lidded black-figure amphora: its outline traced
+//                               from a photograph and lathed, two handles swept,
+//                               its bands painted; beside the chimney)
+//   a horn-flower, 2 m         (the horn as a plant: its stalk cut short, the
+//                               flower's petals on the cut, leaves up it)
 //   a boulder, 2 m             (sculpt's pebble: a box subdivided and Taubin-smoothed,
-//                               then once more)
+//                               then once more; on the chimney's other side)
 //   a horn, 3 m along          (sculpt's horn family, stage 0: an ellipse swept and ribbed)
-//   a chimney stack, 3.5 m     (sculpt's chimney: a cube grown by face operators,
-//                               its cage flat-shaded)
+//   a chimney stack, 4 m       (brick masonry in stretcher bond, whole bricks, two
+//                               oversailing courses, flaunching and a pot; the
+//                               bricks a colour, normal and ORM map)
 //   a hot-air balloon, 25 m    (sculpt's balloon, the photograph's chevrons, its
 //                               envelope painted; vfx's burner flame on it, held
 //                               mid-burst)
@@ -49,7 +53,10 @@
 //   motions.cone      the ball's bounce, the balloon's flight and its burner's bursts
 //   balloon.cone      the balloon and its paint
 //   flame.cone        the burner's flame and its pilot light
-//   sculptures.cone   the rooks, the urn, the flower, the boulder, the horn, the chimney
+//   sculptures.cone   the rooks, the boulder, the horn
+//   amphora.cone      the amphora, its handles and its paint
+//   chimney.cone      the brick chimney stack and its maps
+//   hornflower.cone   the horn-flower
 
 mod bakedworld;
 
@@ -60,6 +67,7 @@ import collections use *;
 import geomath use *;
 import mesh;
 import noise;
+import pbrmaterial;
 import sculpt use *;
 import render use Image;
 import vfx use Emitter, SHAPE_DISC;
@@ -84,11 +92,12 @@ pub struct PartDesc {
   pub shape mesh.Mesh;
   pub look Look;
   pub paint Image;
+  pub maps Maps;              // a physical look's normal and ORM maps
   pub at Transform3;
 
   pub fn empty() PartDesc {
     new PartDesc(String.empty(), mesh.Mesh.empty(), Look.plain(new Color(1., 1., 1., 1.)), Image.empty(),
-      Transform3.identity());
+      Maps.none(), Transform3.identity());
   }
 }
 
@@ -115,7 +124,12 @@ pub struct Hydrated {
   pub fn empty() Hydrated { new Hydrated(List[PartDesc].empty(), List[EffectDesc].empty()); }
 
   pub fn add(self &mut, name &[]u8, shape mesh.Mesh, look Look, paint Image, at Transform3) {
-    parts.push(new PartDesc(String.from(name), shape, look, paint, at));
+    parts.push(new PartDesc(String.from(name), shape, look, paint, Maps.none(), at));
+  }
+
+  // A part of a physical look, with its maps
+  pub fn addMapped(self &mut, name &[]u8, shape mesh.Mesh, look Look, paint Image, maps Maps, at Transform3) {
+    parts.push(new PartDesc(String.from(name), shape, look, paint, maps, at));
   }
 
   // How many triangles its meshes have
@@ -133,11 +147,14 @@ pub struct Hydrated {
 // ---- The world's objects ----
 
 pub const OBJECTS = 11u32;
-imm NAMES Array[&[]u8, 11] = ["rook", "urn", "flower", "boulder", "horn", "chimney", "balloon", "lathed rook",
+imm NAMES Array[&[]u8, 11] = ["rook", "amphora", "horn-flower", "boulder", "horn", "chimney", "balloon", "lathed rook",
   "starship", "launch button", "ball"];
 
-// The objects the world moves
+// The objects the world moves, or the script looks at
 pub const ROOK = 0u32;
+pub const AMPHORA = 1u32;
+pub const HORNFLOWER = 2u32;
+pub const CHIMNEY = 5u32;
 pub const BALLOON = 6u32;
 pub const BUTTON = 9u32;
 pub const BALL = 10u32;
@@ -148,11 +165,11 @@ pub fn objectName(k u32) &[]u8 { NAMES[usize.from(k)]; }
 // Where each stands: x, z, its yaw (radians) and its scale (metres a unit)
 imm PLACES Array[f32, 44] = [
   -1.3, 0.6, 0.3, 0.8,          // the rook, near the walk's first stop
-  1.4, 1.0, 0., 0.5,            // the urn
-  0.2, 1.8, 0.2, 0.75,          // the flower
-  8.5, -4., 0.6, 1.,            // the boulder
+  -7.4, -17., 0., 1.,           // the amphora, 1.7 m right of the chimney, a panel towards the start
+  0.2, 1.8, -2.356, 1.,         // the horn-flower, where the flower was, leaning left towards the start
+  -13.4, -17., 0.6, 1.,         // the boulder, 1.6 m left of the chimney
   -4.5, -6., -1.9, 1.,          // the horn, curving towards the path
-  -10., -17., 0.4, 1.,          // the chimney
+  -10., -17., 0.6, 1.,          // the chimney, its front face raked by the sun
   23., -34.84, 0.7, 9.,         // the balloon: 40 m along the walk's run, 9 m a unit
   -3., 0.6, 0.3, 0.8,           // the lathed rook, beside the first, turned as it is
   -120., -170., 0., 10.,        // the starship, hovering (its y is SHIP_HOVER): 10 m a unit, 156 m long
@@ -178,16 +195,20 @@ pub fn hydrate(k u32) Hydrated {
   mut h = Hydrated.empty();
   if k == 0u32 {
     h.add("rook", grounded(rookMesh(ROOK_STEPS)), Look.shiny(srgb(232., 222., 196.), 0.5, 40.), Image.empty(), placeOf(k, 0.));
-  } elif k == 1u32 {
-    h.add("urn", grounded(urnMesh()), Look.shiny(srgb(176., 84., 48.), 0.15, 16.), Image.empty(), placeOf(k, 0.));
-  } elif k == 2u32 {
-    h.add("flower", grounded(flowerMesh()), Look.shiny(srgb(232., 92., 140.), 0.25, 24.), Image.empty(), placeOf(k, 0.));
+  } elif k == AMPHORA {
+    hydrateAmphora(&mut h, placeOf(k, 0.));
+    print <- "The amphora: lathed in "; print <- amphoraStats.latheMs; print <- " ms, its handles in ";
+    print <- amphoraStats.handlesMs; print <- " ms, its paint and ORM map in "; print <- amphoraStats.paintMs; print <- " ms\n";
+  } elif k == HORNFLOWER {
+    hydrateHornflower(&mut h, placeOf(k, 0.));
   } elif k == 3u32 {
     h.add("boulder", grounded(boulderMesh()), Look.plain(srgb(128., 122., 112.)), Image.empty(), placeOf(k, 0.));
   } elif k == 4u32 {
     h.add("horn", grounded(hornMesh()), Look.shiny(srgb(70., 46., 30.), 0.6, 48.), Image.empty(), placeOf(k, 0.));
-  } elif k == 5u32 {
-    h.add("chimney", grounded(chimneyMesh()), Look.plain(srgb(150., 70., 50.)), Image.empty(), placeOf(k, 0.));
+  } elif k == CHIMNEY {
+    hydrateChimney(&mut h, placeOf(k, 0.));
+    print <- "The chimney: its bricks' colour and height in "; print <- chimneyStats.heightMs;
+    print <- " ms, the normal map from the height in "; print <- chimneyStats.mapsMs; print <- " ms\n";
   } elif k == 6u32 {
     hydrateBalloon(&mut h, k);
   } elif k == 7u32 {
@@ -274,9 +295,11 @@ pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mu
     door.send(Request.Place[id, p.at]);
     mut paint = Image.empty();
     paint <=> p.paint;
+    mut maps = Maps.none();
+    maps <=> p.maps;
     mut shape = mesh.Mesh.empty();
     shape <=> p.shape;
-    door.send(Request.Show[id, shape, p.look, paint, 0.]);
+    door.send(Request.Show[id, shape, p.look, paint, maps, 0.]);
     ids.push(id);
     places.push(p.at);
     i = i + 1usize;

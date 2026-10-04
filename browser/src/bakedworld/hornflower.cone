@@ -1,0 +1,101 @@
+// The horn-flower: the chitin horn grown as a plant, the flower's petals
+// stuck on its top "as if the plant was like that". Four parts:
+//
+// - the stalk: the stage horn (sculptures.cone's, its ribs and its taper),
+//   2.4 m along rather than 3, cut a tenth of the way short of its point so
+//   the bloom has a base (about 4 cm across there);
+// - the bloom: the flower example's seven petals (a rounded slab swept along
+//   a curve, arrayed round an axis, subdivided twice), broadened, at 0.4 of
+//   their size, so they start at the cut's edge and spread 0.48 m; the
+//   ring's axis along the stalk's last frame's tangent, its middle on the cut;
+// - its heart: a small flattened ball on the cut;
+// - five leaves up the stalk, each made as a petal is (a flattened slab swept
+//   along a curve that rises and droops) but narrowing to a point, widest a
+//   third of the way out; each set into the stalk's surface at its own
+//   height and angle round it, in the frame the stalk was swept with there,
+//   growing outward and up.
+//
+// The plant stands where it is placed, the stalk's foot at the origin,
+// bending towards its own +x.
+
+const BLOOM_LENGTH f32 = 2.4;           // the stalk's length, before it is cut
+const BLOOM_CUT f32 = 0.9;              // where it is cut, of the horn's curve
+const BLOOM_RINGS = 324u32;             // the horn's ring spacing
+const PETAL_SCALE f32 = 0.4;            // the flower's petals, scaled
+const LEAVES = 5;
+// Each leaf: the share of the stalk's way up it grows from, its angle round
+// the stalk (radians, from the sweep's normal), its scale (a leaf is 1.1 long)
+imm LEAF_PLACES Array[f32, 15] = [0.16, 0.4, 0.7, 0.3, 2.7, 0.64, 0.44, 4.9, 0.58, 0.58, 1.7, 0.52, 0.72, 3.9, 0.46];
+
+// The flower's petals: seven round the y axis, rising and opening outward;
+// the flower example's, but nearly twice as broad (0.45 to its 0.24), since
+// a third of their size its narrow petals read as a tassel
+fn petalRing() mesh.Mesh {
+  imm profile = Profile.roundedRectangle(0.45, 0.05, 0.02, 2u32);
+  imm curve = new CubicBezier3(v(0.1, 0., 0.), v(0.4, 0.3, 0.), v(0.9, 0.45, 0.), v(1.2, 0.35, 0.));
+  imm path = Path.fromCubic(curve, 12u32);
+  imm petal = sweep(&profile, &path, 0., 0.6, 0.15, true);
+  imm flower = arrayRadial(&petal, 7u32, up(), 2. * pi, v(0., 0., 0.), -1.);
+  imm smooth = subdivide(&flower, 2u32);
+  smooth.triangulate(true);
+}
+
+// A leaf's width along it: narrow where it leaves the stalk, widest about a
+// third of the way out, narrowing to a point
+fn leafWidth(u f32) f32 { 0.12 * (1. - u) + sin(pi * u) * (1. - 0.35 * u) + 0.02 * u; }
+
+// A leaf: a thin rounded slab swept along a curve from the origin out along
+// +x, rising and then drooping, its broad faces up and down
+fn leafMesh() mesh.Mesh {
+  imm profile = Profile.roundedRectangle(0.34, 0.035, 0.015, 2u32);
+  imm curve = new CubicBezier3(v(0., 0., 0.), v(0.35, 0.3, 0.), v(0.75, 0.42, 0.), v(1.1, 0.28, 0.));
+  imm path = Path.fromCubic(curve, 12u32);
+  imm leaf = sweepScaled(&profile, &path, 0., true, &leafWidth);
+  imm smooth = subdivide(&leaf, 2u32);
+  smooth.triangulate(true);
+}
+
+// The matrix that carries x to 'x', y to 'y' (unit, perpendicular) and z to
+// x cross y, scales by 's' and moves to 'origin'
+fn basisAt(origin Vec3, x Vec3, y Vec3, s f32) Mat4 {
+  imm z = x.cross(y);
+  new Mat4([x.x * s, x.y * s, x.z * s, 0., y.x * s, y.y * s, y.z * s, 0., z.x * s, z.y * s, z.z * s, 0.,
+    origin.x, origin.y, origin.z, 1.]);
+}
+
+// The horn-flower's parts into 'h', at 'at'
+fn hydrateHornflower(h &mut Hydrated, at Transform3) {
+  imm stalk = hornMeshCut(BLOOM_LENGTH, BLOOM_CUT, BLOOM_RINGS);
+  imm path = hornPath(BLOOM_LENGTH, BLOOM_CUT, BLOOM_RINGS);
+  imm frames = path.frames();
+  imm tip = *frames[frames.len() - 1usize];
+
+  // The bloom on the cut, facing the way the stalk runs there
+  mut petals = petalRing();
+  petals.transform(basisAt(tip.origin - tip.tangent * 0.01, tip.normal, tip.tangent, PETAL_SCALE));
+  mut heart = mesh.Mesh.sphere(1., 20);
+  heart.transform(basisAt(tip.origin + tip.tangent * 0.005, tip.normal, tip.tangent, 1.) * Mat4.fromScale(v(0.055, 0.03, 0.055)));
+
+  // The leaves, set into the stalk
+  mut leaves = mesh.Mesh.empty();
+  mut i = 0;
+  while i < LEAVES {
+    imm j = usize.from(i) * 3usize;
+    imm share = LEAF_PLACES[j];
+    imm f = *frames[usize.from(f32.from(BLOOM_RINGS) * share)];
+    imm out = f.normal * cos(LEAF_PLACES[j + 1usize]) + f.binormal * sin(LEAF_PLACES[j + 1usize]);
+    imm base = f.origin + out * (hornRadius(share * BLOOM_CUT, BLOOM_LENGTH) * 0.8);
+    // Out from the stalk and up along it: the leaf's +x outward, its +y the
+    // stalk's way, made perpendicular to the outward
+    imm along = (f.tangent - out * out.dot(f.tangent)).normalize();
+    mut leaf = leafMesh();
+    leaf.transform(basisAt(base, out, along, LEAF_PLACES[j + 2usize]));
+    leaves.append(&leaf);
+    i = i + 1;
+  }
+
+  h.add("horn-flower stalk", stalk, Look.shiny(srgb(62., 104., 40.), 0.35, 30.), Image.empty(), at);
+  h.add("horn-flower leaves", leaves, Look.shiny(srgb(88., 150., 58.), 0.2, 16.), Image.empty(), at);
+  h.add("horn-flower petals", petals, Look.shiny(srgb(232., 92., 140.), 0.25, 24.), Image.empty(), at);
+  h.add("horn-flower heart", heart, Look.shiny(srgb(240., 196., 40.), 0.3, 20.), Image.empty(), at);
+}

@@ -1,0 +1,306 @@
+// The chimney stack: classic brick masonry, its sizes whole bricks. The
+// masonry is material, not geometry: the stack is a few boxes, and the
+// bricks and the mortar between them are its paint, a normal map and an ORM
+// map, drawn by render's physically based material.
+//
+// THE BRICKS are standard UK ones, 215 x 102.5 x 65 mm, laid with 10 mm of
+// mortar: 225 mm a brick along a course (112.5 a half) and 75 mm a course.
+// The stack is 4 bricks by 3 in plan (0.9 x 0.675 m: whole bricks, so each
+// corner closes on a whole brick on one face and a half, a header, on the
+// next) and 45 courses high (3.375 m); over them two oversailing (corbelled)
+// courses, each stepping out a quarter brick on every side (to 4.5 x 3.5
+// bricks, then 5 x 4), 3.525 m in all; on top a flaunching of mortar sloping
+// up to a terracotta chimney pot (a short lathe), 4 m to its rim.
+//
+// THE BOND is stretcher (running) bond: each course's bricks offset half a
+// brick from the course below's. Round a corner the bond goes on: on a
+// course where one face ends in a whole brick (its stretcher face), the next
+// face begins with that brick's end (its header, half a brick), and the
+// next course the other way round; the brick at a corner is one brick, its
+// colour the same on both faces. Head joints are never at a corner.
+//
+// THE MAPS are one square sheet, 4.05 m a side (wide enough for the widest
+// course's whole way round), at 2.5 mm a texel: across it the way round a
+// course, from the front face's left corner (front, right, back, left), up
+// it the height above the ground. Each face of the boxes takes its uvs from
+// its size in metres (box projection) at its place in that sheet, so bricks
+// are the same size on every face and the courses run round the corners.
+// The mortar is recessed 6 mm and each brick's arrises rounded over 4 mm
+// (the height the normal map is made from, by the pbrmaterial package);
+// each brick's colour is one of four shades of red-brown, about one in
+// fourteen darker, mottled by noise; mortar rough, bricks a little less.
+
+const BRICK f32 = 0.225;                // a brick and a joint, along a course
+const HALF_BRICK f32 = 0.1125;
+const COURSE f32 = 0.075;               // a brick's height and a joint
+const JOINT f32 = 0.010;
+const STACK_BRICKS_W = 4;               // the stack's plan, in bricks
+const STACK_BRICKS_D = 3;
+const BODY_COURSES = 45;                // the stack's courses below the oversailing ones
+const OVERSAIL_COURSES = 2;
+const OVERSAIL f32 = 0.05625;           // a quarter brick: each oversailing course's step out
+const SHEET f32 = 4.05;                 // the maps' sheet, metres a side
+const SHEET_TEXELS = 1620;              // 2.5 mm a texel
+const MORTAR_DEPTH f32 = 0.006;
+const ARRIS f32 = 0.004;                // the width a brick's edge is rounded over
+const BRICK_SEED = 1851u32;             // the Great Exhibition's year
+const FLAUNCH_TOP f32 = 0.075;          // the flaunching's rise above the top course
+const POT_SINK f32 = 0.03;              // how deep the pot is bedded in it
+
+fn minF(a f32, b f32) f32 { if a < b { a; } else { b; }; }
+
+// Course k's plan: its width (x) and depth (z), metres
+fn coursePlan(k i32) Vec2 {
+  imm w = f32.from(STACK_BRICKS_W) * BRICK;
+  imm d = f32.from(STACK_BRICKS_D) * BRICK;
+  imm out = if k < BODY_COURSES { 0.; } else { f32.from(k - BODY_COURSES + 1) * OVERSAIL * 2.; };
+  p2(w + out, d + out);
+}
+
+pub fn stackHeight() f32 { f32.from(BODY_COURSES + OVERSAIL_COURSES) * COURSE; }
+
+// ---- The bond: which brick, or mortar, is at a place on a course ----
+
+// What is at a place in the sheet: mortar, or a brick (its key, for its
+// colour) and how far in from its nearest edge
+struct Masonry {
+  pub mortar Bool;
+  pub key u32;
+  pub inside f32;
+}
+
+// The place 'a' metres along face 'f' (0 front, 1 right, 2 back, 3 left) of
+// course 'k', a face 'length' long, 'yc' metres up the course
+fn bondAt(k i32, f i32, a f32, length f32, yc f32) Masonry {
+  // On even courses the front and back begin with a whole brick at their
+  // left corner and the sides with a header; on odd ones the other way
+  imm offset = if (k + f) % 2 == 1 { HALF_BRICK; } else { 0.; };
+  imm b = i32.from(libc.floorf((a - offset) / BRICK));
+  imm first = i32.from(libc.floorf((0. - offset) / BRICK));
+  imm last = i32.from(libc.floorf((length - 0.0001 - offset) / BRICK));
+  imm left = offset + f32.from(b) * BRICK;
+  imm right = left + BRICK;
+  // Head joints at the bricks' ends, but none at a corner
+  imm dl = if left > 0.0001 { a - left - JOINT * 0.5; } else { 1.; };
+  imm dr = if right < length - 0.0001 { right - JOINT * 0.5 - a; } else { 1.; };
+  imm db = yc - JOINT;
+  imm dt = COURSE - yc;
+  imm inside = minF(minF(dl, dr), minF(db, dt));
+  // A corner's brick is one brick on both faces: keyed by the face it ends
+  imm keyFace = if b == first { (f + 3) % 4; } else { f; };
+  imm keyBrick = if b == first or b == last { 1000; } else { b; };
+  imm key = noise.hash2(k, keyFace * 2000 + keyBrick, BRICK_SEED).x;
+  new Masonry(inside < 0., key, inside);
+}
+
+// What is at (s, y) of the sheet: s metres round course k from the front's
+// left corner, y metres above the ground
+fn masonryAt(s f32, y f32) Masonry {
+  imm k = i32.from(libc.floorf(y / COURSE));
+  if k >= BODY_COURSES + OVERSAIL_COURSES { return new Masonry(true, 0u32, -1.); }
+  imm plan = coursePlan(k);
+  imm yc = y - f32.from(k) * COURSE;
+  mut f = 0;
+  mut a = s;
+  mut length = plan.x;
+  while f < 4 and a >= length {
+    a = a - length;
+    f = f + 1;
+    length = if f % 2 == 0 { plan.x; } else { plan.y; };
+  }
+  if f >= 4 { return new Masonry(true, 0u32, -1.); }
+  bondAt(k, f, a, length, yc);
+}
+
+// ---- The maps ----
+
+// sRGB 0 to 1: four brick shades, a dark brick, the mortar
+imm BRICK_SHADES Array[f32, 18] = [0.60, 0.26, 0.18, 0.54, 0.23, 0.165, 0.65, 0.32, 0.23, 0.50, 0.235, 0.18,
+  0.35, 0.16, 0.125, 0.67, 0.65, 0.60];
+
+fn smooth01(x f32) f32 {
+  imm t = clampF(x, 0., 1.);
+  t * t * (3. - 2. * t);
+}
+
+pub struct ChimneyStats {
+  pub heightMs f64;
+  pub mapsMs f64;
+}
+mut chimneyStats ChimneyStats = new ChimneyStats(0d, 0d);
+
+// The sheet's colour (sRGB), normal and ORM maps
+fn brickMaps(colour &mut Image, normal &mut Image, orm &mut Image) {
+  imm n = SHEET_TEXELS;
+  imm texel = SHEET / f32.from(n);
+  imm t0 = sdl.GetPerformanceCounter();
+  // The height: 1 on a brick's face, falling over its arris to 0, the
+  // mortar's face, grained a little
+  mut height = pbrmaterial.ScalarMap.zeros(n);
+  mut col = List[u8].withCapacity(usize.from(n * n * 3));
+  mut occ = List[u8].withCapacity(usize.from(n * n * 3));
+  mut y = 0;
+  while y < n {
+    imm py = (f32.from(y) + 0.5) * texel;
+    mut x = 0;
+    while x < n {
+      imm px = (f32.from(x) + 0.5) * texel;
+      imm m = masonryAt(px, py);
+      imm grain = noise.toSigned(noise.hash2(x, y, BRICK_SEED + 1u32).x);
+      imm mottle = noise.fbm2(new Vec2(px * 30., py * 30.), BRICK_SEED + 2u32, 3, 2., 0.5).value;
+      mut h = 0.;
+      mut c Array[f32, 3] = [0., 0., 0.];
+      mut rough = 0.95;
+      if m.mortar {
+        h = 0.06 * (0.5 + 0.5 * grain);
+        imm shade = 1. + 0.05 * grain + 0.06 * mottle;
+        c = [BRICK_SHADES[15usize] * shade, BRICK_SHADES[16usize] * shade, BRICK_SHADES[17usize] * shade];
+      } else {
+        h = smooth01(m.inside / ARRIS) * (0.97 + 0.03 * grain);
+        // One in fourteen darker; the rest one of four shades
+        imm pick = noise.toUnit(m.key);
+        imm which = if pick < 0.07 { 4usize; } else { usize.from(m.key % 4u32); };
+        imm shade = (1. + 0.06 * grain + 0.10 * mottle) * (0.94 + 0.12 * noise.toUnit(m.key >> 3u32));
+        c = [BRICK_SHADES[which * 3usize] * shade, BRICK_SHADES[which * 3usize + 1usize] * shade,
+          BRICK_SHADES[which * 3usize + 2usize] * shade];
+        rough = 0.82 + 0.1 * (1. - h);
+      }
+      height.set(x, y, h);
+      mut i = 0usize;
+      while i < 3usize {
+        col.push(u8.from(clampF(c[i], 0., 1.) * 255. + 0.5));
+        i = i + 1usize;
+      }
+      // The mortar's recess shades the environment's light a little
+      occ.push(u8.from((0.6 + 0.4 * h) * 255. + 0.5));
+      occ.push(u8.from(rough * 255. + 0.5));
+      occ.push(0u8);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  imm t1 = sdl.GetPerformanceCounter();
+  // The normal map from the height: pbrmaterial's per-texel normal, the
+  // height's 0 to 1 being MORTAR_DEPTH of the sheet's width
+  mut nor = List[u8].withCapacity(usize.from(n * n * 3));
+  imm depth = MORTAR_DEPTH / SHEET;
+  y = 0;
+  while y < n {
+    mut x = 0;
+    while x < n {
+      imm nv = pbrmaterial.normalTexel(&height, x, y, depth);
+      nor.push(pbrmaterial.unitByte(nv.x * 0.5 + 0.5));
+      nor.push(pbrmaterial.unitByte(nv.y * 0.5 + 0.5));
+      nor.push(pbrmaterial.unitByte(nv.z * 0.5 + 0.5));
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  imm t2 = sdl.GetPerformanceCounter();
+  chimneyStats = new ChimneyStats(msBetween(t0, t1), msBetween(t1, t2));
+  *colour = new Image(n, n, 3, col);
+  *normal = new Image(n, n, 3, nor);
+  *orm = new Image(n, n, 3, occ);
+}
+
+// ---- The stack's boxes ----
+
+// A quad a, b, c, d (counterclockwise seen from outside) with its own flat
+// normal and the uvs given
+fn quad(m &mut mesh.Mesh, a Vec3, b Vec3, c Vec3, d Vec3, ua Vec2, ub Vec2, uc Vec2, ud Vec2) {
+  imm base = u32.from(m.positions.len());
+  imm nrm = (b - a).cross(c - a).normalize();
+  m.positions.push(a); m.positions.push(b); m.positions.push(c); m.positions.push(d);
+  m.normals.push(nrm); m.normals.push(nrm); m.normals.push(nrm); m.normals.push(nrm);
+  m.uvs.push(ua); m.uvs.push(ub); m.uvs.push(uc); m.uvs.push(ud);
+  m.indices.push(base); m.indices.push(base + 1u32); m.indices.push(base + 2u32);
+  m.indices.push(base); m.indices.push(base + 2u32); m.indices.push(base + 3u32);
+}
+
+// A face's uv: 'along' metres from its left corner, 'start' metres round
+// the course from the front's left corner, 'y' metres up
+fn sheetUv(start f32, along f32, y f32) Vec2 { p2((start + along) / SHEET, y / SHEET); }
+
+// The courses from y0 to y1, a plan 'plan' across, centred on the axis: its
+// four sides, mapped to the sheet; its bottom and top, if asked, mapped to a
+// brick's face
+fn courseBox(m &mut mesh.Mesh, plan Vec2, y0 f32, y1 f32, bottom Bool, top Bool) {
+  imm a = plan.x * 0.5;
+  imm b = plan.y * 0.5;
+  imm w = plan.x;
+  imm d = plan.y;
+  // Front (+z), right (+x), back (-z), left (-x), each from its left corner
+  quad(m, v(0. - a, y0, b), v(a, y0, b), v(a, y1, b), v(0. - a, y1, b),
+    sheetUv(0., 0., y0), sheetUv(0., w, y0), sheetUv(0., w, y1), sheetUv(0., 0., y1));
+  quad(m, v(a, y0, b), v(a, y0, 0. - b), v(a, y1, 0. - b), v(a, y1, b),
+    sheetUv(w, 0., y0), sheetUv(w, d, y0), sheetUv(w, d, y1), sheetUv(w, 0., y1));
+  quad(m, v(a, y0, 0. - b), v(0. - a, y0, 0. - b), v(0. - a, y1, 0. - b), v(a, y1, 0. - b),
+    sheetUv(w + d, 0., y0), sheetUv(w + d, w, y0), sheetUv(w + d, w, y1), sheetUv(w + d, 0., y1));
+  quad(m, v(0. - a, y0, 0. - b), v(0. - a, y0, b), v(0. - a, y1, b), v(0. - a, y1, 0. - b),
+    sheetUv(w + w + d, 0., y0), sheetUv(w + w + d, d, y0), sheetUv(w + w + d, d, y1), sheetUv(w + w + d, 0., y1));
+  // A brick's face, the front's first on the bottom course, for the flat faces
+  imm face = sheetUv(0., HALF_BRICK, 0.0425);
+  if bottom {
+    quad(m, v(0. - a, y0, 0. - b), v(a, y0, 0. - b), v(a, y0, b), v(0. - a, y0, b), face, face, face, face);
+  }
+  if top {
+    quad(m, v(0. - a, y1, b), v(a, y1, b), v(a, y1, 0. - b), v(0. - a, y1, 0. - b), face, face, face, face);
+  }
+}
+
+// The stack: the body, then each oversailing course
+fn stackMesh() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  imm body = f32.from(BODY_COURSES) * COURSE;
+  courseBox(&mut m, coursePlan(0), 0., body, false, false);
+  mut k = BODY_COURSES;
+  while k < BODY_COURSES + OVERSAIL_COURSES {
+    imm last = k + 1 == BODY_COURSES + OVERSAIL_COURSES;
+    courseBox(&mut m, coursePlan(k), f32.from(k) * COURSE, f32.from(k + 1) * COURSE, true, last);
+    k = k + 1;
+  }
+  m;
+}
+
+// The flaunching: mortar sloping up from just inside the top course's edge
+// to a square round the pot, and its top
+fn flaunchingMesh() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  imm plan = coursePlan(BODY_COURSES + OVERSAIL_COURSES - 1);
+  imm y0 = stackHeight();
+  imm y1 = y0 + FLAUNCH_TOP;
+  imm a = plan.x * 0.5 - 0.02;
+  imm b = plan.y * 0.5 - 0.02;
+  imm c = 0.17;
+  imm z = p2(0., 0.);
+  quad(&mut m, v(0. - a, y0, b), v(a, y0, b), v(c, y1, c), v(0. - c, y1, c), z, z, z, z);
+  quad(&mut m, v(a, y0, b), v(a, y0, 0. - b), v(c, y1, 0. - c), v(c, y1, c), z, z, z, z);
+  quad(&mut m, v(a, y0, 0. - b), v(0. - a, y0, 0. - b), v(0. - c, y1, 0. - c), v(c, y1, 0. - c), z, z, z, z);
+  quad(&mut m, v(0. - a, y0, 0. - b), v(0. - a, y0, b), v(0. - c, y1, c), v(0. - c, y1, 0. - c), z, z, z, z);
+  quad(&mut m, v(0. - c, y1, c), v(c, y1, c), v(c, y1, 0. - c), v(0. - c, y1, 0. - c), z, z, z, z);
+  m;
+}
+
+// The chimney pot: a terracotta pot 0.45 m tall, tapering, a rolled rim,
+// open at the top down to the flue, bedded in the flaunching
+fn potMesh() mesh.Mesh {
+  imm pts Array[Vec2, 10] = [p2(0., 0.), p2(0.13, 0.), p2(0.125, 0.06), p2(0.105, 0.37), p2(0.118, 0.385),
+    p2(0.122, 0.42), p2(0.112, 0.435), p2(0.092, 0.43), p2(0.092, 0.12), p2(0., 0.12)];
+  imm profile = Profile.fromPoints(&pts, false);
+  imm pot = lathe(&profile, up(), 2. * pi, 48u32);
+  mut m = pot.triangulate(true);
+  m.transform(Mat4.fromTranslation(v(0., stackHeight() + FLAUNCH_TOP - POT_SINK, 0.)));
+  m;
+}
+
+// The chimney's parts into 'h', at 'at': the brick stack, its flaunching, its pot
+fn hydrateChimney(h &mut Hydrated, at Transform3) {
+  mut colour = Image.empty();
+  mut normal = Image.empty();
+  mut orm = Image.empty();
+  brickMaps(&mut colour, &mut normal, &mut orm);
+  h.addMapped("chimney", stackMesh(), Look.physicallyBased(new Color(1., 1., 1., 1.), 1., 0.), colour,
+    new Maps(normal, orm), at);
+  h.add("chimney flaunching", flaunchingMesh(), Look.plain(srgb(150., 147., 138.)), Image.empty(), at);
+  h.add("chimney pot", potMesh(), Look.shiny(srgb(178., 92., 58.), 0.12, 10.), Image.empty(), at);
+}

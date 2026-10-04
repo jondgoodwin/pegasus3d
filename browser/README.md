@@ -3,7 +3,8 @@
 A native 3-D browser written in [Cone](https://github.com/jondgoodwin/cone), in the spirit of the
 Acorn-era Pegasus3D in `src/`. It is the shell and the walkable plane (an endless brown ground under a
 sky-blue sky, in metres, walked on at eye height, 1.7 m) and a baked-in world standing on it: two chess
-rooks, an urn, a flower, a boulder, a horn, a chimney stack, a hot-air balloon with its burner alight and,
+rooks, a horn-flower, a horn, a brick chimney stack with a black-figure amphora on one side of it and a
+boulder on the other, a hot-air balloon with its burner alight and,
 hovering beyond them, Elizabeth's skeletal dragon starship, built from Cone's sculpt, vfx, sdf and sdfmesh
 packages and sent in as if downloaded. Things move: a ball bounces and spins, the burner fires in bursts,
 and a launch button by the path sends the balloon up (and, pressed again, brings it down). A click
@@ -60,18 +61,22 @@ browser.exe --watch 300               300 s in real time, a line a second and a 
 
 `--script` pushes key events into SDL's own queue (never the operating system's), so nothing reaches
 any other window, and a run of a fixed number of frames ignores the real keyboard and mouse (and the
-window losing focus, which would otherwise let go of the script's keys). It walks up to the rooks, the
-urn and the flower, clicks on the rook and then on the sky, turns, runs to the balloon, clicks its
-launch button, then draws four close-ups from eyes of its own. Its clicks are pushed mouse events at
+window losing focus, which would otherwise let go of the script's keys). It walks up to the rooks and
+the horn-flower, clicks on the rook and then on the sky, turns, runs to the balloon, clicks its
+launch button, then draws six close-ups from eyes of its own (the amphora's through a 20 degree lens,
+straight on, as its photograph shows it). Its clicks are pushed mouse events at
 the place the script works out the target is drawn. It checks the walk against what its events must
 give (exact on the synthetic clock); what each click picked and highlighted; that the world heard the
 button and the balloon (every one of its parts) rose as its formula says; the ball's height against
 its formula; every burst of the burner sent was applied; that the scene applied, refused and removed
 what it was sent; and that every part the world sent is live, placed and (with a GPU) drawn or giving
-off particles, with every request sent accounted for as applied or refused. It exits 0 only if every
-check passed, no Vulkan call failed and the validation layer said nothing. `shots/` holds the views of
-one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups `rooks`, `chimney`,
-`starship`, `rising`), converted to PNG.
+off particles, with every request sent accounted for as applied or refused; and that the amphora and
+the chimney stack are the sizes they were built to (the amphora 1.484 m to its tip, 0.3368 m at its
+widest; the stack 47 courses, 3.525 m, and 5 x 4 bricks at its top course) and drawn physically based.
+It exits 0 only if every check passed, no Vulkan call failed and the validation layer said nothing.
+`shots/` holds the views of one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups
+`rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`), converted to PNG, and
+`amphora-vs-photo.png`, the amphora's close-up beside the photograph it was traced from.
 
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
 scene's inbox is empty after the apply point and that the parts, the rows drawn and the particle
@@ -93,7 +98,7 @@ along the way when the first frame was presented and when every object was first
 | --- | --- |
 | `src/browser.cone` | the browser, a world that frame's loop runs (`mod browser is World`): input, the walk in fixed steps, the world's next object and the apply point, drawing |
 | `src/parts/parts.cone` | the module `parts`: one id registry for parts, aspect tables keyed by id, the requests, the Door senders are given, and the Scene |
-| `src/rendersys.cone` | the render system: owns how parts look, their effects (particles) and the sky, and turns them into render's draw list |
+| `src/rendersys.cone` | the render system: owns how parts look, their effects (particles) and the sky, and turns them into render's draw list; a physical look is drawn with render's physically based material |
 | `src/shell.cone` | what the browser puts in every scene: the ground and the sky, sent as requests |
 | `src/walk.cone` | walking on the ground: the controller and its key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
@@ -114,7 +119,9 @@ Once a frame, at the publish phase, the browser applies the inbox in order, rout
 system that owns what it changes; a request naming a part that is gone is refused and counted. The
 ground and the sky go in this way too: the ground is an ordinary part whose render row is *anchored*,
 drawn under the viewer in steps of its checkerboard's period, so it never ends. A `Show` may carry a
-painted image (the balloon's envelope, the basket's wicker), which its colour multiplies; an `Effect`
+painted image (the balloon's envelope, the basket's wicker), which its colour multiplies, and, for a
+*physical* look, a normal map and an ORM map (the amphora's glaze glossy and its clay matt; the
+chimney's mortar recessed), drawn with render's physically based material; an `Effect`
 is a part's particle emitters (the vfx package's), fired from a start to a stop on the scene's clock
 and drawn as they are at the scene's time each frame; a `Fire` fires it again (a burst).
 
@@ -157,11 +164,11 @@ frames keep coming while the world arrives.
 | --- | --- | --- | --- | --- |
 | chess rook | `sculpt/examples/rook.cone` (a lathe and three booleans), 96 steps round | 1.4 m | 2,020 | 92 |
 | lathed rook, beside it | the same rook with no booleans: one lathe, four capped merlons joined on | 1.4 m | 2,320 | 0.75 |
-| urn | `sculpt/examples/vase.cone` | 1 m | 12,672 | 5.5 |
-| flower | `sculpt/examples/flower.cone` | 1.8 m across | 33,600 | 14 |
+| amphora | new (`amphora.cone`): an outline traced from a photograph, lathed 128 steps round; two handles swept along a traced centreline; its bands and patterns painted, 2048 x 2048, and an ORM map | 1.5 m | 63,832 | 100 (paint 83) |
+| horn-flower (stalk, leaves, petals, heart) | new (`hornflower.cone`): the horn, 2.4 m and cut short; `sculpt/examples/flower.cone`'s petals on the cut; five swept leaves | 2 m | 99,956 | 39 |
 | boulder | `sculpt/examples/pebble.cone` (one more subdivision) | 2 m | 768 | 0.4 |
 | horn | `sculpt/examples/hornfamily.cone`, stage 0 | 3 m along | 46,204 | 18 |
-| chimney stack | `sculpt/examples/chimney.cone`, its cage flat-shaded (not subdivided) | 3.5 m | 76 | 0.1 |
+| chimney stack (stack, flaunching, pot) | new (`chimney.cone`): brick masonry, 4 x 3 bricks, 47 courses; boxes, its bricks a 1620 x 1620 colour, normal and ORM map | 4 m to the pot's rim | 808 | 254 (maps) |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |

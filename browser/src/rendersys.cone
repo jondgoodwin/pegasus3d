@@ -5,7 +5,10 @@
 // placements, into the render package's draw list, and fires each effect's
 // emitters where its part is, as they are at the scene's time. The renderer
 // itself never sees a part or walks a hierarchy: it gets world matrices and
-// meshes.
+// meshes. A part's look is drawn with render's Blinn-Phong material, or, if
+// it is physical, its physically based one, with its paint, normal and ORM
+// maps; that one is lit by the sun and by an environment made to match the
+// Blinn-Phong ambient (environmentSky).
 
 // What one part is drawn as
 pub struct Renderable {
@@ -13,8 +16,34 @@ pub struct Renderable {
   pub material MaterialHandle;
   pub anchor f32;             // 0: where the part is placed; else under the viewer, in steps of this
   pub base Material;          // the material's parameters, to make its highlight from
+  pub physical Bool;          // drawn physically based: 'pbr' its parameters, not 'base'
+  pub pbr PbrMaterial;
   pub lit MaterialHandle;     // the highlighted material, made the first time it is asked for
   pub highlighted Bool;
+}
+
+// The physically based shader takes the sun's colour as irradiance and
+// divides its diffuse light by pi; Blinn-Phong does not. A physical part's
+// colour is multiplied by pi so the sun lights both kinds alike (the
+// environment it is lit by besides is made to match Blinn-Phong's ambient:
+// environmentSky).
+const PHYSICAL_GAIN f32 = 3.14159265;
+
+// The environment the physically based material is lit by: a sky of even,
+// dim radiance, so its diffuse light (times PHYSICAL_GAIN) is about the
+// Blinn-Phong ambient the shell's sky gives (0.35, 0.38, 0.45), a little
+// bluer overhead and browner below; no sun in it (the directional light is
+// the sun), no glow, line or clouds. Never drawn: the sky seen is the clear
+// colour.
+pub fn environmentSky() render.Sky {
+  mut s = render.Sky.dusk(0.9, 0.);
+  s.zenith = new Color(0.115, 0.125, 0.155, 1.);
+  s.horizon = new Color(0.12, 0.125, 0.14, 1.);
+  s.horizonSharpness = 2.;
+  s.glow = new Color(0., 0., 0., 1.);
+  s.ground = new Color(0.075, 0.05, 0.035, 1.);
+  s.groundFade = 4.;
+  s;
 }
 
 // What one part gives off: its emitters, 'count' of them from 'first' in the
@@ -35,6 +64,14 @@ fn highlightOf(m &Material) Material {
   out.baseColor = new Color(m.baseColor.red * 0.5 + 0.5, m.baseColor.green * 0.5 + 0.42, m.baseColor.blue * 0.5 + 0.05, 1.);
   out.specular = new Color(0.6, 0.6, 0.6, 1.);
   out.shininess = 24.;
+  out;
+}
+
+// A highlighted physical part's: its colour (which multiplies its paint)
+// turned towards a warm yellow
+fn highlightOfPhysical(m &PbrMaterial) PbrMaterial {
+  mut out = *m;
+  out.baseColor = new Color(m.baseColor.red * 1.6, m.baseColor.green * 1.4, m.baseColor.blue * 0.45, 1.);
   out;
 }
 
@@ -60,7 +97,11 @@ pub struct RenderSystem {
   // Apply a Show: upload the mesh, make its material, and give the part its
   // row (a part shown again has its old mesh removed)
   pub fn show(self &mut, renderer &mut Renderer, device &mut Device, id PartId, m &Mesh, surface &Look,
-      paint &Image, anchor f32) {
+      paint &Image, maps &Maps, anchor f32) {
+    if surface.physical {
+      self.showPhysical(renderer, device, id, m, surface, paint, maps, anchor);
+      return;
+    }
     imm handle = renderer.addMesh(device, m);
     mut material = Material.plain(surface.color);
     if surface.specular > 0. {
@@ -83,7 +124,39 @@ pub struct RenderSystem {
       imm old = (*rows.rows[row]).meshH;
       renderer.removeMesh(device, old);
     }
-    rows.put(id, new Renderable(handle, mh, anchor, material, MaterialHandle.none(), false));
+    rows.put(id, new Renderable(handle, mh, anchor, material, false, PbrMaterial.standard(surface.color, 0., 1.),
+      MaterialHandle.none(), false));
+  }
+
+  // A Show of a physical look: render's physically based material, its
+  // colour times PHYSICAL_GAIN, the paint its base colour map, the maps its
+  // normal map and its ORM map (as roughness and metallic, and as
+  // occlusion of the environment's light)
+  fn showPhysical(self &mut, renderer &mut Renderer, device &mut Device, id PartId, m &Mesh, surface &Look,
+      paint &Image, maps &Maps, anchor f32) {
+    imm handle = renderer.addMesh(device, m);
+    imm c = surface.color;
+    mut pbr = PbrMaterial.standard(new Color(c.red * PHYSICAL_GAIN, c.green * PHYSICAL_GAIN, c.blue * PHYSICAL_GAIN, 1.),
+      surface.metallic, surface.roughness);
+    if !paint.isEmpty() {
+      pbr.texture = renderer.addTexture(device, paint);
+      painted = painted + 1usize;
+    }
+    if !maps.normal.isEmpty() {
+      pbr.normalTexture = renderer.addLinearTexture(device, &maps.normal);
+    }
+    if !maps.orm.isEmpty() {
+      imm orm = renderer.addLinearTexture(device, &maps.orm);
+      pbr.metallicRoughnessTexture = orm;
+      pbr.occlusionTexture = orm;
+    }
+    imm mh = renderer.addPbrMaterial(device, &pbr);
+    imm row = rows.find(id);
+    if row != NO_ROW {
+      imm old = (*rows.rows[row]).meshH;
+      renderer.removeMesh(device, old);
+    }
+    rows.put(id, new Renderable(handle, mh, anchor, Material.plain(c), true, pbr, MaterialHandle.none(), false));
   }
 
   // Apply a Highlight: part 'id' drawn in its highlighted material, or its own
@@ -92,8 +165,13 @@ pub struct RenderSystem {
     if row == NO_ROW { return; }
     mut r = *rows.rows[row];
     if on and r.lit.isNone() {
-      imm lit = highlightOf(&r.base);
-      r.lit = renderer.addMaterial(device, &lit);
+      if r.physical {
+        imm lit = highlightOfPhysical(&r.pbr);
+        r.lit = renderer.addPbrMaterial(device, &lit);
+      } else {
+        imm lit = highlightOf(&r.base);
+        r.lit = renderer.addMaterial(device, &lit);
+      }
     }
     r.highlighted = on;
     rows.put(id, r);
