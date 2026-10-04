@@ -1,0 +1,122 @@
+// The scripted walk: with no one at the keyboard, key events are pushed into
+// SDL's own queue (sdl.PushEvent), never the system's, so nothing reaches any
+// other window. Each is pushed just after a frame is presented, to be drained
+// at the top of the next. On frame's synthetic clock (one 1/60 s step a
+// frame, none on the first), the walk they give is exact, and is checked.
+//
+//   frames 1-29     standing 8 m from the post, facing it      shot "start" at 20
+//   frames 30-149   W held: 120 steps at 1.5 m/s, 3 m forward   shot "walked" at 160
+//   frames 170-199  D held: 30 steps, a twelfth of a turn right shot "turned" at 210
+//   frames 220-279  Shift and W held: 60 steps at 6 m/s, 6 m on that heading
+
+// The device the script's events claim (no real keyboard has it)
+pub const SCRIPT_DEVICE = 0x5C1u;
+
+// The frames a scripted run needs
+pub const SCRIPT_FRAMES = 300u64;
+
+fn pushKey(scancode u32, down Bool) {
+  mut e = sdl.Event.empty();
+  e.type = if down {sdl.EVENT_KEY_DOWN;} else {sdl.EVENT_KEY_UP;};
+  imm k = &mut e as &mut sdl.KeyboardEvent;
+  k.which = SCRIPT_DEVICE;
+  k.scancode = scancode;
+  k.key = 0u;
+  k.down = down;
+  e.timestamp = 0u64;
+  sdl.PushEvent(&mut e);
+}
+
+// The script's events for frame 'f'
+pub fn pushScript(f u64) {
+  if f == 30u64 { pushKey(sdl.SCANCODE_W, true); }
+  if f == 150u64 { pushKey(sdl.SCANCODE_W, false); }
+  if f == 170u64 { pushKey(sdl.SCANCODE_D, true); }
+  if f == 200u64 { pushKey(sdl.SCANCODE_D, false); }
+  if f == 220u64 {
+    pushKey(sdl.SCANCODE_LSHIFT, true);
+    pushKey(sdl.SCANCODE_W, true);
+  }
+  if f == 280u64 {
+    pushKey(sdl.SCANCODE_W, false);
+    pushKey(sdl.SCANCODE_LSHIFT, false);
+  }
+}
+
+// A part made and taken away again through the scene's requests, and a
+// request sent afterwards to its stale id, which must be refused
+mut tempPart PartId;          // set by the module's init
+
+// The script's scene requests, sent after frame 'f' is presented
+pub fn driveScene(f u64) {
+  if f == 3u64 {
+    tempPart = scene.newPart("temporary cube");
+    scene.send(Request.Show[tempPart, Mesh.cube(0.5), Look.plain(new Color(1., 0., 0., 1.)), 0.]);
+  }
+  if f == 5u64 { scene.send(Request.Despawn[tempPart]); }
+  if f == 7u64 { scene.send(Request.Place[tempPart, Transform3.identity()]); }
+}
+
+// The view saved at frame 'f', or an empty name
+pub fn shotAt(f u64) &[]u8 {
+  if f == 20u64 { return "start"; }
+  if f == 160u64 { return "walked"; }
+  if f == 210u64 { return "turned"; }
+  "";
+}
+
+fn near(name &[]u8, got f32, want f32, within f32) Bool {
+  print <- "  "; printStr(name); print <- ": "; print <- got; print <- " (want "; print <- want; print <- ")";
+  imm ok = got - want <= within and want - got <= within;
+  if ok { print <- "\n"; } else { print <- " WRONG\n"; }
+  ok;
+}
+
+// What the script's events must have done by the end of frame 'f'
+pub fn checkScript(f u64, w &Walk) Bool {
+  mut ok = true;
+  if f == 2u64 {
+    // The shell's requests, applied at frame 1's apply point: three spawns,
+    // two placements, two shows and the sky
+    print <- "Frame 2: requests applied "; print <- scene.applied; print <- " (want 8), refused ";
+    print <- scene.refused; print <- " (want 0), waiting "; print <- scene.waiting(); print <- "\n";
+    if scene.applied != 8u64 or scene.refused != 0u64 or scene.waiting() != 0usize { ok = false; }
+  }
+  if f == 9u64 {
+    // The temporary cube spawned and shown (2), despawned (1); the Place to
+    // its stale id refused
+    print <- "Frame 9: requests applied "; print <- scene.applied; print <- " (want 11), refused ";
+    print <- scene.refused; print <- " (want 1), parts "; print <- scene.partCount(); print <- " (want 3)";
+    if scene.isReserved(tempPart) { print <- ", the stale id still RESERVED"; ok = false; }
+    print <- "\n";
+    if scene.applied != 11u64 or scene.refused != 1u64 or scene.partCount() != 3usize { ok = false; }
+  }
+  if f == 29u64 {
+    print <- "Frame 29, standing:\n";
+    ok = near("x", w.position.x, 0., 0.) and ok;
+    ok = near("z", w.position.z, 8., 0.) and ok;
+    ok = near("yaw", w.yaw, 0., 0.) and ok;
+  }
+  if f == 165u64 {
+    print <- "Frame 165, after 120 steps of W at 1.5 m/s:\n";
+    ok = near("x", w.position.x, 0., 0.0001) and ok;
+    ok = near("z", w.position.z, 5., 0.001) and ok;
+    ok = near("eye height", w.pose().origin.y, 1.7, 0.0001) and ok;
+  }
+  if f == 205u64 {
+    print <- "Frame 205, after 30 steps of D:\n";
+    ok = near("yaw", w.yaw, -0.5235988, 0.00001) and ok;
+    ok = near("z", w.position.z, 5., 0.001) and ok;
+  }
+  if f == 290u64 {
+    // 6 m along the heading -30 degrees from -z: (6 sin 30, -6 cos 30)
+    print <- "Frame 290, after 60 steps of Shift and W:\n";
+    ok = near("x", w.position.x, 3., 0.002) and ok;
+    ok = near("z", w.position.z, 5. - 5.196152, 0.002) and ok;
+  }
+  ok;
+}
+
+pub fn reportScript(ok Bool) {
+  if ok { print <- "Script: OK\n"; } else { print <- "Script: FAILED\n"; }
+}

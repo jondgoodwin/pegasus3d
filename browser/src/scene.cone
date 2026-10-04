@@ -1,0 +1,244 @@
+// The scene: the parts of the world and how they change.
+//
+// A PART is an id, not a container. One registry gives every part its id (a
+// slot and a generation, the pool package's Ref, so an id whose part has gone
+// is detected, never mistaken for whatever takes its slot next). What a part
+// IS lives elsewhere, in tables keyed by its id, each owned by the system the
+// aspect belongs to: the scene owns placement; the render system owns how a
+// part looks and the sky (rendersys.cone). Later systems (physics, picking,
+// behaviour) add tables of their own the same way, and a part may be in any
+// of them or none.
+//
+// CHANGES ARRIVE AS REQUESTS. Nothing outside a table's owner writes into it.
+// Whoever wants the scene changed (today the browser's own shell, next the
+// baked-in world) sends a Request into the scene's inbox, and the browser
+// applies the inbox once a frame, at one point (the publish phase), routing
+// each request to the system that owns what it changes. That is the shape a
+// message to an actor has, so moving the systems onto actors later changes
+// who drains the inbox, not what is sent.
+//
+// The one thing a sender does directly is RESERVE an id, so it can name the
+// part in the requests that follow (Bevy's Commands reserve an entity the
+// same way): the part is reserved, not yet live, until its Spawn is applied.
+
+// What the registry holds for a part: its name, for people, and whether its
+// Spawn has been applied
+pub struct PartRecord {
+  pub name String;
+  pub live Bool;
+}
+
+// A part's id: a slot of the registry and which occupant of it
+pub struct PartId {
+  pub key Ref[PartRecord];
+
+  pub fn none() PartId { new PartId(Ref[PartRecord].none()); }
+  pub fn isNone(self) Bool { key.isNone(); }
+  pub fn slot(self) u32 { key.slot(); }
+  pub fn `==`(self, other PartId) Bool { key == other.key; }
+}
+
+// No row: what 'Table.find' answers for a part not in the table
+pub const NO_ROW = 0xFFFFFFFFusize;
+
+// An aspect table: one row of T per part that has the aspect, packed (the
+// rows are a plain list to iterate), and a sparse index from a part's slot to
+// its row (a sparse set, as EnTT and Flecs keep components). A row is found
+// only by the id it was put with, generation and all.
+pub struct Table[T] {
+  pub rows List[T];
+  pub ids List[PartId];       // the part each row belongs to
+  index List[u32];            // a slot's row plus one; 0 where it has none
+
+  pub fn empty() Table[T] { new Table[T](List[T].empty(), List[PartId].empty(), List[u32].empty()); }
+
+  pub fn len(self &) usize { rows.len(); }
+
+  // The row of part 'id', or NO_ROW
+  pub fn find(self &, id PartId) usize {
+    imm s = usize.from(id.slot());
+    if s >= index.len() { return NO_ROW; }
+    imm r = *index[s];
+    if r == 0u32 { return NO_ROW; }
+    imm row = usize.from(r - 1u32);
+    if !(*ids[row] == id) { return NO_ROW; }
+    row;
+  }
+
+  // Give part 'id' the row 'value', replacing the one it had
+  pub fn put(self &mut, id PartId, value T) {
+    imm row = self.find(id);
+    if row != NO_ROW {
+      rows.set(row, value);
+      return;
+    }
+    imm s = usize.from(id.slot());
+    while index.len() <= s { index.push(0u32); }
+    index.set(s, u32.from(rows.len()) + 1u32);
+    rows.push(value);
+    ids.push(id);
+  }
+
+  // Take part 'id''s row away (the last row moves into its place),
+  // answering whether it had one
+  pub fn remove(self &mut, id PartId) Bool {
+    imm row = self.find(id);
+    if row == NO_ROW { return false; }
+    imm last = rows.len() - 1usize;
+    if row != last {
+      rows.swap(row, last);
+      ids.swap(row, last);
+      index.set(usize.from((*ids[row]).slot()), u32.from(row) + 1u32);
+    }
+    rows.pop();
+    ids.pop();
+    index.set(usize.from(id.slot()), 0u32);
+    true;
+  }
+}
+
+// How a part's surface looks: a colour (linear), a highlight, and
+// optionally a checkerboard of two shades of it
+pub struct Look {
+  pub color Color;
+  pub specular f32;           // the highlight's strength; 0: none
+  pub shininess f32;
+  pub checker Bool;           // a checkerboard over the mesh's uvs, its light squares the colour
+  pub checkerShade f32;       // and its dark ones the colour times this
+
+  pub fn plain(color Color) Look { new Look(color, 0., 1., false, 1.); }
+  pub fn shiny(color Color, specular f32, shininess f32) Look { new Look(color, specular, shininess, false, 1.); }
+  pub fn checkered(color Color, shade f32) Look { new Look(color, 0., 1., true, shade); }
+}
+
+// The sky and the sun: what fills everything no part covers, and the light
+pub struct SkyLook {
+  pub color Color;            // linear
+  pub sunDirection Vec3;      // towards the sun
+  pub sunColor Color;
+  pub ambient Color;
+}
+
+// A change to the scene, as sent. The system that owns what it changes
+// applies it, in the order sent.
+pub enum Request {
+  // Part 'id' (reserved by Scene.reserve) becomes live, named 'name'
+  pub struct Spawn {
+    pub id PartId;
+    pub name String;
+  }
+  // Part 'id' goes, with every aspect it has; its id goes stale
+  pub struct Despawn {
+    pub id PartId;
+  }
+  // Part 'id' is placed at 'at', in the world's coordinates (metres, y up)
+  pub struct Place {
+    pub id PartId;
+    pub at Transform3;
+  }
+  // Part 'id' is drawn as 'mesh' (moved in: the request owns it until the
+  // render system uploads it) with 'surface'. A non-zero 'anchor' draws it
+  // under the viewer wherever the viewer is, moved only in steps of 'anchor'
+  // metres across the ground, so a ground of that period never ends
+  pub struct Show {
+    pub id PartId;
+    pub mesh Mesh;
+    pub surface Look;
+    pub anchor f32;
+  }
+  // Part 'id' is the sky
+  pub struct Sky {
+    pub id PartId;
+    pub look SkyLook;
+  }
+  // Nothing: what an applied request's place holds once it is taken
+  pub struct Done;
+}
+
+// The registry, the placement table, and the inbox
+pub struct Scene {
+  pub registry Pool[PartRecord];
+  pub placements Table[Transform3];
+  inbox List[Request];
+  pub applied u64;            // requests applied
+  pub refused u64;            // requests naming a part that is not live (gone, or never spawned)
+
+  pub fn empty() Scene {
+    new Scene(Pool[PartRecord].empty(), Table[Transform3].empty(), List[Request].empty(), 0u64, 0u64);
+  }
+
+  // A new id, reserved now so the requests that follow can name it; the
+  // part is live once its Spawn is applied
+  pub fn reserve(self &mut) PartId {
+    new PartId(registry.add(new PartRecord(String.empty(), false)));
+  }
+
+  // Send a request, to be applied at the frame's apply point
+  pub fn send(self &mut, r Request) { inbox.push(r); }
+
+  // Reserve a part and send its Spawn: the usual way to make one
+  pub fn newPart(self &mut, name &[]u8) PartId {
+    imm id = self.reserve();
+    self.send(Request.Spawn[id, String.from(name)]);
+    id;
+  }
+
+  // The requests waiting, taken out to be applied; the inbox is left empty
+  pub fn takeInbox(self &mut) List[Request] {
+    mut batch = List[Request].empty();
+    batch <=> inbox;
+    batch;
+  }
+
+  // How many requests are waiting
+  pub fn waiting(self &) usize { inbox.len(); }
+
+  // Whether part 'id' is live
+  pub fn isLive(self &, id PartId) Bool {
+    if !registry.alive(id.key) { return false; }
+    registry[id.key].live;
+  }
+
+  // Whether part 'id' has been reserved and not yet despawned
+  pub fn isReserved(self &, id PartId) Bool { registry.alive(id.key); }
+
+  // How many parts are reserved or live
+  pub fn partCount(self &) usize { registry.len(); }
+
+  // ---- What the scene applies itself ----
+
+  pub fn applySpawn(self &mut, id PartId, name String) Bool {
+    if !registry.alive(id.key) { refused = refused + 1u64; return false; }
+    imm rec = &mut registry[id.key];
+    rec.name = name;
+    rec.live = true;
+    applied = applied + 1u64;
+    true;
+  }
+
+  pub fn applyPlace(self &mut, id PartId, at Transform3) Bool {
+    if !self.isLive(id) { refused = refused + 1u64; return false; }
+    placements.put(id, at);
+    applied = applied + 1u64;
+    true;
+  }
+
+  // The scene's own part of a despawn: the placement and the id. The other
+  // systems drop their rows for it first.
+  pub fn applyDespawn(self &mut, id PartId) Bool {
+    if !registry.alive(id.key) { refused = refused + 1u64; return false; }
+    placements.remove(id);
+    registry.remove(id.key);
+    applied = applied + 1u64;
+    true;
+  }
+
+  // Where part 'id' is, as a matrix: its placement, or where it was made
+  // (the origin) if it has none
+  pub fn worldMatrix(self &, id PartId) Mat4 {
+    imm row = placements.find(id);
+    if row == NO_ROW { return Mat4.identity(); }
+    imm t = *placements.rows[row];
+    Mat4.fromTrs(t.translation, t.rotation, t.scale);
+  }
+}

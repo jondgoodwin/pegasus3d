@@ -1,0 +1,410 @@
+// The browser: a native 3-D browser in Cone, in the spirit of Pegasus3D.
+// Today it is the shell and the walkable plane: an endless brown ground under
+// a sky-blue sky, in metres, walked on at eye height. Worlds (baked in for
+// now, standing in for fetched ones) come next, through the same scene
+// requests the shell uses for its own ground and sky.
+//
+// It is a world the frame package runs (frame's World module trait), so the
+// loop is frame's: each frame drains input, takes the simulation's fixed
+// steps, publishes, draws and presents, every phase timed.
+//
+//   input      each event into the input package
+//   simulate   the walk, one fixed step at a time (walk.cone)
+//   publish    THE APPLY POINT: the scene's inbox applied, each request by the
+//              system that owns what it changes (scene.cone, rendersys.cone);
+//              then the last two walk states kept for the picture
+//   draw       the camera between those states, the render system's draw list
+//   present    show it
+//
+// Arguments, besides frame's (--frames N, --headless, --quiet):
+//   --script        walk and turn with no one at the keyboard: events pushed
+//                   into SDL's own queue (sdl.PushEvent), never the system's,
+//                   and checked against what they must do (script.cone)
+//   --shots DIR     write the scripted run's views into DIR as BMPs
+//
+// A run of a fixed number of frames (--frames, --script) takes input only
+// from its own pushed events, so it is the same every time.
+
+mod browser is World;
+
+import stdio use *;
+import libc;
+import sdl;
+import collections use *;
+import pool use *;
+import geomath use *;
+import mesh use Mesh;
+import gpu use *;
+import render use *;
+import arena use Arena;
+import frame use World, Config, Host, Step;
+import input use *;
+import controls use Pose;
+
+// ---- The world's state ----
+
+mut scene Scene;
+mut inputState Input;
+mut ctx Context;
+mut walkActions WalkActions;
+mut walk Walk;                // after the last step
+mut walkBefore Walk;          // after the one before
+mut shownFrom Walk;           // published for the picture
+mut shownTo Walk;
+mut ctxFrame u64 = 0u64;      // the frame whose actions are in 'ctx'
+mut inputFrame u64 = 0u64;    // the frame whose events are in 'input'
+mut automated Bool = false;   // a run of a fixed number of frames: real input ignored
+mut scripted Bool = false;
+mut scriptOk Bool = true;
+mut shotsDir String;
+mut unrendered u64 = 0u64;    // render requests a headless run had no GPU for
+
+// Where the viewer starts: 8 m back from the post, facing it (down -z)
+const START_Z f32 = 8.;
+
+// The GPU side, made by start; the device outlives what it made
+struct Gfx {
+  pub readback Buffer;
+  pub shotName String;        // the file the frame read back goes to; empty: none
+  pub target SurfaceTexture;
+  pub sys RenderSystem;
+  pub renderer Renderer;
+  pub swapchain SwapChain;
+  pub device Device;
+  pub adapter Adapter;
+  pub surface Surface;
+  pub instance Instance;
+  pub camera Camera;
+}
+
+mut gfx Option[Gfx];
+
+fn @initpure init() {
+  gfx = None[Gfx][];
+  scene = Scene.empty();
+  inputState = Input.empty();
+  ctx = Context.empty();
+  walkActions = WalkActions.bind(&mut ctx);
+  walk = Walk.make(new Vec3(0., 0., START_Z), 0.);
+  walkBefore = walk;
+  shownFrom = walk;
+  shownTo = walk;
+  shotsDir = String.empty();
+  tempPart = PartId.none();
+}
+
+fn takeGfx() Option[Gfx] {
+  mut g Option[Gfx] = None[Gfx][];
+  g <=> gfx;
+  g;
+}
+
+// ---- start ----
+
+pub fn start(host &mut Host) Bool {
+  automated = host.config.frames > 0u64;
+  seedScene(&mut scene);
+  print <- "Scene: "; print <- scene.partCount(); print <- " parts reserved, ";
+  print <- scene.waiting(); print <- " requests waiting\n";
+  if scripted { pushScript(1u64); }
+  if !host.hasWindow() { return true; }
+
+  mut instance = Instance.create("browser");
+  mut surface = instance.createSurface(host.window().sdlHandle());
+  mut preference = POWER_PREFERENCE_HIGH_PERFORMANCE;
+  imm env = libc.getenv(&"GPU_POWER_PREFERENCE" as *u8);
+  if (env as usize) != 0usize {
+    if libc.strcmp(env, &"low-power" as *u8) == 0i32 { preference = POWER_PREFERENCE_LOW_POWER; }
+  }
+  mut adapter = instance.requestAdapter(&surface, preference);
+  if !adapter.isValid() {
+    print <- "No GPU can draw to the window\n";
+    return false;
+  }
+  print <- "Adapter: "; printStr(adapter.name.view());
+  if instance.validation { print <- "; validation layer on\n"; } else { print <- "; validation layer off\n"; }
+  mut device = adapter.requestDevice();
+  imm size = host.window().size();
+  mut swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
+  mut renderer = Renderer.create(&mut device, swapchain.format, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  if !renderer.isValid() {
+    print <- "The renderer could not be made\n";
+    return false;
+  }
+  mut camera = Camera.make();
+  camera.fov = radians(60.);
+  camera.near = 0.1;
+  camera.far = 1500.;
+  imm target = swapchain.getCurrentTexture(&mut device);
+  gfx = Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, RenderSystem.empty(), renderer, swapchain, device,
+    adapter, surface, instance, camera)];
+  true;
+}
+
+// ---- input ----
+
+// Whether an event may reach the walk: any, when someone is at the
+// keyboard; only the script's own in a run of a fixed number of frames
+fn accepted(e &sdl.Event) Bool {
+  if !automated { return true; }
+  if e.type == sdl.EVENT_KEY_DOWN or e.type == sdl.EVENT_KEY_UP {
+    return (e as &sdl.KeyboardEvent).which == SCRIPT_DEVICE;
+  }
+  if e.type == sdl.EVENT_MOUSE_MOTION { return (e as &sdl.MouseMotionEvent).which == SCRIPT_DEVICE; }
+  if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN or e.type == sdl.EVENT_MOUSE_BUTTON_UP {
+    return (e as &sdl.MouseButtonEvent).which == SCRIPT_DEVICE;
+  }
+  if e.type == sdl.EVENT_MOUSE_WHEEL { return (e as &sdl.MouseWheelEvent).which == SCRIPT_DEVICE; }
+  true;
+}
+
+// The input package's frame begun once a frame, before its first event
+fn beginInput(frameNo u64) {
+  if inputFrame != frameNo {
+    inputState.beginFrame();
+    inputFrame = frameNo;
+  }
+}
+
+// The actions brought up to date once a frame, after every event
+fn updateActions(frameNo u64) {
+  if ctxFrame != frameNo {
+    beginInput(frameNo);
+    ctx.update(&inputState);
+    ctxFrame = frameNo;
+  }
+}
+
+pub fn event(host &mut Host, e &imm sdl.Event) {
+  if host.hasWindow() and host.window().resized {
+    host.window().resized = false;
+    imm s = host.window().size();
+    mut g = takeGfx();
+    match &mut g {
+      case mut some &mut Some { some.value.swapchain.resize(u32.from(s.w), u32.from(s.h)); }
+      else {}
+    }
+    gfx = g;
+  }
+  beginInput(host.frame);
+  if accepted(e) { inputState.handle(e); }
+}
+
+// ---- simulate ----
+
+pub fn simulate(host &mut Host, step &imm Step, scratch &mut Arena) {
+  updateActions(host.frame);
+  walkBefore = walk;
+  walkStep(&mut walk, &walkActions, &ctx, step.dt);
+}
+
+// ---- publish: the apply point ----
+
+pub fn publish(host &mut Host) {
+  updateActions(host.frame);
+  applyRequests();
+  shownFrom = walkBefore;
+  shownTo = walk;
+}
+
+// Apply every request waiting, in the order sent, each by the system that
+// owns what it changes
+fn applyRequests() {
+  if scene.waiting() == 0usize { return; }
+  mut batch = scene.takeInbox();
+  mut g = takeGfx();
+  imm requests = batch.viewMut();
+  mut i = 0usize;
+  while i < requests.len {
+    mut r Request = Request.Done[];
+    r <=> requests[i];
+    match &mut r {
+      case mut s &mut Spawn {
+        mut name = String.empty();
+        name <=> s.name;
+        scene.applySpawn(s.id, name);
+      }
+      case mut p &mut Place { scene.applyPlace(p.id, p.at); }
+      case mut d &mut Despawn {
+        match &mut g {
+          case mut some &mut Some {
+            some.value.sys.drop(&mut some.value.renderer, &mut some.value.device, d.id);
+          }
+          else {}
+        }
+        scene.applyDespawn(d.id);
+      }
+      case mut sh &mut Show {
+        if !scene.isLive(sh.id) {
+          scene.refused = scene.refused + 1u64;
+        } else {
+          match &mut g {
+            case mut some &mut Some {
+              some.value.sys.show(&mut some.value.renderer, &mut some.value.device, sh.id, &sh.mesh, &sh.surface,
+                sh.anchor);
+            }
+            else { unrendered = unrendered + 1u64; }
+          }
+          scene.applied = scene.applied + 1u64;
+        }
+      }
+      case mut k &mut Sky {
+        if !scene.isLive(k.id) {
+          scene.refused = scene.refused + 1u64;
+        } else {
+          match &mut g {
+            case mut some &mut Some { some.value.sys.sky(k.id, k.look); }
+            else { unrendered = unrendered + 1u64; }
+          }
+          scene.applied = scene.applied + 1u64;
+        }
+      }
+      else {}
+    }
+    i = i + 1usize;
+  }
+  gfx = g;
+}
+
+// ---- draw ----
+
+pub fn draw(host &mut Host, alpha f32, scratch &mut Arena) {
+  updateActions(host.frame);
+  imm pose = between(&shownFrom, &shownTo, alpha);
+  mut g = takeGfx();
+  match &mut g {
+    case mut some &mut Some { drawFrame(&mut some.value, pose, host.frame); }
+    else {}
+  }
+  gfx = g;
+}
+
+fn drawFrame(g &mut Gfx, pose Pose, frameNo u64) {
+  if !g.target.ok() { return; }
+  imm sky = g.sys.currentSky();
+  g.camera.origin = pose.origin;
+  g.camera.orientation = pose.orientation;
+  g.camera.background = sky.color;
+  imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
+  g.sys.build(&scene, pose.origin);
+  mut encoder = g.device.createCommandEncoder();
+  g.renderer.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera, &light, &g.sys.list);
+
+  // A scripted view to save: copied now, written once presented
+  imm shot = shotAt(frameNo);
+  if shotsDir.len() > 0usize and shot.len > 0usize {
+    imm w = g.target.texture.width;
+    imm h = g.target.texture.height;
+    g.readback = g.device.createBuffer(u64.from(w) * u64.from(h) * 4u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+    encoder.copyTextureToBuffer(&g.target.texture, &g.readback);
+    mut name = shotsDir.copy();
+    name <- "/";
+    name <- shot;
+    name <- ".bmp";
+    g.shotName = name;
+  }
+  g.device.queue.submit(encoder.finish());
+}
+
+// ---- present ----
+
+pub fn present(host &mut Host) {
+  mut g = takeGfx();
+  match &mut g {
+    case mut some &mut Some { showAndAcquire(&mut some.value); }
+    else {}
+  }
+  gfx = g;
+  if scripted {
+    if !checkScript(host.frame, &walk) { scriptOk = false; }
+    driveScene(host.frame);
+    pushScript(host.frame + 1u64);
+  }
+}
+
+fn showAndAcquire(g &mut Gfx) {
+  if g.target.ok() {
+    g.swapchain.present(&mut g.device);
+    if g.shotName.len() > 0usize {
+      g.device.waitIdle();
+      imm w = g.target.texture.width;
+      imm h = g.target.texture.height;
+      imm bgra = g.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM_SRGB
+        or g.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM;
+      imm img = Image.fromTexels(g.readback.mappedRange(), i32.from(w), i32.from(h), bgra);
+      imm written = img.save(g.shotName.view());
+      print <- "Screenshot: "; printStr(g.shotName.view());
+      if written { print <- "\n"; } else { print <- " could NOT be written\n"; scriptOk = false; }
+      g.shotName = String.empty();
+      g.readback = Buffer.none();
+    }
+  } else {
+    sdl.Delay(10u32);
+  }
+  g.target = g.swapchain.getCurrentTexture(&mut g.device);
+}
+
+// ---- quit ----
+
+pub fn quit(host &mut Host) i32 {
+  print <- "Scene: "; print <- scene.partCount(); print <- " parts; requests applied "; print <- scene.applied;
+  print <- ", refused "; print <- scene.refused; print <- "\n";
+  print <- "Walked to ("; print <- walk.position.x; print <- ", "; print <- walk.position.z;
+  print <- "), facing "; print <- walk.yaw; print <- " rad\n";
+  mut code = 0i32;
+  if scripted and !scriptOk { code = 1i32; }
+  if !host.hasWindow() {
+    if unrendered > 0u64 { print <- "Headless: "; print <- unrendered; print <- " render requests had no GPU\n"; }
+    if scripted { reportScript(scriptOk); }
+    return code;
+  }
+  mut g = takeGfx();
+  match &mut g {
+    case mut some &mut Some {
+      some.value.device.waitIdle();
+      print <- "Parts drawn: "; print <- some.value.sys.drawn; print <- "; draws ";
+      print <- u64.from(some.value.renderer.drawCalls); print <- ", triangles "; print <- some.value.renderer.triangles;
+      print <- "\n";
+    }
+    else {}
+  }
+  g = None[Gfx][];
+  print <- "Vulkan failures: "; print <- u64.from(failures());
+  print <- "; validation messages: "; print <- u64.from(validationMessages()); print <- "\n";
+  if failures() != 0u32 or validationMessages() != 0u32 { code = 1i32; }
+  if scripted { reportScript(scriptOk); }
+  code;
+}
+
+// ---- main ----
+
+fn main(argc i32, argv **u8) i32 {
+  initAll();
+  mut config = Config.fromArgs(argc, argv);
+  config.setTitle("Pegasus3D in Cone: the walkable plane");
+  mut a = 1i32;
+  while a < argc {
+    imm arg = *(argv + usize.from(a));
+    if libc.strcmp(arg, &"--script" as *u8) == 0i32 {
+      scripted = true;
+    } elif libc.strcmp(arg, &"--shots" as *u8) == 0i32 and a + 1i32 < argc {
+      shotsDir = String.fromCStr(*(argv + usize.from(a + 1i32)));
+      a = a + 1i32;
+    }
+    a = a + 1i32;
+  }
+  if scripted {
+    if config.frames == 0u64 {
+      config.frames = SCRIPT_FRAMES;
+      config.synthetic = true;
+    }
+    if config.frames < SCRIPT_FRAMES {
+      print <- "--script wants at least "; print <- SCRIPT_FRAMES; print <- " frames\n";
+      finalAll();
+      return 2i32;
+    }
+  }
+  imm code = run(config);
+  finalAll();
+  code;
+}

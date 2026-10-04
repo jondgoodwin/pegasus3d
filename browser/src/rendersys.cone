@@ -1,0 +1,95 @@
+// The render system: the owner of how parts look. It keeps its own tables,
+// keyed by part id (what each part is drawn as, and the sky), and the GPU
+// resources behind them, made when a Show request is applied. Each frame it
+// turns its rows, with the scene's placements, into the render package's
+// draw list. The renderer itself never sees a part or walks a hierarchy: it
+// gets world matrices and meshes.
+
+// What one part is drawn as
+pub struct Renderable {
+  pub meshH MeshHandle;
+  pub material MaterialHandle;
+  pub anchor f32;             // 0: where the part is placed; else under the viewer, in steps of this
+}
+
+pub struct RenderSystem {
+  pub rows Table[Renderable];
+  pub skies Table[SkyLook];
+  pub list DrawList;
+  pub drawn usize;            // parts in the last draw list
+
+  pub fn empty() RenderSystem {
+    new RenderSystem(Table[Renderable].empty(), Table[SkyLook].empty(), DrawList.empty(), 0usize);
+  }
+
+  // Apply a Show: upload the mesh, make its material, and give the part its
+  // row (a part shown again has its old mesh removed)
+  pub fn show(self &mut, renderer &mut Renderer, device &mut Device, id PartId, m &Mesh, surface &Look,
+      anchor f32) {
+    imm handle = renderer.addMesh(device, m);
+    mut material = Material.plain(surface.color);
+    if surface.checker {
+      // Two squares by two: the light ones white, the dark ones the shade,
+      // both multiplying the colour (the image's bytes are sRGB)
+      imm s = surface.checkerShade;
+      imm checks = Image.checker(64, 64, 2, 2, new Color(1., 1., 1., 1.), new Color(s, s, s, 1.));
+      imm tex = renderer.addTexture(device, &checks);
+      material = Material.textured(surface.color, tex);
+    } elif surface.specular > 0. {
+      material = Material.shiny(surface.color, surface.specular, surface.shininess);
+    }
+    imm mh = renderer.addMaterial(device, &material);
+    imm row = rows.find(id);
+    if row != NO_ROW {
+      imm old = (*rows.rows[row]).meshH;
+      renderer.removeMesh(device, old);
+    }
+    rows.put(id, new Renderable(handle, mh, anchor));
+  }
+
+  // Apply a Sky: the part becomes the sky (the last one applied is the sky drawn)
+  pub fn sky(self &mut, id PartId, look SkyLook) {
+    skies.remove(id);
+    skies.put(id, look);
+  }
+
+  // A despawned part's rows go, and its mesh
+  pub fn drop(self &mut, renderer &mut Renderer, device &mut Device, id PartId) {
+    imm row = rows.find(id);
+    if row != NO_ROW {
+      imm old = (*rows.rows[row]).meshH;
+      renderer.removeMesh(device, old);
+      rows.remove(id);
+    }
+    skies.remove(id);
+  }
+
+  // The sky drawn: the last applied, or a plain grey if no part is the sky
+  pub fn currentSky(self &) SkyLook {
+    imm n = skies.len();
+    if n == 0usize {
+      return new SkyLook(new Color(0.2, 0.2, 0.2, 1.), new Vec3(0., 1., 0.), new Color(1., 1., 1., 1.),
+        new Color(0.2, 0.2, 0.2, 1.));
+    }
+    *skies.rows[n - 1usize];
+  }
+
+  // The frame's draw list, from every row and the scene's placements, for a
+  // viewer whose eye is at 'eye'
+  pub fn build(self &mut, scene &Scene, eye Vec3) {
+    list.clear();
+    mut i = 0usize;
+    while i < rows.len() {
+      imm r = *rows.rows[i];
+      mut model = scene.worldMatrix(*rows.ids[i]);
+      if r.anchor > 0. {
+        imm sx = libc.floorf(eye.x / r.anchor) * r.anchor;
+        imm sz = libc.floorf(eye.z / r.anchor) * r.anchor;
+        model = Mat4.fromTranslation(new Vec3(sx, 0., sz)) * model;
+      }
+      list.add(r.meshH, r.material, model);
+      i = i + 1usize;
+    }
+    drawn = rows.len();
+  }
+}
