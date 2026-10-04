@@ -35,12 +35,20 @@
 //                               booleans, one lathe and four merlons joined on)
 //   a starship, 156 m long     (the starship package's dragon ship, meshed on the
 //                               GPU by the dragonship module), hovering
+//   a launch button, 1 m       (a pedestal and a red cap, whose clicks the world
+//                               listens for: they launch and land the balloon)
+//   a ball, 1 m across         (bouncing and spinning)
+//
+// THE WORLD MOVES. Once a frame, 'tick' reads the world's mail (the button's
+// clicks, posted by the browser into the Door) and sends its motions, each
+// a formula of the scene's time (motions.cone), as Place and Fire requests.
 //
 // Its files are one module, and only this one, the designated file, imports:
 //
-//   bakedworld.cone   the objects' list and places, hydrate, inject, step
+//   bakedworld.cone   the objects' list and places, hydrate, inject, step, tick
+//   motions.cone      the ball's bounce, the balloon's flight and its burner's bursts
 //   balloon.cone      the balloon and its paint
-//   flame.cone        the burner's flame
+//   flame.cone        the burner's flame and its pilot light
 //   sculptures.cone   the rooks, the urn, the flower, the boulder, the horn, the chimney
 
 mod bakedworld;
@@ -84,17 +92,18 @@ pub struct PartDesc {
   }
 }
 
-// One effect of an object: its layers, where they start, the seed and the
-// moment they are held at
+// One effect of an object: its layers, where they start, the seed, and
+// when it first fires and stops (the scene's seconds)
 pub struct EffectDesc {
   pub name String;
   pub layers List[EffectLayer];
   pub at Transform3;
   pub seed u32;
-  pub time f64;
+  pub start f64;
+  pub stop f64;
 
   pub fn empty() EffectDesc {
-    new EffectDesc(String.empty(), List[EffectLayer].empty(), Transform3.identity(), 0u32, 0d);
+    new EffectDesc(String.empty(), List[EffectLayer].empty(), Transform3.identity(), 0u32, 0d, 0d);
   }
 }
 
@@ -123,15 +132,21 @@ pub struct Hydrated {
 
 // ---- The world's objects ----
 
-pub const OBJECTS = 9u32;
-imm NAMES Array[&[]u8, 9] = ["rook", "urn", "flower", "boulder", "horn", "chimney", "balloon", "lathed rook",
-  "starship"];
+pub const OBJECTS = 11u32;
+imm NAMES Array[&[]u8, 11] = ["rook", "urn", "flower", "boulder", "horn", "chimney", "balloon", "lathed rook",
+  "starship", "launch button", "ball"];
+
+// The objects the world moves
+pub const ROOK = 0u32;
+pub const BALLOON = 6u32;
+pub const BUTTON = 9u32;
+pub const BALL = 10u32;
 
 // Object 'k''s name
 pub fn objectName(k u32) &[]u8 { NAMES[usize.from(k)]; }
 
 // Where each stands: x, z, its yaw (radians) and its scale (metres a unit)
-imm PLACES Array[f32, 36] = [
+imm PLACES Array[f32, 44] = [
   -1.3, 0.6, 0.3, 0.8,          // the rook, near the walk's first stop
   1.4, 1.0, 0., 0.5,            // the urn
   0.2, 1.8, 0.2, 0.75,          // the flower
@@ -140,7 +155,9 @@ imm PLACES Array[f32, 36] = [
   -10., -17., 0.4, 1.,          // the chimney
   23., -34.84, 0.7, 9.,         // the balloon: 40 m along the walk's run, 9 m a unit
   -3., 0.6, 0.3, 0.8,           // the lathed rook, beside the first, turned as it is
-  -120., -170., 0., 10.];       // the starship, hovering (its y is SHIP_HOVER): 10 m a unit, 156 m long
+  -120., -170., 0., 10.,        // the starship, hovering (its y is SHIP_HOVER): 10 m a unit, 156 m long
+  19.8, -26.3, 0.5, 1.,         // the balloon's launch button, where the walk's run ends, 9 m short of the basket
+  3.2, -1.5, 0., 1.];           // the ball, bouncing beside the path
 
 fn placeOf(k u32, y f32) Transform3 {
   imm i = usize.from(k) * 4usize;
@@ -180,8 +197,28 @@ pub fn hydrate(k u32) Hydrated {
     print <- merlonHolesAfter; print <- " once capped\n";
   } elif k == 8u32 {
     hydrateShip(&mut h, k);
+  } elif k == BUTTON {
+    // A pedestal a metre high, and on it the button: a red cap, clickable
+    mut pedestal = mesh.Mesh.cube(0.5);
+    pedestal.transform(Mat4.fromTrs(v(0., 0.5, 0.), Quat.identity(), v(0.4, 1., 0.4)));
+    h.add("button pedestal", pedestal, Look.shiny(srgb(70., 78., 92.), 0.3, 20.), Image.empty(), placeOf(k, 0.));
+    h.add("launch button", buttonCapMesh(), Look.shiny(srgb(210., 30., 24.), 0.6, 40.), Image.empty(),
+      placeOf(k, BUTTON_TOP));
+  } elif k == BALL {
+    // A ball a metre across, checkered so its spin shows; the world bounces it
+    h.add("ball", mesh.Mesh.sphere(BALL_RADIUS, 32), Look.checkered(srgb(240., 150., 30.), 0.25), Image.empty(),
+      placeOf(k, BALL_RADIUS));
   }
   h;
+}
+
+// The button's cap: a disc 0.24 across and 0.06 high, its edges sharp
+const BUTTON_TOP f32 = 1.;
+fn buttonCapMesh() mesh.Mesh {
+  imm pts Array[Vec2, 4] = [p2(0., 0.), p2(0.12, 0.), p2(0.12, 0.06), p2(0., 0.06)];
+  imm profile = Profile.fromPoints(&pts, false);
+  imm cap = lathe(&profile, up(), 2. * pi, 32u32);
+  cap.triangulate(false);
 }
 
 // ---- The starship (dragonship/, meshed on the GPU) ----
@@ -225,9 +262,9 @@ fn hydrateShip(h &mut Hydrated, k u32) {
 // ---- Inject: an object's parts sent through the Door ----
 
 // Every part of 'h' reserved and sent: its Spawn, its Place, its Show or
-// Effect. The ids go into 'ids'. 'h' is taken apart (its meshes move into
-// the requests).
-pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId]) {
+// Effect. The ids go into 'ids', and where each was placed into 'places'.
+// 'h' is taken apart (its meshes move into the requests).
+pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mut List[Transform3]) {
   imm parts = h.parts.viewMut();
   mut i = 0usize;
   while i < parts.len {
@@ -241,6 +278,7 @@ pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId]) {
     shape <=> p.shape;
     door.send(Request.Show[id, shape, p.look, paint, 0.]);
     ids.push(id);
+    places.push(p.at);
     i = i + 1usize;
   }
   imm effects = h.effects.viewMut();
@@ -252,8 +290,9 @@ pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId]) {
     door.send(Request.Place[id, e.at]);
     mut layers = List[EffectLayer].empty();
     layers <=> e.layers;
-    door.send(Request.Effect[id, layers, e.seed, e.time]);
+    door.send(Request.Effect[id, layers, e.seed, e.start, e.stop]);
     ids.push(id);
+    places.push(e.at);
     i = i + 1usize;
   }
 }
@@ -272,12 +311,106 @@ pub struct Hydration {
 pub struct BakedWorld {
   next u32;
   pub ids List[PartId];       // every part it has sent, in the order sent
+  places List[Transform3];    // where each was first placed
+  firstOf List[usize];        // object k's first part's index in 'ids'
   pub log List[Hydration];
+  pub flight Flight;          // the balloon's
+  pub pressedAt f64;          // when the button was last pressed; negative: never
+  capDown Bool;               // the button's cap is drawn pressed
+  sentAltitude f32;           // the balloon's altitude last sent
+  pub fires u64;              // bursts of the burner fired (Fire requests sent)
+  pub moves u64;              // Place requests sent by motions
+  pub presses u64;            // the button's clicks read from the mail
 
-  pub fn make() BakedWorld { new BakedWorld(0u32, List[PartId].empty(), List[Hydration].empty()); }
+  pub fn make() BakedWorld {
+    new BakedWorld(0u32, List[PartId].empty(), List[Transform3].empty(), List[usize].empty(), List[Hydration].empty(),
+      Flight.grounded(), -1d, false, 0., 0u64, 0u64, 0u64);
+  }
 
   // Whether every object has been sent
   pub fn done(self &) Bool { next >= OBJECTS; }
+
+  // Whether object 'k' has been sent
+  pub fn has(self &, k u32) Bool { next > k; }
+
+  // Object 'k''s part 'j' (sent)
+  pub fn partOf(self &, k u32, j usize) PartId { *ids[*firstOf[usize.from(k)] + j]; }
+
+  // How many parts object 'k' has (sent)
+  pub fn partsOf(self &, k u32) usize {
+    imm from = *firstOf[usize.from(k)];
+    if usize.from(k) + 1usize < firstOf.len() { *firstOf[usize.from(k) + 1usize] - from; } else { ids.len() - from; };
+  }
+
+  // The button's cap: the part whose clicks the world listens for
+  pub fn buttonCap(self &) PartId { if self.has(BUTTON) { self.partOf(BUTTON, 1usize); } else { PartId.none(); }; }
+
+  // Once a frame, at the scene's time 'now' (seconds): the mail read (a
+  // click on the button launches or lands the balloon), then every motion
+  // sent as Place (and Fire) requests: the ball bouncing and spinning, the
+  // button's cap, the balloon's altitude and its burner
+  pub fn tick(self &mut, door &mut Door, now f64) {
+    mut mail = door.takeMail();
+    imm msgs = mail.viewMut();
+    mut i = 0usize;
+    while i < msgs.len {
+      mut m Message = Message.Read[];
+      m <=> msgs[i];
+      match &mut m {
+        case mut c &mut Clicked {
+          if c.id == self.buttonCap() {
+            presses = presses + 1u64;
+            pressedAt = now;
+            flight = flight.pressed(now);
+            print <- "The world: the launch button pressed at "; print <- now; print <- " s; the balloon ";
+            if flight.rising() { print <- "rises\n"; } else { print <- "comes down\n"; }
+          }
+        }
+        else {}
+      }
+      i = i + 1usize;
+    }
+    if self.has(BALL) {
+      imm id = self.partOf(BALL, 0usize);
+      door.send(Request.Place[id, ballAt(*places[*firstOf[usize.from(BALL)]], now)]);
+      moves = moves + 1u64;
+    }
+    if self.has(BUTTON) {
+      imm down = pressedAt >= 0d and now - pressedAt < BUTTON_HELD;
+      if down != capDown {
+        capDown = down;
+        imm j = *firstOf[usize.from(BUTTON)] + 1usize;
+        mut at = *places[j];
+        if down { at.translation.y = at.translation.y - 0.03; }
+        door.send(Request.Place[*ids[j], at]);
+        moves = moves + 1u64;
+      }
+    }
+    if self.has(BALLOON) {
+      imm alt = flight.altitude(now);
+      if alt != sentAltitude {
+        sentAltitude = alt;
+        imm from = *firstOf[usize.from(BALLOON)];
+        mut j = 0usize;
+        while j < self.partsOf(BALLOON) {
+          mut at = *places[from + j];
+          at.translation.y = at.translation.y + alt;
+          door.send(Request.Place[*ids[from + j], at]);
+          moves = moves + 1u64;
+          j = j + 1usize;
+        }
+      }
+      // The burner: its burst now, sent when it is not the last one sent
+      imm burst = flight.burst(now);
+      if burst.start != flight.firedStart or burst.stop != flight.firedStop {
+        flight.firedStart = burst.start;
+        flight.firedStop = burst.stop;
+        imm flame = self.partOf(BALLOON, BALLOON_FLAME);
+        door.send(Request.Fire[flame, noise.hash1(i32.from(burst.start * 10d), BALLOON_SEED), burst.start, burst.stop]);
+        fires = fires + 1u64;
+      }
+    }
+  }
 
   // Hydrate the next object and send it through 'door'; false once there
   // are none left
@@ -289,7 +422,10 @@ pub struct BakedWorld {
     imm t1 = sdl.GetPerformanceCounter();
     imm parts = u32.from(h.parts.len() + h.effects.len());
     imm tris = h.triangles();
-    inject(&mut h, door, &mut ids);
+    firstOf.push(ids.len());
+    inject(&mut h, door, &mut ids, &mut places);
+    // The button's clicks are the world's to hear
+    if next == BUTTON { door.send(Request.Listen[*ids[*firstOf[usize.from(BUTTON)] + 1usize]]); }
     imm t2 = sdl.GetPerformanceCounter();
     log.push(new Hydration(next, parts, tris, f64.from(t1 - t0) / hz, f64.from(t2 - t1) / hz));
     next = next + 1u32;

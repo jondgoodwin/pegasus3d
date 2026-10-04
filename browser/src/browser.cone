@@ -11,20 +11,28 @@
 //
 //   input      each event into the input package
 //   simulate   the walk, one fixed step at a time (walk.cone)
-//   publish    the baked-in world's next object hydrated and sent (one a
-//              frame, until all are); then THE APPLY POINT: the scene's inbox
-//              applied, each request by the system that owns what it changes
-//              (scene/, rendersys.cone); then the last two walk states kept
-//              for the picture
+//   publish    a click picked (picking.cone): the part hit highlighted, and
+//              posted to the world's Door if the world listens for it; the
+//              baked-in world's next object hydrated and sent (one a frame,
+//              until all are), and the world's tick: its mail read, its
+//              motions sent as Place requests at the scene's time; then THE
+//              APPLY POINT: the scene's inbox applied, each request by the
+//              system that owns what it changes (parts/, rendersys.cone,
+//              picking.cone); then the last two walk states kept for the
+//              picture
 //   draw       the camera between those states, the render system's draw
-//              list, then the effects' particles
+//              list, then the effects' particles at the scene's time
 //   present    show it
 //
+// THE SCENE'S TIME is the simulation's (frame's fixed steps, exact on the
+// synthetic clock): the world's motions and the effects are read from it.
+//
 // Arguments, besides frame's (--frames N, --headless, --quiet):
-//   --script        walk and turn with no one at the keyboard: events pushed
-//                   into SDL's own queue (sdl.PushEvent), never the system's,
-//                   and checked against what they must do (script.cone)
+//   --script        walk, turn and click with no one at the keyboard: events
+//                   pushed into SDL's own queue (sdl.PushEvent), never the
+//                   system's, and checked against what they must do (script.cone)
 //   --shots DIR     write the scripted run's views into DIR as BMPs
+//   --watch S, --soak N   a watched real-time run, a soak (watch.cone)
 //
 // A run of a fixed number of frames (--frames, --script) takes input only
 // from its own pushed events, so it is the same every time.
@@ -50,7 +58,7 @@ import vfx use ParticleRenderer, EmitterHandle, Emitter, Event;
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
 // of parts that imports it
 use parts;
-use bakedworld { BakedWorld };
+use bakedworld { BakedWorld, ROOK, BALL, BALLOON };
 
 // ---- The world's state ----
 
@@ -73,6 +81,17 @@ mut world BakedWorld;         // the baked-in world: what of it has been sent
 mut startedAt u64 = 0u64;     // the performance counter when main began
 mut worldSentFrame u64 = 0u64;  // the frame whose publish sent the world's last object
 mut worldShownAt u64 = 0u64;  // the counter once that frame was presented (or applied, headless)
+mut picks PickSystem;         // what each shown part is, for picking
+mut picked PartId;            // the part highlighted: the last click's
+mut lastPick PickHit;         // the last click's answer, for the script
+mut clicks u64 = 0u64;
+mut fired u64 = 0u64;         // Fire requests applied: an effect's bursts
+mut sceneNow f64 = 0d;        // the scene's time, seconds: the simulation's
+
+// The view a headless run picks in (no window to measure)
+const HEADLESS_W f32 = 1280.;
+const HEADLESS_H f32 = 720.;
+const FOV f32 = 1.0471976;    // 60 degrees, vertical
 
 // Where the viewer starts: 8 m back from the origin, facing down -z
 const START_Z f32 = 8.;
@@ -108,6 +127,10 @@ fn @initpure init() {
   world = BakedWorld.make();
   tempPart = PartId.none();
   probeFrom = new Vec3(0., 0., 0.);
+  picks = PickSystem.empty();
+  clickAt = new Vec2(0., 0.);
+  picked = PartId.none();
+  lastPick = new PickHit(PartId.none(), 0., 0u32, 0u64);
 }
 
 fn takeGfx() Option[Gfx] {
@@ -182,7 +205,7 @@ pub fn start(host &mut Host) Bool {
     return false;
   }
   mut camera = Camera.make();
-  camera.fov = radians(60.);
+  camera.fov = FOV;
   camera.near = 0.1;
   camera.far = 1500.;
   imm target = swapchain.getCurrentTexture(&mut device);
@@ -256,11 +279,52 @@ pub fn simulate(host &mut Host, step &imm Step, scratch &mut Arena) {
 
 pub fn publish(host &mut Host) {
   updateActions(host.frame);
+  sceneNow = f64.from(host.simNs()) / 1.0e9d;
+  if (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u { click(host); }
   // The world is handed the Door, never the scene
   if world.step(&mut scene.door) and world.done() { worldSentFrame = host.frame; }
+  world.tick(&mut scene.door, sceneNow);
   applyRequests();
   shownFrom = walkBefore;
   shownTo = walk;
+}
+
+// The view the mouse's places are in: the window's own units, or a fixed
+// size in a headless run
+pub fn viewSize(host &mut Host) Vec2 {
+  if !host.hasWindow() { return new Vec2(HEADLESS_W, HEADLESS_H); }
+  imm r = host.window().windowSize();
+  new Vec2(f32.from(r.w), f32.from(r.h));
+}
+
+// A click where the pointer is: the part it hits picked, reported and
+// highlighted (the one before let go), and, if its sender listens for its
+// clicks, posted to the sender's Door. The eye is where the last picture
+// was drawn from.
+fn click(host &mut Host) {
+  imm size = viewSize(host);
+  imm eye = between(&shownFrom, &shownTo, 1.);
+  imm ray = rayThrough(eye, FOV, inputState.pointer.x, inputState.pointer.y, size.x, size.y);
+  imm t0 = sdl.GetPerformanceCounter();
+  imm hit = picks.pick(&scene, ray);
+  imm us = f64.from(sdl.GetPerformanceCounter() - t0) / f64.from(sdl.GetPerformanceFrequency()) * 1.0e6d;
+  clicks = clicks + 1u64;
+  lastPick = hit;
+  print <- "Click at ("; print <- inputState.pointer.x; print <- ", "; print <- inputState.pointer.y; print <- "): ";
+  if hit.id.isNone() {
+    print <- "nothing";
+  } else {
+    imm name = scene.nameOf(hit.id);
+    printStr(name.view()); print <- ", "; print <- hit.distance; print <- " m away";
+  }
+  print <- " ("; print <- hit.boxesHit; print <- " boxes entered, "; print <- hit.triangles; print <- " triangles tested, ";
+  print <- us; print <- " us)\n";
+  if !picked.isNone() and !(picked == hit.id) { scene.send(Request.Highlight[picked, false]); }
+  if !hit.id.isNone() {
+    scene.send(Request.Highlight[hit.id, true]);
+    if scene.isListening(hit.id) { scene.post(Message.Clicked[hit.id]); }
+  }
+  picked = hit.id;
 }
 
 // Apply every request waiting, in the order sent, each by the system that
@@ -288,12 +352,16 @@ fn applyRequests() {
           }
           else {}
         }
+        picks.drop(d.id);
         scene.applyDespawn(d.id);
       }
       case mut sh &mut Show {
         if !scene.isLive(sh.id) {
           scene.refused = scene.refused + 1u64;
         } else {
+          // The picking system keeps its shape (not the ground's: an
+          // anchored part is drawn wherever the viewer is)
+          if sh.anchor == 0. { picks.shape(sh.id, &sh.mesh); }
           match &mut g {
             case mut some &mut Some {
               some.value.sys.show(&mut some.value.renderer, &mut some.value.device, sh.id, &sh.mesh, &sh.surface,
@@ -310,7 +378,33 @@ fn applyRequests() {
         } else {
           match &mut g {
             case mut some &mut Some {
-              some.value.sys.effect(&mut some.value.device, ef.id, &ef.layers, ef.seed, ef.at);
+              some.value.sys.effect(&mut some.value.device, ef.id, &ef.layers, ef.seed, ef.start, ef.stop);
+            }
+            else { unrendered = unrendered + 1u64; }
+          }
+          scene.applied = scene.applied + 1u64;
+        }
+      }
+      case mut f &mut Fire {
+        if !scene.isLive(f.id) {
+          scene.refused = scene.refused + 1u64;
+        } else {
+          match &mut g {
+            case mut some &mut Some { some.value.sys.fire(f.id, f.seed, f.start, f.stop); }
+            else { unrendered = unrendered + 1u64; }
+          }
+          fired = fired + 1u64;
+          scene.applied = scene.applied + 1u64;
+        }
+      }
+      case mut l &mut Listen { scene.applyListen(l.id); }
+      case mut hl &mut Highlight {
+        if !scene.isLive(hl.id) {
+          scene.refused = scene.refused + 1u64;
+        } else {
+          match &mut g {
+            case mut some &mut Some {
+              some.value.sys.highlight(&mut some.value.renderer, &mut some.value.device, hl.id, hl.on);
             }
             else { unrendered = unrendered + 1u64; }
           }
@@ -361,7 +455,7 @@ fn drawFrame(g &mut Gfx, pose Pose, frameNo u64) {
   mut encoder = g.device.createCommandEncoder();
   g.renderer.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera, &light, &g.sys.list);
   if g.sys.hasEffects() {
-    g.sys.aimEffects(&mut g.device, &scene);
+    g.sys.aimEffects(&mut g.device, &scene, sceneNow);
     g.sys.particles.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera);
   }
 
@@ -403,6 +497,7 @@ pub fn present(host &mut Host) {
     if !checkScript(host.frame, &walk) { scriptOk = false; }
     driveScene(host.frame);
     pushScript(host.frame + 1u64);
+    pushClicks(host, host.frame + 1u64, &walk);
   }
   if watching() or soaking() { watchSizes(host); }
 }

@@ -5,7 +5,9 @@ Acorn-era Pegasus3D in `src/`. It is the shell and the walkable plane (an endles
 sky-blue sky, in metres, walked on at eye height, 1.7 m) and a baked-in world standing on it: two chess
 rooks, an urn, a flower, a boulder, a horn, a chimney stack, a hot-air balloon with its burner alight and,
 hovering beyond them, Elizabeth's skeletal dragon starship, built from Cone's sculpt, vfx, sdf and sdfmesh
-packages and sent in as if downloaded.
+packages and sent in as if downloaded. Things move: a ball bounces and spins, the burner fires in bursts,
+and a launch button by the path sends the balloon up (and, pressed again, brings it down). A click
+picks what it lands on and highlights it.
 
 ## Building and running
 
@@ -41,6 +43,7 @@ first run after a driver's shader cache is cleared makes the kernels in about 4 
 | A or Left | turn left (a quarter turn in 1.5 s) |
 | D or Right | turn right |
 | Shift (held) | walk four times as fast (12 m/s) |
+| Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button launches or lands the balloon |
 | F11 | fullscreen |
 | Escape | quit |
 
@@ -58,13 +61,17 @@ browser.exe --watch 300               300 s in real time, a line a second and a 
 `--script` pushes key events into SDL's own queue (never the operating system's), so nothing reaches
 any other window, and a run of a fixed number of frames ignores the real keyboard and mouse (and the
 window losing focus, which would otherwise let go of the script's keys). It walks up to the rooks, the
-urn and the flower, turns, and runs to the balloon, then draws three close-ups from eyes of its own. It
-checks the walk against what its events must give (exact on the synthetic clock); that the scene
-applied, refused and removed what it was sent; and that every part the world sent is live, placed and
-(with a GPU) drawn or giving off particles, with every request sent accounted for as applied or
-refused. It exits 0 only if every check passed, no Vulkan call failed and the validation layer said
-nothing. `shots/` holds the views of one run (`start`, `walked`, `turned`, `balloon`, and the close-ups
-`rooks`, `chimney`, `starship`), converted to PNG.
+urn and the flower, clicks on the rook and then on the sky, turns, runs to the balloon, clicks its
+launch button, then draws four close-ups from eyes of its own. Its clicks are pushed mouse events at
+the place the script works out the target is drawn. It checks the walk against what its events must
+give (exact on the synthetic clock); what each click picked and highlighted; that the world heard the
+button and the balloon (every one of its parts) rose as its formula says; the ball's height against
+its formula; every burst of the burner sent was applied; that the scene applied, refused and removed
+what it was sent; and that every part the world sent is live, placed and (with a GPU) drawn or giving
+off particles, with every request sent accounted for as applied or refused. It exits 0 only if every
+check passed, no Vulkan call failed and the validation layer said nothing. `shots/` holds the views of
+one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups `rooks`, `chimney`,
+`starship`, `rising`), converted to PNG.
 
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
 scene's inbox is empty after the apply point and that the parts, the rows drawn and the particle
@@ -90,8 +97,9 @@ along the way when the first frame was presented and when every object was first
 | `src/shell.cone` | what the browser puts in every scene: the ground and the sky, sent as requests |
 | `src/walk.cone` | walking on the ground: the controller and its key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
+| `src/picking.cone` | the picking system: each shown part's triangles, and the ray a click casts |
 | `src/watch.cone` | the watched real-time run and the soak |
-| `src/bakedworld/` | the module `bakedworld`, the baked-in world: its objects' descriptions, hydrating and injecting them |
+| `src/bakedworld/` | the module `bakedworld`, the baked-in world: its objects' descriptions, hydrating and injecting them, and its motions (`motions.cone`) |
 | `src/dragonship/` | the module `dragonship`: the starship's description and its meshing on the GPU, on a device of the world's own |
 | `gpu/shipfield.cone` | the starship's GPU half: its distance field and kernels, compiled into the browser and into `browser.spv` |
 
@@ -101,13 +109,34 @@ What a part is lives in tables keyed by its id (sparse sets), each owned by one 
 placement; the render system owns what a part is drawn as, the particles it gives off, and the sky.
 
 **Changes are requests.** Whoever wants the scene changed reserves an id and sends requests (`Spawn`,
-`Place`, `Show`, `Effect`, `Sky`, `Despawn`) into the scene's inbox. Once a frame, at the publish
-phase, the browser applies the inbox in order, routing each request to the system that owns what it
-changes; a request naming a part that is gone is refused and counted. The ground and the sky go in this
-way too: the ground is an ordinary part whose render row is *anchored*, drawn under the viewer in steps
-of its checkerboard's period, so it never ends. A `Show` may carry a painted image (the balloon's
-envelope, the basket's wicker), which its colour multiplies; an `Effect` is a part's particle
-emitters (the vfx package's), held at one moment until something sends the time on.
+`Place`, `Show`, `Effect`, `Fire`, `Listen`, `Highlight`, `Sky`, `Despawn`) into the scene's inbox.
+Once a frame, at the publish phase, the browser applies the inbox in order, routing each request to the
+system that owns what it changes; a request naming a part that is gone is refused and counted. The
+ground and the sky go in this way too: the ground is an ordinary part whose render row is *anchored*,
+drawn under the viewer in steps of its checkerboard's period, so it never ends. A `Show` may carry a
+painted image (the balloon's envelope, the basket's wicker), which its colour multiplies; an `Effect`
+is a part's particle emitters (the vfx package's), fired from a start to a stop on the scene's clock
+and drawn as they are at the scene's time each frame; a `Fire` fires it again (a burst).
+
+**The scene's time** is the simulation's: frame's fixed steps, exact on the synthetic clock. Each
+frame the world reads it and sends its motions as ordinary `Place` and `Fire` requests: the ball's
+height `1.6 |sin(pi t / 1.1)|` m and its spin, 3 rad/s; the button's cap sinking 3 cm for a quarter of
+a second when pressed; the balloon on the ground, its burner firing 3 s in every 4; pressed, rising at
+2.5 m/s with the burner held on to 30 m, then bobbing 0.6 m either way every 7 s with a 2 s burst every
+6 s; pressed again, the burner out, sinking at 1.5 m/s to land.
+
+**A click picks.** The picking system keeps a copy of each shown part's triangles (taken when its
+`Show` is applied; not the anchored ground's). A left click casts a ray from the eye through the
+pointer, takes it into each part's own frame by the inverse of its placement, tests the part's box,
+and, where the box is entered nearer than the best hit so far, each triangle; the nearest triangle
+hit names the part. The browser prints it and sends itself a `Highlight` (the render system draws the
+part in its colour half-way to yellow, and lets the last one go).
+
+**Buttons are messages to the world.** A world that wants a part's clicks sends `Listen` for it; when
+a click picks that part, the browser posts `Message.Clicked` into the world's Door, and the world reads
+its mail at its next tick, at the publish phase of the same frame, and answers with requests. The
+browser never reaches into the world, and the world never into the scene's tables: the Door's mail is
+the world's inbox, as an actor's would be.
 
 **A world is given the Door, not the scene.** The `parts` module keeps the registry, the inbox and the
 placement table private, and hands a sender a `Door`, which only reserves ids and sends requests. The
@@ -134,5 +163,7 @@ frames keep coming while the world arrives.
 | horn | `sculpt/examples/hornfamily.cone`, stage 0 | 3 m along | 46,204 | 18 |
 | chimney stack | `sculpt/examples/chimney.cone`, its cage flat-shaded (not subdivided) | 3.5 m | 76 | 0.1 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
-| burner flame (core, tongue, embers, pilot) | `vfx/examples/burner.cone`, held 1.25 s into a burst | 3 m | particles | (in the balloon's) |
+| burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
+| launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |
+| ball | new: a sphere, checkered so its spin shows | 1 m across | 1,984 | 0.03 |
 | starship (frame, membranes, wing lights, ports, eyes, mouth) | `packages/starship`, meshed on the GPU at 0.03 a cell | 156 m, 10 m a unit | 458,324 | 700 (0.4 s of it making the kernels) |

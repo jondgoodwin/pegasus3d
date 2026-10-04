@@ -2,24 +2,40 @@
 // keyed by part id (what each part is drawn as, the effects parts give off,
 // and the sky), and the GPU resources behind them, made when a Show or an
 // Effect request is applied. Each frame it turns its rows, with the scene's
-// placements, into the render package's draw list, and starts each effect's
-// emitters where its part is. The renderer itself never sees a part or walks
-// a hierarchy: it gets world matrices and meshes.
+// placements, into the render package's draw list, and fires each effect's
+// emitters where its part is, as they are at the scene's time. The renderer
+// itself never sees a part or walks a hierarchy: it gets world matrices and
+// meshes.
 
 // What one part is drawn as
 pub struct Renderable {
   pub meshH MeshHandle;
   pub material MaterialHandle;
   pub anchor f32;             // 0: where the part is placed; else under the viewer, in steps of this
+  pub base Material;          // the material's parameters, to make its highlight from
+  pub lit MaterialHandle;     // the highlighted material, made the first time it is asked for
+  pub highlighted Bool;
 }
 
 // What one part gives off: its emitters, 'count' of them from 'first' in the
-// system's lists, started with 'seed' and held 'at' seconds after
+// system's lists, fired with 'seed' from 'start' until 'stop' on the
+// scene's clock
 pub struct EffectRow {
   pub first u32;
   pub count u32;
   pub seed u32;
-  pub at f64;
+  pub start f64;
+  pub stop f64;
+}
+
+// A highlighted part's material: its colour half way to a warm yellow,
+// with a highlight
+fn highlightOf(m &Material) Material {
+  mut out = *m;
+  out.baseColor = new Color(m.baseColor.red * 0.5 + 0.5, m.baseColor.green * 0.5 + 0.42, m.baseColor.blue * 0.5 + 0.05, 1.);
+  out.specular = new Color(0.6, 0.6, 0.6, 1.);
+  out.shininess = 24.;
+  out;
 }
 
 pub struct RenderSystem {
@@ -32,12 +48,13 @@ pub struct RenderSystem {
   handles List[EmitterHandle];
   pub drawn usize;            // parts in the last draw list
   pub painted usize;          // Shows applied with a painted image
+  pub now f64;                // the scene's time the effects were last drawn at
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
     new RenderSystem(Table[Renderable].empty(), Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
-      List[EmitterHandle].empty(), 0usize, 0usize);
+      List[EmitterHandle].empty(), 0usize, 0usize, 0d);
   }
 
   // Apply a Show: upload the mesh, make its material, and give the part its
@@ -66,14 +83,27 @@ pub struct RenderSystem {
       imm old = (*rows.rows[row]).meshH;
       renderer.removeMesh(device, old);
     }
-    rows.put(id, new Renderable(handle, mh, anchor));
+    rows.put(id, new Renderable(handle, mh, anchor, material, MaterialHandle.none(), false));
+  }
+
+  // Apply a Highlight: part 'id' drawn in its highlighted material, or its own
+  pub fn highlight(self &mut, renderer &mut Renderer, device &mut Device, id PartId, on Bool) {
+    imm row = rows.find(id);
+    if row == NO_ROW { return; }
+    mut r = *rows.rows[row];
+    if on and r.lit.isNone() {
+      imm lit = highlightOf(&r.base);
+      r.lit = renderer.addMaterial(device, &lit);
+    }
+    r.highlighted = on;
+    rows.put(id, r);
   }
 
   // Apply an Effect: a slot of the particle renderer for each layer. A part
   // given an effect again with as many layers keeps its slots; otherwise
   // its old slots are stilled and new ones added (the particle renderer
   // does not take slots back yet)
-  pub fn effect(self &mut, device &mut Device, id PartId, layers &List[EffectLayer], seed u32, at f64) {
+  pub fn effect(self &mut, device &mut Device, id PartId, layers &List[EffectLayer], seed u32, start f64, stop f64) {
     imm n = u32.from(layers.len());
     imm row = effects.find(id);
     mut first = u32.from(emitters.len());
@@ -93,7 +123,20 @@ pub struct RenderSystem {
       }
       k = k + 1usize;
     }
-    effects.put(id, new EffectRow(first, n, seed, at));
+    effects.put(id, new EffectRow(first, n, seed, start, stop));
+  }
+
+  // Apply a Fire: part 'id''s effect fired again, with 'seed', from 'start'
+  // until 'stop'. False if it has no effect.
+  pub fn fire(self &mut, id PartId, seed u32, start f64, stop f64) Bool {
+    imm row = effects.find(id);
+    if row == NO_ROW { return false; }
+    mut r = *effects.rows[row];
+    r.seed = seed;
+    r.start = start;
+    r.stop = stop;
+    effects.put(id, r);
+    true;
   }
 
   // An effect's slots made to draw nothing: started in the far future
@@ -152,23 +195,24 @@ pub struct RenderSystem {
         imm sz = libc.floorf(eye.z / r.anchor) * r.anchor;
         model = Mat4.fromTranslation(new Vec3(sx, 0., sz)) * model;
       }
-      list.add(r.meshH, r.material, model);
+      list.add(r.meshH, if r.highlighted { r.lit; } else { r.material; }, model);
       i = i + 1usize;
     }
     drawn = rows.len();
   }
 
-  // Each effect's emitters started where its part is now, as they are at
-  // the effect's time
-  pub fn aimEffects(self &mut, device &mut Device, scene &Scene) {
+  // Each effect's emitters fired where its part is now, as they are at the
+  // scene's time 'now'
+  pub fn aimEffects(self &mut, device &mut Device, scene &Scene, now f64) {
+    self.now = now;
     mut i = 0usize;
     while i < effects.len() {
       imm r = *effects.rows[i];
-      imm ev = Event.at(r.seed, 0d, scene.worldMatrix(*effects.ids[i]));
+      imm ev = new Event(r.seed, r.start, r.stop, scene.worldMatrix(*effects.ids[i]));
       mut k = 0u32;
       while k < r.count {
         imm e = usize.from(r.first + k);
-        particles.update(device, *handles[e], emitters[e], &ev, r.at);
+        particles.update(device, *handles[e], emitters[e], &ev, now);
         k = k + 1u32;
       }
       i = i + 1usize;

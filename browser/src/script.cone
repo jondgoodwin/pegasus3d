@@ -7,20 +7,30 @@
 //   frames 1-29     standing 8 m back from the origin, facing -z  shot "start" at 20
 //                   (the world arrives an object a frame, frames 1 to 7)
 //   frames 30-89    W held: 60 steps at 3 m/s, 3 m forward,
-//                   up to the rooks, the urn and the flower       shot "walked" at 160
+//                   up to the rooks, the urn and the flower
+//   frame 120       a click on the (boolean) rook: picked and highlighted
+//                                                                 shot "picked" at 130
+//   frame 145       a click on the sky: nothing picked, the rook let go
+//                                                                 shot "walked" at 160
 //   frames 170-199  D held: 30 steps, a twelfth of a turn right   shot "turned" at 210
 //   frames 220-249  Shift and W held: 30 steps at 12 m/s, 6 m on that heading
 //   frames 300-434  Shift and W held: 135 steps, 27 m on, to 13 m from the
-//                   balloon's basket                              shot "balloon" at 580
-//   frames 600-629  close-ups, drawn from the script's own eyes (the walk
+//                   balloon's basket and beside its launch button
+//   frame 450       a click on the launch button: the world is told, and the
+//                   balloon rises                                 shot "balloon" at 580
+//   all along       the ball bounces and spins, the burner fires in bursts:
+//                   checked against their formulas at frames 200 and 590
+//   frames 600-639  close-ups, drawn from the script's own eyes (the walk
 //                   is not moved): the two rooks at 602 ("rooks"), the
-//                   chimney at 612 ("chimney"), the starship at 622 ("starship")
+//                   chimney at 612 ("chimney"), the starship at 622
+//                   ("starship"), the balloon rising, from where the walk
+//                   ended, at 632 ("rising")
 
 // The device the script's events claim (no real keyboard has it)
 pub const SCRIPT_DEVICE = 0x5C1u;
 
 // The frames a scripted run needs
-pub const SCRIPT_FRAMES = 630u64;
+pub const SCRIPT_FRAMES = 640u64;
 
 // A pose at 'eye' looking at 'target' (level of roll)
 fn lookFrom(eye Vec3, target Vec3) Pose {
@@ -30,13 +40,15 @@ fn lookFrom(eye Vec3, target Vec3) Pose {
 }
 
 // Whether frame 'f' is drawn from a close-up's eye
-pub fn hasView(f u64) Bool { f >= 600u64 and f < 630u64; }
+pub fn hasView(f u64) Bool { f >= 600u64 and f < 640u64; }
 
 // The close-up's eye for frame 'f'
 pub fn viewAt(f u64) Pose {
   if f < 610u64 { return lookFrom(new Vec3(-2.15, 1.55, 3.1), new Vec3(-2.15, 0.75, 0.6)); }
   if f < 620u64 { return lookFrom(new Vec3(-6.5, 2.2, -10.), new Vec3(-10., 1.6, -17.)); }
-  lookFrom(new Vec3(40., 20., -60.), new Vec3(-60., 42., -170.));
+  if f < 630u64 { return lookFrom(new Vec3(40., 20., -60.), new Vec3(-60., 42., -170.)); }
+  // Where the walk ended, looking up at the balloon rising
+  lookFrom(new Vec3(16.5, 1.7, -23.58), new Vec3(23., 15., -34.84));
 }
 
 fn pushKey(scancode u32, down Bool) {
@@ -67,6 +79,126 @@ pub fn pushScript(f u64) {
   }
 }
 
+fn pushButton(x f32, y f32, down Bool) {
+  mut e = sdl.Event.empty();
+  e.type = if down {sdl.EVENT_MOUSE_BUTTON_DOWN;} else {sdl.EVENT_MOUSE_BUTTON_UP;};
+  imm b = &mut e as &mut sdl.MouseButtonEvent;
+  b.which = SCRIPT_DEVICE;
+  b.button = sdl.BUTTON_LEFT;
+  b.down = down;
+  b.clicks = 1u8;
+  b.x = x;
+  b.y = y;
+  e.timestamp = 0u64;
+  sdl.PushEvent(&mut e);
+}
+
+// Where the script clicks, and on what
+mut clickAt Vec2;             // set by the module's init
+mut rookClick Bool = false;   // the click on the rook landed where the rook is drawn
+
+// Where world point 'p' is drawn for a viewer at 'w' (the walk is still
+// when the script clicks)
+fn seen(host &mut Host, w &Walk, p Vec3) Vec2 {
+  imm size = viewSize(host);
+  placeOnView(w.pose(), FOV, p, size.x, size.y);
+}
+
+// The world point at part 'id''s placement, 'up' metres above it
+fn partPoint(id PartId, up f32) Vec3 {
+  imm m = scene.worldMatrix(id);
+  new Vec3(m.m[12], m.m[13] + up, m.m[14]);
+}
+
+// The script's clicks for frame 'f': pressed then let go two frames later
+pub fn pushClicks(host &mut Host, f u64, w &Walk) {
+  if f == 120u64 {
+    // The boolean rook, 0.7 m up its 1.4
+    clickAt = seen(host, w, partPoint(world.partOf(ROOK, 0usize), 0.7));
+    pushButton(clickAt.x, clickAt.y, true);
+  }
+  if f == 145u64 {
+    // The sky, high in the middle
+    clickAt = new Vec2(viewSize(host).x * 0.5, viewSize(host).y * 0.1);
+    pushButton(clickAt.x, clickAt.y, true);
+  }
+  if f == 450u64 {
+    // The launch button's cap, at its middle
+    clickAt = seen(host, w, partPoint(world.buttonCap(), 0.03));
+    pushButton(clickAt.x, clickAt.y, true);
+  }
+  if f == 122u64 or f == 147u64 or f == 452u64 { pushButton(clickAt.x, clickAt.y, false); }
+}
+
+// The ball's height, as its formula has it, at the scene's time 'now'
+fn ballHeight(now f64) f32 {
+  imm t = f32.from(now);
+  0.5 + 1.6 * libc.fabsf(sin(pi * t / 1.1));
+}
+
+// The script's checks of the clicks and the motions at frame 'f'
+fn checkMotions(f u64) Bool {
+  mut ok = true;
+  if f == 125u64 {
+    print <- "Frame 125, after a click on the rook:\n";
+    imm want = world.partOf(ROOK, 0usize);
+    print <- "  picked: "; printStr(scene.nameOf(lastPick.id).view());
+    if !(lastPick.id == want) { print <- " WRONG (want the rook)"; ok = false; }
+    if !(picked == want) { print <- ", NOT highlighted"; ok = false; }
+    print <- "\n";
+  }
+  if f == 150u64 {
+    print <- "Frame 150, after a click on the sky: ";
+    if lastPick.id.isNone() and picked.isNone() { print <- "nothing picked, nothing highlighted\n"; }
+    else { print <- "something picked: WRONG\n"; ok = false; }
+    print <- "  clicks: "; print <- clicks; print <- " (want 2)\n";
+    if clicks != 2u64 { ok = false; }
+  }
+  if f == 200u64 or f == 590u64 {
+    print <- "Frame "; print <- f; print <- ", the ball at "; print <- sceneNow; print <- " s:\n";
+    ok = near("height", scene.worldMatrix(world.partOf(BALL, 0usize)).m[13], ballHeight(sceneNow), 0.0005) and ok;
+  }
+  if f == 455u64 {
+    print <- "Frame 455, after a click on the launch button: the world read "; print <- world.presses;
+    print <- " press (want 1)";
+    if world.presses != 1u64 or !world.flight.rising() { print <- ", NOT rising"; ok = false; }
+    print <- "\n";
+  }
+  if f == 590u64 {
+    // Rising at 2.5 m/s since the press, every part with it
+    imm alt = 2.5 * f32.from(sceneNow - world.pressedAt);
+    print <- "Frame 590, the balloon "; print <- sceneNow - world.pressedAt; print <- " s after the press:\n";
+    imm from = world.partsOf(BALLOON);
+    ok = near("envelope's rise", scene.worldMatrix(world.partOf(BALLOON, 0usize)).m[13] - balloonBaseY, alt, 0.002) and ok;
+    // Every part of it (meshes, flame, pilot) risen as far
+    mut j = 1usize;
+    mut together = true;
+    while j < from {
+      imm rise = scene.worldMatrix(world.partOf(BALLOON, j)).m[13] - balloonPartY(j);
+      if rise - alt > 0.002 or alt - rise > 0.002 { together = false; }
+      j = j + 1usize;
+    }
+    print <- "  its "; print <- from; print <- " parts risen together: ";
+    if together { print <- "yes\n"; } else { print <- "NO\n"; ok = false; }
+    print <- "  the burner: "; print <- world.fires; print <- " bursts sent, "; print <- fired; print <- " applied (want as many, 2 or more)\n";
+    if world.fires != fired or fired < 2u64 { ok = false; }
+  }
+  ok;
+}
+
+// The balloon's parts' heights before any press (taken at frame 29)
+mut balloonBaseY f32 = 0.;
+mut balloonYs Array[f32, 8] = [0., 0., 0., 0., 0., 0., 0., 0.];
+fn balloonPartY(j usize) f32 { balloonYs[j]; }
+fn takeBalloonBase() {
+  mut j = 0usize;
+  while j < world.partsOf(BALLOON) and j < 8usize {
+    balloonYs[j] = scene.worldMatrix(world.partOf(BALLOON, j)).m[13];
+    j = j + 1usize;
+  }
+  balloonBaseY = balloonYs[0usize];
+}
+
 // A part made and taken away again through the scene's requests, and a
 // request sent afterwards to its stale id, which must be refused
 mut tempPart PartId;          // set by the module's init
@@ -94,8 +226,10 @@ pub fn shotAt(f u64) &[]u8 {
   if f == 210u64 { return "turned"; }
   if f == 580u64 { return "balloon"; }
   if f == 602u64 { return "rooks"; }
+  if f == 130u64 { return "picked"; }
   if f == 612u64 { return "chimney"; }
   if f == 622u64 { return "starship"; }
+  if f == 632u64 { return "rising"; }
   "";
 }
 
@@ -141,8 +275,9 @@ fn checkWorld() Bool {
 }
 
 // The parts the world sends: seven objects of one part, the balloon's six
-// and its flame, the starship's six
-const WORLD_PARTS = 20usize;
+// and its flame and pilot light, the starship's six, the launch button's
+// two, the ball
+const WORLD_PARTS = 24usize;
 
 // What the script's events must have done by the end of frame 'f'
 pub fn checkScript(f u64, w &Walk) Bool {
@@ -171,7 +306,9 @@ pub fn checkScript(f u64, w &Walk) Bool {
     ok = near("x", w.position.x, 0., 0.) and ok;
     ok = near("z", w.position.z, 8., 0.) and ok;
     ok = near("yaw", w.yaw, 0., 0.) and ok;
+    takeBalloonBase();
   }
+  ok = checkMotions(f) and ok;
   if f == 165u64 {
     print <- "Frame 165, after 60 steps of W at 3 m/s:\n";
     ok = near("x", w.position.x, 0., 0.0001) and ok;

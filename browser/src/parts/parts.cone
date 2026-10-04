@@ -21,9 +21,15 @@
 // part in the requests that follow (Bevy's Commands reserve an entity the
 // same way): the part is reserved, not yet live, until its Spawn is applied.
 //
-// A SENDER IS GIVEN THE DOOR, NOT THE SCENE. The Door holds the registry and
-// the inbox and offers only reserving ids, sending requests and asking
-// whether an id is still reserved; the placement table and the apply
+// MESSAGES GO THE OTHER WAY. What the browser tells a sender (a click on a
+// part it listens for: Request.Listen, then Message.Clicked) is posted into
+// the Door's mail by the browser, through the Scene, and the sender takes it
+// out when it next looks: a sender's own inbox, as an actor's would be.
+//
+// A SENDER IS GIVEN THE DOOR, NOT THE SCENE. The Door holds the registry,
+// the inbox and the mail and offers only reserving ids, sending requests,
+// reading its mail and asking whether an id is still reserved; the
+// placement table, the listeners, posting and the apply
 // methods are the Scene's. This module is the privacy boundary (a member not
 // 'pub' is private to the module that declares its type), so a world handed
 // '&mut scene.door' cannot reach a table or apply anything, and the module is
@@ -179,15 +185,36 @@ pub enum Request {
     pub paint Image;
     pub anchor f32;
   }
-  // Part 'id' gives off particles: each layer an emitter started at the
-  // part's placement with 'seed', drawn as it is 'at' seconds after it
-  // started (held there: an effect stands still until something sends the
-  // time on)
+  // Part 'id' gives off particles: each layer an emitter, at the part's
+  // placement, fired with 'seed' from 'start' until 'stop' (seconds on the
+  // scene's clock; EFFECT_NEVER: it never stops) and drawn as it is at the
+  // scene's time now, every frame: an effect is live. Particles already
+  // born live out their lives after it stops.
   pub struct Effect {
     pub id PartId;
     pub layers List[EffectLayer];
     pub seed u32;
-    pub at f64;
+    pub start f64;
+    pub stop f64;
+  }
+  // Part 'id''s effect fired again, from 'start' until 'stop', with 'seed'
+  // (a burner's burst): its layers kept, the burst before forgotten
+  pub struct Fire {
+    pub id PartId;
+    pub seed u32;
+    pub start f64;
+    pub stop f64;
+  }
+  // Part 'id''s clicks are wanted: each one hit is posted to the sender's
+  // Door as a Message.Clicked
+  pub struct Listen {
+    pub id PartId;
+  }
+  // Part 'id' drawn highlighted ('on') or as it is: the browser's own, for
+  // what was picked
+  pub struct Highlight {
+    pub id PartId;
+    pub on Bool;
   }
   // Part 'id' is the sky
   pub struct Sky {
@@ -198,14 +225,40 @@ pub enum Request {
   pub struct Done;
 }
 
-// What a sender is given: reserving ids and sending requests, and nothing
-// that reaches a table
+// An effect that never stops firing
+pub const EFFECT_NEVER f64 = 1.0e30d;
+
+// What the browser tells a sender, through its Door: the other way from a
+// Request. (A message to an actor, when worlds are actors.)
+pub enum Message {
+  // Part 'id', whose clicks the sender listens for, was clicked
+  pub struct Clicked {
+    pub id PartId;
+  }
+  // Nothing: what a taken message's place holds
+  pub struct Read;
+}
+
+// What a sender is given: reserving ids and sending requests, and reading
+// what it is told; nothing that reaches a table
 pub struct Door {
   registry Pool[PartRecord];
   inbox List[Request];
+  mail List[Message];         // what the browser has told the sender, not yet read
   pub sent u64;               // requests sent through it, ever
 
-  pub fn empty() Door { new Door(Pool[PartRecord].empty(), List[Request].empty(), 0u64); }
+  pub fn empty() Door { new Door(Pool[PartRecord].empty(), List[Request].empty(), List[Message].empty(), 0u64); }
+
+  // What the browser has told the sender since it last looked, in order;
+  // the mail is left empty
+  pub fn takeMail(self &mut) List[Message] {
+    mut out = List[Message].empty();
+    out <=> mail;
+    out;
+  }
+
+  // How many messages are waiting to be read
+  pub fn unread(self &) usize { mail.len(); }
 
   // A new id, reserved now so the requests that follow can name it; the
   // part is live once its Spawn is applied
@@ -234,11 +287,36 @@ pub struct Door {
 pub struct Scene {
   pub door Door;
   placements Table[Transform3];
+  listeners Table[Bool];      // the parts whose clicks their sender wants
   pub applied u64;            // requests applied
   pub refused u64;            // requests naming a part that is not live (gone, or never spawned)
+  pub posted u64;             // messages posted to the Door, ever
 
   pub fn empty() Scene {
-    new Scene(Door.empty(), Table[Transform3].empty(), 0u64, 0u64);
+    new Scene(Door.empty(), Table[Transform3].empty(), Table[Bool].empty(), 0u64, 0u64, 0u64);
+  }
+
+  // Tell the sender something, through its Door: the browser's, never a
+  // sender's (a sender holds only the Door)
+  pub fn post(self &mut, m Message) {
+    door.mail.push(m);
+    posted = posted + 1u64;
+  }
+
+  // Whether part 'id''s sender listens for its clicks
+  pub fn isListening(self &, id PartId) Bool { listeners.find(id) != NO_ROW; }
+
+  // Part 'id''s name, for people; empty if it is gone
+  pub fn nameOf(self &, id PartId) String {
+    if !door.registry.alive(id.key) { return String.empty(); }
+    door.registry[id.key].name.copy();
+  }
+
+  pub fn applyListen(self &mut, id PartId) Bool {
+    if !self.isLive(id) { refused = refused + 1u64; return false; }
+    listeners.put(id, true);
+    applied = applied + 1u64;
+    true;
   }
 
   // The door's own, for the browser's code
@@ -294,6 +372,7 @@ pub struct Scene {
   pub fn applyDespawn(self &mut, id PartId) Bool {
     if !door.registry.alive(id.key) { refused = refused + 1u64; return false; }
     placements.remove(id);
+    listeners.remove(id);
     door.registry.remove(id.key);
     applied = applied + 1u64;
     true;

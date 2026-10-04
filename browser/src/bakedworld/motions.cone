@@ -1,0 +1,117 @@
+// The world's motions, each a formula of the scene's time (seconds, the
+// simulation's: exact on frame's synthetic clock), sent as Place and Fire
+// requests by BakedWorld.tick once a frame:
+//
+// - the ball bounces and spins: its height BOUNCE |sin(pi t / BOUNCE_PERIOD)|
+//   above its rest, turned SPIN radians a second about its own z;
+// - the button's cap sinks 3 cm for BUTTON_HELD after a press;
+// - the balloon (its six meshes, its flame and its pilot light, moved
+//   together) stands on the ground, its burner firing in the example's
+//   bursts (BURST_ON seconds every BURST_PERIOD); pressed, it rises at RISE
+//   with the burner held on, to CRUISE, where it bobs BOB either way every
+//   BOB_PERIOD with a short burst every ALOFT_PERIOD; pressed again (rising
+//   or aloft), the burner goes out and it comes down at SINK, to land and
+//   fire in bursts again. Pressed while coming down, it rises again.
+
+pub const BALL_RADIUS f32 = 0.5;
+const BOUNCE f32 = 1.6;            // metres, at the top of a bounce
+const BOUNCE_PERIOD f32 = 1.1;     // seconds, ground to ground
+const SPIN f32 = 3.;               // radians a second
+
+const BUTTON_HELD f64 = 0.25;
+
+pub const BURST_ON f64 = 3.;
+const BURST_PERIOD f64 = 4.;
+const RISE f32 = 2.5;              // metres a second
+const SINK f32 = 1.5;
+const CRUISE f32 = 30.;
+const BOB f32 = 0.6;
+const BOB_PERIOD f32 = 7.;
+const ALOFT_ON f64 = 2.;
+const ALOFT_PERIOD f64 = 6.;
+
+// The burner flame's place among the balloon's parts: after its six meshes
+const BALLOON_FLAME = 6usize;
+
+// The ball at time 'now', bouncing from 'rest'
+fn ballAt(rest Transform3, now f64) Transform3 {
+  imm t = f32.from(now);
+  imm h = BOUNCE * libc.fabsf(sin(pi * t / BOUNCE_PERIOD));
+  new Transform3(rest.translation + v(0., h, 0.), rest.rotation * Quat.angleAxis(SPIN * t, v(0., 0., 1.)), rest.scale);
+}
+
+// A burst of the burner: from 'start' until 'stop' (the scene's seconds)
+pub struct Burst {
+  pub start f64;
+  pub stop f64;
+}
+
+const GROUND = 0u32;
+const RISING = 1u32;   // climbing, then aloft
+const SINKING = 2u32;  // coming down, then landed
+
+// The balloon's flight: what it is doing since when, and from what altitude
+pub struct Flight {
+  pub state u32;
+  pub since f64;
+  pub from f32;
+  pub firedStart f64;          // the burst last sent
+  pub firedStop f64;
+
+  // On the ground from the start, its first burst sent with its Effect
+  pub fn grounded() Flight { new Flight(GROUND, 0d, 0., 0d, BURST_ON); }
+
+  // Whether it is going up (or aloft)
+  pub fn rising(self &) Bool { state == RISING; }
+
+  // When it reached CRUISE, rising
+  fn aloftAt(self &) f64 { since + f64.from((CRUISE - from) / RISE); }
+
+  // When it landed, sinking
+  fn landedAt(self &) f64 { since + f64.from(from / SINK); }
+
+  // The basket's height above the ground at 'now'
+  pub fn altitude(self &, now f64) f32 {
+    imm t = f32.from(now - since);
+    if state == RISING {
+      imm a = from + RISE * t;
+      if a < CRUISE { return a; }
+      return CRUISE + BOB * sin(2. * pi * f32.from(now - self.aloftAt()) / BOB_PERIOD);
+    }
+    if state == SINKING {
+      imm a = from - SINK * t;
+      return if a > 0. { a; } else { 0.; };
+    }
+    0.;
+  }
+
+  // Pressed at 'now': up if it is down or coming down, down if it is going up
+  pub fn pressed(self, now f64) Flight {
+    imm a = self.altitude(now);
+    imm next = if state == RISING { SINKING; } else { RISING; };
+    new Flight(next, now, a, firedStart, firedStop);
+  }
+
+  // The burner's burst at 'now'
+  pub fn burst(self &, now f64) Burst {
+    if state == RISING {
+      imm aloft = self.aloftAt();
+      if now < aloft { return new Burst(since, EFFECT_NEVER); }
+      return bursts(aloft, ALOFT_PERIOD, ALOFT_ON, now);
+    }
+    if state == SINKING {
+      imm landed = self.landedAt();
+      if now >= landed { return bursts(landed, BURST_PERIOD, BURST_ON, now); }
+      return new Burst(firedStart, if firedStop < since { firedStop; } else { since; });
+    }
+    bursts(since, BURST_PERIOD, BURST_ON, now);
+  }
+}
+
+// Bursts 'on' seconds long every 'period' from 'from': the one at 'now'
+fn bursts(from f64, period f64, on f64, now f64) Burst {
+  mut b = 0d;
+  if now > from { b = libc.floor((now - from) / period); }
+  imm start = from + b * period;
+  new Burst(start, start + on);
+}
