@@ -16,22 +16,129 @@ fn rookBox(lo Vec3, hi Vec3) mesh.PolyMesh {
   joinPlaced(&parts, &places, &mut problems);
 }
 
-fn rookMesh() mesh.Mesh {
+// The lathes' steps round a whole turn: 3.75 degrees each (the example's
+// 32, 11.25 degrees, showed facets)
+pub const ROOK_STEPS = 96u32;
+
+fn rookMesh(steps u32) mesh.Mesh {
   imm pts Array[Vec2, 9] = [p2(0., 0.), p2(0.9, 0.), p2(0.9, 0.15), p2(0.75, 0.25), p2(0.6, 0.35), p2(0.55, 1.2),
     p2(0.7, 1.35), p2(0.7, 1.7), p2(0., 1.7)];
   imm profile = Profile.fromPoints(&pts, false);
-  imm body = lathe(&profile, up(), 2. * pi, 32u32);
+  imm body = lathe(&profile, up(), 2. * pi, steps);
   mut problems = List[String].empty();
   // The hollow: a cylinder of radius 0.5 from 1.45 up through the top
   imm rect Array[Vec2, 4] = [p2(0., 1.45), p2(0.5, 1.45), p2(0.5, 2.), p2(0., 2.)];
   imm hollowProfile = Profile.fromPoints(&rect, false);
-  imm hollow = lathe(&hollowProfile, up(), 2. * pi, 32u32);
+  imm hollow = lathe(&hollowProfile, up(), 2. * pi, steps);
   imm cup = booleanDifference(&body, &hollow, &mut problems);
   // The crenellations: two bars 0.24 wide, cutting 0.2 down from the top
   imm bar1 = rookBox(v(-1., 1.5, -0.12), v(1., 2., 0.12));
   imm bar2 = rookBox(v(-0.12, 1.5, -1.), v(0.12, 2., 1.));
   imm once = booleanDifference(&cup, &bar1, &mut problems);
   imm rook = booleanDifference(&once, &bar2, &mut problems);
+  rook.triangulate(false);
+}
+
+// ---- The second rook, an experiment: the same rook with no booleans ----
+//
+// The body and its hollow are ONE lathe of an outline that goes up the
+// outside, over the rim (at the crenellations' floor) and down the inside
+// to the hollow's floor, as the balloon's basket is lathed. Each merlon is
+// the battlement's cross-section (a closed rectangle) lathed over a short
+// arc, its two open ends capped, then copied round four times and joined to
+// the body, standing on its rim. The notches between merlons have radial
+// sides (each a plane through the axis), where the boolean rook's, cut by
+// bars, are parallel.
+
+// 'm' with each hole closed by a face: a lathe over less than a whole turn
+// is left open at both ends
+fn capped(m &mesh.PolyMesh) mesh.PolyMesh {
+  mut counts = List[u32].empty();
+  mut indices = List[u32].empty();
+  mut f = 0usize;
+  while f < m.faceCount() {
+    imm vs = m.faceVertices(u32.from(f));
+    counts.push(u32.from(vs.len()));
+    mut i = 0usize;
+    while i < vs.len() { indices.push(*vs[i]); i = i + 1usize; }
+    f = f + 1usize;
+  }
+  mut seen = List[Bool].withCapacity(m.vertexCount());
+  mut k = 0usize;
+  while k < m.vertexCount() { seen.push(false); k = k + 1usize; }
+  mut holes = 0u32;
+  k = 0usize;
+  while k < m.vertexCount() {
+    if !*seen[k] and m.isBoundaryVertex(u32.from(k)) {
+      imm loop = boundaryLoop(m, u32.from(k));
+      counts.push(u32.from(loop.len()));
+      mut i = 0usize;
+      while i < loop.len() {
+        indices.push(*loop[i]);
+        seen.set(usize.from(*loop[i]), true);
+        i = i + 1usize;
+      }
+      holes = holes + 1u32;
+    }
+    k = k + 1usize;
+  }
+  mut problems = List[String].empty();
+  mesh.PolyMesh.fromPolygons(m.positions.view(), counts.view(), indices.view(), &mut problems);
+}
+
+// Holes a mesh has: boundary loops, counted (what 'capped' closed)
+pub fn holesIn(m &mesh.PolyMesh) u32 {
+  mut seen = List[Bool].withCapacity(m.vertexCount());
+  mut k = 0usize;
+  while k < m.vertexCount() { seen.push(false); k = k + 1usize; }
+  mut holes = 0u32;
+  k = 0usize;
+  while k < m.vertexCount() {
+    if !*seen[k] and m.isBoundaryVertex(u32.from(k)) {
+      imm loop = boundaryLoop(m, u32.from(k));
+      mut i = 0usize;
+      while i < loop.len() { seen.set(usize.from(*loop[i]), true); i = i + 1usize; }
+      holes = holes + 1u32;
+    }
+    k = k + 1usize;
+  }
+  holes;
+}
+
+// What the experiment found about the merlon's lathe, for the report
+mut merlonHolesBefore u32 = 0u32;
+mut merlonHolesAfter u32 = 0u32;
+
+fn lathedRookMesh(steps u32) mesh.Mesh {
+  // Up the outside to the crenellations' floor (1.5), in over the rim to
+  // the hollow's wall (0.5), down to its floor (1.45) and in to the axis
+  imm pts Array[Vec2, 11] = [p2(0., 0.), p2(0.9, 0.), p2(0.9, 0.15), p2(0.75, 0.25), p2(0.6, 0.35), p2(0.55, 1.2),
+    p2(0.7, 1.35), p2(0.7, 1.5), p2(0.5, 1.5), p2(0.5, 1.45), p2(0., 1.45)];
+  imm outline = Profile.fromPoints(&pts, false);
+  imm body = lathe(&outline, up(), 2. * pi, steps);
+  // A merlon: the battlement's section, 0.2 thick and 0.2 high, lathed over
+  // three sixteenths of a turn (67.5 degrees: the notches 22.5, about the
+  // bars' 0.24 at the wall's middle), its ends capped
+  imm sq Array[Vec2, 4] = [p2(0.5, 1.5), p2(0.7, 1.5), p2(0.7, 1.7), p2(0.5, 1.7)];
+  imm section = Profile.fromPoints(&sq, true);
+  imm arcSteps = steps * 3u32 / 16u32;
+  imm arc = 2. * pi * f32.from(arcSteps) / f32.from(steps);
+  imm open = lathe(&section, up(), arc, arcSteps);
+  merlonHolesBefore = holesIn(&open);
+  imm merlon = capped(&open);
+  merlonHolesAfter = holesIn(&merlon);
+  // Centred on 45 degrees, so the notches are on the axes, as the bars cut them
+  mut one = List[mesh.PolyMesh].empty();
+  one.push(merlon);
+  mut turn = List[Transform3].empty();
+  turn.push(new Transform3(v(0., 0., 0.), Quat.angleAxis(0.25 * pi - 0.5 * arc, up()), v(1., 1., 1.)));
+  mut problems = List[String].empty();
+  imm placed = joinPlaced(&one, &turn, &mut problems);
+  imm merlons = arrayRadial(&placed, 4u32, up(), 2. * pi, v(0., 0., 0.), -1.);
+  mut parts = List[mesh.PolyMesh].empty();
+  parts.push(body);
+  parts.push(merlons);
+  imm rook = join(&parts, &mut problems);
   rook.triangulate(false);
 }
 
@@ -109,8 +216,9 @@ fn chimneyMesh() mesh.Mesh {
   imm d = extrudeFaces(&c, &top, -1.2);
   imm sides Array[u32, 4] = [0u32, 1u32, 2u32, 3u32];
   imm cage = insetIndividual(&d, &sides, 0.2, -0.1);
-  imm fine = subdivide(&cage, 2u32);
-  fine.triangulate(true);
+  // The cage itself, flat-shaded: its edges sharp (the example subdivides
+  // twice only to show Catmull-Clark)
+  cage.triangulate(false);
 }
 
 // ---- The horn (hornfamily.cone, experiment 1's stage 0): an ellipse swept

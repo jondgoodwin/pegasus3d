@@ -1,0 +1,271 @@
+// A long real-time run, watched: '--watch SECONDS' runs the browser in its
+// window on the real clock for that long, printing a line a second (frames,
+// frame time, each phase's mean, fixed steps a frame, events, the scene's
+// queue and table sizes) and, every few seconds, a probe of how long a key
+// takes to move the viewer: a W (or S, alternately) pushed into SDL's own
+// queue (sdl.PushEvent, never the system's), timed from the push to the
+// frame that drew the walk moved, and let go again. Real input is ignored,
+// as in a scripted run, so nothing typed elsewhere disturbs it.
+
+mut watchSeconds u64 = 0u64;    // 0: not watching
+mut watchStart u64 = 0u64;      // GetTicksNS at the first frame
+mut watchLast u64 = 0u64;       // at the last second's line
+mut watchFrameAt u64 = 0u64;    // at the last present
+mut watchFrames u64 = 0u64;     // frames this second
+mut watchMaxFrame u64 = 0u64;   // the longest this second
+mut watchPhases Array[u64, 6] = [0u64, 0u64, 0u64, 0u64, 0u64, 0u64];
+mut watchSteps u64 = 0u64;
+mut watchEvents u64 = 0u64;
+mut watchStepMax u64 = 0u64;    // the most steps a frame took this second
+mut watchStepsBefore u64 = 0u64;
+
+// The key probe
+mut probeNext u64 = 0u64;       // when the next is pushed
+mut probeAt u64 = 0u64;         // when this one was pushed; 0: none under way
+mut probeSeen u64 = 0u64;       // when the input phase took it from SDL's queue
+mut probeFrom Vec3;             // where the walk was when it was pushed
+mut probeKey u32 = 0u;
+mut probeForward Bool = true;
+mut probeUp u64 = 0u64;         // the frame to let it go at
+mut probeCount u64 = 0u64;
+mut probeWorst u64 = 0u64;
+
+const PROBE_EVERY = 5000000000u64;   // ns between probes
+
+pub fn watching() Bool { watchSeconds > 0u64; }
+
+// A whole number from a C string, 0 if it is not one
+pub fn wholeNumber(s *u8) u64 {
+  mut n = 0u64;
+  mut i = 0usize;
+  while *(s + i) != 0u8 {
+    imm c = *(s + i);
+    if c < '0' or c > '9' { return 0u64; }
+    n = n * 10u64 + u64.from(c - '0');
+    i = i + 1usize;
+  }
+  n;
+}
+
+// SDL's window flags (SDL_GetWindowFlags), which the sdl package does not
+// bind: what the line reports of the window each second
+extern {
+  fn @c("SDL_GetWindowFlags") windowFlags(window *sdl.Window) u64;
+}
+const FLAG_OCCLUDED = 0x4u64;
+const FLAG_MINIMIZED = 0x40u64;
+const FLAG_INPUT_FOCUS = 0x200u64;
+
+mut watchNotOptimal u64 = 0u64;   // frames this second whose texture was not optimal
+mut watchPresentNs u64 = 0u64;    // this second: in the swapchain's present
+mut watchAcquireNs u64 = 0u64;    // and in acquiring the next texture
+
+// A frame's texture was not SUCCESS_OPTIMAL
+pub fn watchTexture(status u32) {
+  if status != SURFACE_TEXTURE_SUCCESS_OPTIMAL { watchNotOptimal = watchNotOptimal + 1u64; }
+}
+
+// The window's own events, named as they come
+fn windowEventName(t u32) &[]u8 {
+  if t == sdl.EVENT_WINDOW_FOCUS_GAINED { return "focus gained"; }
+  if t == sdl.EVENT_WINDOW_FOCUS_LOST { return "focus lost"; }
+  if t == sdl.EVENT_WINDOW_SHOWN { return "shown"; }
+  if t == sdl.EVENT_WINDOW_HIDDEN { return "hidden"; }
+  if t == sdl.EVENT_WINDOW_EXPOSED { return "exposed"; }
+  if t == sdl.EVENT_WINDOW_MINIMIZED { return "minimized"; }
+  if t == 0x20Bu { return "restored"; }
+  if t == 0x216u { return "occluded"; }
+  "";
+}
+
+// The input phase took one of the probe's events
+pub fn watchEvent(e &sdl.Event) {
+  if e.type >= 0x200u and e.type < 0x300u {
+    print <- "  window event 0x"; mut hex = String.empty(); hex.appendHex(u64.from(e.type), 3usize); printStr(hex.view());
+    print <- " "; printStr(windowEventName(e.type)); print <- " at "; print <- ms(sdl.GetTicksNS() - watchStart); print <- " ms\n";
+  }
+  if probeAt == 0u64 or probeSeen != 0u64 { return; }
+  if e.type == sdl.EVENT_KEY_DOWN and (e as &sdl.KeyboardEvent).which == SCRIPT_DEVICE {
+    probeSeen = sdl.GetTicksNS();
+  }
+}
+
+fn ms(ns u64) f64 { f64.from(ns) / 1000000d; }
+
+// After each present: the second's line, and the probe
+pub fn watchTick(host &mut Host, w &Walk, waiting usize, rows usize, emitters usize) {
+  imm now = sdl.GetTicksNS();
+  if watchStart == 0u64 {
+    watchStart = now;
+    watchLast = now;
+    watchFrameAt = now;
+    probeNext = now + PROBE_EVERY;
+    watchStepsBefore = host.stats.steps;
+    mut p = 0usize;
+    while p < 6usize { watchPhases[p] = host.stats.phase(u32.from(p)).total; p = p + 1usize; }
+    watchSteps = host.stats.steps;
+    watchEvents = host.stats.events;
+    return;
+  }
+  imm frameNs = now - watchFrameAt;
+  watchFrameAt = now;
+  watchFrames = watchFrames + 1u64;
+  if frameNs > watchMaxFrame { watchMaxFrame = frameNs; }
+  imm stepsThis = host.stats.steps - watchStepsBefore;
+  watchStepsBefore = host.stats.steps;
+  if stepsThis > watchStepMax { watchStepMax = stepsThis; }
+
+  // The probe: moved yet?
+  if probeAt != 0u64 and probeUp == 0u64 {
+    if !(w.position.x == probeFrom.x and w.position.z == probeFrom.z) {
+      imm lat = now - probeAt;
+      probeCount = probeCount + 1u64;
+      if lat > probeWorst { probeWorst = lat; }
+      print <- "  probe "; print <- probeCount; print <- ": key pushed to taken "; print <- ms(probeSeen - probeAt);
+      print <- " ms, to the moved walk presented "; print <- ms(lat); print <- " ms\n";
+      probeUp = host.frame + 6u64;
+    } elif now - probeAt > 3000000000u64 {
+      print <- "  probe: NO MOVE 3 s after the key was pushed\n";
+      probeCount = probeCount + 1u64;
+      probeWorst = now - probeAt;
+      probeUp = host.frame;
+    }
+  }
+  if probeUp != 0u64 and host.frame >= probeUp {
+    pushKey(probeKey, false);
+    probeAt = 0u64;
+    probeUp = 0u64;
+  }
+  if probeAt == 0u64 and now >= probeNext {
+    probeKey = if probeForward { sdl.SCANCODE_W; } else { sdl.SCANCODE_S; };
+    probeForward = !probeForward;
+    probeFrom = w.position;
+    probeSeen = 0u64;
+    probeAt = sdl.GetTicksNS();
+    pushKey(probeKey, true);
+    probeNext = probeAt + PROBE_EVERY;
+  }
+
+  // A line a second
+  if now - watchLast >= 1000000000u64 {
+    imm secs = (now - watchStart) / 1000000000u64;
+    print <- "t "; print <- secs; print <- " s: "; print <- watchFrames; print <- " frames, mean ";
+    print <- ms((now - watchLast) / watchFrames); print <- " ms, max "; print <- ms(watchMaxFrame); print <- " ms; phases (ms)";
+    mut p = 0usize;
+    while p < 6usize {
+      imm total = host.stats.phase(u32.from(p)).total;
+      print <- " "; print <- ms((total - watchPhases[p]) / watchFrames);
+      watchPhases[p] = total;
+      p = p + 1usize;
+    }
+    imm steps = host.stats.steps - watchSteps;
+    print <- "; steps "; print <- steps; print <- " (most a frame "; print <- watchStepMax; print <- ", dropped ";
+    print <- host.stats.dropped; print <- "); events "; print <- host.stats.events - watchEvents;
+    print <- "; waiting "; print <- waiting; print <- ", rows "; print <- rows; print <- ", emitters "; print <- emitters;
+    print <- ", frame samples "; print <- host.stats.frame.count(); print <- "; not optimal "; print <- watchNotOptimal; print <- "; present "; print <- ms(watchPresentNs / watchFrames);
+    print <- " ms, acquire "; print <- ms(watchAcquireNs / watchFrames); print <- " ms; window";
+    if host.hasWindow() {
+      imm flags = windowFlags(host.window().sdlHandle());
+      if (flags & FLAG_INPUT_FOCUS) != 0u64 { print <- " focused"; } else { print <- " unfocused"; }
+      if (flags & FLAG_OCCLUDED) != 0u64 { print <- " occluded"; }
+      if (flags & FLAG_MINIMIZED) != 0u64 { print <- " minimized"; }
+    }
+    print <- "\n";
+    watchNotOptimal = 0u64;
+    watchPresentNs = 0u64;
+    watchAcquireNs = 0u64;
+    watchSteps = host.stats.steps;
+    watchEvents = host.stats.events;
+    watchFrames = 0u64;
+    watchMaxFrame = 0u64;
+    watchStepMax = 0u64;
+    watchLast = now;
+  }
+  if now - watchStart >= watchSeconds * 1000000000u64 {
+    print <- "Watched "; print <- watchSeconds; print <- " s: "; print <- probeCount; print <- " probes, the slowest ";
+    print <- ms(probeWorst); print <- " ms\n";
+    host.stop();
+  }
+}
+
+// ---- The soak: a long synthetic run that checks nothing grows ----
+//
+// '--soak N' runs N frames on frame's synthetic clock (as --frames does)
+// and, once the world has all arrived, checks every frame that the scene's
+// inbox is empty after the apply point, and that the number of parts, of
+// rows the render system draws and of particle emitters stay what they
+// were; and every SOAK_WINDOW frames, that the CPU's work a frame (input,
+// simulate, publish and render, the phases the browser does itself; not
+// present, which waits for the display) is no more than twice what it was
+// in the first window, plus half a millisecond. It exits 1 if any check
+// failed. A queue that is not drained, a table or a list that grows a frame,
+// or work that grows with the time run would each fail it.
+
+mut soakFrames u64 = 0u64;      // 0: not soaking
+mut soakOk Bool = true;
+mut soakParts usize = 0usize;   // the sizes once the world is in
+mut soakRows usize = 0usize;
+mut soakEmitters usize = 0usize;
+mut soakFrom u64 = 0u64;        // the frame they were taken at
+mut soakWork Array[u64, 4] = [0u64, 0u64, 0u64, 0u64];
+mut soakFirst u64 = 0u64;       // the first window's work, ns a frame
+mut soakWorst u64 = 0u64;
+mut soakWindows u64 = 0u64;
+
+const SOAK_WINDOW = 3000u64;
+
+pub fn soaking() Bool { soakFrames > 0u64; }
+
+fn cpuWork(host &mut Host) Array[u64, 4] {
+  [host.stats.phase(0u32).total, host.stats.phase(1u32).total, host.stats.phase(3u32).total,
+    host.stats.phase(4u32).total];
+}
+
+// After each present of a soak
+pub fn soakTick(host &mut Host, worldDone Bool, parts usize, waiting usize, rows usize, emitters usize) {
+  if !worldDone { return; }
+  if soakFrom == 0u64 {
+    soakFrom = host.frame;
+    soakParts = parts;
+    soakRows = rows;
+    soakEmitters = emitters;
+    soakWork = cpuWork(host);
+    print <- "Soak: from frame "; print <- soakFrom; print <- ", "; print <- parts; print <- " parts, ";
+    print <- rows; print <- " rows drawn, "; print <- emitters; print <- " emitters\n";
+    return;
+  }
+  if waiting != 0usize or parts != soakParts or rows != soakRows or emitters != soakEmitters {
+    if soakOk {
+      print <- "Soak: at frame "; print <- host.frame; print <- " GREW: waiting "; print <- waiting; print <- ", parts ";
+      print <- parts; print <- ", rows "; print <- rows; print <- ", emitters "; print <- emitters; print <- "\n";
+    }
+    soakOk = false;
+  }
+  if (host.frame - soakFrom) % SOAK_WINDOW == 0u64 {
+    imm now = cpuWork(host);
+    mut sum = 0u64;
+    mut k = 0usize;
+    while k < 4usize { sum = sum + (now[k] - soakWork[k]); k = k + 1usize; }
+    soakWork = now;
+    imm perFrame = sum / SOAK_WINDOW;
+    soakWindows = soakWindows + 1u64;
+    if soakWindows == 1u64 { soakFirst = perFrame; }
+    if perFrame > soakWorst { soakWorst = perFrame; }
+    print <- "Soak: frames to "; print <- host.frame; print <- ", the browser's work "; print <- ms(perFrame);
+    print <- " ms a frame\n";
+    if perFrame > 2u64 * soakFirst + 500000u64 {
+      print <- "Soak: the work a frame GREW from "; print <- ms(soakFirst); print <- " ms\n";
+      soakOk = false;
+    }
+  }
+}
+
+pub fn soakReport() i32 {
+  if soakWindows < 2u64 {
+    print <- "Soak: too short to judge (wants "; print <- 2u64 * SOAK_WINDOW; print <- " frames after the world is in)\n";
+    return 1i32;
+  }
+  print <- "Soak: "; print <- soakWindows; print <- " windows of "; print <- SOAK_WINDOW; print <- " frames, the work a frame ";
+  print <- ms(soakFirst); print <- " ms at first, at most "; print <- ms(soakWorst); print <- " ms";
+  if soakOk { print <- ": OK\n"; 0i32; } else { print <- ": FAILED\n"; 1i32; };
+}
