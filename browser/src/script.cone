@@ -4,16 +4,20 @@
 // at the top of the next. On frame's synthetic clock (one 1/60 s step a
 // frame, none on the first), the walk they give is exact, and is checked.
 //
-//   frames 1-29     standing 8 m from the post, facing it      shot "start" at 20
-//   frames 30-149   W held: 120 steps at 1.5 m/s, 3 m forward   shot "walked" at 160
-//   frames 170-199  D held: 30 steps, a twelfth of a turn right shot "turned" at 210
+//   frames 1-29     standing 8 m back from the origin, facing -z  shot "start" at 20
+//                   (the world arrives an object a frame, frames 1 to 7)
+//   frames 30-149   W held: 120 steps at 1.5 m/s, 3 m forward,
+//                   up to the rook, the urn and the flower        shot "walked" at 160
+//   frames 170-199  D held: 30 steps, a twelfth of a turn right   shot "turned" at 210
 //   frames 220-279  Shift and W held: 60 steps at 6 m/s, 6 m on that heading
+//   frames 300-569  Shift and W held: 270 steps, 27 m on, to 13 m from the
+//                   balloon's basket                              shot "balloon" at 580
 
 // The device the script's events claim (no real keyboard has it)
 pub const SCRIPT_DEVICE = 0x5C1u;
 
 // The frames a scripted run needs
-pub const SCRIPT_FRAMES = 300u64;
+pub const SCRIPT_FRAMES = 600u64;
 
 fn pushKey(scancode u32, down Bool) {
   mut e = sdl.Event.empty();
@@ -33,11 +37,11 @@ pub fn pushScript(f u64) {
   if f == 150u64 { pushKey(sdl.SCANCODE_W, false); }
   if f == 170u64 { pushKey(sdl.SCANCODE_D, true); }
   if f == 200u64 { pushKey(sdl.SCANCODE_D, false); }
-  if f == 220u64 {
+  if f == 220u64 or f == 300u64 {
     pushKey(sdl.SCANCODE_LSHIFT, true);
     pushKey(sdl.SCANCODE_W, true);
   }
-  if f == 280u64 {
+  if f == 280u64 or f == 570u64 {
     pushKey(sdl.SCANCODE_W, false);
     pushKey(sdl.SCANCODE_LSHIFT, false);
   }
@@ -46,12 +50,18 @@ pub fn pushScript(f u64) {
 // A part made and taken away again through the scene's requests, and a
 // request sent afterwards to its stale id, which must be refused
 mut tempPart PartId;          // set by the module's init
+mut tempApplied u64 = 0u64;   // the scene's counts just before it was made
+mut tempRefused u64 = 0u64;
+mut tempSent u64 = 0u64;
 
 // The script's scene requests, sent after frame 'f' is presented
 pub fn driveScene(f u64) {
   if f == 3u64 {
+    tempApplied = scene.applied;
+    tempRefused = scene.refused;
+    tempSent = scene.door.sent;
     tempPart = scene.newPart("temporary cube");
-    scene.send(Request.Show[tempPart, Mesh.cube(0.5), Look.plain(new Color(1., 0., 0., 1.)), 0.]);
+    scene.send(Request.Show[tempPart, Mesh.cube(0.5), Look.plain(new Color(1., 0., 0., 1.)), Image.empty(), 0.]);
   }
   if f == 5u64 { scene.send(Request.Despawn[tempPart]); }
   if f == 7u64 { scene.send(Request.Place[tempPart, Transform3.identity()]); }
@@ -62,6 +72,7 @@ pub fn shotAt(f u64) &[]u8 {
   if f == 20u64 { return "start"; }
   if f == 160u64 { return "walked"; }
   if f == 210u64 { return "turned"; }
+  if f == 580u64 { return "balloon"; }
   "";
 }
 
@@ -72,26 +83,66 @@ fn near(name &[]u8, got f32, want f32, within f32) Bool {
   ok;
 }
 
+// The world's parts each the scene's: live, placed, and (with a GPU) drawn
+// or giving off particles. The world was handed only the Door, which holds
+// no table: that is the compiler's to check (scene's tables are private to
+// the scene module), and this checks what the world sent arrived.
+fn checkWorld() Bool {
+  mut ok = world.done();
+  print <- "The world: "; print <- world.ids.len(); print <- " parts sent (want "; print <- WORLD_PARTS; print <- ")";
+  if !world.done() { print <- ", NOT every object sent"; }
+  if world.ids.len() != WORLD_PARTS { ok = false; }
+  mut live = 0usize;
+  mut placed = 0usize;
+  mut drawn = 0usize;
+  mut i = 0usize;
+  while i < world.ids.len() {
+    imm id = *world.ids[i];
+    if scene.isLive(id) { live = live + 1usize; }
+    if scene.isPlaced(id) { placed = placed + 1usize; }
+    if isDrawn(id) { drawn = drawn + 1usize; }
+    i = i + 1usize;
+  }
+  print <- "; live "; print <- live; print <- ", placed "; print <- placed;
+  if hasGpu() { print <- ", drawn or emitting "; print <- drawn; }
+  print <- "\n";
+  if live != WORLD_PARTS or placed != WORLD_PARTS { ok = false; }
+  if hasGpu() and drawn != WORLD_PARTS { ok = false; }
+  print <- "  the scene: "; print <- scene.partCount(); print <- " parts (want "; print <- SHELL_PARTS + WORLD_PARTS;
+  print <- "); sent "; print <- scene.door.sent; print <- " = applied "; print <- scene.applied; print <- " + refused ";
+  print <- scene.refused; print <- " (want 1), waiting "; print <- scene.waiting(); print <- "\n";
+  if scene.partCount() != SHELL_PARTS + WORLD_PARTS or scene.door.sent != scene.applied + scene.refused
+    or scene.refused != 1u64 or scene.waiting() != 0usize { ok = false; }
+  if !ok { print <- "  the world's injection is WRONG\n"; }
+  ok;
+}
+
+// The parts the world sends: six objects of one part, the balloon's six and its flame
+const WORLD_PARTS = 13usize;
+
 // What the script's events must have done by the end of frame 'f'
 pub fn checkScript(f u64, w &Walk) Bool {
   mut ok = true;
   if f == 2u64 {
-    // The shell's requests, applied at frame 1's apply point: three spawns,
-    // two placements, two shows and the sky
-    print <- "Frame 2: requests applied "; print <- scene.applied; print <- " (want 8), refused ";
-    print <- scene.refused; print <- " (want 0), waiting "; print <- scene.waiting(); print <- "\n";
-    if scene.applied != 8u64 or scene.refused != 0u64 or scene.waiting() != 0usize { ok = false; }
+    // The shell's requests and the world's first object's, applied at
+    // frame 1's apply point
+    print <- "Frame 2: requests applied "; print <- scene.applied; print <- " (want "; print <- scene.door.sent;
+    print <- "), refused "; print <- scene.refused; print <- " (want 0), waiting "; print <- scene.waiting(); print <- "\n";
+    if scene.applied != scene.door.sent or scene.refused != 0u64 or scene.waiting() != 0usize { ok = false; }
   }
   if f == 9u64 {
-    // The temporary cube spawned and shown (2), despawned (1); the Place to
-    // its stale id refused
-    print <- "Frame 9: requests applied "; print <- scene.applied; print <- " (want 11), refused ";
-    print <- scene.refused; print <- " (want 1), parts "; print <- scene.partCount(); print <- " (want 3)";
+    // Since frame 3: the temporary cube spawned and shown, despawned, the
+    // Place to its stale id refused; the world's requests all applied
+    imm sent = scene.door.sent - tempSent;
+    print <- "Frame 9: since frame 3, sent "; print <- sent; print <- ", applied "; print <- scene.applied - tempApplied;
+    print <- " (want "; print <- sent - 1u64; print <- "), refused "; print <- scene.refused - tempRefused;
+    print <- " (want 1)";
     if scene.isReserved(tempPart) { print <- ", the stale id still RESERVED"; ok = false; }
     print <- "\n";
-    if scene.applied != 11u64 or scene.refused != 1u64 or scene.partCount() != 3usize { ok = false; }
+    if scene.applied - tempApplied != sent - 1u64 or scene.refused - tempRefused != 1u64 { ok = false; }
   }
   if f == 29u64 {
+    ok = checkWorld() and ok;
     print <- "Frame 29, standing:\n";
     ok = near("x", w.position.x, 0., 0.) and ok;
     ok = near("z", w.position.z, 8., 0.) and ok;
@@ -113,6 +164,13 @@ pub fn checkScript(f u64, w &Walk) Bool {
     print <- "Frame 290, after 60 steps of Shift and W:\n";
     ok = near("x", w.position.x, 3., 0.002) and ok;
     ok = near("z", w.position.z, 5. - 5.196152, 0.002) and ok;
+  }
+  if f == 590u64 {
+    // 27 m more on that heading: 33 m in all from (0, 5)
+    print <- "Frame 590, after 270 more steps of Shift and W:\n";
+    ok = near("x", w.position.x, 16.5, 0.01) and ok;
+    ok = near("z", w.position.z, 5. - 28.578838, 0.01) and ok;
+    ok = checkWorld() and ok;
   }
   ok;
 }

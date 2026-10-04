@@ -1,0 +1,262 @@
+// The baked-in world: what the browser shows before it can fetch one. It
+// stands in for a world that arrives from elsewhere, so it reaches the
+// browser exactly as a downloaded one will: it is given the scene's Door,
+// reserves ids and sends requests, and nothing else. It never sees a scene
+// table, the render system or a GPU handle (the scene module keeps them
+// private: the Door is all a sender can hold).
+//
+// HYDRATE, THEN INJECT. Each object is a description in Cone, ported from
+// the example programs of Cone's sculpt and vfx packages (examples are not
+// importable, and these are this world's own content, not library code).
+// Hydrating one runs its description through the libraries into plain data:
+// meshes, paint images, emitters, placements (a Hydrated, which holds no
+// id and touches no scene). Injecting it reserves an id for each of its
+// parts and sends that part's Spawn, Place and Show (or Effect) through the
+// Door. The Hydrated is the message: when worlds arrive from another actor,
+// that actor hydrates and sends the Hydrated, and only 'inject' runs here.
+//
+// One object is hydrated and injected a call ('step'), so the browser keeps
+// drawing frames while a world arrives, its objects appearing one by one.
+//
+// THE OBJECTS, in metres on the plane (y up; the viewer starts at (0, 8)
+// facing -z):
+//   a chess rook, 1.4 m        (sculpt's rook: a lathe and three booleans)
+//   an urn, 1 m                (sculpt's vase: a lathe, a lattice, a wall)
+//   a flower, 1.8 m across     (sculpt's flower: a petal swept, arrayed, subdivided)
+//   a boulder, 2 m             (sculpt's pebble: a box subdivided and Taubin-smoothed,
+//                               then once more)
+//   a horn, 3 m along          (sculpt's horn family, stage 0: an ellipse swept and ribbed)
+//   a chimney stack, 3.5 m     (sculpt's chimney: a cube grown by face operators)
+//   a hot-air balloon, 25 m    (sculpt's balloon, the photograph's chevrons, its
+//                               envelope painted; vfx's burner flame on it, held
+//                               mid-burst)
+//
+// Its files are one module, and only this one, the designated file, imports:
+//
+//   bakedworld.cone   the objects' list and places, hydrate, inject, step
+//   balloon.cone      the balloon and its paint
+//   flame.cone        the burner's flame
+//   sculptures.cone   the rook, the urn, the flower, the boulder, the horn, the chimney
+
+mod bakedworld;
+
+import stdio use *;
+import libc;
+import sdl;
+import collections use *;
+import geomath use *;
+import mesh;
+import noise;
+import sculpt use *;
+import render use Image;
+import vfx use Emitter, SHAPE_DISC;
+import parts use *;
+
+fn v(x f32, y f32, z f32) Vec3 { new Vec3(x, y, z); }
+fn p2(x f32, y f32) Vec2 { new Vec2(x, y); }
+fn up() Vec3 { v(0., 1., 0.); }
+fn fract(x f32) f32 { x - libc.floorf(x); }
+
+// sRGB 0-255 as a linear colour
+fn srgb(r f32, g f32, b f32) Color {
+  new Color(libc.powf(r / 255., 2.2), libc.powf(g / 255., 2.2), libc.powf(b / 255., 2.2), 1.);
+}
+
+// ---- Hydrated: an object as data ----
+
+// One part of an object: what it is called, drawn as and where it stands
+pub struct PartDesc {
+  pub name String;
+  pub shape mesh.Mesh;
+  pub look Look;
+  pub paint Image;
+  pub at Transform3;
+
+  pub fn empty() PartDesc {
+    new PartDesc(String.empty(), mesh.Mesh.empty(), Look.plain(new Color(1., 1., 1., 1.)), Image.empty(),
+      Transform3.identity());
+  }
+}
+
+// One effect of an object: its layers, where they start, the seed and the
+// moment they are held at
+pub struct EffectDesc {
+  pub name String;
+  pub layers List[EffectLayer];
+  pub at Transform3;
+  pub seed u32;
+  pub time f64;
+
+  pub fn empty() EffectDesc {
+    new EffectDesc(String.empty(), List[EffectLayer].empty(), Transform3.identity(), 0u32, 0d);
+  }
+}
+
+// An object hydrated: its parts and effects, ready to send
+pub struct Hydrated {
+  pub parts List[PartDesc];
+  pub effects List[EffectDesc];
+
+  pub fn empty() Hydrated { new Hydrated(List[PartDesc].empty(), List[EffectDesc].empty()); }
+
+  pub fn add(self &mut, name &[]u8, shape mesh.Mesh, look Look, paint Image, at Transform3) {
+    parts.push(new PartDesc(String.from(name), shape, look, paint, at));
+  }
+
+  // How many triangles its meshes have
+  pub fn triangles(self &) u64 {
+    mut n = 0u64;
+    mut i = 0usize;
+    while i < parts.len() {
+      n = n + u64.from(parts[i].shape.triangleCount());
+      i = i + 1usize;
+    }
+    n;
+  }
+}
+
+// ---- The world's objects ----
+
+pub const OBJECTS = 7u32;
+imm NAMES Array[&[]u8, 7] = ["rook", "urn", "flower", "boulder", "horn", "chimney", "balloon"];
+
+// Object 'k''s name
+pub fn objectName(k u32) &[]u8 { NAMES[usize.from(k)]; }
+
+// Where each stands: x, z, its yaw (radians) and its scale (metres a unit)
+imm PLACES Array[f32, 28] = [
+  -1.3, 0.6, 0.3, 0.8,          // the rook, near the walk's first stop
+  1.4, 1.0, 0., 0.5,            // the urn
+  0.2, 1.8, 0.2, 0.75,          // the flower
+  8.5, -4., 0.6, 1.,            // the boulder
+  -4.5, -6., -1.9, 1.,          // the horn, curving towards the path
+  -10., -17., 0.4, 1.,          // the chimney
+  23., -34.84, 0.7, 9.];        // the balloon: 40 m along the walk's run, 9 m a unit
+
+fn placeOf(k u32, y f32) Transform3 {
+  imm i = usize.from(k) * 4usize;
+  imm s = PLACES[i + 3usize];
+  new Transform3(v(PLACES[i], y, PLACES[i + 1usize]), Quat.angleAxis(PLACES[i + 2usize], up()), v(s, s, s));
+}
+
+// A mesh moved so it stands on y = 0 centred on its own axis (x = z = 0)
+fn grounded(m mesh.Mesh) mesh.Mesh {
+  mut out = m;
+  imm b = out.bounds();
+  out.transform(Mat4.fromTranslation(v(0. - (b.min.x + b.max.x) * 0.5, 0. - b.min.y, 0. - (b.min.z + b.max.z) * 0.5)));
+  out;
+}
+
+// Object 'k' as data: every mesh made and painted, every part placed
+pub fn hydrate(k u32) Hydrated {
+  mut h = Hydrated.empty();
+  if k == 0u32 {
+    h.add("rook", grounded(rookMesh()), Look.shiny(srgb(232., 222., 196.), 0.5, 40.), Image.empty(), placeOf(k, 0.));
+  } elif k == 1u32 {
+    h.add("urn", grounded(urnMesh()), Look.shiny(srgb(176., 84., 48.), 0.15, 16.), Image.empty(), placeOf(k, 0.));
+  } elif k == 2u32 {
+    h.add("flower", grounded(flowerMesh()), Look.shiny(srgb(232., 92., 140.), 0.25, 24.), Image.empty(), placeOf(k, 0.));
+  } elif k == 3u32 {
+    h.add("boulder", grounded(boulderMesh()), Look.plain(srgb(128., 122., 112.)), Image.empty(), placeOf(k, 0.));
+  } elif k == 4u32 {
+    h.add("horn", grounded(hornMesh()), Look.shiny(srgb(70., 46., 30.), 0.6, 48.), Image.empty(), placeOf(k, 0.));
+  } elif k == 5u32 {
+    h.add("chimney", grounded(chimneyMesh()), Look.plain(srgb(150., 70., 50.)), Image.empty(), placeOf(k, 0.));
+  } elif k == 6u32 {
+    hydrateBalloon(&mut h, k);
+  }
+  h;
+}
+
+// ---- Inject: an object's parts sent through the Door ----
+
+// Every part of 'h' reserved and sent: its Spawn, its Place, its Show or
+// Effect. The ids go into 'ids'. 'h' is taken apart (its meshes move into
+// the requests).
+pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId]) {
+  imm parts = h.parts.viewMut();
+  mut i = 0usize;
+  while i < parts.len {
+    mut p = PartDesc.empty();
+    p <=> parts[i];
+    imm id = door.newPart(p.name.view());
+    door.send(Request.Place[id, p.at]);
+    mut paint = Image.empty();
+    paint <=> p.paint;
+    mut shape = mesh.Mesh.empty();
+    shape <=> p.shape;
+    door.send(Request.Show[id, shape, p.look, paint, 0.]);
+    ids.push(id);
+    i = i + 1usize;
+  }
+  imm effects = h.effects.viewMut();
+  i = 0usize;
+  while i < effects.len {
+    mut e = EffectDesc.empty();
+    e <=> effects[i];
+    imm id = door.newPart(e.name.view());
+    door.send(Request.Place[id, e.at]);
+    mut layers = List[EffectLayer].empty();
+    layers <=> e.layers;
+    door.send(Request.Effect[id, layers, e.seed, e.time]);
+    ids.push(id);
+    i = i + 1usize;
+  }
+}
+
+// ---- The world's progress ----
+
+// What hydrating one object cost
+pub struct Hydration {
+  pub object u32;
+  pub parts u32;
+  pub triangles u64;
+  pub seconds f64;            // hydrating it (the meshes and the paint)
+  pub injectSeconds f64;      // sending it
+}
+
+pub struct BakedWorld {
+  next u32;
+  pub ids List[PartId];       // every part it has sent, in the order sent
+  pub log List[Hydration];
+
+  pub fn make() BakedWorld { new BakedWorld(0u32, List[PartId].empty(), List[Hydration].empty()); }
+
+  // Whether every object has been sent
+  pub fn done(self &) Bool { next >= OBJECTS; }
+
+  // Hydrate the next object and send it through 'door'; false once there
+  // are none left
+  pub fn step(self &mut, door &mut Door) Bool {
+    if next >= OBJECTS { return false; }
+    imm hz = f64.from(sdl.GetPerformanceFrequency());
+    imm t0 = sdl.GetPerformanceCounter();
+    mut h = hydrate(next);
+    imm t1 = sdl.GetPerformanceCounter();
+    imm parts = u32.from(h.parts.len() + h.effects.len());
+    imm tris = h.triangles();
+    inject(&mut h, door, &mut ids);
+    imm t2 = sdl.GetPerformanceCounter();
+    log.push(new Hydration(next, parts, tris, f64.from(t1 - t0) / hz, f64.from(t2 - t1) / hz));
+    next = next + 1u32;
+    true;
+  }
+
+  // The log, printed
+  pub fn report(self &) {
+    mut total = 0d;
+    mut tris = 0u64;
+    mut i = 0usize;
+    while i < log.len() {
+      imm e = log[i];
+      print <- "  "; printStr(objectName(e.object)); print <- ": "; print <- e.parts; print <- " parts, ";
+      print <- e.triangles; print <- " triangles; hydrated in "; print <- e.seconds * 1000d; print <- " ms, sent in ";
+      print <- e.injectSeconds * 1000d; print <- " ms\n";
+      total = total + e.seconds + e.injectSeconds;
+      tris = tris + e.triangles;
+      i = i + 1usize;
+    }
+    print <- "  all: "; print <- ids.len(); print <- " parts, "; print <- tris; print <- " triangles, ";
+    print <- total * 1000d; print <- " ms\n";
+  }
+}

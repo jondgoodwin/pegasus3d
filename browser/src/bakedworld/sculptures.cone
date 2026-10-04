@@ -1,0 +1,184 @@
+// The smaller objects, each ported from one of sculpt's example programs
+// (packages/sculpt/examples/), in its own units; the world scales and
+// places them. Each answers its finest mesh as triangles with smooth or flat
+// normals.
+
+// ---- The rook (rook.cone): a profile lathed, hollowed and crenellated by
+// three booleans ----
+
+// A box from lo to hi: the cube cage, scaled and moved
+fn rookBox(lo Vec3, hi Vec3) mesh.PolyMesh {
+  mut parts = List[mesh.PolyMesh].empty();
+  parts.push(mesh.PolyMesh.cube(0.5));
+  mut places = List[Transform3].empty();
+  places.push(new Transform3((lo + hi) * 0.5, Quat.identity(), hi - lo));
+  mut problems = List[String].empty();
+  joinPlaced(&parts, &places, &mut problems);
+}
+
+fn rookMesh() mesh.Mesh {
+  imm pts Array[Vec2, 9] = [p2(0., 0.), p2(0.9, 0.), p2(0.9, 0.15), p2(0.75, 0.25), p2(0.6, 0.35), p2(0.55, 1.2),
+    p2(0.7, 1.35), p2(0.7, 1.7), p2(0., 1.7)];
+  imm profile = Profile.fromPoints(&pts, false);
+  imm body = lathe(&profile, up(), 2. * pi, 32u32);
+  mut problems = List[String].empty();
+  // The hollow: a cylinder of radius 0.5 from 1.45 up through the top
+  imm rect Array[Vec2, 4] = [p2(0., 1.45), p2(0.5, 1.45), p2(0.5, 2.), p2(0., 2.)];
+  imm hollowProfile = Profile.fromPoints(&rect, false);
+  imm hollow = lathe(&hollowProfile, up(), 2. * pi, 32u32);
+  imm cup = booleanDifference(&body, &hollow, &mut problems);
+  // The crenellations: two bars 0.24 wide, cutting 0.2 down from the top
+  imm bar1 = rookBox(v(-1., 1.5, -0.12), v(1., 2., 0.12));
+  imm bar2 = rookBox(v(-0.12, 1.5, -1.), v(0.12, 2., 1.));
+  imm once = booleanDifference(&cup, &bar1, &mut problems);
+  imm rook = booleanDifference(&once, &bar2, &mut problems);
+  rook.triangulate(false);
+}
+
+// ---- The urn (vase.cone): a cylinder reshaped by a 3 x 3 x 3 lattice,
+// given a wall, subdivided twice ----
+
+// Each control point of ring j moved out from the axis (y) by 'scale'
+fn scaleRing(lat &mut Lattice, j u32, scale f32) {
+  mut k = 0u32;
+  while k < 3u32 {
+    mut i = 0u32;
+    while i < 3u32 {
+      imm p = lat.rest(i, j, k);
+      lat.setPoint(i, j, k, v(p.x * scale, p.y, p.z * scale));
+      i = i + 1u32;
+    }
+    k = k + 1u32;
+  }
+}
+
+fn urnMesh() mesh.Mesh {
+  imm pts Array[Vec2, 9] = [p2(0., 0.), p2(1., 0.), p2(1., 0.25), p2(1., 0.5), p2(1., 0.75), p2(1., 1.), p2(1., 1.25),
+    p2(1., 1.5), p2(1., 2.)];
+  imm profile = Profile.fromPoints(&pts, false);
+  imm cylinder = lathe(&profile, up(), 2. * pi, 24u32);
+  mut lat = Lattice.regular(v(-1., 0., -1.), v(2., 0., 0.), v(0., 2., 0.), v(0., 0., 2.), 3u32, 3u32, 3u32);
+  scaleRing(&mut lat, 0u32, 1.3);
+  scaleRing(&mut lat, 1u32, 0.4);
+  scaleRing(&mut lat, 2u32, 1.2);
+  imm shaped = latticeDeform(&cylinder, &lat, LatticeBernstein);
+  imm cage = solidify(&shaped, 0.05, -1., true, true);
+  imm fine = subdivide(&cage, 2u32);
+  fine.triangulate(true);
+}
+
+// ---- The flower (flower.cone): a petal swept along a curve, seven round
+// an axis, subdivided twice ----
+
+fn flowerMesh() mesh.Mesh {
+  imm profile = Profile.roundedRectangle(0.24, 0.05, 0.02, 2u32);
+  imm curve = new CubicBezier3(v(0.1, 0., 0.), v(0.4, 0.3, 0.), v(0.9, 0.45, 0.), v(1.2, 0.35, 0.));
+  imm path = Path.fromCubic(curve, 12u32);
+  imm petal = sweep(&profile, &path, 0., 0.6, 0.15, true);
+  imm flower = arrayRadial(&petal, 7u32, up(), 2. * pi, v(0., 0., 0.), -1.);
+  imm smooth = subdivide(&flower, 2u32);
+  smooth.triangulate(true);
+}
+
+// ---- The boulder (pebble.cone): a 2 x 1 x 0.6 box cut finer by two levels
+// of Catmull-Clark and smoothed 20 times by Taubin's lambda|mu, laid flat ----
+
+fn boulderMesh() mesh.Mesh {
+  imm rect = Profile.rectangle(2., 1.);
+  imm box = extrude(&rect, v(0., 0., 0.6), 1u32, true);
+  imm cage = subdivide(&box, 2u32);
+  imm kept = smoothTaubin(&cage, 0.5, taubinMu(0.5, TaubinPassBand), 20u32);
+  // One more level than the example's, so its outline is round at arm's length
+  imm finer = subdivide(&kept, 1u32);
+  mut m = finer.triangulate(true);
+  // Laid on its broad side: its 0.6 upright
+  m.transform(Mat4.fromTrs(v(0., 0., 0.), Quat.angleAxis(0. - 0.5 * pi, v(1., 0., 0.)), v(1., 1., 1.)));
+  m;
+}
+
+// ---- The chimney (chimney.cone): a cube grown by inset and extrude into a
+// stack with a flue, its sides panelled, subdivided twice ----
+
+fn chimneyMesh() mesh.Mesh {
+  imm cube = mesh.PolyMesh.cube(1.);
+  // The cube's faces: back 0, front 1, left 2, right 3, bottom 4, top 5
+  imm top Array[u32, 1] = [5u32];
+  imm a = inset(&cube, &top, 0.5, 0.);
+  imm b = extrudeFaces(&a, &top, 1.5);
+  imm c = inset(&b, &top, 0.15, 0.);
+  imm d = extrudeFaces(&c, &top, -1.2);
+  imm sides Array[u32, 4] = [0u32, 1u32, 2u32, 3u32];
+  imm cage = insetIndividual(&d, &sides, 0.2, -0.1);
+  imm fine = subdivide(&cage, 2u32);
+  fine.triangulate(true);
+}
+
+// ---- The horn (hornfamily.cone, experiment 1's stage 0): an ellipse swept
+// along an arc, tapering, its ribs a channel displaced along the normals ----
+
+const HORN_AROUND = 64u32;     // outline points
+const HORN_RINGS = 360u32;     // path segments: about 16 rings a rib at 22 ribs
+
+// The stage horn: 3 long, its base's radius 0.12 of that, bent 0.9 radians
+const HORN_LENGTH f32 = 3.;
+const HORN_GIRTH f32 = 0.12;
+const HORN_BEND f32 = 0.9;
+const HORN_TAPER f32 = 1.;
+const HORN_BLADE f32 = 1.25;
+
+fn clampF(x f32, lo f32, hi f32) f32 { if x < lo {lo;} elif x > hi {hi;} else {x;}; }
+
+// The path: a circular arc of the bend and the horn's length, as one cubic
+// Bezier (the arc's usual four-thirds-tangent fit), bending towards +x
+fn hornPath() Path {
+  imm side = v(1., 0., 0.);
+  imm rho = HORN_LENGTH / HORN_BEND;
+  imm tip = side * (rho * (1. - cos(HORN_BEND))) + up() * (rho * sin(HORN_BEND));
+  imm tipDir = side * sin(HORN_BEND) + up() * cos(HORN_BEND);
+  imm k = 4. / 3. * tan(HORN_BEND / 4.) * rho;
+  Path.fromCubic(new CubicBezier3(v(0., 0., 0.), up() * k, tip - tipDir * k, tip), HORN_RINGS);
+}
+
+fn hornRadius(u f32) f32 {
+  imm r0 = HORN_GIRTH * HORN_LENGTH;
+  r0 * (0.03 + 0.97 * libc.powf(1. - clampF(u, 0., 1.), HORN_TAPER));
+}
+
+fn hornMesh() mesh.Mesh {
+  // The bare horn: the blade swept at unit scale, each ring then scaled
+  // about its path point by the taper
+  mut pts = List[Vec2].withCapacity(usize.from(HORN_AROUND));
+  imm w = libc.sqrtf(HORN_BLADE);
+  mut j = 0u32;
+  while j < HORN_AROUND {
+    imm a = 2. * pi * f32.from(j) / f32.from(HORN_AROUND);
+    pts.push(p2(cos(a) * w, sin(a) / w));
+    j = j + 1u32;
+  }
+  imm outline = Profile.fromPoints(pts.view(), true);
+  imm path = hornPath();
+  mut m = sweep(&outline, &path, 0., 1., 1., true);
+  imm frames = path.frames();
+  imm along = m.findFloatChannel(mesh.VertexDomain, "along");
+  mut k = 0usize;
+  while k < m.vertexCount() {
+    imm ring = k / usize.from(HORN_AROUND);
+    imm o = frames[ring].origin;
+    imm p = *m.positions[k];
+    m.positions.set(k, o + (p - o) * hornRadius(m.float(along, u32.from(k))));
+    k = k + 1usize;
+  }
+  // Regular ribs, 22 along it
+  imm ribs = RibField.plain(22., 7u32);
+  ribField(&mut m, "ribs", &ribs);
+  // Their height, times the local radius, along the normals
+  imm ribChannel = m.findFloatChannel(mesh.VertexDomain, "ribs");
+  imm lift = m.addFloatChannel(mesh.VertexDomain, "lift", 0.);
+  mut q = 0u32;
+  while q < u32.from(m.vertexCount()) {
+    m.setFloat(lift, q, m.float(ribChannel, q) * 0.14 * hornRadius(m.float(along, q)));
+    q = q + 1u32;
+  }
+  imm horn = displaceAlongNormal(&m, "lift", 1.);
+  horn.triangulate(true);
+}
