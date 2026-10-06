@@ -1,0 +1,413 @@
+// The scene: the parts of the world and how they change.
+//
+// A PART is an id, not a container. One registry gives every part its id (a
+// slot and a generation, the pool package's Ref, so an id whose part has gone
+// is detected, never mistaken for whatever takes its slot next). What a part
+// IS lives elsewhere, in tables keyed by its id, each owned by the system the
+// aspect belongs to: the scene owns placement; the render system owns how a
+// part looks, its effects and the sky (rendersys.cone). Later systems
+// (physics, picking, behaviour) add tables of their own the same way, and a
+// part may be in any of them or none.
+//
+// CHANGES ARRIVE AS REQUESTS. Nothing outside a table's owner writes into it.
+// Whoever wants the scene changed (the browser's own shell, the baked-in
+// world) sends a Request into the scene's inbox, and the browser applies the
+// inbox once a frame, at one point (the publish phase), routing each request
+// to the system that owns what it changes. That is the shape a message to an
+// actor has, so moving the systems onto actors later changes who drains the
+// inbox, not what is sent.
+//
+// The one thing a sender does directly is RESERVE an id, so it can name the
+// part in the requests that follow (Bevy's Commands reserve an entity the
+// same way): the part is reserved, not yet live, until its Spawn is applied.
+//
+// MESSAGES GO THE OTHER WAY. What the browser tells a sender (a click on a
+// part it listens for: Request.Listen, then Message.Clicked) is posted into
+// the Door's mail by the browser, through the Scene, and the sender takes it
+// out when it next looks: a sender's own inbox, as an actor's would be.
+//
+// A SENDER IS GIVEN THE DOOR, NOT THE SCENE. The Door holds the registry,
+// the inbox and the mail and offers only reserving ids, sending requests,
+// reading its mail and asking whether an id is still reserved; the
+// placement table, the listeners, posting and the apply
+// methods are the Scene's. This module is the privacy boundary (a member not
+// 'pub' is private to the module that declares its type), so a world handed
+// '&mut scene.door' cannot reach a table or apply anything, and the module is
+// its own (not a file of the browser's root) so that the browser and a world
+// can both reach it without an import loop. (It is called 'parts', not
+// 'scene', because the browser's scene is a global named 'scene'.)
+
+mod parts;
+
+import collections use *;
+import pool use *;
+import geomath use *;
+import mesh use Mesh;
+import render use Image;
+import vfx use Emitter;
+
+// What the registry holds for a part: its name, for people, and whether its
+// Spawn has been applied
+pub struct PartRecord {
+  pub name String;
+  pub live Bool;
+}
+
+// A part's id: a slot of the registry and which occupant of it
+pub struct PartId {
+  pub key Ref[PartRecord];
+
+  pub fn none() PartId { new PartId(Ref[PartRecord].none()); }
+  pub fn isNone(self) Bool { key.isNone(); }
+  pub fn slot(self) u32 { key.slot(); }
+  pub fn `==`(self, other PartId) Bool { key == other.key; }
+}
+
+// No row: what 'Table.find' answers for a part not in the table
+pub const NO_ROW = 0xFFFFFFFFusize;
+
+// An aspect table: one row of T per part that has the aspect, packed (the
+// rows are a plain list to iterate), and a sparse index from a part's slot to
+// its row (a sparse set, as EnTT and Flecs keep components). A row is found
+// only by the id it was put with, generation and all.
+pub struct Table[T] {
+  pub rows List[T];
+  pub ids List[PartId];       // the part each row belongs to
+  index List[u32];            // a slot's row plus one; 0 where it has none
+
+  pub fn empty() Table[T] { new Table[T](List[T].empty(), List[PartId].empty(), List[u32].empty()); }
+
+  pub fn len(self &) usize { rows.len(); }
+
+  // The row of part 'id', or NO_ROW
+  pub fn find(self &, id PartId) usize {
+    imm s = usize.from(id.slot());
+    if s >= index.len() { return NO_ROW; }
+    imm r = *index[s];
+    if r == 0u32 { return NO_ROW; }
+    imm row = usize.from(r - 1u32);
+    if !(*ids[row] == id) { return NO_ROW; }
+    row;
+  }
+
+  // Give part 'id' the row 'value', replacing the one it had
+  pub fn put(self &mut, id PartId, value T) {
+    imm row = self.find(id);
+    if row != NO_ROW {
+      rows.set(row, value);
+      return;
+    }
+    imm s = usize.from(id.slot());
+    while index.len() <= s { index.push(0u32); }
+    index.set(s, u32.from(rows.len()) + 1u32);
+    rows.push(value);
+    ids.push(id);
+  }
+
+  // Take part 'id''s row away (the last row moves into its place),
+  // answering whether it had one
+  pub fn remove(self &mut, id PartId) Bool {
+    imm row = self.find(id);
+    if row == NO_ROW { return false; }
+    imm last = rows.len() - 1usize;
+    if row != last {
+      rows.swap(row, last);
+      ids.swap(row, last);
+      index.set(usize.from((*ids[row]).slot()), u32.from(row) + 1u32);
+    }
+    rows.pop();
+    ids.pop();
+    index.set(usize.from(id.slot()), 0u32);
+    true;
+  }
+}
+
+// How a part's surface looks: a colour (linear), a highlight, and
+// optionally a checkerboard of two shades of it. A Show may also carry a
+// painted image, which the colour then multiplies. A physical look is drawn
+// with render's physically based material instead (rough or glossy by its
+// roughness, which a Show's ORM map can vary across the surface, and bumpy
+// by a Show's normal map); the others with its Blinn-Phong one.
+pub struct Look {
+  pub color Color;
+  pub specular f32;           // the highlight's strength; 0: none
+  pub shininess f32;
+  pub checker Bool;           // a checkerboard over the mesh's uvs, its light squares the colour
+  pub checkerShade f32;       // and its dark ones the colour times this
+  pub physical Bool;          // drawn physically based
+  pub roughness f32;          // its roughness, 0 to 1 (times the ORM map's green)
+  pub metallic f32;           // its metalness, 0 to 1 (times the ORM map's blue)
+
+  pub fn plain(color Color) Look { new Look(color, 0., 1., false, 1., false, 1., 0.); }
+  pub fn shiny(color Color, specular f32, shininess f32) Look {
+    new Look(color, specular, shininess, false, 1., false, 1., 0.);
+  }
+  pub fn checkered(color Color, shade f32) Look { new Look(color, 0., 1., true, shade, false, 1., 0.); }
+  pub fn physicallyBased(color Color, roughness f32, metallic f32) Look {
+    new Look(color, 0., 1., false, 1., true, roughness, metallic);
+  }
+}
+
+// A physical look's maps, read through the mesh's uvs like the paint: a
+// tangent-space normal map (+y towards +v) and an ORM map (occlusion,
+// roughness, metallic in red, green, blue: glTF's packing), both linear;
+// either empty for none
+pub struct Maps {
+  pub normal Image;
+  pub orm Image;
+
+  pub fn none() Maps { new Maps(Image.empty(), Image.empty()); }
+}
+
+// The sky and the sun: what fills everything no part covers, and the light
+pub struct SkyLook {
+  pub color Color;            // linear
+  pub sunDirection Vec3;      // towards the sun
+  pub sunColor Color;
+  pub ambient Color;
+}
+
+// How an effect's emitter is drawn (the vfx package's STYLE_ numbers)
+pub const EFFECT_SPRITES = 0u32;
+pub const EFFECT_TRAILS = 1u32;
+
+// One layer of an effect: an emitter, in the part's frame, and how it is drawn
+pub struct EffectLayer {
+  pub emitter Emitter;
+  pub style u32;              // EFFECT_SPRITES or EFFECT_TRAILS
+}
+
+// A change to the scene, as sent. The system that owns what it changes
+// applies it, in the order sent.
+pub enum Request {
+  // Part 'id' (reserved by Door.reserve) becomes live, named 'name'
+  pub struct Spawn {
+    pub id PartId;
+    pub name String;
+  }
+  // Part 'id' goes, with every aspect it has; its id goes stale
+  pub struct Despawn {
+    pub id PartId;
+  }
+  // Part 'id' is placed at 'at', in the world's coordinates (metres, y up)
+  pub struct Place {
+    pub id PartId;
+    pub at Transform3;
+  }
+  // Part 'id' is drawn as 'mesh' (moved in: the request owns it until the
+  // render system uploads it) with 'surface', and painted with 'paint' (an
+  // image read through the mesh's uvs, multiplied by the surface's colour;
+  // empty for none), and, if the surface is physical, by its 'maps'. A
+  // non-zero 'anchor' draws it under the viewer wherever the viewer is,
+  // moved only in steps of 'anchor' metres across the ground, so a ground
+  // of that period never ends
+  pub struct Show {
+    pub id PartId;
+    pub mesh Mesh;
+    pub surface Look;
+    pub paint Image;
+    pub maps Maps;
+    pub anchor f32;
+  }
+  // Part 'id' gives off particles: each layer an emitter, at the part's
+  // placement, fired with 'seed' from 'start' until 'stop' (seconds on the
+  // scene's clock; EFFECT_NEVER: it never stops) and drawn as it is at the
+  // scene's time now, every frame: an effect is live. Particles already
+  // born live out their lives after it stops.
+  pub struct Effect {
+    pub id PartId;
+    pub layers List[EffectLayer];
+    pub seed u32;
+    pub start f64;
+    pub stop f64;
+  }
+  // Part 'id''s effect fired again, from 'start' until 'stop', with 'seed'
+  // (a burner's burst): its layers kept, the burst before forgotten
+  pub struct Fire {
+    pub id PartId;
+    pub seed u32;
+    pub start f64;
+    pub stop f64;
+  }
+  // Part 'id''s clicks are wanted: each one hit is posted to the sender's
+  // Door as a Message.Clicked
+  pub struct Listen {
+    pub id PartId;
+  }
+  // Part 'id' drawn highlighted ('on') or as it is: the browser's own, for
+  // what was picked
+  pub struct Highlight {
+    pub id PartId;
+    pub on Bool;
+  }
+  // Part 'id' is the sky
+  pub struct Sky {
+    pub id PartId;
+    pub look SkyLook;
+  }
+  // Nothing: what an applied request's place holds once it is taken
+  pub struct Done;
+}
+
+// An effect that never stops firing
+pub const EFFECT_NEVER f64 = 1.0e30d;
+
+// What the browser tells a sender, through its Door: the other way from a
+// Request. (A message to an actor, when worlds are actors.)
+pub enum Message {
+  // Part 'id', whose clicks the sender listens for, was clicked
+  pub struct Clicked {
+    pub id PartId;
+  }
+  // Nothing: what a taken message's place holds
+  pub struct Read;
+}
+
+// What a sender is given: reserving ids and sending requests, and reading
+// what it is told; nothing that reaches a table
+pub struct Door {
+  registry Pool[PartRecord];
+  inbox List[Request];
+  mail List[Message];         // what the browser has told the sender, not yet read
+  pub sent u64;               // requests sent through it, ever
+
+  pub fn empty() Door { new Door(Pool[PartRecord].empty(), List[Request].empty(), List[Message].empty(), 0u64); }
+
+  // What the browser has told the sender since it last looked, in order;
+  // the mail is left empty
+  pub fn takeMail(self &mut) List[Message] {
+    mut out = List[Message].empty();
+    out <=> mail;
+    out;
+  }
+
+  // How many messages are waiting to be read
+  pub fn unread(self &) usize { mail.len(); }
+
+  // A new id, reserved now so the requests that follow can name it; the
+  // part is live once its Spawn is applied
+  pub fn reserve(self &mut) PartId {
+    new PartId(registry.add(new PartRecord(String.empty(), false)));
+  }
+
+  // Send a request, to be applied at the frame's apply point
+  pub fn send(self &mut, r Request) {
+    inbox.push(r);
+    sent = sent + 1u64;
+  }
+
+  // Reserve a part and send its Spawn: the usual way to make one
+  pub fn newPart(self &mut, name &[]u8) PartId {
+    imm id = self.reserve();
+    self.send(Request.Spawn[id, String.from(name)]);
+    id;
+  }
+
+  // Whether part 'id' has been reserved and not yet despawned
+  pub fn isReserved(self &, id PartId) Bool { registry.alive(id.key); }
+}
+
+// The door, and the placement table
+pub struct Scene {
+  pub door Door;
+  placements Table[Transform3];
+  listeners Table[Bool];      // the parts whose clicks their sender wants
+  pub applied u64;            // requests applied
+  pub refused u64;            // requests naming a part that is not live (gone, or never spawned)
+  pub posted u64;             // messages posted to the Door, ever
+
+  pub fn empty() Scene {
+    new Scene(Door.empty(), Table[Transform3].empty(), Table[Bool].empty(), 0u64, 0u64, 0u64);
+  }
+
+  // Tell the sender something, through its Door: the browser's, never a
+  // sender's (a sender holds only the Door)
+  pub fn post(self &mut, m Message) {
+    door.mail.push(m);
+    posted = posted + 1u64;
+  }
+
+  // Whether part 'id''s sender listens for its clicks
+  pub fn isListening(self &, id PartId) Bool { listeners.find(id) != NO_ROW; }
+
+  // Part 'id''s name, for people; empty if it is gone
+  pub fn nameOf(self &, id PartId) String {
+    if !door.registry.alive(id.key) { return String.empty(); }
+    door.registry[id.key].name.copy();
+  }
+
+  pub fn applyListen(self &mut, id PartId) Bool {
+    if !self.isLive(id) { refused = refused + 1u64; return false; }
+    listeners.put(id, true);
+    applied = applied + 1u64;
+    true;
+  }
+
+  // The door's own, for the browser's code
+  pub fn reserve(self &mut) PartId { door.reserve(); }
+  pub fn send(self &mut, r Request) { door.send(r); }
+  pub fn newPart(self &mut, name &[]u8) PartId { door.newPart(name); }
+
+  // The requests waiting, taken out to be applied; the inbox is left empty
+  pub fn takeInbox(self &mut) List[Request] {
+    mut batch = List[Request].empty();
+    batch <=> door.inbox;
+    batch;
+  }
+
+  // How many requests are waiting
+  pub fn waiting(self &) usize { door.inbox.len(); }
+
+  // Whether part 'id' is live
+  pub fn isLive(self &, id PartId) Bool {
+    if !door.registry.alive(id.key) { return false; }
+    door.registry[id.key].live;
+  }
+
+  // Whether part 'id' has been reserved and not yet despawned
+  pub fn isReserved(self &, id PartId) Bool { door.registry.alive(id.key); }
+
+  // How many parts are reserved or live
+  pub fn partCount(self &) usize { door.registry.len(); }
+
+  // Whether part 'id' has a placement
+  pub fn isPlaced(self &, id PartId) Bool { placements.find(id) != NO_ROW; }
+
+  // ---- What the scene applies itself ----
+
+  pub fn applySpawn(self &mut, id PartId, name String) Bool {
+    if !door.registry.alive(id.key) { refused = refused + 1u64; return false; }
+    imm rec = &mut door.registry[id.key];
+    rec.name = name;
+    rec.live = true;
+    applied = applied + 1u64;
+    true;
+  }
+
+  pub fn applyPlace(self &mut, id PartId, at Transform3) Bool {
+    if !self.isLive(id) { refused = refused + 1u64; return false; }
+    placements.put(id, at);
+    applied = applied + 1u64;
+    true;
+  }
+
+  // The scene's own part of a despawn: the placement and the id. The other
+  // systems drop their rows for it first.
+  pub fn applyDespawn(self &mut, id PartId) Bool {
+    if !door.registry.alive(id.key) { refused = refused + 1u64; return false; }
+    placements.remove(id);
+    listeners.remove(id);
+    door.registry.remove(id.key);
+    applied = applied + 1u64;
+    true;
+  }
+
+  // Where part 'id' is, as a matrix: its placement, or where it was made
+  // (the origin) if it has none
+  pub fn worldMatrix(self &, id PartId) Mat4 {
+    imm row = placements.find(id);
+    if row == NO_ROW { return Mat4.identity(); }
+    imm t = *placements.rows[row];
+    Mat4.fromTrs(t.translation, t.rotation, t.scale);
+  }
+}

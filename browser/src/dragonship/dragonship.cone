@@ -1,0 +1,115 @@
+// The dragonship: Elizabeth's "Starship 1", the skeletal dragon ship,
+// ported from Cone's packages/starship for the baked-in world. Its
+// description is signed distance fields composed from the sdf package's
+// primitives, and it is meshed on the GPU by surface nets (sdfmesh's
+// GridMesher and the ship's own kernels): exemplar content, so it lives in
+// the browser, not in a library package. A module of its own, a sister of
+// bakedworld, because the ship's field folds in names ('v', 'minf' ...)
+// the world's files also define.
+//
+//   ../../gpu/shipfield.cone   the GPU half: the field over its description
+//                              (ShipData, one buffer) and the kernels, compiled
+//                              into the browser and into browser.spv
+//   ship.cone                  the description built on the CPU (makeShip), the
+//                              lights (and the stars, not used here)
+//   gpumesh.cone               the GPU meshing: shipfield's kernels and
+//                              sdfmesh's GridMesher, through gpuwork
+//
+// THE WORLD'S OWN GPU. Meshing wants a GPU device. The world is never handed
+// the browser's (it holds only the Door), so it makes its own: an instance
+// and a compute device with no surface, made once, the first time the ship
+// is meshed. The meshes come back to the CPU as plain Meshes and are sent
+// through the Door like any others, to be uploaded by the render system.
+
+mod dragonship;
+
+import stdio use *;
+import libc;
+import sdl;
+import collections use *;
+import geomath use *;
+import mesh;
+import noise;
+import sculpt;
+import time use Instant;
+import gpu use *;
+import gpuwork use *;
+import sdf use *;
+import sdfmesh use *;
+import shipfield use *;
+
+// The finest level's cells, in the ship's units (the demo's level 0)
+pub const SHIP_CELL f32 = 0.03;
+
+// The ship meshed: its frame, its membranes, its lights by kind (wing,
+// port, eye, mouth: one mesh of balls each), and what it cost
+pub struct ShipMeshes {
+  pub frame mesh.Mesh;
+  pub membrane mesh.Mesh;
+  pub lights List[mesh.Mesh];
+  pub ok Bool;
+  pub deviceOnlyMs f64;       // making the world's GPU instance and device
+  pub deviceMs f64;           // and the kernels too
+  pub describeMs f64;         // the two descriptions, on the CPU
+  pub frameMs f64;            // meshing the frame on the GPU
+  pub membraneMs f64;         // and the membranes
+}
+
+fn millis(t Instant) f64 { f64.from((Instant.now() - t).micros()) / 1000d; }
+
+// The ship, meshed at SHIP_CELL on a GPU device of the world's own, in the
+// ship's units (x from the snout to the tail, y up, about 15.6 long)
+pub fn meshShip() ShipMeshes {
+  mut out = new ShipMeshes(mesh.Mesh.empty(), mesh.Mesh.empty(), List[mesh.Mesh].empty(), false, 0d, 0d, 0d, 0d, 0d);
+  imm t0 = Instant.now();
+  mut instance = Instance.create("browser world");
+  mut none = Surface.none();
+  mut preference = POWER_PREFERENCE_HIGH_PERFORMANCE;
+  imm env = libc.getenv(&"GPU_POWER_PREFERENCE" as *u8);
+  if (env as usize) != 0usize and libc.strcmp(env, &"low-power" as *u8) == 0i32 { preference = POWER_PREFERENCE_LOW_POWER; }
+  mut adapter = instance.requestAdapter(&none, preference);
+  if !instance.isValid() or !adapter.isValid() {
+    print <- "The world has no GPU to mesh the ship on\n";
+    return out;
+  }
+  mut device = adapter.requestDevice();
+  out.deviceOnlyMs = millis(t0);
+  imm sm = ShipMesher.make(&device);
+  if !sm.isValid() {
+    print <- "The ship's kernels could not be made (browser.spv, sdfmesh.spv)\n";
+    return out;
+  }
+  out.deviceMs = millis(t0);
+
+  imm t1 = Instant.now();
+  imm frameShip = makeShip(false, ALL);
+  imm skinShip = makeShip(true, ALL);
+  out.describeMs = millis(t1);
+
+  mut times = GpuTimes.zero();
+  mut stats = new GpuStats(0u64, 0u32, 0u32, false);
+  imm t2 = Instant.now();
+  out.frame = sm.meshShip(&mut device, &frameShip, shipBounds(&frameShip), SHIP_CELL, 1u32, true, &mut times, &mut stats);
+  out.frameMs = millis(t2);
+  imm frameOk = stats.ok;
+  imm t3 = Instant.now();
+  out.membrane = sm.meshShip(&mut device, &skinShip, shipBounds(&skinShip), SHIP_CELL, 1u32, true, &mut times, &mut stats);
+  out.membraneMs = millis(t3);
+  out.ok = frameOk and stats.ok;
+
+  // The lights: a ball each, gathered by kind
+  mut k = 0usize;
+  while k < 4usize { out.lights.push(mesh.Mesh.empty()); k = k + 1usize; }
+  imm glows = lights(&frameShip);
+  mut i = 0usize;
+  while i < glows.len() {
+    imm l = glows[i];
+    mut ball = mesh.Mesh.sphere(1., 8);
+    ball.transform(Mat4.fromTrs(l.at, Quat.identity(), l.size));
+    imm group = &mut out.lights[usize.from(l.kind)];
+    group.append(&ball);
+    i = i + 1usize;
+  }
+  device.waitIdle();
+  out;
+}

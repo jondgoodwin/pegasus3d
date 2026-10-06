@@ -1,0 +1,107 @@
+// Picking: what a click hits. A ray from the eye through the place clicked
+// is tested against every shown part, nearest hit first: the part's box (its
+// mesh's bounds in its own frame) and then, if the box is hit nearer than
+// the best so far, each of its triangles. The ray is taken into each part's
+// own frame (by the inverse of its placement), so a part is tested where it
+// is drawn, and the distance along the ray (in multiples of its direction,
+// which is unit length in the world) is the same in every frame.
+//
+// The picking system owns its own table, keyed by part id like the render
+// system's: a copy of each part's positions and triangles, taken when its
+// Show is applied (the render system uploads the mesh and keeps no CPU
+// copy). An anchored part (the ground) is not pickable.
+
+pub struct PickShape {
+  pub bounds Aabb3;            // in the part's own frame
+  pub positions List[Vec3];
+  pub indices List[u32];
+}
+
+// What a click hit: the part (none if nothing), how far along the ray, and
+// the work it took
+pub struct PickHit {
+  pub id PartId;
+  pub distance f32;
+  pub boxesHit u32;            // parts whose box the ray entered
+  pub triangles u64;           // triangles tested
+}
+
+pub struct PickSystem {
+  pub shapes Table[PickShape];
+
+  pub fn empty() PickSystem { new PickSystem(Table[PickShape].empty()); }
+
+  // Part 'id' is drawn as 'm': keep its positions and triangles
+  pub fn shape(self &mut, id PartId, m &Mesh) {
+    mut ps = List[Vec3].withCapacity(m.positions.len());
+    mut i = 0usize;
+    while i < m.positions.len() { ps.push(*m.positions[i]); i = i + 1usize; }
+    mut ix = List[u32].withCapacity(m.indices.len());
+    i = 0usize;
+    while i < m.indices.len() { ix.push(*m.indices[i]); i = i + 1usize; }
+    shapes.put(id, new PickShape(Aabb3.fromPoints(m.positions.view()), ps, ix));
+  }
+
+  pub fn drop(self &mut, id PartId) { shapes.remove(id); }
+
+  // The nearest part 'ray' (in the world) hits
+  pub fn pick(self &, scene &Scene, ray Ray3) PickHit {
+    mut best = new PickHit(PartId.none(), 1.0e30, 0u32, 0u64);
+    mut i = 0usize;
+    while i < shapes.len() {
+      imm id = *shapes.ids[i];
+      imm s = shapes.rows[i];
+      imm inv = scene.worldMatrix(id).inverse();
+      imm own = new Ray3(inv * ray.origin, inv.transformVector(ray.direction));
+      imm enter = hitAt(own.intersectAabb(s.bounds));
+      if enter >= 0. and enter < best.distance {
+        best.boxesHit = best.boxesHit + 1u32;
+        mut t = 0usize;
+        while t + 2usize < s.indices.len() {
+          imm a = *s.positions[usize.from(*s.indices[t])];
+          imm b = *s.positions[usize.from(*s.indices[t + 1usize])];
+          imm c = *s.positions[usize.from(*s.indices[t + 2usize])];
+          imm d = hitAt(own.intersectTriangle(a, b, c));
+          if d >= 0. and d < best.distance {
+            best.distance = d;
+            best.id = id;
+          }
+          t = t + 3usize;
+        }
+        best.triangles = best.triangles + u64.from(s.indices.len() / 3usize);
+      }
+      i = i + 1usize;
+    }
+    best;
+  }
+}
+
+// A hit's distance, or -1 for a miss
+fn hitAt(h Option[f32]) f32 {
+  match h {
+    case imm s Some { s.value; }
+    else { -1.; }
+  }
+}
+
+// The ray from the eye at 'pose' through the place (x, y) of a view w by h
+// (the window's own units, y down), for a camera of vertical field of view
+// 'fov'
+pub fn rayThrough(pose Pose, fov f32, x f32, y f32, w f32, h f32) Ray3 {
+  imm tanHalf = tan(fov * 0.5);
+  imm nx = (2. * x / w - 1.) * tanHalf * (w / h);
+  imm ny = (1. - 2. * y / h) * tanHalf;
+  imm dir = (pose.orientation * new Vec3(nx, ny, -1.)).normalize();
+  new Ray3(pose.origin, dir);
+}
+
+// Where world point 'p' is seen in a view w by h from the eye at 'pose'
+// (the window's own units, y down): the inverse of rayThrough, for the
+// script to click on what it wants
+pub fn placeOnView(pose Pose, fov f32, p Vec3, w f32, h f32) Vec2 {
+  imm seenFrom = pose.orientation.inverse() * (p - pose.origin);
+  imm tanHalf = tan(fov * 0.5);
+  imm nx = seenFrom.x / (0. - seenFrom.z) / (tanHalf * (w / h));
+  imm ny = seenFrom.y / (0. - seenFrom.z) / tanHalf;
+  new Vec2((nx + 1.) * 0.5 * w, (1. - ny) * 0.5 * h);
+}
