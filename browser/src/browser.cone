@@ -57,6 +57,7 @@ import pool use *;
 import geomath use *;
 import bonepose;
 import walkgait;
+import sculpt;
 import mesh use Mesh;
 import gpu use *;
 import render use *;
@@ -72,6 +73,10 @@ import boidflock use Flock, FlockParams;
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
 // of parts that imports it
 use parts;
+// The island: its land baked once, and what the browser asks of it
+use island { writePreview, bake as bakeIsland, heightGrid, pathGrid, pathDistanceAt, maskImage, fineMesh, coarseMesh, waterMesh, CELL, N, HALF,
+  FINE_I0, FINE_J0, FINE_I1, FINE_J1, groundHeight as islandHeight, constrain as islandConstrain, WORLD_DX, WORLD_DZ,
+  START_X as BEACH_X, START_Z as BEACH_Z, insideFence as insideIslandFence, pathCentreline };
 use bakedworld { BakedWorld, ROOK, LATHED_ROOK, BALL, BALLOON, BUTTON as LAUNCH_BUTTON, AMPHORA, HORNFLOWER, COTTAGE, LANTERNS,
   COTTAGE_ROOT, COTTAGE_ROOF, COTTAGE_DOOR, COTTAGE_STACK, COTTAGE_PORCH, COTTAGE_PANES, COTTAGE_LANTERNS, COTTAGE_PARTS, LANTERN_PARTS,
   ALARM_AT };
@@ -112,8 +117,12 @@ const HEADLESS_W f32 = 1280.;
 const HEADLESS_H f32 = 720.;
 const FOV f32 = 1.0471976;    // 60 degrees, vertical
 
-// Where the viewer starts: 8 m back from the origin, facing down -z
-const START_Z f32 = 8.;
+// Where the old flat world's viewer started (8 m back from its origin, facing
+// down -z), with the old world shifted onto the island's lowland (island.cone's
+// WORLD_DX, WORLD_DZ): the scripted walk's second part begins here. The
+// browser's own start is the landing beach.
+const START_X f32 = WORLD_DX;
+const START_Z f32 = 8. + WORLD_DZ;
 
 // SDL3's scancodes for P and F (the sdl package binds only some letters)
 const SCANCODE_F = 9u;
@@ -245,28 +254,40 @@ fn addMannequin(name &[]u8, at Vec3, yaw f32, height f32, seed u32, color Color)
   cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, parts)));
 }
 
-// How many parts a mannequin is: its own and a part a bone
-const FIGURE_PARTS = 20usize;
-const FIGURE_MESHES = 19u64;
+// How many parts a mannequin is (its own, shown as its skinned body) and
+// how many meshes (the body)
+const FIGURE_PARTS = 1usize;
+const FIGURE_MESHES = 1u64;
 
 // ---- start ----
 
+// The point at (x, z) on the ground, for a being to stand on
+fn standing(x f32, z f32) Vec3 { new Vec3(x, groundHeight(x, z), z); }
+
 pub fn start(host &mut Host) bool {
   automated = host.config.frames > 0u64 or watching();
+  // The island's land is baked first (the beings stand on it), then sent
+  imm bakeStart = sdl.GetPerformanceCounter();
+  bakeIsland();
+  print <- "The island: baked in "; print <- f64.from(sdl.GetPerformanceCounter() - bakeStart) * 1000d
+    / f64.from(sdl.GetPerformanceFrequency()); print <- " ms\n";
   seedScene(&mut scene);
   if scripted {
-    // The scripted run keeps its exact walk checks: it starts as the plain
-    // walker, 8 m back from the origin, facing -z, and takes the mannequin
-    // over by pressing Tab at its end. The mannequins stand off to the right.
-    imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(0., 0., START_Z), 0.)));
+    // The scripted run starts as the plain walker on the landing beach,
+    // facing -z up the path's first stretch; its walk is checked there, then
+    // it is set down at the old flat world's start (START_X, START_Z) and
+    // keeps its exact walk checks from there. It takes the mannequin over by
+    // pressing Tab at its end. The mannequins stand off to the right of that start.
+    imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(BEACH_X, islandHeight(BEACH_X, BEACH_Z),
+      BEACH_Z), 0.)));
     cast.possess(youAt);
-    addMannequin("mannequin", new Vec3(5., 0., START_Z), 0., 1.75, 3u32, woodColor());
-    addMannequin("second mannequin", new Vec3(3.5, 0., START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
+    addMannequin("mannequin", standing(START_X + 5., START_Z), 0., 1.75, 3u32, woodColor());
+    addMannequin("second mannequin", standing(START_X + 3.5, START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
   } else {
-    // The user's own being: a mannequin 8 m back from the origin, facing -z,
-    // possessed, seen from behind and above; another stands a few metres off
-    imm youAt = addMannequin("mannequin", new Vec3(0., 0., START_Z), 0., 1.75, 3u32, woodColor());
-    addMannequin("second mannequin", new Vec3(3., 0., START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
+    // The user's own being: a mannequin on the landing beach, facing -z up
+    // the path, possessed, seen from behind and above; another stands a few metres off
+    imm youAt = addMannequin("mannequin", standing(BEACH_X, BEACH_Z), 0., 1.75, 3u32, woodColor());
+    addMannequin("second mannequin", standing(BEACH_X + 3., BEACH_Z - 4.), 2.356, 1.62, 11u32, clayColor());
     cast.possess(youAt);
   }
   cast.look(1. / 60.);
@@ -313,7 +334,7 @@ pub fn start(host &mut Host) bool {
   mut camera = Camera.make();
   camera.fov = FOV;
   camera.near = 0.1;
-  camera.far = 1500.;
+  camera.far = 6000.;           // the island is 1.3 km across, the sea runs to the horizon
   imm target = swapchain.getCurrentTexture(&mut device);
   gfx = Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, post, sys, renderer, swapchain, device,
     adapter, surface, instance, camera)];
@@ -454,19 +475,13 @@ fn placeBeings() {
   }
 }
 
-// Each mannequin's bones placed, each in its parent's frame: the pose the
-// gait wrote this step, and the scene's tree composes the rest
+// Each mannequin posed: the skinning matrices of the pose the gait wrote
+// this step, for its one skinned part (mannequin.cone)
 fn placeFigures() {
   mut i = 0usize;
   while i < cast.beings.len() {
     imm b = &mut cast.beings[i];
-    if b.figure.active {
-      mut k = 0usize;
-      while k < b.figure.parts.len() {
-        scene.send(Request.Place[*b.figure.parts[k], *b.figure.pose.locals[k]]);
-        k = k + 1usize;
-      }
-    }
+    if b.figure.active { scene.send(Request.Bones[b.part, b.figure.skinning()]); }
     i = i + 1usize;
   }
 }
@@ -555,6 +570,30 @@ fn applyRequests() {
             }
             else { unrendered = unrendered + 1u64; }
           }
+        }
+      }
+      case mut ds &mut DefineSkinnedMesh {
+        if scene.applyDefine(ds.mesh.id, KIND_MESH) {
+          // Picked as modelled; drawn posed
+          picks.shape(ds.mesh, &ds.shape);
+          match &mut g {
+            case mut some &mut Some {
+              some.value.sys.defineSkinnedMesh(&mut some.value.renderer, &mut some.value.device, ds.mesh, &ds.shape,
+                &ds.skin);
+            }
+            else { unrendered = unrendered + 1u64; }
+          }
+        }
+      }
+      case mut bn &mut Bones {
+        if !scene.isLive(bn.id) {
+          scene.refused = scene.refused + 1u64;
+        } else {
+          match &mut g {
+            case mut some &mut Some { some.value.sys.pose(bn.id, &bn.bones); }
+            else { unrendered = unrendered + 1u64; }
+          }
+          scene.applied = scene.applied + 1u64;
         }
       }
       case mut dl &mut DefineMaterial {
@@ -673,6 +712,8 @@ fn drawFrame(g &mut Gfx, pose Pose, frameNo u64, alpha f32) {
   // A scripted close-up may look through a longer lens
   g.camera.fov = if scripted and hasView(frameNo) { viewFov(frameNo); } else { FOV; };
   g.camera.background = sky.color;
+  // The shaders' clock: the scene's time (the sea's waves, the swash), stopped when it is
+  g.renderer.time = f32.from(snapshot.now);
   imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
   g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()); } else { exposureFor(&sky); };
   g.sys.build(&snapshot, pose.origin);
@@ -831,6 +872,12 @@ fn main(argc i32, argv **u8) i32 {
       imm result = runChecks();
       finalAll();
       return result;
+    } elif libc.strcmp(arg, &"--island" as *u8) == 0i32 and a + 1i32 < argc {
+      // The island's preview picture, as a BMP, and nothing else
+      imm path = String.fromCStr(*(argv + usize.from(a + 1i32)));
+      imm ok = writePreview(path.view());
+      finalAll();
+      return if ok { 0i32; } else { 1i32; };
     } elif libc.strcmp(arg, &"--script" as *u8) == 0i32 {
       scripted = true;
     } elif libc.strcmp(arg, &"--no-sky" as *u8) == 0i32 {
