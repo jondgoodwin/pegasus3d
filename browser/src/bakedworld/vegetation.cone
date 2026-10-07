@@ -1,0 +1,582 @@
+// The vegetation of the cottage scene: red maples and white pines, rocks and
+// edging stones, hostas, ferns and flowers, each family a few meshes (variants
+// grown from seeds) of which many parts are copies, standing where layout.cone
+// puts them. The generators are Cone's own packages (weberpenn for the trees,
+// noiserock for the rocks, leafrosette for the plants); what this file adds
+// is the scene's choices: which species, how many variants, how detailed, in
+// which colours, and the textures, all procedural (the surfacepatterns kit's
+// bark and granite; the leaves' and the plants' paints are made here).
+//
+// LEAVES AND CUT-OUT. Render has no alpha-test material yet (another branch is
+// adding it), so every leaf is geometry: a maple leaf a blade of 7 to 24
+// triangles in the leaf's own outline, drawn from both sides, a pine needle
+// spray a thin triangle or two. Moving to cut-out cards later changes only
+// weberpenn's foliageMesh (one card a leaf, or a cluster of leaves a card) and
+// the leaf material's alpha; the trees, the parts and the layout stay.
+//
+// A tree is two parts: the bark (the root, which is what moves a tree) and
+// its foliage, a child with no placement of its own. The colours of a leaf
+// come from the palette image it samples (u: its tone, from its exposure in
+// the crown), so one material, with no per-instance tint, shades a whole
+// crown. The scene is 20 May, so the maple is in spring-to-early-summer leaf:
+// mid to light green, the sunlit outer leaves yellower, the petioles red.
+//
+// OBJECTS (hydrate): 3 the rocks (they replace the old boulder), 13 the
+// specimen maples, 14 the pines, 15 the forest maples, 16 the edging stones,
+// 17 the hostas and ferns, 18 the flowers.
+
+pub const ROCKS = 3u32;
+pub const SPECIMENS = 13u32;
+pub const PINES = 14u32;
+pub const FOREST_MAPLES = 15u32;
+pub const EDGING = 16u32;
+pub const GROUNDCOVER = 17u32;
+pub const FLOWERS = 18u32;
+
+pub const SHARED_MAPLE_BARK = 8u32;   // after the cottage's 2-7 (cottage.cone)
+pub const SHARED_MAPLE_LEAF = 9u32;
+
+// How long the vegetation's generation took, milliseconds, and what it drew
+pub struct VegetationStats {
+  pub treeMs f64;
+  pub barkMs f64;
+  pub rockMs f64;
+  pub plantMs f64;
+  pub paintMs f64;
+  pub treeTriangles u64;      // the variants' own, once each
+  pub copies u64;             // parts of every kind
+  pub drawnTriangles u64;     // what the scene draws of it, counting every copy
+}
+pub mut vegStats VegetationStats = new VegetationStats(0d, 0d, 0d, 0d, 0d, 0u64, 0u64, 0u64);
+
+fn white() Color { new Color(1., 1., 1., 1.); }
+
+fn byteOf(x f32) u8 { if x <= 0. { 0u8; } elif x >= 255. { 255u8; } else { u8.from(x + 0.5); }; }
+
+// ---- The maps and the paints ----
+
+// A kit tile's colour, normal and ORM maps as a physically based material
+// (shared across objects when 'shared' is not 0)
+fn vegKitMaterial(h &mut Hydrated, t &mut pbrmaterial.TextureSet, tint Color, shared u32) usize {
+  h.addMaterial(Look.physicallyBased(tint, 1., 0.), ctTake(t.size, &mut t.baseColor),
+    Maps.images(ctTake(t.size, &mut t.normal), ctTake(t.size, &mut t.orm)), shared);
+}
+
+// A leaf palette image (sRGB, w by h): u the tone from the shade to the sun,
+// v along the blade (0.08 to 0.68: a darker edge at the base and tip) and, from 0.8, a petiole's red.
+fn leafPaint(w i32, h i32, shade Color, sun Color, tinge Color, petiole Color) Image {
+  mut px = List[u8].withCapacity(usize.from(w * h * 3));
+  mut y = 0;
+  while y < h {
+    imm v = (f32.from(y) + 0.5) / f32.from(h);
+    mut x = 0;
+    while x < w {
+      imm u = (f32.from(x) + 0.5) / f32.from(w);
+      mut r = shade.red + (sun.red - shade.red) * u;
+      mut g = shade.green + (sun.green - shade.green) * u;
+      mut b = shade.blue + (sun.blue - shade.blue) * u;
+      // the brightest sunlit leaves keep a hint of spring's red
+      imm hint = if u > 0.8 { (u - 0.8) / 0.2 * 0.35; } else { 0.; };
+      r = r + (tinge.red - r) * hint;
+      g = g + (tinge.green - g) * hint;
+      b = b + (tinge.blue - b) * hint;
+      // the blade: darker at the base and the tip, the midribs a touch paler
+      imm edge = 0.82 + 0.18 * vsmooth(0.08, 0.2, v) * (1. - vsmooth(0.58, 0.68, v));
+      imm rib = 1. + 0.1 * (1. - vsmooth(0.28, 0.4, libc.fabsf(v - 0.36)));
+      r = r * edge * rib;
+      g = g * edge * rib;
+      b = b * edge * rib;
+      if v > 0.76 {
+        imm k = vsmooth(0.76, 0.84, v);
+        r = r + (petiole.red * (0.7 + 0.3 * u) - r) * k;
+        g = g + (petiole.green * (0.7 + 0.3 * u) - g) * k;
+        b = b + (petiole.blue * (0.7 + 0.3 * u) - b) * k;
+      }
+      px.push(byteOf(r)); px.push(byteOf(g)); px.push(byteOf(b));
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  new Image(w, h, 3, px);
+}
+
+fn vsmooth(a f32, b f32, x f32) f32 {
+  imm t = if x <= a { 0.; } elif x >= b { 1.; } else { (x - a) / (b - a); };
+  t * t * (3. - 2. * t);
+}
+
+fn rgbf(r f32, g f32, b f32) Color { new Color(r, g, b, 1.); }
+
+// A hosta or fern blade's paint (w by h): u across the blade (0.5 the midrib) or along a leaflet, v up it
+fn bladePaint(w i32, h i32, base Color, tip Color, rib Color, edge Color, veins f32, seed u32) Image {
+  mut px = List[u8].withCapacity(usize.from(w * h * 3));
+  mut y = 0;
+  while y < h {
+    imm v = (f32.from(y) + 0.5) / f32.from(h);
+    mut x = 0;
+    while x < w {
+      imm u = (f32.from(x) + 0.5) / f32.from(w);
+      imm du = libc.fabsf(u - 0.5);
+      mut r = base.red + (tip.red - base.red) * v;
+      mut g = base.green + (tip.green - base.green) * v;
+      mut b = base.blue + (tip.blue - base.blue) * v;
+      // veins: faint diagonal lines running out from the midrib and up
+      imm vein = 0.5 + 0.5 * libc.sinf((du * 38. - v * 20. + noise.toUnit(noise.pcg(seed + 3u32)) * 6.) * 2.);
+      imm k = 1. - veins * 0.22 * vein;
+      r = r * k; g = g * k; b = b * k;
+      imm m = 1. - vsmooth(0.012, 0.04, du);
+      r = r + (rib.red - r) * m * 0.8;
+      g = g + (rib.green - g) * m * 0.8;
+      b = b + (rib.blue - b) * m * 0.8;
+      imm e = vsmooth(0.40, 0.5, du);
+      r = r + (edge.red - r) * e * 0.5;
+      g = g + (edge.green - g) * e * 0.5;
+      b = b + (edge.blue - b) * e * 0.5;
+      px.push(byteOf(r)); px.push(byteOf(g)); px.push(byteOf(b));
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  new Image(w, h, 3, px);
+}
+
+// A flower palette (4 by 1): a stem, a petal, a centre, a petal's darker base
+fn flowerPaint(petal Color, centre Color) Image {
+  mut px = List[u8].empty();
+  imm cs Array[Color, 4] = [rgbf(70., 120., 52.), petal, centre, rgbf(petal.red * 0.8, petal.green * 0.78, petal.blue * 0.8)];
+  mut i = 0usize;
+  while i < 4usize {
+    imm c = cs[i];
+    px.push(byteOf(c.red)); px.push(byteOf(c.green)); px.push(byteOf(c.blue));
+    i = i + 1usize;
+  }
+  new Image(4, 1, 3, px);
+}
+
+// How many more meshes than materials the vegetation defines: 36 meshes (two
+// specimens' four, six each of the pines' and forest maples', six rocks, four
+// edging stones, two hostas, two ferns, six flower clumps) in 13 materials (the
+// maples' bark and leaf, the pines', the granite and the edging stone, two
+// hostas and two ferns, three flowers)
+pub fn vegetationMeshSurplus() u64 { if vegetationOff { 0u64; } else { 23u64; }; }
+
+// How many parts the layout makes: a tree's two (its bark and its foliage), the rest's one
+pub fn vegetationParts() usize {
+  imm items = vegetationLayout();
+  mut n = 0usize;
+  mut i = 0usize;
+  while i < items.len() {
+    imm k = items[i].kind;
+    n = n + (if k == K_SPECIMEN or k == K_PINE or k == K_MAPLE { 2usize; } else { 1usize; });
+    i = i + 1usize;
+  }
+  n;
+}
+
+// ---- Item to placement ----
+
+fn itemAt(it &Item, sink f32) Transform3 {
+  new Transform3(v(it.x, it.y - sink * it.scale, it.z), Quat.angleAxis(it.yaw, up()), v(it.scale, it.scale, it.scale));
+}
+
+fn countKind(items &List[Item], kind u32) usize {
+  mut n = 0usize;
+  mut i = 0usize;
+  while i < items.len() { if items[i].kind == kind { n = n + 1usize; } i = i + 1usize; }
+  n;
+}
+
+// ---- The trees ----
+
+// What a tree variant is made of: its meshes' indices in the object
+struct TreeVariant {
+  bark usize;
+  leaves usize;
+}
+
+const SPECIMEN_SEEDS Array[u32, 2] = [3u32, 2u32];
+const SPECIMEN_HEIGHTS Array[f32, 2] = [11., 9.6];
+const MAPLE_SEEDS Array[u32, 3] = [31u32, 47u32, 59u32];
+const MAPLE_HEIGHTS Array[f32, 3] = [8.6, 9.8, 7.8];
+const PINE_SEEDS Array[u32, 3] = [11u32, 23u32, 37u32];
+const PINE_HEIGHTS Array[f32, 3] = [13., 15.5, 14.];
+
+fn maplePaint() Image {
+  // spring into early summer: shade a deep green, sun a fresh yellow-green, a red tinge at the very top
+  leafPaint(64, 32, rgbf(40., 78., 30.), rgbf(128., 168., 48.), rgbf(168., 112., 44.), rgbf(176., 60., 46.));
+}
+
+fn pinePaint() Image {
+  leafPaint(32, 16, rgbf(16., 42., 30.), rgbf(54., 88., 46.), rgbf(54., 88., 46.), rgbf(90., 70., 50.));
+}
+
+fn mapleBarkMaterial(h &mut Hydrated) usize {
+  imm t0 = sdl.GetPerformanceCounter();
+  mut bp = surfacepatterns.BarkParams.redMaple(512, 4101u32);
+  mut tex = surfacepatterns.bakeBark(&bp);
+  imm m = vegKitMaterial(h, &mut tex, white(), SHARED_MAPLE_BARK);
+  vegStats.barkMs = vegStats.barkMs + msBetween(t0, sdl.GetPerformanceCounter());
+  m;
+}
+
+fn mapleLeafMaterial(h &mut Hydrated) usize {
+  h.addMaterial(Look.physicallyBased(white(), 0.62, 0.), maplePaint(), Maps.none(), SHARED_MAPLE_LEAF);
+}
+
+// The specimens: two full red maples, bark and leaves, each its own meshes
+fn hydrateSpecimens(h &mut Hydrated) {
+  if vegetationOff { return; }
+  imm items = vegetationLayout();
+  imm bark = mapleBarkMaterial(h);
+  imm leaf = mapleLeafMaterial(h);
+  mut tp = new weberpenn.TubeParams();
+  tp.maxLevel = 3;
+  mut variants = List[TreeVariant].empty();
+  mut v = 0u32;
+  while v < SPECIMEN_VARIANTS {
+    imm t0 = sdl.GetPerformanceCounter();
+    mut p = weberpenn.redMaple(SPECIMEN_SEEDS[usize.from(v)], SPECIMEN_HEIGHTS[usize.from(v)]);
+    p.leafSites = 5;
+    imm tree = weberpenn.grow(&p);
+    mut fp = weberpenn.mapleFoliage(900u32 + v);
+    fp.leafSize = 0.2;
+    fp.detail = 7;
+    imm bm = weberpenn.branchMesh(&tree, &tp);
+    imm lm = weberpenn.foliageMesh(&tree, &fp);
+    vegStats.treeMs = vegStats.treeMs + msBetween(t0, sdl.GetPerformanceCounter());
+    vegStats.treeTriangles = vegStats.treeTriangles + u64.from(bm.triangleCount()) + u64.from(lm.triangleCount());
+    print <- "  specimen maple "; print <- v; print <- ": "; print <- tree.stems.len(); print <- " stems, "; print <- tree.sites.len();
+    print <- " leaves, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, "; print <- tree.height;
+    print <- " m tall, "; print <- tree.reach * 2.; print <- " m across\n";
+    variants.push(new TreeVariant(h.addMesh(bm), h.addMesh(lm)));
+    v = v + 1u32;
+  }
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_SPECIMEN {
+      imm tv = *variants[usize.from(it.variant)];
+      imm root = h.part("specimen maple", tv.bark, bark, TOP, itemAt(it, 0.));
+      h.part("specimen maple leaves", tv.leaves, leaf, root, Transform3.identity());
+      vegStats.copies = vegStats.copies + 2u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + u64.from(h.meshes[tv.bark].triangleCount() + h.meshes[tv.leaves].triangleCount());
+    }
+    i = i + 1usize;
+  }
+}
+
+// The forest's maples: lighter trees (three levels, bigger and plainer leaves)
+fn hydrateForestMaples(h &mut Hydrated) {
+  if vegetationOff { return; }
+  imm items = vegetationLayout();
+  if countKind(&items, K_MAPLE) == 0usize { return; }
+  // the specimens (object 13, sent first) defined these two; naming their keys again reuses them
+  imm bark = h.addMaterial(Look.plain(white()), Image.empty(), Maps.none(), SHARED_MAPLE_BARK);
+  imm leaf = h.addMaterial(Look.plain(white()), Image.empty(), Maps.none(), SHARED_MAPLE_LEAF);
+  mut tp = new weberpenn.TubeParams();
+  tp.maxLevel = 2;
+  tp.subdivide = 1;
+  tp.fatSides = 7;
+  tp.midSides = 4;
+  mut variants = List[TreeVariant].empty();
+  mut v = 0u32;
+  while v < MAPLE_VARIANTS {
+    imm t0 = sdl.GetPerformanceCounter();
+    mut p = weberpenn.redMaple(MAPLE_SEEDS[usize.from(v)], MAPLE_HEIGHTS[usize.from(v)]);
+    p.levels = 3;
+    p.leafFromLevel = 2;
+    p.leafSites = 4;
+    mut l2 = p.levelParams[2usize];
+    l2.branches = 0.;
+    p.levelParams[2usize] = l2;
+    imm tree = weberpenn.grow(&p);
+    mut fp = weberpenn.mapleFoliage(950u32 + v);
+    fp.leafSize = 0.34;
+    fp.detail = 5;
+    imm bm = weberpenn.branchMesh(&tree, &tp);
+    imm lm = weberpenn.foliageMesh(&tree, &fp);
+    vegStats.treeMs = vegStats.treeMs + msBetween(t0, sdl.GetPerformanceCounter());
+    vegStats.treeTriangles = vegStats.treeTriangles + u64.from(bm.triangleCount()) + u64.from(lm.triangleCount());
+    print <- "  forest maple "; print <- v; print <- ": "; print <- tree.stems.len(); print <- " stems, "; print <- tree.sites.len();
+    print <- " leaves, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, "; print <- tree.height; print <- " m tall\n";
+    variants.push(new TreeVariant(h.addMesh(bm), h.addMesh(lm)));
+    v = v + 1u32;
+  }
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_MAPLE {
+      imm tv = *variants[usize.from(it.variant)];
+      imm root = h.part("maple", tv.bark, bark, TOP, itemAt(it, 0.));
+      h.part("maple leaves", tv.leaves, leaf, root, Transform3.identity());
+      vegStats.copies = vegStats.copies + 2u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + u64.from(h.meshes[tv.bark].triangleCount() + h.meshes[tv.leaves].triangleCount());
+    }
+    i = i + 1usize;
+  }
+}
+
+fn hydratePines(h &mut Hydrated) {
+  if vegetationOff { return; }
+  imm items = vegetationLayout();
+  imm t00 = sdl.GetPerformanceCounter();
+  mut bp = surfacepatterns.BarkParams.pine(512, 4202u32);
+  mut tex = surfacepatterns.bakeBark(&bp);
+  // the kit's pine bark is warm red-brown; an old white pine's is greyer
+  imm bark = vegKitMaterial(h, &mut tex, srgb(176., 164., 156.), 0u32);
+  vegStats.barkMs = vegStats.barkMs + msBetween(t00, sdl.GetPerformanceCounter());
+  imm needles = h.addMaterial(Look.physicallyBased(white(), 0.7, 0.), pinePaint(), Maps.none(), 0u32);
+  mut tp = new weberpenn.TubeParams();
+  tp.maxLevel = 2;
+  tp.subdivide = 1;
+  tp.fatSides = 7;
+  tp.midSides = 4;
+  mut variants = List[TreeVariant].empty();
+  mut v = 0u32;
+  while v < PINE_VARIANTS {
+    imm t0 = sdl.GetPerformanceCounter();
+    mut p = weberpenn.whitePine(PINE_SEEDS[usize.from(v)], PINE_HEIGHTS[usize.from(v)]);
+    mut l0 = p.levelParams[0usize];
+    l0.branches = 45.;
+    p.levelParams[0usize] = l0;
+    mut l1 = p.levelParams[1usize];
+    l1.branches = 9.;
+    l1.curveRes = 8;
+    p.levelParams[1usize] = l1;
+    mut l2 = p.levelParams[2usize];
+    l2.curveRes = 4;
+    p.levelParams[2usize] = l2;
+    imm tree = weberpenn.grow(&p);
+    mut fp = weberpenn.pineFoliage(970u32 + v);
+    fp.plumeFromLevel = 1;
+    fp.plumeStart = 0.2;
+    fp.plumeWidth = 0.15;
+    fp.plumeMax = 0.65;
+    fp.plumeDroop = 0.55;
+    imm bm = weberpenn.branchMesh(&tree, &tp);
+    imm lm = weberpenn.foliageMesh(&tree, &fp);
+    vegStats.treeMs = vegStats.treeMs + msBetween(t0, sdl.GetPerformanceCounter());
+    vegStats.treeTriangles = vegStats.treeTriangles + u64.from(bm.triangleCount()) + u64.from(lm.triangleCount());
+    print <- "  pine "; print <- v; print <- ": "; print <- tree.stems.len(); print <- " stems, "; print <- tree.sites.len();
+    print <- " sprays, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, "; print <- tree.height; print <- " m tall\n";
+    variants.push(new TreeVariant(h.addMesh(bm), h.addMesh(lm)));
+    v = v + 1u32;
+  }
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_PINE {
+      imm tv = *variants[usize.from(it.variant)];
+      imm root = h.part("pine", tv.bark, bark, TOP, itemAt(it, 0.));
+      h.part("pine needles", tv.leaves, needles, root, Transform3.identity());
+      vegStats.copies = vegStats.copies + 2u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + u64.from(h.meshes[tv.bark].triangleCount() + h.meshes[tv.leaves].triangleCount());
+    }
+    i = i + 1usize;
+  }
+}
+
+// ---- The rocks ----
+
+fn graniteMaterial(h &mut Hydrated, seed u32, warm bool) usize {
+  imm t0 = sdl.GetPerformanceCounter();
+  mut rp = surfacepatterns.RockParams.granite(512, seed);
+  if warm {
+    // the edging stones' field-stone colours
+    rp.colorA = srgb(148., 142., 130.);
+    rp.colorB = srgb(92., 84., 76.);
+    rp.lichenAmount = 0.4;
+  }
+  mut tex = surfacepatterns.bakeRock(&rp);
+  imm m = vegKitMaterial(h, &mut tex, white(), 0u32);
+  vegStats.paintMs = vegStats.paintMs + msBetween(t0, sdl.GetPerformanceCounter());
+  m;
+}
+
+// The family: a boulder's three proportions (squat, tall, long), each with two seeds
+fn rockVariant(v u32) mesh.Mesh {
+  mut p = new noiserock.RockParams();
+  p.seed = 500u32 + v * 17u32;
+  imm kind = v % 3u32;
+  if kind == 0u32 { p.width = 0.5; p.height = 0.3; p.depth = 0.42; p.facets = 10; p.facetDepth = 0.7; p.bumpAmp = 0.12; }
+  elif kind == 1u32 { p.width = 0.34; p.height = 0.55; p.depth = 0.32; p.facets = 8; p.facetDepth = 0.66; p.bumpAmp = 0.1; }
+  else { p.width = 0.62; p.height = 0.32; p.depth = 0.3; p.facets = 9; p.facetDepth = 0.68; p.bumpAmp = 0.16; }
+  p.rings = 9;
+  p.slices = 14;
+  noiserock.rockMesh(&p);
+}
+
+fn edgingVariant(v u32) mesh.Mesh {
+  mut p = new noiserock.RockParams();
+  p.seed = 800u32 + v * 13u32;
+  p.width = 0.22 + 0.04 * f32.from(v % 2u32);
+  p.height = 0.15;
+  p.depth = 0.19 + 0.05 * f32.from(v / 2u32);
+  p.facets = 4;
+  p.facetDepth = 0.9;
+  p.bumpAmp = 0.12;
+  p.flatBase = 0.45;
+  p.rings = 6;
+  p.slices = 10;
+  p.smooth = true;
+  p.tileMetres = 1.5;
+  noiserock.rockMesh(&p);
+}
+
+// How far into the ground a rock (an edging stone) is set: a third of its height
+const ROCK_SINK f32 = 0.1;
+const EDGING_SINK f32 = 0.05;
+
+fn hydrateRocks(h &mut Hydrated) {
+  if vegetationOff { return; }
+  imm items = vegetationLayout();
+  imm granite = graniteMaterial(h, 6101u32, false);
+  imm t0 = sdl.GetPerformanceCounter();
+  mut meshes = List[usize].empty();
+  mut tris = 0u64;
+  mut v = 0u32;
+  while v < ROCK_VARIANTS {
+    imm m = rockVariant(v);
+    tris = tris + u64.from(m.triangleCount());
+    meshes.push(h.addMesh(m));
+    v = v + 1u32;
+  }
+  vegStats.rockMs = vegStats.rockMs + msBetween(t0, sdl.GetPerformanceCounter());
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_ROCK {
+      h.part("rock", *meshes[usize.from(it.variant)], granite, TOP, itemAt(it, ROCK_SINK * 2.));
+      vegStats.copies = vegStats.copies + 1u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + tris / u64.from(ROCK_VARIANTS);
+    }
+    i = i + 1usize;
+  }
+}
+
+fn hydrateEdging(h &mut Hydrated) {
+  if vegetationOff { return; }
+  imm items = vegetationLayout();
+  imm stone = graniteMaterial(h, 6202u32, true);
+  imm t0 = sdl.GetPerformanceCounter();
+  mut meshes = List[usize].empty();
+  mut tris = 0u64;
+  mut v = 0u32;
+  while v < EDGING_VARIANTS {
+    imm m = edgingVariant(v);
+    tris = tris + u64.from(m.triangleCount());
+    meshes.push(h.addMesh(m));
+    v = v + 1u32;
+  }
+  vegStats.rockMs = vegStats.rockMs + msBetween(t0, sdl.GetPerformanceCounter());
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_EDGING {
+      // set a third of the way in: a stone's height 0.15 m at scale 1, its foot below the ground
+      h.part("edging stone", *meshes[usize.from(it.variant)], stone, TOP, itemAt(it, EDGING_SINK));
+      vegStats.copies = vegStats.copies + 1u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + tris / u64.from(EDGING_VARIANTS);
+    }
+    i = i + 1usize;
+  }
+}
+
+// ---- Hostas, ferns and flowers ----
+
+fn hydrateGroundcover(h &mut Hydrated) {
+  if vegetationOff { return; }
+  imm items = vegetationLayout();
+  imm t0 = sdl.GetPerformanceCounter();
+  // two hostas: a blue-grey one and a yellow-green one; two ferns
+  imm hostaA = h.addMaterial(Look.physicallyBased(white(), 0.6, 0.),
+    bladePaint(48, 48, rgbf(46., 88., 68.), rgbf(66., 112., 84.), rgbf(120., 160., 124.), rgbf(88., 124., 92.), 1., 3u32), Maps.none(), 0u32);
+  imm hostaB = h.addMaterial(Look.physicallyBased(white(), 0.6, 0.),
+    bladePaint(48, 48, rgbf(62., 104., 38.), rgbf(98., 140., 48.), rgbf(150., 180., 96.), rgbf(120., 148., 60.), 1., 9u32), Maps.none(), 0u32);
+  imm fernA = h.addMaterial(Look.physicallyBased(white(), 0.65, 0.),
+    bladePaint(16, 32, rgbf(48., 96., 36.), rgbf(86., 134., 54.), rgbf(48., 96., 36.), rgbf(48., 96., 36.), 0., 5u32), Maps.none(), 0u32);
+  imm fernB = h.addMaterial(Look.physicallyBased(white(), 0.65, 0.),
+    bladePaint(16, 32, rgbf(62., 110., 40.), rgbf(104., 148., 60.), rgbf(62., 110., 40.), rgbf(62., 110., 40.), 0., 7u32), Maps.none(), 0u32);
+  vegStats.paintMs = vegStats.paintMs + msBetween(t0, sdl.GetPerformanceCounter());
+  imm t1 = sdl.GetPerformanceCounter();
+  mut hostaMeshes = List[usize].empty();
+  mut fernMeshes = List[usize].empty();
+  mut hostaTris = 0u64;
+  mut fernTris = 0u64;
+  mut v = 0u32;
+  while v < HOSTA_VARIANTS {
+    mut p = new leafrosette.HostaParams();
+    p.seed = 40u32 + v * 7u32;
+    imm m = leafrosette.hostaMesh(&p);
+    hostaTris = hostaTris + u64.from(m.triangleCount());
+    hostaMeshes.push(h.addMesh(m));
+    v = v + 1u32;
+  }
+  v = 0u32;
+  while v < FERN_VARIANTS {
+    mut p = new leafrosette.FernParams();
+    p.seed = 60u32 + v * 11u32;
+    imm m = leafrosette.fernMesh(&p);
+    fernTris = fernTris + u64.from(m.triangleCount());
+    fernMeshes.push(h.addMesh(m));
+    v = v + 1u32;
+  }
+  vegStats.plantMs = vegStats.plantMs + msBetween(t1, sdl.GetPerformanceCounter());
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_HOSTA {
+      imm mat = if it.variant == 0u32 { hostaA; } else { hostaB; };
+      h.part("hosta", *hostaMeshes[usize.from(it.variant)], mat, TOP, itemAt(it, 0.));
+      vegStats.copies = vegStats.copies + 1u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + hostaTris / u64.from(HOSTA_VARIANTS);
+    } elif it.kind == K_FERN {
+      imm mat = if it.variant == 0u32 { fernA; } else { fernB; };
+      h.part("fern", *fernMeshes[usize.from(it.variant)], mat, TOP, itemAt(it, 0.));
+      vegStats.copies = vegStats.copies + 1u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + fernTris / u64.from(FERN_VARIANTS);
+    }
+    i = i + 1usize;
+  }
+}
+
+fn hydrateFlowers(h &mut Hydrated) {
+  if vegetationOff { return; }
+  imm items = vegetationLayout();
+  imm t0 = sdl.GetPerformanceCounter();
+  // three colours: buttercup yellow, white, violet
+  imm petals Array[Color, 3] = [rgbf(240., 206., 64.), rgbf(238., 238., 228.), rgbf(142., 106., 196.)];
+  imm centres Array[Color, 3] = [rgbf(176., 120., 40.), rgbf(224., 186., 60.), rgbf(236., 214., 96.)];
+  mut mats = List[usize].empty();
+  mut c = 0usize;
+  while c < 3usize {
+    mats.push(h.addMaterial(Look.physicallyBased(white(), 0.7, 0.), flowerPaint(petals[c], centres[c]), Maps.none(), 0u32));
+    c = c + 1usize;
+  }
+  mut meshes = List[usize].empty();
+  mut tris = 0u64;
+  mut v = 0u32;
+  while v < FLOWER_VARIANTS {
+    mut p = new leafrosette.FlowerParams();
+    p.seed = 80u32 + v * 5u32;
+    p.flowers = 4 + i32.from(v % 2u32) * 3;
+    p.height = 0.38;
+    p.head = 0.036;
+    p.spread = 0.16;
+    imm m = leafrosette.flowerClumpMesh(&p);
+    tris = tris + u64.from(m.triangleCount());
+    meshes.push(h.addMesh(m));
+    v = v + 1u32;
+  }
+  vegStats.plantMs = vegStats.plantMs + msBetween(t0, sdl.GetPerformanceCounter());
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_FLOWER {
+      h.part("flowers", *meshes[usize.from(it.variant)], *mats[usize.from(it.variant / 2u32)], TOP, itemAt(it, 0.));
+      vegStats.copies = vegStats.copies + 1u64;
+      vegStats.drawnTriangles = vegStats.drawnTriangles + tris / u64.from(FLOWER_VARIANTS);
+    }
+    i = i + 1usize;
+  }
+}

@@ -1,0 +1,514 @@
+// The vegetation's layout: where every tree, rock, edging stone, hosta, fern
+// and flower of the cottage scene stands, by rules over the island, from one
+// seed. It is a list of Items, each a kind (and which variant of its mesh),
+// a place on the ground, a yaw and a scale; vegetation.cone makes the meshes
+// and sends one part for each Item, and the browser's --checks read the list
+// itself (no mesh, scene or GPU is needed to lay it out).
+//
+// THE RULES, in the order they place (each later kind keeps clear of the
+// earlier ones, and everything keeps off the path, the cottage and the
+// world's other objects):
+//
+//   anchors     two specimen red maples near the cottage and the path, and a
+//               ring of white pines round the cottage's back and sides
+//   the forest  pines (two in three) and maples by island.forestDensity, a
+//               dart-thrown scatter (candidates on a jittered grid, nearest
+//               the path first) with a spacing that falls where the forest is
+//               thick, 4.5 m from the path's centre at the least, on ground
+//               above the beach and not steep, inside the fence
+//   rocks       on the beach and the shore's edge, on steep ground, and at the
+//               path's side every dozen metres or so
+//   edging      stones along both edges of the path, jittered spacing, larger
+//               at its bends, overlapping its edge, from where the beach ends
+//               to the steps (not where a lantern stands)
+//   hostas      clumps by the cottage's foundation and the path's last 30 m
+//   ferns       two or three clumps under each tree and along the path
+//   flowers     in beds on the porch's front either side of the steps, round
+//               the amphora, and by the path's last 25 m
+//
+// Everything is deterministic: a function of SEED and the island's.
+
+// What stands: the kinds
+pub const K_SPECIMEN = 0u32;      // a specimen red maple (variant: which of the two)
+pub const K_PINE = 1u32;
+pub const K_MAPLE = 2u32;         // a forest red maple
+pub const K_ROCK = 3u32;
+pub const K_EDGING = 4u32;
+pub const K_HOSTA = 5u32;
+pub const K_FERN = 6u32;
+pub const K_FLOWER = 7u32;
+
+// How many variants (meshes) each kind has
+pub const SPECIMEN_VARIANTS = 2u32;
+pub const PINE_VARIANTS = 3u32;
+pub const MAPLE_VARIANTS = 3u32;
+pub const ROCK_VARIANTS = 6u32;
+pub const EDGING_VARIANTS = 4u32;
+pub const HOSTA_VARIANTS = 2u32;
+pub const FERN_VARIANTS = 2u32;
+pub const FLOWER_VARIANTS = 6u32;   // three colours, two clumps each
+
+// The most of each, which keeps the scene within what the Intel GPU draws
+pub const MAX_TREES = 90usize;     // pines and forest maples together (the anchors extra)
+pub const MAX_ROCKS = 120usize;
+pub const MAX_FERNS = 220usize;
+pub const MAX_HOSTAS = 60usize;
+pub const MAX_FLOWERS = 120usize;
+
+const SEED = 20260520u32;
+
+pub struct Item {
+  pub kind u32;
+  pub variant u32;
+  pub x f32;
+  pub y f32;                  // the ground's height there (a rock or an edging stone is set into it by its own sink)
+  pub z f32;
+  pub yaw f32;
+  pub scale f32;
+  pub radius f32;             // the footprint it keeps others off by, metres
+}
+
+// A small random stream (noise's PCG hash; a state advanced by a Weyl step)
+struct VRng {
+  state u32;
+  fn next(self &mut) u32 { state = state + 0x9E3779B9u32; noise.pcg(state); }
+  fn unit(self &mut) f32 { noise.toUnit(self.next()); }
+  fn signed(self &mut) f32 { self.unit() * 2. - 1.; }
+  fn below(self &mut, n u32) u32 { self.next() % n; }
+}
+
+fn vrng(salt u32) VRng { new VRng(noise.pcg(SEED ^ (salt * 0x85ebca6bu32))); }
+
+fn dist2(ax f32, az f32, bx f32, bz f32) f32 { ((ax - bx) * (ax - bx) + (az - bz) * (az - bz)).sqrt(); }
+
+// ---- What is already there: the cottage, the world's other objects, the lanterns ----
+
+// The cottage's footprint on the ground, as four rectangles (x0, x1, z0, z1, world metres, from
+// cottage.cone's measures about its frame at (COTTAGE_X, COTTAGE_Z)): the main block with its
+// chimney, the wing on its left, the porch deck, and the steps
+imm COTTAGE_RECTS Array[f32, 16] = [
+  -18.7, -12.6, 323.8, 330.0,
+  -21.5, -18.7, 325.1, 330.0,
+  -18.5, -13.2, 330.0, 331.7,
+  -16.6, -15.3, 331.7, 332.4];
+
+// Whether a circle of 'r' at (x, z) overlaps the cottage's footprint grown by 'margin'
+pub fn nearCottage(x f32, z f32, r f32, margin f32) bool {
+  imm m = r + margin;
+  mut k = 0usize;
+  while k < 4usize {
+    imm b = k * 4usize;
+    if x > COTTAGE_RECTS[b] - m and x < COTTAGE_RECTS[b + 1usize] + m and z > COTTAGE_RECTS[b + 2usize] - m
+      and z < COTTAGE_RECTS[b + 3usize] + m { return true; }
+    k = k + 1usize;
+  }
+  false;
+}
+
+// The old world's objects that stand in the scene, by where each is now and how far it reaches
+// (the rook, the lathed rook, the horn-flower, the horn, the amphora, the ball, the mound, the
+// launch button and the balloon), each (x, z, radius)
+fn worldObjects() List[Vec3] {
+  mut out = List[Vec3].empty();
+  imm ids Array[usize, 9] = [0usize, 7usize, 2usize, 4usize, 1usize, 10usize, 12usize, 9usize, 6usize];
+  imm reach Array[f32, 9] = [1.2, 1.2, 1.6, 2.2, 1.2, 1., 3.2, 1.5, 10.];
+  mut i = 0usize;
+  while i < 9usize {
+    imm k = ids[i];
+    out.push(new Vec3(PLACES[k * 4usize] + WORLD_DX, reach[i], PLACES[k * 4usize + 1usize] + WORLD_DZ));
+    i = i + 1usize;
+  }
+  out;
+}
+
+// The path lanterns' spots (the same arithmetic as cottage.cone's hydrateLanterns)
+fn lanternSpots() List[Vec2] {
+  mut out = List[Vec2].empty();
+  imm line = pathCentreline();
+  mut i = 0usize;
+  while i < 3usize {
+    imm k = line.len() - 2usize - usize.from(LANTERN_BACK[i]);
+    imm a = *line[k - 1usize];
+    imm b = *line[k + 1usize];
+    imm tx = b.x - a.x;
+    imm tz = b.z - a.z;
+    imm tl = (tx * tx + tz * tz).sqrt();
+    imm side = if i % 2usize == 0usize { LANTERN_OFFSET; } else { 0. - LANTERN_OFFSET; };
+    imm c = *line[k];
+    out.push(new Vec2(c.x + (0. - tz) / tl * side, c.z + tx / tl * side));
+    i = i + 1usize;
+  }
+  out;
+}
+
+// Everything laid out so far, and the fixed things: a place's room for a circle of 'r'
+struct Ground {
+  items List[Item];
+  objects List[Vec3];
+  lanterns List[Vec2];
+
+  fn make() Ground { new Ground(List[Item].empty(), worldObjects(), lanternSpots()); }
+
+  // Whether a circle of 'r' at (x, z) is clear of what stands (anything laid out, the cottage, the
+  // world's objects, the lanterns)
+  fn clear(self &, x f32, z f32, r f32) bool { self.clearAt(x, z, r, 1.2); }
+
+  // The same, keeping 'margin' off the cottage (a bed against its wall asks for little)
+  fn clearAt(self &, x f32, z f32, r f32, margin f32) bool {
+    if nearCottage(x, z, r, margin) { return false; }
+    mut i = 0usize;
+    while i < objects.len() {
+      imm o = *objects[i];
+      if dist2(x, z, o.x, o.z) < o.y + r { return false; }
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < lanterns.len() {
+      imm l = *lanterns[i];
+      if dist2(x, z, l.x, l.y) < 0.7 + r { return false; }
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < items.len() {
+      imm it = items[i];
+      if it.kind != K_EDGING and dist2(x, z, it.x, it.z) < it.radius + r { return false; }
+      i = i + 1usize;
+    }
+    true;
+  }
+
+  fn count(self &, kind u32) usize {
+    mut n = 0usize;
+    mut i = 0usize;
+    while i < items.len() { if items[i].kind == kind { n = n + 1usize; } i = i + 1usize; }
+    n;
+  }
+
+  fn add(self &mut, kind u32, variant u32, x f32, z f32, yaw f32, scale f32, radius f32) {
+    items.push(new Item(kind, variant, x, groundHeight(x, z), z, yaw, scale, radius));
+  }
+}
+
+// Whether (x, z) is somewhere something may stand: on the island's land above the beach, inside
+// the fence, and not on the path
+fn standable(x f32, z f32, minHeight f32, pathClear f32) bool {
+  insideFence(x, z) and groundHeight(x, z) > minHeight and pathDistanceAt(x, z) > pathClear;
+}
+
+// ---- The forest's candidates, nearest the path first ----
+
+struct Cand {
+  x f32;
+  z f32;
+  d f32;
+  density f32;
+}
+
+fn byDistance(a &Cand, b &Cand) i32 { if a.d < b.d { -1; } elif a.d > b.d { 1; } else { 0; }; }
+
+fn anchors(g &mut Ground, rng &mut VRng) {
+  // two specimen maples: one right of the path in front of the cottage, one left of it
+  g.add(K_SPECIMEN, 0u32, -4., 341., 0.4, 1., 0.7);
+  g.add(K_SPECIMEN, 1u32, -31., 347., 2.1, 0.92, 0.7);
+  // pines round the back and sides: on the cottage's west, north and east
+  imm px Array[f32, 8] = [-36., -31., -24., -10., 4., 12., -34., 8.];
+  imm pz Array[f32, 8] = [323., 309., 305., 303., 306., 336., 340., 345.];
+  mut i = 0usize;
+  while i < 8usize {
+    if g.clear(px[i], pz[i], 1.2) {
+      g.add(K_PINE, rng.below(PINE_VARIANTS), px[i], pz[i], rng.unit() * 6.28, 1.05 + 0.25 * rng.unit(), 0.6);
+    }
+    i = i + 1usize;
+  }
+}
+
+fn forest(g &mut Ground, rng &mut VRng) {
+  mut cands = List[Cand].empty();
+  imm cell = 6.;
+  mut z = 300.;
+  while z < 520. {
+    mut x = -230.;
+    while x < 210. {
+      imm cx = x + rng.unit() * cell;
+      imm cz = z + rng.unit() * cell;
+      if standable(cx, cz, 2.6, 4.5) and groundSlope(cx, cz) < 0.42 {
+        imm d = forestDensity(cx, cz);
+        imm pd = pathDistanceAt(cx, cz);
+        if d > 0.18 and pd < 70. { cands.push(new Cand(cx, cz, pd + rng.unit() * 10., d)); }
+      }
+      x = x + cell;
+    }
+    z = z + cell;
+  }
+  cands.sortBy(&byDistance);
+  mut i = 0usize;
+  mut placed = 0usize;
+  while i < cands.len() and placed < MAX_TREES {
+    imm c = *cands[i];
+    imm spacing = 7. + 6. * (1. - c.density);
+    if g.clear(c.x, c.z, spacing * 0.5) {
+      imm pine = rng.unit() < 0.66;
+      if pine { g.add(K_PINE, rng.below(PINE_VARIANTS), c.x, c.z, rng.unit() * 6.28, 0.75 + 0.55 * rng.unit(), spacing * 0.5 - 0.4); }
+      else { g.add(K_MAPLE, rng.below(MAPLE_VARIANTS), c.x, c.z, rng.unit() * 6.28, 0.8 + 0.5 * rng.unit(), spacing * 0.5 - 0.4); }
+      placed = placed + 1usize;
+    }
+    i = i + 1usize;
+  }
+}
+
+fn rocks(g &mut Ground, rng &mut VRng) {
+  mut n = 0usize;
+  // the beach and the shore: a scatter about where you land
+  mut tries = 0;
+  while tries < 400 and n < 22usize {
+    tries = tries + 1;
+    imm x = START_X + rng.signed() * 55.;
+    imm z = START_Z - 40. + rng.unit() * 70.;
+    imm h = groundHeight(x, z);
+    if insideFence(x, z) and h > 0.15 and h < 2.2 and pathDistanceAt(x, z) > 3.5 and dist2(x, z, START_X, START_Z) > 6. {
+      imm s = 0.5 + 1.6 * rng.unit() * rng.unit();
+      if g.clear(x, z, 0.5 * s) { g.add(K_ROCK, rng.below(ROCK_VARIANTS), x, z, rng.unit() * 6.28, s, 0.55 * s); n = n + 1usize; }
+    }
+  }
+  // on steep ground, in the forest, near the path
+  tries = 0;
+  while tries < 3000 and n < MAX_ROCKS - 22usize {
+    tries = tries + 1;
+    imm x = -170. + rng.unit() * 340.;
+    imm z = 300. + rng.unit() * 190.;
+    if standable(x, z, 2.6, 3.5) and pathDistanceAt(x, z) < 60. {
+      imm slope = groundSlope(x, z);
+      imm want = 0.06 + 2.2 * (if slope > 0.1 { slope - 0.1; } else { 0.; });
+      if rng.unit() < want {
+        imm s = 0.45 + 1.7 * rng.unit() * rng.unit();
+        if g.clear(x, z, 0.5 * s) { g.add(K_ROCK, rng.below(ROCK_VARIANTS), x, z, rng.unit() * 6.28, s, 0.55 * s); n = n + 1usize; }
+      }
+    }
+  }
+  // at the path's side, every dozen metres or so, past the edging stones
+  imm line = pathCentreline();
+  mut k = 20usize;
+  mut side = 1.;
+  while k + 8usize < line.len() {
+    imm a = *line[k - 1usize];
+    imm b = *line[k + 1usize];
+    imm c = *line[k];
+    imm tx = b.x - a.x;
+    imm tz = b.z - a.z;
+    imm tl = (tx * tx + tz * tz).sqrt();
+    imm off = side * (2.3 + 1.4 * rng.unit());
+    imm x = c.x + (0. - tz) / tl * off;
+    imm z = c.z + tx / tl * off;
+    if rng.unit() < 0.7 and standable(x, z, 2.6, 1.8) {
+      imm s = 0.55 + 0.9 * rng.unit();
+      if g.clear(x, z, 0.55 * s) { g.add(K_ROCK, rng.below(ROCK_VARIANTS), x, z, rng.unit() * 6.28, s, 0.55 * s); }
+    }
+    side = 0. - side;
+    k = k + 9usize + usize.from(rng.below(7u32));
+  }
+}
+
+// Edging stones along both edges of the path, in order along it
+fn edging(g &mut Ground, rng &mut VRng) {
+  imm line = pathCentreline();
+  mut side = -1;
+  while side <= 1 {
+    mut k = 1usize;
+    mut carry = 0.;
+    while k + 1usize < line.len() {
+      imm a = *line[k - 1usize];
+      imm b = *line[k + 1usize];
+      imm c = *line[k];
+      carry = carry + 1.;
+      if carry >= 1.1 + 0.5 * rng.unit() {
+        carry = 0.;
+        imm tx = b.x - a.x;
+        imm tz = b.z - a.z;
+        imm tl = (tx * tx + tz * tz).sqrt();
+        // a bend: how far the heading turns over six metres
+        imm k0 = if k > 6usize { k - 6usize; } else { 0usize; };
+        imm k1 = if k + 6usize < line.len() { k + 6usize; } else { line.len() - 1usize; };
+        imm hx0 = c.x - (*line[k0]).x;
+        imm hz0 = c.z - (*line[k0]).z;
+        imm hx1 = (*line[k1]).x - c.x;
+        imm hz1 = (*line[k1]).z - c.z;
+        imm l0 = (hx0 * hx0 + hz0 * hz0).sqrt() + 0.0001;
+        imm l1 = (hx1 * hx1 + hz1 * hz1).sqrt() + 0.0001;
+        imm turn = 1. - (hx0 * hx1 + hz0 * hz1) / (l0 * l1);
+        imm off = f32.from(side) * (PATH_HALF_WIDTH + 0.02 + 0.2 * rng.unit());
+        imm x = c.x + (0. - tz) / tl * off;
+        imm z = c.z + tx / tl * off;
+        if rng.unit() > 0.1 and groundHeight(x, z) > 2.7 and insideFence(x, z) and !nearCottage(x, z, 0.1, 0.6) {
+          imm s = (0.85 + 0.5 * rng.unit()) * (1. + 4. * turn);
+          imm ok = g.clear(x, z, 0.1);
+          if ok { g.add(K_EDGING, rng.below(EDGING_VARIANTS), x, z, rng.unit() * 6.28, s, 0.2 * s); }
+        }
+      }
+      k = k + 1usize;
+    }
+    side = side + 2;
+  }
+}
+
+fn hostas(g &mut Ground, rng &mut VRng) {
+  // by the cottage's foundation: along the wing's and the main block's front, and the east wall
+  imm fx Array[f32, 12] = [-21., -19.6, -18., -12.9, -12.4, -11.6, -22.4, -22.4, -11.7, -11.8, -22.3, -12.4];
+  imm fz Array[f32, 12] = [331.2, 331.6, 333.4, 333.8, 332.2, 329.4, 326., 328.7, 326.4, 324.2, 324.4, 322.4];
+  mut i = 0usize;
+  while i < 12usize {
+    imm x = fx[i] + 0.3 * rng.signed();
+    imm z = fz[i] + 0.3 * rng.signed();
+    if g.count(K_HOSTA) < MAX_HOSTAS and pathDistanceAt(x, z) > 1.5 and g.clearAt(x, z, 0.4, 0.15) {
+      g.add(K_HOSTA, rng.below(HOSTA_VARIANTS), x, z, rng.unit() * 6.28, 1.15 + 0.6 * rng.unit(), 0.6);
+    }
+    i = i + 1usize;
+  }
+  // along the path's last 30 m, both sides, 1.6 to 2.6 m out
+  imm line = pathCentreline();
+  mut k = line.len() - 2usize;
+  while k > line.len() - 32usize and k > 2usize {
+    imm a = *line[k - 1usize];
+    imm b = *line[k + 1usize];
+    imm c = *line[k];
+    imm tx = b.x - a.x;
+    imm tz = b.z - a.z;
+    imm tl = (tx * tx + tz * tz).sqrt();
+    imm off = (if rng.unit() < 0.5 { 1.; } else { -1.; }) * (1.7 + 0.9 * rng.unit());
+    imm x = c.x + (0. - tz) / tl * off;
+    imm z = c.z + tx / tl * off;
+    if rng.unit() < 0.45 and g.count(K_HOSTA) < MAX_HOSTAS and standable(x, z, 2.6, 1.3) and g.clearAt(x, z, 0.45, 0.2) {
+      g.add(K_HOSTA, rng.below(HOSTA_VARIANTS), x, z, rng.unit() * 6.28, 1.15 + 0.6 * rng.unit(), 0.6);
+    }
+    k = k - 1usize;
+  }
+}
+
+fn ferns(g &mut Ground, rng &mut VRng) {
+  // two or three clumps round each tree
+  imm trees = g.items.len();
+  mut i = 0usize;
+  while i < trees {
+    imm t = g.items[i];
+    if (t.kind == K_PINE or t.kind == K_MAPLE or t.kind == K_SPECIMEN) and g.count(K_FERN) < MAX_FERNS {
+      imm n = 3 + i32.from(rng.below(2u32));
+      mut j = 0;
+      while j < n {
+        imm a = rng.unit() * 6.28;
+        imm r = 1.4 + 3.4 * rng.unit();
+        imm x = t.x + a.cos() * r;
+        imm z = t.z + a.sin() * r;
+        if standable(x, z, 2.6, 1.4) and groundSlope(x, z) < 0.45 and g.count(K_FERN) < MAX_FERNS and g.clearAt(x, z, 0.5, 0.2) {
+          g.add(K_FERN, rng.below(FERN_VARIANTS), x, z, rng.unit() * 6.28, 1.0 + 0.6 * rng.unit(), 0.75);
+        }
+        j = j + 1;
+      }
+    }
+    i = i + 1usize;
+  }
+  // along the lane
+  imm line = pathCentreline();
+  mut k = 4usize;
+  while k + 2usize < line.len() {
+    imm a = *line[k - 1usize];
+    imm b = *line[k + 1usize];
+    imm c = *line[k];
+    imm tx = b.x - a.x;
+    imm tz = b.z - a.z;
+    imm tl = (tx * tx + tz * tz).sqrt();
+    imm off = (if rng.unit() < 0.5 { 1.; } else { -1.; }) * (1.6 + 2.2 * rng.unit());
+    imm x = c.x + (0. - tz) / tl * off;
+    imm z = c.z + tx / tl * off;
+    if rng.unit() < 0.55 and g.count(K_FERN) < MAX_FERNS and standable(x, z, 2.7, 1.35) and g.clearAt(x, z, 0.5, 0.2) {
+      g.add(K_FERN, rng.below(FERN_VARIANTS), x, z, rng.unit() * 6.28, 1.0 + 0.6 * rng.unit(), 0.75);
+    }
+    k = k + 3usize;
+  }
+}
+
+fn flowers(g &mut Ground, rng &mut VRng) {
+  // the beds on the porch's front, either side of the steps and the path's end (x -17.1 to -14.8)
+  mut x = -18.2;
+  while x < -13.2 {
+    if x < -17.2 or x > -14.7 {
+      mut j = 0;
+      while j < 2 {
+        imm fx = x + 0.3 * rng.signed();
+        imm fz = 332.5 + 0.5 * rng.unit() + 0.45 * f32.from(j);
+        if g.count(K_FLOWER) < MAX_FLOWERS and pathDistanceAt(fx, fz) > 1.25 and g.clearAt(fx, fz, 0.25, 0.1) {
+          g.add(K_FLOWER, rng.below(FLOWER_VARIANTS), fx, fz, rng.unit() * 6.28, 1.1 + 0.4 * rng.unit(), 0.3);
+        }
+        j = j + 1;
+      }
+    }
+    x = x + 0.55;
+  }
+  // round the amphora (the world's object 1)
+  imm ax = PLACES[4usize] + WORLD_DX;
+  imm az = PLACES[5usize] + WORLD_DZ;
+  mut i = 0;
+  while i < 14 {
+    imm a = rng.unit() * 6.28;
+    imm r = 0.9 + 1.0 * rng.unit();
+    imm fx = ax + a.cos() * r;
+    imm fz = az + a.sin() * r;
+    if g.count(K_FLOWER) < MAX_FLOWERS and pathDistanceAt(fx, fz) > 1.4 and g.clear(fx, fz, 0.25) {
+      g.add(K_FLOWER, rng.below(FLOWER_VARIANTS), fx, fz, rng.unit() * 6.28, 1.1 + 0.4 * rng.unit(), 0.3);
+    }
+    i = i + 1;
+  }
+  // by the path's last 25 m
+  imm line = pathCentreline();
+  mut k = line.len() - 2usize;
+  while k > line.len() - 27usize and k > 2usize {
+    imm a = *line[k - 1usize];
+    imm b = *line[k + 1usize];
+    imm c = *line[k];
+    imm tx = b.x - a.x;
+    imm tz = b.z - a.z;
+    imm tl = (tx * tx + tz * tz).sqrt();
+    imm off = (if rng.unit() < 0.5 { 1.; } else { -1.; }) * (1.5 + 0.9 * rng.unit());
+    imm fx = c.x + (0. - tz) / tl * off;
+    imm fz = c.z + tx / tl * off;
+    if rng.unit() < 0.6 and g.count(K_FLOWER) < MAX_FLOWERS and standable(fx, fz, 2.6, 1.3) and g.clearAt(fx, fz, 0.25, 0.1) {
+      g.add(K_FLOWER, rng.below(FLOWER_VARIANTS), fx, fz, rng.unit() * 6.28, 1.1 + 0.4 * rng.unit(), 0.3);
+    }
+    k = k - 1usize;
+  }
+}
+
+mut layoutCache List[Item];
+mut layoutDone bool = false;
+fn @initpure init() { layoutCache = List[Item].empty(); }
+
+// The layout built afresh from its seed (what a check compares the cached one to)
+pub fn vegetationLayoutAgain() List[Item] {
+  layoutDone = false;
+  layoutCache.clear();
+  vegetationLayout();
+}
+
+// Whether the vegetation is left out (browser.exe --no-vegetation, to time what it costs)
+mut vegetationOff bool = false;
+pub fn setVegetation(on bool) { vegetationOff = !on; }
+
+// The whole layout (built once)
+pub fn vegetationLayout() List[Item] {
+  if vegetationOff { return List[Item].empty(); }
+  if !layoutDone {
+    mut g = Ground.make();
+    mut rng = vrng(1u32);
+    anchors(&mut g, &mut rng);
+    forest(&mut g, &mut rng);
+    rocks(&mut g, &mut rng);
+    hostas(&mut g, &mut rng);
+    flowers(&mut g, &mut rng);
+    ferns(&mut g, &mut rng);
+    edging(&mut g, &mut rng);
+    layoutCache <=> g.items;
+    layoutDone = true;
+  }
+  mut out = List[Item].withCapacity(layoutCache.len());
+  mut i = 0usize;
+  while i < layoutCache.len() { out.push(*layoutCache[i]); i = i + 1usize; }
+  out;
+}
