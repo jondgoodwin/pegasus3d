@@ -3,7 +3,7 @@
 A native 3-D browser written in [Cone](https://github.com/jondgoodwin/cone), in the spirit of the
 Acorn-era Pegasus3D in `src/`. It is the shell and the walkable ground (an island in the sea, below; in metres, walked on at eye
 height, 1.7 m) and a baked-in world standing on it, assembled as one scene: you land on the beach and
-a path (about 200 m, snaking through a forest of red maples and white pines, rocks, edging stones, hostas,
+a path (about 200 m, snaking through a forest of red maples, white pines, hemlock and fir, rocks, edging stones, hostas,
 ferns and flowers, below) leads to a forest cottage (board and batten, a brick chimney up its right
 eave wall) with twelve pathway lanterns in six pairs facing across its last 16 m and a black-figure amphora beside it
 with the horn-flower; on its porch a lathed chess rook and two clay pots of flowers stand by the door; a ball
@@ -402,7 +402,7 @@ world actor's turn at the publish phase, so frames keep coming while the world a
 | horn-flower (stalk, leaves, petals, heart) | new (`hornflower.cone`): the horn, 2.4 m and cut short; `sculpt/examples/flower.cone`'s petals on the cut; five swept leaves | 2 m | 99,956 | 39 |
 | rocks (108 parts of six meshes) | new (`vegetation.cone`): `noiserock`'s faceted rocks in the kit's granite, scattered by `layout.cone`; they replace the one boulder | 0.3 to 1.6 m | 24,192 | 505 (granite bake 440) |
 | specimen maples (two, 4 parts) | `weberpenn` red maples, fitted to the winter photograph, in full leaf (below) | 11.6 m and 10.6 m | 316,528 | 392 |
-| pines (63, 126 parts of three variants) | `weberpenn` white pines, tiers of needle plumes | 13 to 15.5 m | 1,144,536 | 336 |
+| conifers (62, 124 parts of twelve variants: three young, three forest-grown and two shore white pines, two hemlocks, two balsam firs) | `weberpenn` conifers, cut-out cards painted with `surfacepatterns`' needle tufts (pads, tufts, sprays) | 9 to 29 m | about 250,000 (2,400 to 5,800 a tree; the old 63 pines were 1,144,536, 18,200 each) | see the start of a run |
 | forest maples (35, 70 parts of three variants) | `weberpenn` red maples, three levels, bigger plainer leaves | 8 to 10.5 m | 626,870 | 3 |
 | edging stones (335, four variants) | `noiserock` low rounded stones in field-stone colours, one every 0.7 to 1.1 m along both edges just outside the walking surface (0.03 to 0.2 m clear of it, never on it), a quarter of their height sunk into the ground | 0.25 to 0.5 m across (the larger at bends) | 33,500 | 603 (bake 600) |
 | hostas and ferns (118, two each) | `leafrosette` | 0.5 to 1 m | 60,048 | 0.5 |
@@ -426,21 +426,31 @@ cell, 156 m, 458,324 triangles, 700 ms of it 0.4 s making the kernels), which `d
 The scene is 15 October, so the maples are in autumn colour: scarlet at the top and on the outer side, orange and gold in the middle, a few greenish-yellow leaves low and inside (the leaf palette's ramp, by each leaf's exposure); the pines stay green. The generators are Cone's own packages (`weberpenn`: Weber and
 Penn's trees with an opposite-pair and whorl mode; `noiserock`: rocks; `leafrosette`: hostas, ferns and flower
 clumps); this folder holds the scene's choices. Everything is a few meshes (variants by seed) of which many parts
-are copies, so render draws each (mesh, material) pair as one instanced draw. **Every leaf is geometry, not a
-cut-out** (render has no alpha-test material yet): a maple leaf is a blade of 7 to 24 triangles in its own
-three-lobed outline, drawn from both sides, a pine's needles are tiers of drooping ribbons. When the cut-out
-material arrives, only `weberpenn`'s `foliageMesh` and the leaf material change; the trees, parts and layout stay.
+are copies, so render draws each (mesh, material) pair as one instanced draw. A maple's leaf is geometry: a blade of 7 to 24 triangles in its own
+three-lobed outline, drawn from both sides. **The conifers are cut-out cards**: needle tufts baked in code
+(`surfacepatterns`' `needletuft.cone`: five-needle fascicles in a starburst, anti-aliased, 40 % coverage), laid
+as a flat pad along each limb of a white pine (a cloud of tufts, tier above tier with sky between) with a crossed
+tuft at each tip, and as flat sprays along a hemlock's or fir's limbs; render's alpha mask cuts them out, and
+`addCutoutTexture` keeps the card's coverage down its mip levels so a tree does not thin out with distance. Their
+look is matte (`PbrMaterial.specularScale`): the first conifers shone pale cream at night and against a low sun,
+because a flat card seen edge-on mirrors the sun or moon at the grazing angle where a dielectric reflects nearly
+all of it (the ribbons did the same).
 
 | File | What it is |
 | --- | --- |
 | `src/bakedworld/layout.cone` | where everything stands: the rules and the seed (`vegetationLayout`, a list of `Item`s: kind, variant, x, y, z, yaw, scale, radius) |
 | `src/bakedworld/vegetation.cone` | the meshes, the textures and the parts of each family, objects 9 (rocks) to 15 |
 | `src/vegscript.cone` | the scripted run's eleven views (frames 1230 to 1339, after glow and glass's: `veg-maple`, `veg-maple-close`, `veg-path-beach`, `veg-path-forest`, `veg-cottage-trees`, `veg-cottage-above`, `veg-plants`, `veg-flowers`, `veg-rocks`, `veg-edging`, `veg-overview`), worked out from the layout |
-| `src/vegchecks.cone` | the layout's checks, part of `--checks` |
+| `src/pinescript.cone` | the scripted run's ten conifer views (the last 100 frames: `pines-white-close`, `pines-forest`, `pines-forest-b`, `pines-hemlock`, `pines-fir`, `pines-ring`, `pines-shore`, `pines-mature`, `pines-backlit` at 16:40, `pines-night` at 23:00) |
+| `src/vegchecks.cone` | the layout's checks, part of `--checks` (the conifers' mix and forms too) |
 
 **The rules.** Two specimen maples stand near the cottage and the path (-4, 341 and -31, 347, the first to the
-right of the lane as you walk up it, as in the photograph that started this) and eight pines round the cottage's
-back and sides; then pines (two in three) and forest maples by `island.forestDensity`, a dart-thrown scatter over
+right of the lane as you walk up it, as in the photograph that started this) and a ring of eight white pines round the
+cottage's back and sides (the three at its back the tall forest-grown form); then conifers (two in three) and forest
+maples by `island.forestDensity` (the conifers about three white pines in five, a fifth to a quarter hemlock, the rest
+fir, the hemlock likelier in the thick shade and the fir on low ground; a white pine is the wind-shaped shore form on
+low ground, the tall forest-grown form in thick forest 9 m or more off the path, the young open-grown one elsewhere;
+each with its own lean of up to 3 degrees and its width 0.88 to 1.15 of its height's), a dart-thrown scatter over
 a jittered grid of candidates, nearest the path first, with a spacing that falls where the forest is thick (7 to
 13 m), 4.5 m from the path's centre at the least, above the beach, off steep ground, inside the fence, and clear of
 the cottage's footprint, the old world's objects and the lanterns, capped at 90 trees. Rocks: 22 on the beach and
@@ -480,7 +490,9 @@ photograph's, and its limbs' angles vary more.
 
 **Colours** (late May, none from Jon's autumn note): leaves a deep green in the crown's shade to a fresh
 yellow-green in the sun, the very sunniest with a hint of spring's red, petioles red; the maple bark is the kit's
-`BarkParams.redMaple`, the pine's `BarkParams.pine` greyed; the pine's needles deep blue-green; hostas one
+`BarkParams.redMaple`, the white pine's `BarkParams.whitePine` (grey-brown), the hemlock's `BarkParams.pine` dulled
+(cinnamon), the fir's `BarkParams.redMaple` paler; the white pine's needles deep blue-green, with October's tawny
+inner pads on about a quarter of those inside the crown, the hemlock's and fir's darker green; hostas one
 blue-grey and one yellow-green, ferns two greens, flowers buttercup, white and violet.
 
 **Glow and flutter** (render's foliage shading, set per material in `vegetation.cone`: `MAPLE_TRANSLUCENCY`,
@@ -488,7 +500,7 @@ blue-grey and one yellow-green, ferns two greens, flowers buttercup, white and v
 colour, so a backlit crown glows coral and orange instead of going dark; the maples' leaves also turn up to about
 seven degrees about their stems, each on its own phase and period (0.6 to 1.8 s), so they catch and lose the light.
 The maples' leaf meshes carry each leaf's pivot and phase in their vertex colours (`FoliageParams.sway`). The
-pines' needles have a little translucency and no flutter. `shots/foliage-*.png` shows the maple before and after,
+conifers' needles have a little translucency (`PINE_TRANSLUCENCY`), a matte look and no flutter. `shots/foliage-*.png` shows the maple before and after,
 with the sun behind the tree and behind the viewer, and two frames 0.25 s apart.
 
 **Counts and cost.** 98 trees (63 pines, 35 forest maples) and 2 specimens, 106 rocks, 335 edging stones, 21
