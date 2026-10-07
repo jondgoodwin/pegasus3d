@@ -52,6 +52,33 @@ HARD, the pelvis crouches, and the scene mails a `HardLanding` to the world; one
 being's health, to nothing left at 24 m/s. The body is a smooth skinned figure in the second half of T2,
 once the render core has dynamic vertex buffers and custom pipelines.
 
+## The sky and the birds
+
+The sky is the day's, drawn by one custom pipeline (`src/skyshader.slang`, a full-screen draw at the far plane,
+`src/skyrig.cone`) over the sky of Cone's `analyticdaylight` package: Preetham, Shirley and Smits's analytic daylight
+(coefficients read from the paper, not from memory), a twilight patch for the sun below 6 degrees, a night floor,
+the sun's disc, a moon that is always up at night with a phase and seas, and a field of stars that turns with
+the hour; with two layers of cloud (a low one 1800 m up, cirrus at 7500 m) drifting on scene time, lit by the
+sun's colour so they redden at dusk and by the moon at night. The day is **45 degrees north on 20 May** (so the
+clock's dawn at 4:30 and dusk at 19:30 are the sun's centre at the horizon), the sun rising in the east (+x) and
+setting in the west, due south (+z) at noon, 64.8 degrees up. Turbidity 2.5.
+
+The scene is lit from the same `DaySky` on the CPU, each frame, from the scene's day clock: the sun's irradiance
+(100 000 lux at noon, reddening through the air it crosses), the moon's (0.18 lux at night, the directional light
+once the sun's is the less), and the ambient radiance, the sky averaged over the hemisphere (10 000 nits at noon).
+The exposure is scripted from the sun's height (`ev100ForSun`, `look.cone`): EV 15 at noon, falling to -1 at night,
+where the moon and the ambient floor show the ground dark but readable. `--no-sky` runs with the static sky and
+light and no birds, to time what the day costs.
+
+Forty birds (`boidflock`) keep to within 90 m of the cottage (`BIRD_HOME_X/Z`, a parameter), flock by
+separation, alignment and cohesion on their 7 nearest neighbours, steer round the ground and the hill (the
+flock is asked the ground's height, `ground.cone`), and beat their wings at 7 Hz on the level, up to 13 Hz
+climbing and down to 4.5 Hz diving, gliding between bursts. A bird is **one mesh drawn once, instanced** (a body,
+head and beak, a forked tail and two wings of ten stations with three primaries each, 0.54 m across): the flap
+is done in the vertex stage (`src/birdshader.slang`) from the phase and amplitude the flock gives each instance,
+so there is no CPU vertex work and one draw for all of them. The flock steps on scene time (paused with P, x10
+with F).
+
 ## Keys
 
 | Key | Does |
@@ -76,7 +103,8 @@ once the render core has dynamic vertex buffers and custom pipelines.
 browser.exe --script                  walk and turn with no one at the keyboard, checked
 browser.exe --script --shots shots    the same, saving its views as BMPs into shots/
 browser.exe --headless --script       the same with no window: the scene, the world and the walk
-browser.exe --checks                  the scene core's own checks, on scenes of their own (below)
+browser.exe --checks                  the scene core's own checks, on scenes of their own (below), and the sky's
+browser.exe --no-sky                  the static sky and light, no birds (to time what the day costs)
 browser.exe --frames 600              600 frames on frame's synthetic clock
 browser.exe --soak 12000              12000 frames, checking nothing grows (below)
 browser.exe --watch 300               300 s in real time, a line a second and a key probe (below)
@@ -117,6 +145,12 @@ was mailed and read by the world and hurt by (speed - 10) / 14. It saves `manneq
 `mannequin-side` and `mannequin-side2` (a side view mid-stride), `mannequin-first`, `mannequin-second`,
 `mannequin-falling` and `mannequin-landing`. Last, from frame 940, it looks at the cottage from the
 reference photograph's place and from the walker's eye on the approach.
+After that (frames 960 to 1130, `src/skyscript.cone`) it sets the day clock to a series of hours, forward from
+noon to the next morning, and saves the sky from beside the cottage in windows of ten frames: `sky-noon`, four
+birds from beside, above and ahead (`sky-bird-1` to `-4`), the flock from the ground (`sky-flock`),
+`sky-afternoon`, the sunset (`sky-sunset-cottage`, `sky-sunset-sun`), dusk (`sky-dusk-cottage`, `sky-dusk-west`,
+`sky-deepdusk`), night (`sky-night-cottage`, `sky-night-moon`, `sky-night-stars`) and dawn (`sky-dawn`,
+`sky-morning-cottage`).
 It exits 0 only if every check passed, no Vulkan call failed and the validation layer said nothing.
 
 `--checks` runs the scene core's checks on scenes of their own, with no window, GPU or frames: a
@@ -131,7 +165,11 @@ at v = sqrt(2 g h), the hard landings mailed once each and the hurt (nothing to 
 12.5 m/s) taken from health, a 6 s walk whose gait speed follows the intent and whose planted foot does
 not move more than 1 cm, standing with both feet flat and level, the third-person camera 3.2 m behind
 and the first-person one at the eyes socket, and Tab possessing the other mannequin with the camera and
-the controls following it. It exits 0 only if every check passed.
+the controls following it; and the sky (`src/skychecks.cone`): the sun at the clock's noon (64.8 degrees,
+due south), dusk and dawn (-0.84 degrees, its centre at the horizon), the sun below the horizon and the
+moon above it every quarter hour from 20:00 to 4:30, the light (noon: 100 000 lux and a few thousand nits of
+ambient; midnight: the moon's 0.18 lux, never black), the exposure (EV 15 at noon, -1 at night, only falling
+through the evening) and forty birds staying over the cottage. It exits 0 only if every check passed.
 `shots/` holds the views of one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups
 `rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`, the mannequins' `mannequin-*`,
 `cottage-photo`, `cottage-approach`), converted to PNG, `amphora-vs-photo.png`, the amphora's close-up
