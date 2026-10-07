@@ -48,7 +48,7 @@
 pub const SCRIPT_DEVICE = 0x5C1u;
 
 // The frames a scripted run needs
-pub const SCRIPT_FRAMES = 1230u64;
+pub const SCRIPT_FRAMES = 1340u64;
 
 // The island's views follow the cottage's: partway up the path, the whole
 // island, the shoreline (the sky's run, skyscript.cone, comes after, at SKY_FROM)
@@ -99,6 +99,7 @@ pub fn hasView(f u64) bool {
 
 // The close-up's eye for frame 'f'
 pub fn viewAt(f u64) Pose {
+  if f >= VEG_FROM { return vegView(f); }
   if f >= GLOW_FROM { return glowView(f); }
   if f >= SKY_FROM { return skyView(f); }
   if f >= ISLAND_FROM {
@@ -153,7 +154,8 @@ pub const AMPHORA_FOV f32 = 0.34906585;
 
 // The close-up's vertical field of view: the amphora's longer lens, or the walk's
 pub fn viewFov(f u64) f32 {
-  if f >= GLOW_FROM { glowFov(f); }
+  if f >= VEG_FROM { vegFov(f); }
+  elif f >= GLOW_FROM { glowFov(f); }
   elif f >= SKY_FROM { skyFov(f); }
   elif f >= 640u64 and f < 650u64 { AMPHORA_FOV; }
   elif f >= COTTAGE_FROM and f < COTTAGE_FROM + 10u64 { COTTAGE_PHOTO_FOV; }
@@ -248,8 +250,8 @@ pub fn pushClicks(host &mut Host, f u64, w &Walk) {
     pushButton(clickAt.x, clickAt.y, true);
   }
   if f == 145u64 {
-    // The sky, high in the middle
-    clickAt = new Vec2(viewSize(host).x * 0.5, viewSize(host).y * 0.1);
+    // The sky, at the top edge in the middle (a tall pine can stand higher in the view than 10% down)
+    clickAt = new Vec2(viewSize(host).x * 0.5, viewSize(host).y * 0.01);
     pushButton(clickAt.x, clickAt.y, true);
   }
   if f == 450u64 {
@@ -341,6 +343,7 @@ mut tempSent u64 = 0u64;
 pub fn driveScene(f u64) {
   skyDrive(f);
   glowDrive(f);
+  vegDrive(f);
   if f == 3u64 {
     tempApplied = scene.applied;
     tempRefused = scene.refused;
@@ -394,6 +397,7 @@ pub fn shotAt(f u64) &[]u8 {
   if f == 964u64 { return "island-path"; }
   if f == 974u64 { return "island-overview"; }
   if f == 984u64 { return "island-shore"; }
+  if f >= VEG_FROM { return vegShotAt(f); }
   if f >= GLOW_FROM { return glowShotAt(f); }
   skyShotAt(f);
 }
@@ -411,9 +415,9 @@ fn near(name &[]u8, got f32, want f32, within f32) bool {
 // the scene module), and this checks what the world sent arrived.
 fn checkWorld() bool {
   mut ok = world.done();
-  print <- "The world: "; print <- world.ids.len(); print <- " parts sent (want "; print <- WORLD_PARTS; print <- ")";
+  print <- "The world: "; print <- world.ids.len(); print <- " parts sent (want "; print <- worldParts(); print <- ")";
   if !world.done() { print <- ", NOT every object sent"; }
-  if world.ids.len() != WORLD_PARTS { ok = false; }
+  if world.ids.len() != worldParts() { ok = false; }
   mut live = 0usize;
   mut placed = 0usize;
   mut drawn = 0usize;
@@ -428,12 +432,12 @@ fn checkWorld() bool {
   print <- "; live "; print <- live; print <- ", placed "; print <- placed;
   if hasGpu() { print <- ", drawn or emitting "; print <- drawn; }
   print <- "\n";
-  if live != WORLD_PARTS or placed != WORLD_PARTS { ok = false; }
-  if hasGpu() and drawn != WORLD_PARTS { ok = false; }
-  print <- "  the scene: "; print <- scene.partCount(); print <- " parts (want "; print <- SHELL_PARTS + WORLD_PARTS + SCRIPT_FIGURES * FIGURE_PARTS;
+  if live != worldParts() or placed != worldParts() { ok = false; }
+  if hasGpu() and drawn != worldParts() { ok = false; }
+  print <- "  the scene: "; print <- scene.partCount(); print <- " parts (want "; print <- SHELL_PARTS + worldParts() + SCRIPT_FIGURES * FIGURE_PARTS;
   print <- "); sent "; print <- scene.door.sent; print <- " = applied "; print <- scene.applied; print <- " + refused ";
   print <- scene.refused; print <- " (want 1), waiting "; print <- scene.waiting(); print <- "\n";
-  if scene.partCount() != SHELL_PARTS + WORLD_PARTS + SCRIPT_FIGURES * FIGURE_PARTS or scene.door.sent != scene.applied + scene.refused
+  if scene.partCount() != SHELL_PARTS + worldParts() + SCRIPT_FIGURES * FIGURE_PARTS or scene.door.sent != scene.applied + scene.refused
     or scene.refused != 1u64 or scene.waiting() != 0usize { ok = false; }
   if !ok { print <- "  the world's injection is WRONG\n"; }
   ok;
@@ -446,8 +450,9 @@ fn checkWorld() bool {
 // wall lanterns' four each, the rooms behind the windows, three parts of
 // pools of light); the three path lanterns' twelve and their three pools;
 // the balloon's six and its flame and pilot light, the starship's six, the
-// launch button's two, the ball, the mound
-const WORLD_PARTS = 72usize;
+// launch button's two, the ball, the mound; and the vegetation's (layout.cone's
+// items: each tree two parts, the rest one)
+fn worldParts() usize { 71usize + vegetationParts(); }   // 72 less the boulder, now among the rocks
 
 // Part 'id''s shape's bounds in its own frame, as the picking system keeps them
 fn boundsOf(id PartId) Aabb3 {
@@ -616,9 +621,10 @@ fn checkSharing() bool {
   print <- " materials (want 15 fewer: the rooks share theirs, the cottage's 26 meshes share 20 materials, the lanterns' 4 meshes add none";
   print <- " and their 3 pools' meshes share 1 material the cottage defined,";
   print <- " the island's 3 meshes (land fine and coarse, the sea) have 2 materials;";
+  print <- " plus the vegetation's surplus (its 36 meshes have 13 materials);";
   print <- " and each mannequin is "; print <- FIGURE_MESHES;
   print <- " meshes in one material), "; print <- scene.resourceCount(); print <- " defined\n";
-  if scene.door.meshes != scene.door.materials + 15u64 + u64.from(SCRIPT_FIGURES) * (FIGURE_MESHES - 1u64)
+  if scene.door.meshes != scene.door.materials + 15u64 + vegetationMeshSurplus() + u64.from(SCRIPT_FIGURES) * (FIGURE_MESHES - 1u64)
     or u64.from(scene.resourceCount()) != scene.door.meshes + scene.door.materials {
     ok = false;
   }
