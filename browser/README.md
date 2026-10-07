@@ -4,7 +4,8 @@ A native 3-D browser written in [Cone](https://github.com/jondgoodwin/cone), in 
 Acorn-era Pegasus3D in `src/`. It is the shell and the walkable ground (an island in the sea, below; in metres, walked on at eye
 height, 1.7 m) and a baked-in world standing on it: two chess
 rooks, a horn-flower, a horn, a forest cottage (board and batten, a brick chimney up its right eave wall)
-with three pathway lanterns along its path, a black-figure amphora and a boulder in front of it, a
+with three pathway lanterns along its path, a black-figure amphora in front of it, a forest of red maples and
+white pines round it with rocks, edging stones, hostas, ferns and flowers (below), a
 hot-air balloon with its burner alight and,
 hovering beyond them, Elizabeth's skeletal dragon starship, built from Cone's sculpt, vfx, sdf and sdfmesh
 packages and sent in as if downloaded. Things move: a ball bounces and spins, the burner fires in bursts,
@@ -106,7 +107,8 @@ with F).
 browser.exe --script                  walk and turn with no one at the keyboard, checked
 browser.exe --script --shots shots    the same, saving its views as BMPs into shots/
 browser.exe --headless --script       the same with no window: the scene, the world and the walk
-browser.exe --checks                  the scene core's own checks, on scenes of their own (below), and the sky's
+browser.exe --no-vegetation           the same without the trees, rocks and plants (to time what they cost)
+browser.exe --checks                  the scene core's own checks, on scenes of their own (below), the sky's and the vegetation's layout
 browser.exe --no-sky                  the static sky and light, no birds (to time what the day costs)
 browser.exe --frames 600              600 frames on frame's synthetic clock
 browser.exe --soak 12000              12000 frames, checking nothing grows (below)
@@ -323,7 +325,13 @@ frames keep coming while the world arrives.
 | lathed rook, beside it | the same rook with no booleans: one lathe, four capped merlons joined on | 1.4 m | 2,320 | 0.75 |
 | amphora | new (`amphora.cone`): an outline traced from a photograph, lathed 128 steps round; two handles swept along a traced centreline; its bands and patterns painted, 2048 x 2048, and an ORM map | 1.5 m | 63,832 | 100 (paint 83) |
 | horn-flower (stalk, leaves, petals, heart) | new (`hornflower.cone`): the horn, 2.4 m and cut short; `sculpt/examples/flower.cone`'s petals on the cut; five swept leaves | 2 m | 99,956 | 39 |
-| boulder | `sculpt/examples/pebble.cone` (one more subdivision) | 2 m | 768 | 0.4 |
+| rocks (108 parts of six meshes) | new (`vegetation.cone`): `noiserock`'s faceted rocks in the kit's granite, scattered by `layout.cone`; they replace the one boulder | 0.3 to 1.6 m | 24,192 | 505 (granite bake 440) |
+| specimen maples (two, 4 parts) | `weberpenn` red maples, fitted to the winter photograph, in full leaf (below) | 11.6 m and 10.6 m | 316,528 | 392 |
+| pines (63, 126 parts of three variants) | `weberpenn` white pines, tiers of needle plumes | 13 to 15.5 m | 1,144,536 | 336 |
+| forest maples (35, 70 parts of three variants) | `weberpenn` red maples, three levels, bigger plainer leaves | 8 to 10.5 m | 626,870 | 3 |
+| edging stones (150, four variants) | `noiserock` rounded stones in field-stone colours, set a third into the ground along the path | 0.2 to 0.5 m | 15,000 | 603 (bake 600) |
+| hostas and ferns (118, two each) | `leafrosette` | 0.5 to 1 m | 60,048 | 0.5 |
+| flowers (16 clumps, six variants) | `leafrosette` | 0.4 m | 7,040 | 0.2 |
 | horn | `sculpt/examples/hornfamily.cone`, stage 0 | 3 m along | 46,204 | 18 |
 | cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
 | path lanterns (three: stake, glass, bulb, cap each) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 2,892 | 0.24 |
@@ -333,6 +341,77 @@ frames keep coming while the world arrives.
 | ball | new: a sphere, checkered so its spin shows | 1 m across | 1,984 | 0.03 |
 | mound | new: a 65 x 65 grid lifted on the GPU by a heightfield (the heightfield shader, a custom pipeline), green rising to a faintly glowing sandy hump | 4 m square | 8,192 | 0.14 |
 | starship (frame, membranes, wing lights, ports, eyes, mouth) | `packages/starship`, meshed on the GPU at 0.03 a cell | 156 m, 10 m a unit | 458,324 | 700 (0.4 s of it making the kernels) |
+
+## The vegetation
+
+The scene is 20 May, so the maples are in leaf. The generators are Cone's own packages (`weberpenn`: Weber and
+Penn's trees with an opposite-pair and whorl mode; `noiserock`: rocks; `leafrosette`: hostas, ferns and flower
+clumps); this folder holds the scene's choices. Everything is a few meshes (variants by seed) of which many parts
+are copies, so render draws each (mesh, material) pair as one instanced draw. **Every leaf is geometry, not a
+cut-out** (render has no alpha-test material yet): a maple leaf is a blade of 7 to 24 triangles in its own
+three-lobed outline, drawn from both sides, a pine's needles are tiers of drooping ribbons. When the cut-out
+material arrives, only `weberpenn`'s `foliageMesh` and the leaf material change; the trees, parts and layout stay.
+
+| File | What it is |
+| --- | --- |
+| `src/bakedworld/layout.cone` | where everything stands: the rules and the seed (`vegetationLayout`, a list of `Item`s: kind, variant, x, y, z, yaw, scale, radius) |
+| `src/bakedworld/vegetation.cone` | the meshes, the textures and the parts of each family, objects 3 (rocks) and 13 to 18 |
+| `src/vegscript.cone` | the scripted run's eleven views (frames 1170 to 1279: `veg-maple`, `veg-maple-close`, `veg-path-beach`, `veg-path-forest`, `veg-cottage-trees`, `veg-cottage-above`, `veg-plants`, `veg-flowers`, `veg-rocks`, `veg-edging`, `veg-overview`), worked out from the layout |
+| `src/vegchecks.cone` | the layout's checks, part of `--checks` |
+
+**The rules.** Two specimen maples stand near the cottage and the path (-4, 341 and -31, 347, the first to the
+right of the lane as you walk up it, as in the photograph that started this) and eight pines round the cottage's
+back and sides; then pines (two in three) and forest maples by `island.forestDensity`, a dart-thrown scatter over
+a jittered grid of candidates, nearest the path first, with a spacing that falls where the forest is thick (7 to
+13 m), 4.5 m from the path's centre at the least, above the beach, off steep ground, inside the fence, and clear of
+the cottage's footprint, the old world's objects and the lanterns, capped at 90 trees. Rocks: 22 on the beach and
+shore about where you land, the rest on steep ground, and one every dozen metres or so at the path's side. Edging
+stones along both edges of the path (jittered spacing 1.1 to 1.6 m, larger at its bends, a third sunk, overlapping
+the path's edge) from where the beach ends to the steps. Hostas by the cottage's foundation and the path's last
+30 m; two to four fern clumps round each tree and along the lane; flowers in beds on the porch front either side
+of the steps, round the amphora and by the path's last 25 m. Deterministic from one seed.
+
+**Interfaces for assembly.** A tree is two parts: the bark is the root (what moves a tree: send `Place` to it) and
+the foliage a child with no placement of its own. `world.partOf(SPECIMENS, 2 * i)` is specimen i's root;
+`PINES` and `FOREST_MAPLES` the same, two parts a tree, in layout order; `ROCKS`, `EDGING`, `GROUNDCOVER` and
+`FLOWERS` one part an item. To clear an area, add a disc to `worldObjects()` in `layout.cone` (its x, radius, z),
+or a rectangle to `COTTAGE_RECTS`, and every kind keeps off it; to move an anchor, change `anchors()`. `--no-vegetation`
+leaves the lot out (to time what it costs).
+
+**The red maple, measured against the winter photograph** (`winter-3-king-rhodes-2014.jpg`, the lone
+single-trunk tree; `shots/maple-vs-winter-photo.png` puts it beside the model's bare skeleton, the photograph
+Famartin, CC BY-SA 4.0). The numbers come from the photograph (the crown's width at 19 heights, by segmenting it
+against the sky; the trunk's width by rows; the limbs' exit angles by eye on a crop) and the model's, over four
+seeds and two views:
+
+| Measure | Photograph | Model |
+| --- | --- | --- |
+| first limbs, as a fraction of the height | 0.24 | 0.21 to 0.24 |
+| crown width over height, widest | 0.81 at 0.5 H | 0.76 at 0.48 H |
+| crown width over height at 0.9 H | 0.39 | 0.46 |
+| rms difference of the width profile | | 0.06 |
+| trunk radius over height, at the ground | 0.020 (65 px of 1590) | 0.022 to 0.025 |
+| trunk radius over height, mid-trunk | 0.0125 | 0.012 to 0.014 |
+| limbs' exit angle from the vertical | about 10 to 57 degrees, the lowest widest | mean 30, standard deviation 24 |
+
+Weber and Penn's dials were fitted to it by a random search (about 6000 trials, the crown profile and the exit
+angles in its cost), not by hand; the fitted values are `redMaple`'s in `packages/weberpenn/src/species.cone`.
+Where it falls short: the model's top is wider and its fine branching sparser and straighter than the
+photograph's, and its limbs' angles vary more.
+
+**Colours** (late May, none from Jon's autumn note): leaves a deep green in the crown's shade to a fresh
+yellow-green in the sun, the very sunniest with a hint of spring's red, petioles red; the maple bark is the kit's
+`BarkParams.redMaple`, the pine's `BarkParams.pine` greyed; the pine's needles deep blue-green; hostas one
+blue-grey and one yellow-green, ferns two greens, flowers buttercup, white and violet.
+
+**Counts and cost.** 98 trees (63 pines, 35 forest maples) and 2 specimens, 108 rocks, 150 edging stones, 21
+hostas, 97 ferns, 16 flower clumps: 656 parts in all, 2,959,446 triangles of the world's 3,530,352 drawn (with
+the island, sky and cottage), against 1,336,138 and 67 parts without (`--no-vegetation`). Frame times at the
+start view, `--watch`, the p50 of the whole frame with and without: on the RTX 4060 6.97 and 6.99 ms (its render
+phase 2.69 and 2.25 ms), on the Intel UHD 770 32.2 and 33.5 ms, about 31 frames a second either way (its render
+phase 2.8 and 2.1 ms): the Intel's frame was already waiting on the GPU or the display before the vegetation, and
+it adds no more than the noise between runs (the machine was shared, so a clean difference could not be read).
+The scripted run's phases, which include every close-up, were no cleaner: see the PR.
 
 ## The island
 
