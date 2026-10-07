@@ -39,6 +39,8 @@ pub struct MaterialRow {
   pub physical bool;          // drawn physically based: 'pbr' its parameters, not 'base'
   pub pbr PbrMaterial;
   pub lit MaterialHandle;     // the highlighted material, made the first time it is asked for
+  pub shaded bool = false;    // drawn by a shader of the browser's own: 'params' its parameters
+  pub params Array[f32, 8] = [0., 0., 0., 0., 0., 0., 0., 0.];
 }
 
 // What one part is drawn as
@@ -49,6 +51,7 @@ pub struct Renderable {
   pub highlighted bool;
   pub batch u32;              // its batch
   pub member u32;             // and its place among the batch's members
+  pub tint Color = new Color(1., 1., 1., 1.);   // its colour and glow multiplied by this (Tint)
 }
 
 // Where a skinned part's skinning matrices are in 'poseBones'
@@ -95,7 +98,8 @@ pub struct EffectRow {
 // with a highlight
 fn highlightOf(m &Material) Material {
   mut out = *m;
-  out.baseColor = new Color(m.baseColor.red * 0.5 + 0.5, m.baseColor.green * 0.5 + 0.42, m.baseColor.blue * 0.5 + 0.05, 1.);
+  out.baseColor = new Color(m.baseColor.red * 0.5 + 0.5, m.baseColor.green * 0.5 + 0.42, m.baseColor.blue * 0.5 + 0.05,
+    m.baseColor.alpha);
   out.specular = new Color(0.6, 0.6, 0.6, 1.);
   out.shininess = 24.;
   out;
@@ -105,7 +109,7 @@ fn highlightOf(m &Material) Material {
 // turned towards a warm yellow
 fn highlightOfPhysical(m &PbrMaterial) PbrMaterial {
   mut out = *m;
-  out.baseColor = new Color(m.baseColor.red * 1.6, m.baseColor.green * 1.4, m.baseColor.blue * 0.45, 1.);
+  out.baseColor = new Color(m.baseColor.red * 1.6, m.baseColor.green * 1.4, m.baseColor.blue * 0.45, m.baseColor.alpha);
   out;
 }
 
@@ -128,6 +132,7 @@ pub struct RenderSystem {
   pub poses Table[PoseRow];   // keyed by a skinned part's id: where its skinning matrices are
   pub poseBones List[Mat4];   // every skinned part's skinning matrices, a run a part
   pub skinned usize;          // skinned parts in the last draw list
+  pub glows u64 = 0u64;       // Glow requests applied, ever
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
@@ -186,6 +191,8 @@ pub struct RenderSystem {
       material = Material.shiny(surface.color, surface.specular, surface.shininess);
     }
     material.emissive = surface.glow;
+    material.alphaMode = surface.alphaMode;
+    material.alphaCutoff = surface.alphaCutoff;
     if !paint.isEmpty() {
       // The painted image, multiplying the colour (its bytes are sRGB)
       material.texture = renderer.addTexture(device, paint);
@@ -229,7 +236,7 @@ pub struct RenderSystem {
       mh = renderer.addMaterial(device, &plain);
     }
     materials.put(id.id, new MaterialRow(mh, Material.plain(surface.color), false,
-      PbrMaterial.standard(surface.color, 0., 1.), MaterialHandle.none()));
+      PbrMaterial.standard(surface.color, 0., 1.), MaterialHandle.none(), renderer.hasPipeline(pipeline), surface.params));
     shaded = shaded + 1usize;
   }
 
@@ -241,6 +248,8 @@ pub struct RenderSystem {
       paint &Image, maps &Maps) {
     imm c = surface.color;
     mut pbr = PbrMaterial.standard(c, surface.metallic, surface.roughness).glowing(surface.glow, 1.);
+    pbr.alphaMode = surface.alphaMode;
+    pbr.alphaCutoff = surface.alphaCutoff;
     if !paint.isEmpty() {
       pbr.texture = renderer.addTexture(device, paint);
       painted = painted + 1usize;
@@ -263,17 +272,62 @@ pub struct RenderSystem {
   pub fn show(self &mut, id PartId, mesh MeshId, material MaterialId, anchor f32) bool {
     if meshes.find(mesh.id) == NO_ROW or materials.find(material.id) == NO_ROW { return false; }
     mut highlighted = false;
+    mut tint = new Color(1., 1., 1., 1.);
     imm row = rows.find(id);
     if row != NO_ROW {
       highlighted = rows.rows[row].highlighted;
+      tint = rows.rows[row].tint;
       self.leaveBatch(id);
     }
     imm b = self.batchOf(mesh, material);
     imm batch = &mut batches[b];
     imm member = u32.from(batch.members.len());
     batch.members.push(id);
-    rows.put(id, new Renderable(mesh, material, anchor, highlighted, u32.from(b), member));
+    rows.put(id, new Renderable(mesh, material, anchor, highlighted, u32.from(b), member, tint));
     true;
+  }
+
+  // Apply a Glow: material 'id' gives off 'glow' (nits) from now on: its
+  // emissive colour, or a shaded look's first three parameters. False if it
+  // is not defined here.
+  pub fn glow(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, glow Color) bool {
+    imm mrow = materials.find(id.id);
+    if mrow == NO_ROW { return false; }
+    mut m = *materials.rows[mrow];
+    if m.shaded {
+      m.params[0usize] = glow.red;
+      m.params[1usize] = glow.green;
+      m.params[2usize] = glow.blue;
+      renderer.setCustomParams(device, m.handle, &m.params);
+    } elif m.physical {
+      m.pbr.emissive = glow;
+      m.pbr.emissiveStrength = 1.;
+      renderer.setPbrMaterial(device, m.handle, &m.pbr);
+    } else {
+      m.base.emissive = glow;
+      renderer.setMaterial(device, m.handle, &m.base);
+    }
+    materials.rows.set(mrow, m);
+    glows = glows + 1u64;
+    true;
+  }
+
+  // Apply a Tint: part 'id' drawn with its colour and glow times 'tint'.
+  // False if it is not drawn.
+  pub fn tint(self &mut, id PartId, tint Color) bool {
+    imm row = rows.find(id);
+    if row == NO_ROW { return false; }
+    mut r = *rows.rows[row];
+    r.tint = tint;
+    rows.rows.set(row, r);
+    true;
+  }
+
+  // Part 'id''s tint (white if it is not drawn)
+  pub fn tintOf(self &, id PartId) Color {
+    imm row = rows.find(id);
+    if row == NO_ROW { return new Color(1., 1., 1., 1.); }
+    rows.rows[row].tint;
   }
 
   // The batch for (mesh, material), made if there is none
@@ -455,10 +509,10 @@ pub struct RenderSystem {
           if posed != NO_ROW {
             imm pr = *poses.rows[posed];
             imm from = usize.from(pr.first);
-            list.addSkinned(meshH, material, model, &allBones[from..from + usize.from(pr.count)]);
+            list.addSkinnedTinted(meshH, material, model, r.tint, &allBones[from..from + usize.from(pr.count)]);
             skinnedNow = skinnedNow + 1usize;
           } else {
-            list.add(meshH, material, model);
+            list.addTinted(meshH, material, model, r.tint);
           }
           drawnNow = drawnNow + 1usize;
           k = k + 1usize;

@@ -82,6 +82,43 @@ is done in the vertex stage (`src/birdshader.slang`) from the phase and amplitud
 so there is no CPU vertex work and one draw for all of them. The flock steps on scene time (paused with P, x10
 with F).
 
+## Glow and glass
+
+**Nothing casts light yet: no point lights.** The lamps glow, glass is see-through, and the light a lamp would
+throw on the ground is painted there. All of it is the world's lights (`src/bakedworld/lights.cone`):
+
+- **What glows:** the five lanterns' bulbs and frosted glass chimneys, and a lit room behind every window and
+  door pane (`src/interior.slang`: a card 9 mm behind the glass, a lampshade a little left of centre, its warm
+  light falling off round it, the dark back of a sofa across the lower third, curtains gathered at both sides).
+  Their glow is their material's emissive colour, which the picture's bloom spreads. The lamps are about 2700 K
+  (linear (1, 0.40, 0.095)); the rooms a deeper amber (1, 0.25, 0.028), deep enough that AgX does not pale it
+  to peach.
+- **On at dusk, off at dawn:** the world reads the scene's `Dusk` and `Dawn` mail and fades the lamps over
+  15 s of scene time (a quarter of an hour of the day). The fade is counted from the time the message was for,
+  so a clock set past dusk finds them already on.
+- **How bright follows the clock,** as the scripted exposure does: a bulb gives off about 2800 nits at dusk,
+  falling to 1.3 nits from 22:00 (`nitsAt`).
+  - The exposure rises about 5000-fold over the same hours.
+  - The bulb is about 1.2 of the display's white at 19:30, 2.7 at 19:50 and 3 at night: brighter as the night
+    deepens, as the eye adapting sees a lamp.
+  - Every other glow is a share of the bulb's: the glass 0.22, a room 0.4, a lantern's pool 0.04, a window's
+    pool 0.05.
+- **Nearness:** each path lantern's stake is an `Area` 4 m round. The possessed being coming into it brightens
+  that lantern's glass, bulb and pool 1.45 times over 0.4 s (a `Tint` on the three parts), and going out dims
+  them back. Only lit lanterns brighten.
+- **Pools of light** (`src/lightpool.slang`) are see-through, added light: a grid lying on the ground, its
+  vertices at `groundHeight` plus 3 cm, so it follows the terrain. They are soft from the middle out,
+  (1 - d^2)^2 times a bright core, with no rim. There is one under each path lantern (1.3 m round); one under
+  each wall lantern and before each lit porch window and the door, on the deck; and one on the ground before
+  the wing's windows.
+- **Glass:** the window and door panes are physically based and see-through (alpha 0.1, a faint grey-green, so
+  they reflect the sky at a glancing angle). The lanterns' chimneys are frosted (alpha 0.45), so the bulb shows
+  through as a paler oval.
+
+The requests are `Glow` (a material's emissive colour, or a shaded look's first three parameters) and `Tint` (a
+part's colour and glow multiplied). A `Look` is see-through with `.translucent(alpha)` and cut out with
+`.cutOut(cutoff)`, through render's alpha modes.
+
 ## Keys
 
 | Key | Does |
@@ -182,6 +219,20 @@ through the evening) and forty birds staying over the cottage. It exits 0 only i
 beside the photograph it was traced from, and `cottage-vs-photo.png`, the cottage from the photograph's
 viewpoint beside the photograph.
 
+After the sky's views, from frame 1170 (`src/glowscript.cone`), the clock is set to the next evening and night
+for the lights:
+- `glow-dusk-approach`, `glow-night-approach`: the cottage at 19:50 and at 23:00;
+- `glow-glass-dusk`, `glow-glass-night`: the porch's right bay window close up;
+- `glow-dusk-photo`, and `glow-dusk-vs-photo.png` beside the reference photograph: the photograph's view at
+  19:50;
+- `glow-lantern-night`: the nearest path lantern close up. The walker was set down within its area two windows
+  before, so the lantern is brightened.
+
+At frame 1222 the lights are checked: on, the bulb at the hour's brightness, the lantern beside the walker
+brightened 1.45 times, and the next one not. `--checks` runs the same lights on a scene of their own: off by day
+(and not brightened by nearness), half way through the fade at half its time, at the hour's brightness after
+it, brightened on coming near at night and dimmed on leaving, and off after dawn.
+
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
 scene's inbox is empty after the apply point and that the parts, the rows drawn and the particle
 emitters stay as many as they were, and every 3000 frames that the browser's own work a frame (input,
@@ -207,7 +258,7 @@ along the way when the first frame was presented and when every object was first
 | `src/parts/snapshot.cone` | what the scene publishes each frame for drawing |
 | `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list (render draws each batch as one instanced draw); a physical material is render's physically based one; a shaded one, a custom pipeline |
 | `src/look.cone` | the look: light in physical units (the sun in lux, the sky and glows in nits), the exposure from the sun's height (EV 15 at noon), AgX tone mapping and bloom through render's Post |
-| `src/shaders.cone` | the browser's own shaders, which a shaded Look names: the heightfield (`heightfield.slang`); after editing a `.slang`, run Cone's `tools/shaders/shaders.py src` to compile and embed it |
+| `src/shaders.cone` | the browser's own shaders, which a shaded Look names: the heightfield (`heightfield.slang`), a pool of light (`lightpool.slang`, see-through) and a lit room behind a window (`interior.slang`); after editing a `.slang`, run Cone's `tools/shaders/shaders.py src` to compile and embed it |
 | `src/shell.cone` | what the browser puts in every scene: the island's land and sea and the sky, sent as requests |
 | `src/island/island.cone` | the module `island`: the baked heightfield, its path, fence, height query and meshes (below) |
 | `src/terrain.slang`, `src/water.slang`, `src/islandshaders.cone` | the island's two shaders and the custom pipelines made from them |
@@ -219,7 +270,7 @@ along the way when the first frame was presented and when every object was first
 | `src/checks.cone` | the scene core's headless checks (`--checks`) |
 | `src/picking.cone` | the picking system: each mesh's triangles, which mesh each part is, and the ray a click casts |
 | `src/watch.cone` | the watched real-time run and the soak |
-| `src/bakedworld/` | the module `bakedworld`, the baked-in world: its objects' descriptions, hydrating and injecting them, and its motions (`motions.cone`) |
+| `src/bakedworld/` | the module `bakedworld`, the baked-in world: its objects' descriptions, hydrating and injecting them, its motions (`motions.cone`), and its lights (`lights.cone`: glow on at dusk and off at dawn, nearness, pools of light) |
 | `src/dragonship/` | the module `dragonship`: the starship's description and its meshing on the GPU, on a device of the world's own |
 | `gpu/shipfield.cone` | the starship's GPU half: its distance field and kernels, compiled into the browser and into `browser.spv` |
 
@@ -247,6 +298,8 @@ scene's inbox:
 | `Highlight`, `Sky` | the browser's own: what was picked, and the sky |
 | `Timer`, `Cancel` | a timer on the scene's clock, ringing once or every period, posted back as `Rang` with the sender's token; and all timers with a token disarmed |
 | `Area` | a part is an area (a sphere or a box in its own frame): the possessed being coming in or going out is posted as `Entered` or `Left` |
+| `Glow` | a material gives off a radiance (nits) from now on: a lamp switched on, dimmed or off |
+| `Tint` | a part's colour and glow multiplied by a colour from now on: one lamp of many brightened |
 
 Once a frame, at the publish phase, the browser applies the inbox in order, routing each request to the
 system that owns what it changes; a request naming a part that is gone is refused and counted. The
