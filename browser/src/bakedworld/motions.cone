@@ -4,14 +4,50 @@
 //
 // - (the ball once bounced and spun here; it now lies where it was left, and
 //   needs no motion)
-// - the button's cap sinks 3 cm for BUTTON_HELD after a press;
-// - the balloon (one tree: its envelope moved, and its five other meshes,
-//   its flame and its pilot light with it) stands on the ground, its burner firing in the example's
-//   bursts (BURST_ON seconds every BURST_PERIOD); pressed, it rises at RISE
-//   with the burner held on, to CRUISE, where it bobs BOB either way every
-//   BOB_PERIOD with a short burst every ALOFT_PERIOD; pressed again (rising
-//   or aloft), the burner goes out and it comes down at SINK, to land and
-//   fire in bursts again. Pressed while coming down, it rises again.
+// - the launch button's cap sinks for BUTTON_HELD after a press;
+// - the balloon (one tree: its envelope moved, and everything under it with
+//   it) stands in the backyard, its burner firing in the example's bursts
+//   (BURST_ON seconds every BURST_PERIOD). Pressed, it flies THE RIDE: a
+//   scripted flight on the scene's clock, FLIGHT_SECONDS long, up from its
+//   spot, round over the island and down onto its spot again, turning as it
+//   goes so that its basket's open front faces the view (below). A press
+//   while it flies is ignored: the ride has one way down, its end.
+//
+// THE RIDE is a centripetal Catmull-Rom spline through WAYPOINTS (its
+// corners never overshoot into loops, however unevenly the waypoints are
+// spaced), travelled by its length at an eased speed: from rest over
+// EASE_SECONDS, steady, and to rest again over the last EASE_SECONDS. Each
+// waypoint names what its rider should be looking at; the balloon turns so
+// its open front faces it, the heading interpolated between waypoints
+// along the same spline's parameter, always the short way round from the
+// last (so over the whole ride it turns once round, clockwise seen from
+// above, and a rider who walked in and turned about faces every view in
+// turn). At the start and the end it faces as it stands.
+//
+// The views, in order (x east, z south to the sea; the balloon's spot is
+// (-10, 300), 24 m behind the cottage, whose front faces the path):
+//   lift-off       straight up 25 m over its spot, facing the cottage's back
+//   over the lawn  at 60 m, east of the cottage, looking west-south-west
+//                  across the lowland
+//   east lowland   at 110 m, looking west-north-west over the forest to the
+//                  hill's flank
+//   east beach     at 140 m over the cove's east shore, looking north-west
+//                  up the path to the hill
+//   over the cove  at 150 m, the highest, over the cove's mouth, looking
+//                  north: the beach, the path, the cottage and the 150 m hill
+//                  behind, the whole island across the view
+//   west coast     at 140 m, looking north-east over the lowland and the
+//                  cottage to the hill
+//   west lowland   at 130 m, looking east: the cottage, the cove and the
+//                  long south-east peninsula
+//   north-west     at 100 m behind the cottage, looking south-east over it
+//                  to the cove and the beach
+//   descent        down past the cottage's roof onto the spot
+// The rider's eyes look level, so each view is chosen to put land, not sea,
+// across the lower half of the picture: across the island, not out from it.
+// The burner fires in bursts as it climbs (BURST_CLIMB_ON every
+// BURST_CLIMB_PERIOD) to the top, a short burst every BURST_CRUISE_PERIOD
+// after, and none for the last DESCENT_QUIET seconds, as it sinks to land.
 
 pub const BALL_RADIUS f32 = 0.5;
 
@@ -19,16 +55,46 @@ const BUTTON_HELD f64 = 0.25;
 
 pub const BURST_ON f64 = 3.;
 const BURST_PERIOD f64 = 4.;
-const RISE f32 = 2.5;              // metres a second
-const SINK f32 = 1.5;
-const CRUISE f32 = 30.;
-const BOB f32 = 0.6;
-const BOB_PERIOD f32 = 7.;
-const ALOFT_ON f64 = 2.;
-const ALOFT_PERIOD f64 = 6.;
+const BURST_CLIMB_ON f64 = 3.2;
+const BURST_CLIMB_PERIOD f64 = 5.;
+const BURST_CRUISE_ON f64 = 1.5;
+const BURST_CRUISE_PERIOD f64 = 20.;
+const DESCENT_QUIET f64 = 45.;
 
-// The burner flame's place among the balloon's parts: after its six meshes
-const BALLOON_FLAME = 6usize;
+// The ride's length in the scene's seconds, and the time it eases from and to rest
+pub const FLIGHT_SECONDS f32 = 170.;
+const EASE_SECONDS f32 = 20.;
+
+// The waypoints: x, the height above the spot's ground, z; and the point (x,
+// z) the open front is to face there (REST: as the balloon stands). The
+// first and last are the spot itself.
+const REST f32 = 1.0e9;
+const WAYPOINTS = 12usize;
+imm WAYPOINT Array[f32, 60] = [
+  -10., 0., 300.,       REST, REST,         // on its spot in the backyard
+  -10., 25., 300.,      REST, REST,         // straight up, clear of the pines round it
+  30., 60., 350.,       -200., 500.,        // over the lawn east of the cottage: west-south-west across the lowland
+  110., 110., 440.,     -200., 300.,        // the east lowland: west-north-west over the forest to the hill's flank
+  60., 140., 560.,      -120., 250.,        // over the cove's east shore: north-west up the path to the hill
+  -30., 150., 650.,     -20., 0.,           // the top, over the cove's mouth: north over the beach, the cottage and the hill
+  -230., 140., 580.,    100., 250.,         // the west coast: north-east over the lowland, the cottage, the hill
+  -260., 130., 420.,    200., 520.,         // the west lowland: east to the cottage, the cove and the south-east peninsula
+  -160., 100., 300.,    100., 560.,         // north-west of the cottage: south-east over it to the cove and the beach
+  -60., 50., 270.,      -10., 450.,         // coming down behind the cottage, looking over its roof
+  -10., 25., 300.,      REST, REST,         // over the spot
+  -10., 0., 300.,       REST, REST];        // landed
+// The highest waypoint: the climb ends there
+const TOP_WAYPOINT = 5usize;
+// Samples of each span between waypoints, for its length
+const SPAN_SAMPLES = 32usize;
+
+// Where the balloon is on the ride: its envelope's place moved by 'offset'
+// (metres, from where it stands), turned to 'yaw' (radians about +y, as the
+// world's place turns it: its open front, +z, faces (sin yaw, cos yaw))
+pub struct FlightPose {
+  pub offset Vec3;
+  pub yaw f32;
+}
 
 // A burst of the burner: from 'start' until 'stop' (the scene's seconds)
 pub struct Burst {
@@ -37,64 +103,56 @@ pub struct Burst {
 }
 
 const GROUND = 0u32;
-const RISING = 1u32;   // climbing, then aloft
-const SINKING = 2u32;  // coming down, then landed
+const FLYING = 1u32;   // the ride, from 'since'; on its spot again from 'since' + FLIGHT_SECONDS
 
-// The balloon's flight: what it is doing since when, and from what altitude
+// The balloon's flight: on the ground since the start, or on the ride
+// since a press (and on the ground again once it has ended)
 pub struct Flight {
   pub state u32;
   pub since f64;
-  pub from f32;
   pub firedStart f64;          // the burst last sent
   pub firedStop f64;
 
   // On the ground from the start, its first burst sent with its Effect
-  pub fn grounded() Flight { new Flight(GROUND, 0d, 0., 0d, BURST_ON); }
+  pub fn grounded() Flight { new Flight(GROUND, 0d, 0d, BURST_ON); }
 
-  // Whether it is going up (or aloft)
-  pub fn rising(self &) bool { state == RISING; }
-
-  // When it reached CRUISE, rising
-  fn aloftAt(self &) f64 { since + f64.from((CRUISE - from) / RISE); }
-
-  // When it landed, sinking
-  fn landedAt(self &) f64 { since + f64.from(from / SINK); }
-
-  // The basket's height above the ground at 'now'
-  pub fn altitude(self &, now f64) f32 {
+  // Seconds into the ride at 'now': 0 before any, FLIGHT_SECONDS once landed
+  pub fn elapsed(self &, now f64) f32 {
+    if state != FLYING { return 0.; }
     imm t = f32.from(now - since);
-    if state == RISING {
-      imm a = from + RISE * t;
-      if a < CRUISE { return a; }
-      return CRUISE + BOB * sin(2. * pi * f32.from(now - self.aloftAt()) / BOB_PERIOD);
-    }
-    if state == SINKING {
-      imm a = from - SINK * t;
-      return if a > 0. { a; } else { 0.; };
-    }
-    0.;
+    if t < 0. { 0.; } elif t > FLIGHT_SECONDS { FLIGHT_SECONDS; } else { t; };
   }
 
-  // Pressed at 'now': up if it is down or coming down, down if it is going up
+  // Whether it is on the ride at 'now'
+  pub fn flying(self &, now f64) bool { state == FLYING and now - since < f64.from(FLIGHT_SECONDS); }
+
+  // When the ride ended (or will): its landing
+  pub fn landedAt(self &) f64 { since + f64.from(FLIGHT_SECONDS); }
+
+  // Where it is at 'now'
+  pub fn pose(self &, now f64, restYaw f32) FlightPose { ridePose(self.elapsed(now), restYaw); }
+
+  // The basket's height above its spot at 'now'
+  pub fn altitude(self &, now f64, restYaw f32) f32 { self.pose(now, restYaw).offset.y; }
+
+  // Pressed at 'now': the ride begins, if it is on the ground; a press
+  // while it flies is ignored
   pub fn pressed(self, now f64) Flight {
-    imm a = self.altitude(now);
-    imm next = if state == RISING { SINKING; } else { RISING; };
-    new Flight(next, now, a, firedStart, firedStop);
+    if self.flying(now) { return self; }
+    new Flight(FLYING, now, firedStart, firedStop);
   }
 
   // The burner's burst at 'now'
   pub fn burst(self &, now f64) Burst {
-    if state == RISING {
-      imm aloft = self.aloftAt();
-      if now < aloft { return new Burst(since, EFFECT_NEVER); }
-      return bursts(aloft, ALOFT_PERIOD, ALOFT_ON, now);
-    }
-    if state == SINKING {
-      imm landed = self.landedAt();
-      if now >= landed { return bursts(landed, BURST_PERIOD, BURST_ON, now); }
-      return new Burst(firedStart, if firedStop < since { firedStop; } else { since; });
-    }
-    bursts(since, BURST_PERIOD, BURST_ON, now);
+    if state != FLYING { return bursts(since, BURST_PERIOD, BURST_ON, now); }
+    imm landed = self.landedAt();
+    if now >= landed { return bursts(landed, BURST_PERIOD, BURST_ON, now); }
+    imm top = since + f64.from(rideTopTime());
+    if now < top { return bursts(since, BURST_CLIMB_PERIOD, BURST_CLIMB_ON, now); }
+    imm quiet = landed - DESCENT_QUIET;
+    if now < quiet { return bursts(top, BURST_CRUISE_PERIOD, BURST_CRUISE_ON, now); }
+    // Sinking to land: the last burst cut short where the quiet begins
+    new Burst(firedStart, if firedStop < quiet { firedStop; } else { quiet; });
   }
 }
 
@@ -104,4 +162,169 @@ fn bursts(from f64, period f64, on f64, now f64) Burst {
   if now > from { b = libc.floor((now - from) / period); }
   imm start = from + b * period;
   new Burst(start, start + on);
+}
+
+// ---- The ride's path ----
+
+// Waypoint 'i' (clamped to the ends, and one span past each end mirrored, so
+// the path leaves its spot and comes down onto it straight up and down)
+fn waypointAt(i i32) Vec3 {
+  imm n = i32.from(WAYPOINTS);
+  if i < 0 { return waypointAt(0) * 2. - waypointAt(1); }
+  if i >= n { return waypointAt(n - 1) * 2. - waypointAt(n - 2); }
+  imm k = usize.from(i) * 5usize;
+  new Vec3(WAYPOINT[k], WAYPOINT[k + 1usize], WAYPOINT[k + 2usize]);
+}
+
+fn knotStep(a Vec3, b Vec3) f32 {
+  imm d = (b - a).length();
+  if d < 0.0001 { 0.01; } else { libc.sqrtf(d); };
+}
+
+// The point 'u' (0 to 1) of the way along the span from waypoint 'i' to
+// 'i' + 1: centripetal Catmull-Rom (Barry and Goldman's pyramid)
+fn spanPoint(i i32, u f32) Vec3 {
+  imm p0 = waypointAt(i - 1);
+  imm p1 = waypointAt(i);
+  imm p2 = waypointAt(i + 1);
+  imm p3 = waypointAt(i + 2);
+  imm t0 = 0.;
+  imm t1 = t0 + knotStep(p0, p1);
+  imm t2 = t1 + knotStep(p1, p2);
+  imm t3 = t2 + knotStep(p2, p3);
+  imm t = t1 + (t2 - t1) * u;
+  imm a1 = p0 * ((t1 - t) / (t1 - t0)) + p1 * ((t - t0) / (t1 - t0));
+  imm a2 = p1 * ((t2 - t) / (t2 - t1)) + p2 * ((t - t1) / (t2 - t1));
+  imm a3 = p2 * ((t3 - t) / (t3 - t2)) + p3 * ((t - t2) / (t3 - t2));
+  imm b1 = a1 * ((t2 - t) / (t2 - t0)) + a2 * ((t - t0) / (t2 - t0));
+  imm b2 = a2 * ((t3 - t) / (t3 - t1)) + a3 * ((t - t1) / (t3 - t1));
+  b1 * ((t2 - t) / (t2 - t1)) + b2 * ((t - t1) / (t2 - t1));
+}
+
+// The heading at waypoint 'i' for a balloon standing at 'restYaw': facing
+// its target, or as it stands
+fn targetYaw(i usize, restYaw f32) f32 {
+  imm k = i * 5usize;
+  if WAYPOINT[k + 3usize] == REST { return restYaw; }
+  libc.atan2f(WAYPOINT[k + 3usize] - WAYPOINT[k], WAYPOINT[k + 4usize] - WAYPOINT[k + 2usize]);
+}
+
+fn wrapAngle(a f32) f32 {
+  mut x = a;
+  while x > pi { x = x - 2. * pi; }
+  while x < 0. - pi { x = x + 2. * pi; }
+  x;
+}
+
+// The heading at waypoint 'i' (clamped to the ends), unwound: each the
+// short way round from the one before, from the first's
+fn headingAt(i i32, restYaw f32) f32 {
+  imm n = i32.from(WAYPOINTS);
+  imm last = if i < 0 { 0; } elif i >= n { n - 1; } else { i; };
+  mut h = targetYaw(0usize, restYaw);
+  mut k = 1;
+  while k <= last {
+    h = h + wrapAngle(targetYaw(usize.from(k), restYaw) - h);
+    k = k + 1;
+  }
+  h;
+}
+
+// The heading 'u' of the way along span 'i': Catmull-Rom on the waypoints' headings
+fn spanHeading(i i32, u f32, restYaw f32) f32 {
+  imm h0 = headingAt(i - 1, restYaw);
+  imm h1 = headingAt(i, restYaw);
+  imm h2 = headingAt(i + 1, restYaw);
+  imm h3 = headingAt(i + 2, restYaw);
+  imm u2 = u * u;
+  imm u3 = u2 * u;
+  0.5 * (2. * h1 + (h2 - h0) * u + (2. * h0 - 5. * h1 + 4. * h2 - h3) * u2 + (3. * h1 - h0 - 3. * h2 + h3) * u3);
+}
+
+// The path's length from its start to each sample, into 'out' (one more
+// than the samples), its spans SPAN_SAMPLES samples each
+fn pathLengths(out &mut List[f32]) {
+  out.clear();
+  out.push(0.);
+  mut acc = 0.;
+  mut prev = waypointAt(0);
+  mut i = 0;
+  while i + 1 < i32.from(WAYPOINTS) {
+    mut j = 1usize;
+    while j <= SPAN_SAMPLES {
+      imm p = spanPoint(i, f32.from(j) / f32.from(SPAN_SAMPLES));
+      acc = acc + (p - prev).length();
+      out.push(acc);
+      prev = p;
+      j = j + 1usize;
+    }
+    i = i + 1;
+  }
+}
+
+// The ride's whole length, metres
+pub fn rideLength() f32 {
+  mut l = List[f32].empty();
+  pathLengths(&mut l);
+  *l[l.len() - 1usize];
+}
+
+// Its steady speed, m/s: the length over the time less one ease
+pub fn rideSpeed() f32 { rideLength() / (FLIGHT_SECONDS - EASE_SECONDS); }
+
+// How far along the path it is 't' seconds in: eased from rest (its speed
+// rising as 1 - cos over EASE_SECONDS), steady, eased to rest again
+fn distanceAt(t f32, length f32) f32 {
+  imm vmax = length / (FLIGHT_SECONDS - EASE_SECONDS);
+  if t <= 0. { return 0.; }
+  if t >= FLIGHT_SECONDS { return length; }
+  if t < EASE_SECONDS { return vmax * (0.5 * t - EASE_SECONDS / (2. * pi) * sin(pi * t / EASE_SECONDS)); }
+  if t > FLIGHT_SECONDS - EASE_SECONDS { return length - distanceAt(FLIGHT_SECONDS - t, length); }
+  vmax * (0.5 * EASE_SECONDS + t - EASE_SECONDS);
+}
+
+// When it reaches waypoint 'i', seconds into the ride (found by halving the
+// time, the distance only growing with it)
+pub fn rideTimeAt(i usize) f32 {
+  mut l = List[f32].empty();
+  pathLengths(&mut l);
+  imm length = *l[l.len() - 1usize];
+  imm s = *l[i * SPAN_SAMPLES];
+  mut lo = 0.;
+  mut hi = FLIGHT_SECONDS;
+  mut k = 0;
+  while k < 40 {
+    imm mid = 0.5 * (lo + hi);
+    if distanceAt(mid, length) < s { lo = mid; } else { hi = mid; }
+    k = k + 1;
+  }
+  0.5 * (lo + hi);
+}
+
+// When it reaches its highest waypoint: the climb's end
+pub fn rideTopTime() f32 { rideTimeAt(TOP_WAYPOINT); }
+
+// How many waypoints the ride has, and the height of each above the spot
+pub fn rideWaypoints() usize { WAYPOINTS; }
+pub fn rideWaypointHeight(i usize) f32 { WAYPOINT[i * 5usize + 1usize]; }
+
+// Where the balloon is 't' seconds into the ride, standing at 'restYaw'
+// on its spot: exactly as it stands before and after
+pub fn ridePose(t f32, restYaw f32) FlightPose {
+  if t <= 0. or t >= FLIGHT_SECONDS { return new FlightPose(new Vec3(0., 0., 0.), restYaw); }
+  mut l = List[f32].empty();
+  pathLengths(&mut l);
+  imm length = *l[l.len() - 1usize];
+  imm s = distanceAt(t, length);
+  // The sample at or before it, and the way to the next
+  mut k = 0usize;
+  while k + 2usize < l.len() and *l[k + 1usize] <= s { k = k + 1usize; }
+  imm a = *l[k];
+  imm b = *l[k + 1usize];
+  imm f = if b > a { (s - a) / (b - a); } else { 0.; };
+  imm span = i32.from(k / SPAN_SAMPLES);
+  imm u = (f32.from(k % SPAN_SAMPLES) + f) / f32.from(SPAN_SAMPLES);
+  imm p = spanPoint(span, u);
+  imm start = waypointAt(0);
+  new FlightPose(new Vec3(p.x - start.x, p.y - start.y, p.z - start.z), spanHeading(span, u, restYaw));
 }

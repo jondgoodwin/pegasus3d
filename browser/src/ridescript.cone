@@ -1,0 +1,424 @@
+// The balloon's ride in the scripted run: assembly.cone's phases from the
+// boarding spot (behind the cottage, at the lawn route's end) to the empty
+// balloon's landing (assembly.cone's header says what each does). Its keys
+// are the user's (W, A, D, V, Tab, F, and a click), pushed into SDL's queue.
+//
+// The rider is the first mannequin (being 1), set down where the plain walker
+// stands and taken over with Tab. What is checked as it goes:
+//   boarding    it walked in at the open front and stands on the floor (the
+//               platform holds it, at the floor's height), inside the basket's
+//               area (the world was told)
+//   the ride    every frame: still standing on the floor, its feet within
+//               1 cm of where they stood on it when the balloon set off, its
+//               heading on the floor within 0.1 degree of what it was (the
+//               floor carried it, turning and all); the burner's bursts all
+//               applied; landed, the balloon on its spot as it stood
+//   stepping out and back in: off the floor onto the lawn and back
+//   the fall    it left the floor once past the open front's edge, fell under
+//               gravity (its landing speed sqrt(v0^2 + 2 g h) for its drop h
+//               and the floor's upward speed v0 when it left), its health
+//               emptied, the hard landing mailed, and 2 s later it got up on
+//               the landing beach, whole
+
+const RIDER = 1usize;
+// The height above its spot the balloon is at, on the second ride, when the rider walks off
+const STEP_OFF_HEIGHT f32 = 70.;
+
+mut sub u32 = 0u32;              // a phase's own steps
+mut subFrom u64 = 0u64;
+mut restMouth Vec3;              // the envelope's root as the balloon stands on its spot
+mut restFront Vec3;              // and the way its open front faces
+mut rideLocal0 Vec3;             // the rider's feet on the floor (the basket's frame, metres) as the ride began
+mut rideYaw0 f32 = 0.;           // and its heading less the basket's
+mut rideDrift f32 = 0.;          // the farthest its feet went from there on the ride, metres
+mut rideTurn f32 = 0.;           // the most its heading on the floor changed, radians
+mut rideOff u64 = 0u64;          // frames of the ride it was not standing on the floor
+mut rideTop f32 = 0.;            // the highest the basket went above its spot
+mut rideFrames u64 = 0u64;
+mut rideShot usize = 0usize;
+mut thirdTaken bool = false;
+mut firesBefore u64 = 0u64;
+mut leftAt Vec3;                 // where the rider left the floor, and its upward speed then
+mut leftVy f32 = 0.;
+mut leftFrame u64 = 0u64;
+
+mut lastTick u64 = 0u64;         // the clock at the last frame of the ride, ns
+mut rideFrameMs List[f32];       // the time between the ride's frames, ms
+
+// The value 'q' of the way up 'xs' (sorted in place)
+fn percentile(xs &mut List[f32], q f32) f32 {
+  imm n = xs.len();
+  if n == 0usize { return 0.; }
+  // Insertion sort: ten thousand values once, at the ride's end
+  mut i = 1usize;
+  while i < n {
+    imm x = *xs[i];
+    mut j = i;
+    while j > 0usize and *xs[j - 1usize] > x {
+      xs.set(j, *xs[j - 1usize]);
+      j = j - 1usize;
+    }
+    xs.set(j, x);
+    i = i + 1usize;
+  }
+  *xs[usize.from(q * f32.from(n - 1usize))];
+}
+
+// The basket's world matrix, and metres a unit of its frame
+fn basketMatrix(st &mut SceneState) Mat4 { st.scene.worldMatrix(st.world.basket()); }
+fn unitMetres(m &Mat4) f32 { m.transformVector(new Vec3(1., 0., 0.)).length(); }
+
+// The middle of the basket's floor, in the world
+fn basketMiddle(st &mut SceneState) Vec3 {
+  imm m = basketMatrix(st);
+  m * new Vec3(0., basketPlatform().floorY, 0.);
+}
+
+// The way the open front faces, level and of unit length, and the way to its right
+fn openFront(st &mut SceneState) Vec3 {
+  imm d = basketMatrix(st).transformVector(new Vec3(0., 0., 1.));
+  imm l = libc.sqrtf(d.x * d.x + d.z * d.z);
+  new Vec3(d.x / l, 0., d.z / l);
+}
+fn rightOf(d Vec3) Vec3 { new Vec3(0. - d.z, 0., d.x); }
+
+// A walker's heading facing out of the open front
+fn facingOut(st &mut SceneState) f32 {
+  imm d = openFront(st);
+  libc.atan2f(0. - d.x, 0. - d.z);
+}
+
+// Point 'p' in the basket's frame, in metres
+fn onFloor(st &mut SceneState, p Vec3) Vec3 {
+  imm m = basketMatrix(st);
+  (m.inverse() * p) * unitMetres(&m);
+}
+
+// Steer the possessed being to (x, z), walking (never running); true once
+// within 'stop' metres
+fn steerTo(w &Walk, x f32, z f32, stop f32) bool {
+  imm err = yawError(w, x, z);
+  holdTurn(err);
+  imm d = flatDist(w.position.x, w.position.z, x, z);
+  holdAhead(d > stop and absF(err) < 0.35, false);
+  d <= stop;
+}
+
+// Turn the possessed being where it stands to face (x, z): true once it does
+fn turnTo(w &Walk, x f32, z f32) bool {
+  holdAhead(false, false);
+  imm err = yawError(w, x, z);
+  holdTurn(err);
+  absF(err) <= TURN_BAND;
+}
+
+fn subTo(n u32, f u64) { sub = n; subFrom = f; }
+
+// What the script reads of the rider, copied out
+struct Rider {
+  pos Vec3;
+  on PartId;
+  grounded bool;
+  vy f32;
+  speed f32;
+  health f32;
+  landSpeed f32;
+  respawns u32;
+  part PartId;
+}
+
+fn rider(st &mut SceneState) Rider {
+  imm b = &mut st.cast.beings[RIDER];
+  new Rider(b.body.position, b.figure.on, b.figure.grounded, b.figure.vy, b.figure.speed, b.figure.health, b.figure.landSpeed,
+    b.figure.respawns, b.part);
+}
+
+// Whether the rider stands on the basket's floor, at its height
+fn riderOnFloor(st &mut SceneState) bool {
+  imm b = rider(st);
+  imm floor = basketMiddle(st).y;
+  b.on == st.world.basket() and b.grounded and absF(b.pos.y - floor) < 0.001;
+}
+
+// The ride's phases, from frame 'f''s pushes, 'w' the possessed being's body
+fn rideStep(st &mut SceneState, f u64, w &Walk, since u64) {
+  imm sceneNow = st.sceneNow;
+  imm restYaw = balloonRestYaw();
+  if phase == PH_FACE_BASKET {
+    // The plain walker at the boarding spot turns to the basket's open front
+    imm mid = basketMiddle(st);
+    if turnTo(w, mid.x, mid.z) and since > 4u64 {
+      restMouth = balloonMouth(st);
+      restFront = openFront(st);
+      print <- "Frame "; print <- f; print <- ": at the boarding spot after "; print <- f - routeFrames; print <- " frames, ";
+      print <- flatDist(w.position.x, w.position.z, mid.x, mid.z); print <- " m from the basket's middle, never farther than ";
+      print <- routeDev; print <- " m from the route\n";
+      print <- "  the ride: "; print <- rideLength(); print <- " m in "; print <- FLIGHT_SECONDS; print <- " s, steady at ";
+      print <- rideSpeed(); print <- " m/s, its top at "; print <- rideTopTime(); print <- " s\n";
+      takePicture(f + 2u64, SHOT_READY);
+      goTo(PH_READY, f);
+    }
+    return;
+  }
+  if phase == PH_READY {
+    if since == 8u64 {
+      // The burner close up: from in front of the open front, a little to the side, at 2.2 m, up at the burner
+      imm mid = basketMiddle(st);
+      imm d = openFront(st);
+      imm r = rightOf(d);
+      takeView(f + 1u64, SHOT_BURNER, mid + d * 1.9 + r * 0.6 + new Vec3(0., 2.2, 0.), mid + new Vec3(0., 2.9, 0.), 0.75);
+    }
+    if since == 14u64 { goTo(PH_BOARD, f); }
+    return;
+  }
+  if phase == PH_BOARD {
+    if since == 1u64 {
+      // The first mannequin set down where the walker stands, facing the basket, and taken over
+      imm mid = basketMiddle(st);
+      imm at = new Vec3(w.position.x, groundHeight(w.position.x, w.position.z), w.position.z);
+      imm b = &mut st.cast.beings[RIDER];
+      b.setDown(at, libc.atan2f(0. - (mid.x - at.x), 0. - (mid.z - at.z)));
+      tap(f, SCANCODE_TAB);
+    }
+    if since == 8u64 {
+      asmOk = yesNo("Tab: the first mannequin possessed, in third person, at the boarding spot",
+        st.cast.possessed == RIDER and st.cast.rig.mode == VIEW_THIRD) and asmOk;
+      goTo(PH_WALK_IN, f);
+    }
+    return;
+  }
+  if phase == PH_WALK_IN {
+    imm mid = basketMiddle(st);
+    imm arrived = steerTo(w, mid.x, mid.z, 0.35);
+    if arrived and rider(st).speed == 0. {
+      imm there = onFloor(st, w.position);
+      imm inside = st.scene.isInside(st.world.basket(), rider(st).part);
+      print <- "Frame "; print <- f; print <- ": walked in at the open front, "; print <- since; print <- " frames; standing ";
+      print <- there.x; print <- ", "; print <- there.z; print <- " m from the floor's middle\n";
+      asmOk = yesNo("  on the basket's floor (the platform holds it up, at the floor's height)", riderOnFloor(st)) and asmOk;
+      asmOk = yesNo("  inside the basket's area, and the world told someone stepped in", inside and st.world.arrivals >= 1u64) and asmOk;
+      goTo(PH_TURN_OUT, f);
+    } elif since > 900u64 { say(f, "the walk into the basket did NOT finish"); asmOk = false; goTo(PH_TURN_OUT, f); }
+    return;
+  }
+  if phase == PH_TURN_OUT {
+    // About, to face out of the open front
+    imm mid = basketMiddle(st);
+    imm d = openFront(st);
+    if turnTo(w, mid.x + d.x * 8., mid.z + d.z * 8.) and since > 4u64 {
+      print <- "Frame "; print <- f; print <- ": turned about in "; print <- since; print <- " frames, facing out of the open front\n";
+      asmOk = yesNo("  still on the floor, held in by the walls", riderOnFloor(st)) and asmOk;
+      goTo(PH_PRESS, f);
+    } elif since > 600u64 { say(f, "the turn about did NOT finish"); asmOk = false; goTo(PH_PRESS, f); }
+    return;
+  }
+  if phase == PH_PRESS {
+    // The third person's camera settles behind it, over the back rail, and the button is clicked where it shows
+    if since == 40u64 { clickDownAt = f + 1u64; }
+    if since == 48u64 {
+      print <- "Frame "; print <- f; print <- ", after a click on the launch button in the basket: the world read "; print <- st.world.presses;
+      print <- " press (want 1), the balloon ";
+      imm flying = st.world.flight.flying(sceneNow);
+      if flying { print <- "on its ride\n"; } else { print <- "NOT flying\n"; }
+      if st.world.presses != 1u64 or !flying { asmOk = false; }
+      rideLocal0 = onFloor(st, w.position);
+      rideYaw0 = wrapPi(w.yaw - facingOut(st));
+      rideDrift = 0.;
+      rideTurn = 0.;
+      rideOff = 0u64;
+      rideTop = 0.;
+      rideShot = 0usize;
+      firesBefore = st.world.fires;
+      tap(f, SCANCODE_V);
+      goTo(PH_RIDE, f);
+    }
+    return;
+  }
+  if phase == PH_RIDE {
+    // The time between frames on the ride, the whole island in view from up there
+    imm tick = sdl.GetTicksNS();
+    if lastTick > 0u64 { rideFrameMs.push(f32.from(tick - lastTick) / 1.0e6); }
+    lastTick = tick;
+    imm e = st.world.flight.elapsed(sceneNow);
+    if riderOnFloor(st) {
+      imm there = onFloor(st, w.position);
+      imm drift = (there - rideLocal0).length();
+      if drift > rideDrift { rideDrift = drift; }
+      imm turn = absF(wrapPi(w.yaw - facingOut(st) - rideYaw0));
+      if turn > rideTurn { rideTurn = turn; }
+    } else { rideOff = rideOff + 1u64; }
+    imm alt = st.world.flight.altitude(sceneNow, restYaw);
+    if alt > rideTop { rideTop = alt; }
+    // The rider's eyes at six waypoints, facing each one's view
+    if rideShot < 6usize and e >= rideTimeAt(2usize + rideShot) {
+      print <- "Frame "; print <- f; print <- ": ride-0"; print <- rideShot + 1usize; print <- ", "; print <- e; print <- " s into the ride, ";
+      print <- alt; print <- " m up, at ("; print <- w.position.x; print <- ", "; print <- w.position.z; print <- ")\n";
+      takePicture(f + 1u64, SHOT_RIDE + u32.from(rideShot));
+      rideShot = rideShot + 1usize;
+    }
+    // The rider in the basket in the air, from outside it: off its right side, a little behind and above,
+    // looking past the rider out of the open front at the view it faces
+    if !thirdTaken and e >= rideTopTime() + 6. {
+      thirdTaken = true;
+      imm mid = basketMiddle(st);
+      imm d = openFront(st);
+      imm r = rightOf(d);
+      takeView(f + 1u64, SHOT_RIDE_THIRD, mid + r * 5.5 - d * 2. + new Vec3(0., 3., 0.), mid + d * 1.5 + new Vec3(0., 0.6, 0.), FOV);
+    }
+    if !st.world.flight.flying(sceneNow) and since > 60u64 {
+      imm mouth = balloonMouth(st);
+      imm front = openFront(st);
+      print <- "Frame "; print <- f; print <- ", the ride over after "; print <- since; print <- " frames ("; print <- f64.from(since) / 60d;
+      print <- " s; want about "; print <- FLIGHT_SECONDS; print <- "), its highest "; print <- rideTop; print <- " m above its spot:\n";
+      asmOk = yesNo("  the rider stood on the floor the whole ride", rideOff == 0u64) and asmOk;
+      asmOk = near("  the farthest its feet moved on the floor (m)", rideDrift, 0., 0.01) and asmOk;
+      asmOk = near("  the most its heading on the floor turned (degrees)", rideTurn * 57.29578, 0., 0.1) and asmOk;
+      asmOk = near("  the balloon landed on its spot: the envelope's x", mouth.x, restMouth.x, 0.001) and asmOk;
+      asmOk = near("    its height", mouth.y, restMouth.y, 0.001) and asmOk;
+      asmOk = near("    its z", mouth.z, restMouth.z, 0.001) and asmOk;
+      asmOk = near("    the open front facing as it stood (the dot of the two ways)", front.dot(restFront), 1., 0.0001) and asmOk;
+      asmOk = yesNo("  the rider on the floor, landed", riderOnFloor(st)) and asmOk;
+      print <- "  the burner: "; print <- st.world.fires - firesBefore; print <- " bursts sent on the ride, "; print <- st.world.fires;
+      print <- " in all, "; print <- st.fired; print <- " applied\n";
+      if st.world.fires != st.fired or st.world.fires - firesBefore < 10u64 { asmOk = false; print <- "  the bursts are WRONG\n"; }
+      print <- "  the time between frames on the ride (ms): p50 "; print <- percentile(&mut rideFrameMs, 0.5); print <- ", p95 ";
+      print <- percentile(&mut rideFrameMs, 0.95); print <- ", over "; print <- rideFrameMs.len(); print <- " frames\n";
+      tap(f, SCANCODE_V);
+      goTo(PH_STEP_OUT, f);
+    } elif since > u64.from(FLIGHT_SECONDS) * 60u64 + 600u64 { say(f, "the ride did NOT end"); asmOk = false; goTo(PH_STEP_OUT, f); }
+    return;
+  }
+  if phase == PH_STEP_OUT {
+    // Out of the open front onto the lawn, 3 m out from the middle
+    if since < 6u64 { return; }
+    imm mid = basketMiddle(st);
+    imm d = openFront(st);
+    if sub == 0u32 {
+      holdTurn(0.);
+      holdAhead(flatDist(w.position.x, w.position.z, mid.x, mid.z) < 3., false);
+      if flatDist(w.position.x, w.position.z, mid.x, mid.z) >= 3. and rider(st).speed == 0. {
+        imm b = rider(st);
+        print <- "Frame "; print <- f; print <- ": stepped out of the open front onto the lawn\n";
+        asmOk = yesNo("  on the ground, off the floor, and the world told it stepped out", b.on.isNone() and b.grounded
+          and absF(b.pos.y - groundHeight(b.pos.x, b.pos.z)) < 0.001 and st.world.departures >= 1u64) and asmOk;
+        subTo(1u32, f);
+      }
+      return;
+    }
+    if sub == 1u32 {
+      // Turned about, back in, and about again
+      if turnTo(w, mid.x, mid.z) and f - subFrom > 4u64 { subTo(2u32, f); }
+      return;
+    }
+    if sub == 2u32 {
+      if steerTo(w, mid.x, mid.z, 0.35) and rider(st).speed == 0. { subTo(3u32, f); }
+      return;
+    }
+    if sub == 3u32 {
+      if turnTo(w, mid.x + d.x * 8., mid.z + d.z * 8.) and f - subFrom > 4u64 {
+        asmOk = yesNo("Back in the basket, facing out again, on the floor", riderOnFloor(st)) and asmOk;
+        subTo(0u32, f);
+        goTo(PH_PRESS_AGAIN, f);
+      }
+      return;
+    }
+    return;
+  }
+  if phase == PH_PRESS_AGAIN {
+    if since == 40u64 { clickDownAt = f + 1u64; }
+    if since == 48u64 {
+      print <- "Frame "; print <- f; print <- ": the button pressed again, "; print <- st.world.presses; print <- " presses (want 2), the balloon ";
+      imm flying = st.world.flight.flying(sceneNow);
+      if flying { print <- "on its ride again\n"; } else { print <- "NOT flying\n"; }
+      if st.world.presses != 2u64 or !flying { asmOk = false; }
+    }
+    if since > 48u64 and st.world.flight.altitude(sceneNow, restYaw) >= STEP_OFF_HEIGHT {
+      print <- "Frame "; print <- f; print <- ": "; print <- STEP_OFF_HEIGHT; print <- " m up; the rider walks forward\n";
+      leftFrame = 0u64;
+      goTo(PH_STEP_OFF, f);
+    } elif since > 3000u64 { say(f, "the second ride did NOT climb"); asmOk = false; goTo(PH_STEP_OFF, f); }
+    return;
+  }
+  if phase == PH_STEP_OFF {
+    imm b = rider(st);
+    holdTurn(0.);
+    holdAhead(leftFrame == 0u64, false);
+    if leftFrame == 0u64 and b.on.isNone() and !b.grounded {
+      leftFrame = f;
+      leftAt = b.pos;
+      leftVy = b.vy;
+      holdAhead(false, false);
+      imm there = onFloor(st, b.pos);
+      print <- "Frame "; print <- f; print <- ": off the floor "; print <- there.z; print <- " m out from its middle (the open front's edge is at ";
+      print <- 1.02; print <- " m), "; print <- leftAt.y - groundHeight(leftAt.x, leftAt.z); print <- " m above the ground, going up at ";
+      print <- leftVy; print <- " m/s with the floor\n";
+      // Seen from off the basket's open front and to its right, a little above it, as it goes
+      imm d = openFront(st);
+      imm r = rightOf(d);
+      takeView(f + 1u64, SHOT_FALL, b.pos + r * 6. + d * 4. + new Vec3(0., 1.5, 0.), b.pos + new Vec3(0., 0.5, 0.), FOV);
+      goTo(PH_FALLING, f);
+    } elif since > 400u64 { say(f, "the rider did NOT step off"); asmOk = false; goTo(PH_FALLING, f); }
+    return;
+  }
+  if phase == PH_FALLING {
+    imm b = rider(st);
+    imm p = b.pos;
+    if since == 90u64 {
+      // Falling, 1.5 s on, from beside it, the balloon above
+      imm d = restFront;
+      imm r = rightOf(d);
+      takeView(f + 1u64, SHOT_FALL + 1u32, p + r * 10. + new Vec3(0., 2., 0.), p + new Vec3(0., 4., 0.), FOV);
+    }
+    if b.grounded and since > 2u64 {
+      imm drop = leftAt.y - p.y;
+      mut want = libc.sqrtf(leftVy * leftVy + 2. * GRAVITY * drop);
+      if want > TERMINAL_SPEED { want = TERMINAL_SPEED; }
+      print <- "Frame "; print <- f; print <- ": landed after "; print <- since; print <- " frames, "; print <- drop; print <- " m down, at (";
+      print <- p.x; print <- ", "; print <- p.z; print <- "); inside the fence: "; if insideIslandFence(p.x, p.z) { print <- "yes\n"; } else { print <- "no\n"; }
+      asmOk = near("  its landing speed (m/s), sqrt(v0^2 + 2 g h)", b.landSpeed, want, 0.6) and asmOk;
+      asmOk = yesNo("  a fatal fall: its health emptied, the hard landing mailed and read", b.health == 0.
+        and st.world.hardLandings >= 2u64) and asmOk;
+      imm d = restFront;
+      imm r = rightOf(d);
+      takeView(f + 30u64, SHOT_FALL + 2u32, p + r * 3.5 + d * 1.5 + new Vec3(0., 1.6, 0.), p + new Vec3(0., 0.4, 0.), FOV);
+      goTo(PH_DOWN, f);
+    } elif since > 900u64 { say(f, "the fall did NOT land"); asmOk = false; goTo(PH_DOWN, f); }
+    return;
+  }
+  if phase == PH_DOWN {
+    imm b = rider(st);
+    if b.respawns >= 1u32 {
+      print <- "Frame "; print <- f; print <- ": got up again "; print <- since; print <- " frames after landing (want "; print <- RESPAWN_AFTER * 60.;
+      print <- " or one more)\n";
+      asmOk = yesNo("  on the landing beach, whole, standing", flatDist(b.pos.x, b.pos.z, BEACH_X, BEACH_Z) < 0.01
+        and b.health == 1. and b.grounded and st.cast.possessed == RIDER) and asmOk;
+      takePicture(f + 30u64, SHOT_FALL + 3u32);
+      goTo(PH_EMPTY_RIDE, f);
+    } elif since > 400u64 { say(f, "the fallen rider did NOT get up"); asmOk = false; goTo(PH_EMPTY_RIDE, f); }
+    return;
+  }
+  if phase == PH_EMPTY_RIDE {
+    // The empty balloon finishes its ride at x10 and lands on its spot
+    if since == 40u64 { tap(f, SCANCODE_F); }
+    if since > 50u64 and !st.world.flight.flying(sceneNow) {
+      tap(f, SCANCODE_F);
+      imm mouth = balloonMouth(st);
+      print <- "Frame "; print <- f; print <- ": the empty balloon landed:\n";
+      asmOk = near("  the envelope's x", mouth.x, restMouth.x, 0.001) and asmOk;
+      asmOk = near("  its height", mouth.y, restMouth.y, 0.001) and asmOk;
+      asmOk = near("  its z", mouth.z, restMouth.z, 0.001) and asmOk;
+      goTo(PH_RETURN, f);
+    } elif since > 2400u64 { say(f, "the empty balloon did NOT land"); asmOk = false; goTo(PH_RETURN, f); }
+    return;
+  }
+  if phase == PH_RETURN {
+    // The plain walker again, still at the boarding spot, for the walk back
+    if since == 4u64 { st.cast.possess(0usize); }
+    if since == 8u64 {
+      routeFromButton(w);
+      routeFrames = f;
+      goTo(PH_BACK, f);
+    }
+    return;
+  }
+}

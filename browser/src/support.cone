@@ -1,0 +1,229 @@
+// What a body stands on: the ground, or a platform (parts/platforms.cone), and
+// how a platform carries the bodies standing on it. This is physics, so it
+// lives with the bodies, in the scene actor.
+//
+// SUPPORT. Each frame, once the placements are propagated, the scene actor
+// hands this file its platforms as they stand (setSupports). A body's
+// support under a point is then the highest of the ground there and every
+// platform's floor over it that is not above the body's feet by more than a
+// step (STEP_UP): a floor overhead is not a floor to stand on. walkgait asks
+// the height under each foot through a plain function (it cannot be handed
+// the body), so the feet's height of the body being stepped is set first
+// (standFrom) and supportHeight reads it.
+//
+// WALLS. A platform's walls stop a capsule: one coming from inside a wall's
+// side stays its radius inside it, one from outside stays its radius
+// outside, while the capsule's height overlaps the wall's. An edge with no
+// wall (a basket's open front) stops nothing, so a body walks off it, and
+// then falls.
+//
+// CARRYING. A body standing on a platform is carried by the platform's move
+// since the last frame: its feet's point moved and turned with the floor
+// (and its feet planted in the gait, the frame before's place and the camera
+// following it), so it stays where it stood on the floor, facing the same
+// way on it; it is held up only by the floor's support, as any body is.
+// While it stands still, its place on the floor is kept in the floor's own
+// frame and its place in the world worked out from that each frame, so a
+// long ride hundreds of metres from the world's origin does not add up
+// rounding; what goes with it is turned about it. A body that steps off
+// goes on at the platform's velocity as well as its own.
+
+// The platforms as they stood after the last frame's propagation, and the
+// feet's height of the body being stepped (module state: the scene actor's
+// alone, set before its beings step)
+mut supports List[PlatformNow];
+mut feetY f32 = 0.;
+
+// The platforms as they stand now, from 'scene'
+pub fn setSupports(scene &Scene) { scene.platformsNow(&mut supports); }
+
+// The feet's height of the body about to be stepped (supportHeight's 'from')
+pub fn standFrom(y f32) { feetY = y; }
+
+// Platforms are taken as level and scaled alike every way: a world length
+// in the part's frame is the world length times this
+fn frameScale(p &PlatformNow) f32 {
+  imm c = p.inverse.transformVector(new Vec3(1., 0., 0.));
+  c.length();
+}
+
+// The highest support under (x, z) for feet at 'from': the ground, or a
+// platform's floor that is over the point and no higher than a step above
+// the feet; 'on' is set to that platform (none: the ground)
+pub fn supportAt(x f32, z f32, from f32, on &mut PartId) f32 { supportUnder(x, z, x, z, from, on); }
+
+// The same for a point (x, z) of the footprint of a body whose middle is
+// at (cx, cz): a floor counts only if the middle is over it or beyond one of
+// its open edges, never across a wall (a body standing outside against a
+// wall does not stand on the floor behind it)
+fn supportUnder(x f32, z f32, cx f32, cz f32, from f32, on &mut PartId) f32 {
+  mut top = groundHeight(x, z);
+  *on = PartId.none();
+  mut i = 0usize;
+  while i < supports.len() {
+    imm p = *supports[i];
+    imm there = p.inverse * new Vec3(x, from, z);
+    imm mid = p.inverse * new Vec3(cx, from, cz);
+    imm sh = p.shape;
+    imm walled = (mid.x < sh.min.x and (sh.walls & WALL_MIN_X) != 0u32) or (mid.x > sh.max.x and (sh.walls & WALL_MAX_X) != 0u32)
+      or (mid.z < sh.min.y and (sh.walls & WALL_MIN_Z) != 0u32) or (mid.z > sh.max.y and (sh.walls & WALL_MAX_Z) != 0u32);
+    if sh.over(there.x, there.z) and !walled {
+      imm floor = (p.world * new Vec3(there.x, p.shape.floorY, there.z)).y;
+      if floor <= from + STEP_UP and floor > top { top = floor; *on = p.id; }
+    }
+    i = i + 1usize;
+  }
+  top;
+}
+
+// The support under (x, z) for the body being stepped (walkgait's question)
+pub fn supportHeight(x f32, z f32) f32 {
+  mut on = PartId.none();
+  supportAt(x, z, feetY, &mut on);
+}
+
+// The highest support under a capsule of 'radius' standing at (x, z) with
+// its feet at 'from': its centre and four points on its footprint's ring (as
+// footprintHeight, ground.cone), so a body on a floor's edge stands until its
+// whole footprint is off it; 'on' the platform the highest is (none: the ground)
+pub fn supportFootprint(x f32, z f32, radius f32, from f32, on &mut PartId) f32 {
+  mut top = supportAt(x, z, from, on);
+  imm dx Array[f32, 4] = [radius, 0. - radius, 0., 0.];
+  imm dz Array[f32, 4] = [0., 0., radius, 0. - radius];
+  mut k = 0usize;
+  while k < 4usize {
+    mut o = PartId.none();
+    imm h = supportUnder(x + dx[k], z + dz[k], x, z, from, &mut o);
+    if h > top { top = h; *on = o; }
+    k = k + 1usize;
+  }
+  top;
+}
+
+// A capsule of 'radius' and 'height' moving from 'was' to 'to' (its feet's
+// points), stopped by every platform's walls: where it ends up
+pub fn hitWalls(was Vec3, to Vec3, radius f32, height f32) Vec3 {
+  mut p = to;
+  mut i = 0usize;
+  while i < supports.len() {
+    imm s = *supports[i];
+    if s.shape.walls != 0u32 {
+      imm k = frameScale(&s);
+      imm a = s.inverse * was;
+      mut b = s.inverse * p;
+      imm r = radius * k;
+      imm sh = s.shape;
+      // Only while the capsule's height overlaps the walls'
+      if b.y < sh.floorY + sh.wallHeight and b.y + height * k > sh.floorY {
+        imm free = b;
+        b = wallAlongX(a, b, r, sh.min.x, sh.min.y, sh.max.y, (sh.walls & WALL_MIN_X) != 0u32);
+        b = wallAlongX(a, b, r, sh.max.x, sh.min.y, sh.max.y, (sh.walls & WALL_MAX_X) != 0u32);
+        b = wallAlongZ(a, b, r, sh.min.y, sh.min.x, sh.max.x, (sh.walls & WALL_MIN_Z) != 0u32);
+        b = wallAlongZ(a, b, r, sh.max.y, sh.min.x, sh.max.x, (sh.walls & WALL_MAX_Z) != 0u32);
+        // Only a wall that stopped it moves it (the way into the frame and
+        // back would round a free step's last digits)
+        if b.x != free.x or b.z != free.z {
+          imm w = s.world * b;
+          p = new Vec3(w.x, p.y, w.z);
+        }
+      }
+    }
+    i = i + 1usize;
+  }
+  p;
+}
+
+// A wall in the plane x = 'at', from z 'z0' to 'z1' (if there is one): 'b'
+// kept 'r' on the side 'a' came from, while it is within the wall's reach
+// along z (its ends taken square, 'r' beyond them)
+fn wallAlongX(a Vec3, b Vec3, r f32, at f32, z0 f32, z1 f32, has bool) Vec3 {
+  if !has or b.z < z0 - r or b.z > z1 + r { return b; }
+  if a.x >= at and b.x < at + r { return new Vec3(at + r, b.y, b.z); }
+  if a.x < at and b.x > at - r { return new Vec3(at - r, b.y, b.z); }
+  b;
+}
+
+// The same for a wall in the plane z = 'at', from x 'x0' to 'x1'
+fn wallAlongZ(a Vec3, b Vec3, r f32, at f32, x0 f32, x1 f32, has bool) Vec3 {
+  if !has or b.x < x0 - r or b.x > x1 + r { return b; }
+  if a.z >= at and b.z < at + r { return new Vec3(b.x, b.y, at + r); }
+  if a.z < at and b.z > at - r { return new Vec3(b.x, b.y, at - r); }
+  b;
+}
+
+// A body's move by its platform, as what goes with it feels it: point 'q'
+// carried with a body that went from 'was' to 'now' (turned about the body
+// by the platform's 'turn', and moved with it). Taken about the body, the
+// offsets turned are a few metres, so the turn's rounding stays small.
+pub struct Carry {
+  pub was Vec3;
+  pub now Vec3;
+  pub turn Mat4;
+
+  pub fn point(self &, q Vec3) Vec3 { now + turn.transformVector(q - was); }
+}
+
+// The turn of a move about the up axis, radians (a positive turn is to the
+// left, as a yaw is)
+pub fn carryYaw(turn &Mat4) f32 { libc.atan2f(turn.m[8], turn.m[10]); }
+
+// How far a body may be from where its last carry put it and still count as
+// standing still on the floor (a step's snap to the floor's height rounds
+// a little differently): metres
+const ANCHOR_SLACK f32 = 0.0001;
+
+// The bodies standing on each platform that moved this frame carried with
+// it ('moves', from Scene.platformMoves), and their velocity from it noted,
+// over 'dt' seconds of the frame's steps (none: unchanged)
+pub fn carryRiders(cast &mut Cast, moves &List[PlatformMove], dt f32) {
+  // A body on a platform that did not move has no velocity from it
+  mut i = 0usize;
+  while i < cast.beings.len() {
+    imm b = &mut cast.beings[i];
+    if dt > 0. { b.figure.platformVel = new Vec3(0., 0., 0.); }
+    i = i + 1usize;
+  }
+  mut j = 0usize;
+  while j < moves.len() {
+    imm move = *moves[j];
+    imm m = &move;
+    // The turn alone: the move's rotation (its scale is the same at both ends)
+    imm turn = m.to * m.from.inverse();
+    imm yaw = carryYaw(&turn);
+    i = 0usize;
+    while i < cast.beings.len() {
+      mut rode = false;
+      mut carry = new Carry(new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), turn);
+      {
+        imm b = &mut cast.beings[i];
+        if b.figure.active and b.figure.on == m.id {
+          imm was = b.body.position;
+          // Where it stands on the floor, in the floor's frame, is kept while
+          // it stands still on it (anchor), and its place each frame is
+          // worked out afresh from that: carried move by move instead, the
+          // rounding of a place hundreds of metres out would add up over a
+          // ride to centimetres
+          if !b.figure.anchored or (was - b.figure.anchorAt).length() > ANCHOR_SLACK {
+            b.figure.anchor = m.from.inverse() * was;
+          }
+          imm now = m.to * b.figure.anchor;
+          b.figure.anchored = true;
+          b.figure.anchorAt = now;
+          imm c = new Carry(was, now, turn);
+          b.body.position = now;
+          b.body.yaw = b.body.yaw + yaw;
+          b.before.position = c.point(b.before.position);
+          b.before.yaw = b.before.yaw + yaw;
+          b.figure.carried(&c, yaw);
+          if dt > 0. { b.figure.platformVel = (now - was) * (1. / dt); }
+          rode = true;
+          carry = c;
+        }
+      }
+      // The camera on the possessed rider goes with it, so it neither lags nor swings
+      if rode and i == cast.possessed { cast.rig.carried(&carry, yaw); }
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+}

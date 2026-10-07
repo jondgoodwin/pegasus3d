@@ -65,6 +65,7 @@
 //   parts.cone       ids, the aspect table, looks, requests, messages, the Door, the Scene
 //   placement.cone   the placement tree: parents before children, world matrices
 //   events.cone      the scene's clock and the day, timers (on the timewheel), areas
+//   platforms.cone   platforms: parts a being stands on and is carried by
 //   snapshot.cone    what the scene publishes each frame for drawing
 
 mod parts;
@@ -457,6 +458,13 @@ pub enum Request {
     pub id PartId;
     pub tint Color;
   }
+  // Part 'id' is a platform: 'shape' (a floor and walls, in the part's own
+  // frame: platforms.cone). A being standing on its floor is held up by it
+  // and carried as it moves; its walls stop a being.
+  pub struct Platform {
+    pub id PartId;
+    pub shape PlatformShape;
+  }
   // Nothing: what an applied request's place holds once it is taken
   pub struct Done;
 }
@@ -675,6 +683,7 @@ pub struct Scene {
   placements Placements;
   listeners Table[bool];      // the parts whose clicks their sender wants
   areas Table[AreaRow];       // the parts that are areas
+  platforms Table[PlatformRow]; // the parts that are platforms
   timers Timers;
   pub clock SceneClock;
   pub applied u64;            // requests applied
@@ -683,7 +692,7 @@ pub struct Scene {
   resources usize;            // ids of the registry that are resources, not parts
 
   pub fn empty() Scene {
-    new Scene(Door.empty(), Placements.empty(), Table[bool].empty(), Table[AreaRow].empty(), Timers.make(),
+    new Scene(Door.empty(), Placements.empty(), Table[bool].empty(), Table[AreaRow].empty(), Table[PlatformRow].empty(), Timers.make(),
       SceneClock.start(), 0u64, 0u64, 0u64, 0usize);
   }
 
@@ -814,6 +823,7 @@ pub struct Scene {
       imm g = *gone[i];
       listeners.remove(g);
       areas.remove(g);
+      platforms.remove(g);
       door.registry.remove(g.key);
       i = i + 1usize;
     }
@@ -838,6 +848,44 @@ pub struct Scene {
     areas.put(id, new AreaRow(volume, PartId.none()));
     applied = applied + 1u64;
     true;
+  }
+
+  pub fn applyPlatform(self &mut, id PartId, shape PlatformShape) bool {
+    if !self.isLive(id) { refused = refused + 1u64; return false; }
+    platforms.put(id, new PlatformRow(shape, Mat4.identity(), false));
+    applied = applied + 1u64;
+    true;
+  }
+
+  // Whether part 'id' is a platform
+  pub fn isPlatform(self &, id PartId) bool { platforms.find(id) != NO_ROW; }
+
+  // How each platform moved since this was last asked (call it once a
+  // frame, after 'propagate'): one PlatformMove into 'out' for each that
+  // has moved; the platforms seen for the first time are only noted
+  pub fn platformMoves(self &mut, out &mut List[PlatformMove]) {
+    out.clear();
+    mut i = 0usize;
+    while i < platforms.len() {
+      imm id = *platforms.ids[i];
+      imm row = *platforms.rows[i];
+      imm now = placements.worldOf(id);
+      if row.seen and !sameMatrix(&row.world, &now) { out.push(new PlatformMove(id, row.world, now)); }
+      if !row.seen or !sameMatrix(&row.world, &now) { platforms.rows.set(i, new PlatformRow(row.shape, now, true)); }
+      i = i + 1usize;
+    }
+  }
+
+  // Every platform as it stands now (as last propagated), into 'out'
+  pub fn platformsNow(self &, out &mut List[PlatformNow]) {
+    out.clear();
+    mut i = 0usize;
+    while i < platforms.len() {
+      imm id = *platforms.ids[i];
+      imm world = placements.worldOf(id);
+      out.push(new PlatformNow(id, world, world.inverse(), platforms.rows[i].shape));
+      i = i + 1usize;
+    }
   }
 
   // Every world matrix brought up to date, in one pass over what changed
