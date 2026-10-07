@@ -70,6 +70,7 @@
 //   amphora.cone      the amphora, its handles and its paint
 //   chimney.cone      the brick chimney (a shaft and a stack) and its maps
 //   cottage.cone      the cottage, its materials, and the lanterns
+//   lights.cone       what glows and when: dusk and dawn, nearness, pools of light
 //   hornflower.cone   the horn-flower
 
 mod bakedworld;
@@ -523,11 +524,24 @@ pub struct BakedWorld {
   pub dawns u64;
   pub hardLandings u64;       // hard landings read from the mail
   pub lastLandingSpeed f32;
+  pub lights Lights;          // what glows, when, and nearness to the path lanterns (lights.cone)
 
   pub fn make() BakedWorld {
     new BakedWorld(0u32, List[PartId].empty(), List[Transform3].empty(), List[usize].empty(), List[Hydration].empty(),
       Flight.grounded(), -1d, false, 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64,
-      0u64, 0.);
+      0u64, 0., Lights.make());
+  }
+
+  // The materials the lights glow, as far as they are defined yet
+  pub fn glowMaterials(self &) GlowMaterials {
+    new GlowMaterials(self.sharedOf(SHARED_LANTERN_BULB), self.sharedOf(SHARED_LANTERN_GLASS),
+      self.sharedOf(SHARED_LANTERN_POOL), self.sharedOf(SHARED_WINDOW_ROOM), self.sharedOf(SHARED_WINDOW_POOL));
+  }
+
+  // The material shared under 'key', or none if it is not defined yet
+  fn sharedOf(self &, key u32) MaterialId {
+    imm k = usize.from(key);
+    if k < shared.len() { *shared[k]; } else { MaterialId.none(); };
   }
 
   // Whether every object has been sent
@@ -553,6 +567,7 @@ pub struct BakedWorld {
   // sent as Place (and Fire) requests: the ball bouncing and spinning, the
   // button's cap, the balloon's altitude and its burner
   pub fn tick(self &mut, door &mut Door, now f64) {
+    lights.arrive(now);
     mut mail = door.takeMail();
     imm msgs = mail.viewMut();
     mut i = 0usize;
@@ -577,12 +592,16 @@ pub struct BakedWorld {
           }
         }
         case mut en &mut Entered {
+          if lights.near(en.area, true) {
+            print <- "The world: someone came near a path lantern at "; print <- now; print <- " s\n";
+          }
           if self.has(BUTTON) and en.area == self.partOf(BUTTON, 0usize) {
             arrivals = arrivals + 1u64;
             print <- "The world: someone came up to the launch button at "; print <- now; print <- " s\n";
           }
         }
         case mut lf &mut Left {
+          lights.near(lf.area, false);
           if self.has(BUTTON) and lf.area == self.partOf(BUTTON, 0usize) {
             departures = departures + 1u64;
             print <- "The world: someone left the launch button at "; print <- now; print <- " s\n";
@@ -590,11 +609,13 @@ pub struct BakedWorld {
         }
         case mut dk &mut Dusk {
           dusks = dusks + 1u64;
-          print <- "The world: dusk, at "; print <- dk.at; print <- " s\n";
+          lights.dusk(dk.at);
+          print <- "The world: dusk, at "; print <- dk.at; print <- " s; the lamps go on\n";
         }
         case mut dn &mut Dawn {
           dawns = dawns + 1u64;
-          print <- "The world: dawn, at "; print <- dn.at; print <- " s\n";
+          lights.dawn(dn.at);
+          print <- "The world: dawn, at "; print <- dn.at; print <- " s; the lamps go off\n";
         }
         case mut hl &mut HardLanding {
           hardLandings = hardLandings + 1u64;
@@ -605,6 +626,9 @@ pub struct BakedWorld {
       }
       i = i + 1usize;
     }
+    // The lamps: faded on or off, and the path lanterns brightened by nearness
+    imm glowing = self.glowMaterials();
+    lights.tick(door, now, &glowing);
     if self.has(BALL) {
       imm id = self.partOf(BALL, 0usize);
       door.send(Request.Place[id, ballAt(*places[*firstOf[usize.from(BALL)]], now)]);
@@ -665,6 +689,19 @@ pub struct BakedWorld {
       imm first = *firstOf[usize.from(BUTTON)];
       door.send(Request.Listen[*ids[first + 1usize]]);
       door.send(Request.Area[*ids[first], Volume.sphere(v(0., 0., 0.), BUTTON_AREA)]);
+    }
+    if next == LANTERNS {
+      // Each path lantern's stake is an area; coming near brightens its
+      // glass, bulb and pool (cottage.cone: four parts a lantern, then the pools)
+      imm first = *firstOf[usize.from(LANTERNS)];
+      mut k = 0usize;
+      while k < 3usize {
+        imm stake = *ids[first + k * 4usize];
+        door.send(Request.Area[stake, Volume.sphere(v(0., 0.2, 0.), NEAR_RADIUS)]);
+        lights.addLantern(stake, *ids[first + k * 4usize + 1usize], *ids[first + k * 4usize + 2usize],
+          *ids[first + LANTERN_POOLS + k]);
+        k = k + 1usize;
+      }
     }
     imm t2 = sdl.GetPerformanceCounter();
     log.push(new Hydration(next, parts, tris, f64.from(t1 - t0) / hz, f64.from(t2 - t1) / hz));

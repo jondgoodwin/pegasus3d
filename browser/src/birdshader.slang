@@ -35,8 +35,7 @@
 import renderframe;
 
 [[vk::binding(0, 1)]] ConstantBuffer<float4> params;
-[[vk::binding(1, 1)]] Texture2D<float4> unusedTexture;   // the pipeline's layout has one texture (skyrig.cone), not used
-[[vk::binding(2, 1)]] SamplerState unused;
+[[vk::binding(1, 1)]] SamplerState unused;
 
 struct VertexInput {
     float3 position : POSITION;
