@@ -483,8 +483,11 @@ frame, pane, door, timber, deck and stone. Four of them are baked from the `surf
 physically based material with colour, normal and ORM maps) in `ctBakeBoards` (siding, 512 x 512 over 1.8 m),
 `ctBakeShingles` (cedar, 256 over 1.12 m), `ctBakeDeck` (decking, 256 over 1.68 m) and `ctBakeStone` (garden
 flagstones, 512 over 2 m); the meshes' uvs are metres over each tile's side. The four bakes take about 0.6 s of
-the cottage's hydration. The renderer keeps no mip levels, so the roof and deck shimmer a little as the camera
-moves. The brick chimney is `chimney.cone`'s stack, unchanged, standing on a shaft of 44
+the cottage's hydration. The renderer gives every texture its whole mip chain and samples it trilinearly and
+anisotropically, so the roof and deck no longer shimmer as the camera moves (a 1 cm shift of the
+camera changes the roof's pixels by 8.0 grey levels on average before, 1.9 to 2.3 after, on the
+two GPUs; the deck's, 6.3 before, 1.7 to 2.3 after; the mips cost about 0.1 s on the first frame the
+world is published). The brick chimney is `chimney.cone`'s stack, unchanged, standing on a shaft of 44
 more courses of the same bond from the ground to the eave, on the right eave wall; its pot is 0.3 m above the
 ridge. The three path lanterns and the two wall lanterns are one family (stake or bracket, glass, bulb, cap), the
 glass and the bulb each its own part, in three materials the world shares.
