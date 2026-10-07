@@ -5,7 +5,7 @@ Acorn-era Pegasus3D in `src/`. It is the shell and the walkable ground (an islan
 height, 1.7 m) and a baked-in world standing on it, assembled as one scene: you land on the beach and
 a path (about 200 m, snaking through a forest of red maples and white pines, rocks, edging stones, hostas,
 ferns and flowers, below) leads to a forest cottage (board and batten, a brick chimney up its right
-eave wall) with three pathway lanterns along its last stretch and a black-figure amphora beside it
+eave wall) with twelve pathway lanterns in six pairs facing across its last 16 m and a black-figure amphora beside it
 with the horn-flower; on its porch a lathed chess rook and two clay pots of flowers stand by the door; a ball
 lies on the lawn where it was left; and behind the cottage, in the backyard, a hot-air balloon with its
 burner alight waits by a launch button, reached round the cottage's east end. Things move: the burner
@@ -262,7 +262,10 @@ along the way when the first frame was presented and when every object was first
 
 | File | What it is |
 | --- | --- |
-| `src/browser.cone` | the browser, a world that frame's loop runs (`mod browser is World`): input, the beings in fixed steps, the scene's events, the world's next object and the apply point, the snapshot, drawing |
+| `src/browser.cone` | the shell, on the main thread: the window, input and the user's controller, the clock and the fixed steps (frame's `Host`), the statistics; it makes the three actors and hands the scene each frame (below) |
+| `src/sceneactor.cone` | the scene actor: the scene, the beings and possession, their bodies (the physics, for now), the birds' flock, picking; each frame's steps, the apply point and the snapshot |
+| `src/worldactor.cone` | the world actor: the world's own code (the baked-in world) behind a Door of its own, its turn once a frame |
+| `src/renderactor.cone` | the render actor: the device and everything on it; it applies render's requests, draws the snapshot and presents |
 | `src/parts/parts.cone` | the module `parts`: one id registry for parts and resources, aspect tables keyed by id, the requests and messages, the Door senders are given, and the Scene |
 | `src/parts/placement.cone` | the placement tree: parents before children, world matrices in one pass over what changed |
 | `src/parts/events.cone` | the scene's clock and the day, timers on the timewheel, areas |
@@ -313,8 +316,9 @@ scene's inbox:
 | `Glow` | a material gives off a radiance (nits) from now on: a lamp switched on, dimmed or off |
 | `Tint` | a part's colour and glow multiplied by a colour from now on: one lamp of many brightened |
 
-Once a frame, at the publish phase, the browser applies the inbox in order, routing each request to the
-system that owns what it changes; a request naming a part that is gone is refused and counted. The
+Once a frame, at the publish phase, the scene actor applies the inbox in order, routing each request to
+the system that owns what it changes (render's moved on to the render actor, in the same order); a
+request naming a part that is gone is refused and counted. The
 land, the sea and the sky go in this way too (an *anchored* part, a non-zero `anchor` in `Show`, is drawn
 under the viewer in steps of that many metres; a negative one is placed where it is but not pickable, the
 island's). A material may carry a
@@ -331,8 +335,8 @@ changed. The balloon is one tree: its envelope is the root, with the skirt, the 
 (and under it the flame and the pilot light) and the basket (and under it the passengers) beneath, so
 launching it moves only the envelope. The renderer never walks the tree: each frame the scene publishes
 a **snapshot** (`parts/snapshot.cone`), a plain struct of every placed part's world matrix, the scene's
-time, the day clock and the possessed being's eyes, and the draw phase works from that alone (when the
-scene and render are actors, it is what moves between them).
+time, the day clock, the possessed being's eyes and the birds, and the draw phase works from that alone:
+the scene actor moves it to the render actor each frame, and render moves it back once it is presented.
 
 **Beings and possession.** The walker is a *being*: a part (`you`) with a body (the walk) that moves by
 the *intents* it is given each step. The user's *controller* turns the input package's actions into
@@ -358,19 +362,28 @@ hit names the part. The browser prints it and sends itself a `Highlight` (the re
 part in its colour half-way to yellow, and lets the last one go).
 
 **Buttons are messages to the world.** A world that wants a part's clicks sends `Listen` for it; when
-a click picks that part, the browser posts `Message.Clicked` into the world's Door, and the world reads
-its mail at its next tick, at the publish phase of the same frame, and answers with requests. The
-browser never reaches into the world, and the world never into the scene's tables: the Door's mail is
-the world's inbox, as an actor's would be. Timers (`Rang`), dusk and dawn, and areas (`Entered`,
+a click picks that part, the scene posts `Message.Clicked` into its mail for the world, which moves to
+the world actor with the world's turn at the publish phase of the same frame; the world reads it and
+answers with requests. The scene never reaches into the world, and the world never into the scene's
+tables. Timers (`Rang`), dusk and dawn, and areas (`Entered`,
 `Left`) come back the same way: the baked-in world sets an alarm for 3 s and keeps an area of 5 m
 about the launch button, and prints what it is told.
 
-**A world is given the Door, not the scene.** The `parts` module keeps the registry, the inbox and the
+**A world is given a Door, not the scene.** The `parts` module keeps the registry, the inbox and the
 placement table private, and hands a sender a `Door`, which only reserves ids and sends requests. The
-baked-in world is a sister module of `parts` and gets `&mut scene.door`; it cannot name the browser's
-scene, any table, the render system or a GPU handle, so fetching worlds later changes where a world
-comes from, not what it can do. (The starship, when the scene had it, made a GPU device of its own, an instance and
-a device with no surface, to mesh itself, never the browser's.)
+baked-in world is a sister module of `parts`, run by the world actor with a Door of its own; it cannot
+name the browser's scene, any table, the render system or a GPU handle, so fetching worlds later
+changes where a world comes from, not what it can do. The registry is lent to the world for its turn
+and handed back with its requests, so ids are reserved in one place and in one order, without a lock.
+(The starship, when the scene had it, made a GPU device of its own, an instance and a device with no
+surface, to mesh itself, never the browser's.)
+
+**Four actors.** The shell (the main thread, since SDL wants the window's events there), the scene, the
+world and render each own their state and reach each other only by messages (Cone's actors). Each
+frame the shell hands the scene its steps and the user's intents; the scene simulates, awaits the
+world's turn, applies the requests, publishes the snapshot and awaits render's drawing of it; then it
+reports the frame to the shell. The actors take turns, so a frame is the same sequence it was on one
+thread, and no actor divides its own work across threads.
 
 **Hydrate, then inject.** Each object of the baked-in world is a description in Cone, ported from the
 example programs of Cone's `sculpt` and `vfx` packages and from the `starship` package (examples and
@@ -378,9 +391,8 @@ executables are not importable, and this content belongs to the browser). Hydrat
 those libraries into plain data, a `Hydrated`: meshes, materials (with their paint images), parts
 naming them with their parents and placements, and emitters, with no ids. Injecting it defines its
 meshes and materials (a material the world shares across objects, the cottage's and the maples', only once),
-reserves an id per part and sends its requests. The `Hydrated` is what a world actor
-would send; today one object is hydrated and injected a frame, at the start of the publish phase, so
-frames keep coming while the world arrives.
+reserves an id per part and sends its requests. One object is hydrated and injected a frame, in the
+world actor's turn at the publish phase, so frames keep coming while the world arrives.
 
 | Object | Ported from | Size | Triangles | Hydrated in (ms) |
 | --- | --- | --- | --- | --- |
@@ -396,7 +408,7 @@ frames keep coming while the world arrives.
 | hostas and ferns (118, two each) | `leafrosette` | 0.5 to 1 m | 60,048 | 0.5 |
 | flowers (16 clumps, six variants) | `leafrosette` | 0.4 m | 7,040 | 0.2 |
 | cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
-| path lanterns (three: stake, glass, bulb, cap each) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 2,892 | 0.24 |
+| path lanterns (twelve, six pairs 2.8 m apart, 3 m across: stake, glass, bulb, cap each, and a pool of light) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 17,712 with the pools | 0.24 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |

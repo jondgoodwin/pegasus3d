@@ -1,0 +1,501 @@
+// The scene actor: the simulation and the scene, run on the actors package's
+// workers. It owns the scene (the registry, the placement tree, listeners,
+// areas, timers and the scene's clock: parts/), the beings and their bodies
+// (the cast and possession, being.cone; the mannequins' kinematic capsules,
+// mannequin.cone: the physics, for now, lives here), the birds' flock
+// (skyrig.cone), and the picking system (picking.cone). Its frame is one
+// message from the shell, which it answers when the frame is presented:
+//
+//   frame(input)  the frame's fixed steps: the user's intents to the
+//                 possessed being, every being stepped, the birds, the
+//                 scene's clock (SIMULATE); then the clock's and the view's
+//                 keys, a click picked, the hard landings, timers and areas
+//                 posted to the world's mail; the WORLD'S TURN, awaited; the
+//                 beings placed; THE APPLY POINT: the inbox applied, the
+//                 scene's own requests here and render's moved on in order;
+//                 the world matrices propagated and THE SNAPSHOT published
+//                 (PUBLISH); the frame DRAWN, awaited: the snapshot and
+//                 render's requests moved to the render actor, the snapshot
+//                 moved back once presented; in a scripted run, the
+//                 script's checks and its next events; and the shell told
+//
+//   finish()      the end of the run: what the scene, the world and render
+//                 report, and the run's exit code to the shell
+//
+// The world's turn and the frame's drawing are awaited, so a frame is the
+// same sequence it was when the browser was one loop on one thread: the
+// actors take turns, and only one runs at a time. That is the only
+// concurrency there is: no actor splits its own work across threads.
+//
+// INPUT -> CONTROLLER -> A BEING'S INTENTS. The user's controller is the
+// shell's (it reads the input package's actions); what arrives here is the
+// intents, for whichever being is possessed. The camera follows the
+// possessed being's eyes (Cast's view rig); none of the three knows the
+// others.
+
+// What the shell hands the scene each frame: its steps, the user's intents
+// and the keys and click of the frame, and the window's sizes
+pub struct FrameInput {
+  pub frame u64;
+  pub steps List[Step];       // the fixed steps due this frame, in order
+  pub intents Intents;        // the user's controller's, for the possessed being
+  pub pause bool;             // pressed this frame: P (pause), F (x10), V (first or third person), Tab (the next being)
+  pub fast bool;
+  pub view bool;
+  pub swap bool;
+  pub click bool;             // the left button pressed, at 'pointer'
+  pub pointer Vec2;
+  pub viewSize Vec2;          // the window in its own units (the pointer's)
+  pub alpha f32;              // the picture this far from the step before the last to the last
+  pub resized bool;           // the window changed size: 'width' by 'height' pixels
+  pub width u32;
+  pub height u32;
+}
+
+// What the scene tells the shell once a frame is presented
+pub struct FrameReport {
+  pub simulateNs u64;         // the phases, as each actor timed its own
+  pub publishNs u64;
+  pub renderNs u64;
+  pub presentNs u64;
+  pub swapNs u64;             // the present phase's swapchain present and acquire
+  pub acquireNs u64;
+  pub status u32;             // the image acquired's status
+  pub you Walk;               // the possessed being's body
+  pub waiting usize;          // requests waiting after the apply point
+  pub parts usize;            // parts the scene has
+  pub rows usize;             // rows render draws, and particle emitters
+  pub emitters usize;
+  pub worldDone bool;         // every object of the world sent
+  pub worldSentFrame u64;     // the frame that sent its last; 0 before
+
+  // Nothing yet: what the shell holds until a report comes
+  pub fn none() FrameReport {
+    new FrameReport(0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u, Walk.make(new Vec3(0., 0., 0.), 0.), 0usize, 0usize, 0usize,
+      0usize, false, 0u64);
+  }
+}
+
+// The scene actor's state: a struct of its own, so that the scripted run's
+// functions (script.cone and its sister files) can be handed it
+pub struct SceneState {
+  pub scene Scene;
+  pub cast Cast;              // the beings, and which one the user possesses
+  pub birds Birds;            // the flock, stepped on scene time
+  pub picks PickSystem;       // what each shown part is, for picking
+  pub picked PartId;          // the part highlighted: the last click's
+  pub lastPick PickHit;       // the last click's answer, for the script
+  pub clicks u64;
+  pub fired u64;              // Fire requests applied: an effect's bursts
+  pub sceneNow f64;           // the scene's time, seconds, at this frame's publish
+  pub hardLandingsMailed u64; // hard landings posted to the world's mail
+  pub view Vec2;              // the window in its own units, as the shell last said
+  pub scripted bool;
+  pub scriptOk bool;
+  pub world WorldFacts;       // a scripted run's: the world as its last turn left it
+  pub rendered RenderFacts;   // a scripted run's: what render last drew
+  pub worldDone bool;
+  pub worldSentFrame u64;     // the frame whose world turn sent the last object
+  sentBodies List[Walk];      // each being's body as its part was last placed
+  snapshot Snapshot;          // the last published, handed back by render once drawn
+  forRender List[Request];    // render's share of this frame's requests, in order
+
+  pub fn make(scripted bool, birds Birds) SceneState {
+    new SceneState(Scene.empty(), Cast.empty(), birds, PickSystem.empty(), PartId.none(),
+      new PickHit(PartId.none(), 0., 0u32, 0u64), 0u64, 0u64, 0d, 0u64, new Vec2(HEADLESS_W, HEADLESS_H), scripted,
+      true, WorldFacts.empty(), RenderFacts.empty(), false, 0u64, List[Walk].empty(),
+      Snapshot.empty(), List[Request].empty());
+  }
+
+  // The possessed being's body: where the user is
+  pub fn youBody(self &) Walk { cast.beings[cast.possessed].body; }
+
+  // A mannequin of 'height' metres made, shown and added to the cast standing
+  // at 'at' facing 'yaw': the index of its being
+  fn addMannequin(self &mut, name &[]u8, at Vec3, yaw f32, height f32, seed u32, color Color) usize {
+    imm root = scene.newPart(name);
+    imm parts = spawnMannequin(&mut scene, height, color, root);
+    cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, parts)));
+  }
+
+  // The scene before the first frame: the shell's land, sea and sky, and the
+  // beings (a scripted run's plain walker and its mannequins, or the user's
+  // mannequin and another)
+  fn seed(self &mut) {
+    seedScene(&mut scene);
+    if scripted {
+      // The scripted run starts as the plain walker on the landing beach,
+      // facing -z up the path's first stretch; its walk is checked there, then
+      // it is set down at the old flat world's start (START_X, START_Z) and
+      // keeps its exact walk checks from there. It takes the mannequin over by
+      // pressing Tab at its end. The mannequins stand off to the right of that start.
+      imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(BEACH_X, islandHeight(BEACH_X, BEACH_Z),
+        BEACH_Z), 0.)));
+      cast.possess(youAt);
+      self.addMannequin("mannequin", standing(START_X + 5., START_Z), 0., 1.75, 3u32, woodColor());
+      self.addMannequin("second mannequin", standing(START_X + 3.5, START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
+    } else {
+      // The user's own being: a mannequin on the landing beach, facing -z up
+      // the path, possessed, seen from behind and above; another stands a few metres off
+      imm youAt = self.addMannequin("mannequin", standing(BEACH_X, BEACH_Z), 0., 1.75, 3u32, woodColor());
+      self.addMannequin("second mannequin", standing(BEACH_X + 3., BEACH_Z - 4.), 2.356, 1.62, 11u32, clayColor());
+      cast.possess(youAt);
+    }
+    cast.look(1. / 60.);
+    print <- "Scene: "; print <- scene.partCount(); print <- " parts reserved, ";
+    print <- scene.waiting(); print <- " requests waiting\n";
+  }
+
+  // ---- simulate ----
+
+  // The frame's fixed steps: input -> the user's controller -> the possessed
+  // being's intents; every being stepped; the birds on scene time (paused and
+  // x10 with the day); the scene's clock moved on
+  fn simulate(self &mut, input &FrameInput) {
+    mut i = 0usize;
+    while i < input.steps.len() {
+      imm step = *input.steps[i];
+      cast.step(input.intents, step.dt);
+      birds.step(step.dt * f32.from(scene.clock.rate()));
+      scene.advanceClock(step.ns);
+      i = i + 1usize;
+    }
+  }
+
+  // ---- publish: before the world's turn ----
+
+  // The clock's and the view's keys, the hard landings mailed, a click
+  // picked, and the scene's events into the world's mail: timers due, and
+  // the areas the possessed being is in
+  fn beforeWorld(self &mut, input &FrameInput) {
+    view = input.viewSize;
+    if input.pause {
+      scene.togglePause();
+      print <- "Scene time "; if scene.clock.paused { print <- "paused"; } else { print <- "running"; };
+      print <- " at "; print <- scene.now(); print <- " s\n";
+    }
+    if input.fast {
+      scene.toggleFast();
+      print <- "Scene time x"; print <- scene.clock.rate(); print <- " at "; print <- scene.now(); print <- " s\n";
+    }
+    sceneNow = scene.now();
+    // The view and possession keys: V first or third person, Tab the next mannequin
+    if input.view {
+      cast.rig.toggle();
+      print <- "View: "; if cast.rig.mode == VIEW_FIRST { print <- "first person"; } else { print <- "third person"; }; print <- "\n";
+    }
+    if input.swap {
+      cast.swap();
+      print <- "Possessing being "; print <- cast.possessed; print <- "\n";
+    }
+    // Hard landings, mailed to the world
+    mut landings = cast.takeLandings();
+    mut li = 0usize;
+    while li < landings.len() {
+      imm l = *landings[li];
+      scene.post(Message.HardLanding[l.part, l.speed, l.damage]);
+      hardLandingsMailed = hardLandingsMailed + 1u64;
+      li = li + 1usize;
+    }
+    if input.click { self.click(input.pointer); }
+    scene.ring();
+    imm you = self.youBody();
+    scene.sense(cast.beings[cast.possessed].part, you.position);
+  }
+
+  // A click at 'pointer': the part it hits picked, reported and highlighted
+  // (the one before let go), and, if its sender listens for its clicks,
+  // posted to the sender's Door. The eye is where the last picture was drawn
+  // from: the snapshot render handed back.
+  fn click(self &mut, pointer Vec2) {
+    imm eye = snapshot.eyeTo;
+    imm ray = rayThrough(eye, FOV, pointer.x, pointer.y, view.x, view.y);
+    imm t0 = sdl.GetPerformanceCounter();
+    imm hit = picks.pick(&scene, ray);
+    imm us = f64.from(sdl.GetPerformanceCounter() - t0) / f64.from(sdl.GetPerformanceFrequency()) * 1.0e6d;
+    clicks = clicks + 1u64;
+    lastPick = hit;
+    print <- "Click at ("; print <- pointer.x; print <- ", "; print <- pointer.y; print <- "): ";
+    if hit.id.isNone() {
+      print <- "nothing";
+    } else {
+      imm name = scene.nameOf(hit.id);
+      printStr(name.view()); print <- ", "; print <- hit.distance; print <- " m away";
+    }
+    print <- " ("; print <- hit.boxesHit; print <- " boxes entered, "; print <- hit.triangles; print <- " triangles tested, ";
+    print <- us; print <- " us)\n";
+    if !picked.isNone() and !(picked == hit.id) { scene.send(Request.Highlight[picked, false]); }
+    if !hit.id.isNone() {
+      scene.send(Request.Highlight[hit.id, true]);
+      if scene.isListening(hit.id) { scene.post(Message.Clicked[hit.id]); }
+    }
+    picked = hit.id;
+  }
+
+  // The world's turn: the registry lent and the mail moved to it
+  fn worldTurn(self &mut) WorldTurn {
+    new WorldTurn(scene.door.takeRegistry(), scene.door.takeMail(), sceneNow);
+  }
+
+  // ---- publish: after the world's turn ----
+
+  // The registry back, the world's requests after the scene's own; the
+  // beings placed and posed; the apply point; the world matrices and the
+  // snapshot
+  fn afterWorld(self &mut, reply WorldReply, frameNo u64) {
+    mut r = reply;
+    mut lent = Registry.empty();
+    lent <=> r.registry;
+    scene.door.putRegistry(lent);
+    mut batch = List[Request].empty();
+    batch <=> r.requests;
+    scene.door.absorb(batch, r.meshes, r.materials);
+    if r.sentLast { worldSentFrame = frameNo; }
+    worldDone = r.done;
+    if scripted {
+      mut facts = WorldFacts.empty();
+      facts <=> r.facts;
+      world = facts;
+    }
+    self.placeBeings();
+    self.placeFigures();
+    self.applyRequests();
+    scene.propagate();
+    mut last = Snapshot.empty();
+    last <=> snapshot;
+    snapshot = scene.publish(last, cast.eyesBefore(), cast.eyes());
+    birds.publish(&mut snapshot.birds);
+    // A scripted close-up looks from where the script says instead, through its lens
+    snapshot.fixedView = scripted and hasView(frameNo);
+    snapshot.fov = FOV;
+    if snapshot.fixedView {
+      snapshot.view = viewAt(self, frameNo);
+      snapshot.fov = viewFov(frameNo);
+    }
+  }
+
+  // Each being's part placed where its body is, when it has moved
+  fn placeBeings(self &mut) {
+    mut i = 0usize;
+    while i < cast.beings.len() {
+      imm b = &mut cast.beings[i];
+      if i >= sentBodies.len() {
+        sentBodies.push(b.body);
+        scene.send(Request.Place[b.part, b.placement()]);
+      } else {
+        imm was = *sentBodies[i];
+        if was.position.x != b.body.position.x or was.position.y != b.body.position.y
+          or was.position.z != b.body.position.z or was.yaw != b.body.yaw {
+          sentBodies.set(i, b.body);
+          scene.send(Request.Place[b.part, b.placement()]);
+        }
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // Each mannequin posed: the skinning matrices of the pose the gait wrote
+  // this step, for its one skinned part (mannequin.cone)
+  fn placeFigures(self &mut) {
+    mut i = 0usize;
+    while i < cast.beings.len() {
+      imm b = &mut cast.beings[i];
+      if b.figure.active { scene.send(Request.Bones[b.part, b.figure.skinning()]); }
+      i = i + 1usize;
+    }
+  }
+
+  // Apply every request waiting, in the order sent: the scene's own here,
+  // the picking system's here, and render's, once the scene has checked what
+  // they name is live, moved on to render in the same order (forRender)
+  fn applyRequests(self &mut) {
+    if scene.waiting() == 0usize { return; }
+    mut batch = scene.takeInbox();
+    imm requests = batch.viewMut();
+    mut i = 0usize;
+    while i < requests.len {
+      mut r Request = Request.Done[];
+      r <=> requests[i];
+      mut toRender = false;
+      match &mut r {
+        case mut s &mut Spawn {
+          mut name = String.empty();
+          name <=> s.name;
+          scene.applySpawn(s.id, name);
+        }
+        case mut p &mut Place { scene.applyPlace(p.id, p.at); }
+        case mut pa &mut Parent { scene.applyParent(pa.id, pa.parent); }
+        case mut d &mut Despawn {
+          // The part and its whole subtree: the scene's rows first, then
+          // every other system's for each part that went (render's as a
+          // Despawn of each, in order)
+          mut gone = List[PartId].empty();
+          if scene.applyDespawn(d.id, &mut gone) {
+            mut k = 0usize;
+            while k < gone.len() {
+              imm id = *gone[k];
+              picks.drop(id);
+              forRender.push(Request.Despawn[id]);
+              k = k + 1usize;
+            }
+          }
+        }
+        case mut dm &mut DefineMesh {
+          if scene.applyDefine(dm.mesh.id, KIND_MESH) {
+            // The picking system keeps its shape; the render system uploads it
+            picks.shape(dm.mesh, &dm.shape);
+            toRender = true;
+          }
+        }
+        case mut ds &mut DefineSkinnedMesh {
+          if scene.applyDefine(ds.mesh.id, KIND_MESH) {
+            // Picked as modelled; drawn posed
+            picks.shape(ds.mesh, &ds.shape);
+            toRender = true;
+          }
+        }
+        case mut bn &mut Bones { toRender = self.passLive(bn.id); }
+        case mut dl &mut DefineMaterial { toRender = scene.applyDefine(dl.material.id, KIND_MATERIAL); }
+        case mut sh &mut Show {
+          if !scene.isLive(sh.id) or !scene.isMesh(sh.mesh) or !scene.isMaterial(sh.material) {
+            scene.refused = scene.refused + 1u64;
+          } else {
+            // The picking system keeps which mesh it is (not the ground's: an
+            // anchored part is drawn wherever the viewer is)
+            if sh.anchor == 0. { picks.show(sh.id, sh.mesh); }
+            scene.applied = scene.applied + 1u64;
+            toRender = true;
+          }
+        }
+        case mut tm &mut Timer { scene.applyTimer(tm.token, tm.at, tm.every); }
+        case mut cn &mut Cancel { scene.applyCancel(cn.token); }
+        case mut ar &mut Area { scene.applyArea(ar.id, ar.volume); }
+        case mut ef &mut Effect { toRender = self.passLive(ef.id); }
+        case mut f &mut Fire {
+          toRender = self.passLive(f.id);
+          if toRender { fired = fired + 1u64; }
+        }
+        case mut l &mut Listen { scene.applyListen(l.id); }
+        case mut gl &mut Glow {
+          if !scene.isMaterial(gl.material) {
+            scene.refused = scene.refused + 1u64;
+          } else {
+            scene.applied = scene.applied + 1u64;
+            toRender = true;
+          }
+        }
+        case mut tn &mut Tint { toRender = self.passLive(tn.id); }
+        case mut hl &mut Highlight { toRender = self.passLive(hl.id); }
+        case mut k &mut Sky { toRender = self.passLive(k.id); }
+        else {}
+      }
+      if toRender { forRender.push(r); }
+      i = i + 1usize;
+    }
+  }
+
+  // A render request naming part 'id': passed on (and counted applied) if
+  // the part is live, else refused
+  fn passLive(self &mut, id PartId) bool {
+    if !scene.isLive(id) {
+      scene.refused = scene.refused + 1u64;
+      return false;
+    }
+    scene.applied = scene.applied + 1u64;
+    true;
+  }
+
+  // What is moved to render for the frame: the snapshot and render's requests,
+  // and the name of a scripted view to save (the script's own state is this
+  // actor's, so the name is worked out here)
+  fn drawOrder(self &mut, input &FrameInput) DrawOrder {
+    mut snap = Snapshot.empty();
+    snap <=> snapshot;
+    mut requests = List[Request].empty();
+    requests <=> forRender;
+    imm shot = String.from(shotAt(input.frame));
+    new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, shot);
+  }
+
+  // ---- after the frame is presented ----
+
+  // The snapshot back; in a scripted run, what render drew, and the
+  // script's checks and next events; the shell's report
+  fn afterDraw(self &mut, shown Presented, input &FrameInput, simulateNs u64, publishNs u64) FrameReport {
+    mut p = shown;
+    p.snapshot <=> snapshot;
+    if p.shotFailed { scriptOk = false; }
+    imm you = self.youBody();
+    if scripted {
+      mut facts = RenderFacts.empty();
+      facts <=> p.facts;
+      rendered = facts;
+      if !checkScript(self, input.frame, &you) { scriptOk = false; }
+      driveScene(self, input.frame);
+      pushScript(input.frame + 1u64);
+      pushClicks(self, input.frame + 1u64, &you);
+    }
+    new FrameReport(simulateNs, publishNs, p.renderNs, p.presentNs, p.swapNs, p.acquireNs, p.status, self.youBody(),
+      scene.waiting(), scene.partCount(), p.rows, p.emitters, worldDone, worldSentFrame);
+  }
+
+  // The scene's lines at the end of the run
+  fn report(self &mut) {
+    print <- "Scene: "; print <- scene.partCount(); print <- " parts; requests applied "; print <- scene.applied;
+    print <- ", refused "; print <- scene.refused; print <- "\n";
+    imm you = self.youBody();
+    print <- "Walked to ("; print <- you.position.x; print <- ", "; print <- you.position.z;
+    print <- "), facing "; print <- you.yaw; print <- " rad\n";
+    print <- "Scene time "; print <- scene.now(); print <- " s, the day clock at "; print <- scene.hour();
+    print <- " h; timers rung "; print <- scene.rung(); print <- ", armed "; print <- scene.timerCount(); print <- "\n";
+    print <- "The baked-in world, object by object:\n";
+  }
+}
+
+// The point at (x, z) on the ground, for a being to stand on
+fn standing(x f32, z f32) Vec3 { new Vec3(x, groundHeight(x, z), z); }
+
+actor SceneActor {
+  st SceneState;
+  world WorldActor;
+  render RenderActor;
+  frames Sender[FrameReport];  // the shell's: each frame presented
+  ended Sender[i32];           // the shell's: the run's exit code, at the end
+
+  // The scene seeded (the shell's parts and the beings), with the flock the
+  // shell made, its world and render actors named, and the shell's two inboxes
+  fn init(self &new, scripted bool, birds Birds, world WorldActor, render RenderActor, frames Sender[FrameReport],
+    ended Sender[i32]) {
+    mut state = SceneState.make(scripted, birds);
+    state.seed();
+    *self = new Self(state, world, render, frames, ended);
+  }
+
+  // The frame (above)
+  pub async do frame(self, input FrameInput) {
+    imm t0 = sdl.GetTicksNS();
+    st.simulate(&input);
+    imm t1 = sdl.GetTicksNS();
+    st.beforeWorld(&input);
+    imm reply = await world.tick(st.worldTurn());
+    st.afterWorld(reply, input.frame);
+    imm order = st.drawOrder(&input);
+    imm t2 = sdl.GetTicksNS();
+    imm shown = await render.draw(order);
+    imm report = st.afterDraw(shown, &input, t1 - t0, t2 - t1);
+    frames <- report;
+  }
+
+  // The end of the run (above): the scene's lines, the world's log, render's
+  // lines, the script's verdict, and the exit code to the shell
+  pub async do finish(self, hasWindow bool) {
+    st.report();
+    imm reported = await world.report();
+    imm end = await render.finish(hasWindow);
+    mut code = 0i32;
+    if st.scripted and !st.scriptOk { code = 1i32; }
+    if !end.clean { code = 1i32; }
+    if st.scripted { reportScript(st.scriptOk); }
+    ended <- code;
+  }
+}

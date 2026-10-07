@@ -1,0 +1,168 @@
+// The world actor: the world's own code, run on the actors package's workers
+// as the world's turn each frame. Today the world is the baked-in one
+// (bakedworld/); a fetched world will run here the same way. "World" is a
+// placeholder name: one world may come to hold several scenes.
+//
+// It owns the world (BakedWorld: what of it has been sent, its motions, its
+// lights) and a Door of its own: the inbox its requests collect in, the mail
+// it reads, and, for its turn, the registry the scene lends it. It never
+// holds the scene, a table, the render system or a GPU handle of the
+// browser's: what it can do is what a Door offers.
+//
+// ITS TURN, once a frame, is one message from the scene actor, awaited by
+// it (sceneactor.cone):
+//
+//   tick(turn)   the registry and the mail moved in, at the scene's time;
+//                the world's next object hydrated and injected (one a turn,
+//                until all are), then its tick: the mail read, its motions
+//                sent as requests; answered with the registry, the requests
+//                in the order sent and how many meshes and materials they
+//                define (and, in a scripted run, the facts the script checks)
+//
+// Since the scene awaits the turn, the world runs while the scene waits, and
+// the world's requests are applied at the same frame's apply point, after
+// the scene's own and before the beings' places, as when both were one loop.
+//
+// The baked-in world's module keeps some globals of its own (its objects'
+// statistics and the vegetation's layout, built once): only this actor's
+// turns reach them, but for the scripted run's vegetation views, which read
+// the layout from the scene actor's end of frame, while this actor is idle.
+
+// What the scene hands the world for its turn
+pub struct WorldTurn {
+  pub registry Registry;
+  pub mail List[Message];
+  pub now f64;                // the scene's time, seconds
+}
+
+// What the world hands back
+pub struct WorldReply {
+  pub registry Registry;
+  pub requests List[Request]; // in the order sent
+  pub meshes u64;             // meshes and materials they define
+  pub materials u64;
+  pub sentLast bool;          // this turn sent the world's last object
+  pub done bool;              // every object has been sent
+  pub facts WorldFacts;       // a scripted run's: what the script reads of the world
+}
+
+// What the scripted run's checks read of the world (script.cone and its
+// sister files), copied out of it at the end of a turn: its parts by object,
+// and what it has read of its mail and sent. Its names are the world's own,
+// so the checks read it as they read the world.
+pub struct WorldFacts {
+  pub ids List[PartId];       // every part the world has sent, in the order sent
+  firstOf List[usize];        // object k's first part's index in 'ids'
+  pub flight Flight;          // the balloon's
+  pub pressedAt f64;
+  pub fires u64;
+  pub presses u64;
+  pub alarms u64;
+  pub alarmHeardAt f64;
+  pub arrivals u64;
+  pub departures u64;
+  pub dusks u64;
+  pub dawns u64;
+  pub hardLandings u64;
+  pub lights LightFacts;
+
+  pub fn empty() WorldFacts {
+    new WorldFacts(List[PartId].empty(), List[usize].empty(), Flight.grounded(), -1d, 0u64, 0u64, 0u64, -1d, 0u64,
+      0u64, 0u64, 0u64, 0u64, LightFacts.empty());
+  }
+
+  // The world's facts now
+  pub fn of(w &BakedWorld) WorldFacts {
+    mut ids = List[PartId].empty();
+    mut i = 0usize;
+    while i < w.ids.len() {
+      ids.push(*w.ids[i]);
+      i = i + 1usize;
+    }
+    // Objects are sent in order, so object k's first part follows the parts
+    // of those before it
+    mut firstOf = List[usize].empty();
+    mut first = 0usize;
+    mut k = 0u32;
+    while k < OBJECTS and w.has(k) {
+      firstOf.push(first);
+      first = first + w.partsOf(k);
+      k = k + 1u32;
+    }
+    new WorldFacts(ids, firstOf, w.flight, w.pressedAt, w.fires, w.presses, w.alarms, w.alarmHeardAt, w.arrivals,
+      w.departures, w.dusks, w.dawns, w.hardLandings, LightFacts.of(&w.lights));
+  }
+
+  // Whether every object has been sent
+  pub fn done(self &) bool { u32.from(firstOf.len()) >= OBJECTS; }
+
+  // Whether object 'k' has been sent
+  pub fn has(self &, k u32) bool { usize.from(k) < firstOf.len(); }
+
+  // Object 'k''s part 'j' (sent)
+  pub fn partOf(self &, k u32, j usize) PartId { *ids[*firstOf[usize.from(k)] + j]; }
+
+  // How many parts object 'k' has (sent)
+  pub fn partsOf(self &, k u32) usize {
+    imm from = *firstOf[usize.from(k)];
+    if usize.from(k) + 1usize < firstOf.len() { *firstOf[usize.from(k) + 1usize] - from; } else { ids.len() - from; };
+  }
+
+  // The button's cap: the part whose clicks the world listens for
+  pub fn buttonCap(self &) PartId {
+    if self.has(LAUNCH_BUTTON) { self.partOf(LAUNCH_BUTTON, 1usize); } else { PartId.none(); };
+  }
+}
+
+// What the script reads of the world's lights
+pub struct LightFacts {
+  pub on bool;
+  pub level f32;
+  pub comings u64;
+  sent Array[f32, 5];
+
+  pub fn empty() LightFacts { new LightFacts(false, 0., 0u64, [-1., -1., -1., -1., -1.]); }
+
+  pub fn of(l &Lights) LightFacts {
+    new LightFacts(l.on, l.level, l.comings, [l.sentNits(0usize), l.sentNits(1usize), l.sentNits(2usize),
+      l.sentNits(3usize), l.sentNits(4usize)]);
+  }
+
+  // Each glow's radiance last sent (the bulb's first)
+  pub fn sentNits(self &, k usize) f32 { sent[k]; }
+}
+
+actor WorldActor {
+  world BakedWorld;
+  door Door;
+  scripted bool;              // copy the facts out each turn
+
+  fn init(self &new, scripted bool) {
+    *self = new Self(BakedWorld.make(), Door.empty(), scripted);
+  }
+
+  // The world's turn (above)
+  pub async do tick(self, turn WorldTurn) WorldReply {
+    mut t = turn;
+    mut lent = Registry.empty();
+    lent <=> t.registry;
+    door.putRegistry(lent);
+    mut mail = List[Message].empty();
+    mail <=> t.mail;
+    door.putMail(mail);
+    imm meshesBefore = door.meshes;
+    imm materialsBefore = door.materials;
+    imm sentLast = world.step(&mut door) and world.done();
+    world.tick(&mut door, t.now);
+    imm facts = if scripted { WorldFacts.of(&world); } else { WorldFacts.empty(); };
+    new WorldReply(door.takeRegistry(), door.takeInbox(), door.meshes - meshesBefore, door.materials - materialsBefore,
+      sentLast, world.done(), facts);
+  }
+
+  // The world's log, printed at the end of the run: each object's parts,
+  // triangles, and the time it took to hydrate and send
+  pub async do report(self) bool {
+    world.report();
+    true;
+  }
+}

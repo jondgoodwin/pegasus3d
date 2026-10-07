@@ -20,15 +20,16 @@
 // directional light is the sun while its light is the greater, else the moon;
 // the ambient is the sky's average; and the exposure follows the sun's
 // height (look.cone). THE BIRDS are one mesh drawn once for every bird
-// (birdshader.slang): the flock is stepped in the simulation (scene time:
-// paused and fast with the day), and each frame every bird is one instance in
-// the draw list, its wings flapped in the vertex stage at the phase and
-// amplitude the flock gives it.
+// (birdshader.slang): the flock (Birds) is stepped in the simulation, by the
+// scene actor (scene time: paused and fast with the day), and carried to the
+// render actor in the snapshot; each frame every bird is one instance in the
+// draw list, its wings flapped in the vertex stage at the phase and amplitude
+// the flock gives it.
 //
 // WHERE IT HANGS: the render system's draw list takes the sky and the
-// birds' instances after it has built the parts' (browser.cone's drawFrame);
-// the Sky request's part says a sky is wanted (the rig draws only if one was
-// sent), its SkyLook the static fallback otherwise.
+// birds' instances after it has built the parts' (renderactor.cone's
+// drawFrame); the Sky request's part says a sky is wanted (the rig draws only
+// if one was sent), its SkyLook the static fallback otherwise.
 
 // The cottage's frame and so the birds' home: the flocks keep within 90 m of it
 pub const BIRD_HOME_X f32 = -10. + WORLD_DX;   // (the old flat world's cottage, on the island's lowland)
@@ -54,32 +55,23 @@ fn dayConfig() DayConfig {
 const CLOUD_LOW f32 = 0.42;
 const CLOUD_HIGH f32 = 0.5;
 
-pub struct SkyRig {
-  pub config DayConfig;
-  pub sky DaySky;                  // at the hour last asked for
-  pub lighting DayLighting;
+// The birds: the flock, which the scene actor steps in the simulation (scene
+// time), and each bird's place and wings' phase before the last step, which
+// the snapshot carries to the render actor to draw between. Kept apart from
+// the sky because the flock is simulated (the scene's) and the sky is drawn
+// (render's).
+pub struct Birds {
   pub flock Flock;
   pub prevPos List[Vec3];          // each bird's place before the last step, to draw between
   pub prevPhase List[f32];
-  pub skyMesh MeshHandle;
-  pub skyMaterial MaterialHandle;
-  pub birdMesh MeshHandle;
-  pub birdMaterial MaterialHandle;
-  pub made bool;                   // the GPU side made
-  pub packed List[f32];
-  pub birdsDrawn usize;
-  pub sceneTime f32;
 
-  // The rig, its flock over the cottage, before any GPU
-  pub fn make() SkyRig {
-    imm cfg = dayConfig();
-    imm sky = DaySky.at(&cfg, 7.);
+  // The flock over the cottage
+  pub fn make() Birds {
     imm home = new Vec3(BIRD_HOME_X, groundHeight(BIRD_HOME_X, BIRD_HOME_Z), BIRD_HOME_Z);
     imm flock = Flock.make(BIRD_COUNT, FlockParams.standard(home), 7u32, &groundHeight);
-    mut rig = new SkyRig(cfg, sky, sky.lighting(), flock, List[Vec3].empty(), List[f32].empty(), MeshHandle.none(),
-      MaterialHandle.none(), MeshHandle.none(), MaterialHandle.none(), false, List[f32].empty(), 0usize, 0.);
-    rig.rememberPositions();
-    rig;
+    mut birds = new Birds(flock, List[Vec3].empty(), List[f32].empty());
+    birds.rememberPositions();
+    birds;
   }
 
   fn rememberPositions(self &mut) {
@@ -96,7 +88,7 @@ pub struct SkyRig {
 
   // The flock stepped on by 'dt' seconds of scene time (in steps of at most
   // 1/30 s)
-  pub fn stepBirds(self &mut, dt f32) {
+  pub fn step(self &mut, dt f32) {
     if dt <= 0. { return; }
     self.rememberPositions();
     mut left = dt;
@@ -105,6 +97,40 @@ pub struct SkyRig {
       flock.step(h, &groundHeight);
       left = left - h;
     }
+  }
+
+  // Every bird as the snapshot carries it, into 'dest' (emptied first)
+  pub fn publish(self &, dest &mut List[BirdFrame]) {
+    dest.clear();
+    mut i = 0usize;
+    while i < flock.birds.len() {
+      imm pose = flock.pose(i);
+      dest.push(new BirdFrame(*prevPos[i], *prevPhase[i], pose.position, pose.forward, pose.up, pose.right, pose.phase,
+        pose.amp));
+      i = i + 1usize;
+    }
+  }
+}
+
+pub struct SkyRig {
+  pub config DayConfig;
+  pub sky DaySky;                  // at the hour last asked for
+  pub lighting DayLighting;
+  pub skyMesh MeshHandle;
+  pub skyMaterial MaterialHandle;
+  pub birdMesh MeshHandle;
+  pub birdMaterial MaterialHandle;
+  pub made bool;                   // the GPU side made
+  pub packed List[f32];
+  pub birdsDrawn usize;
+  pub sceneTime f32;
+
+  // The rig, before any GPU
+  pub fn make() SkyRig {
+    imm cfg = dayConfig();
+    imm sky = DaySky.at(&cfg, 7.);
+    new SkyRig(cfg, sky, sky.lighting(), MeshHandle.none(), MaterialHandle.none(), MeshHandle.none(),
+      MaterialHandle.none(), false, List[f32].empty(), 0usize, 0.);
   }
 
   // The sky and its light at the day clock's hour 'hour'
@@ -155,9 +181,10 @@ pub struct SkyRig {
   }
 
   // The sky's parameters for scene time 'now' written, and the draw list
-  // given the sky and the birds, at 'alpha' of the way from the flock's last
-  // step to this one
-  pub fn draw(self &mut, renderer &mut Renderer, device &mut Device, list &mut DrawList, now f32, alpha f32) {
+  // given the sky and the birds (the snapshot's), at 'alpha' of the way from
+  // the flock's last step to this one
+  pub fn draw(self &mut, renderer &mut Renderer, device &mut Device, list &mut DrawList, now f32, alpha f32,
+    birds &List[BirdFrame]) {
     if !made { return; }
     sceneTime = now;
     packed.clear();
@@ -174,13 +201,13 @@ pub struct SkyRig {
     // The birds
     mut i = 0usize;
     mut drawn = 0usize;
-    while i < flock.birds.len() {
-      imm pose = flock.pose(i);
-      imm p0 = *prevPos[i];
+    while i < birds.len() {
+      imm pose = *birds[i];
+      imm p0 = pose.before;
       imm pos = p0 + (pose.position - p0) * alpha;
-      mut dphase = pose.phase - *prevPhase[i];
+      mut dphase = pose.phase - pose.phaseBefore;
       if dphase < 0. { dphase = dphase + 2. * pi; }
-      imm phase = *prevPhase[i] + dphase * alpha;
+      imm phase = pose.phaseBefore + dphase * alpha;
       imm s = BIRD_SCALE;
       // Columns: right, up, back (-forward), each times the scale, then the place;
       // the fourth row's x is the wings' amplitude (birdshader.slang)
