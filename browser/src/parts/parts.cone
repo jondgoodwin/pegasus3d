@@ -30,34 +30,36 @@
 //
 // CHANGES ARRIVE AS REQUESTS. Nothing outside a table's owner writes into it.
 // Whoever wants the scene changed (the browser's own shell, the baked-in
-// world) sends a Request into the scene's inbox, and the browser applies the
-// inbox once a frame, at one point (the publish phase), routing each request
-// to the system that owns what it changes. That is the shape a message to an
-// actor has, so moving the systems onto actors later changes who drains the
-// inbox, not what is sent.
+// world) sends a Request into the scene's inbox, and the scene actor applies
+// the inbox once a frame, at one point (the publish phase), routing each
+// request to the system that owns what it changes: its own tables, or, moved
+// on in the order sent, the render actor's (sceneactor.cone).
 //
 // The one thing a sender does directly is RESERVE an id, so it can name the
 // part (or the resource) in the requests that follow (Bevy's Commands
 // reserve an entity the same way): the part is reserved, not yet live, until
-// its Spawn is applied; a resource, until its Define is.
+// its Spawn is applied; a resource, until its Define is. The world is an
+// actor of its own, so the registry is handed to it whole for its turn and
+// handed back with its requests (Registry, below): whoever holds it reserves,
+// and nobody else does meanwhile, so it needs no lock.
 //
 // MESSAGES GO THE OTHER WAY. What the browser tells a sender (a click on a
 // part it listens for, a timer it armed, an area entered or left, dusk and
-// dawn: events.cone) is posted into the Door's mail by the browser, through
-// the Scene, and the sender takes it out when it next looks: a sender's own
-// inbox, as an actor's would be.
+// dawn: events.cone) is posted into the Door's mail by the scene, and moved
+// whole to the world actor for its turn, where the world takes it out of its
+// own Door when it next looks.
 //
-// A SENDER IS GIVEN THE DOOR, NOT THE SCENE. The Door holds the registry,
-// the inbox and the mail and offers only reserving ids, defining resources,
-// sending requests, reading its mail and asking whether an id is still
-// reserved; the placement tree, the listeners, the areas, the timers,
-// posting and the apply methods are the Scene's. This module is the privacy
-// boundary (a member not 'pub' is private to the module that declares its
-// type), so a world handed '&mut scene.door' cannot reach a table or apply
-// anything, and the module is its own (not a file of the browser's root) so
-// that the browser and a world can both reach it without an import loop. (It
-// is called 'parts', not 'scene', because the browser's scene is a global
-// named 'scene'.)
+// A SENDER IS GIVEN A DOOR, NOT THE SCENE. A Door holds the registry (while
+// it is lent the registry), the inbox and the mail and offers only reserving
+// ids, defining resources, sending requests, reading its mail and asking
+// whether an id is still reserved; the placement tree, the listeners, the
+// areas, the timers, posting and the apply methods are the Scene's. This
+// module is the privacy boundary (a member not 'pub' is private to the
+// module that declares its type), so a world holding a Door cannot reach a
+// table or apply anything, and the module is its own (not a file of the
+// browser's root) so that the browser and a world can both reach it without
+// an import loop. (It is called 'parts', not 'scene', because the browser
+// calls its scene 'scene'.)
 //
 // Its files:
 //   parts.cone       ids, the aspect table, looks, requests, messages, the Door, the Scene
@@ -506,6 +508,20 @@ pub enum Message {
   pub struct Read;
 }
 
+// The registry, as it travels between actors: the scene lends it to the
+// world for the world's turn each frame, and the world hands it back with the
+// requests it sent, so ids are reserved in one place and in one order, the
+// order the scene and the world reserve them, and only by whichever actor
+// holds it. It declares Sendable on trust (the compiler takes a declaration
+// so): the pool owns its block outright, as a List does, and moving the pool
+// moves the block with it. (pool.Pool does not declare Sendable itself yet.)
+pub struct Registry is Sendable {
+  pool Pool[PartRecord];
+
+  // None: what a place for one holds while the registry is elsewhere
+  pub fn empty() Registry { new Registry(Pool[PartRecord].empty()); }
+}
+
 // What a sender is given: reserving ids, defining resources, sending
 // requests, and reading what it is told; nothing that reaches a table
 pub struct Door {
@@ -595,6 +611,61 @@ pub struct Door {
 
   // Whether id 'id' has been reserved and not yet despawned
   pub fn isReserved(self &, id PartId) bool { registry.alive(id.key); }
+
+  // ---- Between actors: the registry lent and given back, the requests and
+  // the mail moved whole ----
+
+  // The registry, taken out to be lent to another actor; this Door reserves
+  // nothing until it is put back
+  pub fn takeRegistry(self &mut) Registry {
+    mut pool = Pool[PartRecord].empty();
+    pool <=> registry;
+    new Registry(pool);
+  }
+
+  // The registry put (back) in
+  pub fn putRegistry(self &mut, r Registry) {
+    mut lent = r;
+    lent.pool <=> registry;
+  }
+
+  // The requests sent through it since it was last asked, in order; the
+  // inbox is left empty
+  pub fn takeInbox(self &mut) List[Request] {
+    mut batch = List[Request].empty();
+    batch <=> inbox;
+    batch;
+  }
+
+  // What the browser has told the sender, put in its mail to be read
+  pub fn putMail(self &mut, m List[Message]) {
+    mut more = m;
+    mut i = 0usize;
+    imm msgs = more.viewMut();
+    while i < msgs.len {
+      mut one Message = Message.Read[];
+      one <=> msgs[i];
+      mail.push(one);
+      i = i + 1usize;
+    }
+  }
+
+  // Another sender's requests (the world's turn), joining the inbox after
+  // what is already waiting, counted as sent through this Door, with the
+  // meshes and materials they define
+  pub fn absorb(self &mut, batch List[Request], meshesDefined u64, materialsDefined u64) {
+    mut more = batch;
+    imm requests = more.viewMut();
+    mut i = 0usize;
+    while i < requests.len {
+      mut r Request = Request.Done[];
+      r <=> requests[i];
+      self.send(r);
+      i = i + 1usize;
+    }
+    meshes = meshes + meshesDefined;
+    materials = materials + materialsDefined;
+  }
 }
 
 // The door, and the scene's own tables: placement, listeners, areas, timers
@@ -645,11 +716,7 @@ pub struct Scene {
   pub fn newPart(self &mut, name &[]u8) PartId { door.newPart(name); }
 
   // The requests waiting, taken out to be applied; the inbox is left empty
-  pub fn takeInbox(self &mut) List[Request] {
-    mut batch = List[Request].empty();
-    batch <=> door.inbox;
-    batch;
-  }
+  pub fn takeInbox(self &mut) List[Request] { door.takeInbox(); }
 
   // How many requests are waiting
   pub fn waiting(self &) usize { door.inbox.len(); }

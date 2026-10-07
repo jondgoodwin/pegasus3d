@@ -249,8 +249,9 @@ pub fn asmFov(f u64) f32 { viewLens; }
 // ---- The hooks ----
 
 // The walker set down on the beach just before the first frame of this part
-pub fn asmDrive(f u64) {
+pub fn asmDrive(st &mut SceneState, f u64) {
   if f != ASM_FROM - 1u64 { return; }
+  imm cast = &mut st.cast;
   cast.possess(0usize);
   imm b = &mut cast.beings[0usize];
   b.body.position = new Vec3(BEACH_X, groundHeight(BEACH_X, BEACH_Z), BEACH_Z);
@@ -269,17 +270,17 @@ pub fn asmDrive(f u64) {
 }
 
 // The day clock set to hour 'h' (hours beyond 24 are the next day's)
-fn setHour(h f32) {
-  scene.clock.ns = u64.from(nanosOf(f64.from(h - 7.) * 60d));
+fn setHour(st &mut SceneState, h f32) {
+  st.scene.clock.ns = u64.from(nanosOf(f64.from(h - 7.) * 60d));
 }
 
 // The launch button's click, pressed at 'clickDownAt' and let go two frames after, called with
 // the pushes of frame 'f'
-pub fn asmClicks(host &mut Host, f u64, w &Walk) {
+pub fn asmClicks(st &mut SceneState, f u64, w &Walk) {
   if f < ASM_FROM { return; }
-  asmStep(host, f, w);
+  asmStep(st, f, w);
   if f == clickDownAt and clickDownAt > 0u64 {
-    clickAt = seen(host, w, partPoint(world.buttonCap(), 0.03));
+    clickAt = seen(st.view, w, partPoint(&st.scene, st.world.buttonCap(), 0.03));
     pushButton(clickAt.x, clickAt.y, true);
   }
   if f == clickDownAt + 2u64 and clickDownAt > 0u64 { pushButton(clickAt.x, clickAt.y, false); }
@@ -314,7 +315,7 @@ fn routeFromButton(w &Walk) {
 }
 
 // The balloon's mouth (its envelope's root) in the world
-fn balloonMouth() Vec3 { scene.worldMatrix(world.partOf(BALLOON, 0usize)).translation(); }
+fn balloonMouth(st &mut SceneState) Vec3 { st.scene.worldMatrix(st.world.partOf(BALLOON, 0usize)).translation(); }
 
 // The nearest tree's trunk, in metres from the balloon's axis
 fn nearestTreeToBalloon() f32 {
@@ -338,7 +339,12 @@ fn say(f u64, what &[]u8) {
 }
 
 // The state machine: frame 'f's pushes, from the walker 'w' as the last frame left it
-fn asmStep(host &mut Host, f u64, w &Walk) {
+fn asmStep(st &mut SceneState, f u64, w &Walk) {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm cast = &mut st.cast;
+  imm sceneNow = st.sceneNow;
+  imm fired = st.fired;
   imm since = f - phaseFrom;
   if phase == PH_START {
     // Standing on the beach for the first picture, then up the path
@@ -425,7 +431,7 @@ fn asmStep(host &mut Host, f u64, w &Walk) {
     if sceneNow - world.pressedAt >= 4d {
       // 4 s up at 2.5 m/s: 10 m. Every part risen as far, straight up (the balloon stays over its place)
       imm alt = 2.5 * f32.from(sceneNow - world.pressedAt);
-      imm mouth = balloonMouth();
+      imm mouth = balloonMouth(st);
       imm at = placeXZ(BALLOON);
       print <- "Frame "; print <- f; print <- ", the balloon "; print <- sceneNow - world.pressedAt; print <- " s after the press:\n";
       asmOk = near("  the envelope's rise", mouth.y - balloonBaseY, alt, 0.002) and asmOk;
@@ -463,7 +469,7 @@ fn asmStep(host &mut Host, f u64, w &Walk) {
   if phase == PH_SINKING {
     // Landed: the burner fires in bursts again, and the envelope stands where it began
     if world.flight.altitude(sceneNow) == 0. and since > 30u64 {
-      imm mouth = balloonMouth();
+      imm mouth = balloonMouth(st);
       imm at = placeXZ(BALLOON);
       print <- "Frame "; print <- f; print <- ", the balloon landed after "; print <- since; print <- " frames:\n";
       asmOk = near("  the envelope back at its base height", mouth.y, balloonBaseY, 0.002) and asmOk;
@@ -487,7 +493,7 @@ fn asmStep(host &mut Host, f u64, w &Walk) {
   if phase == PH_FACE_DOOR {
     holdTurn(yawError(w, -16., 330.));
     if absF(yawError(w, -16., 330.)) <= TURN_BAND and since > 4u64 {
-      setHour(EVENING_HOUR);
+      setHour(st, EVENING_HOUR);
       goTo(PH_DUSK, f);
     }
     return;
@@ -495,7 +501,7 @@ fn asmStep(host &mut Host, f u64, w &Walk) {
   if phase == PH_DUSK {
     if since == 12u64 { takePicture(f + 1u64, SHOT_DUSK_STEPS); }
     if since == 14u64 {
-      checkLamps(f, "at the steps");
+      checkLamps(st, f, "at the steps");
       goTo(PH_FACE_PATH, f);
     }
     return;
@@ -524,8 +530,8 @@ fn asmStep(host &mut Host, f u64, w &Walk) {
     }
     if since == 12u64 {
       // Night: the clock at 23:00, and the walker set down 45 m short of the steps on the path, facing them
-      checkLamps(f, "looking down the path");
-      setHour(NIGHT_HOUR);
+      checkLamps(st, f, "looking down the path");
+      setHour(st, NIGHT_HOUR);
       imm line = pathCentreline();
       imm n = line.len();
       routeFromPath(n - 46usize, n - 1usize);
@@ -570,9 +576,9 @@ fn asmStep(host &mut Host, f u64, w &Walk) {
       print <- " frames, never farther than "; print <- routeDev; print <- " m from the path; ended ";
       print <- flatDist(w.position.x, w.position.z, end.x, end.z); print <- " m from the steps' foot\n";
       if routeDev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { asmOk = false; print <- "  the night walk is WRONG\n"; }
-      checkLamps(f, "at the steps by night");
+      checkLamps(st, f, "at the steps by night");
       // Then noon again, for the autumn maple with the sun behind it and in front of it
-      setHour(60.);
+      setHour(st, 60.);
       goTo(PH_SUN, f);
     }
     return;
@@ -595,8 +601,9 @@ fn asmStep(host &mut Host, f u64, w &Walk) {
 
 // The lamps: on, the bulb's glow the hour's (and the room behind a window lit, the path lantern's
 // pool lit), as the glow script checks them
-fn checkLamps(f u64, place &[]u8) {
-  imm lights = &world.lights;
+fn checkLamps(st &mut SceneState, f u64, place &[]u8) {
+  imm scene = &st.scene;
+  imm lights = &st.world.lights;
   imm want = nitsAt(hourAt(scene.now()));
   imm bulb = lights.sentNits(0usize);
   imm room = lights.sentNits(3usize);

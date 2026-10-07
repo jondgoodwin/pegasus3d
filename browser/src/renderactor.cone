@@ -1,0 +1,392 @@
+// The render actor: the GPU side, run on the actors package's workers. It
+// owns the device and everything made on it (the swapchain, the renderer,
+// the HDR frame and its Post, the render system's meshes, materials, rows
+// and effects, and the sky rig's pipelines), and it draws from nothing but
+// what the scene actor moves to it:
+//
+//   draw(order)   once a frame, awaited by the scene actor: the requests the
+//                 scene has passed on to render (applied in the order sent),
+//                 then the frame drawn from the snapshot alone, presented,
+//                 and the next image acquired; answered with the snapshot
+//                 handed back (so the scene publishes the next one into the
+//                 same lists), the phases' times, and, in a scripted run,
+//                 what it drew for the script's checks
+//   finish()      at the end of the run: what it drew, the Vulkan failures
+//                 and the validation layer's messages; the device let go
+//
+// Its device is made by its initializer, which runs on the shell's thread
+// (the one that made the window, as SDL wants); from then on only this
+// actor's messages reach it, on whichever worker runs them.
+
+// The GPU side, made by the initializer; the device outlives what it made
+struct Gfx {
+  pub readback Buffer;
+  pub shotName String;        // the file the frame read back goes to; empty: none
+  pub target SurfaceTexture;
+  pub post Post;              // the HDR frame drawn into, bloomed and tone-mapped into the target
+  pub sys RenderSystem;
+  pub renderer Renderer;
+  pub swapchain SwapChain;
+  pub device Device;
+  pub adapter Adapter;
+  pub surface Surface;
+  pub instance Instance;
+  pub camera Camera;
+}
+
+// What the scene actor moves to render each frame
+pub struct DrawOrder {
+  pub snapshot Snapshot;
+  pub requests List[Request]; // render's share of the frame's requests, in the order sent
+  pub alpha f32;              // the picture this far from the step before the last to the last
+  pub frame u64;
+  pub resized bool;           // the window changed size: the swapchain is made 'width' by 'height'
+  pub width u32;
+  pub height u32;
+  pub shot String;            // a scripted run's view to save from this frame, by name; empty: none
+}
+
+// What render hands back once the frame is presented
+pub struct Presented {
+  pub snapshot Snapshot;      // the one drawn, handed back to be published into again
+  pub renderNs u64;           // recording the frame: the render phase
+  pub presentNs u64;          // presenting it and acquiring the next image: the present phase
+  pub swapNs u64;             // of which the swapchain's present
+  pub acquireNs u64;          // and acquiring
+  pub status u32;             // the image acquired's status
+  pub rows usize;             // rows the render system draws, and particle emitters
+  pub emitters usize;
+  pub shotFailed bool;        // a scripted view could not be written
+  pub facts RenderFacts;      // a scripted run's: what it drew
+}
+
+// How a part is drawn, as the scripted run's checks read it
+pub struct DrawnFact {
+  pub material MaterialId;
+  pub physical bool;
+  pub tint Color;
+}
+
+// What render drew, copied out for the scripted run's checks (script.cone):
+// whether a part is drawn or gives off particles, its material, whether it
+// is physically based, and its tint
+pub struct RenderFacts {
+  pub gpu bool;               // the run has the GPU side
+  drawn Table[DrawnFact];
+  emitting Table[bool];
+
+  pub fn empty() RenderFacts { new RenderFacts(false, Table[DrawnFact].empty(), Table[bool].empty()); }
+
+  // The render system's tables now, into 'dest' (its lists reused)
+  fn take(sys &RenderSystem, dest &mut RenderFacts) {
+    dest.gpu = true;
+    dest.drawn.clear();
+    dest.emitting.clear();
+    mut i = 0usize;
+    while i < sys.rows.ids.len() {
+      imm id = *sys.rows.ids[i];
+      dest.drawn.put(id, new DrawnFact(sys.materialOf(id), sys.isPhysical(id), sys.tintOf(id)));
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < sys.effects.ids.len() {
+      dest.emitting.put(*sys.effects.ids[i], true);
+      i = i + 1usize;
+    }
+  }
+
+  // Whether part 'id' is drawn, or gives off particles
+  pub fn isDrawn(self &, id PartId) bool { drawn.find(id) != NO_ROW or emitting.find(id) != NO_ROW; }
+
+  // Whether part 'id' is drawn physically based
+  pub fn isPhysical(self &, id PartId) bool {
+    imm row = drawn.find(id);
+    row != NO_ROW and drawn.rows[row].physical;
+  }
+
+  // The material part 'id' is drawn in (none if it is not drawn)
+  pub fn materialOf(self &, id PartId) MaterialId {
+    imm row = drawn.find(id);
+    if row == NO_ROW { MaterialId.none(); } else { drawn.rows[row].material; };
+  }
+
+  // Part 'id''s tint (white if it is not drawn)
+  pub fn tintOf(self &, id PartId) Color {
+    imm row = drawn.find(id);
+    if row == NO_ROW { new Color(1., 1., 1., 1.); } else { drawn.rows[row].tint; };
+  }
+}
+
+// What render tells the scene at the end of the run
+pub struct RenderEnd {
+  pub clean bool;             // no Vulkan call failed and the validation layer said nothing
+}
+
+actor RenderActor {
+  gfx Option[Gfx];
+  rig SkyRig;                 // the day's sky and light (skyrig.cone); the birds come in the snapshot
+  skyOff bool;                // --no-sky: the static sky and light, no birds
+  scripted bool;
+  shotsDir String;            // where a scripted run's views are written; empty: nowhere
+  unrendered u64;             // render requests a headless run had no GPU for
+
+  // The GPU side made for the window (its SDL handle as a number, since a
+  // raw pointer is not Sendable; 0 for a headless run, which has none),
+  // 'width' by 'height' pixels. 'ready' is told whether it could be made.
+  fn init(self &new, window usize, width u32, height u32, skyOff bool, scripted bool, shotsDir String,
+    ready Sender[bool]) {
+    mut rig = SkyRig.make();
+    mut made Option[Gfx] = None[Gfx][];
+    mut ok = true;
+    if window != 0usize {
+      made = makeGfx(window as *u8 as *sdl.Window, width, height, skyOff, &mut rig);
+      ok = false;
+      match &mut made {
+        case mut some &mut Some { ok = true; }
+        else {}
+      }
+    }
+    *self = new Self(made, rig, skyOff, scripted, shotsDir, 0u64);
+    mut told = ready;
+    told <- ok;
+  }
+
+  // The frame (above)
+  pub async do draw(self, order DrawOrder) Presented {
+    mut o = order;
+    imm t0 = sdl.GetTicksNS();
+    mut g Option[Gfx] = None[Gfx][];
+    g <=> gfx;
+    mut rows = 0usize;
+    mut emitters = 0usize;
+    mut swapNs = 0u64;
+    mut acquireNs = 0u64;
+    mut status = SURFACE_TEXTURE_SUCCESS_OPTIMAL;
+    mut shotFailed = false;
+    mut facts = RenderFacts.empty();
+    mut t1 = t0;
+    match &mut g {
+      case mut some &mut Some {
+        if o.resized { some.value.swapchain.resize(o.width, o.height); }
+        self.apply(&mut some.value, &mut o.requests);
+        self.drawFrame(&mut some.value, &o.snapshot, o.shot.view(), o.alpha);
+        t1 = sdl.GetTicksNS();
+        imm s0 = sdl.GetTicksNS();
+        if some.value.target.ok() {
+          some.value.swapchain.present(&mut some.value.device);
+          swapNs = sdl.GetTicksNS() - s0;
+          if !self.writeShot(&mut some.value) { shotFailed = true; }
+        } else {
+          sdl.Delay(10u32);
+        }
+        imm a0 = sdl.GetTicksNS();
+        some.value.target = some.value.swapchain.getCurrentTexture(&mut some.value.device);
+        acquireNs = sdl.GetTicksNS() - a0;
+        status = some.value.target.status;
+        rows = some.value.sys.rows.len();
+        emitters = some.value.sys.particles.emitterCount();
+        if scripted { RenderFacts.take(&some.value.sys, &mut facts); }
+      }
+      else {
+        self.countUnrendered(&mut o.requests);
+        t1 = sdl.GetTicksNS();
+      }
+    }
+    gfx = g;
+    imm t2 = sdl.GetTicksNS();
+    mut snap = Snapshot.empty();
+    snap <=> o.snapshot;
+    new Presented(snap, t1 - t0, t2 - t1, swapNs, acquireNs, status, rows, emitters, shotFailed, facts);
+  }
+
+  // The end of the run (above), printed as the browser always has
+  pub async do finish(self, hasWindow bool) RenderEnd {
+    if !hasWindow {
+      if unrendered > 0u64 { print <- "Headless: "; print <- unrendered; print <- " render requests had no GPU\n"; }
+      return new RenderEnd(true);
+    }
+    mut g Option[Gfx] = None[Gfx][];
+    g <=> gfx;
+    match &mut g {
+      case mut some &mut Some {
+        some.value.device.waitIdle();
+        print <- "Parts drawn: "; print <- some.value.sys.drawn; print <- "; draws ";
+        print <- u64.from(some.value.renderer.drawCalls); print <- ", triangles "; print <- some.value.renderer.triangles;
+        print <- "\n";
+      }
+      else {}
+    }
+    g = None[Gfx][];
+    print <- "Vulkan failures: "; print <- u64.from(failures());
+    print <- "; validation messages: "; print <- u64.from(validationMessages()); print <- "\n";
+    new RenderEnd(failures() == 0u32 and validationMessages() == 0u32);
+  }
+
+  // The render requests a headless run has no GPU for, counted as the
+  // browser always has (a part's despawn is not one)
+  fn countUnrendered(self, requests &mut List[Request]) {
+    imm rs = requests.viewMut();
+    mut i = 0usize;
+    while i < rs.len {
+      mut r Request = Request.Done[];
+      r <=> rs[i];
+      match &mut r {
+        case mut d &mut Despawn {}
+        else { unrendered = unrendered + 1u64; }
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // The scene's requests for render, applied in the order sent; the scene
+  // has already refused any naming a part or resource that is not live
+  fn apply(self, g &mut Gfx, requests &mut List[Request]) {
+    imm rs = requests.viewMut();
+    mut i = 0usize;
+    while i < rs.len {
+      mut r Request = Request.Done[];
+      r <=> rs[i];
+      match &mut r {
+        // The scene's Despawn has taken the subtree; each part that went
+        // comes as one Despawn of its own
+        case mut d &mut Despawn { g.sys.drop(&mut g.device, d.id); }
+        case mut dm &mut DefineMesh { g.sys.defineMesh(&mut g.renderer, &mut g.device, dm.mesh, &dm.shape); }
+        case mut ds &mut DefineSkinnedMesh {
+          g.sys.defineSkinnedMesh(&mut g.renderer, &mut g.device, ds.mesh, &ds.shape, &ds.skin);
+        }
+        case mut bn &mut Bones { g.sys.pose(bn.id, &bn.bones); }
+        case mut dl &mut DefineMaterial {
+          g.sys.defineMaterial(&mut g.renderer, &mut g.device, dl.material, &dl.surface, &dl.paint, &dl.maps);
+        }
+        case mut sh &mut Show { g.sys.show(sh.id, sh.mesh, sh.material, sh.anchor); }
+        case mut ef &mut Effect { g.sys.effect(&mut g.device, ef.id, &ef.layers, ef.seed, ef.start, ef.stop); }
+        case mut f &mut Fire { g.sys.fire(f.id, f.seed, f.start, f.stop); }
+        case mut gl &mut Glow { g.sys.glow(&mut g.renderer, &mut g.device, gl.material, gl.glow); }
+        case mut tn &mut Tint { g.sys.tint(tn.id, tn.tint); }
+        case mut hl &mut Highlight { g.sys.highlight(&mut g.renderer, &mut g.device, hl.id, hl.on); }
+        case mut k &mut Sky { g.sys.sky(k.id, k.look); }
+        else {}
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // The frame drawn from the snapshot alone: the camera at its eye, the
+  // render system's draw list, the sky and the birds, then the effects'
+  // particles at the snapshot's time
+  fn drawFrame(self, g &mut Gfx, snapshot &Snapshot, shot &[]u8, alpha f32) {
+    if !g.target.ok() { return; }
+    imm pose = snapshot.eye(alpha);
+    mut sky = g.sys.currentSky();
+    // Once the world has sent a sky, the day's: the sun, moon and ambient from
+    // the day clock (skyrig.cone), and the exposure from the sun's height
+    imm dayLit = g.sys.skies.len() > 0usize and rig.made;
+    if dayLit {
+      rig.setHour(f32.from(snapshot.hour));
+      sky = rig.look();
+      g.renderer.environmentStrength = rig.environmentStrength();
+    }
+    g.camera.origin = pose.origin;
+    g.camera.orientation = pose.orientation;
+    // A scripted close-up may look through a longer lens
+    g.camera.fov = snapshot.fov;
+    g.camera.background = sky.color;
+    // The shaders' clock: the scene's time (the sea's waves, the swash), stopped when it is
+    g.renderer.time = f32.from(snapshot.now);
+    imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
+    g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()); } else { exposureFor(&sky); };
+    g.sys.build(snapshot, pose.origin);
+    if dayLit { rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds); }
+    mut encoder = g.device.createCommandEncoder();
+    // Into the HDR frame (the size of the target), then bloomed and
+    // tone-mapped into the target
+    g.post.resize(&mut g.device, g.target.texture.width, g.target.texture.height);
+    g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
+    if g.sys.hasEffects() {
+      g.sys.aimEffects(&mut g.device, snapshot);
+      g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
+    }
+    g.post.apply(&mut encoder, &g.target.texture);
+
+    // A scripted view to save: copied now, written once presented
+    if shotsDir.len() > 0usize and shot.len > 0usize {
+      imm w = g.target.texture.width;
+      imm h = g.target.texture.height;
+      g.readback = g.device.createBuffer(u64.from(w) * u64.from(h) * 4u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+      encoder.copyTextureToBuffer(&g.target.texture, &g.readback);
+      mut name = shotsDir.copy();
+      name <- "/";
+      name <- shot;
+      name <- ".bmp";
+      g.shotName = name;
+    }
+    g.device.queue.submit(encoder.finish());
+  }
+
+  // The scripted view copied this frame, written once presented; false if it
+  // could not be
+  fn writeShot(self, g &mut Gfx) bool {
+    if g.shotName.len() == 0usize { return true; }
+    g.device.waitIdle();
+    imm w = g.target.texture.width;
+    imm h = g.target.texture.height;
+    imm bgra = g.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM_SRGB
+      or g.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM;
+    imm img = Image.fromTexels(g.readback.mappedRange(), i32.from(w), i32.from(h), bgra);
+    imm written = img.save(g.shotName.view());
+    print <- "Screenshot: "; printStr(g.shotName.view());
+    if written { print <- "\n"; } else { print <- " could NOT be written\n"; }
+    g.shotName = String.empty();
+    g.readback = Buffer.none();
+    written;
+  }
+}
+
+// The GPU side for 'window', 'width' by 'height': the instance, the surface,
+// the adapter (GPU_POWER_PREFERENCE=low-power picks the integrated GPU where
+// there are two), the device, the swapchain, the renderer and its Post, the
+// render system, and the sky rig's pipelines (unless 'skyOff'). None if no
+// GPU can draw to the window.
+fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, rig &mut SkyRig) Option[Gfx] {
+  mut instance = Instance.create("browser");
+  mut surface = instance.createSurface(window);
+  mut preference = POWER_PREFERENCE_HIGH_PERFORMANCE;
+  imm env = libc.getenv(&"GPU_POWER_PREFERENCE" as *u8);
+  if (env as usize) != 0usize {
+    if libc.strcmp(env, &"low-power" as *u8) == 0i32 { preference = POWER_PREFERENCE_LOW_POWER; }
+  }
+  mut adapter = instance.requestAdapter(&surface, preference);
+  if !adapter.isValid() {
+    print <- "No GPU can draw to the window\n";
+    return None[Gfx][];
+  }
+  print <- "Adapter: "; printStr(adapter.name.view());
+  if instance.validation { print <- "; validation layer on\n"; } else { print <- "; validation layer off\n"; }
+  mut device = adapter.requestDevice();
+  mut swapchain = device.createSwapChain(&surface, width, height, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  // The scene is drawn into a half-float frame, which the Post blooms and
+  // tone-maps into the swapchain's texture (lookPost says how)
+  mut renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  mut post = Post.create(&mut device, swapchain.format, width, height);
+  lookPost(&mut post);
+  // The depth kept after the scene's pass, for the particles' pass to test against
+  renderer.keepDepth = true;
+  // The environment the physical parts are lit by besides the sun; the sky
+  // drawn stays the clear colour
+  imm environment = environmentSky();
+  renderer.setSky(&mut device, &environment);
+  renderer.drawSky = false;
+  mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT);
+  if !renderer.isValid() or !sys.particles.isValid() or !post.isValid() {
+    print <- "The renderer could not be made\n";
+    return None[Gfx][];
+  }
+  if !skyOff { rig.makeGpu(&mut renderer, &mut device); }
+  mut camera = Camera.make();
+  camera.fov = FOV;
+  camera.near = 0.1;
+  camera.far = 6000.;           // the island is 1.3 km across, the sea runs to the horizon
+  imm target = swapchain.getCurrentTexture(&mut device);
+  Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, post, sys, renderer, swapchain, device, adapter, surface,
+    instance, camera)];
+}
