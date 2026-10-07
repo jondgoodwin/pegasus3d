@@ -2,15 +2,17 @@
 
 A native 3-D browser written in [Cone](https://github.com/jondgoodwin/cone), in the spirit of the
 Acorn-era Pegasus3D in `src/`. It is the shell and the walkable ground (an island in the sea, below; in metres, walked on at eye
-height, 1.7 m) and a baked-in world standing on it: two chess
-rooks, a horn-flower, a horn, a forest cottage (board and batten, a brick chimney up its right eave wall)
-with three pathway lanterns along its path, a black-figure amphora in front of it, a forest of red maples and
-white pines round it with rocks, edging stones, hostas, ferns and flowers (below), a
-hot-air balloon with its burner alight and,
-hovering beyond them, Elizabeth's skeletal dragon starship, built from Cone's sculpt, vfx, sdf and sdfmesh
-packages and sent in as if downloaded. Things move: a ball bounces and spins, the burner fires in bursts,
-and a launch button by the path sends the balloon up (and, pressed again, brings it down). A click
-picks what it lands on and highlights it.
+height, 1.7 m) and a baked-in world standing on it, assembled as one scene: you land on the beach and
+a path (about 200 m, snaking through a forest of red maples and white pines, rocks, edging stones, hostas,
+ferns and flowers, below) leads to a forest cottage (board and batten, a brick chimney up its right
+eave wall) with three pathway lanterns along its last stretch and a black-figure amphora beside it
+with the horn-flower; on its porch a lathed chess rook and two clay pots of flowers stand by the door; a ball
+lies on the lawn where it was left; and behind the cottage, in the backyard, a hot-air balloon with its
+burner alight waits by a launch button, reached round the cottage's east end. Things move: the burner
+fires in bursts, and the button sends the balloon up (and, pressed again, brings it down). A click
+picks what it lands on and highlights it. (Elizabeth's skeletal dragon starship, built from Cone's
+sculpt, vfx, sdf and sdfmesh packages, hovered outside the fence until the scene was assembled; its
+code stays in `src/dragonship/` and `gpu/` for a space scene, and nothing places it now.)
 
 ## Building and running
 
@@ -63,9 +65,9 @@ The sky is the day's, drawn by one custom pipeline (`src/skyshader.slang`, a ful
 (coefficients read from the paper, not from memory), a twilight patch for the sun below 6 degrees, a night floor,
 the sun's disc, a moon that is always up at night with a phase and seas, and a field of stars that turns with
 the hour; with two layers of cloud (a low one 1800 m up, cirrus at 7500 m) drifting on scene time, lit by the
-sun's colour so they redden at dusk and by the moon at night. The day is **45 degrees north on 20 May** (so the
-clock's dawn at 4:30 and dusk at 19:30 are the sun's centre at the horizon), the sun rising in the east (+x) and
-setting in the west, due south (+z) at noon, 64.8 degrees up. Turbidity 2.5.
+sun's colour so they redden at dusk and by the moon at night. The day is **45 degrees north on 15 October** (day 288, autumn, to match the maples; so the
+clock's dawn at 6:31 and dusk at 17:28 are the sun's centre at the horizon and the night is 13 of the 24 minutes), the sun rising in the east (+x) and
+setting in the west, due south (+z) at noon, 36.0 degrees up. Turbidity 2.5.
 
 The scene is lit from the same `DaySky` on the CPU, each frame, from the scene's day clock: the sun's irradiance
 (100 000 lux at noon, reddening through the air it crosses), the moon's (0.18 lux at night, the directional light
@@ -100,7 +102,7 @@ throw on the ground is painted there. All of it is the world's lights (`src/bake
 - **How bright follows the clock,** as the scripted exposure does: a bulb gives off about 2800 nits at dusk,
   falling to 1.3 nits from 22:00 (`nitsAt`).
   - The exposure rises about 5000-fold over the same hours.
-  - The bulb is about 1.2 of the display's white at 19:30, 2.7 at 19:50 and 3 at night: brighter as the night
+  - The bulb is about 1.2 of the display's white at 17:28, 2.7 at 17:48 and 3 at night: brighter as the night
     deepens, as the eye adapting sees a lamp.
   - Every other glow is a share of the bulb's: the glass 0.22, a room 0.4, a lantern's pool 0.04, a window's
     pool 0.05.
@@ -155,15 +157,15 @@ browser.exe --watch 300               300 s in real time, a line a second and a 
 `--script` pushes key events into SDL's own queue (never the operating system's), so nothing reaches
 any other window, and a run of a fixed number of frames ignores the real keyboard and mouse (and the
 window losing focus, which would otherwise let go of the script's keys). It starts on the island's landing
-beach and runs 12 m up the path (on the ground, inside the fence, checked), is set down at the old flat
-world's start on the lowland, walks up to the rooks and the horn-flower, clicks on the rook and then on the sky, turns, runs to the balloon, clicks its
-launch button, then draws eight close-ups from eyes of its own (the amphora's through a 20 degree lens,
-straight on, as its photograph shows it; the cottage's from the reference photograph's viewpoint and
+beach and runs 12 m up the path (on the ground, inside the fence, checked), is set down on the lawn
+10 m in front of the porch, clicks on the lathed rook on the porch deck and then on the sky, turns, runs a
+few metres, then draws eight close-ups from eyes of its own (the porch's rook and pots, the chimney,
+the ball on the lawn, the balloon from the lawn, the amphora's through a 20 degree lens,
+straight on, as its photograph shows it; the horn-flower; and, later, the cottage's from the reference photograph's viewpoint and
 lens, and from the walker's eye on the approach). Its clicks are pushed mouse events at
 the place the script works out the target is drawn. It checks the walk against what its events must
-give (exact on the synthetic clock); what each click picked and highlighted; that the world heard the
-button and the balloon (every one of its parts) rose as its formula says; the ball's height against
-its formula; every burst of the burner sent was applied; that the scene applied, refused and removed
+give (exact on the synthetic clock); what each click picked and highlighted; that the ball lies still
+where the table puts it; every burst of the burner sent was applied; that the scene applied, refused and removed
 what it was sent; and that every part the world sent is live, placed and (with a GPU) drawn or giving
 off particles, with every request sent accounted for as applied or refused; and that the amphora and
 the chimney stack are the sizes they were built to (the amphora 1.484 m to its tip, 0.3368 m at its
@@ -174,11 +176,9 @@ against the right eave wall, all 26 of its parts one tree under its plinth, the 
 bulbs and metal one shared material each, and its panes drawn as parts of their own.
 It also presses P (frames 256 and 271) and F (276 and 286) while the walker stands, and checks that
 scene time stood still while paused and ran ten times as fast at x10; that the world's alarm (a timer
-for 3 s) rang at the first frame at or after 3 s; that the world was told the walker came up to the
-launch button (an area) and is still there; the day clock's reading; that the balloon is one tree as
-built; and that the two rooks share one material (11 more meshes than materials defined: the rooks'
-one, the cottage's 22 meshes in 16 materials, the lanterns' 4 meshes in the cottage's 3; each
-mannequin is one skinned mesh in one material; and, with a GPU, both rooks drawn in the same material).
+for 3 s) rang at the first frame at or after 3 s; the day clock's reading; that the balloon is one tree as
+built; and that the two porch pots share one clay (the cottage's meshes in fewer materials, the lanterns' 4 meshes in the cottage's 3; each
+mannequin is one skinned mesh in one material; and, with a GPU, the pots drawn in one material and the rook in another).
 The scripted run starts as the plain walker (so its walk checks stay exact) with the two mannequins
 standing off to the right; from frame 660 it presses Tab (the first mannequin is possessed, in third
 person), walks it with W for 60 steps, presses V (first person, the camera at its eyes socket) and
@@ -200,8 +200,8 @@ It exits 0 only if every check passed, no Vulkan call failed and the validation 
 three-level placement tree made children first, its world matrices against ones worked out by hand, a
 placement changed recomputing only its own row, a reparent to the root and back under the top, a cycle
 refused, and the top despawned with its subtree; timers on the scene's clock in 1/60 s steps at x1,
-paused and at x10, each rung at the first step at or after its time, a cancel, and dusk at 750 s and
-dawn at 1290 s; a sphere area and a box area under a scaled parent entered and left, and a second
+paused and at x10, each rung at the first step at or after its time, a cancel, and dusk at 628.5 s and
+dawn at 1411.5 s; a sphere area and a box area under a scaled parent entered and left, and a second
 being coming in moving the first out; and possession, the user's intents moving only the possessed
 being and the camera following it; and the mannequin: a capsule dropped from 0.5, 3.5 and 8 m landing
 at v = sqrt(2 g h), the hard landings mailed once each and the hurt (nothing to 10 m/s, 0.18 at
@@ -210,23 +210,23 @@ not move more than 1 cm, its skinned sole (skinned by render's CPU twin of the G
 1 cm of where the planted sole socket carries it, not sliding and on the ground, standing with both feet
 flat and level, the third-person camera 3.2 m behind
 and the first-person one at the eyes socket, and Tab possessing the other mannequin with the camera and
-the controls following it; and the sky (`src/skychecks.cone`): the sun at the clock's noon (64.8 degrees,
+the controls following it; and the sky (`src/skychecks.cone`): the sun at the clock's noon (36.0 degrees,
 due south), dusk and dawn (-0.84 degrees, its centre at the horizon), the sun below the horizon and the
-moon above it every quarter hour from 20:00 to 4:30, the light (noon: 100 000 lux and a few thousand nits of
+moon above it every quarter hour from 17:45 to 6:15, the light (noon: 81 000 lux and a few thousand nits of
 ambient; midnight: the moon's 0.18 lux, never black), the exposure (EV 15 at noon, -1 at night, only falling
 through the evening) and forty birds staying over the cottage. It exits 0 only if every check passed.
-`shots/` holds the views of one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups
-`rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`, the mannequins' `mannequin-*`,
+`shots/` holds the views of one run (`start`, `picked`, `walked`, `turned`, and the close-ups
+`porch`, `chimney`, `ball`, `backyard`, `amphora`, `hornflower`, the mannequins' `mannequin-*`,
 `cottage-photo`, `cottage-approach`), converted to PNG, `amphora-vs-photo.png`, the amphora's close-up
 beside the photograph it was traced from, and `cottage-vs-photo.png`, the cottage from the photograph's
 viewpoint beside the photograph.
 
 After the sky's views, from frame 1170 (`src/glowscript.cone`), the clock is set to the next evening and night
 for the lights:
-- `glow-dusk-approach`, `glow-night-approach`: the cottage at 19:50 and at 23:00;
+- `glow-dusk-approach`, `glow-night-approach`: the cottage at 17:48 and at 23:00;
 - `glow-glass-dusk`, `glow-glass-night`: the porch's right bay window close up;
 - `glow-dusk-photo`, and `glow-dusk-vs-photo.png` beside the reference photograph: the photograph's view at
-  19:50;
+  17:48 (taken at 19:50 in May's evening; the reference photograph's light was then);
 - `glow-lantern-night`: the nearest path lantern close up. The walker was set down within its area two windows
   before, so the lantern is brightened.
 
@@ -234,6 +234,15 @@ At frame 1222 the lights are checked: on, the bulb at the hour's brightness, the
 brightened 1.45 times, and the next one not. `--checks` runs the same lights on a scene of their own: off by day
 (and not brightened by nearness), half way through the fade at half its time, at the hour's brightness after
 it, brightened on coming near at night and dimmed on leaving, and off after dawn.
+
+Last, from frame 1340 (`src/assembly.cone`), the plain walker lands on the beach again and the script steers it
+(W, A, D and Shift pushed into SDL's queue as it needs them) the whole way: the path to the steps with eight
+first-person pictures `walk-01` to `walk-08`; round the cottage's east end to the launch button, a click, the balloon rising
+(`balloon-ready`, `balloon-risen`) and a second click bringing it down onto its place; back to the steps at dusk
+(`dusk-steps`, `dusk-path`); a night walk up the path's last 45 m (`night-01` to `-03`); and the specimen maple at noon
+with the sun in front of and behind the eye (`maple-sun-ahead`, `maple-sun-behind`). Each phase prints what it
+measured (the walk's farthest distance from the path's centre, the balloon's rise and landing, the lamps' glow), and
+the run fails if one does not finish.
 
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
 scene's inbox is empty after the apply point and that the parts, the rows drawn and the particle
@@ -272,6 +281,7 @@ along the way when the first frame was presented and when every object was first
 | `src/ground.cone` | the ground's height under a point: the island's, the one function everything standing on the ground asks |
 | `src/walk.cone` | a walker's body on the ground, and the user's key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
+| `src/assembly.cone` | the scripted run's last part (frames 1340 on): the walk from the beach to the steps, the balloon's launch from the backyard, dusk at the steps and the night walk, steered by the script's own key events |
 | `src/checks.cone` | the scene core's headless checks (`--checks`) |
 | `src/picking.cone` | the picking system: each mesh's triangles, which mesh each part is, and the ray a click casts |
 | `src/watch.cone` | the watched real-time run and the soak |
@@ -336,7 +346,7 @@ or driven by another controller, without touching either (`src/being.cone`).
 
 **The scene's time** is the scene's own clock: frame's fixed steps at its rate, 1, or 0 paused (P), or
 10 (F); exact on the synthetic clock. A day is 24 minutes of it, the day clock reading 07:00 at the
-start, dusk at 19:30 (750 s) and dawn at 04:30 (1290 s), each posted to the world as `Dusk` and `Dawn`.
+start, dusk at 17:28 (628.5 s) and dawn at 06:31 (1411.5 s), each posted to the world as `Dusk` and `Dawn`.
 Timers run on Cone's `timewheel`, driven by scene time. Each
 frame the world reads it and sends its motions as ordinary `Place` and `Fire` requests: the ball's
 height `1.6 |sin(pi t / 1.1)|` m and its spin, 3 rad/s; the button's cap sinking 3 cm for a quarter of
@@ -365,8 +375,8 @@ baked-in world is a sister module of `parts`, run by the world actor with a Door
 name the browser's scene, any table, the render system or a GPU handle, so fetching worlds later
 changes where a world comes from, not what it can do. The registry is lent to the world for its turn
 and handed back with its requests, so ids are reserved in one place and in one order, without a lock.
-To mesh the starship it makes a GPU device of its own (an instance and a device with no surface),
-never the browser's.
+(The starship, when the scene had it, made a GPU device of its own, an instance and a device with no
+surface, to mesh itself, never the browser's.)
 
 **Four actors.** The shell (the main thread, since SDL wants the window's events there), the scene, the
 world and render each own their state and reach each other only by messages (Cone's actors). Each
@@ -380,14 +390,14 @@ example programs of Cone's `sculpt` and `vfx` packages and from the `starship` p
 executables are not importable, and this content belongs to the browser). Hydrating one runs it through
 those libraries into plain data, a `Hydrated`: meshes, materials (with their paint images), parts
 naming them with their parents and placements, and emitters, with no ids. Injecting it defines its
-meshes and materials (a material the world shares across objects, the rooks' ivory, only once),
+meshes and materials (a material the world shares across objects, the cottage's and the maples', only once),
 reserves an id per part and sends its requests. One object is hydrated and injected a frame, in the
 world actor's turn at the publish phase, so frames keep coming while the world arrives.
 
 | Object | Ported from | Size | Triangles | Hydrated in (ms) |
 | --- | --- | --- | --- | --- |
-| chess rook | `sculpt/examples/rook.cone` (a lathe and three booleans), 96 steps round | 1.4 m | 2,020 | 92 |
-| lathed rook, beside it | the same rook with no booleans: one lathe, four capped merlons joined on | 1.4 m | 2,320 | 0.75 |
+| lathed rook, on the porch deck | `sculpt/examples/rook.cone`'s rook with no booleans: one lathe, four capped merlons joined on; at 0.32 of its size, standing on the deck at its east end | 0.56 m | 2,320 | 0.75 |
+| porch pots (two pots and two clumps of flowers) | new (`porch.cone`): a clay pot lathed from an outline, 48 steps round; `leafrosette`'s flower clump (the beds' kind) planted in each, one violet, one yellow | 0.35 m | 1,500 | 3 |
 | amphora | new (`amphora.cone`): an outline traced from a photograph, lathed 128 steps round; two handles swept along a traced centreline; its bands and patterns painted, 2048 x 2048, and an ORM map | 1.5 m | 63,832 | 100 (paint 83) |
 | horn-flower (stalk, leaves, petals, heart) | new (`hornflower.cone`): the horn, 2.4 m and cut short; `sculpt/examples/flower.cone`'s petals on the cut; five swept leaves | 2 m | 99,956 | 39 |
 | rocks (108 parts of six meshes) | new (`vegetation.cone`): `noiserock`'s faceted rocks in the kit's granite, scattered by `layout.cone`; they replace the one boulder | 0.3 to 1.6 m | 24,192 | 505 (granite bake 440) |
@@ -397,19 +407,23 @@ world actor's turn at the publish phase, so frames keep coming while the world a
 | edging stones (150, four variants) | `noiserock` rounded stones in field-stone colours, set a third into the ground along the path | 0.2 to 0.5 m | 15,000 | 603 (bake 600) |
 | hostas and ferns (118, two each) | `leafrosette` | 0.5 to 1 m | 60,048 | 0.5 |
 | flowers (16 clumps, six variants) | `leafrosette` | 0.4 m | 7,040 | 0.2 |
-| horn | `sculpt/examples/hornfamily.cone`, stage 0 | 3 m along | 46,204 | 18 |
 | cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
 | path lanterns (three: stake, glass, bulb, cap each) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 2,892 | 0.24 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |
-| ball | new: a sphere, checkered so its spin shows | 1 m across | 1,984 | 0.03 |
-| mound | new: a 65 x 65 grid lifted on the GPU by a heightfield (the heightfield shader, a custom pipeline), green rising to a faintly glowing sandy hump | 4 m square | 8,192 | 0.14 |
-| starship (frame, membranes, wing lights, ports, eyes, mouth) | `packages/starship`, meshed on the GPU at 0.03 a cell | 156 m, 10 m a unit | 458,324 | 700 (0.4 s of it making the kernels) |
+| ball | new: a sphere, checkered; it lies on the lawn where it was left | 1 m across | 1,984 | 0.03 |
+
+Not in this scene (their code stays): the chess rook (`sculptures.cone`'s `rookMesh`, a lathe and three
+booleans), the horn (`hornMesh`, which the horn-flower's stalk is cut from), the mound (a 65 x 65 grid lifted
+on the GPU by the heightfield shader, `src/heightfield.slang`: the island's ground now covers its test), and the
+starship (frame, membranes, wing lights, ports, eyes, mouth; `packages/starship` meshed on the GPU at 0.03 a
+cell, 156 m, 458,324 triangles, 700 ms of it 0.4 s making the kernels), which `dragonship/`, `gpu/` and
+`hydrateShip` keep for a space scene.
 
 ## The vegetation
 
-The scene is 20 May, so the maples are in leaf. The generators are Cone's own packages (`weberpenn`: Weber and
+The scene is 15 October, so the maples are in autumn colour: scarlet at the top and on the outer side, orange and gold in the middle, a few greenish-yellow leaves low and inside (the leaf palette's ramp, by each leaf's exposure); the pines stay green. The generators are Cone's own packages (`weberpenn`: Weber and
 Penn's trees with an opposite-pair and whorl mode; `noiserock`: rocks; `leafrosette`: hostas, ferns and flower
 clumps); this folder holds the scene's choices. Everything is a few meshes (variants by seed) of which many parts
 are copies, so render draws each (mesh, material) pair as one instanced draw. **Every leaf is geometry, not a
@@ -420,7 +434,7 @@ material arrives, only `weberpenn`'s `foliageMesh` and the leaf material change;
 | File | What it is |
 | --- | --- |
 | `src/bakedworld/layout.cone` | where everything stands: the rules and the seed (`vegetationLayout`, a list of `Item`s: kind, variant, x, y, z, yaw, scale, radius) |
-| `src/bakedworld/vegetation.cone` | the meshes, the textures and the parts of each family, objects 3 (rocks) and 13 to 18 |
+| `src/bakedworld/vegetation.cone` | the meshes, the textures and the parts of each family, objects 9 (rocks) to 15 |
 | `src/vegscript.cone` | the scripted run's eleven views (frames 1230 to 1339, after glow and glass's: `veg-maple`, `veg-maple-close`, `veg-path-beach`, `veg-path-forest`, `veg-cottage-trees`, `veg-cottage-above`, `veg-plants`, `veg-flowers`, `veg-rocks`, `veg-edging`, `veg-overview`), worked out from the layout |
 | `src/vegchecks.cone` | the layout's checks, part of `--checks` |
 
