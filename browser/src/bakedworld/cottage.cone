@@ -102,8 +102,8 @@ pub const COTTAGE_LANTERNS = 18usize;   // two wall lanterns, four parts each (b
 pub const COTTAGE_ROOMS = 26usize;      // the rooms behind the windows; then the pools of light: the wall
                                         // lanterns', the windows' on the deck, the wing windows' on the ground
 pub const COTTAGE_PARTS = 30usize;
-pub const LANTERN_POOLS = 12usize;      // after three path lanterns of four parts each (stake, glass, bulb, cap), their pools
-pub const LANTERN_PARTS = 15usize;
+pub const LANTERN_POOLS = 48usize;      // after twelve path lanterns of four parts each (stake, glass, bulb, cap), their pools
+pub const LANTERN_PARTS = 60usize;
 
 // The materials the world shares between the cottage and the lanterns
 pub const SHARED_LANTERN_METAL = 2u32;
@@ -849,33 +849,78 @@ fn hydrateCottage(h &mut Hydrated, at Transform3) {
   ctWingPool(h, root, at, roomPool);
 }
 
-// How far back along the path from its end at the steps each path lantern
-// stands (metres), alternating sides of it, 1.3 m off its centre
-imm LANTERN_BACK Array[f32, 3] = [6., 19., 34.];
-const LANTERN_OFFSET f32 = 1.3;
+// The path lanterns stand in six pairs along the path's last stretch, each pair facing across it
+// at one point: the first pair LANTERN_FIRST metres back along the path from its end at the
+// steps' foot, the next pairs every LANTERN_STEP metres further back (the last 15.8 m out), each
+// lantern LANTERN_OFFSET metres to its side of the centreline. The edging stones lie 0.92 to
+// 1.12 m out, so a lantern stands just beyond them, and layout.cone keeps the stones clear of
+// each lantern's foot (they step back a little round it)
+pub const LANTERN_PAIRS = 6usize;
+pub const LANTERN_COUNT = 12usize;
+const LANTERN_FIRST f32 = 1.8;
+const LANTERN_STEP f32 = 2.8;
+const LANTERN_OFFSET f32 = 1.5;
 
-// The three path lanterns into 'h', in the world's frame, along the island's
-// path (island.cone's centreline), their feet on the ground
+// The twelve lanterns' spots (x, z) in the world's frame: lantern 2p is pair p's on the path's
+// left (the side the heading's left-hand normal points to), lantern 2p+1 its right; pair 0 is the
+// nearest the steps. Each pair's point is found by arc length back along the island's centreline
+// (interpolated between its points) and the two are set off perpendicular to the path's local
+// direction there. The one place the arithmetic lives: hydrateLanterns stands the lanterns on
+// these, and layout.cone keeps the vegetation clear of them
+pub fn lanternSpots() List[Vec2] {
+  mut out = List[Vec2].empty();
+  imm line = pathCentreline();
+  imm last = line.len() - 1usize;
+  mut p = 0usize;
+  while p < LANTERN_PAIRS {
+    imm want = LANTERN_FIRST + LANTERN_STEP * f32.from(p);
+    // Walk back from the end until the arc length reaches 'want'
+    mut k = last;
+    mut got = 0.;
+    mut seg = 1.;
+    while k > 3usize {
+      imm a = *line[k - 1usize];
+      imm b = *line[k];
+      seg = ((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z)).sqrt() + 0.00001;
+      if got + seg >= want { break; }
+      got = got + seg;
+      k = k - 1usize;
+    }
+    // The point is between line[k-1] and line[k]
+    imm t = (want - got) / seg;
+    imm a = *line[k - 1usize];
+    imm b = *line[k];
+    imm cx = b.x + (a.x - b.x) * t;
+    imm cz = b.z + (a.z - b.z) * t;
+    // The path's direction there, over a few metres either side
+    imm k0 = if k > 3usize { k - 3usize; } else { 0usize; };
+    imm k1 = if k + 2usize <= last { k + 2usize; } else { last; };
+    imm tx = (*line[k1]).x - (*line[k0]).x;
+    imm tz = (*line[k1]).z - (*line[k0]).z;
+    imm tl = (tx * tx + tz * tz).sqrt();
+    imm nx = (0. - tz) / tl;
+    imm nz = tx / tl;
+    out.push(new Vec2(cx + nx * LANTERN_OFFSET, cz + nz * LANTERN_OFFSET));
+    out.push(new Vec2(cx - nx * LANTERN_OFFSET, cz - nz * LANTERN_OFFSET));
+    p = p + 1usize;
+  }
+  out;
+}
+
+// The twelve path lanterns into 'h', in the world's frame, in pairs across the island's path
+// (island.cone's centreline), their feet on the ground
 fn hydrateLanterns(h &mut Hydrated, at Transform3) {
   imm lm = ctLanternMaterials(h);
   imm stake = h.addMesh(ctLanternStake(1.));
   imm glass = h.addMesh(ctLanternGlass(1.));
   imm bulb = h.addMesh(ctLanternBulb(1.));
   imm cap = h.addMesh(ctLanternCap(1.));
-  imm line = pathCentreline();
+  imm spots = lanternSpots();
   mut feet = List[Transform3].empty();
   mut i = 0usize;
-  while i < 3usize {
-    imm k = line.len() - 2usize - usize.from(LANTERN_BACK[i]);
-    imm a = *line[k - 1usize];
-    imm b = *line[k + 1usize];
-    imm tx = b.x - a.x;
-    imm tz = b.z - a.z;
-    imm tl = (tx * tx + tz * tz).sqrt();
-    imm side = if i % 2usize == 0usize { LANTERN_OFFSET; } else { 0. - LANTERN_OFFSET; };
-    imm c = *line[k];
-    imm x = c.x + (0. - tz) / tl * side;
-    imm z = c.z + tx / tl * side;
+  while i < LANTERN_COUNT {
+    imm x = (*spots[i]).x;
+    imm z = (*spots[i]).y;
     imm p = new Transform3(v(x, groundHeight(x, z), z), Quat.identity(), v(1., 1., 1.));
     ctLanternParts(h, "path lantern", stake, glass, bulb, cap, lm, TOP, p, Transform3.identity());
     feet.push(p);
@@ -885,7 +930,7 @@ fn hydrateLanterns(h &mut Hydrated, at Transform3) {
   // following the ground's rise and fall (PATH_POOL_RADIUS round its foot)
   imm pool = ctPoolMaterial(h, SHARED_LANTERN_POOL, 3.);
   i = 0usize;
-  while i < 3usize {
+  while i < LANTERN_COUNT {
     imm p = *feet[i];
     imm r = PATH_POOL_RADIUS;
     h.part("path lantern pool", h.addMesh(poolMesh(&groundHeight, p.translation, 0., 0., r, r, 16, 0.03)), pool, TOP, p);
@@ -893,5 +938,6 @@ fn hydrateLanterns(h &mut Hydrated, at Transform3) {
   }
 }
 
-// How far a path lantern's pool of light reaches from its foot (metres)
-pub const PATH_POOL_RADIUS f32 = 1.3;
+// How far a path lantern's pool of light reaches from its foot (metres): 1.6, so the pools of
+// neighbours along a row (2.8 m apart) and across a pair (3 m) just overlap at their soft edges
+pub const PATH_POOL_RADIUS f32 = 1.6;
