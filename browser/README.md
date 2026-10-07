@@ -252,7 +252,7 @@ and the world told), turns about to face out, clicks the button on the back rail
 it, and with V rides the whole flight in first person, `ride-01` to `ride-06` from its eyes at six waypoints and
 `ride-third` from outside the basket in the air (every frame its feet are checked to stay within 1 cm of where they
 stood on the floor and its heading on it within 0.1 degree; landed, the balloon on its spot as it stood); it walks out
-onto the lawn, back in, presses again, and at 70 m up walks off the open front: `fall-01` stepping off, `fall-02`
+onto the lawn, back in, presses again, and at 70 m up walks off the open front: `fall-01` just off it, `fall-02`
 falling, `fall-03` landed (its speed against the drop, its health emptied), `fall-04` up again on the landing beach;
 the empty balloon finishes at x10 scene time and lands on its spot. Then the plain walker goes back to the steps at dusk
 (`dusk-steps`, `dusk-path`); a night walk up the path's last 45 m (`night-01` to `-03`); and the specimen maple at noon
