@@ -5,7 +5,7 @@ Acorn-era Pegasus3D in `src/`. It is the shell and the walkable ground (an islan
 height, 1.7 m) and a baked-in world standing on it, assembled as one scene: you land on the beach and
 a path (about 200 m, snaking through a forest of red maples and white pines, rocks, edging stones, hostas,
 ferns and flowers, below) leads to a forest cottage (board and batten, a brick chimney up its right
-eave wall) with three pathway lanterns along its last stretch and a black-figure amphora beside it
+eave wall) with twelve pathway lanterns in six pairs facing across its last 16 m and a black-figure amphora beside it
 with the horn-flower; on its porch a lathed chess rook and two clay pots of flowers stand by the door; a ball
 lies on the lawn where it was left; and behind the cottage, in the backyard, a hot-air balloon with its
 burner alight waits, reached round the cottage's east end, its basket open at the front to walk into.
@@ -473,11 +473,11 @@ world actor's turn at the publish phase, so frames keep coming while the world a
 | specimen maples (two, 4 parts) | `weberpenn` red maples, fitted to the winter photograph, in full leaf (below) | 11.6 m and 10.6 m | 316,528 | 392 |
 | pines (63, 126 parts of three variants) | `weberpenn` white pines, tiers of needle plumes | 13 to 15.5 m | 1,144,536 | 336 |
 | forest maples (35, 70 parts of three variants) | `weberpenn` red maples, three levels, bigger plainer leaves | 8 to 10.5 m | 626,870 | 3 |
-| edging stones (150, four variants) | `noiserock` rounded stones in field-stone colours, set a third into the ground along the path | 0.2 to 0.5 m | 15,000 | 603 (bake 600) |
+| edging stones (335, four variants) | `noiserock` low rounded stones in field-stone colours, one every 0.7 to 1.1 m along both edges just outside the walking surface (0.03 to 0.2 m clear of it, never on it), a quarter of their height sunk into the ground | 0.25 to 0.5 m across (the larger at bends) | 33,500 | 603 (bake 600) |
 | hostas and ferns (118, two each) | `leafrosette` | 0.5 to 1 m | 60,048 | 0.5 |
 | flowers (16 clumps, six variants) | `leafrosette` | 0.4 m | 7,040 | 0.2 |
 | cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
-| path lanterns (three: stake, glass, bulb, cap each) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 2,892 | 0.24 |
+| path lanterns (twelve, six pairs 2.8 m apart, 3 m across: stake, glass, bulb, cap each, and a pool of light) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 17,712 with the pools | 0.24 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket and rim, burner coil and valves, launch button) | `sculpt/examples/balloon.cone`, the chevrons; the basket (open-fronted, for two standing riders), the burner and the button new | 25 m | 77,200 | 51 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | (launch button) | nothing now: the button is in the balloon's basket; the object keeps its place in the list | | 0 | |
@@ -552,7 +552,15 @@ yellow-green in the sun, the very sunniest with a hint of spring's red, petioles
 `BarkParams.redMaple`, the pine's `BarkParams.pine` greyed; the pine's needles deep blue-green; hostas one
 blue-grey and one yellow-green, ferns two greens, flowers buttercup, white and violet.
 
-**Counts and cost.** 98 trees (63 pines, 35 forest maples) and 2 specimens, 108 rocks, 150 edging stones, 21
+**Glow and flutter** (render's foliage shading, set per material in `vegetation.cone`: `MAPLE_TRANSLUCENCY`,
+`MAPLE_FLUTTER`, `PINE_TRANSLUCENCY`). With the sun behind a leaf, light comes through it in the leaf's own
+colour, so a backlit crown glows coral and orange instead of going dark; the maples' leaves also turn up to about
+seven degrees about their stems, each on its own phase and period (0.6 to 1.8 s), so they catch and lose the light.
+The maples' leaf meshes carry each leaf's pivot and phase in their vertex colours (`FoliageParams.sway`). The
+pines' needles have a little translucency and no flutter. `shots/foliage-*.png` shows the maple before and after,
+with the sun behind the tree and behind the viewer, and two frames 0.25 s apart.
+
+**Counts and cost.** 98 trees (63 pines, 35 forest maples) and 2 specimens, 106 rocks, 335 edging stones, 21
 hostas, 97 ferns, 16 flower clumps: 656 parts in all, 2,959,446 triangles of the world's 3,530,352 drawn (with
 the island, sky and cottage), against 1,336,138 and 67 parts without (`--no-vegetation`). Frame times at the
 start view, `--watch`, the p50 of the whole frame with and without: on the RTX 4060 6.97 and 6.99 ms (its render
