@@ -1,0 +1,110 @@
+// Beings and possession: the seam between the user and what the user moves.
+//
+//   input --> a controller --> a being's intents --> the being steps
+//                                                     \--> the camera, if it is possessed
+//
+// A BEING is something in the scene that acts: today a walker, later
+// T2's mannequin. It is a part (so the scene places it and areas sense it)
+// with a body that moves (today a Walk: on the ground, a yaw, eyes 1.7 m up;
+// later a kinematic capsule) and, each fixed step, the INTENTS it is given:
+// what it means to do this step (walk ahead or back, turn, run), not which
+// key was pressed. A being never reads input.
+//
+// A CONTROLLER decides a being's intents. The user's controller reads the
+// input package's actions (walk.cone's bindings) and gives intents; later an
+// AI controller gives them from the world's logic, a network one from a
+// server. Nothing here knows which kind drove a being.
+//
+// POSSESSION is which being the user's controller drives and the camera
+// follows: the Cast's 'possessed'. The camera draws from the possessed
+// being's eyes, between its last two steps (the scene publishes them in its
+// snapshot), so possessing another being moves the user's view and control
+// to it at once, as projecting into another avatar should. A being that is
+// not possessed gets no intents (it stands) until it has a controller of its
+// own.
+//
+// For T2: the mannequin is a Being whose body is a capsule and skeleton
+// instead of a Walk; the ViewRig replaces 'eyes' (first or third person,
+// attached to the being's eye socket); Intents grows look pitch, jump and
+// the like. The browser's frame calls only Cast.step, Cast.eyesBefore/eyes,
+// Cast.possess and UserController.intents.
+
+// What a being means to do this step, whoever decided it
+pub struct Intents {
+  pub ahead f32;              // -1 (back) to 1 (forward)
+  pub turn f32;               // -1 (right) to 1 (left)
+  pub run bool;
+
+  pub fn none() Intents { new Intents(0., 0., false); }
+}
+
+// A being: its part in the scene, its body after the last step and the one
+// before (the picture is drawn between them), and the intents it was last given
+pub struct Being {
+  pub part PartId;
+  pub body Walk;
+  pub before Walk;
+  pub intents Intents;
+
+  pub fn make(part PartId, body Walk) Being { new Being(part, body, body, Intents.none()); }
+
+  // One fixed step of 'dt' seconds, by 'intents'
+  pub fn step(self &mut, given Intents, dt f32) {
+    intents = given;
+    before = body;
+    body.step(intents.ahead, intents.turn, intents.run, dt);
+  }
+
+  // Where its eyes are after the last step, and after the one before
+  pub fn eyes(self &) Pose { body.pose(); }
+  pub fn eyesBefore(self &) Pose { before.pose(); }
+
+  // Where its feet are, as a placement in the world (facing its yaw)
+  pub fn placement(self &) Transform3 {
+    new Transform3(body.position, Quat.angleAxis(body.yaw, new Vec3(0., 1., 0.)), new Vec3(1., 1., 1.));
+  }
+}
+
+// The user's controller: the input package's actions turned into intents
+pub struct UserController {
+  pub actions WalkActions;
+
+  pub fn bind(ctx &mut Context) UserController { new UserController(WalkActions.bind(ctx)); }
+
+  // This frame's intents, from the actions
+  pub fn intents(self &, ctx &Context) Intents {
+    new Intents(clampUnit(ctx.axis1(actions.move)), clampUnit(ctx.axis1(actions.turn)), ctx.down(actions.run));
+  }
+}
+
+// The beings, and which one the user possesses
+pub struct Cast {
+  pub beings List[Being];
+  pub possessed usize;
+
+  pub fn empty() Cast { new Cast(List[Being].empty(), 0usize); }
+
+  // A being added: its index
+  pub fn add(self &mut, b Being) usize {
+    beings.push(b);
+    beings.len() - 1usize;
+  }
+
+  // The user takes being 'i' over: its intents are the user's controller's
+  // from the next step, and the camera follows it
+  pub fn possess(self &mut, i usize) { if i < beings.len() { possessed = i; } }
+
+  // The possessed being
+  pub fn you(self &) &Being { beings[possessed]; }
+
+  // One fixed step of every being: the possessed one by the user's
+  // 'intents', the others standing (no controller of their own yet)
+  pub fn step(self &mut, user Intents, dt f32) {
+    mut i = 0usize;
+    while i < beings.len() {
+      imm b = &mut beings[i];
+      b.step(if i == possessed { user; } else { Intents.none(); }, dt);
+      i = i + 1usize;
+    }
+  }
+}
