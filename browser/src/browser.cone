@@ -101,6 +101,7 @@ struct Gfx {
   pub readback Buffer;
   pub shotName String;        // the file the frame read back goes to; empty: none
   pub target SurfaceTexture;
+  pub post Post;              // the HDR frame drawn into, bloomed and tone-mapped into the target
   pub sys RenderSystem;
   pub renderer Renderer;
   pub swapchain SwapChain;
@@ -211,7 +212,11 @@ pub fn start(host &mut Host) bool {
   mut device = adapter.requestDevice();
   imm size = host.window().size();
   mut swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
-  mut renderer = Renderer.create(&mut device, swapchain.format, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  // The scene is drawn into a half-float frame, which the Post blooms and
+  // tone-maps into the swapchain's texture (lookPost says how)
+  mut renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  mut post = Post.create(&mut device, swapchain.format, u32.from(size.w), u32.from(size.h));
+  lookPost(&mut post);
   // The depth kept after the scene's pass, for the particles' pass to test against
   renderer.keepDepth = true;
   // The environment the physical parts are lit by besides the sun; the sky
@@ -219,8 +224,8 @@ pub fn start(host &mut Host) bool {
   imm environment = environmentSky();
   renderer.setSky(&mut device, &environment);
   renderer.drawSky = false;
-  mut sys = RenderSystem.make(&mut device, swapchain.format);
-  if !renderer.isValid() or !sys.particles.isValid() {
+  mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT);
+  if !renderer.isValid() or !sys.particles.isValid() or !post.isValid() {
     print <- "The renderer could not be made\n";
     return false;
   }
@@ -229,7 +234,7 @@ pub fn start(host &mut Host) bool {
   camera.near = 0.1;
   camera.far = 1500.;
   imm target = swapchain.getCurrentTexture(&mut device);
-  gfx = Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, sys, renderer, swapchain, device,
+  gfx = Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, post, sys, renderer, swapchain, device,
     adapter, surface, instance, camera)];
   true;
 }
@@ -473,13 +478,18 @@ fn drawFrame(g &mut Gfx, pose Pose, frameNo u64) {
   g.camera.fov = if scripted and hasView(frameNo) { viewFov(frameNo); } else { FOV; };
   g.camera.background = sky.color;
   imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
+  g.renderer.exposure = exposureFor(&sky);
   g.sys.build(&scene, pose.origin);
   mut encoder = g.device.createCommandEncoder();
-  g.renderer.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera, &light, &g.sys.list);
+  // Into the HDR frame (the size of the target), then bloomed and
+  // tone-mapped into the target
+  g.post.resize(&mut g.device, g.target.texture.width, g.target.texture.height);
+  g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
   if g.sys.hasEffects() {
     g.sys.aimEffects(&mut g.device, &scene, sceneNow);
-    g.sys.particles.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera);
+    g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
   }
+  g.post.apply(&mut encoder, &g.target.texture);
 
   // A scripted view to save: copied now, written once presented
   imm shot = shotAt(frameNo);
