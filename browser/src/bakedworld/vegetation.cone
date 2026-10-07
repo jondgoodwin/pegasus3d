@@ -155,12 +155,13 @@ fn flowerPaint(petal Color, centre Color) Image {
   new Image(4, 1, 3, px);
 }
 
-// How many more meshes than materials the vegetation defines: 36 meshes (two
-// specimens' four, six each of the pines' and forest maples', six rocks, four
-// edging stones, two hostas, two ferns, six flower clumps) in 13 materials (the
-// maples' bark and leaf, the pines', the granite and the edging stone, two
-// hostas and two ferns, three flowers)
-pub fn vegetationMeshSurplus() u64 { if vegetationOff { 0u64; } else { 23u64; }; }
+// How many more meshes than materials the vegetation defines: 54 meshes (two
+// specimens' four, 24 of the conifers' (twelve variants of bark and foliage), six
+// of the forest maples', six rocks, four edging stones, two hostas, two ferns,
+// six flower clumps) in 17 materials (the maples' bark and leaf, the conifers'
+// three barks and three needles (white pine, hemlock, fir), the granite and the
+// edging stone, two hostas and two ferns, three flowers)
+pub fn vegetationMeshSurplus() u64 { if vegetationOff { 0u64; } else { 37u64; }; }
 
 // How many parts the layout makes: a tree's two (its bark and its foliage), the rest's one
 pub fn vegetationParts() usize {
@@ -178,7 +179,10 @@ pub fn vegetationParts() usize {
 // ---- Item to placement ----
 
 fn itemAt(it &Item, sink f32) Transform3 {
-  new Transform3(v(it.x, it.y - sink * it.scale, it.z), Quat.angleAxis(it.yaw, up()), v(it.scale, it.scale, it.scale));
+  // a conifer's lean: its height turned about its foot towards 'leanYaw', after its yaw
+  imm tilt = Quat.angleAxis(it.lean, v(libc.sinf(it.leanYaw), 0., 0. - libc.cosf(it.leanYaw)));
+  imm w = it.scale * it.squash;
+  new Transform3(v(it.x, it.y - sink * it.scale, it.z), tilt * Quat.angleAxis(it.yaw, up()), v(w, it.scale, w));
 }
 
 fn countKind(items &List[Item], kind u32) usize {
@@ -208,8 +212,11 @@ const SPECIMEN_SEEDS Array[u32, 2] = [3u32, 2u32];
 const SPECIMEN_HEIGHTS Array[f32, 2] = [11., 9.6];
 const MAPLE_SEEDS Array[u32, 3] = [31u32, 47u32, 59u32];
 const MAPLE_HEIGHTS Array[f32, 3] = [8.6, 9.8, 7.8];
-const PINE_SEEDS Array[u32, 3] = [11u32, 23u32, 37u32];
-const PINE_HEIGHTS Array[f32, 3] = [13., 15.5, 14.];
+// The conifers' variants, by the index layout.cone gives them (PINE_YOUNG_FIRST and the others): three
+// young open-grown white pines, three mature forest-grown (the tall ones, above the maples), two
+// mature shore or open-grown, two hemlocks, two balsam firs
+const PINE_SEEDS Array[u32, 12] = [11u32, 23u32, 37u32, 41u32, 53u32, 67u32, 71u32, 83u32, 91u32, 103u32, 111u32, 127u32];
+const PINE_HEIGHTS Array[f32, 12] = [9., 11., 12.5, 22.5, 25.5, 27.5, 15.5, 18.5, 9.5, 13., 9., 12.5];
 
 // Autumn: u (exposure, height and the leaf's own noise, as the generator gives it) ramps green-yellow ->
 // gold -> orange -> scarlet; the blade's darker base and tip, paler ribs and red petiole as leafPaint's
@@ -366,50 +373,110 @@ fn hydrateForestMaples(h &mut Hydrated) {
   }
 }
 
+// ---- The conifers ----
+
+// A needle tuft's baked image as the browser's Image (four channels, rows bottom first, as baked)
+fn tuftImage(p &surfacepatterns.NeedleTuftParams) Image {
+  mut m = surfacepatterns.bakeNeedleTuft(p);
+  mut px = List[u8].empty();
+  px <=> m.pixels;
+  new Image(m.width, m.height, 4, px);
+}
+
+// What a conifer variant is made of: its meshes' and materials' indices in the object
+struct ConiferVariant {
+  bark usize;
+  leaves usize;
+  barkMat usize;
+  needleMat usize;
+}
+
+// A variant's skeleton: its form and species by the index (layout.cone's PINE_YOUNG_FIRST and the
+// others), its seed and height from the tables
+fn coniferParams(v u32) weberpenn.TreeParams {
+  imm seed = PINE_SEEDS[usize.from(v)];
+  imm height = PINE_HEIGHTS[usize.from(v)];
+  if v >= FIR_FIRST { return weberpenn.balsamFir(seed, height); }
+  if v >= HEMLOCK_FIRST { return weberpenn.easternHemlock(seed, height); }
+  if v >= PINE_SHORE_FIRST { return weberpenn.whitePineShore(seed, height); }
+  if v >= PINE_FOREST_FIRST { return weberpenn.whitePineForest(seed, height); }
+  weberpenn.whitePineYoung(seed, height);
+}
+
+// And its cards: tufts for a white pine (a forest tree's fewer and larger, a shore tree's thinner),
+// sprays for the hemlock and the fir
+fn coniferCards(v u32) weberpenn.FoliageParams {
+  imm seed = 970u32 + v;
+  if v >= FIR_FIRST { return weberpenn.firSprays(seed); }
+  if v >= HEMLOCK_FIRST { return weberpenn.hemlockSprays(seed); }
+  mut f = weberpenn.pineTufts(seed);
+  if v >= PINE_SHORE_FIRST {
+    f.tuftMax = 40;
+    f.padWidth = 1.2;
+  } elif v >= PINE_FOREST_FIRST {
+    f.padWidth = 1.7;
+    f.padLength = 1.25;
+    f.tuftSize = 0.6;
+  }
+  f;
+}
+
+fn speciesName(v u32) &[]u8 {
+  if v >= FIR_FIRST { "balsam fir"; }
+  elif v >= HEMLOCK_FIRST { "hemlock"; }
+  elif v >= PINE_SHORE_FIRST { "shore white pine"; }
+  elif v >= PINE_FOREST_FIRST { "forest white pine"; }
+  else { "young white pine"; };
+}
+
 fn hydratePines(h &mut Hydrated) {
   if vegetationOff { return; }
   imm items = vegetationLayout();
   imm t00 = sdl.GetPerformanceCounter();
-  mut bp = surfacepatterns.BarkParams.pine(512, 4202u32);
-  mut tex = surfacepatterns.bakeBark(&bp);
-  // the kit's pine bark is warm red-brown; an old white pine's is greyer
-  imm bark = vegKitMaterial(h, &mut tex, srgb(176., 164., 156.), 0u32);
+  // The barks: a white pine's grey-brown, a hemlock's cinnamon (the kit's red-brown pine, dulled), a
+  // fir's thin grey (the maple's shallow furrows, a shade paler)
+  mut bpPine = surfacepatterns.BarkParams.whitePine(512, 4202u32);
+  mut texPine = surfacepatterns.bakeBark(&bpPine);
+  imm barkPine = vegKitMaterial(h, &mut texPine, white(), 0u32);
+  mut bpHem = surfacepatterns.BarkParams.pine(256, 4210u32);
+  mut texHem = surfacepatterns.bakeBark(&bpHem);
+  imm barkHem = vegKitMaterial(h, &mut texHem, srgb(168., 156., 148.), 0u32);
+  mut bpFir = surfacepatterns.BarkParams.redMaple(256, 4220u32);
+  mut texFir = surfacepatterns.bakeBark(&bpFir);
+  imm barkFir = vegKitMaterial(h, &mut texFir, srgb(216., 214., 208.), 0u32);
   vegStats.barkMs = vegStats.barkMs + msBetween(t00, sdl.GetPerformanceCounter());
-  imm needles = h.addMaterial(Look.physicallyBased(white(), 0.7, 0.).backlit(PINE_TRANSLUCENCY), pinePaint(), Maps.none(), 0u32);
+  // The needles: one cut-out material for each species, its paint a baked tuft (two cells for the
+  // white pine: fresh, and October's tawny); a little translucent, no flutter
+  imm t01 = sdl.GetPerformanceCounter();
+  imm needleLook = Look.physicallyBased(white(), 0.8, 0.).backlit(PINE_TRANSLUCENCY).matte(0.15).cutOut(0.5);
+  imm pinePaintImg = tuftImage(&surfacepatterns.NeedleTuftParams.whitePine(256, 5u32));
+  imm needlePine = h.addMaterial(needleLook, pinePaintImg, Maps.none(), 0u32);
+  imm needleHem = h.addMaterial(needleLook, tuftImage(&surfacepatterns.NeedleTuftParams.hemlock(256, 6u32)), Maps.none(), 0u32);
+  imm needleFir = h.addMaterial(needleLook, tuftImage(&surfacepatterns.NeedleTuftParams.balsamFir(256, 7u32)), Maps.none(), 0u32);
+  vegStats.paintMs = vegStats.paintMs + msBetween(t01, sdl.GetPerformanceCounter());
+  // The tubes: the trunk eight-sided, the limbs and the stubs four to five, no subdivision
   mut tp = new weberpenn.TubeParams();
-  tp.maxLevel = 2;
+  tp.maxLevel = 1;
   tp.subdivide = 1;
-  tp.fatSides = 7;
+  tp.fatSides = 8;
   tp.midSides = 4;
-  mut variants = List[TreeVariant].empty();
+  mut variants = List[ConiferVariant].empty();
   mut v = 0u32;
   while v < PINE_VARIANTS {
     imm t0 = sdl.GetPerformanceCounter();
-    mut p = weberpenn.whitePine(PINE_SEEDS[usize.from(v)], PINE_HEIGHTS[usize.from(v)]);
-    mut l0 = p.levelParams[0usize];
-    l0.branches = 45.;
-    p.levelParams[0usize] = l0;
-    mut l1 = p.levelParams[1usize];
-    l1.branches = 9.;
-    l1.curveRes = 8;
-    p.levelParams[1usize] = l1;
-    mut l2 = p.levelParams[2usize];
-    l2.curveRes = 4;
-    p.levelParams[2usize] = l2;
+    imm p = coniferParams(v);
     imm tree = weberpenn.grow(&p);
-    mut fp = weberpenn.pineFoliage(970u32 + v);
-    fp.plumeFromLevel = 1;
-    fp.plumeStart = 0.2;
-    fp.plumeWidth = 0.15;
-    fp.plumeMax = 0.65;
-    fp.plumeDroop = 0.55;
+    imm fp = coniferCards(v);
     imm bm = weberpenn.branchMesh(&tree, &tp);
     imm lm = weberpenn.foliageMesh(&tree, &fp);
     vegStats.treeMs = vegStats.treeMs + msBetween(t0, sdl.GetPerformanceCounter());
     vegStats.treeTriangles = vegStats.treeTriangles + u64.from(bm.triangleCount()) + u64.from(lm.triangleCount());
-    print <- "  pine "; print <- v; print <- ": "; print <- tree.stems.len(); print <- " stems, "; print <- tree.sites.len();
-    print <- " sprays, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, "; print <- tree.height; print <- " m tall\n";
-    variants.push(new TreeVariant(h.addMesh(bm), h.addMesh(lm)));
+    print <- "  conifer "; print <- v; print <- " ("; printStr(speciesName(v)); print <- "): "; print <- tree.stems.len();
+    print <- " stems, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, ";
+    print <- tree.height; print <- " m tall, "; print <- tree.reach * 2.; print <- " m across\n";
+    imm barkMat = if v >= FIR_FIRST { barkFir; } elif v >= HEMLOCK_FIRST { barkHem; } else { barkPine; };
+    imm needleMat = if v >= FIR_FIRST { needleFir; } elif v >= HEMLOCK_FIRST { needleHem; } else { needlePine; };
+    variants.push(new ConiferVariant(h.addMesh(bm), h.addMesh(lm), barkMat, needleMat));
     v = v + 1u32;
   }
   mut i = 0usize;
@@ -417,8 +484,8 @@ fn hydratePines(h &mut Hydrated) {
     imm it = items[i];
     if it.kind == K_PINE {
       imm tv = *variants[usize.from(it.variant)];
-      imm root = h.part("pine", tv.bark, bark, TOP, itemAt(it, 0.));
-      h.part("pine needles", tv.leaves, needles, root, Transform3.identity());
+      imm root = h.part("conifer", tv.bark, tv.barkMat, TOP, itemAt(it, 0.));
+      h.part("conifer needles", tv.leaves, tv.needleMat, root, Transform3.identity());
       vegStats.copies = vegStats.copies + 2u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + u64.from(h.meshes[tv.bark].triangleCount() + h.meshes[tv.leaves].triangleCount());
     }

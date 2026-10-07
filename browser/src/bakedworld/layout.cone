@@ -40,13 +40,26 @@ pub const K_FLOWER = 7u32;
 
 // How many variants (meshes) each kind has
 pub const SPECIMEN_VARIANTS = 2u32;
-pub const PINE_VARIANTS = 3u32;
+pub const PINE_VARIANTS = 12u32;    // the conifers (K_PINE), by species and form, below
 pub const MAPLE_VARIANTS = 3u32;
 pub const ROCK_VARIANTS = 6u32;
 pub const EDGING_VARIANTS = 4u32;
 pub const HOSTA_VARIANTS = 2u32;
 pub const FERN_VARIANTS = 2u32;
 pub const FLOWER_VARIANTS = 6u32;   // three colours, two clumps each
+
+// The conifers' variants (a K_PINE item's 'variant'): three forms of eastern white pine, then the
+// hemlock and the balsam fir, each in the order of vegetation.cone's tables of seeds and heights
+pub const PINE_YOUNG_FIRST = 0u32;    // 0 to 2: young open-grown, 9 to 12.5 m, full, a cone of tiers
+pub const PINE_FOREST_FIRST = 3u32;   // 3 to 5: mature forest-grown, 22.5 to 27.5 m, a bare grey trunk with dead stubs
+pub const PINE_SHORE_FIRST = 6u32;    // 6 and 7: mature open-grown or wind-shaped, 15.5 and 18.5 m, one-sided
+pub const HEMLOCK_FIRST = 8u32;       // 8 and 9: eastern hemlock
+pub const FIR_FIRST = 10u32;          // 10 and 11: balsam fir
+
+// Whether a conifer variant is a white pine, a hemlock, a fir
+pub fn isWhitePine(variant u32) bool { variant < HEMLOCK_FIRST; }
+pub fn isHemlock(variant u32) bool { variant >= HEMLOCK_FIRST and variant < FIR_FIRST; }
+pub fn isFir(variant u32) bool { variant >= FIR_FIRST; }
 
 // The most of each, which keeps the scene within what the Intel GPU draws
 pub const MAX_TREES = 90usize;     // pines and forest maples together (the anchors extra)
@@ -66,6 +79,12 @@ pub struct Item {
   pub yaw f32;
   pub scale f32;
   pub radius f32;             // the footprint it keeps others off by, metres
+  // A conifer's own irregularity (the others stand upright and uniform): its width against its
+  // height (the scale is the height's, and the width's is this times it), and a lean of 'lean'
+  // radians towards the direction 'leanYaw' (about the foot)
+  pub squash f32 = 1.;
+  pub lean f32 = 0.;
+  pub leanYaw f32 = 0.;
 }
 
 // A small random stream (noise's PCG hash; a state advanced by a Weyl step)
@@ -190,6 +209,62 @@ struct Ground {
   fn add(self &mut, kind u32, variant u32, x f32, z f32, yaw f32, scale f32, radius f32) {
     items.push(new Item(kind, variant, x, groundHeight(x, z), z, yaw, scale, radius));
   }
+
+  // A conifer: its variant and its own scale, squash and lean (a Conifer, below)
+  fn addConifer(self &mut, c Conifer, x f32, z f32, yaw f32, radius f32) {
+    items.push(new Item(K_PINE, c.variant, x, groundHeight(x, z), z, yaw, c.scale, radius, c.squash, c.lean, c.leanYaw));
+  }
+}
+
+// ---- Which conifer, where ----
+
+// A conifer chosen for a place: its variant (species and form), the height's scale, the width's
+// share of it, and its lean
+struct Conifer {
+  variant u32;
+  scale f32;
+  squash f32;
+  lean f32;
+  leanYaw f32;
+}
+
+// How many variants there are of each form, and the first of it: young, forest, shore, hemlock, fir
+fn formFirst(form i32) u32 {
+  if form == 0 { PINE_YOUNG_FIRST; } elif form == 1 { PINE_FOREST_FIRST; } elif form == 2 { PINE_SHORE_FIRST; }
+  elif form == 3 { HEMLOCK_FIRST; } else { FIR_FIRST; };
+}
+
+fn formCount(form i32) u32 { if form == 0 or form == 1 { 3u32; } else { 2u32; }; }
+
+// The conifer for (x, z), from the stream 'c' (its own, so the choices of species and form do
+// not move anything else the layout places). The forest is about three white pines in five, one
+// hemlock in four and one fir in seven. Where the species grow: the hemlock is the shade's tree,
+// the likelier the thicker the forest, the fir the damp low ground's. The form of a white pine
+// follows the place: along the shore (low ground) the wind-shaped tree, in the thick forest well
+// off the path the tall forest-grown one, and the young open-grown one where the forest is open
+// or the path near. 'pd' is the distance from the path, 'density' the forest's.
+fn pickConifer(c &mut VRng, x f32, z f32, density f32, pd f32) Conifer {
+  imm h = groundHeight(x, z);
+  imm wp = 0.60;
+  imm wh = 0.25 * (0.55 + 0.9 * (if density > 1. { 1.; } else { density; }));
+  imm wf = 0.15 * (if h < 8. { 2.5; } else { 0.75; });
+  imm u = c.unit() * (wp + wh + wf);
+  mut form = 0;
+  if u < wh { form = 3; }
+  elif u < wh + wf { form = 4; }
+  else {
+    imm w = c.unit();
+    if h < 5.5 { form = if w < 0.7 { 2; } else { 0; }; }
+    elif density > 0.5 and pd > 9. { form = if w < 0.55 { 1; } else { 0; }; }
+    elif density > 0.3 { form = if w < 0.25 and pd > 9. { 1; } elif w < 0.8 { 0; } else { 2; }; }
+    else { form = if w < 0.45 { 2; } else { 0; }; }
+  }
+  imm variant = formFirst(form) + c.below(formCount(form));
+  // the tall forest tree keeps close to its height (22 to 28 m); the others vary
+  imm scale = if form == 1 { 0.95 + 0.1 * c.unit(); } elif form == 2 { 0.9 + 0.22 * c.unit(); } else { 0.85 + 0.35 * c.unit(); };
+  imm squash = 0.88 + 0.27 * c.unit();
+  imm lean = radians(3.) * c.unit();
+  new Conifer(variant, scale, squash, lean, c.unit() * 6.28);
 }
 
 // Whether (x, z) is somewhere something may stand: on the island's land above the beach, inside
@@ -209,23 +284,54 @@ struct Cand {
 
 fn byDistance(a &Cand, b &Cand) i32 { if a.d < b.d { -1; } elif a.d > b.d { 1; } else { 0; }; }
 
-fn anchors(g &mut Ground, rng &mut VRng) {
+// The ring of white pines round the cottage's back and sides: where they stand, and the form of each
+// (0 young, 1 forest-grown, 2 open-grown or shore)
+pub imm RING_X Array[f32, 8] = [-36., -31., -24., -10., 4., 12., -34., 8.];
+pub imm RING_Z Array[f32, 8] = [323., 309., 305., 303., 306., 336., 340., 345.];
+pub imm RING_FORM Array[i32, 8] = [2, 0, 1, 1, 1, 0, 2, 0];
+
+// Which of the ring a tree at (x, z) is, or -1
+pub fn ringIndex(x f32, z f32) i32 {
+  mut i = 0usize;
+  while i < 8usize {
+    if libc.fabsf(x - RING_X[i]) < 0.01 and libc.fabsf(z - RING_Z[i]) < 0.01 { return i32.from(i); }
+    i = i + 1usize;
+  }
+  -1;
+}
+
+// The conifer of the ring about the cottage standing at 'ring' of its form (0 young, 1 forest-grown, 2
+// open-grown or shore): always a white pine, a deliberate planting
+fn ringConifer(c &mut VRng, form i32) Conifer {
+  imm variant = formFirst(form) + c.below(formCount(form));
+  imm scale = if form == 1 { 1.0; } else { 0.95 + 0.2 * c.unit(); };
+  imm squash = 0.92 + 0.16 * c.unit();
+  new Conifer(variant, scale, squash, radians(2.5) * c.unit(), c.unit() * 6.28);
+}
+
+fn anchors(g &mut Ground, rng &mut VRng, crng &mut VRng) {
   // two specimen maples: one right of the path in front of the cottage, one left of it
   g.add(K_SPECIMEN, 0u32, -4., 341., 0.4, 1., 0.7);
   g.add(K_SPECIMEN, 1u32, -31., 347., 2.1, 0.92, 0.7);
-  // pines round the back and sides: on the cottage's west, north and east
-  imm px Array[f32, 8] = [-36., -31., -24., -10., 4., 12., -34., 8.];
-  imm pz Array[f32, 8] = [323., 309., 305., 303., 306., 336., 340., 345.];
+  // white pines round the back and sides: on the cottage's west, north and east; the three on the
+  // north, behind it, the tall forest-grown form, a dark backdrop
+  imm px = RING_X;
+  imm pz = RING_Z;
+  imm form = RING_FORM;
   mut i = 0usize;
   while i < 8usize {
     if g.clear(px[i], pz[i], 1.2) {
-      g.add(K_PINE, rng.below(PINE_VARIANTS), px[i], pz[i], rng.unit() * 6.28, 1.05 + 0.25 * rng.unit(), 0.6);
+      // (the draws the ring made before the conifers had forms, kept so nothing laid out after moves)
+      rng.below(PINE_VARIANTS);
+      imm yaw = rng.unit() * 6.28;
+      rng.unit();
+      g.addConifer(ringConifer(crng, form[i]), px[i], pz[i], yaw, 0.6);
     }
     i = i + 1usize;
   }
 }
 
-fn forest(g &mut Ground, rng &mut VRng) {
+fn forest(g &mut Ground, rng &mut VRng, crng &mut VRng) {
   mut cands = List[Cand].empty();
   imm cell = 6.;
   mut z = 300.;
@@ -251,8 +357,14 @@ fn forest(g &mut Ground, rng &mut VRng) {
     imm spacing = 7. + 6. * (1. - c.density);
     if g.clear(c.x, c.z, spacing * 0.5) {
       imm pine = rng.unit() < 0.66;
-      if pine { g.add(K_PINE, rng.below(PINE_VARIANTS), c.x, c.z, rng.unit() * 6.28, 0.75 + 0.55 * rng.unit(), spacing * 0.5 - 0.4); }
-      else { g.add(K_MAPLE, rng.below(MAPLE_VARIANTS), c.x, c.z, rng.unit() * 6.28, 0.8 + 0.5 * rng.unit(), spacing * 0.5 - 0.4); }
+      if pine {
+        // (the draws the forest's pines made before the conifers had species and forms are kept, so
+        // nothing laid out after them moves)
+        rng.below(PINE_VARIANTS);
+        imm yaw = rng.unit() * 6.28;
+        rng.unit();
+        g.addConifer(pickConifer(crng, c.x, c.z, c.density, pathDistanceAt(c.x, c.z)), c.x, c.z, yaw, spacing * 0.5 - 0.4);
+      } else { g.add(K_MAPLE, rng.below(MAPLE_VARIANTS), c.x, c.z, rng.unit() * 6.28, 0.8 + 0.5 * rng.unit(), spacing * 0.5 - 0.4); }
       placed = placed + 1usize;
     }
     i = i + 1usize;
@@ -500,8 +612,9 @@ pub fn vegetationLayout() List[Item] {
   if !layoutDone {
     mut g = Ground.make();
     mut rng = vrng(1u32);
-    anchors(&mut g, &mut rng);
-    forest(&mut g, &mut rng);
+    mut crng = vrng(2u32);
+    anchors(&mut g, &mut rng, &mut crng);
+    forest(&mut g, &mut rng, &mut crng);
     rocks(&mut g, &mut rng);
     hostas(&mut g, &mut rng);
     flowers(&mut g, &mut rng);
