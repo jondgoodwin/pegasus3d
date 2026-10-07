@@ -10,7 +10,10 @@
 // holds world matrices, already composed. A material is drawn with render's
 // Blinn-Phong material, or, if it is physical, its physically based one, with
 // its paint, normal and ORM maps; that one is lit by the sun and by an
-// environment made to match the Blinn-Phong ambient (environmentSky).
+// environment made to match the Blinn-Phong ambient (environmentSky). Both
+// keep render's one lighting convention (look.cone): the sun's colour is
+// irradiance, the ambient light and the environment are radiance, so they
+// light both kinds alike.
 //
 // BATCHES. The parts shown are kept grouped by (mesh, material): one batch
 // per pair, its members the parts drawn with it, and the draw list is built
@@ -49,26 +52,18 @@ pub struct Batch {
   pub members List[PartId];
 }
 
-// The physically based shader takes the sun's colour as irradiance and
-// divides its diffuse light by pi; Blinn-Phong does not. A physical part's
-// colour is multiplied by pi so the sun lights both kinds alike (the
-// environment it is lit by besides is made to match Blinn-Phong's ambient:
-// environmentSky).
-const PHYSICAL_GAIN f32 = 3.14159265;
-
-// The environment the physically based material is lit by: a sky of even,
-// dim radiance, so its diffuse light (times PHYSICAL_GAIN) is about the
-// Blinn-Phong ambient the shell's sky gives (0.35, 0.38, 0.45), a little
-// bluer overhead and browner below; no sun in it (the directional light is
-// the sun), no glow, line or clouds. Never drawn: the sky seen is the clear
-// colour.
+// The environment the physically based material is lit by: a sky of even
+// radiance (nits), about the Blinn-Phong ambient the shell's sky gives
+// (10 000, 10 800, 12 800), a little bluer overhead and browner below; no sun
+// in it (the directional light is the sun), no glow, line or clouds. Never
+// drawn: the sky seen is the clear colour.
 pub fn environmentSky() render.Sky {
   mut s = render.Sky.dusk(0.9, 0.);
-  s.zenith = new Color(0.115, 0.125, 0.155, 1.);
-  s.horizon = new Color(0.12, 0.125, 0.14, 1.);
+  s.zenith = new Color(10300., 11200., 13900., 1.);
+  s.horizon = new Color(10800., 11200., 12600., 1.);
   s.horizonSharpness = 2.;
   s.glow = new Color(0., 0., 0., 1.);
-  s.ground = new Color(0.075, 0.05, 0.035, 1.);
+  s.ground = new Color(6700., 4500., 3100., 1.);
   s.groundFade = 4.;
   s;
 }
@@ -116,13 +111,15 @@ pub struct RenderSystem {
   pub drawn usize;            // parts in the last draw list
   pub painted usize;          // materials defined with a painted image
   pub now f64;                // the scene's time the effects were last drawn at
+  pipelines List[PipelineHandle];   // the browser's shaders' pipelines, by SHADER_ number, made when first asked for
+  pub shaded usize;           // materials defined drawn by a shader of the browser's own
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
     new RenderSystem(Table[MeshRow].empty(), Table[MaterialRow].empty(), Table[Renderable].empty(), List[Batch].empty(),
       Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
-      List[EmitterHandle].empty(), 0usize, 0usize, 0d);
+      List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize);
   }
 
   // Apply a DefineMesh: upload it
@@ -134,6 +131,10 @@ pub struct RenderSystem {
   // Apply a DefineMaterial: make its material, Blinn-Phong or physical
   pub fn defineMaterial(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look,
       paint &Image, maps &Maps) {
+    if surface.shader != SHADER_STANDARD {
+      self.defineShaded(renderer, device, id, surface, maps);
+      return;
+    }
     if surface.physical {
       self.definePhysical(renderer, device, id, surface, paint, maps);
       return;
@@ -142,6 +143,7 @@ pub struct RenderSystem {
     if surface.specular > 0. {
       material = Material.shiny(surface.color, surface.specular, surface.shininess);
     }
+    material.emissive = surface.glow;
     if !paint.isEmpty() {
       // The painted image, multiplying the colour (its bytes are sRGB)
       material.texture = renderer.addTexture(device, paint);
@@ -158,15 +160,39 @@ pub struct RenderSystem {
       MaterialHandle.none()));
   }
 
+  // A shaded look's material: drawn by the browser's shader it names
+  // (shaders.cone), whose pipeline is made the first time a material asks
+  // for it, given the look's parameters and its Field as an r32float
+  // texture. A shader not known falls back to a plain white material.
+  fn defineShaded(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look, maps &Maps) {
+    imm s = usize.from(surface.shader);
+    while pipelines.len() <= s { pipelines.push(PipelineHandle.none()); }
+    if pipelines[s].isNone() { pipelines.set(s, makeShaderPipeline(renderer, device, surface.shader)); }
+    imm pipeline = *pipelines[s];
+    mut mh = MaterialHandle.none();
+    if renderer.hasPipeline(pipeline) {
+      mut textures = List[TextureHandle].empty();
+      if !maps.field.isEmpty() {
+        textures.push(renderer.addFieldTexture(device, maps.field.width, maps.field.height, maps.field.values.view()));
+      }
+      mh = renderer.addCustomMaterial(device, pipeline, &surface.params, textures.view());
+    } else {
+      imm plain = Material.plain(new Color(1., 1., 1., 1.));
+      mh = renderer.addMaterial(device, &plain);
+    }
+    materials.put(id.id, new MaterialRow(mh, Material.plain(surface.color), false,
+      PbrMaterial.standard(surface.color, 0., 1.), MaterialHandle.none()));
+    shaded = shaded + 1usize;
+  }
+
   // A physical look's material: render's physically based one, its colour
-  // times PHYSICAL_GAIN, the paint its base colour map, the maps its normal
+  // the base colour, the paint its base colour map, the maps its normal
   // map and its ORM map (as roughness and metallic, and as occlusion of the
   // environment's light)
   fn definePhysical(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look,
       paint &Image, maps &Maps) {
     imm c = surface.color;
-    mut pbr = PbrMaterial.standard(new Color(c.red * PHYSICAL_GAIN, c.green * PHYSICAL_GAIN, c.blue * PHYSICAL_GAIN, 1.),
-      surface.metallic, surface.roughness);
+    mut pbr = PbrMaterial.standard(c, surface.metallic, surface.roughness).glowing(surface.glow, 1.);
     if !paint.isEmpty() {
       pbr.texture = renderer.addTexture(device, paint);
       painted = painted + 1usize;
@@ -343,11 +369,11 @@ pub struct RenderSystem {
   }
 
   // The sky drawn: the last applied, or a plain grey if no part is the sky
+  // (in physical units: a grey overcast, the light from straight up)
   pub fn currentSky(self &) SkyLook {
     imm n = skies.len();
     if n == 0usize {
-      return new SkyLook(new Color(0.2, 0.2, 0.2, 1.), new Vec3(0., 1., 0.), new Color(1., 1., 1., 1.),
-        new Color(0.2, 0.2, 0.2, 1.));
+      return new SkyLook(Color.gray(8000.), new Vec3(0., 1., 0.), Color.gray(20000.), Color.gray(8000.));
     }
     *skies.rows[n - 1usize];
   }
