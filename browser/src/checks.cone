@@ -708,6 +708,128 @@ fn checkIsland() bool {
   ok;
 }
 
+// What the lights sent, read from the scene's inbox: the last Glow of
+// material 'bulb' (its red channel; -1 if none) and the last Tint of part
+// 'glass' (its red; -1 if none)
+fn readLights(s &mut Scene, bulb MaterialId, glass PartId, glow &mut f32, tint &mut f32) {
+  mut batch = s.takeInbox();
+  imm rs = batch.viewMut();
+  mut i = 0usize;
+  while i < rs.len {
+    mut r Request = Request.Done[];
+    r <=> rs[i];
+    match &mut r {
+      case mut g &mut Glow { if g.material == bulb { *glow = g.glow.red; } }
+      case mut t &mut Tint { if t.id == glass { *tint = t.tint.red; } }
+      else {}
+    }
+    i = i + 1usize;
+  }
+}
+
+// One step of the lights' check: the clock on, timers rung, the mail read
+// into the lights (dusk, dawn, the lantern's area), and the lights ticked
+fn stepLights(s &mut Scene, lights &mut Lights, mats &GlowMaterials, being PartId, at Vec3) {
+  s.advanceClock(CHECK_STEP_NS);
+  s.ring();
+  s.sense(being, at);
+  mut mail = s.door.takeMail();
+  imm msgs = mail.viewMut();
+  mut i = 0usize;
+  while i < msgs.len {
+    mut m Message = Message.Read[];
+    m <=> msgs[i];
+    match &mut m {
+      case mut d &mut Dusk { lights.dusk(d.at); }
+      case mut d &mut Dawn { lights.dawn(d.at); }
+      case mut e &mut Entered { lights.near(e.area, true); }
+      case mut l &mut Left { lights.near(l.area, false); }
+      else {}
+    }
+    i = i + 1usize;
+  }
+  lights.tick(&mut s.door, s.now(), mats);
+}
+
+// The world's lights (bakedworld's lights.cone) on a scene of their own: a
+// lantern (an area, its glass, bulb and pool), a bulb's material; the clock
+// run at x10 from the morning through dusk, the night and dawn, the being
+// standing off and then coming near the lantern
+fn checkLights() bool {
+  print <- "The lights (lanterns on at dusk, off at dawn, brighter when near):\n";
+  mut s = Scene.empty();
+  imm bulb = s.door.defineMaterial(Look.plain(new Color(1., 1., 1., 1.)), Image.empty(), Maps.none());
+  imm stake = livePart(&mut s, "lantern stake");
+  imm glass = livePart(&mut s, "lantern glass");
+  imm bulbPart = livePart(&mut s, "lantern bulb");
+  imm pool = livePart(&mut s, "lantern pool");
+  imm you = livePart(&mut s, "you");
+  s.applyPlace(stake, new Transform3(new Vec3(20., 0., 0.), Quat.identity(), new Vec3(1., 1., 1.)));
+  s.applyArea(stake, Volume.sphere(new Vec3(0., 0.2, 0.), NEAR_RADIUS));
+  s.propagate();
+  s.toggleFast();
+  mut lights = Lights.make();
+  lights.arrive(s.now());
+  lights.addLantern(stake, glass, bulbPart, pool);
+  mut mats = GlowMaterials.none();
+  mats.bulb = bulb;
+  imm away = new Vec3(0., 0., 0.);
+  imm near = new Vec3(21.5, 0., 0.);
+  mut glow = -1.;
+  mut tint = -1.;
+  s.takeInbox();
+  // The morning, standing near it: off, and not brightened
+  stepLights(&mut s, &mut lights, &mats, you, near);
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  mut ok = expect("at 07:00 the bulb's glow sent is black", glow == 0. and !lights.on);
+  mut k = 0;
+  while k < 30 { stepLights(&mut s, &mut lights, &mats, you, near); k = k + 1; }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  ok = expect("near it by day: not brightened (no Tint sent)", tint < 0.) and ok;
+  // On to just before dusk (750 s), standing away
+  while s.now() < 749d { stepLights(&mut s, &mut lights, &mats, you, away); }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  ok = expect("just before dusk: still off", glow == 0. and !lights.on) and ok;
+  // Dusk, and half the fade
+  while s.now() < 750d + FADE_SECONDS * 0.5d { stepLights(&mut s, &mut lights, &mats, you, away); }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  imm halfLevel = lights.level;
+  print <- "  half way through the fade: level "; print <- halfLevel; print <- ", the bulb "; print <- glow; print <- " nits\n";
+  ok = expect("dusk switched it on, fading: about half way at half the fade", lights.on and halfLevel > 0.4
+    and halfLevel < 0.6) and ok;
+  while s.now() < 750d + FADE_SECONDS + 1d { stepLights(&mut s, &mut lights, &mats, you, away); }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  imm want = nitsAt(hourAt(s.now()));
+  print <- "  the fade done at "; print <- hourAt(s.now()); print <- " h: the bulb "; print <- glow; print <- " nits (want ";
+  print <- want; print <- ")\n";
+  ok = expect("faded fully on, at the hour's brightness", lights.level == 1. and glow > want * 0.98
+    and glow < want * 1.02) and ok;
+  // Coming near it at night: brightened over NEAR_SECONDS, then dimmed again on leaving
+  imm t0 = s.now();
+  while s.now() < t0 + f64.from(NEAR_SECONDS) * 0.5d { stepLights(&mut s, &mut lights, &mats, you, near); }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  imm halfway = tint;
+  while s.now() < t0 + f64.from(NEAR_SECONDS) + 0.5d { stepLights(&mut s, &mut lights, &mats, you, near); }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  print <- "  near it: the glass tinted "; print <- halfway; print <- " half way, "; print <- tint; print <- " after\n";
+  // (its second coming: it stood near by day too, unbrightened)
+  ok = expect("coming near at night brightens its glass to the full gain", lights.comings == 2u64
+    and halfway > 1.05 and halfway < NEAR_GAIN - 0.05 and tint == NEAR_GAIN) and ok;
+  imm t1 = s.now();
+  while s.now() < t1 + f64.from(NEAR_SECONDS) + 0.5d { stepLights(&mut s, &mut lights, &mats, you, away); }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  ok = expect("going away dims it back to 1", tint == 1.) and ok;
+  // On to dawn (1290 s) and through its fade
+  while s.now() < 1290d + FADE_SECONDS + 1d { stepLights(&mut s, &mut lights, &mats, you, away); }
+  readLights(&mut s, bulb, glass, &mut glow, &mut tint);
+  ok = expect("dawn switched it off: black once faded", !lights.on and lights.level == 0. and glow == 0.) and ok;
+  // A world arriving at night finds them on, unfaded
+  mut late = Lights.make();
+  late.arrive(900d);
+  ok = expect("a world arriving at 22:00 finds them on", late.on and late.levelAt(900d) == 1.) and ok;
+  ok;
+}
+
 // Every check run: 0 if all passed, else 1
 pub fn runChecks() i32 {
   mut ok = checkTree();
@@ -716,6 +838,7 @@ pub fn runChecks() i32 {
   ok = checkPossession() and ok;
   ok = checkMannequin() and ok;
   ok = checkSky() and ok;
+  ok = checkLights() and ok;
   // The island's last: baking it puts a hill at the origin, where the checks above stand on flat ground
   ok = checkIsland() and ok;
   if ok { print <- "Checks: OK\n"; 0i32; } else { print <- "Checks: FAILED\n"; 1i32; };

@@ -99,13 +99,20 @@ pub const COTTAGE_STEPS = 13usize;
 pub const COTTAGE_CHIMNEY = 14usize;    // the shaft; the stack 15, the flaunching 16, the pot 17
 pub const COTTAGE_STACK = 15usize;
 pub const COTTAGE_LANTERNS = 18usize;   // two wall lanterns, four parts each (bracket, glass, bulb, cap)
-pub const COTTAGE_PARTS = 26usize;
-pub const LANTERN_PARTS = 12usize;      // three path lanterns, four parts each (stake, glass, bulb, cap)
+pub const COTTAGE_ROOMS = 26usize;      // the rooms behind the windows; then the pools of light: the wall
+                                        // lanterns', the windows' on the deck, the wing windows' on the ground
+pub const COTTAGE_PARTS = 30usize;
+pub const LANTERN_POOLS = 12usize;      // after three path lanterns of four parts each (stake, glass, bulb, cap), their pools
+pub const LANTERN_PARTS = 15usize;
 
 // The materials the world shares between the cottage and the lanterns
 pub const SHARED_LANTERN_METAL = 2u32;
 pub const SHARED_LANTERN_GLASS = 3u32;
 pub const SHARED_LANTERN_BULB = 4u32;
+// And the materials the world's lights glow (lights.cone)
+pub const SHARED_WINDOW_ROOM = 5u32;
+pub const SHARED_LANTERN_POOL = 6u32;
+pub const SHARED_WINDOW_POOL = 7u32;
 
 // ---- Geometry helpers ----
 
@@ -580,12 +587,88 @@ fn ctBracket() mesh.Mesh {
   m;
 }
 
-// The three materials of every lantern, shared across the world: dark metal, pale glass, a warm bulb
+// The three materials of every lantern, shared across the world: dark metal,
+// frosted glass (see-through: over half of the bulb behind it shows, and it
+// glows itself once lit), a warm bulb. The world's lights (lights.cone)
+// switch the glass's and the bulb's glow.
 fn ctLanternMaterials(h &mut Hydrated) Array[usize, 3] {
   imm metal = h.addMaterial(Look.shiny(srgb(34., 36., 38.), 0.6, 40.), Image.empty(), Maps.none(), SHARED_LANTERN_METAL);
-  imm glass = h.addMaterial(Look.shiny(srgb(206., 220., 214.), 0.5, 60.), Image.empty(), Maps.none(), SHARED_LANTERN_GLASS);
+  imm frosted = Look.shiny(srgb(232., 226., 212.), 0.45, 30.).translucent(0.45);
+  imm glass = h.addMaterial(frosted, Image.empty(), Maps.none(), SHARED_LANTERN_GLASS);
   imm bulb = h.addMaterial(Look.plain(srgb(255., 214., 122.)), Image.empty(), Maps.none(), SHARED_LANTERN_BULB);
   [metal, glass, bulb];
+}
+
+// ---- Glass, rooms and pools of light (lights.cone glows them) ----
+
+// The window glass: physically based, so it reflects the sky at a glancing
+// angle, and see-through, a faint grey-green tint over the room behind it
+fn ctWindowGlass(h &mut Hydrated) usize {
+  imm look = Look.physicallyBased(srgb(214., 226., 220.), 0.06, 0.).translucent(0.1);
+  h.addMaterial(look, Image.empty(), Maps.none(), 0u32);
+}
+
+// The rooms seen through the windows (SHADER_INTERIOR): a warm beige by day,
+// lit by a quarter of the ambient light; their glow (the first three
+// params) set by the world's lights
+fn ctRoomMaterial(h &mut Hydrated) usize {
+  imm c = srgb(150., 120., 92.);
+  imm look = Look.shaded(SHADER_INTERIOR, [0., 0., 0., 0., c.red, c.green, c.blue, 0.25]);
+  h.addMaterial(look, Image.empty(), Maps.none(), SHARED_WINDOW_ROOM);
+}
+
+// A pool of light's material (SHADER_LIGHT_POOL), shared under 'key', its
+// core's sharpness 'sharp'; dark until the world's lights glow it
+fn ctPoolMaterial(h &mut Hydrated, key u32, sharp f32) usize {
+  imm look = Look.shaded(SHADER_LIGHT_POOL, [0., 0., 0., sharp, 0., 0., 0., 0.]);
+  h.addMaterial(look, Image.empty(), Maps.none(), key);
+}
+
+// A room behind each pane of 'pane' (every pane a quad of two flat
+// triangles, six corners: a, b, c, a, c, d, from its lower left a to its
+// upper right c), 9 mm behind it, its uvs 0 to 1 across the window
+fn ctRooms(pane &mesh.Mesh) mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  mut q = 0usize;
+  while q + 5usize < pane.positions.len() {
+    imm a = *pane.positions[q];
+    imm c = *pane.positions[q + 2usize];
+    imm z = a.z - 0.009;
+    imm base = u32.from(m.positions.len());
+    m.positions.push(v(a.x, a.y, z)); m.positions.push(v(c.x, a.y, z));
+    m.positions.push(v(c.x, c.y, z)); m.positions.push(v(a.x, c.y, z));
+    mut k = 0;
+    while k < 4 { m.normals.push(v(0., 0., 1.)); k = k + 1; }
+    m.uvs.push(p2(0., 0.)); m.uvs.push(p2(1., 0.)); m.uvs.push(p2(1., 1.)); m.uvs.push(p2(0., 1.));
+    m.indices.push(base); m.indices.push(base + 1u32); m.indices.push(base + 2u32);
+    m.indices.push(base); m.indices.push(base + 2u32); m.indices.push(base + 3u32);
+    q = q + 6usize;
+  }
+  m;
+}
+
+// The pools on the porch's deck (flat, 12 mm over it, under 'porch'): one
+// under each wall lantern ('lampPool'), and the light the two bays and the
+// door's glazing throw on the deck ('roomPool'). Each reaches back behind
+// the wall, where the wall hides it, so its brightest is at the wall.
+fn ctPorchPools(h &mut Hydrated, porch usize, lampPool usize, roomPool usize) {
+  imm o = v(0., 0. - CT_FLOOR, 0.);
+  mut lamps = poolMesh(&flatGround, o, -0.7, 0.55, 0.8, 0.95, 8, 0.012);
+  lamps.append(&poolMesh(&flatGround, o, 0.85, 0.55, 0.8, 0.95, 8, 0.012));
+  ctPart(h, "wall lantern pools", lamps, lampPool, porch);
+  mut rooms = poolMesh(&flatGround, o, -1.46, 0.45, 0.6, 1.05, 8, 0.014);
+  rooms.append(&poolMesh(&flatGround, o, 1.46, 0.45, 0.62, 1.05, 8, 0.014));
+  rooms.append(&poolMesh(&flatGround, o, 0., 0.45, 0.5, 1.05, 8, 0.014));
+  ctPart(h, "window pools on the deck", rooms, roomPool, porch);
+}
+
+// The light the wing's windows throw on the ground in front of them (the
+// cottage at 'at', not turned or scaled: the ground's height there read
+// from the world's)
+fn ctWingPool(h &mut Hydrated, root usize, at Transform3, roomPool usize) {
+  mut m = poolMesh(&groundHeight, at.translation, -3.3, 0.5, 0.95, 1.2, 12, 0.03);
+  m.append(&poolMesh(&groundHeight, at.translation, -4.67, 0.45, 0.35, 1.0, 6, 0.03));
+  ctPart(h, "window pools on the ground", m, roomPool, root);
 }
 
 // ---- Materials: one per surface kind ----
@@ -733,9 +816,13 @@ fn hydrateCottage(h &mut Hydrated, at Transform3) {
   frame.append(&doorFrame);
   ctPart(h, "trim", trim, mats.trim, root);
   ctPart(h, "window frames", frame, mats.frame, root);
-  ctPart(h, "window panes", pane, mats.pane, root);
+  // The glass is see-through, and a lit room stands behind every pane
+  imm glass = ctWindowGlass(h);
+  mut rooms = ctRooms(&pane);
+  rooms.append(&ctRooms(&doorPane));
+  ctPart(h, "window panes", pane, glass, root);
   ctPart(h, "door", leaf, mats.door, root);
-  ctPart(h, "door panes", doorPane, mats.pane, root);
+  ctPart(h, "door panes", doorPane, glass, root);
   // The porch: the deck, and under it the skirt, the posts, the roof, the steps
   imm porch = ctPart(h, "porch", ctDeck(), mats.deck, root);
   ctPart(h, "porch skirt", ctSkirt(), mats.door, porch);
@@ -748,12 +835,18 @@ fn hydrateCottage(h &mut Hydrated, at Transform3) {
   imm lm = ctLanternMaterials(h);
   imm s = 0.7;
   imm bracket = h.addMesh(ctBracket());
-  imm glass = h.addMesh(ctLanternGlass(s));
+  imm lanternGlass = h.addMesh(ctLanternGlass(s));
   imm bulb = h.addMesh(ctLanternBulb(s));
   imm cap = h.addMesh(ctLanternCap(s));
   imm inside = ctAt(0., 0. - 0.49 * s - 0.02, 0.17);
-  ctLanternParts(h, "wall lantern", bracket, glass, bulb, cap, lm, porch, ctAt(-0.7, 2.4, 0.), inside);
-  ctLanternParts(h, "wall lantern", bracket, glass, bulb, cap, lm, porch, ctAt(0.85, 2.4, 0.), inside);
+  ctLanternParts(h, "wall lantern", bracket, lanternGlass, bulb, cap, lm, porch, ctAt(-0.7, 2.4, 0.), inside);
+  ctLanternParts(h, "wall lantern", bracket, lanternGlass, bulb, cap, lm, porch, ctAt(0.85, 2.4, 0.), inside);
+  // After the COTTAGE_PARTS above: the rooms behind the glass, and the pools
+  // of light on the deck and the ground (lights.cone glows them)
+  ctPart(h, "window rooms", rooms, ctRoomMaterial(h), root);
+  imm roomPool = ctPoolMaterial(h, SHARED_WINDOW_POOL, 1.5);
+  ctPorchPools(h, porch, ctPoolMaterial(h, SHARED_LANTERN_POOL, 3.), roomPool);
+  ctWingPool(h, root, at, roomPool);
 }
 
 // How far back along the path from its end at the steps each path lantern
@@ -770,6 +863,7 @@ fn hydrateLanterns(h &mut Hydrated, at Transform3) {
   imm bulb = h.addMesh(ctLanternBulb(1.));
   imm cap = h.addMesh(ctLanternCap(1.));
   imm line = pathCentreline();
+  mut feet = List[Transform3].empty();
   mut i = 0usize;
   while i < 3usize {
     imm k = line.len() - 2usize - usize.from(LANTERN_BACK[i]);
@@ -784,6 +878,20 @@ fn hydrateLanterns(h &mut Hydrated, at Transform3) {
     imm z = c.z + tx / tl * side;
     imm p = new Transform3(v(x, groundHeight(x, z), z), Quat.identity(), v(1., 1., 1.));
     ctLanternParts(h, "path lantern", stake, glass, bulb, cap, lm, TOP, p, Transform3.identity());
+    feet.push(p);
+    i = i + 1usize;
+  }
+  // After the LANTERN_PARTS: a pool of light on the ground under each,
+  // following the ground's rise and fall (PATH_POOL_RADIUS round its foot)
+  imm pool = ctPoolMaterial(h, SHARED_LANTERN_POOL, 3.);
+  i = 0usize;
+  while i < 3usize {
+    imm p = *feet[i];
+    imm r = PATH_POOL_RADIUS;
+    h.part("path lantern pool", h.addMesh(poolMesh(&groundHeight, p.translation, 0., 0., r, r, 16, 0.03)), pool, TOP, p);
     i = i + 1usize;
   }
 }
+
+// How far a path lantern's pool of light reaches from its foot (metres)
+pub const PATH_POOL_RADIUS f32 = 1.3;
