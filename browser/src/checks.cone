@@ -443,6 +443,203 @@ fn checkMannequin() bool {
   ok;
 }
 
+// ---- The island ----
+
+// The next pseudo-random number in [0, 1) from 'seed' (a linear congruence)
+fn nextUnit(seed &mut u32) f32 {
+  *seed = *seed * 1664525u32 + 1013904223u32;
+  f32.from(*seed >> 8u32) / 16777216.;
+}
+
+// The height query against the triangles the GPU draws: for points over the
+// fine mesh, the triangle that contains the point by the mesh's own index
+// buffer, its three corners lifted by the heights the shader reads (the
+// grid's), and the plane through them at the point, against groundHeight; and
+// how far plain bilinear interpolation would have been from that plane
+fn checkHeightQuery() bool {
+  print <- "The island's height query against the drawn triangles:\n";
+  imm m = fineMesh();
+  imm grid = heightGrid();
+  imm cols = FINE_I1 - FINE_I0 + 1;
+  mut worst f32 = 0.;
+  mut bilinearWorst f32 = 0.;
+  mut missed = 0;
+  mut seed = 20261007u32;
+  mut n = 0;
+  while n < 4000 {
+    imm x = -400. + 3. + nextUnit(&mut seed) * 794.;
+    imm z = -64. + 3. + nextUnit(&mut seed) * 762.;
+    imm gx = (x + HALF) / CELL;
+    imm gz = (z + HALF) / CELL;
+    imm i = i32.from(libc.floorf(gx));
+    imm j = i32.from(libc.floorf(gz));
+    imm base = usize.from(((j - FINE_J0) * (cols - 1) + (i - FINE_I0)) * 6);
+    mut found = false;
+    mut plane f32 = 0.;
+    mut t = 0usize;
+    while t < 2usize and !found {
+      imm ia = *m.indices[base + t * 3usize];
+      imm ib = *m.indices[base + t * 3usize + 1usize];
+      imm ic = *m.indices[base + t * 3usize + 2usize];
+      imm pa = *m.positions[usize.from(ia)];
+      imm pb = *m.positions[usize.from(ib)];
+      imm pc = *m.positions[usize.from(ic)];
+      imm ha = *grid[usize.from((FINE_J0 + i32.from(ia) / cols) * N + FINE_I0 + i32.from(ia) % cols)];
+      imm hb = *grid[usize.from((FINE_J0 + i32.from(ib) / cols) * N + FINE_I0 + i32.from(ib) % cols)];
+      imm hc = *grid[usize.from((FINE_J0 + i32.from(ic) / cols) * N + FINE_I0 + i32.from(ic) % cols)];
+      // Barycentric coordinates of (x, z) in the triangle, in the plane
+      imm d = (pb.z - pc.z) * (pa.x - pc.x) + (pc.x - pb.x) * (pa.z - pc.z);
+      imm u = ((pb.z - pc.z) * (x - pc.x) + (pc.x - pb.x) * (z - pc.z)) / d;
+      imm v = ((pc.z - pa.z) * (x - pc.x) + (pa.x - pc.x) * (z - pc.z)) / d;
+      imm w = 1. - u - v;
+      if u >= -0.0001 and v >= -0.0001 and w >= -0.0001 {
+        found = true;
+        plane = u * ha + v * hb + w * hc;
+      }
+      t = t + 1usize;
+    }
+    if !found { missed = missed + 1; }
+    else {
+      imm q = groundHeight(x, z);
+      imm err = if q > plane { q - plane; } else { plane - q; };
+      if err > worst { worst = err; }
+      // Plain bilinear on the quad's corners
+      imm fx = gx - f32.from(i);
+      imm fz = gz - f32.from(j);
+      imm h00 = *grid[usize.from(j * N + i)];
+      imm h10 = *grid[usize.from(j * N + i + 1)];
+      imm h01 = *grid[usize.from((j + 1) * N + i)];
+      imm h11 = *grid[usize.from((j + 1) * N + i + 1)];
+      imm bil = (h00 * (1. - fx) + h10 * fx) * (1. - fz) + (h01 * (1. - fx) + h11 * fx) * fz;
+      imm be = if bil > plane { bil - plane; } else { plane - bil; };
+      if be > bilinearWorst { bilinearWorst = be; }
+    }
+    n = n + 1;
+  }
+  print <- "  4000 points: every one inside a triangle of the index buffer ("; print <- missed; print <- " missed); the largest gap between\n";
+  print <- "  groundHeight and the drawn triangle's plane "; print <- worst; print <- " m (plain bilinear would be "; print <- bilinearWorst; print <- " m off)\n";
+  expect("groundHeight is the drawn triangles' height within 1 mm, at every point", missed == 0 and worst < 0.001);
+}
+
+// A plain walker run at the fence: it never leaves it, slides along its edge
+// and does not wade past knee deep
+fn checkFence() bool {
+  print <- "The island's fence:\n";
+  mut ok = true;
+  // East from the lawn at run speed for 600 m: stops at the fence
+  mut w = Walk.make(new Vec3(0., groundHeight(0., 300.), 300.), -1.5707964);
+  mut escaped = false;
+  mut jump f32 = 0.;
+  mut s = 0;
+  while s < 3000 {
+    imm was = w.position;
+    w.step(1., 0., true, 1. / 60.);
+    if !insideIslandFence(w.position.x, w.position.z) { escaped = true; }
+    imm d = len2d(w.position.x - was.x, w.position.z - was.z);
+    if d > jump { jump = d; }
+    s = s + 1;
+  }
+  ok = expect("walking east 600 m at 12 m/s, never outside the fence", !escaped) and ok;
+  ok = expect("it stopped at the fence's east edge (x between 150 and 220)", w.position.x > 150. and w.position.x < 220.) and ok;
+  ok = expect("no step longer than 0.2 m (12 m/s in 1/60 s): nothing jumped", jump < 0.2001) and ok;
+  ok = expect("the feet on the ground the height query gives", nearly(w.position.y, groundHeight(w.position.x, w.position.z), 0.0001)) and ok;
+  // Against the slanted east edge, pushing east: it slides along it
+  mut v = Walk.make(new Vec3(150., groundHeight(150., 350.), 350.), -1.5707964);
+  imm z0 = v.position.z;
+  s = 0;
+  while s < 1500 { v.step(1., 0., true, 1. / 60.); s = s + 1; }
+  ok = expect("pushing east on the slanted east edge, it slides along it (south, at least 3 m)",
+    v.position.z > z0 + 3. and insideIslandFence(v.position.x, v.position.z)) and ok;
+  // South from the path's foot into the sea: stops at the water's edge
+  mut u = Walk.make(new Vec3(-22., groundHeight(-22., 480.), 480.), 3.1415927);
+  s = 0;
+  while s < 1200 { u.step(1., 0., true, 1. / 60.); s = s + 1; }
+  imm depth = groundHeight(u.position.x, u.position.z);
+  print <- "  walking south into the sea, it stopped with the ground at "; print <- depth; print <- " m\n";
+  ok = expect("it stopped at the water's edge (the ground between -0.6 and +0.3 m)", depth >= -0.6 and depth < 0.3) and ok;
+  // The deepest ground inside the fence, and the wading limit there: a step into
+  // water deeper than 0.6 m is refused
+  mut low f32 = 100.;
+  mut lowX f32 = 0.;
+  mut lowZ f32 = 0.;
+  mut gz = 285.;
+  while gz < 560. {
+    mut gx = -215.;
+    while gx < 205. {
+      if insideIslandFence(gx, gz) {
+        imm hgt = groundHeight(gx, gz);
+        if hgt < low { low = hgt; lowX = gx; lowZ = gz; }
+      }
+      gx = gx + 2.;
+    }
+    gz = gz + 2.;
+  }
+  print <- "  the lowest ground inside the fence: "; print <- low; print <- " m at ("; print <- lowX; print <- ", "; print <- lowZ; print <- ")\n";
+  // From a dry point beside the lowest, a step onto it
+  imm from = new Vec3(lowX, 1., lowZ - 3.);
+  imm to = islandConstrain(from, new Vec3(lowX, 1., lowZ));
+  if low < -0.6 {
+    ok = expect("a step into water deeper than 0.6 m is held at the shallows", groundHeight(to.x, to.z) >= -0.6 or (to.x == from.x and to.z == from.z)) and ok;
+  } else {
+    ok = expect("no ground inside the fence is deeper than the wading limit (0.6 m)", low >= -0.6) and ok;
+  }
+  ok;
+}
+
+fn len2d(x f32, z f32) f32 { (x * x + z * z).sqrt(); }
+
+// The path's centreline: on the ground, never steeper than 12 degrees, from
+// the landing beach to the cottage's steps, inside the fence
+fn checkPath() bool {
+  print <- "The island's path:\n";  imm line = pathCentreline();
+  mut ok = expect("it has a point about every metre (150 to 250 of them)", line.len() > 150usize and line.len() < 250usize);
+  mut onGround = true;
+  mut inside = true;
+  mut steepest f32 = 0.;
+  mut k = 0usize;
+  while k < line.len() {
+    imm p = *line[k];
+    if !nearly(p.y, groundHeight(p.x, p.z), 0.0001) { onGround = false; }
+    if !insideIslandFence(p.x, p.z) { inside = false; }
+    if k > 0usize {
+      imm q = *line[k - 1usize];
+      imm run = len2d(p.x - q.x, p.z - q.z);
+      imm slope = (if p.y > q.y { p.y - q.y; } else { q.y - p.y; }) / run;
+      if slope > steepest { steepest = slope; }
+    }
+    k = k + 1usize;
+  }
+  ok = expect("every point on the ground", onGround) and ok;
+  ok = expect("every point inside the fence", inside) and ok;
+  mut lowY f32 = 1000.;
+  mut highY f32 = -1000.;
+  k = 0usize;
+  while k < line.len() {
+    if line[k].y < lowY { lowY = line[k].y; }
+    if line[k].y > highY { highY = line[k].y; }
+    k = k + 1usize;
+  }
+  print <- "  its height runs from "; print <- lowY; print <- " to "; print <- highY; print <- " m, "; print <- line.len();
+  print <- " points\n";
+  print <- "  its steepest metre: "; print <- steepest; print <- " (12 degrees is 0.2126)\n";
+  ok = expect("never steeper than 12 degrees", steepest < 0.2126) and ok;
+  imm first = *line[0usize];
+  imm last = *line[line.len() - 1usize];
+  ok = expect("it begins on the landing beach, a few metres from where you start",
+    len2d(first.x - BEACH_X, first.z - BEACH_Z) < 3.) and ok;
+  ok = expect("and ends at the cottage's steps (3.6 m in front of its door)",
+    nearly(last.x, COT_X, 1.) and nearly(last.z, COT_Z + 3.6, 0.5)) and ok;
+  ok;
+}
+
+fn checkIsland() bool {
+  bakeIsland();
+  mut ok = checkHeightQuery();
+  ok = checkFence() and ok;
+  ok = checkPath() and ok;
+  ok;
+}
+
 // Every check run: 0 if all passed, else 1
 pub fn runChecks() i32 {
   mut ok = checkTree();
@@ -450,5 +647,7 @@ pub fn runChecks() i32 {
   ok = checkAreas() and ok;
   ok = checkPossession() and ok;
   ok = checkMannequin() and ok;
+  // The island's last: baking it puts a hill at the origin, where the checks above stand on flat ground
+  ok = checkIsland() and ok;
   if ok { print <- "Checks: OK\n"; 0i32; } else { print <- "Checks: FAILED\n"; 1i32; };
 }
