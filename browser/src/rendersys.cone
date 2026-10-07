@@ -15,6 +15,12 @@
 // irradiance, the ambient light and the environment are radiance, so they
 // light both kinds alike.
 //
+// SKINNED PARTS. A part shown as a skinned mesh (DefineSkinnedMesh: render's
+// addSkinnedMesh) is drawn posed by its last Bones: its skinning matrices,
+// kept side by side in one list ('poseBones', a row a part saying where its
+// run is), handed to render's DrawList with the part's world matrix; render
+// blends them on the GPU. Before its first Bones it is drawn as modelled.
+//
 // BATCHES. The parts shown are kept grouped by (mesh, material): one batch
 // per pair, its members the parts drawn with it, and the draw list is built
 // batch by batch. Today each member is still one draw; instancing (one draw
@@ -43,6 +49,12 @@ pub struct Renderable {
   pub highlighted bool;
   pub batch u32;              // its batch
   pub member u32;             // and its place among the batch's members
+}
+
+// Where a skinned part's skinning matrices are in 'poseBones'
+pub struct PoseRow {
+  pub first u32;
+  pub count u32;
 }
 
 // The parts drawn with one mesh and one material
@@ -113,19 +125,49 @@ pub struct RenderSystem {
   pub now f64;                // the scene's time the effects were last drawn at
   pipelines List[PipelineHandle];   // the browser's shaders' pipelines, by SHADER_ number, made when first asked for
   pub shaded usize;           // materials defined drawn by a shader of the browser's own
+  pub poses Table[PoseRow];   // keyed by a skinned part's id: where its skinning matrices are
+  pub poseBones List[Mat4];   // every skinned part's skinning matrices, a run a part
+  pub skinned usize;          // skinned parts in the last draw list
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
     new RenderSystem(Table[MeshRow].empty(), Table[MaterialRow].empty(), Table[Renderable].empty(), List[Batch].empty(),
       Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
-      List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize);
+      List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
+      List[Mat4].empty(), 0usize);
   }
 
   // Apply a DefineMesh: upload it
   pub fn defineMesh(self &mut, renderer &mut Renderer, device &mut Device, id MeshId, m &Mesh) {
     imm handle = renderer.addMesh(device, m);
     meshes.put(id.id, new MeshRow(handle));
+  }
+
+  // Apply a DefineSkinnedMesh: upload it with its skin
+  pub fn defineSkinnedMesh(self &mut, renderer &mut Renderer, device &mut Device, id MeshId, m &Mesh, skin &Skin) {
+    imm handle = renderer.addSkinnedMesh(device, m, skin);
+    meshes.put(id.id, new MeshRow(handle));
+  }
+
+  // Apply a Bones: part 'id' posed by 'bones' from now on (its run in
+  // 'poseBones' written over in place when it has as many as before)
+  pub fn pose(self &mut, id PartId, bones &List[Mat4]) {
+    imm n = u32.from(bones.len());
+    imm row = poses.find(id);
+    mut first = u32.from(poseBones.len());
+    if row != NO_ROW and poses.rows[row].count == n {
+      first = poses.rows[row].first;
+    } else {
+      mut k = 0usize;
+      while k < bones.len() { poseBones.push(*bones[k]); k = k + 1usize; }
+    }
+    mut k = 0usize;
+    while k < bones.len() {
+      poseBones.set(usize.from(first) + k, *bones[k]);
+      k = k + 1usize;
+    }
+    poses.put(id, new PoseRow(first, n));
   }
 
   // Apply a DefineMaterial: make its material, Blinn-Phong or physical
@@ -366,6 +408,7 @@ pub struct RenderSystem {
       self.leaveBatch(id);
       rows.remove(id);
     }
+    poses.remove(id);
     imm e = effects.find(id);
     if e != NO_ROW {
       self.still(device, *effects.rows[e]);
@@ -389,6 +432,8 @@ pub struct RenderSystem {
   pub fn build(self &mut, snap &Snapshot, eye Vec3) {
     list.clear();
     mut drawnNow = 0usize;
+    mut skinnedNow = 0usize;
+    imm allBones = poseBones.view();
     mut b = 0usize;
     while b < batches.len() {
       imm batch = batches[b];
@@ -405,7 +450,16 @@ pub struct RenderSystem {
             imm sz = libc.floorf(eye.z / r.anchor) * r.anchor;
             model = Mat4.fromTranslation(new Vec3(sx, 0., sz)) * model;
           }
-          list.add(meshH, if r.highlighted { mat.lit; } else { mat.handle; }, model);
+          imm material = if r.highlighted { mat.lit; } else { mat.handle; };
+          imm posed = poses.find(id);
+          if posed != NO_ROW {
+            imm pr = *poses.rows[posed];
+            imm from = usize.from(pr.first);
+            list.addSkinned(meshH, material, model, &allBones[from..from + usize.from(pr.count)]);
+            skinnedNow = skinnedNow + 1usize;
+          } else {
+            list.add(meshH, material, model);
+          }
           drawnNow = drawnNow + 1usize;
           k = k + 1usize;
         }
@@ -413,6 +467,7 @@ pub struct RenderSystem {
       b = b + 1usize;
     }
     drawn = drawnNow;
+    skinned = skinnedNow;
   }
 
   // Each effect's emitters fired where its part is now, as they are at the
