@@ -5,7 +5,7 @@ Acorn-era Pegasus3D in `src/`. It is the shell and the walkable ground (an islan
 height, 1.7 m) and a baked-in world standing on it, assembled as one scene: you land on the beach and
 a path (about 200 m, snaking through a forest of red maples and white pines, rocks, edging stones, hostas,
 ferns and flowers, below) leads to a forest cottage (board and batten, a brick chimney up its right
-eave wall) with three pathway lanterns along its last stretch and a black-figure amphora beside it
+eave wall) with twelve pathway lanterns in six pairs facing across its last 16 m and a black-figure amphora beside it
 with the horn-flower; on its porch a lathed chess rook and two clay pots of flowers stand by the door; a ball
 lies on the lawn where it was left; and behind the cottage, in the backyard, a hot-air balloon with its
 burner alight waits by a launch button, reached round the cottage's east end. Things move: the burner
@@ -408,7 +408,7 @@ world actor's turn at the publish phase, so frames keep coming while the world a
 | hostas and ferns (118, two each) | `leafrosette` | 0.5 to 1 m | 60,048 | 0.5 |
 | flowers (16 clumps, six variants) | `leafrosette` | 0.4 m | 7,040 | 0.2 |
 | cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
-| path lanterns (three: stake, glass, bulb, cap each) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 2,892 | 0.24 |
+| path lanterns (twelve, six pairs 2.8 m apart, 3 m across: stake, glass, bulb, cap each, and a pool of light) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 17,712 with the pools | 0.24 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |
