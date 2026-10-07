@@ -1,8 +1,8 @@
 # browser: Pegasus3D in Cone
 
 A native 3-D browser written in [Cone](https://github.com/jondgoodwin/cone), in the spirit of the
-Acorn-era Pegasus3D in `src/`. It is the shell and the walkable plane (an endless brown ground under a
-sky-blue sky, in metres, walked on at eye height, 1.7 m) and a baked-in world standing on it: two chess
+Acorn-era Pegasus3D in `src/`. It is the shell and the walkable ground (an island in the sea, below; in metres, walked on at eye
+height, 1.7 m) and a baked-in world standing on it: two chess
 rooks, a horn-flower, a horn, a forest cottage (board and batten, a brick chimney up its right eave wall)
 with three pathway lanterns along its path, a black-figure amphora and a boulder in front of it, a
 hot-air balloon with its burner alight and,
@@ -39,7 +39,7 @@ first run after a driver's shader cache is cleared makes the kernels in about 4 
 ## The mannequin
 
 You start as an artist's wooden mannequin, 1.75 m tall, seen from behind and above (V for its eyes),
-8 m back from the origin, facing -z; a second, 1.62 m and clay red, stands idle (breathing, shifting its
+on the landing beach, facing -z up the path; a second, 1.62 m and clay red, stands idle (breathing, shifting its
 weight) a few metres off, turned towards you. Each is a 19-bone skeleton (Cone's `bonepose` package)
 under one smooth body (`src/mannequin.cone`): the trunk, neck and head one tube of elliptical rings, each
 leg and arm one tube through its knee or elbow, flat-soled feet and mitten hands, lofted along the bones
@@ -50,8 +50,8 @@ matrices. Each step Cone's
 `walkgait` writes the pose: a walk whose phase follows the distance travelled, so the feet do not
 skate, feet that roll heel, flat and toe, two-bone IK on the legs reaching each ankle to a place on the
 ground, the pelvis as high as the legs allow, the arms against the legs, and when standing, breathing
-and shifting weight. The body is a kinematic capsule on `groundHeight` (`src/ground.cone`: flat today,
-the one function T1's terrain will replace) with gravity: a landing at 7 m/s or more (a 2.5 m drop) is
+and shifting weight. The body is a kinematic capsule on `groundHeight` (`src/ground.cone`: the island's,
+below) with gravity: a landing at 7 m/s or more (a 2.5 m drop) is
 HARD, the pelvis crouches, and the scene mails a `HardLanding` to the world; one above 10 m/s hurts the
 being's health, to nothing left at 24 m/s.
 
@@ -115,8 +115,9 @@ browser.exe --watch 300               300 s in real time, a line a second and a 
 
 `--script` pushes key events into SDL's own queue (never the operating system's), so nothing reaches
 any other window, and a run of a fixed number of frames ignores the real keyboard and mouse (and the
-window losing focus, which would otherwise let go of the script's keys). It walks up to the rooks and
-the horn-flower, clicks on the rook and then on the sky, turns, runs to the balloon, clicks its
+window losing focus, which would otherwise let go of the script's keys). It starts on the island's landing
+beach and runs 12 m up the path (on the ground, inside the fence, checked), is set down at the old flat
+world's start on the lowland, walks up to the rooks and the horn-flower, clicks on the rook and then on the sky, turns, runs to the balloon, clicks its
 launch button, then draws eight close-ups from eyes of its own (the amphora's through a 20 degree lens,
 straight on, as its photograph shows it; the cottage's from the reference photograph's viewpoint and
 lens, and from the walker's eye on the approach). Its clicks are pushed mouse events at
@@ -207,10 +208,12 @@ along the way when the first frame was presented and when every object was first
 | `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list (render draws each batch as one instanced draw); a physical material is render's physically based one; a shaded one, a custom pipeline |
 | `src/look.cone` | the look: light in physical units (the sun in lux, the sky and glows in nits), the exposure from the sun's height (EV 15 at noon), AgX tone mapping and bloom through render's Post |
 | `src/shaders.cone` | the browser's own shaders, which a shaded Look names: the heightfield (`heightfield.slang`); after editing a `.slang`, run Cone's `tools/shaders/shaders.py src` to compile and embed it |
-| `src/shell.cone` | what the browser puts in every scene: the ground and the sky, sent as requests |
+| `src/shell.cone` | what the browser puts in every scene: the island's land and sea and the sky, sent as requests |
+| `src/island/island.cone` | the module `island`: the baked heightfield, its path, fence, height query and meshes (below) |
+| `src/terrain.slang`, `src/water.slang`, `src/islandshaders.cone` | the island's two shaders and the custom pipelines made from them |
 | `src/being.cone` | beings and possession: intents, the user's controller, the view rig (first and third person), the Cast |
 | `src/mannequin.cone` | the mannequin: its figure (skeleton, pose, gait, kinematic capsule), its meshes, one a bone, and spawning it |
-| `src/ground.cone` | the ground's height under a point: the one function the terrain will replace |
+| `src/ground.cone` | the ground's height under a point: the island's, the one function everything standing on the ground asks |
 | `src/walk.cone` | a walker's body on the ground, and the user's key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
 | `src/checks.cone` | the scene core's headless checks (`--checks`) |
@@ -247,8 +250,9 @@ scene's inbox:
 
 Once a frame, at the publish phase, the browser applies the inbox in order, routing each request to the
 system that owns what it changes; a request naming a part that is gone is refused and counted. The
-ground and the sky go in this way too: the ground is an ordinary part whose render row is *anchored*,
-drawn under the viewer in steps of its checkerboard's period, so it never ends. A material may carry a
+land, the sea and the sky go in this way too (an *anchored* part, a non-zero `anchor` in `Show`, is drawn
+under the viewer in steps of that many metres; a negative one is placed where it is but not pickable, the
+island's). A material may carry a
 painted image (the balloon's envelope, the basket's wicker), which its colour multiplies, and, for a
 *physical* look, a normal map and an ORM map (the amphora's glaze glossy and its clay matt; the
 chimney's mortar recessed), drawn with render's physically based material; an `Effect`
@@ -329,6 +333,48 @@ frames keep coming while the world arrives.
 | ball | new: a sphere, checkered so its spin shows | 1 m across | 1,984 | 0.03 |
 | mound | new: a 65 x 65 grid lifted on the GPU by a heightfield (the heightfield shader, a custom pipeline), green rising to a faintly glowing sandy hump | 4 m square | 8,192 | 0.14 |
 | starship (frame, membranes, wing lights, ports, eyes, mouth) | `packages/starship`, meshed on the GPU at 0.03 a cell | 156 m, 10 m a unit | 458,324 | 700 (0.4 s of it making the kernels) |
+
+## The island
+
+An island about 1.3 km across (x east, z south, sea level y = 0, its middle near the origin) in water, baked
+once on the CPU at start-up (about 0.6 s, `src/island/island.cone`; `browser.exe --island FILE.bmp` writes a
+picture of it, the fence and the path). Inlets and peninsulas round the coast (a smoothed signed distance of a
+body, two peninsulas and a cove, warped and roughened by noise near the coast only) rise to a **150 m** hill
+in the middle, its summit and ridges ridged noise and its flanks **eroded** by a per-point filter on the
+hill alone (after runevision's erosion filter, built on `noise`'s phacelle: four octaves of gullies from 140 m
+down to 17 m, masked to steep ground, faded at the summit and foot, each octave steered by the slope the
+last left). The cove on the south shore has the landing beach at its head (the start: (-22, 499), facing
+north); 170 m inland, on a flat pad, stands the cottage (its front wall's middle at (-16, 330)), the hill
+rising behind it, the old flat world shifted rigidly onto the lowland with it (`WORLD_DX`, `WORLD_DZ`), every
+object standing on the ground there. The lowland rolls (the farther from the pad, the more, up to about 3 m
+over 70 m) so there is up and down to practise on.
+
+**One grid.** The land is N = 1025 samples a side, 2 m apart, covering 2048 m (4.2 MB, one r32float texture).
+The GPU draws it with the same numbers: a fine mesh with a vertex a sample over x from -400 to 400 and z from
+-64 to 704 (the walkable country and the hill's foot; 307 000 triangles) and a coarse one with a vertex every
+4th sample over the whole grid, with a hole where the fine one is (113 000), the fine mesh's border vertices
+set on the line between the coarse ones, so they meet with no crack. No levels of detail beyond these two;
+the fence keeps you in the fine one. `groundHeight` (`island.cone`) is **triangle-exact**: the quads are split
+by one rule (`diagonalFlipped`), the index buffers use it, and the query finds the triangle the mesh has
+(`--checks`: 4000 points against the index buffer, within 0.4 mm; plain bilinear would be 0.5 m off).
+
+**The path** is a Catmull-Rom curve from the beach (heading north for its first 22 m) to the cottage's steps,
+205 points a metre apart (`pathCentreline`), its height smoothed along it and pressed into the ground in a
+ribbon (the steepest metre 9 degrees); the distance to it is a second field the ground shader reads.
+**The fence** is a polygon round the beach, the path, the forest and the lawn (`constrain`, called by every
+walk and mannequin step, which slide along it) and a wading limit of 0.6 m. **The forest** (`forestDensity`)
+is where trees may stand: above the beach, below 85 m, clear of the path and of 34 to 58 m round the lawn.
+
+**The ground** (`src/terrain.slang`) is coloured per fragment from procedural noise: sand by the water (wetter
+where the swash reaches, rippled), grass in two greens with blades, rock on the steep slopes (triplanar
+noise with strata), forest litter from a painted mask (the one image: red the forest's density) and the path's packed
+earth with pebbles and an uneven edge, blended by height, slope, the mask and the path's distance field.
+**The sea** (`src/water.slang`) is a flat grid and a ring to 8 km moved by five Gerstner waves on scene time
+(Finch, GPU Gems 1 ch. 1: L = 60, 34, 14, 8, 4.5 m, A = 0.16 to 0.014 m, Q = 0.8, w = sqrt(g k), their heights
+and steepness shrinking over shallows; the two longest move the 8 m grid's vertices, all five the normal,
+fading with distance so nothing shimmers), tinted by the depth of the same heightfield (Beer-Lambert: red goes
+first) over a sand bed, with Schlick Fresnel reflection of the frame's sky, a sun glint, ripples, and foam in
+a band that comes and goes along the shoreline.
 
 ## The cottage, measured from the reference frame
 

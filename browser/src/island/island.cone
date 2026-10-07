@@ -1,0 +1,909 @@
+// The island: the browser's own landscape, baked once on the CPU at start-up.
+//
+// An island about a mile across in water, in metres, y up, sea level y = 0,
+// its middle near the origin. Inlets and peninsulas round its coast rise to
+// a hill 150 m high; a sheltered lowland on the south shore, in a cove, holds
+// the cottage; you land on the cove's beach and a path leads inland to it.
+// The hill behind the cottage is out of bounds: a fence (a polygon) keeps a
+// walker on the beach, the path, the forest and the cottage's lawn.
+//
+// ONE FIELD. The land is a single grid of heights, N x N samples CELL
+// metres apart, covering WORLD metres. The GPU draws it (terrain.slang, from
+// the same numbers uploaded as an r32float texture), the walker's feet and
+// capsule read it (groundHeight), the water takes its depth from it, and the
+// ground's colours are painted from it. 'groundHeight' is exact against the
+// drawn triangles: the fine mesh's quads are split into triangles by one
+// rule (diagonalFlipped), and the query uses the triangle the mesh has.
+//
+//   the coast       a signed distance (negative: land), the main body, two
+//                   peninsulas and a cove subtracted from them, smoothed, then
+//                   warped and roughened by noise near the coast only
+//   the hill        150 m, round, its summit and ridges ridged noise, then
+//                   the ERODED by a per-point filter (below) on the hill alone
+//   the shore       a gentle shelf into the sea, a beach rising 1.5 m in
+//                   18 m, a lowland of 4 to 5 m behind it
+//   the lowland     rolling a little (the farther from the cottage, the more)
+//                   and flat on a pad about the cottage
+//   the path        a Catmull-Rom curve from the beach to the cottage's
+//                   steps, its height smoothed along it and pressed into the
+//                   ground in a ribbon
+//
+// THE EROSION FILTER (per point, no simulation) follows runevision's "Fast
+// and Gorgeous Erosion Filter" (blog.runevision.com, 30 Mar 2026), written
+// from his description of it (his Shadertoys could not be fetched): at each
+// octave a phacelle noise (noise/phacelle.cone) gives stripes running down
+// the slope there, its cosine a gully profile and its sine the profile's
+// slope; the gullies are masked to steep ground and faded towards the summit
+// and the foot, and the gradient they leave steers the next octave's stripes,
+// so smaller gullies branch off larger ones. The filter's constants below
+// are mine, tuned by eye on the 2 m grid (nothing finer than 15 m is made:
+// a wavelength must stay several cells long).
+//
+// Everything is deterministic: the bake is a function of the constants here.
+
+mod island;
+
+import collections use *;
+import geomath use *;
+import libc;
+import noise;
+import render use Image;
+import mesh;
+import stdio use *;
+
+// ---- The grid ----
+
+// Metres between samples, samples a side, and the world's edge: the grid
+// covers x and z from -HALF to HALF
+pub const CELL f32 = 2.;
+pub const N i32 = 1025;
+pub const HALF f32 = 1024.;
+
+// The fine mesh (a vertex a sample) covers samples FINE_I0 to FINE_I1 in
+// x and FINE_J0 to FINE_J1 in z (multiples of 4 samples); outside it the
+// coarse mesh has a vertex every 4th sample
+pub const COARSE_STRIDE i32 = 4;
+pub const FINE_I0 i32 = 312;       // x = -400
+pub const FINE_I1 i32 = 712;       // x =  400
+pub const FINE_J0 i32 = 480;       // z =  -64
+pub const FINE_J1 i32 = 864;       // z =  704
+
+// ---- The layout ----
+
+// The cottage's frame (the middle of its front wall on the ground, its door
+// towards +z, the south, the sea) and where the old flat world's origin went:
+// everything the browser had before stands where it stood, shifted by this
+pub const COTTAGE_X f32 = -16.;
+pub const COTTAGE_Z f32 = 330.;
+pub const WORLD_DX f32 = COTTAGE_X + 10.;
+pub const WORLD_DZ f32 = COTTAGE_Z + 24.;
+
+// Where you land: the beach at the cove's head, where the path begins, facing
+// north (-z, yaw 0), inland
+pub const START_X f32 = -22.;
+pub const START_Z f32 = 499.;
+
+// The flat pad about the cottage: its middle, how far it is flat, and how far
+// it takes to fall into the land about it
+pub const PAD_X f32 = COTTAGE_X + 12.;
+pub const PAD_Z f32 = COTTAGE_Z + 8.;
+pub const PAD_FLAT f32 = 46.;
+pub const PAD_BLEND f32 = 100.;
+
+// The hill: its summit, its radius at the foot, its height
+const HILL_X f32 = 30.;
+const HILL_Z f32 = -230.;
+const HILL_RADIUS f32 = 540.;
+pub const HILL_HEIGHT f32 = 150.;
+
+// ---- Small helpers ----
+
+fn clamp01(x f32) f32 { if x < 0. { 0.; } elif x > 1. { 1.; } else { x; }; }
+fn mixf(a f32, b f32, t f32) f32 { a + (b - a) * t; }
+fn len2(x f32, z f32) f32 { (x * x + z * z).sqrt(); }
+fn absf(x f32) f32 { libc.fabsf(x); }
+fn minf(a f32, b f32) f32 { if a < b { a; } else { b; }; }
+fn maxf(a f32, b f32) f32 { if a > b { a; } else { b; }; }
+
+// GLSL's smoothstep (edges either way round)
+fn smooth(a f32, b f32, x f32) f32 {
+  imm t = clamp01((x - a) / (b - a));
+  t * t * (3. - 2. * t);
+}
+
+// Quilez's polynomial smooth minimum and maximum, blending over 'k' metres
+fn smin(a f32, b f32, k f32) f32 {
+  imm h = clamp01(0.5 + 0.5 * (b - a) / k);
+  mixf(b, a, h) - k * h * (1. - h);
+}
+fn smax(a f32, b f32, k f32) f32 { 0. - smin(0. - a, 0. - b, k); }
+
+fn sdCapsule(x f32, z f32, ax f32, az f32, bx f32, bz f32, r f32) f32 {
+  imm pax = x - ax;
+  imm paz = z - az;
+  imm bax = bx - ax;
+  imm baz = bz - az;
+  imm h = clamp01((pax * bax + paz * baz) / (bax * bax + baz * baz));
+  len2(pax - bax * h, paz - baz * h) - r;
+}
+
+fn fbm(x f32, z f32, seed u32, octaves i32) f32 {
+  noise.fbm2(new Vec2(x, z), seed, octaves, 2., 0.5).value;
+}
+
+// ---- The coast ----
+
+// The coast's signed distance (metres, negative on land) before any noise:
+// a body, two peninsulas to the south and a cove between them
+fn baseCoast(x f32, z f32) f32 {
+  mut d = len2(x, z + 40.) - 640.;
+  // The east peninsula: reaching south-east
+  d = smin(d, sdCapsule(x, z, 420., 380., 700., 600., 75.), 100.);
+  // The west one, reaching south and a little east, to shelter the cove
+  d = smin(d, sdCapsule(x, z, -330., 430., -250., 720., 65.), 100.);
+  // A spit on the cove's east side
+  d = smin(d, sdCapsule(x, z, 190., 600., 130., 730., 45.), 60.);
+  // The cove itself, cut out of the body's south: the cottage's, its beach at the head
+  d = smax(d, 0. - (len2(x + 60., z - 790.) - 290.), 80.);
+  // A bay on the north-east, an inlet on the west and a cleft on the north
+  d = smax(d, 0. - (len2(x - 430., z + 470.) - 100.), 60.);
+  d = smax(d, 0. - (len2(x + 640., z + 60.) - 80.), 50.);
+  d = smax(d, 0. - (len2(x + 120., z + 700.) - 70.), 50.);
+  d;
+}
+
+// The coast with its warp and roughness: near the coast only (the noise
+// fades out 70 to 130 m away from it, so the far sea and the inland are the
+// plain curve and cost nothing)
+fn coast(x f32, z f32) f32 {
+  imm d0 = baseCoast(x, z);
+  imm w = 1. - smooth(70., 130., absf(d0));
+  if w <= 0. { return d0; }
+  // A domain warp (about 40 m over 300 m) and a roughness (about 20 m at
+  // 180 m, six octaves): bays gain islets and the coast gains rocks
+  imm qx = x + 40. * fbm(x / 300., z / 300., 11u32, 3);
+  imm qz = z + 40. * fbm(x / 300. + 17., z / 300. - 9., 13u32, 3);
+  d0 + w * 22. * fbm(qx / 180., qz / 180., 17u32, 6);
+}
+
+// ---- The hill ----
+
+// The hill's raw height (before the erosion), as a fraction of HILL_HEIGHT
+// times its summit's, at (x, z): zero beyond its foot
+fn hillRaw(x f32, z f32) f32 {
+  imm wx = x + 70. * fbm(x / 300. + 3.1, z / 300. + 7.7, 21u32, 3);
+  imm wz = z + 70. * fbm(x / 300. + 11.3, z / 300. + 2.2, 23u32, 3);
+  // Elongated a little east-west
+  imm dx = (wx - HILL_X) * 0.86;
+  imm dz = wz - HILL_Z;
+  imm t = len2(dx, dz) / HILL_RADIUS;
+  if t >= 1. { return 0.; }
+  imm f = libc.powf(1. - smooth(0., 1., t), 1.4);
+  // Ridges: ridged noise, stronger on the flanks than at the summit
+  imm ridge = noise.ridged2(new Vec2(wx / 230., wz / 230.), 29u32, 5, 2., 0.5).value;
+  imm flank = smooth(0.0, 0.25, t) * (1. - smooth(0.6, 1., t));
+  f * 1.0 + 0.16 * f * (ridge - 0.9) * (0.35 + flank);
+}
+
+// Eased out: 0 at 0, 1 at 1, steep at the start (runevision's ease_out)
+fn easeOut(t f32) f32 {
+  imm v = 1. - clamp01(t);
+  1. - v * v;
+}
+
+// The eroded height of a hill point: 'h' metres high with the gradient
+// (gx, gz), at (x, z). Four octaves of gullies from 140 m down to 17 m.
+fn erode(x f32, z f32, h f32, gx f32, gz f32) f32 {
+  mut sx = gx;
+  mut sz = gz;
+  mut out = h;
+  mut amp f32 = 9.;
+  mut wavelength f32 = 140.;
+  mut o = 0;
+  while o < 4 {
+    imm sl = len2(sx, sz);
+    if sl > 0.02 {
+      imm dir = new Vec2(sx / sl, sz / sl);
+      imm ph = noise.phacelle2(new Vec2(x / wavelength, z / wavelength), dir, 1., 0., 0.4, 31u32 + u32.from(o));
+      // Gullies only on slopes (a steeper slope than 0.1 is fully gullied),
+      // faded to nothing at the summit and at the foot, so both stay crisp
+      imm tt = clamp01(h / HILL_HEIGHT);
+      imm fade = smooth(0.02, 0.2, tt) * (1. - 0.6 * smooth(0.75, 1., tt));
+      imm k = amp * easeOut(sl / 0.25) * fade;
+      // Valleys down to -k, ridges at 0: material is only taken away
+      out = out + k * (ph.value.x * 0.5 - 0.5);
+      // The profile's slope (per metre), which steers the next octave:
+      // d(cos)/dp = -sin * side, over the wavelength
+      imm ddx = 0. - ph.value.y * ph.side.x / wavelength * k * 0.5;
+      imm ddz = 0. - ph.value.y * ph.side.y / wavelength * k * 0.5;
+      sx = sx + ddx;
+      sz = sz + ddz;
+    }
+    amp = amp * 0.5;
+    wavelength = wavelength * 0.5;
+    o = o + 1;
+  }
+  out;
+}
+
+// ---- The land ----
+
+// Depth of the sea floor 'u' metres out from the coast: gently shelving to
+// 30 m
+fn seaDepth(u f32) f32 { minf(30., 0.05 * u + 0.0003 * u * u); }
+
+// The height of the shore and lowland, 's' metres in from the coast
+// (negative: out to sea): the sea floor, a beach and a lowland
+fn shelf(s f32) f32 {
+  if s < 0. { return 0. - 0.3 - seaDepth(0. - s); }
+  mixf(-0.3, 5.8, smooth(0., 90., s)) + 1.2 * smooth(0., 18., s);
+}
+
+// How far (x, z) is from the pad's middle, as the pad's blend weight sees it
+fn padWeight(x f32, z f32) f32 {
+  1. - smooth(PAD_FLAT, PAD_BLEND, len2(x - PAD_X, z - PAD_Z));
+}
+
+// How much the lowland rolls at (x, z): a little by the cottage, more
+// farther off (metres of amplitude)
+fn rollAmplitude(x f32, z f32) f32 {
+  0.8 + 7.5 * smooth(46., 170., len2(x - PAD_X, z - PAD_Z));
+}
+
+// The height at (x, z) given the eroded hill's height 'hill' there: before the path
+fn landHeight(x f32, z f32, hill f32) f32 {
+  imm s = 0. - coast(x, z);
+  mut h = shelf(s);
+  if s > 0. {
+    h = h + hill * smooth(60., 220., s);
+    // Rolling ground: two scales, fading in from the shore
+    imm roll = fbm(x / 70., z / 70., 41u32, 4) * 0.9 + fbm(x / 26., z / 26., 43u32, 2) * 0.25;
+    h = h + roll * rollAmplitude(x, z) * smooth(0., 40., s);
+  }
+  // The pad: flat at its own height, so the cottage and the things about it stand level
+  imm pw = padWeight(x, z);
+  if pw > 0. { h = mixf(h, PAD_HEIGHT, pw); }
+  h;
+}
+
+// The pad's height: the lowland's, at the pad's middle
+pub const PAD_HEIGHT f32 = 4.6;
+
+// ---- The grid, stored ----
+
+mut heights List[f32];
+mut pathDistance List[f32];   // metres to the path's centre, capped
+fn @initpure init() {
+  heights = List[f32].empty();
+  pathDistance = List[f32].empty();
+  centre = List[Vec3].empty();
+  centreXZ = List[Vec2].empty();
+  fence = List[Vec2].empty();
+}
+mut baked bool = false;
+mut bakeMs f64 = 0d;
+mut hillScale f32 = 1.;
+
+// Sample (i, j) of the field; clamped to the grid
+fn sample(i i32, j i32) f32 {
+  imm ci = if i < 0 { 0; } elif i >= N { N - 1; } else { i; };
+  imm cj = if j < 0 { 0; } elif j >= N { N - 1; } else { j; };
+  *heights[usize.from(cj * N + ci)];
+}
+
+// Whether the quad (i, j) of the mesh is split along its other diagonal,
+// the one from its (i + 1, j) corner to its (i, j + 1) corner. The drawn
+// meshes use this rule (terrain mesh) and so does the height query.
+pub fn diagonalFlipped(i i32, j i32) bool { ((i + j) & 1) == 1; }
+
+// The ground's height at (x, z), exact against the drawn fine mesh's triangles
+// (outside the grid: the sea floor's depth at its edge)
+pub fn groundHeight(x f32, z f32) f32 {
+  if !baked { return 0.; }
+  imm gx = (x + HALF) / CELL;
+  imm gz = (z + HALF) / CELL;
+  if gx < 0. or gz < 0. or gx >= f32.from(N - 1) or gz >= f32.from(N - 1) { return -30.; }
+  imm i = i32.from(libc.floorf(gx));
+  imm j = i32.from(libc.floorf(gz));
+  imm fx = gx - f32.from(i);
+  imm fz = gz - f32.from(j);
+  imm a = sample(i, j);
+  imm b = sample(i + 1, j);
+  imm c = sample(i, j + 1);
+  imm d = sample(i + 1, j + 1);
+  if !diagonalFlipped(i, j) {
+    // The diagonal from a to d
+    if fx >= fz { return a + fx * (b - a) + fz * (d - b); }
+    return a + fx * (d - c) + fz * (c - a);
+  }
+  // The diagonal from b to c
+  if fx + fz <= 1. { return a + fx * (b - a) + fz * (c - a); }
+  d + (1. - fx) * (c - d) + (1. - fz) * (b - d);
+}
+
+// The ground's slope (rise over run) at (x, z), by differences either side
+pub fn groundSlope(x f32, z f32) f32 {
+  imm e f32 = 1.;
+  imm dx = (groundHeight(x + e, z) - groundHeight(x - e, z)) / (2. * e);
+  imm dz = (groundHeight(x, z + e) - groundHeight(x, z - e)) / (2. * e);
+  len2(dx, dz);
+}
+
+// ---- The bake ----
+
+fn bakeGrid() {
+  imm total = usize.from(N * N);
+  // 1. The hill's scale: its raw summit, found on a coarse grid, set to HILL_HEIGHT
+  mut top f32 = 0.;
+  mut j = 0;
+  while j < N {
+    mut i = 0;
+    while i < N {
+      imm x = f32.from(i) * CELL - HALF;
+      imm z = f32.from(j) * CELL - HALF;
+      imm r = hillRaw(x, z);
+      if r > top { top = r; }
+      i = i + 16;
+    }
+    j = j + 16;
+  }
+  hillScale = HILL_HEIGHT / top;
+  // 2. The raw hill on the grid (where it is not zero)
+  mut raw = List[f32].withCapacity(total);
+  j = 0;
+  while j < N {
+    mut i = 0;
+    while i < N {
+      imm x = f32.from(i) * CELL - HALF;
+      imm z = f32.from(j) * CELL - HALF;
+      raw.push(if absf(x - HILL_X) < HILL_RADIUS * 1.3 and absf(z - HILL_Z) < HILL_RADIUS * 1.3 {
+        hillRaw(x, z) * hillScale;
+      } else { 0.; });
+      i = i + 1;
+    }
+    j = j + 1;
+  }
+  // 3. Eroded: each point of the hill with its gradient
+  mut eroded = List[f32].withCapacity(total);
+  j = 0;
+  while j < N {
+    mut i = 0;
+    while i < N {
+      imm idx = usize.from(j * N + i);
+      imm h = *raw[idx];
+      if h > 1. and i > 0 and i < N - 1 and j > 0 and j < N - 1 {
+        imm gx = (*raw[idx + 1usize] - *raw[idx - 1usize]) / (2. * CELL);
+        imm gz = (*raw[idx + usize.from(N)] - *raw[idx - usize.from(N)]) / (2. * CELL);
+        eroded.push(erode(f32.from(i) * CELL - HALF, f32.from(j) * CELL - HALF, h, gx, gz));
+      } else {
+        eroded.push(h);
+      }
+      i = i + 1;
+    }
+    j = j + 1;
+  }
+  // 4. The land: coast, shelf, hill, rolling, pad
+  heights = List[f32].withCapacity(total);
+  j = 0;
+  while j < N {
+    mut i = 0;
+    while i < N {
+      imm x = f32.from(i) * CELL - HALF;
+      imm z = f32.from(j) * CELL - HALF;
+      heights.push(landHeight(x, z, *eroded[usize.from(j * N + i)]));
+      i = i + 1;
+    }
+    j = j + 1;
+  }
+}
+
+// ---- The path ----
+
+// The path's control points, from the landing beach (heading north, -z,
+// for its first 22 m) to the foot of the cottage's steps, which it ends at
+imm PATH_CONTROLS Array[f32, 18] = [
+  -22., 498.,   -22., 476.,   -34., 450.,   -14., 424.,   -38., 400.,
+  -12., 378.,   -22., 354.,   -16., 340.,   -16., 333.6];
+
+// The path ends here, at the steps' foot (the cottage's z = 3.6 in front of its wall)
+pub const PATH_HALF_WIDTH f32 = 0.9;
+// How far the path's carve reaches
+const PATH_REACH f32 = 6.;
+
+mut centre List[Vec3];        // the path's centreline, a point every metre, on the ground
+mut centreXZ List[Vec2];
+
+// Catmull-Rom through four points, at t from 0 to 1 between the middle two
+fn catmull(p0 f32, p1 f32, p2 f32, p3 f32, t f32) f32 {
+  0.5 * ((2. * p1) + (0. - p0 + p2) * t + (2. * p0 - 5. * p1 + 4. * p2 - p3) * t * t
+    + (0. - p0 + 3. * p1 - 3. * p2 + p3) * t * t * t);
+}
+
+// The path's polyline, sampled every metre or so along the curve
+fn buildCentre() {
+  centreXZ = List[Vec2].empty();
+  imm n = 9usize;
+  mut k = 0usize;
+  while k + 1usize < n {
+    imm i0 = if k == 0usize { 0usize; } else { k - 1usize; };
+    imm i3 = if k + 2usize >= n { n - 1usize; } else { k + 2usize; };
+    imm ax = PATH_CONTROLS[i0 * 2usize];
+    imm az = PATH_CONTROLS[i0 * 2usize + 1usize];
+    imm bx = PATH_CONTROLS[k * 2usize];
+    imm bz = PATH_CONTROLS[k * 2usize + 1usize];
+    imm cx = PATH_CONTROLS[(k + 1usize) * 2usize];
+    imm cz = PATH_CONTROLS[(k + 1usize) * 2usize + 1usize];
+    imm dx = PATH_CONTROLS[i3 * 2usize];
+    imm dz = PATH_CONTROLS[i3 * 2usize + 1usize];
+    imm segLen = len2(cx - bx, cz - bz);
+    imm steps = i32.from(segLen) + 1;
+    mut s = 0;
+    while s < steps {
+      imm t = f32.from(s) / f32.from(steps);
+      centreXZ.push(new Vec2(catmull(ax, bx, cx, dx, t), catmull(az, bz, cz, dz, t)));
+      s = s + 1;
+    }
+    k = k + 1usize;
+  }
+  centreXZ.push(new Vec2(PATH_CONTROLS[16], PATH_CONTROLS[17]));
+}
+
+// The path pressed into the ground: its height smoothed along it (a box of
+// about 9 m, twice), then within PATH_REACH of it the ground eased to that
+// height less 6 cm; and the grid of distances to it
+fn carvePath() {
+  buildCentre();
+  imm n = centreXZ.len();
+  mut hp = List[f32].withCapacity(n);
+  mut k = 0usize;
+  while k < n {
+    hp.push(groundHeight(centreXZ[k].x, centreXZ[k].y));
+    k = k + 1usize;
+  }
+  mut pass = 0;
+  while pass < 2 {
+    mut smoothed = List[f32].withCapacity(n);
+    k = 0usize;
+    while k < n {
+      mut sum f32 = 0.;
+      mut cnt f32 = 0.;
+      mut o = -4;
+      while o <= 4 {
+        imm q = i32.from(k) + o;
+        if q >= 0 and q < i32.from(n) { sum = sum + *hp[usize.from(q)]; cnt = cnt + 1.; }
+        o = o + 1;
+      }
+      smoothed.push(sum / cnt);
+      k = k + 1usize;
+    }
+    hp = smoothed;
+    pass = pass + 1;
+  }
+  // Where the path ends the ground is the pad's, so no step: the last point keeps the ground
+  hp.set(n - 1usize, PAD_HEIGHT);
+  mut best = List[f32].withCapacity(usize.from(N * N));
+  mut target = List[f32].withCapacity(usize.from(N * N));
+  pathDistance = List[f32].withCapacity(usize.from(N * N));
+  mut q = 0;
+  while q < N * N {
+    best.push(99.);
+    target.push(0.);
+    pathDistance.push(16.);
+    q = q + 1;
+  }
+  k = 0usize;
+  while k + 1usize < n {
+    imm a = *centreXZ[k];
+    imm b = *centreXZ[k + 1usize];
+    imm ha = *hp[k];
+    imm hb = *hp[k + 1usize];
+    imm minx = minf(a.x, b.x) - 16.;
+    imm maxx = maxf(a.x, b.x) + 16.;
+    imm minz = minf(a.y, b.y) - 16.;
+    imm maxz = maxf(a.y, b.y) + 16.;
+    imm i0 = i32.from(libc.floorf((minx + HALF) / CELL));
+    imm i1 = i32.from(libc.floorf((maxx + HALF) / CELL)) + 1;
+    imm j0 = i32.from(libc.floorf((minz + HALF) / CELL));
+    imm j1 = i32.from(libc.floorf((maxz + HALF) / CELL)) + 1;
+    mut j = j0;
+    while j <= j1 {
+      mut i = i0;
+      while i <= i1 {
+        imm x = f32.from(i) * CELL - HALF;
+        imm z = f32.from(j) * CELL - HALF;
+        imm abx = b.x - a.x;
+        imm abz = b.y - a.y;
+        imm t = clamp01(((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz));
+        imm d = len2(x - (a.x + abx * t), z - (a.y + abz * t));
+        imm idx = usize.from(j * N + i);
+        if d < *best[idx] {
+          best.set(idx, d);
+          target.set(idx, mixf(ha, hb, t));
+          pathDistance.set(idx, minf(d, 16.));
+        }
+        i = i + 1;
+      }
+      j = j + 1;
+    }
+    k = k + 1usize;
+  }
+  mut idx = 0usize;
+  while idx < usize.from(N * N) {
+    imm d = *best[idx];
+    if d < PATH_REACH {
+      imm w = smooth(PATH_REACH, 1.4, d);
+      // Pressed 5 cm into the ground, none at its end, where the pad is level
+      imm x = f32.from(i32.from(idx) % N) * CELL - HALF;
+      imm z = f32.from(i32.from(idx) / N) * CELL - HALF;
+      imm press = 0.05 * smooth(5., 14., len2(x - PATH_CONTROLS[16], z - PATH_CONTROLS[17]));
+      heights.set(idx, mixf(*heights[idx], *target[idx] - press, w));
+    }
+    idx = idx + 1usize;
+  }
+  // The centreline on the carved ground
+  centre = List[Vec3].withCapacity(n);
+  k = 0usize;
+  while k < n {
+    imm p = *centreXZ[k];
+    centre.push(new Vec3(p.x, groundHeight(p.x, p.y), p.y));
+    k = k + 1usize;
+  }
+}
+
+// The path's centreline, from the landing beach to the steps' foot: a point
+// about every metre, on the ground (x, y, z), for lanterns, edging stones and
+// walkers to follow
+pub fn pathCentreline() List[Vec3] {
+  mut out = List[Vec3].withCapacity(centre.len());
+  mut k = 0usize;
+  while k < centre.len() { out.push(*centre[k]); k = k + 1usize; }
+  out;
+}
+
+// How far (x, z) is from the path's centre, in metres (16 at the most)
+pub fn pathDistanceAt(x f32, z f32) f32 {
+  if !baked or pathDistance.len() == 0usize { return 16.; }
+  imm gx = clamp01((x + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
+  imm gz = clamp01((z + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
+  imm i = minf(libc.floorf(gx), f32.from(N - 2));
+  imm j = minf(libc.floorf(gz), f32.from(N - 2));
+  imm fx = gx - i;
+  imm fz = gz - j;
+  imm ii = i32.from(i);
+  imm jj = i32.from(j);
+  imm a = *pathDistance[usize.from(jj * N + ii)];
+  imm b = *pathDistance[usize.from(jj * N + ii + 1)];
+  imm c = *pathDistance[usize.from((jj + 1) * N + ii)];
+  imm d = *pathDistance[usize.from((jj + 1) * N + ii + 1)];
+  mixf(mixf(a, b, fx), mixf(c, d, fx), fz);
+}
+
+// ---- The fence ----
+
+// The walkable area's boundary, corners in order (x, z): the beach, the
+// forest to the east and west of the path, the cottage's lawn and the balloon's
+// field behind it. The hill beyond is out of bounds.
+imm FENCE_CORNERS Array[f32, 22] = [
+  -190., 285.,   175., 285.,   200., 430.,   175., 540.,   120., 552.,   60., 525.,
+  0., 507.,   -60., 505.,   -120., 512.,   -200., 545.,   -215., 420.];
+
+mut fence List[Vec2];
+
+pub fn fencePolygon() List[Vec2] {
+  mut out = List[Vec2].withCapacity(fence.len());
+  mut k = 0usize;
+  while k < fence.len() { out.push(*fence[k]); k = k + 1usize; }
+  out;
+}
+
+fn buildFence() {
+  fence = List[Vec2].empty();
+  mut k = 0usize;
+  while k < 11usize {
+    fence.push(new Vec2(FENCE_CORNERS[k * 2usize], FENCE_CORNERS[k * 2usize + 1usize]));
+    k = k + 1usize;
+  }
+}
+
+// Whether (x, z) is inside the fence
+pub fn insideFence(x f32, z f32) bool { polygonContains(fence.view(), new Vec2(x, z)); }
+
+// The point of the fence's edge nearest (x, z), and how far it is
+fn nearestOnFence(x f32, z f32, onEdge &mut Vec2) f32 {
+  mut best f32 = 1000000.;
+  mut k = 0usize;
+  while k < fence.len() {
+    imm a = *fence[k];
+    imm b = *fence[if k + 1usize == fence.len() { 0usize; } else { k + 1usize; }];
+    imm abx = b.x - a.x;
+    imm abz = b.y - a.y;
+    imm t = clamp01(((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz));
+    imm px = a.x + abx * t;
+    imm pz = a.y + abz * t;
+    imm d = len2(x - px, z - pz);
+    if d < best { best = d; *onEdge = new Vec2(px, pz); }
+    k = k + 1usize;
+  }
+  best;
+}
+
+// The deepest water a walker may wade into (metres below the sea's level)
+pub const WADE_DEPTH f32 = 0.6;
+
+// Where a walker who was at 'from' and means to go to 'to' ends up: 'to',
+// if that is inside the fence and on ground it can stand on; else the
+// fence's nearest edge point (a walker pressing on the fence slides along
+// it); and shallow water only knee deep, never farther (the same, along the
+// axis that is clear). Positions are on the ground plane (x, z); y is kept.
+pub fn constrain(from Vec3, to Vec3) Vec3 {
+  if !baked { return to; }
+  mut p = to;
+  if !insideFence(p.x, p.z) {
+    mut edge = new Vec2(from.x, from.z);
+    imm d = nearestOnFence(p.x, p.z, &mut edge);
+    // A hair inside: from where it meant to go to the edge's nearest point is
+    // the way in, square to the edge
+    imm inx = edge.x - p.x;
+    imm inz = edge.y - p.z;
+    imm il = len2(inx, inz);
+    p = if il > 0.0001 and d > 0. {
+      new Vec3(edge.x + inx / il * 0.02, p.y, edge.y + inz / il * 0.02);
+    } else { new Vec3(from.x, p.y, from.z); };
+    if !insideFence(p.x, p.z) { p = new Vec3(from.x, p.y, from.z); }
+  }
+  if groundHeight(p.x, p.z) < 0. - WADE_DEPTH {
+    if groundHeight(p.x, from.z) >= 0. - WADE_DEPTH { p = new Vec3(p.x, p.y, from.z); }
+    elif groundHeight(from.x, p.z) >= 0. - WADE_DEPTH { p = new Vec3(from.x, p.y, p.z); }
+    else { p = new Vec3(from.x, p.y, from.z); }
+  }
+  p;
+}
+
+// ---- Where things may stand ----
+
+// How thickly forest grows at (x, z), 0 to 1: from above the beach to part
+// way up the hill, clear of the path and of the cottage's lawn, in patches.
+// A scatter places trees by it; the ground's litter is painted from it.
+pub fn forestDensity(x f32, z f32) f32 {
+  imm h = groundHeight(x, z);
+  imm lowland = smooth(2.8, 4.2, h) * (1. - smooth(50., 85., h));
+  imm clearing = smooth(34., 58., len2(x - PAD_X, z - PAD_Z));
+  imm offPath = smooth(2.2, 4.5, pathDistanceAt(x, z));
+  imm patches = 0.55 + 0.45 * smooth(-0.25, 0.3, fbm(x / 55., z / 55., 61u32, 3));
+  lowland * clearing * offPath * patches;
+}
+
+// ---- The ground's mask ----
+
+// The painted mask the ground shader reads, one RGBA texel a grid sample:
+// red the forest litter (the forest's density, softened), the rest spare (the
+// path's distance is a field of its own, pathGrid: a byte is too coarse for
+// it). Rows from the grid's -z edge (row 0), as the heights are.
+pub fn maskImage() Image {
+  mut px = List[u8].withCapacity(usize.from(N * N * 4));
+  mut j = 0;
+  while j < N {
+    mut i = 0;
+    while i < N {
+      imm x = f32.from(i) * CELL - HALF;
+      imm z = f32.from(j) * CELL - HALF;
+      imm litter = clamp01(forestDensity(x, z) * 1.4);
+      imm pd = *pathDistance[usize.from(j * N + i)];
+      px.push(u8.from(litter * 255.));
+      px.push(u8.from(clamp01(pd / 16.) * 255.));
+      px.push(0u8);
+      px.push(255u8);
+      i = i + 1;
+    }
+    j = j + 1;
+  }
+  new Image(N, N, 4, px);
+}
+
+// The height grid, for the GPU (one f32 a sample, row by row from -z)
+pub fn heightGrid() List[f32] {
+  mut out = List[f32].withCapacity(heights.len());
+  mut k = 0usize;
+  while k < heights.len() { out.push(*heights[k]); k = k + 1usize; }
+  out;
+}
+
+// The distance to the path at every sample (metres, 16 at most), for the GPU:
+// one f32 a sample, row by row from -z, as the heights are
+pub fn pathGrid() List[f32] {
+  mut out = List[f32].withCapacity(pathDistance.len());
+  mut k = 0usize;
+  while k < pathDistance.len() { out.push(*pathDistance[k]); k = k + 1usize; }
+  out;
+}
+
+// Bake the island (once)
+pub fn bake() {
+  if baked { return; }
+  bakeGrid();
+  baked = true;
+  centre = List[Vec3].empty();
+  buildFence();
+  carvePath();
+}
+
+// ---- The meshes ----
+
+// A grid of quads over samples i0..i1 by j0..j1, a vertex every 'stride'
+// samples, at (x, 0, z) in metres (the shader lifts it), its quads split by
+// island's rule on the vertices' sample indices divided by 'stride'; with
+// 'hole', the quads wholly inside samples hi0..hi1 by hj0..hj1 left out
+fn gridMesh(i0 i32, j0 i32, i1 i32, j1 i32, stride i32, hole bool, hi0 i32, hj0 i32, hi1 i32, hj1 i32) mesh.Mesh {
+  imm cols = (i1 - i0) / stride + 1;
+  imm rows = (j1 - j0) / stride + 1;
+  mut m = mesh.Mesh.empty();
+  m.positions.reserve(usize.from(cols * rows));
+  m.normals.reserve(usize.from(cols * rows));
+  m.uvs.reserve(usize.from(cols * rows));
+  m.indices.reserve(usize.from(6 * (cols - 1) * (rows - 1)));
+  mut cj = 0;
+  while cj < rows {
+    mut ci = 0;
+    while ci < cols {
+      m.positions.push(new Vec3(f32.from(i0 + ci * stride) * CELL - HALF, 0., f32.from(j0 + cj * stride) * CELL - HALF));
+      m.normals.push(new Vec3(0., 1., 0.));
+      m.uvs.push(new Vec2(0., 0.));
+      ci = ci + 1;
+    }
+    cj = cj + 1;
+  }
+  cj = 0;
+  while cj + 1 < rows {
+    mut ci = 0;
+    while ci + 1 < cols {
+      imm i = i0 + ci * stride;
+      imm j = j0 + cj * stride;
+      imm inside = hole and i >= hi0 and i + stride <= hi1 and j >= hj0 and j + stride <= hj1;
+      if !inside {
+        imm a = u32.from(cj * cols + ci);
+        imm b = a + 1u32;
+        imm c = a + u32.from(cols);
+        imm d = c + 1u32;
+        if !diagonalFlipped(i / stride, j / stride) {
+          m.indices.push(a); m.indices.push(c); m.indices.push(d);
+          m.indices.push(a); m.indices.push(d); m.indices.push(b);
+        } else {
+          m.indices.push(a); m.indices.push(c); m.indices.push(b);
+          m.indices.push(b); m.indices.push(c); m.indices.push(d);
+        }
+      }
+      ci = ci + 1;
+    }
+    cj = cj + 1;
+  }
+  m;
+}
+
+// The fine mesh: a vertex a sample over FINE_I0..FINE_I1 by FINE_J0..FINE_J1
+// (exactly the triangles groundHeight answers for)
+pub fn fineMesh() mesh.Mesh { gridMesh(FINE_I0, FINE_J0, FINE_I1, FINE_J1, 1, false, 0, 0, 0, 0); }
+
+// The coarse mesh: every 4th sample over the whole grid, with a hole where the fine mesh is
+pub fn coarseMesh() mesh.Mesh { gridMesh(0, 0, N - 1, N - 1, COARSE_STRIDE, true, FINE_I0, FINE_J0, FINE_I1, FINE_J1); }
+
+// The sea: a flat grid of 8 m cells over the heightfield's whole extent and,
+// round it, a ring of eight big quads out to 8 km
+pub fn waterMesh() mesh.Mesh {
+  mut m = gridMesh(0, 0, N - 1, N - 1, 4, false, 0, 0, 0, 0);
+  // The ring: the 4 x 4 corners of -8000, -HALF, HALF, 8000
+  mut ring = mesh.Mesh.empty();
+  imm xs Array[f32, 4] = [-8000., 0. - HALF, HALF, 8000.];
+  mut r = 0usize;
+  while r < 4usize {
+    mut c = 0usize;
+    while c < 4usize {
+      ring.positions.push(new Vec3(xs[c], 0., xs[r]));
+      ring.normals.push(new Vec3(0., 1., 0.));
+      ring.uvs.push(new Vec2(0., 0.));
+      c = c + 1usize;
+    }
+    r = r + 1usize;
+  }
+  mut qr = 0u32;
+  while qr < 3u32 {
+    mut qc = 0u32;
+    while qc < 3u32 {
+      if !(qr == 1u32 and qc == 1u32) {
+        imm a = qr * 4u32 + qc;
+        imm b = a + 1u32;
+        imm c = a + 4u32;
+        imm d = c + 1u32;
+        ring.indices.push(a); ring.indices.push(c); ring.indices.push(d);
+        ring.indices.push(a); ring.indices.push(d); ring.indices.push(b);
+      }
+      qc = qc + 1u32;
+    }
+    qr = qr + 1u32;
+  }
+  m.append(&ring);
+  m;
+}
+
+// ---- The preview ----
+
+fn markPixel(px &mut List[u8], x f32, z f32, r u8, g u8, b u8, radius i32) {
+  imm ci = i32.from((x + HALF) / CELL);
+  imm cj = i32.from((z + HALF) / CELL);
+  mut dj = 0 - radius;
+  while dj <= radius {
+    mut di = 0 - radius;
+    while di <= radius {
+      imm i = ci + di;
+      imm j = cj + dj;
+      if i >= 0 and i < N and j >= 0 and j < N {
+        imm at = usize.from(((N - 1 - j) * N + i) * 3);
+        px.set(at, r);
+        px.set(at + 1usize, g);
+        px.set(at + 2usize, b);
+      }
+      di = di + 1;
+    }
+    dj = dj + 1;
+  }
+}
+
+// A picture of the island, N x N pixels, north (-z) up, as a BMP at 'path':
+// sea by depth, land by height with contour lines every 10 m, shaded by the slope
+pub fn writePreview(path &[]u8) bool {
+  bake();
+  mut px = List[u8].withCapacity(usize.from(N * N * 3));
+  // Bottom row first: image row 0 is the south (largest z)
+  mut j = N - 1;
+  while j >= 0 {
+    mut i = 0;
+    while i < N {
+      imm h = sample(i, j);
+      imm hx = (sample(i + 1, j) - sample(i - 1, j)) / (2. * CELL);
+      imm hz = (sample(i, j + 1) - sample(i, j - 1)) / (2. * CELL);
+      imm lit = clamp01(0.62 + 0.8 * (hx * 0.5 + hz * 0.6));
+      mut r f32 = 0.;
+      mut g f32 = 0.;
+      mut b f32 = 0.;
+      if h < 0. {
+        imm t = clamp01(0. - h / 25.);
+        r = 0.05 * (1. - t) + 0.02;
+        g = 0.35 * (1. - t) + 0.08;
+        b = 0.55 * (1. - t) + 0.25;
+      } elif h < 2.4 {
+        r = 0.85; g = 0.78; b = 0.55;
+      } else {
+        imm t = clamp01(h / 150.);
+        r = (0.25 + 0.5 * t) * lit;
+        g = (0.55 - 0.1 * t) * lit;
+        b = (0.2 + 0.3 * t) * lit;
+        imm c = h - 10. * libc.floorf(h / 10.);
+        if c < 0.6 and h > 8. { r = r * 0.6; g = g * 0.6; b = b * 0.6; }
+      }
+      px.push(u8.from(clamp01(r) * 255.));
+      px.push(u8.from(clamp01(g) * 255.));
+      px.push(u8.from(clamp01(b) * 255.));
+      i = i + 1;
+    }
+    j = j - 1;
+  }
+  // The path in red-brown, the fence in white, the cottage a yellow dot
+  mut m = 0usize;
+  while m < centre.len() {
+    markPixel(&mut px, centre[m].x, centre[m].z, 200u8, 80u8, 40u8, 1);
+    m = m + 1usize;
+  }
+  m = 0usize;
+  while m < fence.len() {
+    imm a = *fence[m];
+    imm b = *fence[if m + 1usize == fence.len() { 0usize; } else { m + 1usize; }];
+    mut t f32 = 0.;
+    while t < 1. {
+      markPixel(&mut px, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, 255u8, 255u8, 255u8, 0);
+      t = t + 0.01;
+    }
+    m = m + 1usize;
+  }
+  markPixel(&mut px, COTTAGE_X, COTTAGE_Z, 255u8, 255u8, 0u8, 3);
+  imm img = new Image(N, N, 3, px);
+  img.save(path);
+}

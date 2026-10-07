@@ -1,50 +1,59 @@
 // What the browser itself puts in every scene before any world arrives: the
-// ground and the sky. Each goes in as requests through the scene's inbox,
-// exactly as a world's parts do, so neither is special to the renderer.
-// (Step 1's post at the origin is gone: the baked-in world's objects show
-// the walk well enough.)
+// land and the sea (the island, src/island/island.cone, drawn by terrain.slang
+// and water.slang), and the sky. Each goes in as requests through the scene's
+// inbox, exactly as a world's parts do, so none is special to the renderer.
 //
-// Units are metres, y up, the ground at y = 0.
-
-// The ground's half-width, in metres: it is drawn this far each way from
-// the viewer (in steps of GROUND_PERIOD), past the far plane, so its edge
-// is never seen
-pub const GROUND_HALF f32 = 2000.;
-
-// The checkerboard's squares, in metres; a light and a dark square side by
-// side are one period, the step the ground moves in to follow the viewer
-pub const GROUND_SQUARE f32 = 2.;
-pub const GROUND_PERIOD f32 = 4.;
-
-// sRGB brown (139, 90, 43) and sky blue (135, 206, 235), as linear colours
-pub fn groundBrown() Color { new Color(0.258, 0.102, 0.024, 1.); }
-pub fn skyBlue() Color { new Color(0.242, 0.617, 0.831, 1.); }
+// Units are metres, y up, sea level y = 0.
 
 // The sky seen by day, a radiance in nits (about 25 000): what AgX shows as
 // that sky blue at the noon exposure (look.cone). AgX desaturates bright
 // colours, so the radiance is bluer than the colour it shows.
 pub fn skyRadiance() Color { new Color(500., 28000., 72000., 1.); }
+pub fn skyBlue() Color { new Color(0.242, 0.617, 0.831, 1.); }
 
 // The parts the shell made
 pub struct ShellParts {
-  pub ground PartId;
+  pub ground PartId;          // the fine mesh of the island's land
+  pub coarse PartId;          // its coarse mesh, beyond the fine one
+  pub water PartId;
   pub sky PartId;
 }
 
-// The parts the shell makes: the ground and the sky, and the user's own
-// being (the walker the browser starts in, made by 'start')
-pub const SHELL_PARTS = 3usize;
+// The parts the shell makes: the land (two meshes) and the sea, the sky, and
+// the user's own being (the walker the browser starts in, made by 'start')
+pub const SHELL_PARTS = 5usize;
 
-// Send the shell's parts into 'scene'
+// The height field the island's shaders read: the island's heights, one f32 a sample
+fn islandField() Field { new Field(u32.from(N), u32.from(N), heightGrid()); }
+
+// Send the shell's parts into 'scene'. The island must be baked (bakeIsland)
 pub fn seedScene(scene &mut Scene) ShellParts {
-  // The ground: a square 2 * GROUND_HALF across, its checkerboard repeating
-  // every GROUND_PERIOD, anchored under the viewer
+  // The land: one terrain material (the heights, and the mask painted over
+  // them), the fine mesh and the coarse one. 'anchor' -1: placed where it is
+  // and not pickable (its meshes are flat; the shader lifts them)
   imm ground = scene.newPart("ground");
-  imm plane = scene.door.defineMesh(Mesh.plane(8, 2. * GROUND_HALF / GROUND_PERIOD));
-  imm brown = scene.door.defineMaterial(Look.checkered(groundBrown(), 0.85), Image.empty(), Maps.none());
-  scene.send(Request.Place[ground, new Transform3(new Vec3(0., 0., 0.), Quat.identity(),
-    new Vec3(GROUND_HALF, 1., GROUND_HALF))]);
-  scene.send(Request.Show[ground, plane, brown, GROUND_PERIOD]);
+  imm coarse = scene.newPart("ground, beyond");
+  imm fineId = scene.door.defineMesh(fineMesh());
+  imm coarseId = scene.door.defineMesh(coarseMesh());
+  imm terrainMaps = new Maps(Image.empty(), Image.empty(), islandField(), new Field(u32.from(N), u32.from(N), pathGrid()));
+  imm terrain = scene.door.defineMaterial(
+    Look.shaded(SHADER_TERRAIN, [0. - HALF, 0. - HALF, CELL, 1., f32.from(FINE_I0), f32.from(FINE_J0), f32.from(FINE_I1),
+      f32.from(FINE_J1)]),
+    maskImage(), terrainMaps);
+  scene.send(Request.Place[ground, Transform3.identity()]);
+  scene.send(Request.Show[ground, fineId, terrain, -1.]);
+  scene.send(Request.Place[coarse, Transform3.identity()]);
+  scene.send(Request.Show[coarse, coarseId, terrain, -1.]);
+
+  // The sea: a grid at sea level over the island's extent, and a ring out to the horizon
+  imm water = scene.newPart("sea");
+  imm waterId = scene.door.defineMesh(waterMesh());
+  imm sea = scene.door.defineMaterial(
+    Look.shaded(SHADER_WATER, [0. - HALF, 0. - HALF, CELL, 0., skyRadiance().red, skyRadiance().green,
+      skyRadiance().blue, 0.]),
+    Image.empty(), Maps.fielded(islandField()));
+  scene.send(Request.Place[water, Transform3.identity()]);
+  scene.send(Request.Show[water, waterId, sea, -1.]);
 
   // The sky: sky blue, a sun high in the south-west
   imm sky = scene.newPart("sky");
@@ -56,5 +65,5 @@ pub fn seedScene(scene &mut Scene) ShellParts {
   scene.send(Request.Sky[sky, new SkyLook(skyRadiance(), sun, new Color(100000., 96500., 88200., 1.),
     new Color(10000., 10800., 12800., 1.))]);
 
-  new ShellParts(ground, sky);
+  new ShellParts(ground, coarse, water, sky);
 }
