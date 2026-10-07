@@ -47,6 +47,25 @@
 // The device the script's events claim (no real keyboard has it)
 pub const SCRIPT_DEVICE = 0x5C1u;
 
+// What the script remembers between frames. Its checks and its scene
+// requests run in the scene actor, at the end of each frame, so this is the
+// scene actor's too (SceneState.script), handed in with the rest of its state.
+pub struct ScriptMarks {
+  pub clickAt Vec2;           // where the script clicks
+  pub balloonBaseY f32;       // the balloon's parts' heights before any press (taken at frame 29)
+  pub balloonYs Array[f32, 8];
+  pub tempPart PartId;        // a part made and taken away again, whose stale id must be refused
+  pub tempApplied u64;        // the scene's counts just before it was made
+  pub tempRefused u64;
+  pub tempSent u64;
+  pub pausedAt f64;           // the scene's time when the script's P and F keys took effect
+  pub fastFrom f64;
+
+  pub fn make() ScriptMarks {
+    new ScriptMarks(new Vec2(0., 0.), 0., [0., 0., 0., 0., 0., 0., 0., 0.], PartId.none(), 0u64, 0u64, 0u64, 0d, 0d);
+  }
+}
+
 // The frames a scripted run needs
 pub const SCRIPT_FRAMES = 1340u64;
 
@@ -97,11 +116,12 @@ pub fn hasView(f u64) bool {
     or f >= COTTAGE_FROM;
 }
 
-// The close-up's eye for frame 'f'
-pub fn viewAt(f u64) Pose {
+// The close-up's eye for frame 'f' (the scene actor puts it in the frame's
+// snapshot)
+pub fn viewAt(st &mut SceneState, f u64) Pose {
   if f >= VEG_FROM { return vegView(f); }
-  if f >= GLOW_FROM { return glowView(f); }
-  if f >= SKY_FROM { return skyView(f); }
+  if f >= GLOW_FROM { return glowView(st, f); }
+  if f >= SKY_FROM { return skyView(st, f); }
   if f >= ISLAND_FROM {
     // Partway up the path, looking along it to the cottage, from the walker's eye
     if f < ISLAND_FROM + 10u64 {
@@ -125,9 +145,9 @@ pub fn viewAt(f u64) Pose {
     // From the first mannequin's right side, square to the way it goes,
     // level with its chest, 3 m off; or the second's left, 3.2 m off, as it
     // falls and lands
-    imm at = cast.beings[1usize].body.position;
+    imm at = st.cast.beings[1usize].body.position;
     if f >= 892u64 {
-      imm lp = cast.beings[2usize].body.position;
+      imm lp = st.cast.beings[2usize].body.position;
       return lookFrom(new Vec3(lp.x - 3.2, lp.y + 1.0, lp.z), new Vec3(lp.x, lp.y + 0.8, lp.z));
     }
     return lookFrom(new Vec3(at.x + 3.0, at.y + 1.05, at.z), new Vec3(at.x, at.y + 0.95, at.z));
@@ -225,41 +245,39 @@ fn pushButton(x f32, y f32, down bool) {
   sdl.PushEvent(&mut e);
 }
 
-// Where the script clicks, and on what
-mut clickAt Vec2;             // set by the module's init
-mut rookClick bool = false;   // the click on the rook landed where the rook is drawn
-
 // Where world point 'p' is drawn for a viewer at 'w' (the walk is still
-// when the script clicks)
-fn seen(host &mut Host, w &Walk, p Vec3) Vec2 {
-  imm size = viewSize(host);
+// when the script clicks), in a window of 'size'
+fn seen(size Vec2, w &Walk, p Vec3) Vec2 {
   placeOnView(w.pose(), FOV, p, size.x, size.y);
 }
 
 // The world point at part 'id''s placement, 'up' metres above it
-fn partPoint(id PartId, up f32) Vec3 {
+fn partPoint(scene &Scene, id PartId, up f32) Vec3 {
   imm m = scene.worldMatrix(id);
   new Vec3(m.m[12], m.m[13] + up, m.m[14]);
 }
 
 // The script's clicks for frame 'f': pressed then let go two frames later
-pub fn pushClicks(host &mut Host, f u64, w &Walk) {
+pub fn pushClicks(st &mut SceneState, f u64, w &Walk) {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm sc = &mut st.script;
   if f == 120u64 {
     // The boolean rook, 0.7 m up its 1.4
-    clickAt = seen(host, w, partPoint(world.partOf(ROOK, 0usize), 0.7));
-    pushButton(clickAt.x, clickAt.y, true);
+    sc.clickAt = seen(st.view, w, partPoint(scene, world.partOf(ROOK, 0usize), 0.7));
+    pushButton(sc.clickAt.x, sc.clickAt.y, true);
   }
   if f == 145u64 {
     // The sky, at the top edge in the middle (a tall pine can stand higher in the view than 10% down)
-    clickAt = new Vec2(viewSize(host).x * 0.5, viewSize(host).y * 0.01);
-    pushButton(clickAt.x, clickAt.y, true);
+    sc.clickAt = new Vec2(st.view.x * 0.5, st.view.y * 0.01);
+    pushButton(sc.clickAt.x, sc.clickAt.y, true);
   }
   if f == 450u64 {
     // The launch button's cap, at its middle
-    clickAt = seen(host, w, partPoint(world.buttonCap(), 0.03));
-    pushButton(clickAt.x, clickAt.y, true);
+    sc.clickAt = seen(st.view, w, partPoint(scene, world.buttonCap(), 0.03));
+    pushButton(sc.clickAt.x, sc.clickAt.y, true);
   }
-  if f == 122u64 or f == 147u64 or f == 452u64 { pushButton(clickAt.x, clickAt.y, false); }
+  if f == 122u64 or f == 147u64 or f == 452u64 { pushButton(sc.clickAt.x, sc.clickAt.y, false); }
 }
 
 // The ball's height, as its formula has it, at the scene's time 'now'
@@ -269,7 +287,15 @@ fn ballHeight(now f64) f32 {
 }
 
 // The script's checks of the clicks and the motions at frame 'f'
-fn checkMotions(f u64) bool {
+fn checkMotions(st &mut SceneState, f u64) bool {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm lastPick = st.lastPick;
+  imm picked = st.picked;
+  imm clicks = st.clicks;
+  imm fired = st.fired;
+  imm sceneNow = st.sceneNow;
+  imm balloonBaseY = st.script.balloonBaseY;
   mut ok = true;
   if f == 125u64 {
     print <- "Frame 125, after a click on the rook:\n";
@@ -307,7 +333,7 @@ fn checkMotions(f u64) bool {
     mut j = 1usize;
     mut together = true;
     while j < from {
-      imm rise = scene.worldMatrix(world.partOf(BALLOON, j)).m[13] - balloonPartY(j);
+      imm rise = scene.worldMatrix(world.partOf(BALLOON, j)).m[13] - st.script.balloonYs[j];
       if rise - alt > 0.002 or alt - rise > 0.002 { together = false; }
       j = j + 1usize;
     }
@@ -320,41 +346,39 @@ fn checkMotions(f u64) bool {
 }
 
 // The balloon's parts' heights before any press (taken at frame 29)
-mut balloonBaseY f32 = 0.;
-mut balloonYs Array[f32, 8] = [0., 0., 0., 0., 0., 0., 0., 0.];
-fn balloonPartY(j usize) f32 { balloonYs[j]; }
-fn takeBalloonBase() {
+fn takeBalloonBase(st &mut SceneState) {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm sc = &mut st.script;
   mut j = 0usize;
   while j < world.partsOf(BALLOON) and j < 8usize {
-    balloonYs[j] = scene.worldMatrix(world.partOf(BALLOON, j)).m[13];
+    sc.balloonYs[j] = scene.worldMatrix(world.partOf(BALLOON, j)).m[13];
     j = j + 1usize;
   }
-  balloonBaseY = balloonYs[0usize];
+  sc.balloonBaseY = sc.balloonYs[0usize];
 }
 
-// A part made and taken away again through the scene's requests, and a
-// request sent afterwards to its stale id, which must be refused
-mut tempPart PartId;          // set by the module's init
-mut tempApplied u64 = 0u64;   // the scene's counts just before it was made
-mut tempRefused u64 = 0u64;
-mut tempSent u64 = 0u64;
-
 // The script's scene requests, sent after frame 'f' is presented
-pub fn driveScene(f u64) {
-  skyDrive(f);
-  glowDrive(f);
-  vegDrive(f);
+pub fn driveScene(st &mut SceneState, f u64) {
+  skyDrive(st, f);
+  glowDrive(st, f);
+  vegDrive(st, f);
+  imm scene = &mut st.scene;
+  imm cast = &mut st.cast;
+  imm sc = &mut st.script;
+  // A part made and taken away again through the scene's requests, and a
+  // request sent afterwards to its stale id, which must be refused
   if f == 3u64 {
-    tempApplied = scene.applied;
-    tempRefused = scene.refused;
-    tempSent = scene.door.sent;
-    tempPart = scene.newPart("temporary cube");
+    sc.tempApplied = scene.applied;
+    sc.tempRefused = scene.refused;
+    sc.tempSent = scene.door.sent;
+    sc.tempPart = scene.newPart("temporary cube");
     imm cube = scene.door.defineMesh(Mesh.cube(0.5));
     imm red = scene.door.defineMaterial(Look.plain(new Color(1., 0., 0., 1.)), Image.empty(), Maps.none());
-    scene.send(Request.Show[tempPart, cube, red, 0.]);
+    scene.send(Request.Show[sc.tempPart, cube, red, 0.]);
   }
-  if f == 5u64 { scene.send(Request.Despawn[tempPart]); }
-  if f == 7u64 { scene.send(Request.Place[tempPart, Transform3.identity()]); }
+  if f == 5u64 { scene.send(Request.Despawn[sc.tempPart]); }
+  if f == 7u64 { scene.send(Request.Place[sc.tempPart, Transform3.identity()]); }
   // The plain walker, after its beach walk, is set down at the old flat
   // world's walk (0, 5), shifted onto the lowland, where the rest of the walk begins
   if f == 95u64 {
@@ -413,7 +437,10 @@ fn near(name &[]u8, got f32, want f32, within f32) bool {
 // or giving off particles. The world was handed only the Door, which holds
 // no table: that is the compiler's to check (scene's tables are private to
 // the scene module), and this checks what the world sent arrived.
-fn checkWorld() bool {
+fn checkWorld(st &mut SceneState) bool {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm rendered = &st.rendered;
   mut ok = world.done();
   print <- "The world: "; print <- world.ids.len(); print <- " parts sent (want "; print <- worldParts(); print <- ")";
   if !world.done() { print <- ", NOT every object sent"; }
@@ -426,14 +453,14 @@ fn checkWorld() bool {
     imm id = *world.ids[i];
     if scene.isLive(id) { live = live + 1usize; }
     if scene.isPlaced(id) { placed = placed + 1usize; }
-    if isDrawn(id) { drawn = drawn + 1usize; }
+    if rendered.isDrawn(id) { drawn = drawn + 1usize; }
     i = i + 1usize;
   }
   print <- "; live "; print <- live; print <- ", placed "; print <- placed;
-  if hasGpu() { print <- ", drawn or emitting "; print <- drawn; }
+  if rendered.gpu { print <- ", drawn or emitting "; print <- drawn; }
   print <- "\n";
   if live != worldParts() or placed != worldParts() { ok = false; }
-  if hasGpu() and drawn != worldParts() { ok = false; }
+  if rendered.gpu and drawn != worldParts() { ok = false; }
   print <- "  the scene: "; print <- scene.partCount(); print <- " parts (want "; print <- SHELL_PARTS + worldParts() + SCRIPT_FIGURES * FIGURE_PARTS;
   print <- "); sent "; print <- scene.door.sent; print <- " = applied "; print <- scene.applied; print <- " + refused ";
   print <- scene.refused; print <- " (want 1), waiting "; print <- scene.waiting(); print <- "\n";
@@ -454,11 +481,6 @@ fn checkWorld() bool {
 // items: each tree two parts, the rest one)
 fn worldParts() usize { 71usize + vegetationParts(); }   // 72 less the boulder, now among the rocks
 
-// Part 'id''s shape's bounds in its own frame, as the picking system keeps them
-fn boundsOf(id PartId) Aabb3 {
-  picks.boundsOf(id);
-}
-
 fn nearBox(name &[]u8, b Aabb3, lo Vec3, hi Vec3) bool {
   mut ok = near(name, b.max.y, hi.y, 0.001);
   ok = near("    its x from", b.min.x, lo.x, 0.001) and ok;
@@ -475,16 +497,19 @@ fn nearBox(name &[]u8, b Aabb3, lo Vec3, hi Vec3) bool {
 // and, at its top oversailing course, 5 x 4 bricks (1.125 x 0.9 m); both
 // drawn physically based, with a GPU; the horn-flower's and the chimney's
 // parts all there
-fn checkStep4() bool {
+fn checkStep4(st &mut SceneState) bool {
+  imm world = &st.world;
+  imm picks = &st.picks;
+  imm rendered = &st.rendered;
   print <- "The amphora, the chimney, the horn-flower:\n";
   imm amphora = world.partOf(AMPHORA, 0usize);
-  mut ok = nearBox("  the amphora's height", boundsOf(amphora), new Vec3(-0.3368, 0., -0.3368), new Vec3(0.3368, 1.484, 0.3368));
+  mut ok = nearBox("  the amphora's height", picks.boundsOf(amphora), new Vec3(-0.3368, 0., -0.3368), new Vec3(0.3368, 1.484, 0.3368));
   imm stack = world.partOf(COTTAGE, COTTAGE_STACK);
-  ok = nearBox("  the chimney stack's height", boundsOf(stack), new Vec3(-0.5625, 0., -0.45), new Vec3(0.5625, 3.525, 0.45)) and ok;
+  ok = nearBox("  the chimney stack's height", picks.boundsOf(stack), new Vec3(-0.5625, 0., -0.45), new Vec3(0.5625, 3.525, 0.45)) and ok;
   print <- "  parts: horn-flower "; print <- world.partsOf(HORNFLOWER); print <- " (want 4)\n";
   if world.partsOf(HORNFLOWER) != 4usize { ok = false; }
-  if hasGpu() {
-    imm both = isPhysical(amphora) and isPhysical(stack);
+  if rendered.gpu {
+    imm both = rendered.isPhysical(amphora) and rendered.isPhysical(stack);
     print <- "  the amphora and the stack drawn physically based: ";
     if both { print <- "yes\n"; } else { print <- "NO\n"; ok = false; }
   }
@@ -497,12 +522,16 @@ fn checkStep4() bool {
 // chimney stack standing at the eave on its shaft against the right eave wall,
 // and the lanterns' glass, bulb and metal each one material across the three
 // path lanterns and the two wall ones
-fn checkCottage() bool {
+fn checkCottage(st &mut SceneState) bool {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm picks = &st.picks;
+  imm rendered = &st.rendered;
   print <- "The cottage:\n";
   imm root = world.partOf(COTTAGE, COTTAGE_ROOT);
-  mut ok = nearBox("  the door's top", boundsOf(world.partOf(COTTAGE, COTTAGE_DOOR)), new Vec3(-0.4, 0.6, 0.), new Vec3(0.4, 2.6, 0.045));
-  imm walls = boundsOf(world.partOf(COTTAGE, 1usize));
-  ok = near("  the ridge (the roofs' top)", boundsOf(world.partOf(COTTAGE, COTTAGE_ROOF)).max.y, 6.999, 0.001) and ok;
+  mut ok = nearBox("  the door's top", picks.boundsOf(world.partOf(COTTAGE, COTTAGE_DOOR)), new Vec3(-0.4, 0.6, 0.), new Vec3(0.4, 2.6, 0.045));
+  imm walls = picks.boundsOf(world.partOf(COTTAGE, 1usize));
+  ok = near("  the ridge (the roofs' top)", picks.boundsOf(world.partOf(COTTAGE, COTTAGE_ROOF)).max.y, 6.999, 0.001) and ok;
   ok = near("    the wing's far wall", walls.min.x, -5.3, 0.001) and ok;
   ok = near("    the main block's depth, to z", walls.min.z, -6., 0.001) and ok;
   imm stack = world.partOf(COTTAGE, COTTAGE_STACK);
@@ -529,54 +558,55 @@ fn checkCottage() bool {
   print <- "  parts: cottage "; print <- world.partsOf(COTTAGE); print <- " (want "; print <- COTTAGE_PARTS; print <- "), path lanterns ";
   print <- world.partsOf(LANTERNS); print <- " (want "; print <- LANTERN_PARTS; print <- ")\n";
   if world.partsOf(COTTAGE) != COTTAGE_PARTS or world.partsOf(LANTERNS) != LANTERN_PARTS { ok = false; }
-  if hasGpu() {
+  if rendered.gpu {
     // A path lantern's stake and cap in the one metal, its glass and bulb in the world's two others, shared with the wall lanterns
-    imm stake = drawnMaterial(world.partOf(LANTERNS, 0usize));
-    imm glass = drawnMaterial(world.partOf(LANTERNS, 1usize));
-    imm bulb = drawnMaterial(world.partOf(LANTERNS, 2usize));
-    imm same = stake == drawnMaterial(world.partOf(LANTERNS, 3usize)) and glass == drawnMaterial(world.partOf(LANTERNS, 5usize))
-      and glass == drawnMaterial(world.partOf(LANTERNS, 9usize))
-      and bulb == drawnMaterial(world.partOf(LANTERNS, 10usize))
-      and stake == drawnMaterial(world.partOf(COTTAGE, COTTAGE_LANTERNS))
-      and glass == drawnMaterial(world.partOf(COTTAGE, COTTAGE_LANTERNS + 1usize))
-      and bulb == drawnMaterial(world.partOf(COTTAGE, COTTAGE_LANTERNS + 6usize))
+    imm stake = rendered.materialOf(world.partOf(LANTERNS, 0usize));
+    imm glass = rendered.materialOf(world.partOf(LANTERNS, 1usize));
+    imm bulb = rendered.materialOf(world.partOf(LANTERNS, 2usize));
+    imm same = stake == rendered.materialOf(world.partOf(LANTERNS, 3usize)) and glass == rendered.materialOf(world.partOf(LANTERNS, 5usize))
+      and glass == rendered.materialOf(world.partOf(LANTERNS, 9usize))
+      and bulb == rendered.materialOf(world.partOf(LANTERNS, 10usize))
+      and stake == rendered.materialOf(world.partOf(COTTAGE, COTTAGE_LANTERNS))
+      and glass == rendered.materialOf(world.partOf(COTTAGE, COTTAGE_LANTERNS + 1usize))
+      and bulb == rendered.materialOf(world.partOf(COTTAGE, COTTAGE_LANTERNS + 6usize))
       and !(glass == bulb) and !(glass == stake);
     print <- "  the five lanterns' glass, bulbs and metal each one shared material: ";
     if same { print <- "yes\n"; } else { print <- "NO\n"; ok = false; }
     // The windows' glass its own part, drawn
     print <- "  the window panes and the door's panes drawn, as parts of their own: ";
-    if isDrawn(world.partOf(COTTAGE, COTTAGE_PANES)) and isDrawn(world.partOf(COTTAGE, COTTAGE_PANES + 2usize)) {
+    if rendered.isDrawn(world.partOf(COTTAGE, COTTAGE_PANES)) and rendered.isDrawn(world.partOf(COTTAGE, COTTAGE_PANES + 2usize)) {
       print <- "yes\n";
     } else { print <- "NO\n"; ok = false; }
   }
   ok;
 }
 
-// The scene's time when the script's P and F keys took effect
-mut pausedAt f64 = 0d;
-mut fastFrom f64 = 0d;
-
 // The scene clock's keys, and the events on the scene's clock, at frame 'f'
-fn checkClock(f u64) bool {
+fn checkClock(st &mut SceneState, f u64) bool {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm cast = &st.cast;
+  imm sceneNow = st.sceneNow;
+  imm sc = &mut st.script;
   mut ok = true;
   imm step = 1d / 60d;
   if f == 256u64 {
-    pausedAt = sceneNow;
+    sc.pausedAt = sceneNow;
     if !scene.clock.paused { print <- "Frame 256: P did NOT pause scene time\n"; ok = false; }
   }
   if f == 270u64 {
     // Paused since frame 256's publish: 14 frames of steps, no scene time
     print <- "Frame 270, scene time paused since frame 256:\n";
-    ok = near("scene time", f32.from(sceneNow), f32.from(pausedAt), 0.) and ok;
+    ok = near("scene time", f32.from(sceneNow), f32.from(sc.pausedAt), 0.) and ok;
   }
   if f == 276u64 {
-    fastFrom = sceneNow;
+    sc.fastFrom = sceneNow;
     if scene.clock.rate() != 10u64 { print <- "Frame 276: F did NOT run scene time x10\n"; ok = false; }
   }
   if f == 290u64 {
     // From frame 276: frames 277 to 286 at x10, 287 to 290 at x1
     print <- "Frame 290, after 10 frames at x10 and 4 at x1:\n";
-    ok = near("scene time run", f32.from(sceneNow - fastFrom), f32.from(104d * step), 0.00001) and ok;
+    ok = near("scene time run", f32.from(sceneNow - sc.fastFrom), f32.from(104d * step), 0.00001) and ok;
     if scene.clock.paused or scene.clock.rate() != 1u64 { print <- "  the clock NOT back to x1\n"; ok = false; }
   }
   if f == 200u64 {
@@ -606,7 +636,10 @@ fn checkClock(f u64) bool {
 // balloon one tree under its envelope (the flame and pilot light under the
 // burner frame, the passengers under the basket); the two rooks drawn in one
 // material; every mesh but one with a material of its own
-fn checkSharing() bool {
+fn checkSharing(st &mut SceneState) bool {
+  imm scene = &st.scene;
+  imm world = &st.world;
+  imm rendered = &st.rendered;
   mut ok = true;
   print <- "The balloon's tree:";
   imm envelope = world.partOf(BALLOON, 0usize);
@@ -628,9 +661,9 @@ fn checkSharing() bool {
     or u64.from(scene.resourceCount()) != scene.door.meshes + scene.door.materials {
     ok = false;
   }
-  if hasGpu() {
-    imm a = drawnMaterial(world.partOf(ROOK, 0usize));
-    imm b = drawnMaterial(world.partOf(LATHED_ROOK, 0usize));
+  if rendered.gpu {
+    imm a = rendered.materialOf(world.partOf(ROOK, 0usize));
+    imm b = rendered.materialOf(world.partOf(LATHED_ROOK, 0usize));
     print <- "  the two rooks drawn in one material: ";
     if !a.isNone() and a == b { print <- "yes\n"; } else { print <- "NO\n"; ok = false; }
   }
@@ -645,7 +678,10 @@ fn yesNo(what &[]u8, cond bool) bool {
 // The mannequins' part of the run: Tab takes the first over (third person),
 // W walks it 75 steps, V to first person and back, Tab to the second, which
 // is lifted 6 m and falls: a hard landing, mailed to the world
-fn checkMannequinRun(f u64) bool {
+fn checkMannequinRun(st &mut SceneState, f u64) bool {
+  imm cast = &mut st.cast;
+  imm world = &st.world;
+  imm hardLandingsMailed = st.hardLandingsMailed;
   mut ok = true;
   if f == 665u64 {
     print <- "Frame 665, after Tab:\n";
@@ -700,8 +736,10 @@ fn checkMannequinRun(f u64) bool {
 }
 
 // What the script's events must have done by the end of frame 'f'
-pub fn checkScript(f u64, w &Walk) bool {
-  mut ok = checkMannequinRun(f);
+pub fn checkScript(st &mut SceneState, f u64, w &Walk) bool {
+  mut ok = checkMannequinRun(st, f);
+  imm scene = &st.scene;
+  imm sc = &st.script;
   if f == 2u64 {
     // The shell's requests and the world's first object's, applied at
     // frame 1's apply point
@@ -712,25 +750,25 @@ pub fn checkScript(f u64, w &Walk) bool {
   if f == 9u64 {
     // Since frame 3: the temporary cube spawned and shown, despawned, the
     // Place to its stale id refused; the world's requests all applied
-    imm sent = scene.door.sent - tempSent;
-    print <- "Frame 9: since frame 3, sent "; print <- sent; print <- ", applied "; print <- scene.applied - tempApplied;
-    print <- " (want "; print <- sent - 1u64; print <- "), refused "; print <- scene.refused - tempRefused;
+    imm sent = scene.door.sent - sc.tempSent;
+    print <- "Frame 9: since frame 3, sent "; print <- sent; print <- ", applied "; print <- scene.applied - sc.tempApplied;
+    print <- " (want "; print <- sent - 1u64; print <- "), refused "; print <- scene.refused - sc.tempRefused;
     print <- " (want 1)";
-    if scene.isReserved(tempPart) { print <- ", the stale id still RESERVED"; ok = false; }
+    if scene.isReserved(sc.tempPart) { print <- ", the stale id still RESERVED"; ok = false; }
     print <- "\n";
-    if scene.applied - tempApplied != sent - 1u64 or scene.refused - tempRefused != 1u64 { ok = false; }
+    if scene.applied - sc.tempApplied != sent - 1u64 or scene.refused - sc.tempRefused != 1u64 { ok = false; }
   }
   if f == 29u64 {
-    ok = checkWorld() and ok;
-    ok = checkStep4() and ok;
-    ok = checkCottage() and ok;
-    ok = checkSharing() and ok;
+    ok = checkWorld(st) and ok;
+    ok = checkStep4(st) and ok;
+    ok = checkCottage(st) and ok;
+    ok = checkSharing(st) and ok;
     print <- "Frame 29, standing on the landing beach:\n";
     ok = near("x", w.position.x, BEACH_X, 0.) and ok;
     ok = near("z", w.position.z, BEACH_Z, 0.) and ok;
     ok = near("on the ground, y", w.position.y, groundHeight(BEACH_X, BEACH_Z), 0.) and ok;
     ok = near("yaw", w.yaw, 0., 0.) and ok;
-    takeBalloonBase();
+    takeBalloonBase(st);
   }
   if f == 94u64 {
     // The beach walk: 60 steps at 12 m/s up the path's straight first stretch,
@@ -742,7 +780,7 @@ pub fn checkScript(f u64, w &Walk) bool {
     ok = near("eye height above it", w.pose().origin.y - w.position.y, 1.7, 0.0001) and ok;
     ok = yesNo("inside the fence", insideIslandFence(w.position.x, w.position.z)) and ok;
   }
-  ok = checkMotions(f) and ok;
+  ok = checkMotions(st, f) and ok;
   if f == 165u64 {
     print <- "Frame 165, set down at the flat world's walk (0, 5), shifted:\n";
     ok = near("x", w.position.x, WORLD_DX, 0.0001) and ok;
@@ -754,8 +792,8 @@ pub fn checkScript(f u64, w &Walk) bool {
     ok = near("yaw", w.yaw, -0.5235988, 0.00001) and ok;
     ok = near("z", w.position.z, 5. + WORLD_DZ, 0.001) and ok;
   }
-  ok = checkClock(f) and ok;
-  ok = checkGlow(f) and ok;
+  ok = checkClock(st, f) and ok;
+  ok = checkGlow(st, f) and ok;
   if f == 290u64 {
     // 6 m along the heading -30 degrees from -z: (6 sin 30, -6 cos 30)
     print <- "Frame 290, after 30 steps of Shift and W at 12 m/s:\n";
@@ -767,7 +805,7 @@ pub fn checkScript(f u64, w &Walk) bool {
     print <- "Frame 590, after 135 more steps of Shift and W:\n";
     ok = near("x", w.position.x, 16.5 + WORLD_DX, 0.01) and ok;
     ok = near("z", w.position.z, 5. - 28.578838 + WORLD_DZ, 0.01) and ok;
-    ok = checkWorld() and ok;
+    ok = checkWorld(st) and ok;
   }
   ok;
 }
