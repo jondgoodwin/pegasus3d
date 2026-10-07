@@ -325,7 +325,7 @@ frames keep coming while the world arrives.
 | horn-flower (stalk, leaves, petals, heart) | new (`hornflower.cone`): the horn, 2.4 m and cut short; `sculpt/examples/flower.cone`'s petals on the cut; five swept leaves | 2 m | 99,956 | 39 |
 | boulder | `sculpt/examples/pebble.cone` (one more subdivision) | 2 m | 768 | 0.4 |
 | horn | `sculpt/examples/hornfamily.cone`, stage 0 | 3 m along | 46,204 | 18 |
-| cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and stone paint tiles; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 270 (the chimney's maps 254 of it) |
+| cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
 | path lanterns (three: stake, glass, bulb, cap each) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 2,892 | 0.24 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
@@ -421,13 +421,17 @@ edge in the frame runs across, not back.
 
 **What is real geometry and what is material.** The battens are strips (5 cm wide, 2.5 cm proud, every 0.3 m on
 the front walls, the wing's end and the main block's right and left walls, cut round the door and windows);
-the boards between them are the wall material's paint. The shingles are the roof material's paint (rows 16 cm
-deep) on slabs 12 cm thick, not rows of geometry. The windows are real: a casing, a sash with muntins, and a pane
+the boards between them are the wall material's maps (surfacepatterns' siding, as plain boards 0.3 m wide, the
+tile's seams slid to lie under the battens). The shingles are the roof material's maps (surfacepatterns' cedar,
+courses 14 cm deep, tinted slate grey) on slabs 12 cm thick, not rows of geometry. The windows are real: a casing, a sash with muntins, and a pane
 that is a part of its own (all the windows' panes are one part, the door's another). Every surface kind is one
 material defined in `ctMaterials`, shared by every part of that kind: board, batten, shingle, trim, window
-frame, pane, door, timber, deck and stone; the paint tiles (boards 2 m, shingles 1.28 m, deck planks 1.12 m,
-stone) are made in `ctBoardPaint`, `ctShinglePaint`, `ctDeckPaint` and `ctStonePaint`, and are what the
-texture kit's maps replace. The brick chimney is `chimney.cone`'s stack, unchanged, standing on a shaft of 44
+frame, pane, door, timber, deck and stone. Four of them are baked from the `surfacepatterns` texture kit (a
+physically based material with colour, normal and ORM maps) in `ctBakeBoards` (siding, 512 x 512 over 1.8 m),
+`ctBakeShingles` (cedar, 256 over 1.12 m), `ctBakeDeck` (decking, 256 over 1.68 m) and `ctBakeStone` (garden
+flagstones, 512 over 2 m); the meshes' uvs are metres over each tile's side. The four bakes take about 0.6 s of
+the cottage's hydration. The renderer keeps no mip levels, so the roof and deck shimmer a little as the camera
+moves. The brick chimney is `chimney.cone`'s stack, unchanged, standing on a shaft of 44
 more courses of the same bond from the ground to the eave, on the right eave wall; its pot is 0.3 m above the
 ridge. The three path lanterns and the two wall lanterns are one family (stake or bracket, glass, bulb, cap), the
 glass and the bulb each its own part, in three materials the world shares.
