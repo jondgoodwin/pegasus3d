@@ -41,16 +41,19 @@ first run after a driver's shader cache is cleared makes the kernels in about 4 
 You start as an artist's wooden mannequin, 1.75 m tall, seen from behind and above (V for its eyes),
 8 m back from the origin, facing -z; a second, 1.62 m and clay red, stands idle (breathing, shifting its
 weight) a few metres off, turned towards you. Each is a 19-bone skeleton (Cone's `bonepose` package)
-with one rigid piece a bone (a limb's ellipsoid and a ball at its joint, `src/mannequin.cone`), every
-bone a part under the bone above it, so the scene's placement tree does the posing. Each step Cone's
+under one smooth body (`src/mannequin.cone`): the trunk, neck and head one tube of elliptical rings, each
+leg and arm one tube through its knee or elbow, flat-soled feet and mitten hands, lofted along the bones
+by Cone's `sculpt` and skinned on the GPU by `render` (linear blend skinning, each vertex's weights
+written at build time from where it lies along its bones), so knees, elbows and the waist bend as one
+surface. The being's part is shown as the body, posed each step by a `Bones` request of its skinning
+matrices. Each step Cone's
 `walkgait` writes the pose: a walk whose phase follows the distance travelled, so the feet do not
 skate, feet that roll heel, flat and toe, two-bone IK on the legs reaching each ankle to a place on the
 ground, the pelvis as high as the legs allow, the arms against the legs, and when standing, breathing
 and shifting weight. The body is a kinematic capsule on `groundHeight` (`src/ground.cone`: flat today,
 the one function T1's terrain will replace) with gravity: a landing at 7 m/s or more (a 2.5 m drop) is
 HARD, the pelvis crouches, and the scene mails a `HardLanding` to the world; one above 10 m/s hurts the
-being's health, to nothing left at 24 m/s. The body is a smooth skinned figure in the second half of T2,
-once the render core has dynamic vertex buffers and custom pipelines.
+being's health, to nothing left at 24 m/s.
 
 ## The sky and the birds
 
@@ -134,8 +137,8 @@ scene time stood still while paused and ran ten times as fast at x10; that the w
 for 3 s) rang at the first frame at or after 3 s; that the world was told the walker came up to the
 launch button (an area) and is still there; the day clock's reading; that the balloon is one tree as
 built; and that the two rooks share one material (11 more meshes than materials defined: the rooks'
-one, the cottage's 22 meshes in 16 materials, the lanterns' 4 meshes in the cottage's 3, plus each
-mannequin's meshes in its one material; and, with a GPU, both rooks drawn in the same material).
+one, the cottage's 22 meshes in 16 materials, the lanterns' 4 meshes in the cottage's 3; each
+mannequin is one skinned mesh in one material; and, with a GPU, both rooks drawn in the same material).
 The scripted run starts as the plain walker (so its walk checks stay exact) with the two mannequins
 standing off to the right; from frame 660 it presses Tab (the first mannequin is possessed, in third
 person), walks it with W for 60 steps, presses V (first person, the camera at its eyes socket) and
@@ -163,7 +166,9 @@ being coming in moving the first out; and possession, the user's intents moving 
 being and the camera following it; and the mannequin: a capsule dropped from 0.5, 3.5 and 8 m landing
 at v = sqrt(2 g h), the hard landings mailed once each and the hurt (nothing to 10 m/s, 0.18 at
 12.5 m/s) taken from health, a 6 s walk whose gait speed follows the intent and whose planted foot does
-not move more than 1 cm, standing with both feet flat and level, the third-person camera 3.2 m behind
+not move more than 1 cm, its skinned sole (skinned by render's CPU twin of the GPU's skinning) within
+1 cm of where the planted sole socket carries it, not sliding and on the ground, standing with both feet
+flat and level, the third-person camera 3.2 m behind
 and the first-person one at the eyes socket, and Tab possessing the other mannequin with the camera and
 the controls following it; and the sky (`src/skychecks.cone`): the sun at the clock's noon (64.8 degrees,
 due south), dusk and dawn (-0.84 degrees, its centre at the horizon), the sun below the horizon and the

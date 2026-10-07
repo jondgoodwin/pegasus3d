@@ -18,6 +18,8 @@
 //   possession           two beings, one possessed: the user's intents move
 //                        only it, and the camera (the snapshot's eye) follows
 //                        whichever is possessed
+//   the mannequin        landings, the walk, its planted feet and its skinned
+//                        soles, the views, possession
 
 const CHECK_STEP_NS = 16666667u64;
 
@@ -380,6 +382,22 @@ fn checkMannequin() bool {
   imm a = c.add(mannequinBeing(&mut s, "one", new Vec3(0., 0., 0.), 1.75, 3u32));
   imm b = c.add(mannequinBeing(&mut s, "two", new Vec3(3., 0., 0.), 1.62, 11u32));
   c.possess(a);
+  // The skinned body of the first, and its left sole: the vertices wholly
+  // the left foot's within 5 mm of the ground as modelled, each where the
+  // sole socket is at rest
+  mut skin = Skin.empty();
+  imm body = bodyMesh(&c.beings[a].figure.skeleton, 1.75, &mut skin);
+  mut rest = List[Transform3].empty();
+  c.beings[a].figure.skeleton.modelTransforms(&c.beings[a].figure.pose, &mut rest);
+  imm soleRest = c.beings[a].figure.skeleton.socketModel(&rest, bonepose.SOCKET_SOLE_L).inverse();
+  mut sole = List[usize].empty();
+  mut v = 0usize;
+  while v < body.positions.len() {
+    if skin.joint(v, 0usize) == bonepose.FOOT_L and skin.weight(v, 0usize) == 1. and body.positions[v].y < 0.005 {
+      sole.push(v);
+    }
+    v = v + 1usize;
+  }
   imm walk = new Intents(1., 0., false, false);
   mut k = 0;
   mut worst = 0.;
@@ -387,6 +405,13 @@ fn checkMannequin() bool {
   mut inFlat = false;
   mut planted = new Vec3(0., 0., 0.);
   mut wasFlat = false;
+  mut soleOff = 0.;         // the farthest a sole vertex was from where the planted sole socket carries it
+  mut soleLow = 1.;         // the lowest sole vertex's height, at its lowest and its highest, planted
+  mut soleHigh = -1.;
+  mut soleSlide = 0.;       // the farthest a sole vertex moved from where it was planted
+  mut plantedStance = 0;     // the stance 'plantedSole' was taken in
+  mut rollLow = 1.;         // the lowest sole vertex in the whole stance, rolling heel and toe too
+  mut plantedSole = List[Vec3].empty();
   while k < 360 {
     c.step(walk, 1. / 60.);
     imm f = &c.beings[a].figure;
@@ -399,8 +424,51 @@ fn checkMannequin() bool {
       if d > worst { worst = d; }
     }
     wasFlat = inFlat;
+    // The skinned sole (skinned by the CPU's twin of the GPU's skinning)
+    if k > 60 and !f.walker.left.swinging {
+      imm bones = f.skinning();
+      imm socket = f.skeleton.socketModel(&f.models, bonepose.SOCKET_SOLE_L);
+      mut lowest = 1.0e9;
+      mut i = 0usize;
+      while i < sole.len() {
+        imm at = *sole[i];
+        imm p = *body.positions[at];
+        imm skinned = c.beings[a].body.position + yq * skin.skinPoint(at, bones.view(), p);
+        if skinned.y < lowest { lowest = skinned.y; }
+        if inFlat {
+          // Planted: where the sole socket carries it, and not moving
+          imm carried = c.beings[a].body.position + yq * socket.transformPoint(soleRest.transformPoint(p));
+          imm off = (skinned - carried).length();
+          if off > soleOff { soleOff = off; }
+          if i == 0usize and (plantedSole.len() == 0usize or stances != plantedStance) {
+            plantedSole.clear();
+          }
+          if plantedSole.len() < sole.len() {
+            plantedSole.push(skinned);
+          } else {
+            imm slide = (skinned - *plantedSole[i]).length();
+            if slide > soleSlide { soleSlide = slide; }
+          }
+        }
+        i = i + 1usize;
+      }
+      if inFlat {
+        if lowest < soleLow { soleLow = lowest; }
+        if lowest > soleHigh { soleHigh = lowest; }
+        plantedStance = stances;
+      }
+      if lowest < rollLow { rollLow = lowest; }
+    }
     k = k + 1;
   }
+  print <- "  (the skinned left sole, "; print <- sole.len(); print <- " vertices, planted: at most ";
+  print <- soleOff * 1000.; print <- " mm from where the sole socket carries it, sliding at most ";
+  print <- soleSlide * 1000.; print <- " mm, its lowest "; print <- soleLow * 1000.; print <- " to "; print <- soleHigh * 1000.;
+  print <- " mm above the ground; rolling over the ball at toe-off, with no toe joint, the toe dips to ";
+  print <- rollLow * 1000.; print <- " mm)\n";
+  ok = expect("the skinned left sole, planted, within 1 cm of where the planted sole socket carries it, and not sliding",
+    sole.len() > 20usize and stances >= 4 and soleOff < 0.01 and soleSlide < 0.01) and ok;
+  ok = expect("and on the ground: its lowest vertex within 1 cm of it", soleLow > -0.01 and soleHigh < 0.01) and ok;
   ok = expect("walked 6 s at the walking pace, 1.8 m/s along -z less the 0.12 m its speed took to ramp up (12 m/s^2)",
     nearly(c.beings[a].body.position.z, -(1.8 * 6. - 0.12), 0.01)) and ok;
   ok = expect("the gait's speed followed the intent", nearly(c.beings[a].figure.walker.speed, 1.8, 0.02)) and ok;
