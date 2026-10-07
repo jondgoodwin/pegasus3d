@@ -33,8 +33,10 @@
 //   - rigid attachments, parts of their own (none yet).
 //
 // THE CAPSULE is kinematic, not a rigid body: the body's feet are on the
-// ground's height under it (groundHeight, ground.cone: the highest of its
-// footprint, flat today, the terrain's when T1 lands) when it stands; it
+// height of what it stands on (support.cone: the island's ground, or a
+// platform's floor such as the balloon's basket, the highest of its
+// footprint) when it stands, and a platform's walls stop it; standing on a
+// platform it is carried by it, held up only by the floor; it
 // follows the ground up and down within a step of 0.4 m, stays stuck to it
 // going down within 0.35 m, and otherwise falls under gravity (9.81 m/s^2,
 // at most 55 m/s) until the ground is reached, which is a landing at the
@@ -76,10 +78,18 @@ pub struct Figure {
   pub landed bool;                    // the last step ended in a landing
   pub landSpeed f32;                  // at this speed
   pub hardLandings u32;
+  pub on PartId;                      // the platform it stands on (support.cone); none: the ground, or the air
+  pub platformVel Vec3;               // that platform's velocity where it stands, m/s, the last frame
+  pub downFor f32;                    // seconds since a fall emptied its health (it gets up again: Being.step)
+  pub respawns u32;                   // times it has got up again at the landing
+  pub anchor Vec3;                    // where it stands on its platform, in the platform's frame (support.cone)
+  pub anchorAt Vec3;                  // and where that put it in the world, the last carry
+  pub anchored bool;
 
   pub fn none() Figure {
     new Figure(false, 0., bonepose.Skeleton.empty(), bonepose.Pose.empty(), List[Transform3].empty(), walkgait.Walker.make(1., 0u32),
-      List[PartId].empty(), List[Mat4].empty(), 0., 0., 0., 0., true, 1., false, 0., 0u32);
+      List[PartId].empty(), List[Mat4].empty(), 0., 0., 0., 0., true, 1., false, 0., 0u32, PartId.none(), new Vec3(0., 0., 0.), 0., 0u32,
+      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false);
   }
 
   // A standing figure of 'height' metres, with the rigid attachments 'parts'
@@ -95,7 +105,16 @@ pub struct Figure {
       i = i + 1usize;
     }
     new Figure(true, height, skel, pose, List[Transform3].empty(), walkgait.Walker.make(height, seed), parts, bind,
-      0., 0., 0., 0., true, 1., false, 0., 0u32);
+      0., 0., 0., 0., true, 1., false, 0., 0u32, PartId.none(), new Vec3(0., 0., 0.), 0., 0u32,
+      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false);
+  }
+
+  // Carried by a platform's move (support.cone's carryRiders): the gait's
+  // feet, which are held at points of the world, moved and turned with it,
+  // so a planted foot stays where it stood on the floor
+  pub fn carried(self &mut, c &Carry, yaw f32) {
+    carryFoot(&mut walker.left, c, yaw);
+    carryFoot(&mut walker.right, c, yaw);
   }
 
   // Its skinning matrices for the pose of its last step, one a bone: each
@@ -124,14 +143,20 @@ pub struct Figure {
   }
 
   // One fixed step of 'dt' seconds by 'it' for the body 'body' (its feet's
-  // ground point and yaw): turn, accelerate, jump or fall, land, and pose
+  // ground point and yaw): turn, accelerate, jump or fall, land, and pose.
+  // What it stands on is the ground or a platform's floor (support.cone),
+  // and a platform's walls stop it.
   pub fn step(self &mut, body &mut Walk, it Intents, dt f32) {
     landed = false;
+    imm wasOn = on;
+    standFrom(body.position.y);
     body.yaw = body.yaw + it.turn * TURN_RATE * dt;
     imm fx = 0. - sin(body.yaw);
     imm fz = 0. - cos(body.yaw);
     mut pos = body.position;
     imm was = pos;
+    // Leaving a platform, it goes on at the platform's velocity as well as its own
+    imm carry = if on.isNone() { new Vec3(0., 0., 0.); } else { platformVel; };
     if grounded {
       imm target = it.ahead * (if it.run { RUN_SPEED; } else { WALK_SPEED; });
       imm dv = GROUND_ACCEL * dt;
@@ -141,16 +166,18 @@ pub struct Figure {
       pos = new Vec3(pos.x + fx * speed * dt, pos.y, pos.z + fz * speed * dt);
       if it.jump {
         grounded = false;
-        vy = JUMP_SPEED;
-        airVx = fx * speed;
-        airVz = fz * speed;
+        vy = JUMP_SPEED + carry.y;
+        airVx = fx * speed + carry.x;
+        airVz = fz * speed + carry.z;
       }
     } else {
       vy = vy - GRAVITY * dt;
       if vy < 0. - TERMINAL_SPEED { vy = 0. - TERMINAL_SPEED; }
       pos = new Vec3(pos.x + airVx * dt, pos.y, pos.z + airVz * dt);
     }
-    imm ground = footprintHeight(pos.x, pos.z, self.radius());
+    pos = hitWalls(was, pos, self.radius(), height);
+    mut under = PartId.none();
+    imm ground = supportFootprint(pos.x, pos.z, self.radius(), was.y, &mut under);
     if grounded {
       if ground > pos.y + STEP_UP {
         // Too high a step: blocked, stopped
@@ -158,14 +185,16 @@ pub struct Figure {
         speed = 0.;
       } elif pos.y - ground <= SNAP_DOWN {
         pos = new Vec3(pos.x, ground, pos.z);
+        on = under;
       } else {
-        // Walked off an edge: falling, keeping its way
+        // Walked off an edge: falling, keeping its way (and its platform's)
         grounded = false;
-        vy = 0.;
-        airVx = fx * speed;
-        airVz = fz * speed;
+        vy = carry.y;
+        airVx = fx * speed + carry.x;
+        airVz = fz * speed + carry.z;
       }
     }
+    if !grounded { on = PartId.none(); }
     if !grounded {
       pos = new Vec3(pos.x, pos.y + vy * dt, pos.z);
       if pos.y <= ground and vy <= 0. {
@@ -174,6 +203,7 @@ pub struct Figure {
         vy = 0.;
         grounded = true;
         landed = true;
+        on = under;
         // On the ground it goes on at the speed along its heading it had
         speed = airVx * fx + airVz * fz;
         if landSpeed >= HARD_LANDING_SPEED {
@@ -187,8 +217,30 @@ pub struct Figure {
       }
     }
     body.position = pos;
+    // On another floor (or none): where it stands on it is found afresh
+    if !(on == wasOn) { anchored = false; }
     walker.update(&skeleton, &mut pose, &mut models, pos, body.yaw, if grounded { speed; } else { 0.; },
-      it.turn * TURN_RATE, grounded, &groundHeight, dt);
+      it.turn * TURN_RATE, grounded, &supportHeight, dt);
+  }
+
+  // Set down standing at 'at' facing 'yaw' (getting up again after a fall
+  // emptied its health, or a script putting it somewhere): whole, still,
+  // its gait started afresh
+  pub fn setDown(self &mut, body &mut Walk, at Vec3, yaw f32) {
+    body.position = at;
+    body.yaw = yaw;
+    health = 1.;
+    speed = 0.;
+    vy = 0.;
+    airVx = 0.;
+    airVz = 0.;
+    grounded = true;
+    landed = false;
+    on = PartId.none();
+    anchored = false;
+    downFor = 0.;
+    walker.started = false;
+    walker.crouchDepth = 0.;
   }
 
   // What a landing at 'impact' m/s costs, as a fraction of health: nothing
@@ -200,6 +252,18 @@ pub struct Figure {
     if d > 1. { return 1.; }
     d;
   }
+}
+
+// A gait's foot carried by a platform's move: every point it keeps in the
+// world moved with the floor, every heading turned with it
+fn carryFoot(f &mut walkgait.Foot, c &Carry, yaw f32) {
+  f.heel = c.point(f.heel);
+  f.landHeel = c.point(f.landHeel);
+  f.liftAnkle = c.point(f.liftAnkle);
+  f.ankle = c.point(f.ankle);
+  f.yaw = f.yaw + yaw;
+  f.liftYaw = f.liftYaw + yaw;
+  f.landYaw = f.landYaw + yaw;
 }
 
 // ---- The body: one mesh lofted along the bones, and its skin ----

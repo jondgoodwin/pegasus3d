@@ -29,6 +29,13 @@
 // the rig's last two steps (the scene publishes them in its snapshot).
 // A plain walker has only first person.
 
+// How long a being whose health a fall emptied lies before it gets up again
+// on the landing beach, seconds
+pub const RESPAWN_AFTER f32 = 2.;
+// How high above the ground the fence still holds a being (a jump's height,
+// and more): above it, a body falling from a platform is not held
+const FENCE_REACH f32 = 2.;
+
 // What a being means to do this step, whoever decided it
 pub struct Intents {
   pub ahead f32;              // -1 (back) to 1 (forward)
@@ -48,27 +55,55 @@ pub struct Being {
   pub before Walk;
   pub intents Intents;
   pub figure Figure;
+  pub respawned bool;         // its last step got it up again on the landing beach
 
-  pub fn make(part PartId, body Walk) Being { new Being(part, body, body, Intents.none(), Figure.none()); }
+  pub fn make(part PartId, body Walk) Being { new Being(part, body, body, Intents.none(), Figure.none(), false); }
 
   // A mannequin standing at 'at' facing 'yaw', shown by 'figure'
   pub fn mannequin(part PartId, at Vec3, yaw f32, figure Figure) Being {
     imm body = Walk.make(at, yaw);
-    new Being(part, body, body, Intents.none(), figure);
+    new Being(part, body, body, Intents.none(), figure, false);
   }
 
   // One fixed step of 'dt' seconds, by 'given'
   pub fn step(self &mut, given Intents, dt f32) {
     intents = given;
     before = body;
+    respawned = false;
     if figure.active {
-      figure.step(&mut body, given, dt);
-      // Held by the island's fence and wading limit (it slides along them)
-      body.position = islandConstrain(before.position, body.position);
+      // Down after a fall that emptied its health: it lies RESPAWN_AFTER
+      // seconds, then gets up on the landing beach, where the island begins
+      if figure.health <= 0. {
+        figure.downFor = figure.downFor + dt;
+        if figure.downFor >= RESPAWN_AFTER {
+          figure.setDown(&mut body, new Vec3(BEACH_X, groundHeight(BEACH_X, BEACH_Z), BEACH_Z), 0.);
+          figure.respawns = figure.respawns + 1u32;
+          before = body;
+          respawned = true;
+          print <- "A mannequin's fall emptied its health: it gets up again on the landing beach\n";
+        }
+      }
+      figure.step(&mut body, if figure.health <= 0. { Intents.none(); } else { given; }, dt);
+      // Held by the island's fence and wading limit (it slides along them),
+      // but only on or near the ground (walking, or a jump) from inside it:
+      // a body a platform carries is not stopped by the fence, and one that
+      // falls from high up lands where it falls, outside it or not (and
+      // walks on from there)
+      if figure.on.isNone() and insideIslandFence(before.position.x, before.position.z)
+        and body.position.y - groundHeight(body.position.x, body.position.z) < FENCE_REACH {
+        body.position = islandConstrain(before.position, body.position);
+      }
       body.eyeHeight = figure.eyeModel().y;
     } else {
       body.step(intents.ahead, intents.turn, intents.run, dt);
     }
+  }
+
+  // A mannequin set down standing at 'at' facing 'yaw' (a script's hook):
+  // its gait started afresh, the picture not drawn from where it was
+  pub fn setDown(self &mut, at Vec3, yaw f32) {
+    figure.setDown(&mut body, at, yaw);
+    before = body;
   }
 
   // Where its eyes are after the last step: a plain walker's, or the
@@ -125,6 +160,18 @@ pub struct ViewRig {
 
   // Forget the smoothing: the next update puts the camera where it belongs
   pub fn snap(self &mut) { fresh = true; }
+
+  // Carried with the being it follows by a platform's move (support.cone):
+  // both poses and the third person's smoothed place moved and turned with
+  // it, the first person's smoothed height raised with it, so the camera
+  // keeps its place on the ride instead of trailing behind it
+  pub fn carried(self &mut, c &Carry, yaw f32) {
+    imm q = Quat.angleAxis(yaw, new Vec3(0., 1., 0.));
+    before = new Pose(c.point(before.origin), q * before.orientation);
+    now = new Pose(c.point(now.origin), q * now.orientation);
+    cam = c.point(cam);
+    eyeY = eyeY + (c.now.y - c.was.y);
+  }
 
   // The camera for being 'b' after its step of 'dt' seconds
   pub fn update(self &mut, b &Being, dt f32) {
@@ -204,6 +251,7 @@ pub struct Cast {
   // 'intents', the others standing (no controller of their own yet); then
   // the view; hard landings noted
   pub fn step(self &mut, user Intents, dt f32) {
+    mut moved = false;
     mut i = 0usize;
     while i < beings.len() {
       imm b = &mut beings[i];
@@ -211,8 +259,11 @@ pub struct Cast {
       if b.figure.active and b.figure.landed and b.figure.landSpeed >= HARD_LANDING_SPEED {
         landings.push(new Landing(b.part, b.figure.landSpeed, b.figure.damageOf(b.figure.landSpeed)));
       }
+      if b.respawned and i == possessed { moved = true; }
       i = i + 1usize;
     }
+    // The camera goes with a possessed being that got up somewhere else
+    if moved { rig.snap(); }
     self.look(dt);
   }
 

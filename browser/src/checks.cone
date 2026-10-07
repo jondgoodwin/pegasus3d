@@ -511,6 +511,261 @@ fn checkMannequin() bool {
   ok;
 }
 
+// ---- Platforms: a floor that carries what stands on it ----
+
+// One frame of a platform's ride: its part 'car' placed at 'at', the
+// placements propagated, the bodies on it carried (support.cone), the
+// supports handed to the physics, and the beings stepped by 'it', as the
+// scene actor's frame does them
+fn rideFrame(s &mut Scene, c &mut Cast, moves &mut List[PlatformMove], car PartId, at Transform3, it Intents) {
+  s.applyPlace(car, at);
+  s.propagate();
+  s.platformMoves(moves);
+  carryRiders(c, moves, 1. / 60.);
+  setSupports(s);
+  c.step(it, 1. / 60.);
+}
+
+// The car's place 't' seconds into a turning climb: round a circle 20 m
+// in radius from (30, 30, 0), 5 m/s, climbing 1 m/s, turned with its heading
+fn carOnArc(t f32) Transform3 {
+  imm a = 0.25 * t;
+  new Transform3(new Vec3(30. + 20. * sin(a), 30. + t, 20. * cos(a) - 20.), Quat.angleAxis(a, new Vec3(0., 1., 0.)),
+    new Vec3(2., 2., 2.));
+}
+
+// A point in the deck's frame, in metres (the car is scaled 2)
+fn deckPoint(s &Scene, deck PartId, p Vec3) Vec3 { (s.worldMatrix(deck).inverse() * p) * 2.; }
+
+fn checkPlatforms() bool {
+  print <- "Platforms:\n";
+  mut s = Scene.empty();
+  mut c = Cast.empty();
+  mut moves = List[PlatformMove].empty();
+  // A car, scaled 2 (so its frame's unit is 2 m), and under it a deck 0.5 up:
+  // the deck a platform, its floor 4 m by 4.4 m, walls 1.2 m high on three
+  // sides (at its -x, +x and -z edges), open at +z
+  imm car = livePart(&mut s, "car");
+  imm deck = livePart(&mut s, "deck");
+  s.applyPlace(deck, new Transform3(new Vec3(0., 0.5, 0.), Quat.identity(), new Vec3(1., 1., 1.)));
+  s.applyParent(deck, car);
+  mut ok = s.applyPlatform(deck, PlatformShape.make(0., new Vec2(-1., -1.), new Vec2(1., 1.2), 0.6,
+    WALL_MIN_X | WALL_MAX_X | WALL_MIN_Z));
+  imm still = Intents.none();
+  rideFrame(&mut s, &mut c, &mut moves, car, carOnArc(0.), still);
+  // A mannequin on the deck's floor, in its middle, facing out of its open side
+  imm floor = s.worldMatrix(deck) * new Vec3(0., 0., 0.);
+  imm r = c.add(mannequinBeing(&mut s, "rider", floor, 1.75, 5u32));
+  c.possess(r);
+  c.beings[r].body.yaw = 0. - pi;
+  c.beings[r].before = c.beings[r].body;
+
+  // Standing still while the car climbs and turns for 6 s (the deck moving 5 m/s and turning 14 degrees a second)
+  mut k = 1;
+  mut onAll = true;
+  mut drift = 0.;
+  mut turned = 0.;
+  mut footDrift = 0.;
+  rideFrame(&mut s, &mut c, &mut moves, car, carOnArc(1. / 60.), still);
+  imm start = deckPoint(&s, deck, c.beings[r].body.position);
+  imm heel0 = deckPoint(&s, deck, c.beings[r].figure.walker.left.heel);
+  imm yaw0 = c.beings[r].body.yaw - 1. / 60. * 0.25;
+  while k < 360 {
+    imm t = f32.from(k + 1) / 60.;
+    rideFrame(&mut s, &mut c, &mut moves, car, carOnArc(t), still);
+    if !(c.beings[r].figure.on == deck) or !c.beings[r].figure.grounded { onAll = false; }
+    imm d = (deckPoint(&s, deck, c.beings[r].body.position) - start).length();
+    if d > drift { drift = d; }
+    imm h = (deckPoint(&s, deck, c.beings[r].figure.walker.left.heel) - heel0).length();
+    if h > footDrift { footDrift = h; }
+    imm y = libc.fabsf(c.beings[r].body.yaw - 0.25 * t - yaw0);
+    if y > turned { turned = y; }
+    k = k + 1;
+  }
+  print <- "  (6 s on a climbing turn: its feet at most "; print <- drift * 1000.; print <- " mm from where they stood on the deck, its heel ";
+  print <- footDrift * 1000.; print <- " mm, its heading on the deck "; print <- turned * 57.29578; print <- " degrees)\n";
+  ok = expect("a capsule standing on a moving, turning floor stays standing on it, carried", onAll) and ok;
+  ok = expect("where it stands on the floor and its planted heel move under 1 mm, its heading on it under 0.01 degree",
+    drift < 0.001 and footDrift < 0.001 and turned < 0.0002) and ok;
+  ok = expect("it stands at the floor's height (held up by the floor alone)",
+    nearly(c.beings[r].body.position.y, (s.worldMatrix(deck) * new Vec3(0., 0., 0.)).y, 0.0005)) and ok;
+
+  // Walls: turned to face the deck's -x (the deck's heading is 0.25 t; a
+  // being facing its -x has yaw 0.25 t + 90 degrees), it walks 3 s into the
+  // wall there and is stopped at its radius, the car still climbing and turning
+  imm walk = new Intents(1., 0., false, false);
+  imm radius = c.beings[r].figure.radius();
+  c.beings[r].body.yaw = 0.25 * f32.from(k) / 60. + 0.5 * pi;
+  c.beings[r].before = c.beings[r].body;
+  mut j = 0;
+  while j < 180 {
+    k = k + 1;
+    rideFrame(&mut s, &mut c, &mut moves, car, carOnArc(f32.from(k) / 60.), walk);
+    j = j + 1;
+  }
+  imm atWall = deckPoint(&s, deck, c.beings[r].body.position);
+  print <- "  (walked into the -x wall: its feet at x "; print <- atWall.x; print <- " m on the deck, the wall's face at -2, its radius ";
+  print <- radius; print <- ")\n";
+  ok = expect("a wall stops it, its radius inside the wall's face, still on the floor",
+    nearly(atWall.x, -2. + radius, 0.002) and c.beings[r].figure.on == deck and c.beings[r].figure.grounded) and ok;
+  // And the back wall (-z): facing it, yaw 0.25 t
+  c.beings[r].body.yaw = 0.25 * f32.from(k) / 60.;
+  c.beings[r].before = c.beings[r].body;
+  j = 0;
+  while j < 180 {
+    k = k + 1;
+    rideFrame(&mut s, &mut c, &mut moves, car, carOnArc(f32.from(k) / 60.), walk);
+    j = j + 1;
+  }
+  imm atBack = deckPoint(&s, deck, c.beings[r].body.position);
+  ok = expect("the back wall stops it too", nearly(atBack.z, -2. + radius, 0.002) and c.beings[r].figure.on == deck) and ok;
+
+  // The open side: facing +z (yaw 0.25 t + 180 degrees) it walks out over the open edge, 2.4 m out, and falls
+  c.beings[r].body.yaw = 0.25 * f32.from(k) / 60. + pi;
+  c.beings[r].before = c.beings[r].body;
+  mut leftAt = -1;
+  mut leftY = 0.;
+  mut leftVy = 0.;
+  mut deckVel = new Vec3(0., 0., 0.);
+  mut airV = new Vec3(0., 0., 0.);
+  mut walkV = new Vec3(0., 0., 0.);
+  j = 0;
+  while j < 600 and !(leftAt >= 0 and c.beings[r].figure.grounded) {
+    k = k + 1;
+    // The deck's point under the rider, before and after the frame's move: the floor's velocity where it stands
+    imm was = c.beings[r].body.position;
+    imm under = s.worldMatrix(deck).inverse() * was;
+    rideFrame(&mut s, &mut c, &mut moves, car, carOnArc(f32.from(k) / 60.), if leftAt < 0 { walk; } else { still; });
+    imm before = was;
+    imm after = s.worldMatrix(deck) * under;
+    if leftAt < 0 and !c.beings[r].figure.grounded {
+      leftAt = j;
+      leftY = c.beings[r].body.position.y;
+      leftVy = c.beings[r].figure.vy;
+      airV = new Vec3(c.beings[r].figure.airVx, 0., c.beings[r].figure.airVz);
+      deckVel = (after - before) * 60.;
+      imm y = c.beings[r].body.yaw;
+      walkV = new Vec3(0. - sin(y), 0., 0. - cos(y)) * WALK_SPEED;
+    }
+    j = j + 1;
+  }
+  imm fell = c.beings[r].body.position;
+  imm floorY = (s.worldMatrix(deck) * new Vec3(0., 0., 0.)).y;
+  print <- "  (left the floor after "; print <- leftAt; print <- " steps, at "; print <- leftY; print <- " m, going up at "; print <- leftVy;
+  print <- " m/s; landed at "; print <- fell.y; print <- " m, "; print <- c.beings[r].figure.landSpeed; print <- " m/s, the floor then at ";
+  print <- floorY; print <- " m)\n";
+  ok = expect("the open side does not stop it: it walks off the edge and falls, no longer carried",
+    leftAt > 0 and c.beings[r].figure.on.isNone()) and ok;
+  ok = expect("it goes on at the floor's velocity as well as its own (within 0.1 m/s)",
+    nearly(leftVy, deckVel.y, 0.1) and nearly(airV.x, deckVel.x + walkV.x, 0.1) and nearly(airV.z, deckVel.z + walkV.z, 0.1)) and ok;
+  ok = expect("it falls under gravity to the ground, landing at sqrt(v0^2 + 2 g h)",
+    c.beings[r].figure.grounded and nearly(fell.y, 0., 0.0001)
+    and nearly(c.beings[r].figure.landSpeed, libc.sqrtf(leftVy * leftVy + 2. * GRAVITY * leftY), 0.25)) and ok;
+  ok = expect("from that height, a fatal fall: its health emptied", c.beings[r].figure.health == 0.) and ok;
+  // Down for RESPAWN_AFTER, then up again on the landing beach, whole
+  j = 0;
+  while j < 200 and c.beings[r].figure.respawns == 0u32 {
+    k = k + 1;
+    rideFrame(&mut s, &mut c, &mut moves, car, carOnArc(f32.from(k) / 60.), still);
+    j = j + 1;
+  }
+  ok = expect("2 s later it gets up again at the landing beach, whole", c.beings[r].figure.respawns == 1u32 and j >= 119 and j <= 121
+    and nearly(c.beings[r].body.position.x, BEACH_X, 0.0001) and nearly(c.beings[r].body.position.z, BEACH_Z, 0.0001)
+    and c.beings[r].figure.health == 1.) and ok;
+
+  // From outside: a walker on the ground walking into the back wall of a deck standing on the ground is stopped outside it
+  mut s2 = Scene.empty();
+  mut c2 = Cast.empty();
+  mut moves2 = List[PlatformMove].empty();
+  imm box = livePart(&mut s2, "box");
+  s2.applyPlatform(box, PlatformShape.make(0.12, new Vec2(-0.95, -0.95), new Vec2(0.95, 1.02), 1.1, WALL_MIN_X | WALL_MAX_X | WALL_MIN_Z));
+  imm here = new Transform3(new Vec3(0., 0., 0.), Quat.identity(), new Vec3(1., 1., 1.));
+  rideFrame(&mut s2, &mut c2, &mut moves2, box, here, still);
+  imm w = c2.add(mannequinBeing(&mut s2, "walker", new Vec3(0., 0., -4.), 1.75, 7u32));
+  c2.possess(w);
+  c2.beings[w].body.yaw = pi;
+  c2.beings[w].before = c2.beings[w].body;
+  j = 0;
+  while j < 180 { rideFrame(&mut s2, &mut c2, &mut moves2, box, here, walk); j = j + 1; }
+  imm outside = c2.beings[w].body.position;
+  ok = expect("a walker outside walking into the back wall is stopped outside it, on the ground",
+    nearly(outside.z, -0.95 - c2.beings[w].figure.radius(), 0.002) and outside.y == 0. and c2.beings[w].figure.on.isNone()) and ok;
+  // Walked round to the open front and in: it steps up onto the floor (0.12 m) and stands on it
+  c2.beings[w].setDown(new Vec3(0., 0., 4.), 0.);
+  j = 0;
+  while j < 110 { rideFrame(&mut s2, &mut c2, &mut moves2, box, here, walk); j = j + 1; }
+  j = 0;
+  while j < 30 { rideFrame(&mut s2, &mut c2, &mut moves2, box, here, still); j = j + 1; }
+  imm inside = c2.beings[w].body.position;
+  print <- "  (walked in at the open front to z "; print <- inside.z; print <- ", at "; print <- inside.y; print <- " m)\n";
+  ok = expect("walking in at the open front it steps up onto the floor and stands on it",
+    c2.beings[w].figure.on == box and nearly(inside.y, 0.12, 0.0001) and inside.z < 1. and inside.z > -0.95) and ok;
+  // A floor overhead is not a floor: under a deck lifted 3 m, a walker stands on the ground
+  s2.applyPlace(box, new Transform3(new Vec3(0., 3., 0.), Quat.identity(), new Vec3(1., 1., 1.)));
+  c2.beings[w].setDown(new Vec3(0.5, 0., 0.), 0.);
+  j = 0;
+  while j < 30 { rideFrame(&mut s2, &mut c2, &mut moves2, box, new Transform3(new Vec3(0., 3., 0.), Quat.identity(), new Vec3(1., 1., 1.)), still); j = j + 1; }
+  ok = expect("under a floor 3 m up it stands on the ground, not on the floor overhead",
+    c2.beings[w].body.position.y == 0. and c2.beings[w].figure.on.isNone()) and ok;
+  ok;
+}
+
+// The balloon's ride (motions.cone), on the baked island: sampled every
+// tenth of a second, its length, time and highest point; how fast it goes
+// and turns; how close its basket's bottom comes to the ground (away from
+// its spot, where it rises and lands straight up and down, at least 22 m:
+// the tallest pine is 15.5 m, and the envelope hangs 6 m above the basket's
+// bottom and is no wider than the trees are kept off it); and that it
+// keeps over the island and its cove
+fn checkRide() bool {
+  print <- "The balloon's ride:\n";
+  imm rest = placeXZ(BALLOON);
+  imm restYaw = balloonRestYaw();
+  imm base = groundHeight(rest.x, rest.y);
+  mut prev = ridePose(0., restYaw);
+  mut fastest = 0.;
+  mut turnFastest = 0.;
+  mut lowest = 1000.;
+  mut lowestAt = new Vec3(0., 0., 0.);
+  mut highest = 0.;
+  mut farthest = 0.;
+  mut k = 1;
+  imm n = i32.from(FLIGHT_SECONDS * 10.);
+  while k <= n {
+    imm t = f32.from(k) / 10.;
+    imm p = ridePose(t, restYaw);
+    imm v = (p.offset - prev.offset).length() * 10.;
+    if v > fastest { fastest = v; }
+    imm turn = libc.fabsf(p.yaw - prev.yaw) * 10.;
+    if turn > turnFastest and k < n { turnFastest = turn; }
+    imm x = rest.x + p.offset.x;
+    imm z = rest.y + p.offset.z;
+    imm y = base + p.offset.y;
+    if p.offset.y > highest { highest = p.offset.y; }
+    imm away = len2d(p.offset.x, p.offset.z);
+    imm clear = y - groundHeight(x, z);
+    if away > 15. and clear < lowest { lowest = clear; lowestAt = new Vec3(x, y, z); }
+    imm r = len2d(x, z);
+    if r > farthest { farthest = r; }
+    prev = p;
+    k = k + 1;
+  }
+  print <- "  ("; print <- rideLength(); print <- " m in "; print <- FLIGHT_SECONDS; print <- " s, steady at "; print <- rideSpeed();
+  print <- " m/s, at most "; print <- fastest; print <- "; its highest "; print <- highest; print <- " m above its spot, at ";
+  print <- rideTopTime(); print <- " s; turning at most "; print <- turnFastest * 57.29578; print <- " degrees a second; its basket at least ";
+  print <- lowest; print <- " m above the ground away from its spot, at ("; print <- lowestAt.x; print <- ", "; print <- lowestAt.z;
+  print <- "); at most "; print <- farthest; print <- " m from the island's middle)\n";
+  mut ok = expect("a ride of 2 to 3 minutes, 120 to 200 m up at its highest", FLIGHT_SECONDS >= 120. and FLIGHT_SECONDS <= 180.
+    and highest >= 120. and highest <= 200.);
+  ok = expect("smooth: no faster than 10 m/s, turning no faster than 10 degrees a second", fastest < 10. and turnFastest * 57.29578 < 10.) and ok;
+  ok = expect("its basket at least 22 m above the ground away from its spot, so the envelope clears the trees", lowest >= 22.) and ok;
+  ok = expect("over the island and its cove: within 700 m of its middle", farthest < 700.) and ok;
+  imm end = ridePose(FLIGHT_SECONDS - 0.05, restYaw);
+  ok = expect("it lands back on its spot, facing as it stood", end.offset.length() < 0.01
+    and libc.fabsf(wrapPi(end.yaw - restYaw)) < 0.001) and ok;
+  ok;
+}
+
 // ---- The island ----
 
 // The next pseudo-random number in [0, 1) from 'seed' (a linear congruence)
@@ -837,10 +1092,12 @@ pub fn runChecks() i32 {
   ok = checkAreas() and ok;
   ok = checkPossession() and ok;
   ok = checkMannequin() and ok;
+  ok = checkPlatforms() and ok;
   ok = checkSky() and ok;
   ok = checkLights() and ok;
   // The island's last: baking it puts a hill at the origin, where the checks above stand on flat ground
   ok = checkIsland() and ok;
+  ok = checkRide() and ok;
   ok = checkVegetation() and ok;
   if ok { print <- "Checks: OK\n"; 0i32; } else { print <- "Checks: FAILED\n"; 1i32; };
 }
