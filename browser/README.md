@@ -35,15 +35,34 @@ The build also compiles the browser's `gpu/` folder (the starship's distance fie
 GPU, into `build\release\browser.spv`, beside `sdfmesh.spv`; the program reads both at run time. The
 first run after a driver's shader cache is cleared makes the kernels in about 4 s; after that, 0.4 s.
 
+## The mannequin
+
+You start as an artist's wooden mannequin, 1.75 m tall, seen from behind and above (V for its eyes),
+8 m back from the origin, facing -z; a second, 1.62 m and clay red, stands idle (breathing, shifting its
+weight) a few metres off, turned towards you. Each is a 19-bone skeleton (Cone's `bonepose` package)
+with one rigid piece a bone (a limb's ellipsoid and a ball at its joint, `src/mannequin.cone`), every
+bone a part under the bone above it, so the scene's placement tree does the posing. Each step Cone's
+`walkgait` writes the pose: a walk whose phase follows the distance travelled, so the feet do not
+skate, feet that roll heel, flat and toe, two-bone IK on the legs reaching each ankle to a place on the
+ground, the pelvis as high as the legs allow, the arms against the legs, and when standing, breathing
+and shifting weight. The body is a kinematic capsule on `groundHeight` (`src/ground.cone`: flat today,
+the one function T1's terrain will replace) with gravity: a landing at 7 m/s or more (a 2.5 m drop) is
+HARD, the pelvis crouches, and the scene mails a `HardLanding` to the world; one above 10 m/s hurts the
+being's health, to nothing left at 24 m/s. The body is a smooth skinned figure in the second half of T2,
+once the render core has dynamic vertex buffers and custom pipelines.
+
 ## Keys
 
 | Key | Does |
 | --- | --- |
-| W or Up | walk forward (3 m/s) |
+| W or Up | walk forward (the mannequin 1.8 m/s; the plain walker of a scripted run 3 m/s) |
 | S or Down | walk back |
 | A or Left | turn left (a quarter turn in 1.5 s) |
 | D or Right | turn right |
-| Shift (held) | walk four times as fast (12 m/s) |
+| Shift (held) | run (the mannequin 4.5 m/s; the plain walker four times as fast) |
+| Space | jump (a mannequin: 4.2 m/s up, 0.9 m) |
+| **V** | **first person or third person**: the camera at the mannequin's eyes socket, or 3.2 m behind it and above, looking at its chest |
+| **Tab** | possess the next mannequin: the controls and the camera go to it, and the one left behind stands |
 | Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button launches or lands the balloon |
 | P | pause scene time, or start it again (the world's motions, the effects, the timers and the day stop; the walk does not) |
 | F | run scene time ten times as fast, or back to normal (for testing the day: dusk comes 50 s after the start instead of 12.5 min) |
@@ -82,6 +101,14 @@ for 3 s) rang at the first frame at or after 3 s; that the world was told the wa
 launch button (an area) and is still there; the day clock's reading; that the balloon is one tree as
 built; and that the two rooks share one material (one mesh more than materials defined, and, with a
 GPU, both drawn in the same material).
+The scripted run starts as the plain walker (so its walk checks stay exact) with the two mannequins
+standing off to the right; from frame 660 it presses Tab (the first mannequin is possessed, in third
+person), walks it with W for 60 steps, presses V (first person, the camera at its eyes socket) and
+back, presses Tab again, and lifts the second 6 m into the air to fall and land hard: it checks the gait's
+speed against the intent, the camera's place in each view, the possession, and that the hard landing
+was mailed and read by the world and hurt by (speed - 10) / 14. It saves `mannequin-third`,
+`mannequin-side` and `mannequin-side2` (a side view mid-stride), `mannequin-first`, `mannequin-second`,
+`mannequin-falling` and `mannequin-landing`.
 It exits 0 only if every check passed, no Vulkan call failed and the validation layer said nothing.
 
 `--checks` runs the scene core's checks on scenes of their own, with no window, GPU or frames: a
@@ -91,9 +118,15 @@ refused, and the top despawned with its subtree; timers on the scene's clock in 
 paused and at x10, each rung at the first step at or after its time, a cancel, and dusk at 750 s and
 dawn at 1290 s; a sphere area and a box area under a scaled parent entered and left, and a second
 being coming in moving the first out; and possession, the user's intents moving only the possessed
-being and the camera following it. It exits 0 only if every check passed.
+being and the camera following it; and the mannequin: a capsule dropped from 0.5, 3.5 and 8 m landing
+at v = sqrt(2 g h), the hard landings mailed once each and the hurt (nothing to 10 m/s, 0.18 at
+12.5 m/s) taken from health, a 6 s walk whose gait speed follows the intent and whose planted foot does
+not move more than 1 cm, standing with both feet flat and level, the third-person camera 3.2 m behind
+and the first-person one at the eyes socket, and Tab possessing the other mannequin with the camera and
+the controls following it. It exits 0 only if every check passed.
 `shots/` holds the views of one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups
-`rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`), converted to PNG, and
+`rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`, and the mannequins' `mannequin-*`),
+converted to PNG, and
 `amphora-vs-photo.png`, the amphora's close-up beside the photograph it was traced from.
 
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
@@ -121,7 +154,9 @@ along the way when the first frame was presented and when every object was first
 | `src/parts/snapshot.cone` | what the scene publishes each frame for drawing |
 | `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list; a physical material is render's physically based one |
 | `src/shell.cone` | what the browser puts in every scene: the ground and the sky, sent as requests |
-| `src/being.cone` | beings and possession: intents, the user's controller, the Cast |
+| `src/being.cone` | beings and possession: intents, the user's controller, the view rig (first and third person), the Cast |
+| `src/mannequin.cone` | the mannequin: its figure (skeleton, pose, gait, kinematic capsule), its meshes, one a bone, and spawning it |
+| `src/ground.cone` | the ground's height under a point: the one function the terrain will replace |
 | `src/walk.cone` | a walker's body on the ground, and the user's key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
 | `src/checks.cone` | the scene core's headless checks (`--checks`) |
