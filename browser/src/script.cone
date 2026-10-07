@@ -14,8 +14,12 @@
 //                                                                 shot "walked" at 160
 //   frames 170-199  D held: 30 steps, a twelfth of a turn right   shot "turned" at 210
 //   frames 220-249  Shift and W held: 30 steps at 12 m/s, 6 m on that heading
+//   frame 182       the world's alarm (a timer for 3 s of scene time) rings
+//   frames 256-270  P pressed: scene time paused (the walker stands anyway)
+//   frames 276-286  F pressed: scene time x10, then F again, x1: checked at 290
 //   frames 300-434  Shift and W held: 135 steps, 27 m on, to 13 m from the
-//                   balloon's basket and beside its launch button
+//                   balloon's basket and beside its launch button, coming
+//                   into the button's area on the way (the world is told)
 //   frame 450       a click on the launch button: the world is told, and the
 //                   balloon rises                                 shot "balloon" at 580
 //   all along       the ball bounces and spins, the burner fires in bursts:
@@ -97,6 +101,12 @@ pub fn pushScript(f u64) {
     pushKey(sdl.SCANCODE_W, false);
     pushKey(sdl.SCANCODE_LSHIFT, false);
   }
+  // The scene clock's keys, while the walker stands: P pauses at 256 and
+  // starts again at 271; F runs it x10 from 276 until 286
+  if f == 256u64 or f == 271u64 { pushKey(SCANCODE_P, true); }
+  if f == 258u64 or f == 273u64 { pushKey(SCANCODE_P, false); }
+  if f == 276u64 or f == 286u64 { pushKey(SCANCODE_F, true); }
+  if f == 278u64 or f == 288u64 { pushKey(SCANCODE_F, false); }
 }
 
 fn pushButton(x f32, y f32, down bool) {
@@ -343,6 +353,85 @@ fn checkStep4() bool {
   ok;
 }
 
+// The scene's time when the script's P and F keys took effect
+mut pausedAt f64 = 0d;
+mut fastFrom f64 = 0d;
+
+// The scene clock's keys, and the events on the scene's clock, at frame 'f'
+fn checkClock(f u64) bool {
+  mut ok = true;
+  imm step = 1d / 60d;
+  if f == 256u64 {
+    pausedAt = sceneNow;
+    if !scene.clock.paused { print <- "Frame 256: P did NOT pause scene time\n"; ok = false; }
+  }
+  if f == 270u64 {
+    // Paused since frame 256's publish: 14 frames of steps, no scene time
+    print <- "Frame 270, scene time paused since frame 256:\n";
+    ok = near("scene time", f32.from(sceneNow), f32.from(pausedAt), 0.) and ok;
+  }
+  if f == 276u64 {
+    fastFrom = sceneNow;
+    if scene.clock.rate() != 10u64 { print <- "Frame 276: F did NOT run scene time x10\n"; ok = false; }
+  }
+  if f == 290u64 {
+    // From frame 276: frames 277 to 286 at x10, 287 to 290 at x1
+    print <- "Frame 290, after 10 frames at x10 and 4 at x1:\n";
+    ok = near("scene time run", f32.from(sceneNow - fastFrom), f32.from(104d * step), 0.00001) and ok;
+    if scene.clock.paused or scene.clock.rate() != 1u64 { print <- "  the clock NOT back to x1\n"; ok = false; }
+  }
+  if f == 200u64 {
+    // The world's alarm, set for 3 s, read at the first apply point at or after
+    print <- "Frame 200, the world's alarm: rung "; print <- world.alarms; print <- " (want 1), heard at ";
+    print <- world.alarmHeardAt; print <- " s (want 3 to "; print <- 3d + step; print <- ")\n";
+    if world.alarms != 1u64 or world.alarmHeardAt < ALARM_AT or world.alarmHeardAt >= ALARM_AT + step + 0.000001d {
+      ok = false;
+    }
+  }
+  if f == 590u64 {
+    // The walker came up to the launch button and is still beside it
+    imm area = world.partOf(LAUNCH_BUTTON, 0usize);
+    imm inside = scene.isInside(area, cast.beings[cast.possessed].part);
+    print <- "Frame 590, the button's area: entered "; print <- world.arrivals; print <- " (want 1), left ";
+    print <- world.departures; print <- " (want 0), the walker inside: ";
+    if inside { print <- "yes\n"; } else { print <- "NO\n"; }
+    if world.arrivals != 1u64 or world.departures != 0u64 or !inside { ok = false; }
+    print <- "  the day clock: "; print <- scene.hour(); print <- " h (want "; print <- START_HOUR + sceneNow / 60d; print <- ")\n";
+    imm h = scene.hour() - (START_HOUR + sceneNow / 60d);
+    if h > 0.000001d or h < -0.000001d { ok = false; }
+  }
+  ok;
+}
+
+// The scene's tree and its shared resources, once the world is in: the
+// balloon one tree under its envelope (the flame and pilot light under the
+// burner frame, the passengers under the basket); the two rooks drawn in one
+// material; every mesh but one with a material of its own
+fn checkSharing() bool {
+  mut ok = true;
+  print <- "The balloon's tree:";
+  imm envelope = world.partOf(BALLOON, 0usize);
+  imm frame = world.partOf(BALLOON, 2usize);
+  imm basket = world.partOf(BALLOON, 4usize);
+  imm tree = scene.parentOf(envelope).isNone() and scene.parentOf(world.partOf(BALLOON, 1usize)) == envelope
+    and scene.parentOf(frame) == envelope and scene.parentOf(world.partOf(BALLOON, 3usize)) == envelope
+    and scene.parentOf(basket) == envelope and scene.parentOf(world.partOf(BALLOON, 5usize)) == basket
+    and scene.parentOf(world.partOf(BALLOON, 6usize)) == frame and scene.parentOf(world.partOf(BALLOON, 7usize)) == frame;
+  if tree { print <- " as built\n"; } else { print <- " WRONG\n"; ok = false; }
+  print <- "Resources: "; print <- scene.door.meshes; print <- " meshes, "; print <- scene.door.materials;
+  print <- " materials (want one fewer: the rooks share theirs), "; print <- scene.resourceCount(); print <- " defined\n";
+  if scene.door.meshes != scene.door.materials + 1u64 or u64.from(scene.resourceCount()) != scene.door.meshes + scene.door.materials {
+    ok = false;
+  }
+  if hasGpu() {
+    imm a = drawnMaterial(world.partOf(ROOK, 0usize));
+    imm b = drawnMaterial(world.partOf(LATHED_ROOK, 0usize));
+    print <- "  the two rooks drawn in one material: ";
+    if !a.isNone() and a == b { print <- "yes\n"; } else { print <- "NO\n"; ok = false; }
+  }
+  ok;
+}
+
 // What the script's events must have done by the end of frame 'f'
 pub fn checkScript(f u64, w &Walk) bool {
   mut ok = true;
@@ -367,6 +456,7 @@ pub fn checkScript(f u64, w &Walk) bool {
   if f == 29u64 {
     ok = checkWorld() and ok;
     ok = checkStep4() and ok;
+    ok = checkSharing() and ok;
     print <- "Frame 29, standing:\n";
     ok = near("x", w.position.x, 0., 0.) and ok;
     ok = near("z", w.position.z, 8., 0.) and ok;
@@ -385,6 +475,7 @@ pub fn checkScript(f u64, w &Walk) bool {
     ok = near("yaw", w.yaw, -0.5235988, 0.00001) and ok;
     ok = near("z", w.position.z, 5., 0.001) and ok;
   }
+  ok = checkClock(f) and ok;
   if f == 290u64 {
     // 6 m along the heading -30 degrees from -z: (6 sin 30, -6 cos 30)
     print <- "Frame 290, after 30 steps of Shift and W at 12 m/s:\n";

@@ -1,0 +1,330 @@
+// The scene core's headless checks: 'browser.exe --checks' runs them on
+// scenes of their own (no window, no GPU, no frames) and exits 0 only if
+// every one passed.
+//
+//   the placement tree   three levels made children first, their world
+//                        matrices against ones worked out by hand; a
+//                        placement changed recomputing only its own row; a
+//                        reparent to the root and under the top; a cycle
+//                        refused; the top despawned with its subtree
+//   timers               on the scene's clock in 1/60 s steps: a repeating
+//                        timer and a one-off, at x1, paused (none rings, no
+//                        time passes) and at x10; each rung at the first
+//                        step at or after its time; a cancel; dusk and dawn
+//                        at their hours
+//   areas                a sphere and a box under a scaled parent, entered
+//                        and left by a being; a second being coming into an
+//                        area moving the first out
+//   possession           two beings, one possessed: the user's intents move
+//                        only it, and the camera (the snapshot's eye) follows
+//                        whichever is possessed
+
+const CHECK_STEP_NS = 16666667u64;
+
+fn nearly(a f32, b f32, within f32) bool { a - b <= within and b - a <= within; }
+
+// Matrix 'm' against 'want' (column-major, as Mat4 keeps it)
+fn checkMatrix(name &[]u8, m Mat4, want Array[f32, 16]) bool {
+  mut ok = true;
+  mut i = 0usize;
+  while i < 16usize {
+    if !nearly(m.m[i], want[i], 0.00001) { ok = false; }
+    i = i + 1usize;
+  }
+  print <- "  "; printStr(name);
+  if ok { print <- ": as worked out\n"; } else {
+    print <- ": WRONG, got";
+    i = 0usize;
+    while i < 16usize { print <- " "; print <- m.m[i]; i = i + 1usize; }
+    print <- "\n";
+  }
+  ok;
+}
+
+fn expect(what &[]u8, cond bool) bool {
+  print <- "  "; printStr(what); if cond { print <- ": yes\n"; } else { print <- ": NO\n"; }
+  cond;
+}
+
+// A part reserved and made live at once (no inbox)
+fn livePart(s &mut Scene, name &[]u8) PartId {
+  imm id = s.reserve();
+  s.applySpawn(id, String.from(name));
+  id;
+}
+
+fn checkTree() bool {
+  print <- "The placement tree:\n";
+  mut s = Scene.empty();
+  // Made children first, so the tree must reorder itself
+  imm c = livePart(&mut s, "c");
+  imm b = livePart(&mut s, "b");
+  imm a = livePart(&mut s, "a");
+  imm turn = Quat.angleAxis(1.5707963, new Vec3(0., 1., 0.));
+  s.applyPlace(c, new Transform3(new Vec3(1., 0., 0.), Quat.identity(), new Vec3(0.5, 0.5, 0.5)));
+  s.applyPlace(b, new Transform3(new Vec3(0., 1., 0.), Quat.identity(), new Vec3(1., 1., 1.)));
+  s.applyPlace(a, new Transform3(new Vec3(1., 2., 3.), turn, new Vec3(2., 2., 2.)));
+  mut ok = s.applyParent(c, b);
+  ok = s.applyParent(b, a) and ok;
+  s.propagate();
+  // a: a quarter turn left about +y (x to -z, z to +x), scale 2, at (1, 2, 3)
+  ok = checkMatrix("a", s.worldMatrix(a), [0., 0., -2., 0., 0., 2., 0., 0., 2., 0., 0., 0., 1., 2., 3., 1.]) and ok;
+  // b: a's frame, 1 up: a(0, 1, 0) = (1, 2 + 2, 3)
+  ok = checkMatrix("b, under a", s.worldMatrix(b), [0., 0., -2., 0., 0., 2., 0., 0., 2., 0., 0., 0., 1., 4., 3., 1.]) and ok;
+  // c: b's frame, 1 along x, half size: scale 2 x 0.5 = 1, and b(1, 0, 0)
+  // = (1, 4, 3) + the turn of (2, 0, 0) = (1, 4, 3) + (0, 0, -2)
+  ok = checkMatrix("c, under b", s.worldMatrix(c), [0., 0., -1., 0., 0., 1., 0., 0., 1., 0., 0., 0., 1., 4., 1., 1.]) and ok;
+
+  // c placed again: only its row recomputed
+  imm before = s.recomputed();
+  s.applyPlace(c, new Transform3(new Vec3(2., 0., 0.), Quat.identity(), new Vec3(0.5, 0.5, 0.5)));
+  s.propagate();
+  ok = expect("c placed again recomputed one row", s.recomputed() - before == 1u64) and ok;
+  ok = checkMatrix("c moved: (1, 4, 3) + the turn of (4, 0, 0)", s.worldMatrix(c),
+    [0., 0., -1., 0., 0., 1., 0., 0., 1., 0., 0., 0., 1., 4., -1., 1.]) and ok;
+  // a placed again: all three recomputed
+  imm before2 = s.recomputed();
+  s.applyPlace(a, new Transform3(new Vec3(1., 2., 3.), turn, new Vec3(2., 2., 2.)));
+  s.propagate();
+  ok = expect("a placed again recomputed its subtree's three rows", s.recomputed() - before2 == 3u64) and ok;
+
+  // Reparented to the root: its own placement, now in the world
+  ok = s.applyParent(c, PartId.none()) and ok;
+  s.propagate();
+  ok = checkMatrix("c reparented to the root", s.worldMatrix(c),
+    [0.5, 0., 0., 0., 0., 0.5, 0., 0., 0., 0., 0.5, 0., 2., 0., 0., 1.]) and ok;
+  // Reparented under a: a(2, 0, 0) at half size = (1, 2, 3) + (0, 0, -4)
+  ok = s.applyParent(c, a) and ok;
+  s.propagate();
+  ok = checkMatrix("c reparented under a", s.worldMatrix(c),
+    [0., 0., -1., 0., 0., 1., 0., 0., 1., 0., 0., 0., 1., 2., -1., 1.]) and ok;
+  ok = expect("c's parent is a", s.parentOf(c) == a) and ok;
+  // A cycle refused
+  imm refused = s.refused;
+  ok = expect("a under c refused (c is below a)", !s.applyParent(a, c) and s.refused == refused + 1u64) and ok;
+
+  // a despawned takes b and c with it
+  mut gone = List[PartId].empty();
+  ok = s.applyDespawn(a, &mut gone) and ok;
+  ok = expect("a despawned with its subtree: three parts gone, none placed",
+    gone.len() == 3usize and !s.isPlaced(a) and !s.isPlaced(b) and !s.isPlaced(c) and s.partCount() == 0usize) and ok;
+  ok;
+}
+
+// A step of 's': its clock moved on, its timers rung, its mail read into
+// 'log' as (kind, token, at, now): kind 0 a Rang, 1 Dusk, 2 Dawn
+struct Heard {
+  kind u32;
+  token u64;
+  at f64;
+  now f64;
+}
+
+fn stepScene(s &mut Scene, log &mut List[Heard]) {
+  s.advanceClock(CHECK_STEP_NS);
+  s.ring();
+  mut mail = s.door.takeMail();
+  imm msgs = mail.viewMut();
+  mut i = 0usize;
+  while i < msgs.len {
+    mut m Message = Message.Read[];
+    m <=> msgs[i];
+    match &mut m {
+      case mut r &mut Rang { log.push(new Heard(0u32, r.token, r.at, s.now())); }
+      case mut d &mut Dusk { log.push(new Heard(1u32, 0u64, d.at, s.now())); }
+      case mut d &mut Dawn { log.push(new Heard(2u32, 0u64, d.at, s.now())); }
+      else {}
+    }
+    i = i + 1usize;
+  }
+}
+
+// Whether every message heard was rung at the first step at or after its
+// time: 'now' at or after 'at', and the step before before it
+fn eachOnTime(log &List[Heard], stepSeconds f64) bool {
+  mut i = 0usize;
+  while i < log.len() {
+    imm h = *log[i];
+    if h.now < h.at or h.now - h.at >= stepSeconds { return false; }
+    i = i + 1usize;
+  }
+  true;
+}
+
+fn checkTimers() bool {
+  print <- "Timers on the scene's clock:\n";
+  mut s = Scene.empty();
+  s.applyTimer(1u64, 2d, 0d);
+  s.applyTimer(2u64, 0.5d, 0.5d);
+  imm step = f64.from(CHECK_STEP_NS) / 1.0e9d;
+  // x1: 30 steps, half a second: the repeating one rings once
+  mut log = List[Heard].empty();
+  mut k = 0;
+  while k < 30 { stepScene(&mut s, &mut log); k = k + 1; }
+  mut ok = expect("x1, 30 steps: one ring, timer 2 for 0.5 s, on time",
+    log.len() == 1usize and log[0usize].token == 2u64 and log[0usize].at == 0.5d and eachOnTime(&log, step));
+  // Paused: 120 steps, no time, no ring
+  s.togglePause();
+  imm pausedAt = s.now();
+  log.clear();
+  k = 0;
+  while k < 120 { stepScene(&mut s, &mut log); k = k + 1; }
+  ok = expect("paused, 120 steps: no scene time passed, nothing rang", s.now() == pausedAt and log.len() == 0usize) and ok;
+  // x10: 9 steps, 1.5 s: timer 2 at 1, 1.5 and 2 s, timer 1 at 2 s
+  s.togglePause();
+  s.toggleFast();
+  log.clear();
+  k = 0;
+  while k < 9 { stepScene(&mut s, &mut log); k = k + 1; }
+  mut ones = 0usize;
+  mut twos = 0usize;
+  mut i = 0usize;
+  while i < log.len() {
+    if log[i].token == 1u64 and log[i].at == 2d { ones = ones + 1usize; }
+    if log[i].token == 2u64 { twos = twos + 1usize; }
+    i = i + 1usize;
+  }
+  print <- "  x10, 9 steps to "; print <- s.now(); print <- " s: "; print <- log.len(); print <- " rings\n";
+  ok = expect("x10: timer 2 at 1, 1.5 and 2 s, timer 1 at 2 s, each on time (a step being 1/6 s)",
+    log.len() == 4usize and ones == 1usize and twos == 3usize and eachOnTime(&log, step * 10d)) and ok;
+  // Timer 2 cancelled; on at x10 to the first dusk and dawn
+  s.applyCancel(2u64);
+  log.clear();
+  mut guard = 0;
+  while s.now() < 1300d and guard < 20000 { stepScene(&mut s, &mut log); guard = guard + 1; }
+  mut dusk = -1d;
+  mut dawn = -1d;
+  mut others = 0usize;
+  i = 0usize;
+  while i < log.len() {
+    if log[i].kind == 1u32 { dusk = log[i].at; } elif log[i].kind == 2u32 { dawn = log[i].at; } else { others = others + 1usize; }
+    i = i + 1usize;
+  }
+  print <- "  on to "; print <- s.now(); print <- " s: dusk at "; print <- dusk; print <- " s (the day clock ";
+  print <- hourAt(dusk); print <- " h), dawn at "; print <- dawn; print <- " s ("; print <- hourAt(dawn); print <- " h)\n";
+  ok = expect("dusk at 750 s (19:30) and dawn at 1290 s (04:30), on time, the cancelled timer silent",
+    dusk == 750d and dawn == 1290d and others == 0usize and log.len() == 2usize and eachOnTime(&log, step * 10d)) and ok;
+  ok = expect("the day clock reads 7:00 at 0 s and 19:30 at 750 s",
+    hourAt(0d) == 7d and hourAt(750d) == 19.5d and hourAt(1440d) == 7d) and ok;
+  ok;
+}
+
+// The areas' mail since the last look, as (entered, area, being) triples
+// counted into 'ins' and 'outs' for area 'area'
+fn readAreas(s &mut Scene, area PartId, being PartId, ins &mut u32, outs &mut u32) {
+  mut mail = s.door.takeMail();
+  imm msgs = mail.viewMut();
+  mut i = 0usize;
+  while i < msgs.len {
+    mut m Message = Message.Read[];
+    m <=> msgs[i];
+    match &mut m {
+      case mut e &mut Entered { if e.area == area and e.being == being { *ins = *ins + 1u; } }
+      case mut l &mut Left { if l.area == area and l.being == being { *outs = *outs + 1u; } }
+      else {}
+    }
+    i = i + 1usize;
+  }
+}
+
+fn checkAreas() bool {
+  print <- "Areas:\n";
+  mut s = Scene.empty();
+  imm ball = livePart(&mut s, "sphere area");
+  s.applyPlace(ball, new Transform3(new Vec3(10., 0., 0.), Quat.angleAxis(0.7, new Vec3(0., 1., 0.)), new Vec3(1., 1., 1.)));
+  s.applyArea(ball, Volume.sphere(new Vec3(0., 0., 0.), 2.));
+  // A box under a parent twice the size, 5 m along -z: it covers 2 m each way
+  imm holder = livePart(&mut s, "holder");
+  s.applyPlace(holder, new Transform3(new Vec3(0., 0., -5.), Quat.identity(), new Vec3(2., 2., 2.)));
+  imm box = livePart(&mut s, "box area");
+  s.applyParent(box, holder);
+  s.applyArea(box, Volume.box(new Vec3(0., 0., 0.), new Vec3(1., 1., 1.)));
+  imm you = livePart(&mut s, "you");
+  imm other = livePart(&mut s, "another");
+  s.propagate();
+
+  mut ins = 0u;
+  mut outs = 0u;
+  s.sense(you, new Vec3(0., 0., 0.));
+  readAreas(&mut s, ball, you, &mut ins, &mut outs);
+  mut ok = expect("at the origin: in neither", ins == 0u and outs == 0u);
+  s.sense(you, new Vec3(8.5, 0., 0.));
+  readAreas(&mut s, ball, you, &mut ins, &mut outs);
+  ok = expect("1.5 m from the sphere's centre: entered it", ins == 1u and outs == 0u and s.isInside(ball, you)) and ok;
+  s.sense(you, new Vec3(9., 0.5, 0.));
+  readAreas(&mut s, ball, you, &mut ins, &mut outs);
+  ok = expect("moving inside it: nothing new", ins == 1u and outs == 0u) and ok;
+  s.sense(you, new Vec3(12.5, 0., 0.));
+  readAreas(&mut s, ball, you, &mut ins, &mut outs);
+  ok = expect("2.5 m out: left it", ins == 1u and outs == 1u and !s.isInside(ball, you)) and ok;
+
+  ins = 0u;
+  outs = 0u;
+  s.sense(you, new Vec3(1.5, 1.5, -6.5));
+  readAreas(&mut s, box, you, &mut ins, &mut outs);
+  ok = expect("1.5 m each way from the box's centre (its parent doubles it): entered it", ins == 1u and outs == 0u) and ok;
+  s.sense(you, new Vec3(2.5, 0., -5.));
+  readAreas(&mut s, box, you, &mut ins, &mut outs);
+  ok = expect("2.5 m along x: left it", ins == 1u and outs == 1u) and ok;
+
+  // Another being possessed and coming in while the first is inside
+  s.sense(you, new Vec3(10., 0., 0.));
+  s.door.takeMail();
+  ins = 0u;
+  outs = 0u;
+  mut otherIns = 0u;
+  mut otherOuts = 0u;
+  s.sense(other, new Vec3(10.5, 0., 0.));
+  mut mail = s.door.takeMail();
+  imm msgs = mail.viewMut();
+  mut i = 0usize;
+  while i < msgs.len {
+    mut m Message = Message.Read[];
+    m <=> msgs[i];
+    match &mut m {
+      case mut e &mut Entered { if e.being == other { otherIns = otherIns + 1u; } else { ins = ins + 1u; } }
+      case mut l &mut Left { if l.being == you { outs = outs + 1u; } else { otherOuts = otherOuts + 1u; } }
+      else {}
+    }
+    i = i + 1usize;
+  }
+  ok = expect("another being coming into the sphere moves the first out", outs == 1u and otherIns == 1u
+    and ins == 0u and otherOuts == 0u and s.isInside(ball, other)) and ok;
+  ok;
+}
+
+fn checkPossession() bool {
+  print <- "Possession:\n";
+  mut s = Scene.empty();
+  mut c = Cast.empty();
+  imm first = c.add(Being.make(livePart(&mut s, "first"), Walk.make(new Vec3(0., 0., 0.), 0.)));
+  imm second = c.add(Being.make(livePart(&mut s, "second"), Walk.make(new Vec3(5., 0., 0.), 0.)));
+  c.possess(first);
+  // The user's intents, walking forward, for a second
+  imm forward = new Intents(1., 0., false);
+  mut k = 0;
+  while k < 60 { c.step(forward, 1. / 60.); k = k + 1; }
+  mut ok = expect("the possessed being walked 3 m along -z", nearly(c.beings[first].body.position.z, -3., 0.0001));
+  ok = expect("the other stood", c.beings[second].body.position.z == 0. and c.beings[second].body.position.x == 5.) and ok;
+  mut snap = s.publish(Snapshot.empty(), c.you().eyesBefore(), c.you().eyes());
+  ok = expect("the camera is at the first's eyes", nearly(snap.eye(1.).origin.z, -3., 0.0001)
+    and nearly(snap.eye(1.).origin.y, 1.7, 0.0001)) and ok;
+  c.possess(second);
+  k = 0;
+  while k < 60 { c.step(forward, 1. / 60.); k = k + 1; }
+  ok = expect("possessing the second: it walks, the first stands",
+    nearly(c.beings[second].body.position.z, -3., 0.0001) and nearly(c.beings[first].body.position.z, -3., 0.0001)) and ok;
+  snap = s.publish(snap, c.you().eyesBefore(), c.you().eyes());
+  ok = expect("and the camera follows the second", nearly(snap.eye(1.).origin.x, 5., 0.0001)
+    and nearly(snap.eye(1.).origin.z, -3., 0.0001)) and ok;
+  ok;
+}
+
+// Every check run: 0 if all passed, else 1
+pub fn runChecks() i32 {
+  mut ok = checkTree();
+  ok = checkTimers() and ok;
+  ok = checkAreas() and ok;
+  ok = checkPossession() and ok;
+  if ok { print <- "Checks: OK\n"; 0i32; } else { print <- "Checks: FAILED\n"; 1i32; };
+}
