@@ -2,35 +2,54 @@
 // The shell and the walkable plane: an endless brown ground under a
 // sky-blue sky, in metres, walked on at eye height; and a world in it, baked
 // in for now (bakedworld/), standing in for a fetched one: it reaches the
-// browser only through the scene's Door, reserving ids and sending the same
-// requests the shell uses for its own ground and sky.
+// browser only through a Door, reserving ids and sending the same requests
+// the shell uses for its own ground and sky.
 //
-// It is a world the frame package runs (frame's World module trait), so the
-// loop is frame's: each frame drains input, takes the simulation's fixed
-// steps, publishes, draws and presents, every phase timed.
+// IT IS FOUR ACTORS. Each owns its state, and they reach each other only by
+// messages (Cone's actors, the actors package):
 //
-//   input      each event into the input package
-//   simulate   one fixed step at a time: the user's controller turns the
-//              actions into intents for the possessed being, every being
-//              steps (being.cone), and the scene's clock moves on
-//   publish    the pause and x10 keys; a click picked (picking.cone): the
-//              part hit highlighted, and posted to the world's Door if the
-//              world listens for it; the scene's events: timers due rung,
-//              the areas sensed against the possessed being (parts/
-//              events.cone); the baked-in world's next object hydrated and
-//              sent (one a frame, until all are), and the world's tick: its
-//              mail read, its motions sent as requests at the scene's time;
-//              the beings' parts placed; then THE APPLY POINT: the scene's
-//              inbox applied, each request by the system that owns what it
-//              changes (parts/, rendersys.cone, picking.cone); the world
-//              matrices propagated down the placement tree; and the scene's
-//              SNAPSHOT published (parts/snapshot.cone): every world
-//              matrix, the scene's time, and the possessed being's eyes at
-//              its last two steps
-//   draw       from the snapshot alone: the camera between those eyes, the
-//              render system's draw list, then the effects' particles at
-//              the snapshot's time
-//   present    show it
+//   shell    this file, on the main thread: the window, the input and the
+//            user's controller, the clock and the fixed steps, the frame's
+//            statistics, and the scripted run's and the watched run's
+//            events. It is not a Cone actor, because SDL wants the window's
+//            events on the thread that made the window and an actor runs
+//            on whichever worker takes it up; its mailboxes are two
+//            channels the scene answers into.
+//   scene    sceneactor.cone: the scene's registry, tables and clock, the
+//            beings, their bodies and possession (the physics, for now),
+//            the birds, picking; it publishes the snapshot
+//   world    worldactor.cone: the world's own code (the baked-in world),
+//            given a Door of its own ("world" is a placeholder name)
+//   render   renderactor.cone: the device and everything on it; it draws
+//            the snapshot and presents
+//
+// A FRAME, as the messages go:
+//
+//   shell    input: each event into the input package; the actions into
+//            the user's intents; the steps due on the clock
+//     -> scene.frame(input)
+//   scene    simulate: the steps (the intents to the possessed being, every
+//            being, the birds, the scene's clock); publish: the keys, a
+//            click picked, timers and areas into the world's mail, then
+//     -> world.tick(the registry, the mail, the time), awaited
+//   world    its next object hydrated and injected, its mail read, its
+//            motions sent: the registry and its requests handed back
+//   scene    the beings placed; the apply point: its own requests applied,
+//            render's checked and kept in order; the world matrices; the
+//            SNAPSHOT published, then
+//     -> render.draw(the snapshot, render's requests), awaited
+//   render   render's requests applied, the frame drawn from the snapshot
+//            alone, presented, the next image acquired: the snapshot
+//            handed back (and, scripted, what it drew)
+//   scene    a scripted run's checks and its next events
+//     -> the shell's channel: the frame's report (the phases, as each
+//            actor timed its own; the sizes a watched run prints)
+//
+// The scene awaits the world and render in turn, so one actor runs at a
+// time and a frame is the same sequence it was when this was one loop: the
+// picture, the checks and the timings are those of the single thread. No
+// actor divides its own work across threads, and none runs ahead of the
+// others; those wait for Cone's parallel joins.
 //
 // THE SCENE'S TIME is the scene's clock (parts/events.cone): the
 // simulation's fixed steps at the clock's rate (1; 0 paused with P; 10
@@ -47,7 +66,7 @@
 // A run of a fixed number of frames (--frames, --script) takes input only
 // from its own pushed events, so it is the same every time.
 
-mod browser is World;
+mod browser;
 
 import stdio use *;
 import libc;
@@ -62,12 +81,14 @@ import mesh use Mesh;
 import gpu use *;
 import render use *;
 import arena use Arena;
-import frame use World, Config, Host, Step;
+import frame use Config, Host, Step, PHASE_INPUT, PHASE_SIMULATE, PHASE_PUBLISH, PHASE_RENDER, PHASE_PRESENT;
 import input use *;
 import controls use Pose;
 import vfx use ParticleRenderer, EmitterHandle, Emitter, Event;
 import analyticdaylight use DayConfig, DaySky, DayLighting, lumaOf;
 import boidflock use Flock, FlockParams;
+import actors;
+import sync use Channel, Sender, Receiver;
 
 // The submodules: the scene's parts, ids, tables and requests (parts/), whose
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
@@ -82,38 +103,22 @@ use bakedworld { BakedWorld, LATHED_ROOK, BALL, BALLOON, BUTTON as LAUNCH_BUTTON
   COTTAGE_ROOT, COTTAGE_ROOF, COTTAGE_DOOR, COTTAGE_STACK, COTTAGE_PORCH, COTTAGE_PANES, COTTAGE_LANTERNS, COTTAGE_PARTS, LANTERN_PARTS,
   ALARM_AT, Lights, GlowMaterials, nitsAt, FADE_SECONDS, NEAR_GAIN, NEAR_SECONDS, NEAR_RADIUS,
   vegetationParts, vegetationMeshSurplus, setVegetation, vegStats, vegetationLayout, Item, K_SPECIMEN, K_PINE, K_MAPLE, K_ROCK,
-  K_EDGING, K_HOSTA, K_FERN, K_FLOWER, nearCottage, MAX_TREES, vegetationLayoutAgain };
+  K_EDGING, K_HOSTA, K_FERN, K_FLOWER, nearCottage, MAX_TREES, vegetationLayoutAgain, Flight, OBJECTS };
 
-// ---- The world's state ----
+// ---- The shell's state (the main thread's alone) ----
 
-mut scene Scene;
 mut inputState Input;
 mut ctx Context;
-mut cast Cast;                // the beings, and which one the user possesses
 mut user UserController;      // the user's: the actions into the possessed being's intents
 mut clockKeys ClockActions;   // the pause and x10 keys
-mut sentBodies List[Walk];    // each being's body as its part was last placed
-mut snapshot Snapshot;        // the scene's last published, drawn from
-mut rig SkyRig;               // the day's sky and light, and the birds (skyrig.cone)
 mut skyOff bool = false;      // --no-sky: the static sky and light, no birds (to time what the day costs)
 mut ctxFrame u64 = 0u64;      // the frame whose actions are in 'ctx'
 mut inputFrame u64 = 0u64;    // the frame whose events are in 'input'
 mut automated bool = false;   // a run of a fixed number of frames: real input ignored
 mut scripted bool = false;
-mut scriptOk bool = true;
 mut shotsDir String;
-mut unrendered u64 = 0u64;    // render requests a headless run had no GPU for
-mut world BakedWorld;         // the baked-in world: what of it has been sent
 mut startedAt u64 = 0u64;     // the performance counter when main began
-mut worldSentFrame u64 = 0u64;  // the frame whose publish sent the world's last object
-mut worldShownAt u64 = 0u64;  // the counter once that frame was presented (or applied, headless)
-mut picks PickSystem;         // what each shown part is, for picking
-mut picked PartId;            // the part highlighted: the last click's
-mut lastPick PickHit;         // the last click's answer, for the script
-mut clicks u64 = 0u64;
-mut fired u64 = 0u64;         // Fire requests applied: an effect's bursts
-mut sceneNow f64 = 0d;        // the scene's time, seconds, at this frame's publish
-mut hardLandingsMailed u64 = 0u64;  // hard landings posted to the world's mail
+mut worldShownAt u64 = 0u64;  // the counter once the frame that sent the world's last object was presented
 
 // The view a headless run picks in (no window to measure)
 const HEADLESS_W f32 = 1280.;
@@ -146,219 +151,31 @@ struct ClockActions {
   }
 }
 
-// The GPU side, made by start; the device outlives what it made
-struct Gfx {
-  pub readback Buffer;
-  pub shotName String;        // the file the frame read back goes to; empty: none
-  pub target SurfaceTexture;
-  pub post Post;              // the HDR frame drawn into, bloomed and tone-mapped into the target
-  pub sys RenderSystem;
-  pub renderer Renderer;
-  pub swapchain SwapChain;
-  pub device Device;
-  pub adapter Adapter;
-  pub surface Surface;
-  pub instance Instance;
-  pub camera Camera;
-}
-
-mut gfx Option[Gfx];
-
-fn @initpure init() {
-  gfx = None[Gfx][];
-  scene = Scene.empty();
-  inputState = Input.empty();
-  ctx = Context.empty();
-  user = UserController.bind(&mut ctx);
-  clockKeys = ClockActions.bind(&mut ctx);
-  cast = Cast.empty();
-  sentBodies = List[Walk].empty();
-  snapshot = Snapshot.empty();
-  rig = SkyRig.make();
-  shotsDir = String.empty();
-  world = BakedWorld.make();
-  tempPart = PartId.none();
-  probeFrom = new Vec3(0., 0., 0.);
-  picks = PickSystem.empty();
-  clickAt = new Vec2(0., 0.);
-  route = List[Vec2].empty();
-  routeS = List[f32].empty();
-  viewEye = new Vec3(0., 0., 0.);
-  viewTarget = new Vec3(0., 0., 0.);
-  ballRest = new Vec3(0., 0., 0.);
-  picked = PartId.none();
-  lastPick = new PickHit(PartId.none(), 0., 0u32, 0u64);
-}
-
-fn takeGfx() Option[Gfx] {
-  mut g Option[Gfx] = None[Gfx][];
-  g <=> gfx;
-  g;
-}
-
-fn millisSinceStart() f64 {
-  f64.from(sdl.GetPerformanceCounter() - startedAt) / f64.from(sdl.GetPerformanceFrequency()) * 1000d;
-}
-
-// Whether the run has the GPU side
-fn hasGpu() bool {
-  mut g = takeGfx();
-  mut has = false;
-  match &mut g {
-    case mut some &mut Some { has = true; }
-    else {}
-  }
-  gfx = g;
-  has;
-}
-
-// Whether part 'id' is in the render system's tables: drawn, or giving off particles
-fn isDrawn(id PartId) bool {
-  mut g = takeGfx();
-  mut drawn = false;
-  match &mut g {
-    case mut some &mut Some {
-      drawn = some.value.sys.rows.find(id) != NO_ROW or some.value.sys.effects.find(id) != NO_ROW;
-    }
-    else {}
-  }
-  gfx = g;
-  drawn;
-}
-
-// Whether part 'id' is drawn physically based
-fn isPhysical(id PartId) bool {
-  mut g = takeGfx();
-  mut physical = false;
-  match &mut g {
-    case mut some &mut Some { physical = some.value.sys.isPhysical(id); }
-    else {}
-  }
-  gfx = g;
-  physical;
-}
-
-// The material part 'id' is drawn in, as the render system has it (none
-// without a GPU)
-// Part 'id''s tint in the render system (white if there is no GPU or it is not drawn)
-fn drawnTint(id PartId) Color {
-  mut g = takeGfx();
-  mut t = new Color(1., 1., 1., 1.);
-  match &mut g {
-    case mut some &mut Some { t = some.value.sys.tintOf(id); }
-    else {}
-  }
-  gfx = g;
-  t;
-}
-
-fn drawnMaterial(id PartId) MaterialId {
-  mut g = takeGfx();
-  mut m = MaterialId.none();
-  match &mut g {
-    case mut some &mut Some { m = some.value.sys.materialOf(id); }
-    else {}
-  }
-  gfx = g;
-  m;
-}
-
-// The possessed being's body: where the user is
-fn youBody() Walk { cast.beings[cast.possessed].body; }
-
-// A mannequin of 'height' metres made, shown and added to the cast standing
-// at 'at' facing 'yaw': the index of its being
-fn addMannequin(name &[]u8, at Vec3, yaw f32, height f32, seed u32, color Color) usize {
-  imm root = scene.newPart(name);
-  imm parts = spawnMannequin(&mut scene, height, color, root);
-  cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, parts)));
-}
-
 // How many parts a mannequin is (its own, shown as its skinned body) and
 // how many meshes (the body)
 const FIGURE_PARTS = 1usize;
 const FIGURE_MESHES = 1u64;
 
-// ---- start ----
+fn @initpure init() {
+  inputState = Input.empty();
+  ctx = Context.empty();
+  user = UserController.bind(&mut ctx);
+  clockKeys = ClockActions.bind(&mut ctx);
+  shotsDir = String.empty();
+  probeFrom = new Vec3(0., 0., 0.);
+  // The scripted run's own (script.cone, assembly.cone): touched only from the
+  // scene actor's end of frame
+  clickAt = new Vec2(0., 0.);
+  tempPart = PartId.none();
+  ballRest = new Vec3(0., 0., 0.);
+  route = List[Vec2].empty();
+  routeS = List[f32].empty();
+  viewEye = new Vec3(0., 0., 0.);
+  viewTarget = new Vec3(0., 0., 0.);
+}
 
-// The point at (x, z) on the ground, for a being to stand on
-fn standing(x f32, z f32) Vec3 { new Vec3(x, groundHeight(x, z), z); }
-
-pub fn start(host &mut Host) bool {
-  automated = host.config.frames > 0u64 or watching();
-  // The island's land is baked first (the beings stand on it), then sent
-  imm bakeStart = sdl.GetPerformanceCounter();
-  bakeIsland();
-  print <- "The island: baked in "; print <- f64.from(sdl.GetPerformanceCounter() - bakeStart) * 1000d
-    / f64.from(sdl.GetPerformanceFrequency()); print <- " ms\n";
-  seedScene(&mut scene);
-  if scripted {
-    // The scripted run starts as the plain walker on the landing beach,
-    // facing -z up the path's first stretch; its walk is checked there, then
-    // it is set down at the old flat world's start (START_X, START_Z) and
-    // keeps its exact walk checks from there. It takes the mannequin over by
-    // pressing Tab at its end. The mannequins stand off to the right of that start.
-    imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(BEACH_X, islandHeight(BEACH_X, BEACH_Z),
-      BEACH_Z), 0.)));
-    cast.possess(youAt);
-    addMannequin("mannequin", standing(START_X + 5., START_Z), 0., 1.75, 3u32, woodColor());
-    addMannequin("second mannequin", standing(START_X + 3.5, START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
-  } else {
-    // The user's own being: a mannequin on the landing beach, facing -z up
-    // the path, possessed, seen from behind and above; another stands a few metres off
-    imm youAt = addMannequin("mannequin", standing(BEACH_X, BEACH_Z), 0., 1.75, 3u32, woodColor());
-    addMannequin("second mannequin", standing(BEACH_X + 3., BEACH_Z - 4.), 2.356, 1.62, 11u32, clayColor());
-    cast.possess(youAt);
-  }
-  cast.look(1. / 60.);
-  print <- "Scene: "; print <- scene.partCount(); print <- " parts reserved, ";
-  print <- scene.waiting(); print <- " requests waiting\n";
-  if scripted { pushScript(1u64); }
-  if !host.hasWindow() { return true; }
-
-  mut instance = Instance.create("browser");
-  mut surface = instance.createSurface(host.window().sdlHandle());
-  mut preference = POWER_PREFERENCE_HIGH_PERFORMANCE;
-  imm env = libc.getenv(&"GPU_POWER_PREFERENCE" as *u8);
-  if (env as usize) != 0usize {
-    if libc.strcmp(env, &"low-power" as *u8) == 0i32 { preference = POWER_PREFERENCE_LOW_POWER; }
-  }
-  mut adapter = instance.requestAdapter(&surface, preference);
-  if !adapter.isValid() {
-    print <- "No GPU can draw to the window\n";
-    return false;
-  }
-  print <- "Adapter: "; printStr(adapter.name.view());
-  if instance.validation { print <- "; validation layer on\n"; } else { print <- "; validation layer off\n"; }
-  mut device = adapter.requestDevice();
-  imm size = host.window().size();
-  mut swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
-  // The scene is drawn into a half-float frame, which the Post blooms and
-  // tone-maps into the swapchain's texture (lookPost says how)
-  mut renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
-  mut post = Post.create(&mut device, swapchain.format, u32.from(size.w), u32.from(size.h));
-  lookPost(&mut post);
-  // The depth kept after the scene's pass, for the particles' pass to test against
-  renderer.keepDepth = true;
-  // The environment the physical parts are lit by besides the sun; the sky
-  // drawn stays the clear colour
-  imm environment = environmentSky();
-  renderer.setSky(&mut device, &environment);
-  renderer.drawSky = false;
-  mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT);
-  if !renderer.isValid() or !sys.particles.isValid() or !post.isValid() {
-    print <- "The renderer could not be made\n";
-    return false;
-  }
-  if !skyOff { rig.makeGpu(&mut renderer, &mut device); }
-  mut camera = Camera.make();
-  camera.fov = FOV;
-  camera.near = 0.1;
-  camera.far = 6000.;           // the island is 1.3 km across, the sea runs to the horizon
-  imm target = swapchain.getCurrentTexture(&mut device);
-  gfx = Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, post, sys, renderer, swapchain, device,
-    adapter, surface, instance, camera)];
-  true;
+fn millisSinceStart() f64 {
+  f64.from(sdl.GetPerformanceCounter() - startedAt) / f64.from(sdl.GetPerformanceFrequency()) * 1000d;
 }
 
 // ---- input ----
@@ -398,114 +215,6 @@ fn updateActions(frameNo u64) {
   }
 }
 
-pub fn event(host &mut Host, e &imm sdl.Event) {
-  if host.hasWindow() and host.window().resized {
-    host.window().resized = false;
-    imm s = host.window().size();
-    mut g = takeGfx();
-    match &mut g {
-      case mut some &mut Some { some.value.swapchain.resize(u32.from(s.w), u32.from(s.h)); }
-      else {}
-    }
-    gfx = g;
-  }
-  beginInput(host.frame);
-  if watching() { watchEvent(e); }
-  if accepted(e) { inputState.handle(e); }
-}
-
-// ---- simulate ----
-
-pub fn simulate(host &mut Host, step &imm Step, scratch &mut Arena) {
-  updateActions(host.frame);
-  // input -> the user's controller -> the possessed being's intents
-  cast.step(user.intents(&ctx), step.dt);
-  // The birds fly on scene time (paused and x10 with the day)
-  rig.stepBirds(step.dt * f32.from(scene.clock.rate()));
-  scene.advanceClock(step.ns);
-}
-
-// ---- publish: the apply point ----
-
-pub fn publish(host &mut Host) {
-  updateActions(host.frame);
-  if ctx.pressed(clockKeys.pause) {
-    scene.togglePause();
-    print <- "Scene time "; if scene.clock.paused { print <- "paused"; } else { print <- "running"; };
-    print <- " at "; print <- scene.now(); print <- " s\n";
-  }
-  if ctx.pressed(clockKeys.fast) {
-    scene.toggleFast();
-    print <- "Scene time x"; print <- scene.clock.rate(); print <- " at "; print <- scene.now(); print <- " s\n";
-  }
-  sceneNow = scene.now();
-  // The view and possession keys: V first or third person, Tab the next mannequin
-  if ctx.pressed(user.actions.view) {
-    cast.rig.toggle();
-    print <- "View: "; if cast.rig.mode == VIEW_FIRST { print <- "first person"; } else { print <- "third person"; }; print <- "\n";
-  }
-  if ctx.pressed(user.actions.swap) {
-    cast.swap();
-    print <- "Possessing being "; print <- cast.possessed; print <- "\n";
-  }
-  // Hard landings, mailed to the world
-  mut landings = cast.takeLandings();
-  mut li = 0usize;
-  while li < landings.len() {
-    imm l = *landings[li];
-    scene.post(Message.HardLanding[l.part, l.speed, l.damage]);
-    hardLandingsMailed = hardLandingsMailed + 1u64;
-    li = li + 1usize;
-  }
-  if (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u { click(host); }
-  // The scene's events, into the world's mail: timers due, and the areas
-  // the possessed being is in
-  scene.ring();
-  imm you = youBody();
-  scene.sense(cast.beings[cast.possessed].part, you.position);
-  // The world is handed the Door, never the scene
-  if world.step(&mut scene.door) and world.done() { worldSentFrame = host.frame; }
-  world.tick(&mut scene.door, sceneNow);
-  placeBeings();
-  placeFigures();
-  applyRequests();
-  scene.propagate();
-  mut last = Snapshot.empty();
-  last <=> snapshot;
-  snapshot = scene.publish(last, cast.eyesBefore(), cast.eyes());
-}
-
-// Each being's part placed where its body is, when it has moved
-fn placeBeings() {
-  mut i = 0usize;
-  while i < cast.beings.len() {
-    imm b = &mut cast.beings[i];
-    if i >= sentBodies.len() {
-      sentBodies.push(b.body);
-      scene.send(Request.Place[b.part, b.placement()]);
-    } else {
-      imm was = *sentBodies[i];
-      if was.position.x != b.body.position.x or was.position.y != b.body.position.y
-        or was.position.z != b.body.position.z or was.yaw != b.body.yaw {
-        sentBodies.set(i, b.body);
-        scene.send(Request.Place[b.part, b.placement()]);
-      }
-    }
-    i = i + 1usize;
-  }
-}
-
-// Each mannequin posed: the skinning matrices of the pose the gait wrote
-// this step, for its one skinned part (mannequin.cone)
-fn placeFigures() {
-  mut i = 0usize;
-  while i < cast.beings.len() {
-    imm b = &mut cast.beings[i];
-    if b.figure.active { scene.send(Request.Bones[b.part, b.figure.skinning()]); }
-    i = i + 1usize;
-  }
-}
-
 // The view the mouse's places are in: the window's own units, or a fixed
 // size in a headless run
 pub fn viewSize(host &mut Host) Vec2 {
@@ -514,390 +223,146 @@ pub fn viewSize(host &mut Host) Vec2 {
   new Vec2(f32.from(r.w), f32.from(r.h));
 }
 
-// A click where the pointer is: the part it hits picked, reported and
-// highlighted (the one before let go), and, if its sender listens for its
-// clicks, posted to the sender's Door. The eye is where the last picture
-// was drawn from.
-fn click(host &mut Host) {
-  imm size = viewSize(host);
-  imm eye = snapshot.eyeTo;
-  imm ray = rayThrough(eye, FOV, inputState.pointer.x, inputState.pointer.y, size.x, size.y);
-  imm t0 = sdl.GetPerformanceCounter();
-  imm hit = picks.pick(&scene, ray);
-  imm us = f64.from(sdl.GetPerformanceCounter() - t0) / f64.from(sdl.GetPerformanceFrequency()) * 1.0e6d;
-  clicks = clicks + 1u64;
-  lastPick = hit;
-  print <- "Click at ("; print <- inputState.pointer.x; print <- ", "; print <- inputState.pointer.y; print <- "): ";
-  if hit.id.isNone() {
-    print <- "nothing";
-  } else {
-    imm name = scene.nameOf(hit.id);
-    printStr(name.view()); print <- ", "; print <- hit.distance; print <- " m away";
-  }
-  print <- " ("; print <- hit.boxesHit; print <- " boxes entered, "; print <- hit.triangles; print <- " triangles tested, ";
-  print <- us; print <- " us)\n";
-  if !picked.isNone() and !(picked == hit.id) { scene.send(Request.Highlight[picked, false]); }
-  if !hit.id.isNone() {
-    scene.send(Request.Highlight[hit.id, true]);
-    if scene.isListening(hit.id) { scene.post(Message.Clicked[hit.id]); }
-  }
-  picked = hit.id;
-}
+// ---- the shell's loop ----
 
-// Apply every request waiting, in the order sent, each by the system that
-// owns what it changes
-fn applyRequests() {
-  if scene.waiting() == 0usize { return; }
-  mut batch = scene.takeInbox();
-  mut g = takeGfx();
-  imm requests = batch.viewMut();
-  mut i = 0usize;
-  while i < requests.len {
-    mut r Request = Request.Done[];
-    r <=> requests[i];
-    match &mut r {
-      case mut s &mut Spawn {
-        mut name = String.empty();
-        name <=> s.name;
-        scene.applySpawn(s.id, name);
+// The run: the window and the clock (frame's Host), the actors made, then a
+// frame at a time until the run is over, and the actors' reports. Its answer
+// is the run's exit code.
+fn shellRun(config Config) i32 {
+  mut host = Host.open(config);
+  if !host.isOpen() { return 1i32; }
+  automated = host.config.frames > 0u64 or watching();
+  // The flock is made before the island is baked, as it was when the sky rig
+  // was a global made by the module's initializer: its home's height and its
+  // birds' first heights are read off the ground before there is one (0 m).
+  // Making it after the bake would lift the birds (a change to every view
+  // with a bird in it), so it is left as it was; the scene actor steps it.
+  imm birds = Birds.make();
+  // The island's land is baked first (the beings stand on it, the world
+  // grows on it), here, before any actor starts: from then on it is only
+  // read, by every actor
+  imm bakeStart = sdl.GetPerformanceCounter();
+  bakeIsland();
+  print <- "The island: baked in "; print <- f64.from(sdl.GetPerformanceCounter() - bakeStart) * 1000d
+    / f64.from(sdl.GetPerformanceFrequency()); print <- " ms\n";
+
+  // The shell's three inboxes: render's word that it could make the GPU
+  // side, each frame's report, and the run's exit code
+  mut readyTx Sender[bool];
+  mut readyRx Receiver[bool];
+  readyTx, readyRx = Channel[bool].make();
+  mut framesTx Sender[FrameReport];
+  mut framesRx Receiver[FrameReport];
+  framesTx, framesRx = Channel[FrameReport].make();
+  mut endTx Sender[i32];
+  mut endRx Receiver[i32];
+  endTx, endRx = Channel[i32].make();
+
+  // Render first: its initializer makes the device here, on the thread that
+  // made the window (the window's handle is handed over as a number)
+  mut window = 0usize;
+  mut width = 0u32;
+  mut height = 0u32;
+  if host.hasWindow() {
+    window = host.window().sdlHandle() as *u8 as usize;
+    imm size = host.window().size();
+    width = u32.from(size.w);
+    height = u32.from(size.h);
+  }
+  imm render = new RenderActor(window, width, height, skyOff, scripted, shotsDir.copy(), readyTx);
+  mut ready = false;
+  match readyRx.recv() {
+    case imm r Some { ready = r.value; }
+    case is None[bool] {}
+  }
+  if !ready { return 1i32; }
+  imm world = new WorldActor(scripted);
+  imm scene = new SceneActor(scripted, birds, world, render, framesTx, endTx);
+  if scripted { pushScript(1u64); }
+
+  while host.beginFrame() {
+    // Input: each event waiting into the input package (the window's own
+    // already handled by frame's Host: quit, Escape, F11, a resize)
+    host.beginPhase(PHASE_INPUT);
+    mut resized = false;
+    mut e = sdl.Event.empty();
+    while host.nextEvent(&mut e) {
+      if host.hasWindow() and host.window().resized {
+        host.window().resized = false;
+        resized = true;
       }
-      case mut p &mut Place { scene.applyPlace(p.id, p.at); }
-      case mut pa &mut Parent { scene.applyParent(pa.id, pa.parent); }
-      case mut d &mut Despawn {
-        // The part and its whole subtree: the scene's rows first, then
-        // every other system's for each part that went
-        mut gone = List[PartId].empty();
-        if scene.applyDespawn(d.id, &mut gone) {
-          mut k = 0usize;
-          while k < gone.len() {
-            imm id = *gone[k];
-            match &mut g {
-              case mut some &mut Some { some.value.sys.drop(&mut some.value.device, id); }
-              else {}
-            }
-            picks.drop(id);
-            k = k + 1usize;
-          }
-        }
-      }
-      case mut dm &mut DefineMesh {
-        if scene.applyDefine(dm.mesh.id, KIND_MESH) {
-          // The picking system keeps its shape; the render system uploads it
-          picks.shape(dm.mesh, &dm.shape);
-          match &mut g {
-            case mut some &mut Some {
-              some.value.sys.defineMesh(&mut some.value.renderer, &mut some.value.device, dm.mesh, &dm.shape);
-            }
-            else { unrendered = unrendered + 1u64; }
-          }
-        }
-      }
-      case mut ds &mut DefineSkinnedMesh {
-        if scene.applyDefine(ds.mesh.id, KIND_MESH) {
-          // Picked as modelled; drawn posed
-          picks.shape(ds.mesh, &ds.shape);
-          match &mut g {
-            case mut some &mut Some {
-              some.value.sys.defineSkinnedMesh(&mut some.value.renderer, &mut some.value.device, ds.mesh, &ds.shape,
-                &ds.skin);
-            }
-            else { unrendered = unrendered + 1u64; }
-          }
-        }
-      }
-      case mut bn &mut Bones {
-        if !scene.isLive(bn.id) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          match &mut g {
-            case mut some &mut Some { some.value.sys.pose(bn.id, &bn.bones); }
-            else { unrendered = unrendered + 1u64; }
-          }
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      case mut dl &mut DefineMaterial {
-        if scene.applyDefine(dl.material.id, KIND_MATERIAL) {
-          match &mut g {
-            case mut some &mut Some {
-              some.value.sys.defineMaterial(&mut some.value.renderer, &mut some.value.device, dl.material, &dl.surface,
-                &dl.paint, &dl.maps);
-            }
-            else { unrendered = unrendered + 1u64; }
-          }
-        }
-      }
-      case mut sh &mut Show {
-        if !scene.isLive(sh.id) or !scene.isMesh(sh.mesh) or !scene.isMaterial(sh.material) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          // The picking system keeps which mesh it is (not the ground's: an
-          // anchored part is drawn wherever the viewer is)
-          if sh.anchor == 0. { picks.show(sh.id, sh.mesh); }
-          match &mut g {
-            case mut some &mut Some { some.value.sys.show(sh.id, sh.mesh, sh.material, sh.anchor); }
-            else { unrendered = unrendered + 1u64; }
-          }
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      case mut tm &mut Timer { scene.applyTimer(tm.token, tm.at, tm.every); }
-      case mut cn &mut Cancel { scene.applyCancel(cn.token); }
-      case mut ar &mut Area { scene.applyArea(ar.id, ar.volume); }
-      case mut ef &mut Effect {
-        if !scene.isLive(ef.id) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          match &mut g {
-            case mut some &mut Some {
-              some.value.sys.effect(&mut some.value.device, ef.id, &ef.layers, ef.seed, ef.start, ef.stop);
-            }
-            else { unrendered = unrendered + 1u64; }
-          }
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      case mut f &mut Fire {
-        if !scene.isLive(f.id) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          match &mut g {
-            case mut some &mut Some { some.value.sys.fire(f.id, f.seed, f.start, f.stop); }
-            else { unrendered = unrendered + 1u64; }
-          }
-          fired = fired + 1u64;
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      case mut l &mut Listen { scene.applyListen(l.id); }
-      case mut gl &mut Glow {
-        if !scene.isMaterial(gl.material) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          match &mut g {
-            case mut some &mut Some {
-              some.value.sys.glow(&mut some.value.renderer, &mut some.value.device, gl.material, gl.glow);
-            }
-            else { unrendered = unrendered + 1u64; }
-          }
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      case mut tn &mut Tint {
-        if !scene.isLive(tn.id) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          match &mut g {
-            case mut some &mut Some { some.value.sys.tint(tn.id, tn.tint); }
-            else { unrendered = unrendered + 1u64; }
-          }
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      case mut hl &mut Highlight {
-        if !scene.isLive(hl.id) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          match &mut g {
-            case mut some &mut Some {
-              some.value.sys.highlight(&mut some.value.renderer, &mut some.value.device, hl.id, hl.on);
-            }
-            else { unrendered = unrendered + 1u64; }
-          }
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      case mut k &mut Sky {
-        if !scene.isLive(k.id) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          match &mut g {
-            case mut some &mut Some { some.value.sys.sky(k.id, k.look); }
-            else { unrendered = unrendered + 1u64; }
-          }
-          scene.applied = scene.applied + 1u64;
-        }
-      }
-      else {}
+      beginInput(host.frame);
+      if watching() { watchEvent(&e); }
+      if accepted(&e) { inputState.handle(&e); }
     }
-    i = i + 1usize;
-  }
-  gfx = g;
-}
+    host.endPhase(PHASE_INPUT);
 
-// ---- draw ----
-
-pub fn draw(host &mut Host, alpha f32, scratch &mut Arena) {
-  updateActions(host.frame);
-  mut pose = snapshot.eye(alpha);
-  // A scripted close-up looks from where the script says instead
-  if scripted and hasView(host.frame) { pose = viewAt(host.frame); }
-  mut g = takeGfx();
-  match &mut g {
-    case mut some &mut Some { drawFrame(&mut some.value, pose, host.frame, alpha); }
-    else {}
-  }
-  gfx = g;
-}
-
-fn drawFrame(g &mut Gfx, pose Pose, frameNo u64, alpha f32) {
-  if !g.target.ok() { return; }
-  mut sky = g.sys.currentSky();
-  // Once the world has sent a sky, the day's: the sun, moon and ambient from
-  // the day clock (skyrig.cone), and the exposure from the sun's height
-  imm dayLit = g.sys.skies.len() > 0usize and rig.made;
-  if dayLit {
-    rig.setHour(f32.from(snapshot.hour));
-    sky = rig.look();
-    g.renderer.environmentStrength = rig.environmentStrength();
-  }
-  g.camera.origin = pose.origin;
-  g.camera.orientation = pose.orientation;
-  // A scripted close-up may look through a longer lens
-  g.camera.fov = if scripted and hasView(frameNo) { viewFov(frameNo); } else { FOV; };
-  g.camera.background = sky.color;
-  // The shaders' clock: the scene's time (the sea's waves, the swash), stopped when it is
-  g.renderer.time = f32.from(snapshot.now);
-  imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
-  g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()); } else { exposureFor(&sky); };
-  g.sys.build(&snapshot, pose.origin);
-  if dayLit { rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha); }
-  mut encoder = g.device.createCommandEncoder();
-  // Into the HDR frame (the size of the target), then bloomed and
-  // tone-mapped into the target
-  g.post.resize(&mut g.device, g.target.texture.width, g.target.texture.height);
-  g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
-  if g.sys.hasEffects() {
-    g.sys.aimEffects(&mut g.device, &snapshot);
-    g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
-  }
-  g.post.apply(&mut encoder, &g.target.texture);
-
-  // A scripted view to save: copied now, written once presented
-  imm shot = shotAt(frameNo);
-  if shotsDir.len() > 0usize and shot.len > 0usize {
-    imm w = g.target.texture.width;
-    imm h = g.target.texture.height;
-    g.readback = g.device.createBuffer(u64.from(w) * u64.from(h) * 4u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
-    encoder.copyTextureToBuffer(&g.target.texture, &g.readback);
-    mut name = shotsDir.copy();
-    name <- "/";
-    name <- shot;
-    name <- ".bmp";
-    g.shotName = name;
-  }
-  g.device.queue.submit(encoder.finish());
-}
-
-// ---- present ----
-
-pub fn present(host &mut Host) {
-  mut g = takeGfx();
-  match &mut g {
-    case mut some &mut Some { showAndAcquire(&mut some.value); }
-    else {}
-  }
-  gfx = g;
-  if host.frame == 1u64 {
-    print <- "The first frame presented "; print <- millisSinceStart(); print <- " ms after main began\n";
-  }
-  // The first frame on screen with every object of the world in it
-  if world.done() and worldShownAt == 0u64 and host.frame >= worldSentFrame {
-    worldShownAt = sdl.GetPerformanceCounter();
-    print <- "The world: every object visible at frame "; print <- host.frame; print <- ", ";
-    print <- millisSinceStart(); print <- " ms after main began\n";
-  }
-  if scripted {
-    imm you = youBody();
-    if !checkScript(host.frame, &you) { scriptOk = false; }
-    driveScene(host.frame);
-    pushScript(host.frame + 1u64);
-    pushClicks(host, host.frame + 1u64, &you);
-  }
-  if watching() or soaking() { watchSizes(host); }
-}
-
-// A watched run's line and probe, or a soak's checks, with the scene's and
-// the render system's sizes
-fn watchSizes(host &mut Host) {
-  mut rows = 0usize;
-  mut emitters = 0usize;
-  mut g = takeGfx();
-  match &mut g {
-    case mut some &mut Some {
-      rows = some.value.sys.rows.len();
-      emitters = some.value.sys.particles.emitterCount();
+    // The frame's steps, the actions brought up to date once, and what the
+    // scene is handed: the user's controller's intents, the keys pressed,
+    // a click, the window's sizes
+    mut steps = List[Step].empty();
+    while host.fixed.next() {
+      host.stats.steps = host.fixed.taken;
+      steps.push(host.step());
     }
-    else {}
-  }
-  gfx = g;
-  imm you = youBody();
-  if watching() { watchTick(host, &you, scene.waiting(), rows, emitters); }
-  if soaking() { soakTick(host, world.done(), scene.partCount(), scene.waiting(), rows, emitters); }
-}
-
-fn showAndAcquire(g &mut Gfx) {
-  imm t0 = sdl.GetTicksNS();
-  if g.target.ok() {
-    g.swapchain.present(&mut g.device);
-    watchPresentNs = watchPresentNs + (sdl.GetTicksNS() - t0);
-    if g.shotName.len() > 0usize {
-      g.device.waitIdle();
-      imm w = g.target.texture.width;
-      imm h = g.target.texture.height;
-      imm bgra = g.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM_SRGB
-        or g.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM;
-      imm img = Image.fromTexels(g.readback.mappedRange(), i32.from(w), i32.from(h), bgra);
-      imm written = img.save(g.shotName.view());
-      print <- "Screenshot: "; printStr(g.shotName.view());
-      if written { print <- "\n"; } else { print <- " could NOT be written\n"; scriptOk = false; }
-      g.shotName = String.empty();
-      g.readback = Buffer.none();
+    updateActions(host.frame);
+    imm alpha = host.alpha();
+    mut width = 0u32;
+    mut height = 0u32;
+    if host.hasWindow() {
+      imm s = host.window().size();
+      width = u32.from(s.w);
+      height = u32.from(s.h);
     }
-  } else {
-    sdl.Delay(10u32);
+    imm input = new FrameInput(host.frame, steps, user.intents(&ctx), ctx.pressed(clockKeys.pause),
+      ctx.pressed(clockKeys.fast), ctx.pressed(user.actions.view), ctx.pressed(user.actions.swap),
+      (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u, new Vec2(inputState.pointer.x, inputState.pointer.y),
+      viewSize(&mut host), alpha, resized, width, height);
+    scene.frame(input);
+
+    // The frame comes back presented, with each actor's phases
+    mut report = FrameReport.none();
+    match framesRx.recv() {
+      case imm r Some { report = r.value; }
+      case is None[FrameReport] { break; }
+    }
+    host.stats.phase(PHASE_SIMULATE).add(report.simulateNs, host.frame);
+    host.stats.phase(PHASE_PUBLISH).add(report.publishNs, host.frame);
+    host.stats.phase(PHASE_RENDER).add(report.renderNs, host.frame);
+    host.stats.phase(PHASE_PRESENT).add(report.presentNs, host.frame);
+    if host.frame == 1u64 {
+      print <- "The first frame presented "; print <- millisSinceStart(); print <- " ms after main began\n";
+    }
+    // The first frame on screen with every object of the world in it
+    if report.worldDone and worldShownAt == 0u64 and host.frame >= report.worldSentFrame {
+      worldShownAt = sdl.GetPerformanceCounter();
+      print <- "The world: every object visible at frame "; print <- host.frame; print <- ", ";
+      print <- millisSinceStart(); print <- " ms after main began\n";
+    }
+    if watching() or soaking() {
+      if host.hasWindow() {
+        watchPresentNs = watchPresentNs + report.swapNs;
+        watchAcquireNs = watchAcquireNs + report.acquireNs;
+        watchTexture(report.status);
+      }
+      if watching() { watchTick(&mut host, &report.you, report.waiting, report.rows, report.emitters); }
+      if soaking() { soakTick(&mut host, report.worldDone, report.parts, report.waiting, report.rows, report.emitters); }
+    }
   }
-  imm t1 = sdl.GetTicksNS();
-  g.target = g.swapchain.getCurrentTexture(&mut g.device);
-  watchAcquireNs = watchAcquireNs + (sdl.GetTicksNS() - t1);
-  watchTexture(g.target.status);
-}
 
-// ---- quit ----
-
-pub fn quit(host &mut Host) i32 {
-  print <- "Scene: "; print <- scene.partCount(); print <- " parts; requests applied "; print <- scene.applied;
-  print <- ", refused "; print <- scene.refused; print <- "\n";
-  imm you = youBody();
-  print <- "Walked to ("; print <- you.position.x; print <- ", "; print <- you.position.z;
-  print <- "), facing "; print <- you.yaw; print <- " rad\n";
-  print <- "Scene time "; print <- scene.now(); print <- " s, the day clock at "; print <- scene.hour();
-  print <- " h; timers rung "; print <- scene.rung(); print <- ", armed "; print <- scene.timerCount(); print <- "\n";
-  print <- "The baked-in world, object by object:\n";
-  world.report();
-  mut code = 0i32;
-  if scripted and !scriptOk { code = 1i32; }
+  // The end: the scene's, the world's and render's reports, in that order,
+  // and the run's exit code
+  scene.finish(host.hasWindow());
+  mut code = 1i32;
+  match endRx.recv() {
+    case imm c Some { code = c.value; }
+    case is None[i32] {}
+  }
   if soaking() and soakReport() != 0i32 { code = 1i32; }
-  if !host.hasWindow() {
-    if unrendered > 0u64 { print <- "Headless: "; print <- unrendered; print <- " render requests had no GPU\n"; }
-    if scripted { reportScript(scriptOk); }
-    return code;
-  }
-  mut g = takeGfx();
-  match &mut g {
-    case mut some &mut Some {
-      some.value.device.waitIdle();
-      print <- "Parts drawn: "; print <- some.value.sys.drawn; print <- "; draws ";
-      print <- u64.from(some.value.renderer.drawCalls); print <- ", triangles "; print <- some.value.renderer.triangles;
-      print <- "\n";
-    }
-    else {}
-  }
-  g = None[Gfx][];
-  print <- "Vulkan failures: "; print <- u64.from(failures());
-  print <- "; validation messages: "; print <- u64.from(validationMessages()); print <- "\n";
-  if failures() != 0u32 or validationMessages() != 0u32 { code = 1i32; }
-  if scripted { reportScript(scriptOk); }
+  imm st = actors.stats();
+  print <- "Actors: "; print <- u64.from(st.workers); print <- " workers, "; print <- st.messages; print <- " messages in ";
+  print <- st.activations; print <- " turns, "; print <- st.steals; print <- " steals\n";
+  host.finish();
   code;
 }
 
@@ -953,7 +418,9 @@ fn main(argc i32, argv **u8) i32 {
       return 2i32;
     }
   }
-  imm code = run(config);
+  // The actors are made and let go inside shellRun, so that finalAll finds
+  // them quiet and stops the workers
+  imm code = shellRun(config);
   finalAll();
   code;
 }
