@@ -1,0 +1,779 @@
+// The cottage at the end of the forest lane, and the pathway lanterns along
+// its front path. Measured from the reference frame
+// (C:\src\reference-images\cottage\forest-cottage-dusk.jpg, 640 x 1136),
+// with its front door as the ruler, then built as meshes (not signed
+// distance fields) out of boxes, prisms and slabs. Each surface kind is one
+// material, made in one place (ctMaterials), so the procedural texture kit's
+// maps can replace a material's paint without touching the geometry.
+//
+// THE RULER. The door is taken as 2.0 m high, a standard door; it reads 137
+// px high in the frame (749 down to 612), so 68.5 px a metre at the front
+// wall. Its leaf is 0.8 m wide here (it reads 48 px, 0.70 m, across; the
+// standard 0.85 m is not what the frame shows). Each other feature was
+// back-projected onto its own plane (the front wall's, the porch's) through
+// the camera that least squares fits the frame (12 degrees to the right of
+// square on, so widths shrink a little). Every measurement is in the
+// browser's README, with that camera.
+//
+// THE FORM, in the cottage's frame (origin on the ground at the middle of
+// the main front wall, +x to the right, +z towards the viewer, the porch
+// floor 0.6 m up). A main block, 5.4 m wide and 6 m deep, its ridge running
+// front to back, a steep (54 degree) front gable with a tall window and a
+// small attic opening. To its left a lower wing, its ridge running across,
+// with a dormer in its front slope, a group of three tall windows and a
+// narrow one at the corner. Across the front a shed-roofed porch (two bays,
+// the glazed door, timber posts, a railing at its right end, a deck and two
+// steps), with a lantern each side of the door. On the main block's right
+// eave wall, the brick chimney: chimney.cone's stack on a brick shaft from
+// the ground, its pot a little above the ridge.
+//
+// THE WALLS are board and batten: the boards are the walls' paint (vertical
+// boards a quarter metre wide, in a tile two metres across); the battens over
+// the seams are real strips (5 cm wide, 2.5 cm proud), cut round the door and
+// the windows. THE ROOFS are slabs, 12 cm thick, their shingles the roof
+// material's paint (rows 16 cm deep, in a tile 1.28 m across), not rows of
+// geometry. Windows are a casing, a sash with its muntins, and a pane, which
+// is a part of its own, so the glass can become transparent without touching
+// anything else.
+//
+// THE LANTERNS are one family: a lathed stake and base, a glass chimney, a
+// bulb, a cap with a finial, each its own part, in three materials the world
+// shares (metal, glass, bulb), so the glass and the bulb of every lantern
+// can be made to glow. Three stand along the front path; two hang by the
+// door (a bracket in place of the stake).
+
+const CT_SEED = 1928u32;
+const CT_FLOOR f32 = 0.6;             // the porch floor, and the floor inside, above the ground
+const CT_EAVE f32 = 3.3;              // where the walls end and the roofs begin (44 courses of brick)
+const CT_HALF f32 = 2.7;              // the main block's half width
+const CT_PITCH f32 = 1.37;            // the roofs' rise for a metre run: 53.9 degrees
+const CT_DEPTH f32 = 6.;              // the main block's depth
+const CT_WING_X f32 = 5.3;            // the wing's far wall, left of the middle
+const CT_WING_D f32 = 4.7;            // the wing's depth: its ridge 6.5 m up, a little under the main one's 7.0
+const CT_WING_END f32 = -0.2;         // how far the wing's roof runs on into the main roof (inside it)
+const CT_DORMER_PITCH f32 = 0.7;      // the dormer's roof is shallower (35 degrees)
+const CT_SLAB f32 = 0.12;             // the roofs' thickness
+const CT_EAVE_OVER f32 = 0.2;         // the eaves' overhang
+const CT_RAKE f32 = 0.12;             // the rakes' (the gable ends')
+const CT_BATTEN_W f32 = 0.05;
+const CT_BATTEN_D f32 = 0.025;
+const CT_BOARD_W f32 = 0.3;           // a board's width, batten to batten
+const CT_PORCH_L f32 = -2.4;          // the porch's left end
+const CT_PORCH_R f32 = 2.7;           // and its right end (level with the gable's)
+const CT_PORCH_D f32 = 1.6;           // its deck's depth
+const CT_DORMER_Z f32 = -0.3;         // the dormer's face, behind the wing's wall
+const CT_DORMER_X f32 = -4.17;        // its middle
+const CT_DORMER_BASE f32 = 3.6;       // where its walls start (a little below the roof there, 3.71)
+const CT_DORMER_TOP f32 = 5.05;       // and where they end
+
+// The chimney's place: against the right eave wall at the middle of the
+// block's depth, its 0.9 m side along the wall
+const CT_CHIMNEY_X f32 = 3.025;       // the wall (2.7) and half the stack's depth (0.3375), less 1.25 cm into the wall
+const CT_CHIMNEY_Z f32 = -3.;
+
+// ---- Which part is which, in the order hydrateCottage adds them ----
+
+pub const COTTAGE_ROOT = 0usize;        // the plinth
+pub const COTTAGE_WALLS = 1usize;
+pub const COTTAGE_BATTENS = 2usize;
+pub const COTTAGE_ROOF = 3usize;
+pub const COTTAGE_TRIM = 4usize;
+pub const COTTAGE_FRAMES = 5usize;
+pub const COTTAGE_PANES = 6usize;
+pub const COTTAGE_DOOR = 7usize;
+pub const COTTAGE_DOOR_PANES = 8usize;
+pub const COTTAGE_PORCH = 9usize;       // the deck; under it the skirt, posts, roof, steps, then the lanterns
+pub const COTTAGE_SKIRT = 10usize;
+pub const COTTAGE_POSTS = 11usize;
+pub const COTTAGE_PORCH_ROOF = 12usize;
+pub const COTTAGE_STEPS = 13usize;
+pub const COTTAGE_CHIMNEY = 14usize;    // the shaft; the stack 15, the flaunching 16, the pot 17
+pub const COTTAGE_STACK = 15usize;
+pub const COTTAGE_LANTERNS = 18usize;   // two wall lanterns, four parts each (bracket, glass, bulb, cap)
+pub const COTTAGE_PARTS = 26usize;
+pub const LANTERN_PARTS = 12usize;      // three path lanterns, four parts each (stake, glass, bulb, cap)
+
+// The materials the world shares between the cottage and the lanterns
+pub const SHARED_LANTERN_METAL = 2u32;
+pub const SHARED_LANTERN_GLASS = 3u32;
+pub const SHARED_LANTERN_BULB = 4u32;
+
+// ---- Geometry helpers ----
+
+// A triangle a, b, c (counterclockwise seen from outside), flat shaded, its
+// uvs the position on the face's own axes in 'tile' metres: across it
+// horizontally and up the slope (a wall's up, a roof's way to the ridge), or
+// x and z on a flat top or bottom
+fn ctTri(m &mut mesh.Mesh, a Vec3, b Vec3, c Vec3, tile f32) {
+  imm n = (b - a).cross(c - a).normalize();
+  mut ay = up() - n * up().dot(n);
+  mut ax = v(1., 0., 0.);
+  if ay.length() < 0.05 {
+    ay = v(0., 0., 1.);
+  } else {
+    ay = ay.normalize();
+    ax = ay.cross(n);
+  }
+  imm k = 1. / tile;
+  imm base = u32.from(m.positions.len());
+  m.positions.push(a); m.positions.push(b); m.positions.push(c);
+  m.normals.push(n); m.normals.push(n); m.normals.push(n);
+  m.uvs.push(p2(a.dot(ax) * k, a.dot(ay) * k)); m.uvs.push(p2(b.dot(ax) * k, b.dot(ay) * k));
+  m.uvs.push(p2(c.dot(ax) * k, c.dot(ay) * k));
+  m.indices.push(base); m.indices.push(base + 1u32); m.indices.push(base + 2u32);
+}
+
+fn ctQuad(m &mut mesh.Mesh, a Vec3, b Vec3, c Vec3, d Vec3, tile f32) {
+  ctTri(m, a, b, c, tile);
+  ctTri(m, a, c, d, tile);
+}
+
+// A parallelepiped from corner 'o' along three edges a, b, c (any handedness)
+fn ctPara(m &mut mesh.Mesh, o Vec3, a Vec3, b Vec3, c Vec3, tile f32) {
+  mut oo = o;
+  mut aa = a;
+  if a.cross(b).dot(c) < 0. { oo = o + a; aa = v(0., 0., 0.) - a; }
+  ctQuad(m, oo, oo + b, oo + aa + b, oo + aa, tile);                            // the c = 0 face
+  ctQuad(m, oo + c, oo + c + aa, oo + c + aa + b, oo + c + b, tile);            // c = 1
+  ctQuad(m, oo, oo + c, oo + c + b, oo + b, tile);                              // a = 0
+  ctQuad(m, oo + aa, oo + aa + b, oo + aa + b + c, oo + aa + c, tile);          // a = 1
+  ctQuad(m, oo, oo + aa, oo + aa + c, oo + c, tile);                            // b = 0
+  ctQuad(m, oo + b, oo + b + c, oo + b + c + aa, oo + b + aa, tile);            // b = 1
+}
+
+// A box from x0 to x1, y0 to y1, z0 to z1
+fn ctBox(m &mut mesh.Mesh, x0 f32, x1 f32, y0 f32, y1 f32, z0 f32, z1 f32) {
+  ctPara(m, v(x0, y0, z0), v(x1 - x0, 0., 0.), v(0., y1 - y0, 0.), v(0., 0., z1 - z0), 1.);
+}
+
+// A roof slab: its top face is the parallelogram a, a + ab, a + ab + ad,
+// a + ad, 't' thick below it, the top the side 'hint' points to
+fn ctSlab(m &mut mesh.Mesh, a Vec3, ab Vec3, ad Vec3, t f32, hint Vec3, tile f32) {
+  mut n = ab.cross(ad).normalize();
+  if n.dot(hint) < 0. { n = v(0., 0., 0.) - n; }
+  ctPara(m, a - n * t, ab, ad, n * t, tile);
+}
+
+// A prism: the convex polygon 'poly' (counterclockwise seen from +z, in x
+// and y) from z0 to z1 (z1 the front): a fan for each end, a quad each side
+fn ctPrism(m &mut mesh.Mesh, poly &List[Vec2], z0 f32, z1 f32, tile f32) {
+  imm n = poly.len();
+  mut i = 1usize;
+  while i + 1usize < n {
+    imm p0 = *poly[0usize];
+    imm p1 = *poly[i];
+    imm p2n = *poly[i + 1usize];
+    ctTri(m, v(p0.x, p0.y, z1), v(p1.x, p1.y, z1), v(p2n.x, p2n.y, z1), tile);
+    ctTri(m, v(p0.x, p0.y, z0), v(p2n.x, p2n.y, z0), v(p1.x, p1.y, z0), tile);
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < n {
+    imm p = *poly[i];
+    imm q = *poly[(i + 1usize) % n];
+    ctQuad(m, v(p.x, p.y, z1), v(p.x, p.y, z0), v(q.x, q.y, z0), v(q.x, q.y, z1), tile);
+    i = i + 1usize;
+  }
+}
+
+// A gabled wall's outline: width 2 * half, walls to 'eave', a ridge 'rise' above
+fn ctGableOutline(half f32, eave f32, rise f32) List[Vec2] {
+  mut poly = List[Vec2].empty();
+  poly.push(p2(0. - half, 0.)); poly.push(p2(half, 0.)); poly.push(p2(half, eave));
+  poly.push(p2(0., eave + rise)); poly.push(p2(0. - half, eave));
+  poly;
+}
+
+// A board along p0 to p1 in a plane facing +z, 'w' wide hanging from that
+// line away from 's' (a unit vector across it), 't' thick, its front at z
+fn ctBar(m &mut mesh.Mesh, p0 Vec3, p1 Vec3, s Vec3, w f32, z f32, t f32) {
+  ctPara(m, p0 - s * w + v(0., 0., z - t), p1 - p0, s * w, v(0., 0., t), 1.);
+}
+
+// The runs of a batten at x from y0 to y1 left after the rectangles in
+// 'holes' (x0, x1, ylo, yhi each) are cut away: pairs of (low, high)
+fn ctRuns(x f32, y0 f32, y1 f32, holes &List[f32]) List[f32] {
+  mut runs = List[f32].empty();
+  runs.push(y0); runs.push(y1);
+  mut h = 0usize;
+  while h + 3usize < holes.len() {
+    if x > *holes[h] and x < *holes[h + 1usize] {
+      imm lo = *holes[h + 2usize];
+      imm hi = *holes[h + 3usize];
+      mut next = List[f32].empty();
+      mut r = 0usize;
+      while r + 1usize < runs.len() {
+        imm a = *runs[r];
+        imm b = *runs[r + 1usize];
+        if hi <= a or lo >= b {
+          next.push(a); next.push(b);
+        } else {
+          if a < lo { next.push(a); next.push(lo); }
+          if hi < b { next.push(hi); next.push(b); }
+        }
+        r = r + 2usize;
+      }
+      runs = next;
+    }
+    h = h + 4usize;
+  }
+  runs;
+}
+
+fn ctHole(holes &mut List[f32], x0 f32, x1 f32, y0 f32, y1 f32) {
+  holes.push(x0); holes.push(x1); holes.push(y0); holes.push(y1);
+}
+
+// Battens on a wall facing +z (at z = zw), at x from x0 stepping a board's
+// width to x1, from ybase to the gable's slope (half > 0) or to the eave,
+// cut round the holes
+fn ctBattensFront(m &mut mesh.Mesh, zw f32, x0 f32, x1 f32, ybase f32, half f32, eave f32, rise f32,
+    holes &List[f32]) {
+  mut x = x0;
+  while x < x1 {
+    imm top = if half > 0. { eave + rise * (1. - libc.fabsf(x) / half); } else { eave; };
+    imm runs = ctRuns(x, ybase, top - 0.03, holes);
+    mut r = 0usize;
+    while r + 1usize < runs.len() {
+      ctBox(m, x - CT_BATTEN_W * 0.5, x + CT_BATTEN_W * 0.5, *runs[r], *runs[r + 1usize], zw, zw + CT_BATTEN_D);
+      r = r + 2usize;
+    }
+    x = x + CT_BOARD_W;
+  }
+}
+
+// Battens on a wall facing +x (out = 1, at x = xw) or -x (out = -1), at z
+// from z0 down to z1: to the eave, or, with half > 0, up the gable's
+// triangle about zc
+fn ctBattensSide(m &mut mesh.Mesh, xw f32, out f32, z0 f32, z1 f32, ybase f32, eave f32, rise f32, zc f32, half f32,
+    holes &List[f32]) {
+  mut z = z0;
+  while z > z1 {
+    imm top = if half > 0. { eave + rise * (1. - libc.fabsf(z - zc) / half); } else { eave; };
+    imm runs = ctRuns(z, ybase, top - 0.03, holes);
+    mut r = 0usize;
+    while r + 1usize < runs.len() {
+      imm xa = if out > 0. { xw; } else { xw - CT_BATTEN_D; };
+      ctBox(m, xa, xa + CT_BATTEN_D, *runs[r], *runs[r + 1usize], z - CT_BATTEN_W * 0.5, z + CT_BATTEN_W * 0.5);
+      r = r + 2usize;
+    }
+    z = z - CT_BOARD_W;
+  }
+}
+
+// ---- Windows and the door ----
+
+// A window in a wall facing +z at z = zw: its casing 'cas' wide (trim), its
+// sash and muntins (frame), and its pane (a quad: a part of its own). The
+// opening is x0 to x0 + w, from y0 up 'h'; 'cols' by 'rows' lights.
+fn ctWindow(trim &mut mesh.Mesh, frame &mut mesh.Mesh, pane &mut mesh.Mesh, x0 f32, y0 f32, w f32, h f32, zw f32,
+    cas f32, cols i32, rows i32) {
+  ctBox(trim, x0 - cas, x0 + w + cas, y0 + h, y0 + h + cas, zw, zw + 0.06);                 // head
+  ctBox(trim, x0 - cas * 1.3, x0 + w + cas * 1.3, y0 - cas * 1.3, y0, zw, zw + 0.09);       // sill
+  ctBox(trim, x0 - cas, x0, y0, y0 + h, zw, zw + 0.06);                                     // jambs
+  ctBox(trim, x0 + w, x0 + w + cas, y0, y0 + h, zw, zw + 0.06);
+  // The sash: a thin ring inside the opening, then the muntins
+  imm s = 0.03;
+  ctBox(frame, x0, x0 + w, y0 + h - s, y0 + h, zw, zw + 0.04);
+  ctBox(frame, x0, x0 + w, y0, y0 + s, zw, zw + 0.04);
+  ctBox(frame, x0, x0 + s, y0, y0 + h, zw, zw + 0.04);
+  ctBox(frame, x0 + w - s, x0 + w, y0, y0 + h, zw, zw + 0.04);
+  mut c = 1;
+  while c < cols {
+    imm x = x0 + w * f32.from(c) / f32.from(cols);
+    ctBox(frame, x - 0.012, x + 0.012, y0, y0 + h, zw, zw + 0.035);
+    c = c + 1;
+  }
+  mut r = 1;
+  while r < rows {
+    imm y = y0 + h * f32.from(r) / f32.from(rows);
+    ctBox(frame, x0, x0 + w, y - 0.012, y + 0.012, zw, zw + 0.035);
+    r = r + 1;
+  }
+  ctQuad(pane, v(x0, y0, zw + 0.015), v(x0 + w, y0, zw + 0.015), v(x0 + w, y0 + h, zw + 0.015),
+    v(x0, y0 + h, zw + 0.015), 1.);
+}
+
+// Every window of the cottage: the main front's (the gable's, its attic
+// opening, the two porch bays), the wing's (three tall, one narrow), the dormer's
+fn ctWindows(trim &mut mesh.Mesh, frame &mut mesh.Mesh, pane &mut mesh.Mesh) {
+  ctWindow(trim, frame, pane, -0.42, 3.8, 0.82, 1.31, 0., 0.09, 2, 4);               // the gable's tall window
+  ctWindow(trim, frame, pane, -0.13, 5.52, 0.32, 0.46, 0., 0.04, 1, 2);               // the attic opening
+  ctWindow(trim, frame, pane, -1.75, 1.37, 0.58, 1.24, 0., 0.06, 2, 3);               // the porch's left bay
+  ctWindow(trim, frame, pane, 1.15, 1.37, 0.62, 1.24, 0., 0.06, 2, 3);                // and its right
+  ctWindow(trim, frame, pane, -3.74, 1.41, 0.27, 1.17, 0., 0.025, 1, 3);              // the wing's three
+  ctWindow(trim, frame, pane, -3.415, 1.41, 0.27, 1.17, 0., 0.025, 1, 3);
+  ctWindow(trim, frame, pane, -3.09, 1.41, 0.27, 1.17, 0., 0.025, 1, 3);
+  ctWindow(trim, frame, pane, -4.75, 1.65, 0.16, 0.82, 0., 0.03, 1, 2);               // the narrow one at the corner
+  ctWindow(trim, frame, pane, -4.3, 3.79, 0.26, 0.86, CT_DORMER_Z, 0.05, 1, 3);       // the dormer's
+}
+
+// The door: its leaf (2.0 m by 0.8 m) in the door mesh; its casing in
+// 'trim'; its glazing (two lights across, three up) in 'frame' and 'pane'
+fn ctDoor(leaf &mut mesh.Mesh, trim &mut mesh.Mesh, frame &mut mesh.Mesh, pane &mut mesh.Mesh) {
+  ctBox(leaf, -0.4, 0.4, CT_FLOOR, CT_FLOOR + 2., 0., 0.045);
+  ctBox(trim, -0.47, 0.47, CT_FLOOR + 2., CT_FLOOR + 2.1, 0., 0.07);
+  ctBox(trim, -0.47, -0.4, CT_FLOOR, CT_FLOOR + 2., 0., 0.07);
+  ctBox(trim, 0.4, 0.47, CT_FLOOR, CT_FLOOR + 2., 0., 0.07);
+  mut scratch = mesh.Mesh.empty();                  // the glazing's own casing is the leaf's
+  ctWindow(&mut scratch, frame, pane, -0.3, CT_FLOOR + 0.95, 0.6, 0.9, 0.045, 0.01, 2, 3);
+}
+
+// ---- The body ----
+
+// The wing's front slope's height at z behind the wall (z from 0 to -2)
+fn ctRoofY(z f32) f32 { CT_EAVE + (0. - z) * CT_PITCH; }
+
+// A gabled wall's outline for walls that roof slabs 't' thick (square to the
+// slope) will cover: the slope sunk below the roof's top plane by the slab's
+// thickness, so the wall's sloping faces lie inside the slab (never coplanar with it)
+fn ctWallOutline(half f32, eave f32, pitch f32, t f32) List[Vec2] {
+  imm sunk = t * libc.sqrtf(1. + pitch * pitch);
+  imm top = eave - 0.05;
+  ctGableOutline(half, top, eave + half * pitch - sunk - top);
+}
+
+fn ctWalls() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  // The main block: a gable-fronted prism
+  imm main = ctWallOutline(CT_HALF, CT_EAVE, CT_PITCH, CT_SLAB);
+  ctPrism(&mut m, &main, 0. - CT_DEPTH, 0., 2.);
+  // The wing: the same outline for its own half depth, its ridge across, laid on its side
+  imm half = CT_WING_D * 0.5;
+  imm wing = ctWallOutline(half, CT_EAVE, CT_PITCH, CT_SLAB);
+  mut w = mesh.Mesh.empty();
+  ctPrism(&mut w, &wing, 0., CT_WING_X - CT_HALF, 2.);
+  w.transform(Mat4.fromTrs(v(0. - CT_WING_X, 0., 0. - half), Quat.angleAxis(pi * 0.5, up()), v(1., 1., 1.)));
+  m.append(&w);
+  // The dormer: a small gabled prism standing on the wing's front slope, its walls to 5.05 m
+  imm dormer = ctWallOutline(0.5, CT_DORMER_TOP - CT_DORMER_BASE, CT_DORMER_PITCH, 0.1);
+  mut d = mesh.Mesh.empty();
+  ctPrism(&mut d, &dormer, -1.4, 0., 2.);
+  d.transform(Mat4.fromTranslation(v(CT_DORMER_X, CT_DORMER_BASE, CT_DORMER_Z)));
+  m.append(&d);
+  m;
+}
+
+// The foundation: a low stone course round the main block and the wing
+fn ctPlinth() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  ctBox(&mut m, 0. - CT_HALF - 0.05, CT_HALF + 0.05, 0., 0.35, 0. - CT_DEPTH - 0.05, 0.05);
+  ctBox(&mut m, 0. - CT_WING_X - 0.05, 0. - CT_HALF, 0., 0.3, 0. - CT_WING_D - 0.05, 0.05);
+  m;
+}
+
+// The battens, on every wall that shows, cut round the door and windows
+fn ctBattens() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  // The main block's front: the door, the two bays, the gable's window and its attic opening
+  mut front = List[f32].empty();
+  ctHole(&mut front, -0.5, 0.5, 0., CT_FLOOR + 2.1);
+  ctHole(&mut front, -1.9, -1.0, 1.2, 2.8);
+  ctHole(&mut front, 1.0, 1.95, 1.2, 2.8);
+  ctHole(&mut front, -0.55, 0.55, 3.65, 5.3);
+  ctHole(&mut front, -0.25, 0.3, 5.4, 6.1);
+  ctBattensFront(&mut m, 0., 0. - CT_HALF + 0.15, CT_HALF, 0.35, CT_HALF, CT_EAVE, CT_HALF * CT_PITCH, &front);
+  // The wing's front: its three tall windows and the narrow one
+  mut wf = List[f32].empty();
+  ctHole(&mut wf, -3.9, -2.95, 1.2, 2.85);
+  ctHole(&mut wf, -4.9, -4.6, 1.4, 2.7);
+  ctBattensFront(&mut m, 0., 0. - CT_WING_X + 0.15, 0. - CT_HALF - 0.01, 0.3, 0., CT_EAVE, 0., &wf);
+  // The wing's far end (a gable), the main block's right eave wall, and its left wall behind the wing
+  imm none = List[f32].empty();
+  imm wh = CT_WING_D * 0.5;
+  ctBattensSide(&mut m, 0. - CT_WING_X, -1., -0.15, 0. - CT_WING_D, 0.3, CT_EAVE, wh * CT_PITCH, 0. - wh, wh, &none);
+  ctBattensSide(&mut m, CT_HALF, 1., -0.15, 0. - CT_DEPTH, 0.35, CT_EAVE, 0., 0., 0., &none);
+  ctBattensSide(&mut m, 0. - CT_HALF, -1., 0. - CT_WING_D - 0.15, 0. - CT_DEPTH, 0.35, CT_EAVE, 0., 0., 0., &none);
+  m;
+}
+
+// The roofs: the main block's two slopes, the wing's (cut at the main roof, which it runs into), the dormer's two
+fn ctRoofs() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  imm t = CT_SLAB;
+  imm oe = CT_EAVE_OVER;
+  imm orake = CT_RAKE;
+  imm dropE = oe * CT_PITCH;                                 // how far the eaves' overhang falls
+  imm sh = CT_HALF * CT_PITCH;                               // the main ridge's rise
+  imm ridge = CT_EAVE + sh;
+  imm run = CT_DEPTH + 2. * orake;                           // front rake to back rake
+  ctSlab(&mut m, v(0. - CT_HALF - oe, CT_EAVE - dropE, orake), v(0., 0., 0. - run), v(CT_HALF + oe, sh + dropE, 0.),
+    t, v(-1., 1., 0.), 1.28);
+  ctSlab(&mut m, v(0., ridge, orake), v(0., 0., 0. - run), v(CT_HALF + oe, 0. - sh - dropE, 0.), t, v(1., 1., 0.), 1.28);
+  // The wing: ridge across at z = -wd; the front slope in two (the part
+  // by the main block starts at its wall, no overhang), the back slope in one
+  imm wd = CT_WING_D * 0.5;
+  imm wsh = wd * CT_PITCH;
+  imm farX = 0. - CT_WING_X - orake;
+  ctSlab(&mut m, v(farX, CT_EAVE - dropE, oe), v(CT_WING_X - CT_HALF + orake, 0., 0.), v(0., wsh + dropE, 0. - wd - oe),
+    t, v(0., 1., 1.), 1.28);
+  ctSlab(&mut m, v(0. - CT_HALF, CT_EAVE, 0.), v(CT_HALF + CT_WING_END, 0., 0.), v(0., wsh, 0. - wd), t, v(0., 1., 1.), 1.28);
+  ctSlab(&mut m, v(farX, CT_EAVE + wsh, 0. - wd), v(CT_WING_X + orake + CT_WING_END, 0., 0.),
+    v(0., 0. - wsh - dropE, 0. - wd - oe), t, v(0., 1., -1.), 1.28);
+  // The dormer: two small, shallower slopes, running back into the wing's roof
+  imm dh = 0.5 + 0.12;                                       // the dormer's half width and its eaves' overhang
+  imm dz = CT_DORMER_Z + 0.15;
+  imm dr = dh * CT_DORMER_PITCH;
+  ctSlab(&mut m, v(CT_DORMER_X - dh, CT_DORMER_TOP - 0.12 * CT_DORMER_PITCH, dz), v(0., 0., -2.), v(dh, dr, 0.), 0.1,
+    v(-1., 1., 0.), 1.28);
+  ctSlab(&mut m, v(CT_DORMER_X, CT_DORMER_TOP + 0.5 * CT_DORMER_PITCH, dz), v(0., 0., -2.), v(dh, 0. - dr, 0.), 0.1,
+    v(1., 1., 0.), 1.28);
+  m;
+}
+
+// The porch's roof: a shed slope from the gable wall down to the front beam
+fn ctPorchRoof() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  ctSlab(&mut m, v(CT_PORCH_L - 0.1, 3.55, 0.), v(CT_PORCH_R - CT_PORCH_L + 0.2, 0., 0.), v(0., -0.65, 1.9), 0.1,
+    v(0., 1., 0.3), 1.28);
+  m;
+}
+
+
+// The trim: the barge boards on the gable's rakes, the corner boards, the
+// casings (made with the windows and the door, into this mesh)
+fn ctTrim(trim &mut mesh.Mesh) {
+  imm oe = CT_EAVE_OVER;
+  imm sh = CT_HALF * CT_PITCH;
+  imm drop = oe * CT_PITCH;
+  imm ridge = CT_EAVE + sh;
+  imm d = v(CT_HALF + oe, sh + drop, 0.);
+  imm s = v(0. - d.y, d.x, 0.).normalize();                  // up and outward, left
+  ctBar(trim, v(0. - CT_HALF - oe, CT_EAVE - drop, 0.), v(0., ridge, 0.), s, 0.2, CT_RAKE + 0.01, 0.04);
+  imm s2 = v(d.y, d.x, 0.).normalize();                      // right
+  ctBar(trim, v(0., ridge, 0.), v(CT_HALF + oe, CT_EAVE - drop, 0.), s2, 0.2, CT_RAKE + 0.01, 0.04);
+  // Pilasters either side of the door, in the wall's plane
+  ctBox(trim, 0.47, 0.59, CT_FLOOR, 2.6, 0., 0.09);
+  ctBox(trim, -0.59, -0.47, CT_FLOOR, 2.6, 0., 0.09);
+  // Corner boards on the fronts
+  ctBox(trim, 0. - CT_HALF, 0. - CT_HALF + 0.1, 0.35, CT_EAVE, 0., 0.035);
+  ctBox(trim, CT_HALF - 0.1, CT_HALF, 0.35, CT_EAVE, 0., 0.035);
+  ctBox(trim, 0. - CT_WING_X, 0. - CT_WING_X + 0.1, 0.3, CT_EAVE, 0., 0.035);
+  // A frieze under the wing's eave
+  ctBox(trim, 0. - CT_WING_X - 0.02, 0. - CT_HALF, CT_EAVE - 0.14, CT_EAVE, 0., 0.045);
+}
+
+// ---- The porch ----
+
+// The deck: 18 cm boards on a skirt, from the wall out to its front edge
+fn ctDeck() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  ctBox(&mut m, CT_PORCH_L, CT_PORCH_R, 0.42, CT_FLOOR, 0., CT_PORCH_D);
+  m;
+}
+
+// The skirt below the deck, set back from its edge
+fn ctSkirt() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  ctBox(&mut m, CT_PORCH_L + 0.05, CT_PORCH_R - 0.05, 0., 0.42, 0.05, CT_PORCH_D - 0.05);
+  m;
+}
+
+// The posts, the front beam, and the railing at the right end
+fn ctPosts() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  imm xs Array[f32, 4] = [-2.3, -1.25, 1.25, 2.6];
+  mut i = 0usize;
+  while i < 4usize {
+    ctBox(&mut m, xs[i] - 0.075, xs[i] + 0.075, CT_FLOOR, 2.95, 1.37, 1.52);
+    i = i + 1usize;
+  }
+  ctBox(&mut m, CT_PORCH_L - 0.05, CT_PORCH_R + 0.05, 2.88, 3.12, 1.35, 1.54);
+  // The right-hand railing: a top rail, a bottom rail, balusters every 12 cm
+  imm rx = CT_PORCH_R - 0.12;
+  ctBox(&mut m, rx - 0.06, rx + 0.06, CT_FLOOR + 0.78, CT_FLOOR + 0.86, 0.05, 1.37);
+  ctBox(&mut m, rx - 0.06, rx + 0.06, CT_FLOOR + 0.12, CT_FLOOR + 0.2, 0.05, 1.37);
+  mut z = 0.12;
+  while z < 1.35 {
+    ctBox(&mut m, rx - 0.02, rx + 0.02, CT_FLOOR + 0.2, CT_FLOOR + 0.78, z - 0.018, z + 0.018);
+    z = z + 0.12;
+  }
+  m;
+}
+
+// Two steps down from the deck's front edge, 1.2 m wide, centred a little right of the door's middle
+fn ctSteps() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  ctBox(&mut m, -0.55, 0.65, 0., 0.4, CT_PORCH_D, CT_PORCH_D + 0.35);
+  ctBox(&mut m, -0.55, 0.65, 0., 0.2, CT_PORCH_D + 0.35, CT_PORCH_D + 0.7);
+  m;
+}
+
+// ---- The lanterns ----
+
+// A lathed outline (points from the axis, up, and back to it), 'steps' round,
+// all scaled by 's'
+fn ctLathe(pts &List[Vec2], s f32, steps u32) mesh.Mesh {
+  mut scaled = List[Vec2].empty();
+  mut i = 0usize;
+  while i < pts.len() {
+    imm p = *pts[i];
+    scaled.push(p2(p.x * s, p.y * s));
+    i = i + 1usize;
+  }
+  imm profile = Profile.fromPoints(scaled.view(), false);
+  imm solid = lathe(&profile, up(), 2. * pi, steps);
+  solid.triangulate(true);
+}
+
+fn ctPoint(pts &mut List[Vec2], x f32, y f32) { pts.push(p2(x, y)); }
+
+// The lantern's stake and base (the stake 22 cm into the ground, the base 5.8 cm
+// high), the glass chimney (to 34 cm), the cap and its finial (to 49 cm), all at scale 's'
+fn ctLanternStake(s f32) mesh.Mesh {
+  mut p = List[Vec2].empty();
+  ctPoint(&mut p, 0., -0.22); ctPoint(&mut p, 0.011, -0.1); ctPoint(&mut p, 0.011, 0.); ctPoint(&mut p, 0.052, 0.);
+  ctPoint(&mut p, 0.056, 0.012); ctPoint(&mut p, 0.056, 0.05); ctPoint(&mut p, 0.047, 0.058); ctPoint(&mut p, 0., 0.058);
+  ctLathe(&p, s, 20u32);
+}
+
+fn ctLanternGlass(s f32) mesh.Mesh {
+  mut p = List[Vec2].empty();
+  ctPoint(&mut p, 0., 0.058); ctPoint(&mut p, 0.05, 0.058); ctPoint(&mut p, 0.062, 0.2); ctPoint(&mut p, 0.058, 0.34);
+  ctPoint(&mut p, 0., 0.34);
+  ctLathe(&p, s, 20u32);
+}
+
+fn ctLanternBulb(s f32) mesh.Mesh {
+  mut m = mesh.Mesh.sphere(0.032 * s, 14);
+  m.transform(Mat4.fromTrs(v(0., 0.2 * s, 0.), Quat.identity(), v(1., 1.5, 1.)));
+  m;
+}
+
+fn ctLanternCap(s f32) mesh.Mesh {
+  mut p = List[Vec2].empty();
+  ctPoint(&mut p, 0., 0.34); ctPoint(&mut p, 0.07, 0.34); ctPoint(&mut p, 0.072, 0.352); ctPoint(&mut p, 0.06, 0.37);
+  ctPoint(&mut p, 0.03, 0.43); ctPoint(&mut p, 0.012, 0.455); ctPoint(&mut p, 0.014, 0.485); ctPoint(&mut p, 0., 0.49);
+  ctLathe(&p, s, 20u32);
+}
+
+// A wall lantern's bracket: a plate on the wall and an arm out from it, its top at y = 0
+fn ctBracket() mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  ctBox(&mut m, -0.04, 0.04, -0.07, 0.07, 0., 0.015);
+  ctBox(&mut m, -0.015, 0.015, -0.015, 0.015, 0.015, 0.17);
+  m;
+}
+
+// The three materials of every lantern, shared across the world: dark metal, pale glass, a warm bulb
+fn ctLanternMaterials(h &mut Hydrated) Array[usize, 3] {
+  imm metal = h.addMaterial(Look.shiny(srgb(34., 36., 38.), 0.6, 40.), Image.empty(), Maps.none(), SHARED_LANTERN_METAL);
+  imm glass = h.addMaterial(Look.shiny(srgb(206., 220., 214.), 0.5, 60.), Image.empty(), Maps.none(), SHARED_LANTERN_GLASS);
+  imm bulb = h.addMaterial(Look.plain(srgb(255., 214., 122.)), Image.empty(), Maps.none(), SHARED_LANTERN_BULB);
+  [metal, glass, bulb];
+}
+
+// ---- Materials: one per surface kind ----
+
+fn ctByte(x f32) u8 { u8.from(clampF(x, 0., 1.) * 255. + 0.5); }
+fn ctPush(img &mut Image, r f32, g f32, b f32) {
+  img.pixels.push(ctByte(r)); img.pixels.push(ctByte(g)); img.pixels.push(ctByte(b));
+}
+fn ctImage(n i32) Image { new Image(n, n, 3, List[u8].withCapacity(usize.from(n * n * 3))); }
+
+// Board paint, a tile of two metres: eight boards of a quarter metre, each
+// its own tone, grained along its length, a dark seam at each edge
+fn ctBoardPaint() Image {
+  imm n = 256;
+  mut img = ctImage(n);
+  mut y = 0;
+  while y < n {
+    mut x = 0;
+    while x < n {
+      imm board = x / 32;
+      imm within = x % 32;
+      imm tone = 0.84 + 0.16 * noise.toUnit(noise.hash2(board, 11, CT_SEED).x);
+      imm grain = noise.fbm2(new Vec2(f32.from(x) * 0.35 + f32.from(board) * 41., f32.from(y) * 0.03), CT_SEED + 1u32, 3, 2., 0.5).value;
+      mut shade = tone * (0.95 + 0.1 * grain);
+      if within < 2 or within > 29 { shade = shade * 0.6; }
+      ctPush(&mut img, shade * 0.97, shade, shade * 0.94);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  img;
+}
+
+// Shingle paint, a tile 1.28 m across: eight rows 16 cm deep, each row's
+// shingles 16 cm wide and offset from the row below's, each a tone of its
+// own, shadowed under the row above and at its sides
+fn ctShinglePaint() Image {
+  imm n = 256;
+  mut img = ctImage(n);
+  mut y = 0;
+  while y < n {
+    imm row = y / 32;
+    imm inRow = y % 32;
+    imm off = i32.from(noise.toUnit(noise.hash2(row, 3, CT_SEED + 2u32).x) * 32.);
+    mut x = 0;
+    while x < n {
+      imm k = (x + off) / 32;
+      imm xin = (x + off) % 32;
+      imm tone = 0.70 + 0.30 * noise.toUnit(noise.hash2(row, k, CT_SEED + 3u32).x);
+      imm grain = noise.fbm2(new Vec2(f32.from(x) * 0.12, f32.from(y) * 0.12), CT_SEED + 4u32, 3, 2., 0.5).value;
+      mut shade = tone * (0.94 + 0.12 * grain);
+      if xin < 1 or xin > 30 { shade = shade * 0.55; }
+      if inRow < 7 { shade = shade * (0.55 + 0.45 * f32.from(inRow) / 7.); }      // under the row above
+      if inRow > 29 { shade = shade * 0.8; }
+      ctPush(&mut img, shade, shade * 0.98, shade * 0.96);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  img;
+}
+
+// Deck paint, a tile 1.12 m across: eight boards 14 cm wide running along u, with butt joints
+fn ctDeckPaint() Image {
+  imm n = 256;
+  mut img = ctImage(n);
+  mut y = 0;
+  while y < n {
+    imm board = y / 32;
+    imm within = y % 32;
+    imm joint = i32.from(noise.toUnit(noise.hash2(board, 5, CT_SEED + 5u32).x) * 256.);
+    mut x = 0;
+    while x < n {
+      imm piece = (x + joint) / 160;
+      imm tone = 0.80 + 0.20 * noise.toUnit(noise.hash2(board, piece, CT_SEED + 6u32).x);
+      imm grain = noise.fbm2(new Vec2(f32.from(x) * 0.03, f32.from(y) * 0.4), CT_SEED + 7u32, 3, 2., 0.5).value;
+      mut shade = tone * (0.94 + 0.1 * grain);
+      if within < 2 or within > 29 { shade = shade * 0.55; }
+      if (x + joint) % 160 < 2 { shade = shade * 0.55; }
+      ctPush(&mut img, shade, shade * 0.97, shade * 0.93);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  img;
+}
+
+// Stone paint: mottled grey-brown
+fn ctStonePaint() Image {
+  imm n = 128;
+  mut img = ctImage(n);
+  mut y = 0;
+  while y < n {
+    mut x = 0;
+    while x < n {
+      imm a = noise.fbm2(new Vec2(f32.from(x) * 0.05, f32.from(y) * 0.05), CT_SEED + 8u32, 4, 2., 0.5).value;
+      imm b = noise.toSigned(noise.hash2(x, y, CT_SEED + 9u32).x);
+      imm shade = 0.80 + 0.16 * a + 0.04 * b;
+      ctPush(&mut img, shade, shade * 0.98, shade * 0.94);
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  img;
+}
+
+// One material for each surface kind of the cottage, each defined once and
+// shared by every part of that kind; these are the places the texture kit's
+// maps replace the paint
+struct CtMats {
+  board usize;
+  batten usize;
+  roof usize;
+  trim usize;
+  frame usize;
+  pane usize;
+  door usize;
+  timber usize;
+  deck usize;
+  stone usize;
+}
+
+fn ctMaterials(h &mut Hydrated) CtMats {
+  imm board = h.addMaterial(Look.plain(srgb(62., 74., 58.)), ctBoardPaint(), Maps.none(), 0u32);
+  imm batten = h.addMaterial(Look.plain(srgb(78., 90., 70.)), Image.empty(), Maps.none(), 0u32);
+  imm roof = h.addMaterial(Look.shiny(srgb(88., 83., 78.), 0.12, 12.), ctShinglePaint(), Maps.none(), 0u32);
+  imm trim = h.addMaterial(Look.plain(srgb(150., 156., 142.)), Image.empty(), Maps.none(), 0u32);
+  imm frame = h.addMaterial(Look.plain(srgb(70., 48., 30.)), Image.empty(), Maps.none(), 0u32);
+  imm pane = h.addMaterial(Look.plain(srgb(236., 158., 70.)), Image.empty(), Maps.none(), 0u32);
+  imm door = h.addMaterial(Look.shiny(srgb(52., 34., 22.), 0.2, 20.), Image.empty(), Maps.none(), 0u32);
+  imm timber = h.addMaterial(Look.plain(srgb(118., 82., 50.)), Image.empty(), Maps.none(), 0u32);
+  imm deck = h.addMaterial(Look.plain(srgb(150., 110., 72.)), ctDeckPaint(), Maps.none(), 0u32);
+  imm stone = h.addMaterial(Look.plain(srgb(122., 118., 110.)), ctStonePaint(), Maps.none(), 0u32);
+  new CtMats(board, batten, roof, trim, frame, pane, door, timber, deck, stone);
+}
+
+// ---- The cottage, as one tree ----
+
+fn ctPart(h &mut Hydrated, name &[]u8, shape mesh.Mesh, mat usize, parent usize) usize {
+  h.part(name, h.addMesh(shape), mat, parent, Transform3.identity());
+}
+
+// A lantern's four parts (a mount, glass, bulb, cap) under 'parent': the mount is mesh
+// 'mount' in material 'mountMat'; the glass, bulb and cap meshes 'glass', 'bulb' and
+// 'cap' (made at the lantern's own scale), 'at' the mount's own frame
+fn ctLanternParts(h &mut Hydrated, name &[]u8, mount usize, glass usize, bulb usize, cap usize, mats Array[usize, 3],
+    parent usize, at Transform3, inside Transform3) {
+  imm root = h.part(name, mount, mats[0usize], parent, at);
+  h.part("lantern glass", glass, mats[1usize], root, inside);
+  h.part("lantern bulb", bulb, mats[2usize], root, inside);
+  h.part("lantern cap", cap, mats[0usize], root, inside);
+}
+
+fn ctAt(x f32, y f32, z f32) Transform3 { new Transform3(v(x, y, z), Quat.identity(), v(1., 1., 1.)); }
+
+// The cottage's parts into 'h', its root at 'at' (the world's frame): COTTAGE_PARTS of them
+fn hydrateCottage(h &mut Hydrated, at Transform3) {
+  imm mats = ctMaterials(h);
+  imm root = h.part("cottage", h.addMesh(ctPlinth()), mats.stone, TOP, at);
+  ctPart(h, "walls", ctWalls(), mats.board, root);
+  ctPart(h, "battens", ctBattens(), mats.batten, root);
+  ctPart(h, "roofs", ctRoofs(), mats.roof, root);
+  mut trim = mesh.Mesh.empty();
+  mut frame = mesh.Mesh.empty();
+  mut pane = mesh.Mesh.empty();
+  mut leaf = mesh.Mesh.empty();
+  mut doorFrame = mesh.Mesh.empty();
+  mut doorPane = mesh.Mesh.empty();
+  ctTrim(&mut trim);
+  ctWindows(&mut trim, &mut frame, &mut pane);
+  ctDoor(&mut leaf, &mut trim, &mut doorFrame, &mut doorPane);
+  frame.append(&doorFrame);
+  ctPart(h, "trim", trim, mats.trim, root);
+  ctPart(h, "window frames", frame, mats.frame, root);
+  ctPart(h, "window panes", pane, mats.pane, root);
+  ctPart(h, "door", leaf, mats.door, root);
+  ctPart(h, "door panes", doorPane, mats.pane, root);
+  // The porch: the deck, and under it the skirt, the posts, the roof, the steps
+  imm porch = ctPart(h, "porch", ctDeck(), mats.deck, root);
+  ctPart(h, "porch skirt", ctSkirt(), mats.door, porch);
+  ctPart(h, "porch posts", ctPosts(), mats.timber, porch);
+  ctPart(h, "porch roof", ctPorchRoof(), mats.roof, porch);
+  ctPart(h, "steps", ctSteps(), mats.stone, porch);
+  // The chimney: shaft, stack, flaunching and pot, on the right eave wall, its front face outward
+  hydrateChimney(h, root, new Transform3(v(CT_CHIMNEY_X, 0., CT_CHIMNEY_Z), Quat.angleAxis(pi * 0.5, up()), v(1., 1., 1.)));
+  // The two wall lanterns by the door, hung from brackets under the porch roof
+  imm lm = ctLanternMaterials(h);
+  imm s = 0.7;
+  imm bracket = h.addMesh(ctBracket());
+  imm glass = h.addMesh(ctLanternGlass(s));
+  imm bulb = h.addMesh(ctLanternBulb(s));
+  imm cap = h.addMesh(ctLanternCap(s));
+  imm inside = ctAt(0., 0. - 0.49 * s - 0.02, 0.17);
+  ctLanternParts(h, "wall lantern", bracket, glass, bulb, cap, lm, porch, ctAt(-0.7, 2.4, 0.), inside);
+  ctLanternParts(h, "wall lantern", bracket, glass, bulb, cap, lm, porch, ctAt(0.85, 2.4, 0.), inside);
+}
+
+// Where the path lanterns stand, in the cottage's frame: x, z, down the front path
+imm LANTERN_PLACES Array[f32, 6] = [-0.9, 4.4, 1.0, 6.5, -0.9, 8.6];
+
+// The three path lanterns into 'h' (world frame: each root at 'at' moved by its
+// place; the cottage faces +z and is not turned)
+fn hydrateLanterns(h &mut Hydrated, at Transform3) {
+  imm lm = ctLanternMaterials(h);
+  imm stake = h.addMesh(ctLanternStake(1.));
+  imm glass = h.addMesh(ctLanternGlass(1.));
+  imm bulb = h.addMesh(ctLanternBulb(1.));
+  imm cap = h.addMesh(ctLanternCap(1.));
+  mut i = 0usize;
+  while i < 3usize {
+    imm p = new Transform3(at.translation + v(LANTERN_PLACES[i * 2usize], 0., LANTERN_PLACES[i * 2usize + 1usize]),
+      Quat.identity(), v(1., 1., 1.));
+    ctLanternParts(h, "path lantern", stake, glass, bulb, cap, lm, TOP, p, Transform3.identity());
+    i = i + 1usize;
+  }
+}

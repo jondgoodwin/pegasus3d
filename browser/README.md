@@ -3,8 +3,9 @@
 A native 3-D browser written in [Cone](https://github.com/jondgoodwin/cone), in the spirit of the
 Acorn-era Pegasus3D in `src/`. It is the shell and the walkable plane (an endless brown ground under a
 sky-blue sky, in metres, walked on at eye height, 1.7 m) and a baked-in world standing on it: two chess
-rooks, a horn-flower, a horn, a brick chimney stack with a black-figure amphora on one side of it and a
-boulder on the other, a hot-air balloon with its burner alight and,
+rooks, a horn-flower, a horn, a forest cottage (board and batten, a brick chimney up its right eave wall)
+with three pathway lanterns along its path, a black-figure amphora and a boulder in front of it, a
+hot-air balloon with its burner alight and,
 hovering beyond them, Elizabeth's skeletal dragon starship, built from Cone's sculpt, vfx, sdf and sdfmesh
 packages and sent in as if downloaded. Things move: a ball bounces and spins, the burner fires in bursts,
 and a launch button by the path sends the balloon up (and, pressed again, brings it down). A click
@@ -66,8 +67,9 @@ browser.exe --watch 300               300 s in real time, a line a second and a 
 any other window, and a run of a fixed number of frames ignores the real keyboard and mouse (and the
 window losing focus, which would otherwise let go of the script's keys). It walks up to the rooks and
 the horn-flower, clicks on the rook and then on the sky, turns, runs to the balloon, clicks its
-launch button, then draws six close-ups from eyes of its own (the amphora's through a 20 degree lens,
-straight on, as its photograph shows it). Its clicks are pushed mouse events at
+launch button, then draws eight close-ups from eyes of its own (the amphora's through a 20 degree lens,
+straight on, as its photograph shows it; the cottage's from the reference photograph's viewpoint and
+lens, and from the walker's eye on the approach). Its clicks are pushed mouse events at
 the place the script works out the target is drawn. It checks the walk against what its events must
 give (exact on the synthetic clock); what each click picked and highlighted; that the world heard the
 button and the balloon (every one of its parts) rose as its formula says; the ball's height against
@@ -75,13 +77,18 @@ its formula; every burst of the burner sent was applied; that the scene applied,
 what it was sent; and that every part the world sent is live, placed and (with a GPU) drawn or giving
 off particles, with every request sent accounted for as applied or refused; and that the amphora and
 the chimney stack are the sizes they were built to (the amphora 1.484 m to its tip, 0.3368 m at its
-widest; the stack 47 courses, 3.525 m, and 5 x 4 bricks at its top course) and drawn physically based.
+widest; the stack 47 courses, 3.525 m, and 5 x 4 bricks at its top course) and drawn physically based;
+and that the cottage is as measured: its door 2.0 m by 0.8 m with its floor 0.6 m up, its ridge at 7.0 m
+and its wing's far wall 5.3 m left of the door, its chimney stack standing on its shaft at the eave
+against the right eave wall, all 26 of its parts one tree under its plinth, the five lanterns' glass,
+bulbs and metal one shared material each, and its panes drawn as parts of their own.
 It also presses P (frames 256 and 271) and F (276 and 286) while the walker stands, and checks that
 scene time stood still while paused and ran ten times as fast at x10; that the world's alarm (a timer
 for 3 s) rang at the first frame at or after 3 s; that the world was told the walker came up to the
 launch button (an area) and is still there; the day clock's reading; that the balloon is one tree as
-built; and that the two rooks share one material (one mesh more than materials defined, and, with a
-GPU, both drawn in the same material).
+built; and that the two rooks share one material (11 more meshes than materials defined: the rooks'
+one, the cottage's 22 meshes in 16 materials, the lanterns' 4 meshes in the cottage's 3, and, with a
+GPU, both rooks drawn in the same material).
 It exits 0 only if every check passed, no Vulkan call failed and the validation layer said nothing.
 
 `--checks` runs the scene core's checks on scenes of their own, with no window, GPU or frames: a
@@ -93,8 +100,9 @@ dawn at 1290 s; a sphere area and a box area under a scaled parent entered and l
 being coming in moving the first out; and possession, the user's intents moving only the possessed
 being and the camera following it. It exits 0 only if every check passed.
 `shots/` holds the views of one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups
-`rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`), converted to PNG, and
-`amphora-vs-photo.png`, the amphora's close-up beside the photograph it was traced from.
+`rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`, `cottage-photo`, `cottage-approach`),
+converted to PNG, `amphora-vs-photo.png`, the amphora's close-up beside the photograph it was traced from,
+and `cottage-vs-photo.png`, the cottage from the photograph's viewpoint beside the photograph.
 
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
 scene's inbox is empty after the apply point and that the parts, the rows drawn and the particle
@@ -232,9 +240,66 @@ frames keep coming while the world arrives.
 | horn-flower (stalk, leaves, petals, heart) | new (`hornflower.cone`): the horn, 2.4 m and cut short; `sculpt/examples/flower.cone`'s petals on the cut; five swept leaves | 2 m | 99,956 | 39 |
 | boulder | `sculpt/examples/pebble.cone` (one more subdivision) | 2 m | 768 | 0.4 |
 | horn | `sculpt/examples/hornfamily.cone`, stage 0 | 3 m along | 46,204 | 18 |
-| chimney stack (stack, flaunching, pot) | new (`chimney.cone`): brick masonry, 4 x 3 bricks, 47 courses; boxes, its bricks a 1620 x 1620 colour, normal and ORM map | 4 m to the pot's rim | 808 | 254 (maps) |
+| cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and stone paint tiles; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 270 (the chimney's maps 254 of it) |
+| path lanterns (three: stake, glass, bulb, cap each) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 2,892 | 0.24 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |
 | ball | new: a sphere, checkered so its spin shows | 1 m across | 1,984 | 0.03 |
 | starship (frame, membranes, wing lights, ports, eyes, mouth) | `packages/starship`, meshed on the GPU at 0.03 a cell | 156 m, 10 m a unit | 458,324 | 700 (0.4 s of it making the kernels) |
+
+## The cottage, measured from the reference frame
+
+The frame is `forest-cottage-dusk.jpg` (640 x 1136; `C:\src\reference-images\cottage`). The ruler is its
+front door, taken as 2.0 m high (a standard door; 0.85 m wide is not what the frame shows, it reads 0.70 m, so
+the model's leaf is 0.8 m): 137 px (612 to 749), 68.5 px a metre at the front wall. Pixels were read off
+enlarged, gridded crops of the frame. Each feature was then back-projected onto the plane it stands in (the
+front wall, z = 0; the posts, z = 1.45; the porch roof's edge, z = 1.9) through the camera that least squares
+fits the planar features (a fit of the front-wall points, the horizon read from two receding lines at row 679,
+a 55 degree vertical lens assumed): **1.63 m up, 15.3 m from the front wall, 4.25 m left of the door, turned 12
+degrees to the right, tilted 5.8 degrees up**, 3.8 px rms. The cottage's frame: the ground at the middle of the
+main front wall, +x right, +z towards the viewer. The porch floor is the door's sill, 0.63 m measured, 0.6 built.
+
+| Feature | Pixels (x; y) | Metres (x; y above the ground) | Built |
+| --- | --- | --- | --- |
+| Door, the ruler | 360 to 408; 612 to 749 | -0.41 to 0.31; floor 0.63 to 2.6 (2.0 high by 0.72) | -0.4 to 0.4; 0.6 to 2.6 |
+| Gable's apex | 400; 318 | 0.2; 7.0 | 0; 7.0 |
+| Gable's feet (the eaves' ends) | 203; 565 and 560; 567 | -2.68; 3.23 and 2.72; 3.31 | -2.7 and 2.7; 3.3 |
+| Gable's tall window | 358 to 412; 442 to 530 | -0.43 to 0.4; 3.8 to 5.11 (0.83 by 1.31) | -0.42 to 0.4; 3.8 to 5.11 |
+| Attic opening | 377 to 398; 385 to 415 | -0.13 to 0.19; 5.52 to 5.98 | the same |
+| Left porch bay window | 268 to 308; 610 to 697 | -1.75 to -1.17; 1.37 to 2.61 | the same |
+| Right porch bay window | 461 to 502; 616 to 697 | 1.13 to 1.76; 1.36 to 2.56 | 1.15 to 1.77; 1.37 to 2.61 |
+| Wing's three tall windows | 125 to 192; 610 to 695 | -3.74 to -2.82; 1.41 to 2.58 | -3.74 to -2.82; 1.41 to 2.58 |
+| Wing's narrow corner window | 50 to 62; 617 to 677 | -4.75 to -4.59; 1.65 to 2.47 | the same |
+| Dormer's window | 87 to 106; 465 to 525 | -4.3 to -4.04; 3.79 to 4.65 (face 0.3 m behind the wall) | the same |
+| Dormer's roof top | 100; 390 | -4.15; 5.75 | 5.4 (see below) |
+| Wing's eave | 60; 562 and 200; 572 | -4.64; 3.23 and -2.72; 3.13 | 3.3 |
+| Porch's left post | 326; 600 to 750 | -1.22 (z = 1.45) | -1.25 |
+| Light column right of the right bay | 503 to 515; 610 to 690 | 1.25 (z = 1.45, by symmetry) | a post at 1.25 |
+| Pilaster beside the door | 412 to 428; 600 to 745 | 0.5 to 0.6 (z = 0) | 0.47 to 0.59, and its mirror |
+| Porch's right end post | 606; 650 | 2.71 (z = 1.45) | 2.6 |
+| Porch roof's ends, its front edge | 245 and 612; 583 and 594 | -2.35 and 2.59 (z = 1.9) | -2.5 to 2.8; edge 2.9 up |
+| Deck's right end | 612; 768 | 2.67 | 2.7 |
+| Steps | 387 to 477; 780 to 797 | -0.47 to 0.52 (z = 2.0); 0.3 | -0.55 to 0.65; two risers of 0.2 |
+| Wall lanterns | 337; 640 and 445; 645 | -0.78 and 0.83; 2.15 | -0.78 and 0.83 (bracket at 2.4) |
+| Eave to ridge, the gable's rise | 247 to 254 px | 3.6 to 3.7 | 3.7 (53.9 degrees) |
+
+Left of the door the frame shows one steep slate slope with a small dormer in it, a low eave, and three
+tall windows and a narrow one under the eave. This is built as a **wing** with its own ridge running across
+(7.0 m up on the main block, 6.5 m on the wing), the dormer in the wing's front slope, so it reads as the frame
+does from the front; the earlier note in `WI\other-exemplars.md` read it as the main roof's left slope running
+on down (a catslide). The two cannot be told apart from this one view; the wing was chosen because the slope's top
+edge in the frame runs across, not back.
+
+**What is real geometry and what is material.** The battens are strips (5 cm wide, 2.5 cm proud, every 0.3 m on
+the front walls, the wing's end and the main block's right and left walls, cut round the door and windows);
+the boards between them are the wall material's paint. The shingles are the roof material's paint (rows 16 cm
+deep) on slabs 12 cm thick, not rows of geometry. The windows are real: a casing, a sash with muntins, and a pane
+that is a part of its own (all the windows' panes are one part, the door's another). Every surface kind is one
+material defined in `ctMaterials`, shared by every part of that kind: board, batten, shingle, trim, window
+frame, pane, door, timber, deck and stone; the paint tiles (boards 2 m, shingles 1.28 m, deck planks 1.12 m,
+stone) are made in `ctBoardPaint`, `ctShinglePaint`, `ctDeckPaint` and `ctStonePaint`, and are what the
+texture kit's maps replace. The brick chimney is `chimney.cone`'s stack, unchanged, standing on a shaft of 44
+more courses of the same bond from the ground to the eave, on the right eave wall; its pot is 0.3 m above the
+ridge. The three path lanterns and the two wall lanterns are one family (stake or bracket, glass, bulb, cap), the
+glass and the bulb each its own part, in three materials the world shares.
