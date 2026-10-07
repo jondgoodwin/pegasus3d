@@ -9,10 +9,12 @@
 // the example programs of Cone's sculpt and vfx packages (examples are not
 // importable, and these are this world's own content, not library code).
 // Hydrating one runs its description through the libraries into plain data:
-// meshes, paint images, emitters, placements (a Hydrated, which holds no
-// id and touches no scene). Injecting it reserves an id for each of its
-// parts and sends that part's Spawn, Place and Show (or Effect) through the
-// Door. The Hydrated is the message: when worlds arrive from another actor,
+// meshes, materials and their paint images, emitters, and parts naming
+// them with their parents and placements (a Hydrated, which holds no id
+// and touches no scene). Injecting it defines its meshes and materials
+// (one the world shares across objects only once), reserves an id for each
+// of its parts and sends that part's Spawn, Place, Parent and Show (or
+// Effect) through the Door. The Hydrated is the message: when worlds arrive from another actor,
 // that actor hydrates and sends the Hydrated, and only 'inject' runs here.
 //
 // One object is hydrated and injected a call ('step'), so the browser keeps
@@ -86,58 +88,101 @@ fn srgb(r f32, g f32, b f32) Color {
 
 // ---- Hydrated: an object as data ----
 
-// One part of an object: what it is called, drawn as and where it stands
-pub struct PartDesc {
-  pub name String;
-  pub shape mesh.Mesh;
+// No parent: a part placed in the world
+pub const TOP = 0xFFFFFFFFusize;
+
+// A material of an object: its look, paint and maps, and, if it is one the
+// world shares across objects, its key (SHARED_ keys; 0: its own)
+pub struct MaterialDesc {
   pub look Look;
   pub paint Image;
   pub maps Maps;              // a physical look's normal and ORM maps
-  pub at Transform3;
+  pub shared u32;
 
-  pub fn empty() PartDesc {
-    new PartDesc(String.empty(), mesh.Mesh.empty(), Look.plain(new Color(1., 1., 1., 1.)), Image.empty(),
-      Maps.none(), Transform3.identity());
-  }
+  pub fn empty() MaterialDesc { new MaterialDesc(Look.plain(new Color(1., 1., 1., 1.)), Image.empty(), Maps.none(), 0u32); }
 }
 
-// One effect of an object: its layers, where they start, the seed, and
-// when it first fires and stops (the scene's seconds)
+// One part of an object: what it is called, which of the object's meshes
+// and materials it is drawn as, its parent (another of the object's parts,
+// before it; TOP: none) and where it stands in its parent's frame
+pub struct PartDesc {
+  pub name String;
+  pub mesh usize;
+  pub material usize;
+  pub parent usize;
+  pub at Transform3;
+}
+
+// One effect of an object: its layers, its parent (one of the object's
+// parts; TOP: none) and where it starts in its parent's frame, the seed,
+// and when it first fires and stops (the scene's seconds)
 pub struct EffectDesc {
   pub name String;
   pub layers List[EffectLayer];
+  pub parent usize;
   pub at Transform3;
   pub seed u32;
   pub start f64;
   pub stop f64;
 
   pub fn empty() EffectDesc {
-    new EffectDesc(String.empty(), List[EffectLayer].empty(), Transform3.identity(), 0u32, 0d, 0d);
+    new EffectDesc(String.empty(), List[EffectLayer].empty(), TOP, Transform3.identity(), 0u32, 0d, 0d);
   }
 }
 
-// An object hydrated: its parts and effects, ready to send
+// The materials the world shares across its objects
+pub const SHARED_IVORY = 1u32;    // the two rooks'
+
+// An object hydrated: its meshes, its materials, and its parts and effects
+// naming them, ready to send
 pub struct Hydrated {
+  pub meshes List[mesh.Mesh];
+  pub materials List[MaterialDesc];
   pub parts List[PartDesc];
   pub effects List[EffectDesc];
 
-  pub fn empty() Hydrated { new Hydrated(List[PartDesc].empty(), List[EffectDesc].empty()); }
+  pub fn empty() Hydrated {
+    new Hydrated(List[mesh.Mesh].empty(), List[MaterialDesc].empty(), List[PartDesc].empty(), List[EffectDesc].empty());
+  }
 
-  pub fn add(self &mut, name &[]u8, shape mesh.Mesh, look Look, paint Image, at Transform3) {
-    parts.push(new PartDesc(String.from(name), shape, look, paint, Maps.none(), at));
+  // A mesh of the object: its index
+  pub fn addMesh(self &mut, shape mesh.Mesh) usize {
+    meshes.push(shape);
+    meshes.len() - 1usize;
+  }
+
+  // A material of the object: its index
+  pub fn addMaterial(self &mut, look Look, paint Image, maps Maps, shared u32) usize {
+    materials.push(new MaterialDesc(look, paint, maps, shared));
+    materials.len() - 1usize;
+  }
+
+  // A part drawn as mesh 'm' in material 'mat', under part 'parent': its index
+  pub fn part(self &mut, name &[]u8, m usize, mat usize, parent usize, at Transform3) usize {
+    parts.push(new PartDesc(String.from(name), m, mat, parent, at));
+    parts.len() - 1usize;
+  }
+
+  // A part with a mesh and a material of its own, placed in the world
+  pub fn add(self &mut, name &[]u8, shape mesh.Mesh, look Look, paint Image, at Transform3) usize {
+    imm m = self.addMesh(shape);
+    imm mat = self.addMaterial(look, paint, Maps.none(), 0u32);
+    self.part(name, m, mat, TOP, at);
   }
 
   // A part of a physical look, with its maps
-  pub fn addMapped(self &mut, name &[]u8, shape mesh.Mesh, look Look, paint Image, maps Maps, at Transform3) {
-    parts.push(new PartDesc(String.from(name), shape, look, paint, maps, at));
+  pub fn addMapped(self &mut, name &[]u8, shape mesh.Mesh, look Look, paint Image, maps Maps, at Transform3) usize {
+    imm m = self.addMesh(shape);
+    imm mat = self.addMaterial(look, paint, maps, 0u32);
+    self.part(name, m, mat, TOP, at);
   }
 
-  // How many triangles its meshes have
+  // How many triangles its parts draw (a mesh shared by several counted for each)
   pub fn triangles(self &) u64 {
     mut n = 0u64;
     mut i = 0usize;
     while i < parts.len() {
-      n = n + u64.from(parts[i].shape.triangleCount());
+      n = n + u64.from(meshes[parts[i].mesh].triangleCount());
       i = i + 1usize;
     }
     n;
@@ -156,6 +201,7 @@ pub const AMPHORA = 1u32;
 pub const HORNFLOWER = 2u32;
 pub const CHIMNEY = 5u32;
 pub const BALLOON = 6u32;
+pub const LATHED_ROOK = 7u32;
 pub const BUTTON = 9u32;
 pub const BALL = 10u32;
 
@@ -194,7 +240,10 @@ fn grounded(m mesh.Mesh) mesh.Mesh {
 pub fn hydrate(k u32) Hydrated {
   mut h = Hydrated.empty();
   if k == 0u32 {
-    h.add("rook", grounded(rookMesh(ROOK_STEPS)), Look.shiny(srgb(232., 222., 196.), 0.5, 40.), Image.empty(), placeOf(k, 0.));
+    // Both rooks in the world's one ivory material
+    imm ivory = h.addMaterial(ivoryLook(), Image.empty(), Maps.none(), SHARED_IVORY);
+    imm shape = h.addMesh(grounded(rookMesh(ROOK_STEPS)));
+    h.part("rook", shape, ivory, TOP, placeOf(k, 0.));
   } elif k == AMPHORA {
     hydrateAmphora(&mut h, placeOf(k, 0.));
     print <- "The amphora: lathed in "; print <- amphoraStats.latheMs; print <- " ms, its handles in ";
@@ -212,8 +261,9 @@ pub fn hydrate(k u32) Hydrated {
   } elif k == 6u32 {
     hydrateBalloon(&mut h, k);
   } elif k == 7u32 {
-    h.add("lathed rook", grounded(lathedRookMesh(ROOK_STEPS)), Look.shiny(srgb(232., 222., 196.), 0.5, 40.), Image.empty(),
-      placeOf(k, 0.));
+    imm ivory = h.addMaterial(ivoryLook(), Image.empty(), Maps.none(), SHARED_IVORY);
+    imm shape = h.addMesh(grounded(lathedRookMesh(ROOK_STEPS)));
+    h.part("lathed rook", shape, ivory, TOP, placeOf(k, 0.));
     print <- "The lathed rook's merlon: "; print <- merlonHolesBefore; print <- " holes as lathed, ";
     print <- merlonHolesAfter; print <- " once capped\n";
   } elif k == 8u32 {
@@ -232,6 +282,9 @@ pub fn hydrate(k u32) Hydrated {
   }
   h;
 }
+
+// The rooks' ivory
+fn ivoryLook() Look { Look.shiny(srgb(232., 222., 196.), 0.5, 40.); }
 
 // The button's cap: a disc 0.24 across and 0.06 high, its edges sharp
 const BUTTON_TOP f32 = 1.;
@@ -282,24 +335,53 @@ fn hydrateShip(h &mut Hydrated, k u32) {
 
 // ---- Inject: an object's parts sent through the Door ----
 
-// Every part of 'h' reserved and sent: its Spawn, its Place, its Show or
-// Effect. The ids go into 'ids', and where each was placed into 'places'.
-// 'h' is taken apart (its meshes move into the requests).
-pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mut List[Transform3]) {
-  imm parts = h.parts.viewMut();
+// Every mesh and material of 'h' defined, and every part reserved and
+// sent: its Spawn, its Place, its Parent (if it has one), its Show or
+// Effect. A material the world shares is defined once, the first time an
+// object uses it, and kept in 'shared' (by its key) for the next. The ids
+// go into 'ids', and where each was placed (in its parent's frame) into
+// 'places'. 'h' is taken apart (its meshes and images move into the
+// requests).
+pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mut List[Transform3],
+    shared &mut List[MaterialId]) {
+  mut meshIds = List[MeshId].withCapacity(h.meshes.len());
+  imm meshes = h.meshes.viewMut();
   mut i = 0usize;
-  while i < parts.len {
-    mut p = PartDesc.empty();
-    p <=> parts[i];
+  while i < meshes.len {
+    mut shape = mesh.Mesh.empty();
+    shape <=> meshes[i];
+    meshIds.push(door.defineMesh(shape));
+    i = i + 1usize;
+  }
+  mut materialIds = List[MaterialId].withCapacity(h.materials.len());
+  imm materials = h.materials.viewMut();
+  i = 0usize;
+  while i < materials.len {
+    mut d = MaterialDesc.empty();
+    d <=> materials[i];
+    imm key = usize.from(d.shared);
+    while shared.len() <= key { shared.push(MaterialId.none()); }
+    if key > 0usize and !(*shared[key]).isNone() {
+      materialIds.push(*shared[key]);
+    } else {
+      mut paint = Image.empty();
+      paint <=> d.paint;
+      mut maps = Maps.none();
+      maps <=> d.maps;
+      imm id = door.defineMaterial(d.look, paint, maps);
+      if key > 0usize { shared.set(key, id); }
+      materialIds.push(id);
+    }
+    i = i + 1usize;
+  }
+  imm first = ids.len();
+  i = 0usize;
+  while i < h.parts.len() {
+    imm p = h.parts[i];
     imm id = door.newPart(p.name.view());
     door.send(Request.Place[id, p.at]);
-    mut paint = Image.empty();
-    paint <=> p.paint;
-    mut maps = Maps.none();
-    maps <=> p.maps;
-    mut shape = mesh.Mesh.empty();
-    shape <=> p.shape;
-    door.send(Request.Show[id, shape, p.look, paint, maps, 0.]);
+    if p.parent != TOP { door.send(Request.Parent[id, *ids[first + p.parent]]); }
+    door.send(Request.Show[id, *meshIds[p.mesh], *materialIds[p.material], 0.]);
     ids.push(id);
     places.push(p.at);
     i = i + 1usize;
@@ -311,6 +393,7 @@ pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mu
     e <=> effects[i];
     imm id = door.newPart(e.name.view());
     door.send(Request.Place[id, e.at]);
+    if e.parent != TOP { door.send(Request.Parent[id, *ids[first + e.parent]]); }
     mut layers = List[EffectLayer].empty();
     layers <=> e.layers;
     door.send(Request.Effect[id, layers, e.seed, e.start, e.stop]);
@@ -319,6 +402,14 @@ pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mu
     i = i + 1usize;
   }
 }
+
+// The world's own timer: an alarm at ALARM_AT seconds of scene time, to
+// show a timer's mail coming back
+pub const ALARM_TOKEN = 1u64;
+pub const ALARM_AT f64 = 3d;
+// The area around the launch button: a sphere of this radius (metres)
+// about the pedestal's foot, in which the world greets whoever comes up
+pub const BUTTON_AREA f32 = 5.;
 
 // ---- The world's progress ----
 
@@ -344,10 +435,17 @@ pub struct BakedWorld {
   pub fires u64;              // bursts of the burner fired (Fire requests sent)
   pub moves u64;              // Place requests sent by motions
   pub presses u64;            // the button's clicks read from the mail
+  shared List[MaterialId];    // the materials it shares across objects, by key
+  pub alarms u64;             // its alarm's rings read from the mail
+  pub alarmHeardAt f64;       // the scene's time it read the last; negative: never
+  pub arrivals u64;           // comings into the button's area read from the mail
+  pub departures u64;         // and goings out of it
+  pub dusks u64;              // dusks and dawns read from the mail
+  pub dawns u64;
 
   pub fn make() BakedWorld {
     new BakedWorld(0u32, List[PartId].empty(), List[Transform3].empty(), List[usize].empty(), List[Hydration].empty(),
-      Flight.grounded(), -1d, false, 0., 0u64, 0u64, 0u64);
+      Flight.grounded(), -1d, false, 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64);
   }
 
   // Whether every object has been sent
@@ -389,6 +487,33 @@ pub struct BakedWorld {
             if flight.rising() { print <- "rises\n"; } else { print <- "comes down\n"; }
           }
         }
+        case mut r &mut Rang {
+          if r.token == ALARM_TOKEN {
+            alarms = alarms + 1u64;
+            alarmHeardAt = now;
+            print <- "The world: its alarm for "; print <- r.at; print <- " s rang, heard at "; print <- now; print <- " s\n";
+          }
+        }
+        case mut en &mut Entered {
+          if self.has(BUTTON) and en.area == self.partOf(BUTTON, 0usize) {
+            arrivals = arrivals + 1u64;
+            print <- "The world: someone came up to the launch button at "; print <- now; print <- " s\n";
+          }
+        }
+        case mut lf &mut Left {
+          if self.has(BUTTON) and lf.area == self.partOf(BUTTON, 0usize) {
+            departures = departures + 1u64;
+            print <- "The world: someone left the launch button at "; print <- now; print <- " s\n";
+          }
+        }
+        case mut dk &mut Dusk {
+          dusks = dusks + 1u64;
+          print <- "The world: dusk, at "; print <- dk.at; print <- " s\n";
+        }
+        case mut dn &mut Dawn {
+          dawns = dawns + 1u64;
+          print <- "The world: dawn, at "; print <- dn.at; print <- " s\n";
+        }
         else {}
       }
       i = i + 1usize;
@@ -412,16 +537,15 @@ pub struct BakedWorld {
     if self.has(BALLOON) {
       imm alt = flight.altitude(now);
       if alt != sentAltitude {
+        // The balloon is one tree: its envelope moved, and everything
+        // under it (skirt, cables, burner frame and flame, basket and
+        // passengers) moves with it
         sentAltitude = alt;
-        imm from = *firstOf[usize.from(BALLOON)];
-        mut j = 0usize;
-        while j < self.partsOf(BALLOON) {
-          mut at = *places[from + j];
-          at.translation.y = at.translation.y + alt;
-          door.send(Request.Place[*ids[from + j], at]);
-          moves = moves + 1u64;
-          j = j + 1usize;
-        }
+        imm root = *firstOf[usize.from(BALLOON)];
+        mut at = *places[root];
+        at.translation.y = at.translation.y + alt;
+        door.send(Request.Place[*ids[root], at]);
+        moves = moves + 1u64;
       }
       // The burner: its burst now, sent when it is not the last one sent
       imm burst = flight.burst(now);
@@ -439,6 +563,8 @@ pub struct BakedWorld {
   // are none left
   pub fn step(self &mut, door &mut Door) bool {
     if next >= OBJECTS { return false; }
+    // Its alarm, armed as it begins
+    if next == 0u32 { door.timer(ALARM_TOKEN, ALARM_AT); }
     imm hz = f64.from(sdl.GetPerformanceFrequency());
     imm t0 = sdl.GetPerformanceCounter();
     mut h = hydrate(next);
@@ -446,9 +572,13 @@ pub struct BakedWorld {
     imm parts = u32.from(h.parts.len() + h.effects.len());
     imm tris = h.triangles();
     firstOf.push(ids.len());
-    inject(&mut h, door, &mut ids, &mut places);
-    // The button's clicks are the world's to hear
-    if next == BUTTON { door.send(Request.Listen[*ids[*firstOf[usize.from(BUTTON)] + 1usize]]); }
+    inject(&mut h, door, &mut ids, &mut places, &mut shared);
+    if next == BUTTON {
+      // The button's clicks are the world's to hear, and who comes near it
+      imm first = *firstOf[usize.from(BUTTON)];
+      door.send(Request.Listen[*ids[first + 1usize]]);
+      door.send(Request.Area[*ids[first], Volume.sphere(v(0., 0., 0.), BUTTON_AREA)]);
+    }
     imm t2 = sdl.GetPerformanceCounter();
     log.push(new Hydration(next, parts, tris, f64.from(t1 - t0) / hz, f64.from(t2 - t1) / hz));
     next = next + 1u32;

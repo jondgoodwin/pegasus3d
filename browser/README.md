@@ -45,6 +45,8 @@ first run after a driver's shader cache is cleared makes the kernels in about 4 
 | D or Right | turn right |
 | Shift (held) | walk four times as fast (12 m/s) |
 | Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button launches or lands the balloon |
+| P | pause scene time, or start it again (the world's motions, the effects, the timers and the day stop; the walk does not) |
+| F | run scene time ten times as fast, or back to normal (for testing the day: dusk comes 50 s after the start instead of 12.5 min) |
 | F11 | fullscreen |
 | Escape | quit |
 
@@ -54,6 +56,7 @@ first run after a driver's shader cache is cleared makes the kernels in about 4 
 browser.exe --script                  walk and turn with no one at the keyboard, checked
 browser.exe --script --shots shots    the same, saving its views as BMPs into shots/
 browser.exe --headless --script       the same with no window: the scene, the world and the walk
+browser.exe --checks                  the scene core's own checks, on scenes of their own (below)
 browser.exe --frames 600              600 frames on frame's synthetic clock
 browser.exe --soak 12000              12000 frames, checking nothing grows (below)
 browser.exe --watch 300               300 s in real time, a line a second and a key probe (below)
@@ -73,7 +76,22 @@ what it was sent; and that every part the world sent is live, placed and (with a
 off particles, with every request sent accounted for as applied or refused; and that the amphora and
 the chimney stack are the sizes they were built to (the amphora 1.484 m to its tip, 0.3368 m at its
 widest; the stack 47 courses, 3.525 m, and 5 x 4 bricks at its top course) and drawn physically based.
+It also presses P (frames 256 and 271) and F (276 and 286) while the walker stands, and checks that
+scene time stood still while paused and ran ten times as fast at x10; that the world's alarm (a timer
+for 3 s) rang at the first frame at or after 3 s; that the world was told the walker came up to the
+launch button (an area) and is still there; the day clock's reading; that the balloon is one tree as
+built; and that the two rooks share one material (one mesh more than materials defined, and, with a
+GPU, both drawn in the same material).
 It exits 0 only if every check passed, no Vulkan call failed and the validation layer said nothing.
+
+`--checks` runs the scene core's checks on scenes of their own, with no window, GPU or frames: a
+three-level placement tree made children first, its world matrices against ones worked out by hand, a
+placement changed recomputing only its own row, a reparent to the root and back under the top, a cycle
+refused, and the top despawned with its subtree; timers on the scene's clock in 1/60 s steps at x1,
+paused and at x10, each rung at the first step at or after its time, a cancel, and dusk at 750 s and
+dawn at 1290 s; a sphere area and a box area under a scaled parent entered and left, and a second
+being coming in moving the first out; and possession, the user's intents moving only the possessed
+being and the camera following it. It exits 0 only if every check passed.
 `shots/` holds the views of one run (`start`, `picked`, `walked`, `turned`, `balloon`, and the close-ups
 `rooks`, `chimney`, `starship`, `rising`, `amphora`, `hornflower`), converted to PNG, and
 `amphora-vs-photo.png`, the amphora's close-up beside the photograph it was traced from.
@@ -96,13 +114,18 @@ along the way when the first frame was presented and when every object was first
 
 | File | What it is |
 | --- | --- |
-| `src/browser.cone` | the browser, a world that frame's loop runs (`mod browser is World`): input, the walk in fixed steps, the world's next object and the apply point, drawing |
-| `src/parts/parts.cone` | the module `parts`: one id registry for parts, aspect tables keyed by id, the requests, the Door senders are given, and the Scene |
-| `src/rendersys.cone` | the render system: owns how parts look, their effects (particles) and the sky, and turns them into render's draw list; a physical look is drawn with render's physically based material |
+| `src/browser.cone` | the browser, a world that frame's loop runs (`mod browser is World`): input, the beings in fixed steps, the scene's events, the world's next object and the apply point, the snapshot, drawing |
+| `src/parts/parts.cone` | the module `parts`: one id registry for parts and resources, aspect tables keyed by id, the requests and messages, the Door senders are given, and the Scene |
+| `src/parts/placement.cone` | the placement tree: parents before children, world matrices in one pass over what changed |
+| `src/parts/events.cone` | the scene's clock and the day, timers on the timewheel, areas |
+| `src/parts/snapshot.cone` | what the scene publishes each frame for drawing |
+| `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list; a physical material is render's physically based one |
 | `src/shell.cone` | what the browser puts in every scene: the ground and the sky, sent as requests |
-| `src/walk.cone` | walking on the ground: the controller and its key bindings |
+| `src/being.cone` | beings and possession: intents, the user's controller, the Cast |
+| `src/walk.cone` | a walker's body on the ground, and the user's key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
-| `src/picking.cone` | the picking system: each shown part's triangles, and the ray a click casts |
+| `src/checks.cone` | the scene core's headless checks (`--checks`) |
+| `src/picking.cone` | the picking system: each mesh's triangles, which mesh each part is, and the ray a click casts |
 | `src/watch.cone` | the watched real-time run and the soak |
 | `src/bakedworld/` | the module `bakedworld`, the baked-in world: its objects' descriptions, hydrating and injecting them, and its motions (`motions.cone`) |
 | `src/dragonship/` | the module `dragonship`: the starship's description and its meshing on the GPU, on a device of the world's own |
@@ -111,29 +134,66 @@ along the way when the first frame was presented and when every object was first
 **Parts are ids.** One registry (a generational `pool.Pool`) hands out every part's id, a slot and a
 generation, so an id whose part is gone is detected rather than mistaken for the slot's next occupant.
 What a part is lives in tables keyed by its id (sparse sets), each owned by one system: the scene owns
-placement; the render system owns what a part is drawn as, the particles it gives off, and the sky.
+placement, listeners, areas and timers; the render system owns what a part is drawn as, the particles
+it gives off, and the sky. Meshes and materials take their ids from the same registry (its record says
+what kind of thing an id names) and are shared: many parts name one mesh and one material.
 
-**Changes are requests.** Whoever wants the scene changed reserves an id and sends requests (`Spawn`,
-`Place`, `Show`, `Effect`, `Fire`, `Listen`, `Highlight`, `Sky`, `Despawn`) into the scene's inbox.
+**Changes are requests.** Whoever wants the scene changed reserves an id and sends requests into the
+scene's inbox:
+
+| Request | Does |
+| --- | --- |
+| `Spawn` | a reserved part becomes live, with a name |
+| `Despawn` | a part goes, with its whole subtree and every aspect they have |
+| `Place` | a part placed, in its parent's frame (in the world's, with none) |
+| `Parent` | a part put under another (or under none), keeping its own placement; refused if it would make a cycle |
+| `DefineMesh` | a mesh, its id reserved by `Door.defineMesh` |
+| `DefineMaterial` | a material: a look, a painted image and a physical look's maps, its id reserved by `Door.defineMaterial` |
+| `Show` | a part drawn as a mesh in a material, both defined before; optionally anchored under the viewer |
+| `Effect`, `Fire` | a part's particle emitters, and a burst of them |
+| `Listen` | a part's clicks wanted: posted to the sender as `Clicked` |
+| `Highlight`, `Sky` | the browser's own: what was picked, and the sky |
+| `Timer`, `Cancel` | a timer on the scene's clock, ringing once or every period, posted back as `Rang` with the sender's token; and all timers with a token disarmed |
+| `Area` | a part is an area (a sphere or a box in its own frame): the possessed being coming in or going out is posted as `Entered` or `Left` |
+
 Once a frame, at the publish phase, the browser applies the inbox in order, routing each request to the
 system that owns what it changes; a request naming a part that is gone is refused and counted. The
 ground and the sky go in this way too: the ground is an ordinary part whose render row is *anchored*,
-drawn under the viewer in steps of its checkerboard's period, so it never ends. A `Show` may carry a
+drawn under the viewer in steps of its checkerboard's period, so it never ends. A material may carry a
 painted image (the balloon's envelope, the basket's wicker), which its colour multiplies, and, for a
 *physical* look, a normal map and an ORM map (the amphora's glaze glossy and its clay matt; the
 chimney's mortar recessed), drawn with render's physically based material; an `Effect`
 is a part's particle emitters (the vfx package's), fired from a start to a stop on the scene's clock
-and drawn as they are at the scene's time each frame; a `Fire` fires it again (a burst).
+and drawn as they are at the scene's time each frame; a `Fire` fires it again (a burst). The render
+system keeps the parts it draws in batches by (mesh, material), ready for instancing.
 
-**The scene's time** is the simulation's: frame's fixed steps, exact on the synthetic clock. Each
+**Placement is a tree.** The placement table is kept parents before children, so after the apply point
+the world matrices are composed (world = parent's world x local) in one pass from the first row that
+changed. The balloon is one tree: its envelope is the root, with the skirt, the cables, the burner frame
+(and under it the flame and the pilot light) and the basket (and under it the passengers) beneath, so
+launching it moves only the envelope. The renderer never walks the tree: each frame the scene publishes
+a **snapshot** (`parts/snapshot.cone`), a plain struct of every placed part's world matrix, the scene's
+time, the day clock and the possessed being's eyes, and the draw phase works from that alone (when the
+scene and render are actors, it is what moves between them).
+
+**Beings and possession.** The walker is a *being*: a part (`you`) with a body (the walk) that moves by
+the *intents* it is given each step. The user's *controller* turns the input package's actions into
+intents for whichever being the user *possesses*, and the camera follows the possessed being's eyes.
+Input, camera and walker are not wired together, so another being (T2's mannequin) can be possessed,
+or driven by another controller, without touching either (`src/being.cone`).
+
+**The scene's time** is the scene's own clock: frame's fixed steps at its rate, 1, or 0 paused (P), or
+10 (F); exact on the synthetic clock. A day is 24 minutes of it, the day clock reading 07:00 at the
+start, dusk at 19:30 (750 s) and dawn at 04:30 (1290 s), each posted to the world as `Dusk` and `Dawn`.
+Timers run on Cone's `timewheel`, driven by scene time. Each
 frame the world reads it and sends its motions as ordinary `Place` and `Fire` requests: the ball's
 height `1.6 |sin(pi t / 1.1)|` m and its spin, 3 rad/s; the button's cap sinking 3 cm for a quarter of
 a second when pressed; the balloon on the ground, its burner firing 3 s in every 4; pressed, rising at
 2.5 m/s with the burner held on to 30 m, then bobbing 0.6 m either way every 7 s with a 2 s burst every
 6 s; pressed again, the burner out, sinking at 1.5 m/s to land.
 
-**A click picks.** The picking system keeps a copy of each shown part's triangles (taken when its
-`Show` is applied; not the anchored ground's). A left click casts a ray from the eye through the
+**A click picks.** The picking system keeps a copy of each mesh's triangles (taken when its
+`DefineMesh` is applied) and which mesh each shown part is (not the anchored ground). A left click casts a ray from the eye through the
 pointer, takes it into each part's own frame by the inverse of its placement, tests the part's box,
 and, where the box is entered nearer than the best hit so far, each triangle; the nearest triangle
 hit names the part. The browser prints it and sends itself a `Highlight` (the render system draws the
@@ -143,7 +203,9 @@ part in its colour half-way to yellow, and lets the last one go).
 a click picks that part, the browser posts `Message.Clicked` into the world's Door, and the world reads
 its mail at its next tick, at the publish phase of the same frame, and answers with requests. The
 browser never reaches into the world, and the world never into the scene's tables: the Door's mail is
-the world's inbox, as an actor's would be.
+the world's inbox, as an actor's would be. Timers (`Rang`), dusk and dawn, and areas (`Entered`,
+`Left`) come back the same way: the baked-in world sets an alarm for 3 s and keeps an area of 5 m
+about the launch button, and prints what it is told.
 
 **A world is given the Door, not the scene.** The `parts` module keeps the registry, the inbox and the
 placement table private, and hands a sender a `Door`, which only reserves ids and sends requests. The
@@ -155,8 +217,10 @@ a device with no surface), never the browser's.
 **Hydrate, then inject.** Each object of the baked-in world is a description in Cone, ported from the
 example programs of Cone's `sculpt` and `vfx` packages and from the `starship` package (examples and
 executables are not importable, and this content belongs to the browser). Hydrating one runs it through
-those libraries into plain data, a `Hydrated`: meshes, paint images, emitters and placements, with no
-ids. Injecting it reserves an id per part and sends its requests. The `Hydrated` is what a world actor
+those libraries into plain data, a `Hydrated`: meshes, materials (with their paint images), parts
+naming them with their parents and placements, and emitters, with no ids. Injecting it defines its
+meshes and materials (a material the world shares across objects, the rooks' ivory, only once),
+reserves an id per part and sends its requests. The `Hydrated` is what a world actor
 would send; today one object is hydrated and injected a frame, at the start of the publish phase, so
 frames keep coming while the world arrives.
 

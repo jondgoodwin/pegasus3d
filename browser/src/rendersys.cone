@@ -1,25 +1,52 @@
 // The render system: the owner of how parts look. It keeps its own tables,
-// keyed by part id (what each part is drawn as, the effects parts give off,
-// and the sky), and the GPU resources behind them, made when a Show or an
+// keyed by id: the meshes and materials defined (shared resources, each
+// uploaded once however many parts use it), what each part is drawn as (a
+// mesh id and a material id), the effects parts give off, and the sky; and
+// the GPU resources behind them, made when a DefineMesh, DefineMaterial or
 // Effect request is applied. Each frame it turns its rows, with the scene's
-// placements, into the render package's draw list, and fires each effect's
-// emitters where its part is, as they are at the scene's time. The renderer
-// itself never sees a part or walks a hierarchy: it gets world matrices and
-// meshes. A part's look is drawn with render's Blinn-Phong material, or, if
-// it is physical, its physically based one, with its paint, normal and ORM
-// maps; that one is lit by the sun and by an environment made to match the
-// Blinn-Phong ambient (environmentSky).
+// published snapshot (snapshot.cone in parts/), into the render package's
+// draw list, and fires each effect's emitters where its part is, as they
+// are at the scene's time. It never sees the placement tree: the snapshot
+// holds world matrices, already composed. A material is drawn with render's
+// Blinn-Phong material, or, if it is physical, its physically based one, with
+// its paint, normal and ORM maps; that one is lit by the sun and by an
+// environment made to match the Blinn-Phong ambient (environmentSky).
+//
+// BATCHES. The parts shown are kept grouped by (mesh, material): one batch
+// per pair, its members the parts drawn with it, and the draw list is built
+// batch by batch. Today each member is still one draw; instancing (one draw
+// per batch, the members' world matrices in a buffer: render's, F2) takes
+// the batches as they are.
 
-// What one part is drawn as
-pub struct Renderable {
-  pub meshH MeshHandle;
-  pub material MaterialHandle;
-  pub anchor f32;             // 0: where the part is placed; else under the viewer, in steps of this
+// A mesh resource uploaded
+pub struct MeshRow {
+  pub handle MeshHandle;
+}
+
+// A material resource made
+pub struct MaterialRow {
+  pub handle MaterialHandle;
   pub base Material;          // the material's parameters, to make its highlight from
   pub physical bool;          // drawn physically based: 'pbr' its parameters, not 'base'
   pub pbr PbrMaterial;
   pub lit MaterialHandle;     // the highlighted material, made the first time it is asked for
+}
+
+// What one part is drawn as
+pub struct Renderable {
+  pub mesh MeshId;
+  pub material MaterialId;
+  pub anchor f32;             // 0: where the part is placed; else under the viewer, in steps of this
   pub highlighted bool;
+  pub batch u32;              // its batch
+  pub member u32;             // and its place among the batch's members
+}
+
+// The parts drawn with one mesh and one material
+pub struct Batch {
+  pub mesh MeshId;
+  pub material MaterialId;
+  pub members List[PartId];
 }
 
 // The physically based shader takes the sun's colour as irradiance and
@@ -76,7 +103,10 @@ fn highlightOfPhysical(m &PbrMaterial) PbrMaterial {
 }
 
 pub struct RenderSystem {
-  pub rows Table[Renderable];
+  pub meshes Table[MeshRow];          // keyed by a mesh's id
+  pub materials Table[MaterialRow];   // keyed by a material's id
+  pub rows Table[Renderable];         // keyed by a part's id
+  pub batches List[Batch];
   pub effects Table[EffectRow];
   pub skies Table[SkyLook];
   pub list DrawList;
@@ -84,25 +114,30 @@ pub struct RenderSystem {
   emitters List[Emitter];     // every effect's layers, in the order their slots were added
   handles List[EmitterHandle];
   pub drawn usize;            // parts in the last draw list
-  pub painted usize;          // Shows applied with a painted image
+  pub painted usize;          // materials defined with a painted image
   pub now f64;                // the scene's time the effects were last drawn at
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
-    new RenderSystem(Table[Renderable].empty(), Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
+    new RenderSystem(Table[MeshRow].empty(), Table[MaterialRow].empty(), Table[Renderable].empty(), List[Batch].empty(),
+      Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
       List[EmitterHandle].empty(), 0usize, 0usize, 0d);
   }
 
-  // Apply a Show: upload the mesh, make its material, and give the part its
-  // row (a part shown again has its old mesh removed)
-  pub fn show(self &mut, renderer &mut Renderer, device &mut Device, id PartId, m &Mesh, surface &Look,
-      paint &Image, maps &Maps, anchor f32) {
+  // Apply a DefineMesh: upload it
+  pub fn defineMesh(self &mut, renderer &mut Renderer, device &mut Device, id MeshId, m &Mesh) {
+    imm handle = renderer.addMesh(device, m);
+    meshes.put(id.id, new MeshRow(handle));
+  }
+
+  // Apply a DefineMaterial: make its material, Blinn-Phong or physical
+  pub fn defineMaterial(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look,
+      paint &Image, maps &Maps) {
     if surface.physical {
-      self.showPhysical(renderer, device, id, m, surface, paint, maps, anchor);
+      self.definePhysical(renderer, device, id, surface, paint, maps);
       return;
     }
-    imm handle = renderer.addMesh(device, m);
     mut material = Material.plain(surface.color);
     if surface.specular > 0. {
       material = Material.shiny(surface.color, surface.specular, surface.shininess);
@@ -119,22 +154,16 @@ pub struct RenderSystem {
       material.texture = renderer.addTexture(device, &checks);
     }
     imm mh = renderer.addMaterial(device, &material);
-    imm row = rows.find(id);
-    if row != NO_ROW {
-      imm old = (*rows.rows[row]).meshH;
-      renderer.removeMesh(device, old);
-    }
-    rows.put(id, new Renderable(handle, mh, anchor, material, false, PbrMaterial.standard(surface.color, 0., 1.),
-      MaterialHandle.none(), false));
+    materials.put(id.id, new MaterialRow(mh, material, false, PbrMaterial.standard(surface.color, 0., 1.),
+      MaterialHandle.none()));
   }
 
-  // A Show of a physical look: render's physically based material, its
-  // colour times PHYSICAL_GAIN, the paint its base colour map, the maps its
-  // normal map and its ORM map (as roughness and metallic, and as
-  // occlusion of the environment's light)
-  fn showPhysical(self &mut, renderer &mut Renderer, device &mut Device, id PartId, m &Mesh, surface &Look,
-      paint &Image, maps &Maps, anchor f32) {
-    imm handle = renderer.addMesh(device, m);
+  // A physical look's material: render's physically based one, its colour
+  // times PHYSICAL_GAIN, the paint its base colour map, the maps its normal
+  // map and its ORM map (as roughness and metallic, and as occlusion of the
+  // environment's light)
+  fn definePhysical(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look,
+      paint &Image, maps &Maps) {
     imm c = surface.color;
     mut pbr = PbrMaterial.standard(new Color(c.red * PHYSICAL_GAIN, c.green * PHYSICAL_GAIN, c.blue * PHYSICAL_GAIN, 1.),
       surface.metallic, surface.roughness);
@@ -151,30 +180,94 @@ pub struct RenderSystem {
       pbr.occlusionTexture = orm;
     }
     imm mh = renderer.addPbrMaterial(device, &pbr);
-    imm row = rows.find(id);
-    if row != NO_ROW {
-      imm old = (*rows.rows[row]).meshH;
-      renderer.removeMesh(device, old);
-    }
-    rows.put(id, new Renderable(handle, mh, anchor, Material.plain(c), true, pbr, MaterialHandle.none(), false));
+    materials.put(id.id, new MaterialRow(mh, Material.plain(c), true, pbr, MaterialHandle.none()));
   }
 
-  // Apply a Highlight: part 'id' drawn in its highlighted material, or its own
+  // Apply a Show: part 'id' drawn as mesh 'mesh' in material 'material',
+  // into their batch (out of the one it was in). False if either is not
+  // defined here.
+  pub fn show(self &mut, id PartId, mesh MeshId, material MaterialId, anchor f32) bool {
+    if meshes.find(mesh.id) == NO_ROW or materials.find(material.id) == NO_ROW { return false; }
+    mut highlighted = false;
+    imm row = rows.find(id);
+    if row != NO_ROW {
+      highlighted = rows.rows[row].highlighted;
+      self.leaveBatch(id);
+    }
+    imm b = self.batchOf(mesh, material);
+    imm batch = &mut batches[b];
+    imm member = u32.from(batch.members.len());
+    batch.members.push(id);
+    rows.put(id, new Renderable(mesh, material, anchor, highlighted, u32.from(b), member));
+    true;
+  }
+
+  // The batch for (mesh, material), made if there is none
+  fn batchOf(self &mut, mesh MeshId, material MaterialId) usize {
+    mut b = 0usize;
+    while b < batches.len() {
+      imm batch = batches[b];
+      if batch.mesh == mesh and batch.material == material { return b; }
+      b = b + 1usize;
+    }
+    batches.push(new Batch(mesh, material, List[PartId].empty()));
+    batches.len() - 1usize;
+  }
+
+  // Part 'id' taken out of its batch (the batch's last member moves into its place)
+  fn leaveBatch(self &mut, id PartId) {
+    imm row = rows.find(id);
+    if row == NO_ROW { return; }
+    imm r = *rows.rows[row];
+    imm batch = &mut batches[usize.from(r.batch)];
+    imm last = batch.members.len() - 1usize;
+    imm m = usize.from(r.member);
+    if m != last {
+      batch.members.swap(m, last);
+      imm moved = *batch.members[m];
+      imm mrow = rows.find(moved);
+      mut mr = *rows.rows[mrow];
+      mr.member = r.member;
+      rows.rows.set(mrow, mr);
+    }
+    batch.members.pop();
+  }
+
+  // Apply a Highlight: part 'id' drawn in its material's highlighted
+  // version, or in its own
   pub fn highlight(self &mut, renderer &mut Renderer, device &mut Device, id PartId, on bool) {
     imm row = rows.find(id);
     if row == NO_ROW { return; }
     mut r = *rows.rows[row];
-    if on and r.lit.isNone() {
-      if r.physical {
-        imm lit = highlightOfPhysical(&r.pbr);
-        r.lit = renderer.addPbrMaterial(device, &lit);
+    imm mrow = materials.find(r.material.id);
+    mut m = *materials.rows[mrow];
+    if on and m.lit.isNone() {
+      if m.physical {
+        imm lit = highlightOfPhysical(&m.pbr);
+        m.lit = renderer.addPbrMaterial(device, &lit);
       } else {
-        imm lit = highlightOf(&r.base);
-        r.lit = renderer.addMaterial(device, &lit);
+        imm lit = highlightOf(&m.base);
+        m.lit = renderer.addMaterial(device, &lit);
       }
+      materials.rows.set(mrow, m);
     }
     r.highlighted = on;
-    rows.put(id, r);
+    rows.rows.set(row, r);
+  }
+
+  // Whether part 'id' is drawn in a physical material
+  pub fn isPhysical(self &, id PartId) bool {
+    imm row = rows.find(id);
+    if row == NO_ROW { return false; }
+    imm mrow = materials.find(rows.rows[row].material.id);
+    mrow != NO_ROW and materials.rows[mrow].physical;
+  }
+
+  // Part 'id''s material, or none
+  pub fn materialOf(self &, id PartId) MaterialId {
+    imm row = rows.find(id);
+    if row == NO_ROW { return MaterialId.none(); }
+    rows.rows[row].material;
   }
 
   // Apply an Effect: a slot of the particle renderer for each layer. A part
@@ -234,12 +327,11 @@ pub struct RenderSystem {
     skies.put(id, look);
   }
 
-  // A despawned part's rows go, and its mesh; its effect is stilled
-  pub fn drop(self &mut, renderer &mut Renderer, device &mut Device, id PartId) {
-    imm row = rows.find(id);
-    if row != NO_ROW {
-      imm old = (*rows.rows[row]).meshH;
-      renderer.removeMesh(device, old);
+  // A despawned part's rows go (its mesh and material stay: they are
+  // resources, perhaps shared); its effect is stilled
+  pub fn drop(self &mut, device &mut Device, id PartId) {
+    if rows.find(id) != NO_ROW {
+      self.leaveBatch(id);
       rows.remove(id);
     }
     imm e = effects.find(id);
@@ -260,37 +352,49 @@ pub struct RenderSystem {
     *skies.rows[n - 1usize];
   }
 
-  // The frame's draw list, from every row and the scene's placements, for a
-  // viewer whose eye is at 'eye'
-  pub fn build(self &mut, scene &Scene, eye Vec3) {
+  // The frame's draw list, batch by batch, from the snapshot's world
+  // matrices, for a viewer whose eye is at 'eye'
+  pub fn build(self &mut, snap &Snapshot, eye Vec3) {
     list.clear();
-    mut i = 0usize;
-    while i < rows.len() {
-      imm r = *rows.rows[i];
-      mut model = scene.worldMatrix(*rows.ids[i]);
-      if r.anchor > 0. {
-        imm sx = libc.floorf(eye.x / r.anchor) * r.anchor;
-        imm sz = libc.floorf(eye.z / r.anchor) * r.anchor;
-        model = Mat4.fromTranslation(new Vec3(sx, 0., sz)) * model;
+    mut drawnNow = 0usize;
+    mut b = 0usize;
+    while b < batches.len() {
+      imm batch = batches[b];
+      if batch.members.len() > 0usize {
+        imm meshH = meshes.rows[meshes.find(batch.mesh.id)].handle;
+        imm mat = *materials.rows[materials.find(batch.material.id)];
+        mut k = 0usize;
+        while k < batch.members.len() {
+          imm id = *batch.members[k];
+          imm r = *rows.rows[rows.find(id)];
+          mut model = snap.worldOf(id);
+          if r.anchor > 0. {
+            imm sx = libc.floorf(eye.x / r.anchor) * r.anchor;
+            imm sz = libc.floorf(eye.z / r.anchor) * r.anchor;
+            model = Mat4.fromTranslation(new Vec3(sx, 0., sz)) * model;
+          }
+          list.add(meshH, if r.highlighted { mat.lit; } else { mat.handle; }, model);
+          drawnNow = drawnNow + 1usize;
+          k = k + 1usize;
+        }
       }
-      list.add(r.meshH, if r.highlighted { r.lit; } else { r.material; }, model);
-      i = i + 1usize;
+      b = b + 1usize;
     }
-    drawn = rows.len();
+    drawn = drawnNow;
   }
 
   // Each effect's emitters fired where its part is now, as they are at the
-  // scene's time 'now'
-  pub fn aimEffects(self &mut, device &mut Device, scene &Scene, now f64) {
-    self.now = now;
+  // snapshot's scene time
+  pub fn aimEffects(self &mut, device &mut Device, snap &Snapshot) {
+    self.now = snap.now;
     mut i = 0usize;
     while i < effects.len() {
       imm r = *effects.rows[i];
-      imm ev = new Event(r.seed, r.start, r.stop, scene.worldMatrix(*effects.ids[i]));
+      imm ev = new Event(r.seed, r.start, r.stop, snap.worldOf(*effects.ids[i]));
       mut k = 0u32;
       while k < r.count {
         imm e = usize.from(r.first + k);
-        particles.update(device, *handles[e], emitters[e], &ev, now);
+        particles.update(device, *handles[e], emitters[e], &ev, snap.now);
         k = k + 1u32;
       }
       i = i + 1usize;

@@ -10,22 +10,32 @@
 // steps, publishes, draws and presents, every phase timed.
 //
 //   input      each event into the input package
-//   simulate   the walk, one fixed step at a time (walk.cone)
-//   publish    a click picked (picking.cone): the part hit highlighted, and
-//              posted to the world's Door if the world listens for it; the
-//              baked-in world's next object hydrated and sent (one a frame,
-//              until all are), and the world's tick: its mail read, its
-//              motions sent as Place requests at the scene's time; then THE
-//              APPLY POINT: the scene's inbox applied, each request by the
-//              system that owns what it changes (parts/, rendersys.cone,
-//              picking.cone); then the last two walk states kept for the
-//              picture
-//   draw       the camera between those states, the render system's draw
-//              list, then the effects' particles at the scene's time
+//   simulate   one fixed step at a time: the user's controller turns the
+//              actions into intents for the possessed being, every being
+//              steps (being.cone), and the scene's clock moves on
+//   publish    the pause and x10 keys; a click picked (picking.cone): the
+//              part hit highlighted, and posted to the world's Door if the
+//              world listens for it; the scene's events: timers due rung,
+//              the areas sensed against the possessed being (parts/
+//              events.cone); the baked-in world's next object hydrated and
+//              sent (one a frame, until all are), and the world's tick: its
+//              mail read, its motions sent as requests at the scene's time;
+//              the beings' parts placed; then THE APPLY POINT: the scene's
+//              inbox applied, each request by the system that owns what it
+//              changes (parts/, rendersys.cone, picking.cone); the world
+//              matrices propagated down the placement tree; and the scene's
+//              SNAPSHOT published (parts/snapshot.cone): every world
+//              matrix, the scene's time, and the possessed being's eyes at
+//              its last two steps
+//   draw       from the snapshot alone: the camera between those eyes, the
+//              render system's draw list, then the effects' particles at
+//              the snapshot's time
 //   present    show it
 //
-// THE SCENE'S TIME is the simulation's (frame's fixed steps, exact on the
-// synthetic clock): the world's motions and the effects are read from it.
+// THE SCENE'S TIME is the scene's clock (parts/events.cone): the
+// simulation's fixed steps at the clock's rate (1; 0 paused with P; 10
+// with F), exact on the synthetic clock. The world's motions, the effects,
+// the timers and the day clock are read from it; the walk is not.
 //
 // Arguments, besides frame's (--frames N, --headless, --quiet):
 //   --script        walk, turn and click with no one at the keyboard: events
@@ -58,18 +68,18 @@ import vfx use ParticleRenderer, EmitterHandle, Emitter, Event;
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
 // of parts that imports it
 use parts;
-use bakedworld { BakedWorld, ROOK, BALL, BALLOON, AMPHORA, HORNFLOWER, CHIMNEY };
+use bakedworld { BakedWorld, ROOK, LATHED_ROOK, BALL, BALLOON, BUTTON as LAUNCH_BUTTON, AMPHORA, HORNFLOWER, CHIMNEY, ALARM_AT };
 
 // ---- The world's state ----
 
 mut scene Scene;
 mut inputState Input;
 mut ctx Context;
-mut walkActions WalkActions;
-mut walk Walk;                // after the last step
-mut walkBefore Walk;          // after the one before
-mut shownFrom Walk;           // published for the picture
-mut shownTo Walk;
+mut cast Cast;                // the beings, and which one the user possesses
+mut user UserController;      // the user's: the actions into the possessed being's intents
+mut clockKeys ClockActions;   // the pause and x10 keys
+mut sentBodies List[Walk];    // each being's body as its part was last placed
+mut snapshot Snapshot;        // the scene's last published, drawn from
 mut ctxFrame u64 = 0u64;      // the frame whose actions are in 'ctx'
 mut inputFrame u64 = 0u64;    // the frame whose events are in 'input'
 mut automated bool = false;   // a run of a fixed number of frames: real input ignored
@@ -86,7 +96,7 @@ mut picked PartId;            // the part highlighted: the last click's
 mut lastPick PickHit;         // the last click's answer, for the script
 mut clicks u64 = 0u64;
 mut fired u64 = 0u64;         // Fire requests applied: an effect's bursts
-mut sceneNow f64 = 0d;        // the scene's time, seconds: the simulation's
+mut sceneNow f64 = 0d;        // the scene's time, seconds, at this frame's publish
 
 // The view a headless run picks in (no window to measure)
 const HEADLESS_W f32 = 1280.;
@@ -95,6 +105,25 @@ const FOV f32 = 1.0471976;    // 60 degrees, vertical
 
 // Where the viewer starts: 8 m back from the origin, facing down -z
 const START_Z f32 = 8.;
+
+// SDL3's scancodes for P and F (the sdl package binds only some letters)
+const SCANCODE_F = 9u;
+const SCANCODE_P = 19u;
+
+// The scene clock's keys: P pauses scene time (and starts it again), F runs
+// it ten times as fast (and back), for testing the day and the timers
+struct ClockActions {
+  pub pause Action;
+  pub fast Action;
+
+  pub fn bind(ctx &mut Context) ClockActions {
+    imm pause = ctx.action("clock.pause", BUTTON);
+    ctx.bind(pause, Binding.key(SCANCODE_P));
+    imm fast = ctx.action("clock.fast", BUTTON);
+    ctx.bind(fast, Binding.key(SCANCODE_F));
+    new ClockActions(pause, fast);
+  }
+}
 
 // The GPU side, made by start; the device outlives what it made
 struct Gfx {
@@ -118,11 +147,11 @@ fn @initpure init() {
   scene = Scene.empty();
   inputState = Input.empty();
   ctx = Context.empty();
-  walkActions = WalkActions.bind(&mut ctx);
-  walk = Walk.make(new Vec3(0., 0., START_Z), 0.);
-  walkBefore = walk;
-  shownFrom = walk;
-  shownTo = walk;
+  user = UserController.bind(&mut ctx);
+  clockKeys = ClockActions.bind(&mut ctx);
+  cast = Cast.empty();
+  sentBodies = List[Walk].empty();
+  snapshot = Snapshot.empty();
   shotsDir = String.empty();
   world = BakedWorld.make();
   tempPart = PartId.none();
@@ -174,21 +203,38 @@ fn isPhysical(id PartId) bool {
   mut g = takeGfx();
   mut physical = false;
   match &mut g {
-    case mut some &mut Some {
-      imm row = some.value.sys.rows.find(id);
-      physical = row != NO_ROW and some.value.sys.rows.rows[row].physical;
-    }
+    case mut some &mut Some { physical = some.value.sys.isPhysical(id); }
     else {}
   }
   gfx = g;
   physical;
 }
 
+// The material part 'id' is drawn in, as the render system has it (none
+// without a GPU)
+fn drawnMaterial(id PartId) MaterialId {
+  mut g = takeGfx();
+  mut m = MaterialId.none();
+  match &mut g {
+    case mut some &mut Some { m = some.value.sys.materialOf(id); }
+    else {}
+  }
+  gfx = g;
+  m;
+}
+
+// The possessed being's body: where the user is
+fn youBody() Walk { cast.beings[cast.possessed].body; }
+
 // ---- start ----
 
 pub fn start(host &mut Host) bool {
   automated = host.config.frames > 0u64 or watching();
   seedScene(&mut scene);
+  // The user's own being: a walker 8 m back from the origin, facing -z,
+  // possessed (its part is placed at the first apply point)
+  imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(0., 0., START_Z), 0.)));
+  cast.possess(youAt);
   print <- "Scene: "; print <- scene.partCount(); print <- " parts reserved, ";
   print <- scene.waiting(); print <- " requests waiting\n";
   if scripted { pushScript(1u64); }
@@ -291,22 +337,60 @@ pub fn event(host &mut Host, e &imm sdl.Event) {
 
 pub fn simulate(host &mut Host, step &imm Step, scratch &mut Arena) {
   updateActions(host.frame);
-  walkBefore = walk;
-  walkStep(&mut walk, &walkActions, &ctx, step.dt);
+  // input -> the user's controller -> the possessed being's intents
+  cast.step(user.intents(&ctx), step.dt);
+  scene.advanceClock(step.ns);
 }
 
 // ---- publish: the apply point ----
 
 pub fn publish(host &mut Host) {
   updateActions(host.frame);
-  sceneNow = f64.from(host.simNs()) / 1.0e9d;
+  if ctx.pressed(clockKeys.pause) {
+    scene.togglePause();
+    print <- "Scene time "; if scene.clock.paused { print <- "paused"; } else { print <- "running"; };
+    print <- " at "; print <- scene.now(); print <- " s\n";
+  }
+  if ctx.pressed(clockKeys.fast) {
+    scene.toggleFast();
+    print <- "Scene time x"; print <- scene.clock.rate(); print <- " at "; print <- scene.now(); print <- " s\n";
+  }
+  sceneNow = scene.now();
   if (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u { click(host); }
+  // The scene's events, into the world's mail: timers due, and the areas
+  // the possessed being is in
+  scene.ring();
+  imm you = youBody();
+  scene.sense(cast.beings[cast.possessed].part, you.position);
   // The world is handed the Door, never the scene
   if world.step(&mut scene.door) and world.done() { worldSentFrame = host.frame; }
   world.tick(&mut scene.door, sceneNow);
+  placeBeings();
   applyRequests();
-  shownFrom = walkBefore;
-  shownTo = walk;
+  scene.propagate();
+  mut last = Snapshot.empty();
+  last <=> snapshot;
+  snapshot = scene.publish(last, cast.beings[cast.possessed].eyesBefore(), cast.beings[cast.possessed].eyes());
+}
+
+// Each being's part placed where its body is, when it has moved
+fn placeBeings() {
+  mut i = 0usize;
+  while i < cast.beings.len() {
+    imm b = cast.beings[i];
+    if i >= sentBodies.len() {
+      sentBodies.push(b.body);
+      scene.send(Request.Place[b.part, b.placement()]);
+    } else {
+      imm was = *sentBodies[i];
+      if was.position.x != b.body.position.x or was.position.y != b.body.position.y
+        or was.position.z != b.body.position.z or was.yaw != b.body.yaw {
+        sentBodies.set(i, b.body);
+        scene.send(Request.Place[b.part, b.placement()]);
+      }
+    }
+    i = i + 1usize;
+  }
 }
 
 // The view the mouse's places are in: the window's own units, or a fixed
@@ -323,7 +407,7 @@ pub fn viewSize(host &mut Host) Vec2 {
 // was drawn from.
 fn click(host &mut Host) {
   imm size = viewSize(host);
-  imm eye = between(&shownFrom, &shownTo, 1.);
+  imm eye = snapshot.eyeTo;
   imm ray = rayThrough(eye, FOV, inputState.pointer.x, inputState.pointer.y, size.x, size.y);
   imm t0 = sdl.GetPerformanceCounter();
   imm hit = picks.pick(&scene, ray);
@@ -365,33 +449,64 @@ fn applyRequests() {
         scene.applySpawn(s.id, name);
       }
       case mut p &mut Place { scene.applyPlace(p.id, p.at); }
+      case mut pa &mut Parent { scene.applyParent(pa.id, pa.parent); }
       case mut d &mut Despawn {
-        match &mut g {
-          case mut some &mut Some {
-            some.value.sys.drop(&mut some.value.renderer, &mut some.value.device, d.id);
+        // The part and its whole subtree: the scene's rows first, then
+        // every other system's for each part that went
+        mut gone = List[PartId].empty();
+        if scene.applyDespawn(d.id, &mut gone) {
+          mut k = 0usize;
+          while k < gone.len() {
+            imm id = *gone[k];
+            match &mut g {
+              case mut some &mut Some { some.value.sys.drop(&mut some.value.device, id); }
+              else {}
+            }
+            picks.drop(id);
+            k = k + 1usize;
           }
-          else {}
         }
-        picks.drop(d.id);
-        scene.applyDespawn(d.id);
       }
-      case mut sh &mut Show {
-        if !scene.isLive(sh.id) {
-          scene.refused = scene.refused + 1u64;
-        } else {
-          // The picking system keeps its shape (not the ground's: an
-          // anchored part is drawn wherever the viewer is)
-          if sh.anchor == 0. { picks.shape(sh.id, &sh.mesh); }
+      case mut dm &mut DefineMesh {
+        if scene.applyDefine(dm.mesh.id, KIND_MESH) {
+          // The picking system keeps its shape; the render system uploads it
+          picks.shape(dm.mesh, &dm.shape);
           match &mut g {
             case mut some &mut Some {
-              some.value.sys.show(&mut some.value.renderer, &mut some.value.device, sh.id, &sh.mesh, &sh.surface,
-                &sh.paint, &sh.maps, sh.anchor);
+              some.value.sys.defineMesh(&mut some.value.renderer, &mut some.value.device, dm.mesh, &dm.shape);
             }
+            else { unrendered = unrendered + 1u64; }
+          }
+        }
+      }
+      case mut dl &mut DefineMaterial {
+        if scene.applyDefine(dl.material.id, KIND_MATERIAL) {
+          match &mut g {
+            case mut some &mut Some {
+              some.value.sys.defineMaterial(&mut some.value.renderer, &mut some.value.device, dl.material, &dl.surface,
+                &dl.paint, &dl.maps);
+            }
+            else { unrendered = unrendered + 1u64; }
+          }
+        }
+      }
+      case mut sh &mut Show {
+        if !scene.isLive(sh.id) or !scene.isMesh(sh.mesh) or !scene.isMaterial(sh.material) {
+          scene.refused = scene.refused + 1u64;
+        } else {
+          // The picking system keeps which mesh it is (not the ground's: an
+          // anchored part is drawn wherever the viewer is)
+          if sh.anchor == 0. { picks.show(sh.id, sh.mesh); }
+          match &mut g {
+            case mut some &mut Some { some.value.sys.show(sh.id, sh.mesh, sh.material, sh.anchor); }
             else { unrendered = unrendered + 1u64; }
           }
           scene.applied = scene.applied + 1u64;
         }
       }
+      case mut tm &mut Timer { scene.applyTimer(tm.token, tm.at, tm.every); }
+      case mut cn &mut Cancel { scene.applyCancel(cn.token); }
+      case mut ar &mut Area { scene.applyArea(ar.id, ar.volume); }
       case mut ef &mut Effect {
         if !scene.isLive(ef.id) {
           scene.refused = scene.refused + 1u64;
@@ -453,7 +568,7 @@ fn applyRequests() {
 
 pub fn draw(host &mut Host, alpha f32, scratch &mut Arena) {
   updateActions(host.frame);
-  mut pose = between(&shownFrom, &shownTo, alpha);
+  mut pose = snapshot.eye(alpha);
   // A scripted close-up looks from where the script says instead
   if scripted and hasView(host.frame) { pose = viewAt(host.frame); }
   mut g = takeGfx();
@@ -473,11 +588,11 @@ fn drawFrame(g &mut Gfx, pose Pose, frameNo u64) {
   g.camera.fov = if scripted and hasView(frameNo) { viewFov(frameNo); } else { FOV; };
   g.camera.background = sky.color;
   imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
-  g.sys.build(&scene, pose.origin);
+  g.sys.build(&snapshot, pose.origin);
   mut encoder = g.device.createCommandEncoder();
   g.renderer.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera, &light, &g.sys.list);
   if g.sys.hasEffects() {
-    g.sys.aimEffects(&mut g.device, &scene, sceneNow);
+    g.sys.aimEffects(&mut g.device, &snapshot);
     g.sys.particles.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera);
   }
 
@@ -516,10 +631,11 @@ pub fn present(host &mut Host) {
     print <- millisSinceStart(); print <- " ms after main began\n";
   }
   if scripted {
-    if !checkScript(host.frame, &walk) { scriptOk = false; }
+    imm you = youBody();
+    if !checkScript(host.frame, &you) { scriptOk = false; }
     driveScene(host.frame);
     pushScript(host.frame + 1u64);
-    pushClicks(host, host.frame + 1u64, &walk);
+    pushClicks(host, host.frame + 1u64, &you);
   }
   if watching() or soaking() { watchSizes(host); }
 }
@@ -538,7 +654,8 @@ fn watchSizes(host &mut Host) {
     else {}
   }
   gfx = g;
-  if watching() { watchTick(host, &walk, scene.waiting(), rows, emitters); }
+  imm you = youBody();
+  if watching() { watchTick(host, &you, scene.waiting(), rows, emitters); }
   if soaking() { soakTick(host, world.done(), scene.partCount(), scene.waiting(), rows, emitters); }
 }
 
@@ -574,8 +691,11 @@ fn showAndAcquire(g &mut Gfx) {
 pub fn quit(host &mut Host) i32 {
   print <- "Scene: "; print <- scene.partCount(); print <- " parts; requests applied "; print <- scene.applied;
   print <- ", refused "; print <- scene.refused; print <- "\n";
-  print <- "Walked to ("; print <- walk.position.x; print <- ", "; print <- walk.position.z;
-  print <- "), facing "; print <- walk.yaw; print <- " rad\n";
+  imm you = youBody();
+  print <- "Walked to ("; print <- you.position.x; print <- ", "; print <- you.position.z;
+  print <- "), facing "; print <- you.yaw; print <- " rad\n";
+  print <- "Scene time "; print <- scene.now(); print <- " s, the day clock at "; print <- scene.hour();
+  print <- " h; timers rung "; print <- scene.rung(); print <- ", armed "; print <- scene.timerCount(); print <- "\n";
   print <- "The baked-in world, object by object:\n";
   world.report();
   mut code = 0i32;
@@ -614,7 +734,12 @@ fn main(argc i32, argv **u8) i32 {
   mut a = 1i32;
   while a < argc {
     imm arg = *(argv + usize.from(a));
-    if libc.strcmp(arg, &"--script" as *u8) == 0i32 {
+    if libc.strcmp(arg, &"--checks" as *u8) == 0i32 {
+      // The scene core's headless checks (checks.cone), and nothing else
+      imm result = runChecks();
+      finalAll();
+      return result;
+    } elif libc.strcmp(arg, &"--script" as *u8) == 0i32 {
       scripted = true;
     } elif libc.strcmp(arg, &"--shots" as *u8) == 0i32 and a + 1i32 < argc {
       shotsDir = String.fromCStr(*(argv + usize.from(a + 1i32)));
