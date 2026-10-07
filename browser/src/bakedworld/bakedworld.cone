@@ -197,9 +197,9 @@ pub struct Hydrated {
 
 // ---- The world's objects ----
 
-pub const OBJECTS = 12u32;
-imm NAMES Array[&[]u8, 12] = ["rook", "amphora", "horn-flower", "boulder", "horn", "cottage", "balloon", "lathed rook",
-  "starship", "launch button", "ball", "path lanterns"];
+pub const OBJECTS = 13u32;
+imm NAMES Array[&[]u8, 13] = ["rook", "amphora", "horn-flower", "boulder", "horn", "cottage", "balloon", "lathed rook",
+  "starship", "launch button", "ball", "path lanterns", "mound"];
 
 // The objects the world moves, or the script looks at
 pub const ROOK = 0u32;
@@ -211,12 +211,13 @@ pub const LATHED_ROOK = 7u32;
 pub const BUTTON = 9u32;
 pub const BALL = 10u32;
 pub const LANTERNS = 11u32;
+pub const MOUND = 12u32;
 
 // Object 'k''s name
 pub fn objectName(k u32) &[]u8 { NAMES[usize.from(k)]; }
 
 // Where each stands: x, z, its yaw (radians) and its scale (metres a unit)
-imm PLACES Array[f32, 48] = [
+imm PLACES Array[f32, 52] = [
   -1.3, 0.6, 0.3, 0.8,          // the rook, near the walk's first stop
   -7.4, -17., 0., 1.,           // the amphora, where the chimney stood; now 7 m in front of the cottage's steps
   0.2, 1.8, -2.356, 1.,         // the horn-flower, where the flower was, leaning left towards the start
@@ -228,7 +229,8 @@ imm PLACES Array[f32, 48] = [
   -120., -170., 0., 10.,        // the starship, hovering (its y is SHIP_HOVER): 10 m a unit, 156 m long
   19.8, -26.3, 0.5, 1.,         // the balloon's launch button, where the walk's run ends, 9 m short of the basket
   3.2, -1.5, 0., 1.,            // the ball, bouncing beside the path
-  -10., -24., 0., 1.];          // the path lanterns' frame: the cottage's (they stand in its front path; not turned)
+  -10., -24., 0., 1.,           // the path lanterns' frame: the cottage's (they stand in its front path; not turned)
+  5.5, -5., 0., 2.];            // the mound, right of the path past the ball: 4 m square, 2 m a unit
 
 fn placeOf(k u32, y f32) Transform3 {
   imm i = usize.from(k) * 4usize;
@@ -289,8 +291,40 @@ pub fn hydrate(k u32) Hydrated {
     // A ball a metre across, checkered so its spin shows; the world bounces it
     h.add("ball", mesh.Mesh.sphere(BALL_RADIUS, 32), Look.checkered(srgb(240., 150., 30.), 0.25), Image.empty(),
       placeOf(k, BALL_RADIUS));
+  } elif k == MOUND {
+    // Drawn by the browser's heightfield shader: a flat grid of 65 x 65
+    // vertices lifted on the GPU by a field of heights
+    imm m = h.addMesh(mesh.Mesh.plane(MOUND_CELLS, 1.));
+    imm look = Look.shaded(SHADER_HEIGHTFIELD, [0.06, 0.20, 0.04, MOUND_PEAK, 0.80, 0.42, 0.10, 30000.]);
+    imm mat = h.addMaterial(look, Image.empty(), new Maps(Image.empty(), Image.empty(), moundField()), 0u32);
+    h.part("mound", m, mat, TOP, placeOf(k, 0.));
   }
   h;
+}
+
+// The mound: a grid of MOUND_CELLS cells a side; a hump MOUND_PEAK units
+// high (0.5 m at 2 m a unit) in the middle, rings rippling out from it
+const MOUND_CELLS = 64;
+const MOUND_PEAK f32 = 0.25;
+fn moundField() Field {
+  imm n = u32.from(MOUND_CELLS) + 1u32;
+  mut values = List[f32].withCapacity(usize.from(n * n));
+  mut z = 0u32;
+  while z < n {
+    mut x = 0u32;
+    while x < n {
+      imm px = f32.from(x) / f32.from(n - 1u32) * 2. - 1.;
+      imm pz = f32.from(z) / f32.from(n - 1u32) * 2. - 1.;
+      imm r = (px * px + pz * pz).sqrt();
+      imm hump = MOUND_PEAK * libc.expf(0. - r * r * 6.);
+      imm fade = if r < 1. { 1. - r; } else { 0.; };
+      imm rings = 0.02 * cos(r * 18.) * fade;
+      values.push(hump + rings);
+      x = x + 1u32;
+    }
+    z = z + 1u32;
+  }
+  new Field(n, n, values);
 }
 
 // The rooks' ivory
@@ -328,17 +362,19 @@ fn hydrateShip(h &mut Hydrated, k u32) {
   // Blue-black chitin, glossy; the membranes darker and dull
   h.add("starship frame", frame, Look.shiny(new Color(0.07, 0.08, 0.12, 1.), 0.9, 64.), Image.empty(), at);
   h.add("starship membranes", skin, Look.plain(new Color(0.035, 0.04, 0.065, 1.)), Image.empty(), at);
-  // The lights, as bright as an 8-bit frame shows: the wings' cool
-  // blue-white, the ports dim warm, the eyes and the mouth hot
+  // The lights, glowing (radiance in nits, against a sunlit scene's EV 15,
+  // where 39 000 nits is white): the wings' cool blue-white, the ports dim
+  // warm, the eyes and the mouth hot
   imm names Array[&[]u8, 4] = ["starship wing lights", "starship ports", "starship eyes", "starship mouth"];
   imm colors Array[Color, 4] = [new Color(0.7, 0.8, 1., 1.), new Color(0.9, 0.45, 0.15, 1.),
     new Color(1., 0.6, 0.15, 1.), new Color(1., 0.75, 0.3, 1.)];
+  imm nits Array[f32, 4] = [150000., 60000., 250000., 400000.];
   imm lights = ship.lights.viewMut();
   mut i = 0usize;
   while i < 4usize {
     mut m = mesh.Mesh.empty();
     m <=> lights[i];
-    h.add(names[i], m, Look.shiny(colors[i], 1., 4.), Image.empty(), at);
+    h.add(names[i], m, Look.shiny(colors[i], 1., 4.).glowing(colors[i], nits[i]), Image.empty(), at);
     i = i + 1usize;
   }
 }
@@ -452,10 +488,13 @@ pub struct BakedWorld {
   pub departures u64;         // and goings out of it
   pub dusks u64;              // dusks and dawns read from the mail
   pub dawns u64;
+  pub hardLandings u64;       // hard landings read from the mail
+  pub lastLandingSpeed f32;
 
   pub fn make() BakedWorld {
     new BakedWorld(0u32, List[PartId].empty(), List[Transform3].empty(), List[usize].empty(), List[Hydration].empty(),
-      Flight.grounded(), -1d, false, 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64);
+      Flight.grounded(), -1d, false, 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64,
+      0u64, 0.);
   }
 
   // Whether every object has been sent
@@ -523,6 +562,11 @@ pub struct BakedWorld {
         case mut dn &mut Dawn {
           dawns = dawns + 1u64;
           print <- "The world: dawn, at "; print <- dn.at; print <- " s\n";
+        }
+        case mut hl &mut HardLanding {
+          hardLandings = hardLandings + 1u64;
+          lastLandingSpeed = hl.speed;
+          print <- "The world: a hard landing at "; print <- hl.speed; print <- " m/s, hurting "; print <- hl.damage; print <- "\n";
         }
         else {}
       }

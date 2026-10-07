@@ -55,6 +55,8 @@ import sdl;
 import collections use *;
 import pool use *;
 import geomath use *;
+import bonepose;
+import walkgait;
 import mesh use Mesh;
 import gpu use *;
 import render use *;
@@ -99,6 +101,7 @@ mut lastPick PickHit;         // the last click's answer, for the script
 mut clicks u64 = 0u64;
 mut fired u64 = 0u64;         // Fire requests applied: an effect's bursts
 mut sceneNow f64 = 0d;        // the scene's time, seconds, at this frame's publish
+mut hardLandingsMailed u64 = 0u64;  // hard landings posted to the world's mail
 
 // The view a headless run picks in (no window to measure)
 const HEADLESS_W f32 = 1280.;
@@ -132,6 +135,7 @@ struct Gfx {
   pub readback Buffer;
   pub shotName String;        // the file the frame read back goes to; empty: none
   pub target SurfaceTexture;
+  pub post Post;              // the HDR frame drawn into, bloomed and tone-mapped into the target
   pub sys RenderSystem;
   pub renderer Renderer;
   pub swapchain SwapChain;
@@ -228,15 +232,39 @@ fn drawnMaterial(id PartId) MaterialId {
 // The possessed being's body: where the user is
 fn youBody() Walk { cast.beings[cast.possessed].body; }
 
+// A mannequin of 'height' metres made, shown and added to the cast standing
+// at 'at' facing 'yaw': the index of its being
+fn addMannequin(name &[]u8, at Vec3, yaw f32, height f32, seed u32, color Color) usize {
+  imm root = scene.newPart(name);
+  imm parts = spawnMannequin(&mut scene, height, color, root);
+  cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, parts)));
+}
+
+// How many parts a mannequin is: its own and a part a bone
+const FIGURE_PARTS = 20usize;
+const FIGURE_MESHES = 19u64;
+
 // ---- start ----
 
 pub fn start(host &mut Host) bool {
   automated = host.config.frames > 0u64 or watching();
   seedScene(&mut scene);
-  // The user's own being: a walker 8 m back from the origin, facing -z,
-  // possessed (its part is placed at the first apply point)
-  imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(0., 0., START_Z), 0.)));
-  cast.possess(youAt);
+  if scripted {
+    // The scripted run keeps its exact walk checks: it starts as the plain
+    // walker, 8 m back from the origin, facing -z, and takes the mannequin
+    // over by pressing Tab at its end. The mannequins stand off to the right.
+    imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(0., 0., START_Z), 0.)));
+    cast.possess(youAt);
+    addMannequin("mannequin", new Vec3(5., 0., START_Z), 0., 1.75, 3u32, woodColor());
+    addMannequin("second mannequin", new Vec3(3.5, 0., START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
+  } else {
+    // The user's own being: a mannequin 8 m back from the origin, facing -z,
+    // possessed, seen from behind and above; another stands a few metres off
+    imm youAt = addMannequin("mannequin", new Vec3(0., 0., START_Z), 0., 1.75, 3u32, woodColor());
+    addMannequin("second mannequin", new Vec3(3., 0., START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
+    cast.possess(youAt);
+  }
+  cast.look(1. / 60.);
   print <- "Scene: "; print <- scene.partCount(); print <- " parts reserved, ";
   print <- scene.waiting(); print <- " requests waiting\n";
   if scripted { pushScript(1u64); }
@@ -259,7 +287,11 @@ pub fn start(host &mut Host) bool {
   mut device = adapter.requestDevice();
   imm size = host.window().size();
   mut swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
-  mut renderer = Renderer.create(&mut device, swapchain.format, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  // The scene is drawn into a half-float frame, which the Post blooms and
+  // tone-maps into the swapchain's texture (lookPost says how)
+  mut renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  mut post = Post.create(&mut device, swapchain.format, u32.from(size.w), u32.from(size.h));
+  lookPost(&mut post);
   // The depth kept after the scene's pass, for the particles' pass to test against
   renderer.keepDepth = true;
   // The environment the physical parts are lit by besides the sun; the sky
@@ -267,8 +299,8 @@ pub fn start(host &mut Host) bool {
   imm environment = environmentSky();
   renderer.setSky(&mut device, &environment);
   renderer.drawSky = false;
-  mut sys = RenderSystem.make(&mut device, swapchain.format);
-  if !renderer.isValid() or !sys.particles.isValid() {
+  mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT);
+  if !renderer.isValid() or !sys.particles.isValid() or !post.isValid() {
     print <- "The renderer could not be made\n";
     return false;
   }
@@ -277,7 +309,7 @@ pub fn start(host &mut Host) bool {
   camera.near = 0.1;
   camera.far = 1500.;
   imm target = swapchain.getCurrentTexture(&mut device);
-  gfx = Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, sys, renderer, swapchain, device,
+  gfx = Some[Gfx][new Gfx(Buffer.none(), String.empty(), target, post, sys, renderer, swapchain, device,
     adapter, surface, instance, camera)];
   true;
 }
@@ -358,6 +390,24 @@ pub fn publish(host &mut Host) {
     print <- "Scene time x"; print <- scene.clock.rate(); print <- " at "; print <- scene.now(); print <- " s\n";
   }
   sceneNow = scene.now();
+  // The view and possession keys: V first or third person, Tab the next mannequin
+  if ctx.pressed(user.actions.view) {
+    cast.rig.toggle();
+    print <- "View: "; if cast.rig.mode == VIEW_FIRST { print <- "first person"; } else { print <- "third person"; }; print <- "\n";
+  }
+  if ctx.pressed(user.actions.swap) {
+    cast.swap();
+    print <- "Possessing being "; print <- cast.possessed; print <- "\n";
+  }
+  // Hard landings, mailed to the world
+  mut landings = cast.takeLandings();
+  mut li = 0usize;
+  while li < landings.len() {
+    imm l = *landings[li];
+    scene.post(Message.HardLanding[l.part, l.speed, l.damage]);
+    hardLandingsMailed = hardLandingsMailed + 1u64;
+    li = li + 1usize;
+  }
   if (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u { click(host); }
   // The scene's events, into the world's mail: timers due, and the areas
   // the possessed being is in
@@ -368,18 +418,19 @@ pub fn publish(host &mut Host) {
   if world.step(&mut scene.door) and world.done() { worldSentFrame = host.frame; }
   world.tick(&mut scene.door, sceneNow);
   placeBeings();
+  placeFigures();
   applyRequests();
   scene.propagate();
   mut last = Snapshot.empty();
   last <=> snapshot;
-  snapshot = scene.publish(last, cast.beings[cast.possessed].eyesBefore(), cast.beings[cast.possessed].eyes());
+  snapshot = scene.publish(last, cast.eyesBefore(), cast.eyes());
 }
 
 // Each being's part placed where its body is, when it has moved
 fn placeBeings() {
   mut i = 0usize;
   while i < cast.beings.len() {
-    imm b = cast.beings[i];
+    imm b = &mut cast.beings[i];
     if i >= sentBodies.len() {
       sentBodies.push(b.body);
       scene.send(Request.Place[b.part, b.placement()]);
@@ -389,6 +440,23 @@ fn placeBeings() {
         or was.position.z != b.body.position.z or was.yaw != b.body.yaw {
         sentBodies.set(i, b.body);
         scene.send(Request.Place[b.part, b.placement()]);
+      }
+    }
+    i = i + 1usize;
+  }
+}
+
+// Each mannequin's bones placed, each in its parent's frame: the pose the
+// gait wrote this step, and the scene's tree composes the rest
+fn placeFigures() {
+  mut i = 0usize;
+  while i < cast.beings.len() {
+    imm b = &mut cast.beings[i];
+    if b.figure.active {
+      mut k = 0usize;
+      while k < b.figure.parts.len() {
+        scene.send(Request.Place[*b.figure.parts[k], *b.figure.pose.locals[k]]);
+        k = k + 1usize;
       }
     }
     i = i + 1usize;
@@ -590,13 +658,18 @@ fn drawFrame(g &mut Gfx, pose Pose, frameNo u64) {
   g.camera.fov = if scripted and hasView(frameNo) { viewFov(frameNo); } else { FOV; };
   g.camera.background = sky.color;
   imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
+  g.renderer.exposure = exposureFor(&sky);
   g.sys.build(&snapshot, pose.origin);
   mut encoder = g.device.createCommandEncoder();
-  g.renderer.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera, &light, &g.sys.list);
+  // Into the HDR frame (the size of the target), then bloomed and
+  // tone-mapped into the target
+  g.post.resize(&mut g.device, g.target.texture.width, g.target.texture.height);
+  g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
   if g.sys.hasEffects() {
     g.sys.aimEffects(&mut g.device, &snapshot);
-    g.sys.particles.render(&mut g.device, &mut encoder, &g.target.texture, &g.target.depth, &g.camera);
+    g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
   }
+  g.post.apply(&mut encoder, &g.target.texture);
 
   // A scripted view to save: copied now, written once presented
   imm shot = shotAt(frameNo);

@@ -1,0 +1,60 @@
+// The look: how the scene's light becomes the picture.
+//
+// LIGHT IN PHYSICAL UNITS. The scene keeps render's one lighting convention
+// (render's renderframe.slang): the sun's colour is its irradiance in lux
+// (about 100 000 at noon), the ambient light and the sky seen are radiance
+// in nits (cd/m2), and a part's glow (Look.glowing) is radiance in nits.
+// Colours of surfaces are albedos, 0 to 1, as before.
+//
+// EXPOSURE. The renderer multiplies everything it draws by the exposure as
+// it draws it (pre-exposure), so the half-float frame holds numbers near 1.
+// The exposure is a camera's at an EV100 (render's exposureFromEv100,
+// Frostbite's), scripted from the sun's height, not adapted to the picture:
+// EV 15 with the sun high (photography's sunny-16 rule), falling as the sun
+// sets, to EV 0 at night. The curve between is a tuning, not a measurement
+// (ev100ForSun).
+//
+// THE POST. The renderer draws into a half-float frame (render's Post),
+// which is bloomed (Jimenez's chain, 4% of a wide blur mixed in, so a glow
+// spreads in proportion to its brightness) and tone-mapped by AgX (Sobotka's,
+// Wrensch's fit) into the window's texture: bright light rolls off towards
+// white instead of clipping, and very bright colours lose saturation.
+
+// The Post's settings: AgX, the default bloom, no exposure of its own (the
+// renderer's is applied as it draws)
+pub fn lookPost(post &mut Post) {
+  post.toneMapper = TONE_MAP_AGX;
+  post.bloom = 0.04;
+  post.exposure = 1.;
+}
+
+// The EV100 for a sun at 'sinElevation' (the sine of its height above the
+// horizon): a tuned curve through EV 15 from 30 degrees up, 14 at 10
+// degrees, 12 at the horizon, 8 at -6 degrees (civil twilight's end), 4 at
+// -12 and 0 from -18 down (night), straight between
+pub fn ev100ForSun(sinElevation f32) f32 {
+  imm keys Array[f32, 6] = [-0.309, -0.208, -0.105, 0., 0.174, 0.5];
+  imm evs Array[f32, 6] = [0., 4., 8., 12., 14., 15.];
+  if sinElevation <= keys[0] { return evs[0]; }
+  mut i = 1usize;
+  while i < 6usize {
+    if sinElevation <= keys[i] {
+      imm t = (sinElevation - keys[i - 1usize]) / (keys[i] - keys[i - 1usize]);
+      return evs[i - 1usize] + (evs[i] - evs[i - 1usize]) * t;
+    }
+    i = i + 1usize;
+  }
+  evs[5];
+}
+
+// How many stops brighter than the meter the picture is exposed: AgX rolls
+// a sunlit white off to about 0.55 of the display's white, so half a stop
+// up keeps the rooks' cream from going grey, at the cost of mid-tones a
+// little lighter than they were drawn clamped
+pub const EXPOSURE_COMPENSATION f32 = 0.5;
+
+// The renderer's exposure under 'sky': from its sun's height
+pub fn exposureFor(sky &SkyLook) f32 {
+  imm up = sky.sunDirection.normalize().y;
+  exposureFromEv100(ev100ForSun(up) - EXPOSURE_COMPENSATION);
+}
