@@ -111,13 +111,15 @@ pub struct RenderSystem {
   pub drawn usize;            // parts in the last draw list
   pub painted usize;          // materials defined with a painted image
   pub now f64;                // the scene's time the effects were last drawn at
+  pipelines List[PipelineHandle];   // the browser's shaders' pipelines, by SHADER_ number, made when first asked for
+  pub shaded usize;           // materials defined drawn by a shader of the browser's own
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
     new RenderSystem(Table[MeshRow].empty(), Table[MaterialRow].empty(), Table[Renderable].empty(), List[Batch].empty(),
       Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
-      List[EmitterHandle].empty(), 0usize, 0usize, 0d);
+      List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize);
   }
 
   // Apply a DefineMesh: upload it
@@ -129,6 +131,10 @@ pub struct RenderSystem {
   // Apply a DefineMaterial: make its material, Blinn-Phong or physical
   pub fn defineMaterial(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look,
       paint &Image, maps &Maps) {
+    if surface.shader != SHADER_STANDARD {
+      self.defineShaded(renderer, device, id, surface, maps);
+      return;
+    }
     if surface.physical {
       self.definePhysical(renderer, device, id, surface, paint, maps);
       return;
@@ -152,6 +158,31 @@ pub struct RenderSystem {
     imm mh = renderer.addMaterial(device, &material);
     materials.put(id.id, new MaterialRow(mh, material, false, PbrMaterial.standard(surface.color, 0., 1.),
       MaterialHandle.none()));
+  }
+
+  // A shaded look's material: drawn by the browser's shader it names
+  // (shaders.cone), whose pipeline is made the first time a material asks
+  // for it, given the look's parameters and its Field as an r32float
+  // texture. A shader not known falls back to a plain white material.
+  fn defineShaded(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look, maps &Maps) {
+    imm s = usize.from(surface.shader);
+    while pipelines.len() <= s { pipelines.push(PipelineHandle.none()); }
+    if pipelines[s].isNone() { pipelines.set(s, makeShaderPipeline(renderer, device, surface.shader)); }
+    imm pipeline = *pipelines[s];
+    mut mh = MaterialHandle.none();
+    if renderer.hasPipeline(pipeline) {
+      mut textures = List[TextureHandle].empty();
+      if !maps.field.isEmpty() {
+        textures.push(renderer.addFieldTexture(device, maps.field.width, maps.field.height, maps.field.values.view()));
+      }
+      mh = renderer.addCustomMaterial(device, pipeline, &surface.params, textures.view());
+    } else {
+      imm plain = Material.plain(new Color(1., 1., 1., 1.));
+      mh = renderer.addMaterial(device, &plain);
+    }
+    materials.put(id.id, new MaterialRow(mh, Material.plain(surface.color), false,
+      PbrMaterial.standard(surface.color, 0., 1.), MaterialHandle.none()));
+    shaded = shaded + 1usize;
   }
 
   // A physical look's material: render's physically based one, its colour
