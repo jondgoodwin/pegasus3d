@@ -1,0 +1,102 @@
+// The sky's checks, run by --checks with no window or GPU: the sky's inputs
+// and outputs follow the scene's day clock. The sun is where its formulas put
+// it at the clock's noon, dusk and dawn, below the horizon all night, the
+// moon above it all night, and the light the scene is given (sun, moon,
+// ambient) and the exposure follow the hour. The package's own tests
+// (analyticdaylight, boidflock) check the formulas; these check the wiring.
+
+fn deg(r f32) f32 { r * (180. / pi); }
+
+// The elevation, degrees, of the sun at the day clock's hour 'h' under the rig
+fn sunDegAt(h f32) f32 {
+  rig.setHour(h);
+  deg(asin(rig.sky.sunDir.y));
+}
+
+// The EV100 the scripted exposure is at the day clock's hour 'h'
+fn evAt(h f32) f32 {
+  rig.setHour(h);
+  ev100ForSun(rig.sunSine());
+}
+
+pub fn checkSky() bool {
+  mut ok = true;
+  print <- "The sky follows the clock:\n";
+  // The sun at the day clock's noon, dusk and dawn
+  imm noon = sunDegAt(12.);
+  ok = expect("noon: the sun 64.8 degrees up (45 N, 20 May)", nearly(noon, 64.83, 0.05)) and ok;
+  rig.setHour(12.);
+  ok = expect("noon: due south (x 0, z positive)", nearly(rig.sky.sunDir.x, 0., 0.0001) and rig.sky.sunDir.z > 0.) and ok;
+  imm dusk = sunDegAt(f32.from(DUSK_HOUR));
+  imm dawn = sunDegAt(f32.from(DAWN_HOUR));
+  print <- "  the sun at the clock's dusk (19:30) is "; print <- dusk; print <- " degrees, at dawn (4:30) "; print <- dawn; print <- "\n";
+  ok = expect("dusk: the sun's centre at the horizon (-0.84 degrees)", nearly(dusk, -0.84, 0.05)) and ok;
+  ok = expect("dawn: the same", nearly(dawn, -0.84, 0.05)) and ok;
+  rig.setHour(7.);
+  ok = expect("7:00 (the start): the sun in the east, up", rig.sky.sunDir.x > 0.5 and rig.sky.sunDir.y > 0.2) and ok;
+  // Night: the sun below the horizon, the moon above it, the light the moon's
+  mut nightOk = true;
+  mut moonOk = true;
+  mut h = 20.;
+  while h < 28.5 {
+    rig.setHour(h);
+    if rig.sky.sunDir.y >= 0. { nightOk = false; }
+    if rig.sky.moonDir.y <= 0. { moonOk = false; }
+    h = h + 0.25;
+  }
+  ok = expect("20:00 to 4:30: the sun below the horizon at every quarter hour", nightOk) and ok;
+  ok = expect("and the moon above it", moonOk) and ok;
+  rig.setHour(0.);
+  imm night = rig.lighting;
+  ok = expect("midnight: the light is the moon's (no sunlight, 0.05 to 0.3 lux), up in the sky",
+    lumaOf(night.sunColor) == 0. and lumaOf(night.moonColor) > 0.05 and lumaOf(night.moonColor) < 0.3 and night.lightDir.y > 0.3) and ok;
+  ok = expect("midnight: the ambient is not black", lumaOf(night.ambient) > 0.015) and ok;
+  // Noon's light
+  rig.setHour(12.);
+  imm day = rig.lighting;
+  print <- "  noon: sun "; print <- lumaOf(day.sunColor); print <- " lux, ambient "; print <- lumaOf(day.ambient); print <- " nits\n";
+  ok = expect("noon: the sun about 100 000 lux, no moonlight", nearly(lumaOf(day.sunColor), 100000., 15000.) and lumaOf(day.moonColor) == 0.) and ok;
+  ok = expect("noon: the ambient a few thousand nits, the light the sun, high", lumaOf(day.ambient) > 3000. and lumaOf(day.ambient) < 14000.
+    and day.lightDir.y > 0.8) and ok;
+  // The exposure: EV 15 at noon, falling to -1 at night, never rising through the evening
+  imm evNoon = evAt(12.);
+  ok = expect("noon: the exposure is EV 15", nearly(evNoon, 15., 0.0001)) and ok;
+  rig.setHour(12.);
+  imm expo = exposureForElevation(rig.sunSine());
+  ok = expect("noon: the renderer's exposure is EV 14.5's (half a stop of compensation)",
+    nearly(expo / exposureFromEv100(14.5), 1., 0.0001)) and ok;
+  ok = expect("midnight: EV -1", nearly(evAt(0.), -1., 0.0001)) and ok;
+  mut falling = true;
+  mut prev = evAt(15.);
+  mut e = 15.25;
+  while e < 21. {
+    imm ev = evAt(e);
+    if ev > prev + 0.0001 { falling = false; }
+    prev = ev;
+    e = e + 0.25;
+  }
+  ok = expect("15:00 to 21:00: the exposure's EV only falls", falling) and ok;
+  // The dusk level T5's lanterns switch on at, as the day clock reads it
+  mut hh = 17.;
+  print <- "  the ambient light by the evening clock (nits), the exposure's EV:\n";
+  while hh < 21.1 {
+    rig.setHour(hh);
+    print <- "    "; print <- hh; print <- " h: sun "; print <- deg(asin(rig.sky.sunDir.y)); print <- " deg, ambient ";
+    print <- lumaOf(rig.lighting.ambient); print <- ", EV "; print <- ev100ForSun(rig.sunSine()); print <- "\n";
+    hh = hh + 0.5;
+  }
+  // The birds: forty, over the cottage, after a short flight still over it
+  ok = expect("forty birds in the flock", rig.flock.birds.len() == BIRD_COUNT) and ok;
+  rig.stepBirds(5.);
+  mut closeBy = true;
+  mut i = 0usize;
+  while i < rig.flock.birds.len() {
+    imm b = *rig.flock.birds[i];
+    imm dx = b.pos.x - BIRD_HOME_X;
+    imm dz = b.pos.z - BIRD_HOME_Z;
+    if (dx * dx + dz * dz).sqrt() > 150. or b.pos.y < groundHeight(b.pos.x, b.pos.z) + 3. { closeBy = false; }
+    i = i + 1usize;
+  }
+  ok = expect("after 5 s every bird is within 150 m of the cottage and 3 m above the ground", closeBy) and ok;
+  ok;
+}

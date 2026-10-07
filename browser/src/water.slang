@@ -236,9 +236,10 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     F *= 1.0 - 0.7 * shore;
     float3 R = reflect(-V, n);
     R.y = abs(R.y);
-    // The sky's colour (the material's, from the sky the browser draws: a
-    // clear colour today, so the same in every direction)
-    float3 skyColor = params.extent.rgb;
+    // The sky's colour: the frame's ambient light is the sky's mean radiance
+    // at this hour (the day's sky, dusk, the night's), the sea mirroring
+    // about twice that overhead
+    float3 skyColor = skyLight * 2.0;
     float glint = pow(max(dot(R, L), 0.0), 1500.0) * 400.0;
     float3 reflected = skyColor + frame.lightColor.rgb * (glint / RENDER_PI);
     float3 color = water * (1.0 - F) + reflected * F;

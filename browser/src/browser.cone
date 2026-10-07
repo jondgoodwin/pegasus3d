@@ -65,6 +65,8 @@ import frame use World, Config, Host, Step;
 import input use *;
 import controls use Pose;
 import vfx use ParticleRenderer, EmitterHandle, Emitter, Event;
+import analyticdaylight use DayConfig, DaySky, DayLighting, lumaOf;
+import boidflock use Flock, FlockParams;
 
 // The submodules: the scene's parts, ids, tables and requests (parts/), whose
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
@@ -88,6 +90,8 @@ mut user UserController;      // the user's: the actions into the possessed bein
 mut clockKeys ClockActions;   // the pause and x10 keys
 mut sentBodies List[Walk];    // each being's body as its part was last placed
 mut snapshot Snapshot;        // the scene's last published, drawn from
+mut rig SkyRig;               // the day's sky and light, and the birds (skyrig.cone)
+mut skyOff bool = false;      // --no-sky: the static sky and light, no birds (to time what the day costs)
 mut ctxFrame u64 = 0u64;      // the frame whose actions are in 'ctx'
 mut inputFrame u64 = 0u64;    // the frame whose events are in 'input'
 mut automated bool = false;   // a run of a fixed number of frames: real input ignored
@@ -166,6 +170,7 @@ fn @initpure init() {
   cast = Cast.empty();
   sentBodies = List[Walk].empty();
   snapshot = Snapshot.empty();
+  rig = SkyRig.make();
   shotsDir = String.empty();
   world = BakedWorld.make();
   tempPart = PartId.none();
@@ -323,6 +328,7 @@ pub fn start(host &mut Host) bool {
     print <- "The renderer could not be made\n";
     return false;
   }
+  if !skyOff { rig.makeGpu(&mut renderer, &mut device); }
   mut camera = Camera.make();
   camera.fov = FOV;
   camera.near = 0.1;
@@ -392,6 +398,8 @@ pub fn simulate(host &mut Host, step &imm Step, scratch &mut Arena) {
   updateActions(host.frame);
   // input -> the user's controller -> the possessed being's intents
   cast.step(user.intents(&ctx), step.dt);
+  // The birds fly on scene time (paused and x10 with the day)
+  rig.stepBirds(step.dt * f32.from(scene.clock.rate()));
   scene.advanceClock(step.ns);
 }
 
@@ -662,15 +670,23 @@ pub fn draw(host &mut Host, alpha f32, scratch &mut Arena) {
   if scripted and hasView(host.frame) { pose = viewAt(host.frame); }
   mut g = takeGfx();
   match &mut g {
-    case mut some &mut Some { drawFrame(&mut some.value, pose, host.frame); }
+    case mut some &mut Some { drawFrame(&mut some.value, pose, host.frame, alpha); }
     else {}
   }
   gfx = g;
 }
 
-fn drawFrame(g &mut Gfx, pose Pose, frameNo u64) {
+fn drawFrame(g &mut Gfx, pose Pose, frameNo u64, alpha f32) {
   if !g.target.ok() { return; }
-  imm sky = g.sys.currentSky();
+  mut sky = g.sys.currentSky();
+  // Once the world has sent a sky, the day's: the sun, moon and ambient from
+  // the day clock (skyrig.cone), and the exposure from the sun's height
+  imm dayLit = g.sys.skies.len() > 0usize and rig.made;
+  if dayLit {
+    rig.setHour(f32.from(snapshot.hour));
+    sky = rig.look();
+    g.renderer.environmentStrength = rig.environmentStrength();
+  }
   g.camera.origin = pose.origin;
   g.camera.orientation = pose.orientation;
   // A scripted close-up may look through a longer lens
@@ -679,8 +695,9 @@ fn drawFrame(g &mut Gfx, pose Pose, frameNo u64) {
   // The shaders' clock: the scene's time (the sea's waves, the swash), stopped when it is
   g.renderer.time = f32.from(snapshot.now);
   imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
-  g.renderer.exposure = exposureFor(&sky);
+  g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()); } else { exposureFor(&sky); };
   g.sys.build(&snapshot, pose.origin);
+  if dayLit { rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha); }
   mut encoder = g.device.createCommandEncoder();
   // Into the HDR frame (the size of the target), then bloomed and
   // tone-mapped into the target
@@ -843,6 +860,8 @@ fn main(argc i32, argv **u8) i32 {
       return if ok { 0i32; } else { 1i32; };
     } elif libc.strcmp(arg, &"--script" as *u8) == 0i32 {
       scripted = true;
+    } elif libc.strcmp(arg, &"--no-sky" as *u8) == 0i32 {
+      skyOff = true;
     } elif libc.strcmp(arg, &"--shots" as *u8) == 0i32 and a + 1i32 < argc {
       shotsDir = String.fromCStr(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
