@@ -152,7 +152,9 @@ along the way when the first frame was presented and when every object was first
 | `src/parts/placement.cone` | the placement tree: parents before children, world matrices in one pass over what changed |
 | `src/parts/events.cone` | the scene's clock and the day, timers on the timewheel, areas |
 | `src/parts/snapshot.cone` | what the scene publishes each frame for drawing |
-| `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list; a physical material is render's physically based one |
+| `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list (render draws each batch as one instanced draw); a physical material is render's physically based one; a shaded one, a custom pipeline |
+| `src/look.cone` | the look: light in physical units (the sun in lux, the sky and glows in nits), the exposure from the sun's height (EV 15 at noon), AgX tone mapping and bloom through render's Post |
+| `src/shaders.cone` | the browser's own shaders, which a shaded Look names: the heightfield (`heightfield.slang`); after editing a `.slang`, run Cone's `tools/shaders/shaders.py src` to compile and embed it |
 | `src/shell.cone` | what the browser puts in every scene: the ground and the sky, sent as requests |
 | `src/being.cone` | beings and possession: intents, the user's controller, the view rig (first and third person), the Cast |
 | `src/mannequin.cone` | the mannequin: its figure (skeleton, pose, gait, kinematic capsule), its meshes, one a bone, and spawning it |
@@ -272,4 +274,5 @@ frames keep coming while the world arrives.
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |
 | ball | new: a sphere, checkered so its spin shows | 1 m across | 1,984 | 0.03 |
+| mound | new: a 65 x 65 grid lifted on the GPU by a heightfield (the heightfield shader, a custom pipeline), green rising to a faintly glowing sandy hump | 4 m square | 8,192 | 0.14 |
 | starship (frame, membranes, wing lights, ports, eyes, mouth) | `packages/starship`, meshed on the GPU at 0.03 a cell | 156 m, 10 m a unit | 458,324 | 700 (0.4 s of it making the kernels) |
