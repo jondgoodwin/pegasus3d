@@ -1,0 +1,276 @@
+// The mannequin: an artist's wooden figure, one rigid piece to a bone.
+//
+// This is the first half of T2. Each of the 19 bones of the bonepose
+// humanoid carries its own mesh (an ellipsoid for the limb, a ball at its
+// joint), shown as a part parented to the bone above it, so the scene's
+// placement tree does the forward kinematics: the walkgait Walker writes a
+// pose of local transforms and each bone's part is Placed in its parent's
+// frame. No skinning. The second half, a smooth lofted body skinned on the
+// GPU, replaces these meshes and keeps the skeleton, the gait and the beings.
+//
+// A FIGURE is what a mannequin being is made of besides its place in the
+// world (Being.body, a Walk: the feet's ground point and the yaw):
+//   - the skeleton, its pose and the model-space transforms of the pose;
+//   - the Walker (gait state: phase, feet, pelvis, idle layer, crouch);
+//   - the kinematic capsule: vertical speed, gravity, grounded or falling,
+//     the landing and what it cost;
+//   - the parts that show it, one a bone.
+//
+// THE CAPSULE is kinematic, not a rigid body: the body's feet are on the
+// ground's height under it (groundHeight, ground.cone: the highest of its
+// footprint, flat today, the terrain's when T1 lands) when it stands; it
+// follows the ground up and down within a step of 0.4 m, stays stuck to it
+// going down within 0.35 m, and otherwise falls under gravity (9.81 m/s^2,
+// at most 55 m/s) until the ground is reached, which is a landing at the
+// impact speed. A landing of 7 m/s or more (a drop of 2.5 m: v = sqrt(2 g h))
+// is HARD: the pelvis crouches (the Walker's impact) and the cast reports it
+// to the scene, which mails it. Its cost is a number in the being's own
+// state, health, by (speed - 10) / (24 - 10) clamped to 0 to 1 of it:
+// harmless to 10 m/s (a 5 m drop), fatal at 24 m/s (a 30 m drop).
+
+// The capsule's radius is 0.15 H; its height is H
+pub const CAPSULE_RADIUS_OVER_H = 0.15;
+
+pub const GRAVITY = 9.81;
+pub const TERMINAL_SPEED = 55.;
+pub const HARD_LANDING_SPEED = 7.;
+pub const STEP_UP = 0.4;
+pub const SNAP_DOWN = 0.35;
+pub const WALK_SPEED = 1.8;           // m/s: a purposeful walk, under the walk-run change at 2.1
+pub const RUN_SPEED = 4.5;
+pub const GROUND_ACCEL = 12.;         // m/s^2
+pub const JUMP_SPEED = 4.2;           // m/s up: a jump to 0.9 m
+pub const TURN_RATE = 1.0471976;      // rad/s: the same quarter turn in 1.5 s as the walker
+
+pub struct Figure {
+  pub active bool;                    // false: this being is a plain walker, with no figure
+  pub height f32;
+  pub skeleton bonepose.Skeleton;
+  pub pose bonepose.Pose;
+  pub models List[Transform3];
+  pub walker walkgait.Walker;
+  pub parts List[PartId];             // the part of each bone, by bone
+  pub speed f32;                      // along its heading, m/s
+  pub vy f32;                         // vertical speed, m/s
+  pub airVx f32;                      // horizontal velocity while falling
+  pub airVz f32;
+  pub grounded bool;
+  pub health f32;                     // 1 whole
+  pub landed bool;                    // the last step ended in a landing
+  pub landSpeed f32;                  // at this speed
+  pub hardLandings u32;
+
+  pub fn none() Figure {
+    new Figure(false, 0., bonepose.Skeleton.empty(), bonepose.Pose.empty(), List[Transform3].empty(), walkgait.Walker.make(1., 0u32),
+      List[PartId].empty(), 0., 0., 0., 0., true, 1., false, 0., 0u32);
+  }
+
+  // A standing figure of 'height' metres, its bones shown by 'parts'
+  pub fn make(height f32, seed u32, parts List[PartId]) Figure {
+    imm skel = bonepose.humanoid(height);
+    imm pose = skel.restPose();
+    new Figure(true, height, skel, pose, List[Transform3].empty(), walkgait.Walker.make(height, seed), parts,
+      0., 0., 0., 0., true, 1., false, 0., 0u32);
+  }
+
+  pub fn radius(self &) f32 { CAPSULE_RADIUS_OVER_H * height; }
+
+  // The eye, in the figure's model space (the feet's ground point, facing yaw 0)
+  pub fn eyeModel(self &) Vec3 {
+    if models.len() == 0usize { return new Vec3(0., 0.936 * height, 0.); }
+    skeleton.socketModel(&models, bonepose.SOCKET_EYE).translation;
+  }
+
+  // One fixed step of 'dt' seconds by 'it' for the body 'body' (its feet's
+  // ground point and yaw): turn, accelerate, jump or fall, land, and pose
+  pub fn step(self &mut, body &mut Walk, it Intents, dt f32) {
+    landed = false;
+    body.yaw = body.yaw + it.turn * TURN_RATE * dt;
+    imm fx = 0. - sin(body.yaw);
+    imm fz = 0. - cos(body.yaw);
+    mut pos = body.position;
+    imm was = pos;
+    if grounded {
+      imm target = it.ahead * (if it.run { RUN_SPEED; } else { WALK_SPEED; });
+      imm dv = GROUND_ACCEL * dt;
+      if target > speed + dv { speed = speed + dv; }
+      elif target < speed - dv { speed = speed - dv; }
+      else { speed = target; }
+      pos = new Vec3(pos.x + fx * speed * dt, pos.y, pos.z + fz * speed * dt);
+      if it.jump {
+        grounded = false;
+        vy = JUMP_SPEED;
+        airVx = fx * speed;
+        airVz = fz * speed;
+      }
+    } else {
+      vy = vy - GRAVITY * dt;
+      if vy < 0. - TERMINAL_SPEED { vy = 0. - TERMINAL_SPEED; }
+      pos = new Vec3(pos.x + airVx * dt, pos.y, pos.z + airVz * dt);
+    }
+    imm ground = footprintHeight(pos.x, pos.z, self.radius());
+    if grounded {
+      if ground > pos.y + STEP_UP {
+        // Too high a step: blocked, stopped
+        pos = new Vec3(was.x, pos.y, was.z);
+        speed = 0.;
+      } elif pos.y - ground <= SNAP_DOWN {
+        pos = new Vec3(pos.x, ground, pos.z);
+      } else {
+        // Walked off an edge: falling, keeping its way
+        grounded = false;
+        vy = 0.;
+        airVx = fx * speed;
+        airVz = fz * speed;
+      }
+    }
+    if !grounded {
+      pos = new Vec3(pos.x, pos.y + vy * dt, pos.z);
+      if pos.y <= ground and vy <= 0. {
+        landSpeed = 0. - vy;
+        pos = new Vec3(pos.x, ground, pos.z);
+        vy = 0.;
+        grounded = true;
+        landed = true;
+        // On the ground it goes on at the speed along its heading it had
+        speed = airVx * fx + airVz * fz;
+        if landSpeed >= HARD_LANDING_SPEED {
+          hardLandings = hardLandings + 1u32;
+          health = health - self.damageOf(landSpeed);
+          if health < 0. { health = 0.; }
+          walker.impact(landSpeed);
+        } elif landSpeed > 1.5 {
+          walker.impact(landSpeed * 0.4);
+        }
+      }
+    }
+    body.position = pos;
+    walker.update(&skeleton, &mut pose, &mut models, pos, body.yaw, if grounded { speed; } else { 0.; },
+      it.turn * TURN_RATE, grounded, &groundHeight, dt);
+  }
+
+  // What a landing at 'impact' m/s costs, as a fraction of health: nothing
+  // to 10 m/s, all of it at 24 (a gameplay number, in the being's state,
+  // not the locomotor's)
+  pub fn damageOf(self &, impact f32) f32 {
+    imm d = (impact - 10.) / (24. - 10.);
+    if d < 0. { return 0.; }
+    if d > 1. { return 1.; }
+    d;
+  }
+}
+
+// ---- The meshes: one rigid piece a bone ----
+
+fn ball(centre Vec3, radii Vec3) Mesh {
+  mut m = Mesh.sphere(1., 14);
+  m.transform(Mat4.fromTrs(centre, Quat.identity(), radii));
+  m;
+}
+
+fn join(a Mesh, b Mesh) Mesh {
+  mut m = a;
+  m.append(&b);
+  m;
+}
+
+// Bone 'i''s mesh for a figure 'h' metres tall, in the bone's own frame:
+// its origin at the joint, the piece along the bone's own axis (down for the
+// limbs, up for the trunk), a ball at the joint. Sizes are fractions of H
+// (the bone lengths are the humanoid's; the girths are this file's own, an
+// artist's mannequin's: limbs in the order of the reference note's radii).
+pub fn boneMesh(i usize, h f32) Mesh {
+  imm left = (i % 2usize) == 1usize;
+  imm s = if left { -1.; } else { 1.; };
+  if i == bonepose.PELVIS {
+    return ball(new Vec3(0., 0.012 * h, 0.), new Vec3(0.100 * h, 0.058 * h, 0.062 * h));
+  }
+  if i == bonepose.SPINE {
+    return ball(new Vec3(0., 0.065 * h, 0.), new Vec3(0.088 * h, 0.075 * h, 0.056 * h));
+  }
+  if i == bonepose.CHEST {
+    return ball(new Vec3(0., 0.052 * h, 0.), new Vec3(0.122 * h, 0.090 * h, 0.068 * h));
+  }
+  if i == bonepose.NECK {
+    return ball(new Vec3(0., 0.026 * h, 0.), new Vec3(0.026 * h, 0.040 * h, 0.026 * h));
+  }
+  if i == bonepose.HEAD {
+    // The skull, and a nose to show which way it faces (-z)
+    return join(ball(new Vec3(0., 0.066 * h, 0.), new Vec3(0.043 * h, 0.068 * h, 0.055 * h)),
+      ball(new Vec3(0., 0.058 * h, -0.056 * h), new Vec3(0.010 * h, 0.014 * h, 0.014 * h)));
+  }
+  if i == bonepose.CLAVICLE_L or i == bonepose.CLAVICLE_R {
+    return ball(new Vec3(s * 0.055 * h, 0., 0.), new Vec3(0.062 * h, 0.022 * h, 0.024 * h));
+  }
+  if i == bonepose.UPPER_ARM_L or i == bonepose.UPPER_ARM_R {
+    return join(ball(new Vec3(0., 0., 0.), new Vec3(0.042 * h, 0.042 * h, 0.042 * h)),
+      ball(new Vec3(0., -0.094 * h, 0.), new Vec3(0.034 * h, 0.100 * h, 0.034 * h)));
+  }
+  if i == bonepose.FOREARM_L or i == bonepose.FOREARM_R {
+    return join(ball(new Vec3(0., 0., 0.), new Vec3(0.031 * h, 0.031 * h, 0.031 * h)),
+      ball(new Vec3(0., -0.072 * h, 0.), new Vec3(0.028 * h, 0.077 * h, 0.028 * h)));
+  }
+  if i == bonepose.HAND_L or i == bonepose.HAND_R {
+    return join(ball(new Vec3(0., 0., 0.), new Vec3(0.021 * h, 0.021 * h, 0.021 * h)),
+      ball(new Vec3(0., -0.054 * h, 0.), new Vec3(0.026 * h, 0.056 * h, 0.013 * h)));
+  }
+  if i == bonepose.THIGH_L or i == bonepose.THIGH_R {
+    return join(ball(new Vec3(0., 0., 0.), new Vec3(0.050 * h, 0.050 * h, 0.050 * h)),
+      ball(new Vec3(0., -0.1225 * h, 0.), new Vec3(0.052 * h, 0.130 * h, 0.052 * h)));
+  }
+  if i == bonepose.SHIN_L or i == bonepose.SHIN_R {
+    return join(ball(new Vec3(0., 0., 0.), new Vec3(0.042 * h, 0.042 * h, 0.042 * h)),
+      ball(new Vec3(0., -0.123 * h, 0.), new Vec3(0.040 * h, 0.130 * h, 0.040 * h)));
+  }
+  // The foot: the heel 0.04 H behind the ankle, the toe 0.11 H ahead (-z),
+  // the sole 0.039 H under it
+  join(ball(new Vec3(0., 0., 0.), new Vec3(0.026 * h, 0.026 * h, 0.026 * h)),
+    ball(new Vec3(0., -0.020 * h, -0.035 * h), new Vec3(0.032 * h, 0.019 * h, 0.075 * h)));
+}
+
+fn boneName(i usize) &[]u8 {
+  if i == bonepose.PELVIS { return "pelvis"; }
+  if i == bonepose.SPINE { return "spine"; }
+  if i == bonepose.CHEST { return "chest"; }
+  if i == bonepose.NECK { return "neck"; }
+  if i == bonepose.HEAD { return "head"; }
+  if i == bonepose.CLAVICLE_L { return "left clavicle"; }
+  if i == bonepose.CLAVICLE_R { return "right clavicle"; }
+  if i == bonepose.UPPER_ARM_L { return "left upper arm"; }
+  if i == bonepose.UPPER_ARM_R { return "right upper arm"; }
+  if i == bonepose.FOREARM_L { return "left forearm"; }
+  if i == bonepose.FOREARM_R { return "right forearm"; }
+  if i == bonepose.HAND_L { return "left hand"; }
+  if i == bonepose.HAND_R { return "right hand"; }
+  if i == bonepose.THIGH_L { return "left thigh"; }
+  if i == bonepose.THIGH_R { return "right thigh"; }
+  if i == bonepose.SHIN_L { return "left shin"; }
+  if i == bonepose.SHIN_R { return "right shin"; }
+  if i == bonepose.FOOT_L { return "left foot"; }
+  "right foot";
+}
+
+// The colour of the wood: a pale natural beech, sRGB (214, 176, 128), linear
+pub fn woodColor() Color { new Color(0.672, 0.434, 0.216, 1.); }
+// A second figure painted a muted clay red, sRGB (170, 92, 70)
+pub fn clayColor() Color { new Color(0.402, 0.107, 0.061, 1.); }
+
+// Send a mannequin of 'height' metres into the scene, its bone parts under
+// 'root' (the being's own part), standing in its rest pose; the parts by bone.
+// Defines 19 meshes and one material, in 'color'.
+pub fn spawnMannequin(scene &mut Scene, height f32, color Color, root PartId) List[PartId] {
+  imm skel = bonepose.humanoid(height);
+  imm wood = scene.door.defineMaterial(Look.shiny(color, 0.25, 18.), Image.empty(), Maps.none());
+  mut parts = List[PartId].empty();
+  mut i = 0usize;
+  while i < skel.boneCount() {
+    imm parent = skel.parentOf(i);
+    imm part = scene.door.newChild(boneName(i), if parent < 0i32 { root; } else { *parts[usize.from(parent)]; });
+    imm mesh = scene.door.defineMesh(boneMesh(i, height));
+    scene.send(Request.Show[part, mesh, wood, 0.]);
+    scene.send(Request.Place[part, skel.restOf(i)]);
+    parts.push(part);
+    i = i + 1usize;
+  }
+  parts;
+}

@@ -1,63 +1,81 @@
 // Beings and possession: the seam between the user and what the user moves.
 //
 //   input --> a controller --> a being's intents --> the being steps
-//                                                     \--> the camera, if it is possessed
+//                                                     \--> the view rig, if it is possessed
 //
-// A BEING is something in the scene that acts: today a walker, later
-// T2's mannequin. It is a part (so the scene places it and areas sense it)
-// with a body that moves (today a Walk: on the ground, a yaw, eyes 1.7 m up;
-// later a kinematic capsule) and, each fixed step, the INTENTS it is given:
-// what it means to do this step (walk ahead or back, turn, run), not which
-// key was pressed. A being never reads input.
+// A BEING is something in the scene that acts: a plain walker (eyes 1.7 m up
+// and nothing to see of it) or a mannequin. It is a part (so the scene places
+// it and areas sense it) with a body that moves (a Walk: the feet's ground
+// point and a yaw; for a mannequin, in addition, a Figure: the skeleton and
+// its gait, the kinematic capsule and its parts, mannequin.cone) and, each
+// fixed step, the INTENTS it is given: what it means to do this step (walk
+// ahead or back, turn, run, jump), not which key was pressed. A being never
+// reads input.
 //
 // A CONTROLLER decides a being's intents. The user's controller reads the
 // input package's actions (walk.cone's bindings) and gives intents; later an
 // AI controller gives them from the world's logic, a network one from a
 // server. Nothing here knows which kind drove a being.
 //
-// POSSESSION is which being the user's controller drives and the camera
-// follows: the Cast's 'possessed'. The camera draws from the possessed
-// being's eyes, between its last two steps (the scene publishes them in its
-// snapshot), so possessing another being moves the user's view and control
-// to it at once, as projecting into another avatar should. A being that is
-// not possessed gets no intents (it stands) until it has a controller of its
-// own.
+// POSSESSION is which being the user's controller drives and the view
+// follows: the Cast's 'possessed'. Tab takes the next mannequin over.
 //
-// For T2: the mannequin is a Being whose body is a capsule and skeleton
-// instead of a Walk; the ViewRig replaces 'eyes' (first or third person,
-// attached to the being's eye socket); Intents grows look pitch, jump and
-// the like. The browser's frame calls only Cast.step, Cast.eyesBefore/eyes,
-// Cast.possess and UserController.intents.
+// THE VIEW RIG is the viewer's, not the being's: it reads the possessed
+// being (its eye socket, its place) and makes the camera's pose, in FIRST
+// person (at the eyes socket, level with the heading, a half-bobbed height)
+// or THIRD (3.2 m behind the heading and above, looking at the chest, pulled
+// up out of the ground, smoothed at 9 rad/s). V switches between them; the
+// being and the controller are the same either way. The camera draws between
+// the rig's last two steps (the scene publishes them in its snapshot).
+// A plain walker has only first person.
 
 // What a being means to do this step, whoever decided it
 pub struct Intents {
   pub ahead f32;              // -1 (back) to 1 (forward)
   pub turn f32;               // -1 (right) to 1 (left)
   pub run bool;
+  pub jump bool;
 
-  pub fn none() Intents { new Intents(0., 0., false); }
+  pub fn none() Intents { new Intents(0., 0., false, false); }
 }
 
 // A being: its part in the scene, its body after the last step and the one
-// before (the picture is drawn between them), and the intents it was last given
+// before (the picture is drawn between them), the intents it was last given,
+// and its figure if it is a mannequin
 pub struct Being {
   pub part PartId;
   pub body Walk;
   pub before Walk;
   pub intents Intents;
+  pub figure Figure;
 
-  pub fn make(part PartId, body Walk) Being { new Being(part, body, body, Intents.none()); }
+  pub fn make(part PartId, body Walk) Being { new Being(part, body, body, Intents.none(), Figure.none()); }
 
-  // One fixed step of 'dt' seconds, by 'intents'
+  // A mannequin standing at 'at' facing 'yaw', shown by 'figure'
+  pub fn mannequin(part PartId, at Vec3, yaw f32, figure Figure) Being {
+    imm body = Walk.make(at, yaw);
+    new Being(part, body, body, Intents.none(), figure);
+  }
+
+  // One fixed step of 'dt' seconds, by 'given'
   pub fn step(self &mut, given Intents, dt f32) {
     intents = given;
     before = body;
-    body.step(intents.ahead, intents.turn, intents.run, dt);
+    if figure.active {
+      figure.step(&mut body, given, dt);
+      body.eyeHeight = figure.eyeModel().y;
+    } else {
+      body.step(intents.ahead, intents.turn, intents.run, dt);
+    }
   }
 
-  // Where its eyes are after the last step, and after the one before
-  pub fn eyes(self &) Pose { body.pose(); }
-  pub fn eyesBefore(self &) Pose { before.pose(); }
+  // Where its eyes are after the last step: a plain walker's, or the
+  // figure's eye socket, level and facing its heading
+  pub fn eyes(self &) Pose {
+    if !figure.active { return body.pose(); }
+    imm yq = Quat.angleAxis(body.yaw, new Vec3(0., 1., 0.));
+    Pose.look(body.position + yq * figure.eyeModel(), body.yaw, 0.);
+  }
 
   // Where its feet are, as a placement in the world (facing its yaw)
   pub fn placement(self &) Transform3 {
@@ -73,16 +91,86 @@ pub struct UserController {
 
   // This frame's intents, from the actions
   pub fn intents(self &, ctx &Context) Intents {
-    new Intents(clampUnit(ctx.axis1(actions.move)), clampUnit(ctx.axis1(actions.turn)), ctx.down(actions.run));
+    new Intents(clampUnit(ctx.axis1(actions.move)), clampUnit(ctx.axis1(actions.turn)), ctx.down(actions.run),
+      ctx.down(actions.jump));
   }
 }
 
-// The beings, and which one the user possesses
+// First person: the camera at the eyes socket
+pub const VIEW_FIRST = 0u32;
+// Third person: behind and above
+pub const VIEW_THIRD = 1u32;
+
+// How far behind the third-person camera is, and how far above the chest
+pub const THIRD_BEHIND = 3.2;
+pub const THIRD_ABOVE = 0.65;
+
+// The viewer: first or third person on whichever being is possessed
+pub struct ViewRig {
+  pub mode u32;
+  pub before Pose;            // the camera at the step before the last
+  pub now Pose;               // and at the last
+  cam Vec3;                   // the third-person camera's smoothed place
+  eyeY f32;                   // the first-person eye's smoothed height
+  fresh bool;                 // the next update snaps to its target
+
+  pub fn make(mode u32) ViewRig {
+    imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
+    new ViewRig(mode, still, still, new Vec3(0., 0., 0.), 0., true);
+  }
+
+  pub fn toggle(self &mut) { mode = if mode == VIEW_FIRST { VIEW_THIRD; } else { VIEW_FIRST; }; fresh = true; }
+
+  // Forget the smoothing: the next update puts the camera where it belongs
+  pub fn snap(self &mut) { fresh = true; }
+
+  // The camera for being 'b' after its step of 'dt' seconds
+  pub fn update(self &mut, b &Being, dt f32) {
+    mut target = b.eyes();
+    if b.figure.active {
+      imm yaw = b.body.yaw;
+      imm k = 1. - libc.expf(-9. * dt);
+      if mode == VIEW_FIRST {
+        // Level with the heading; the height follows the head at 18 Hz,
+        // so the walk's bob is half what the head does
+        imm eye = target.origin;
+        eyeY = if fresh { eye.y; } else { eyeY + (eye.y - eyeY) * (1. - libc.expf(-18. * dt)); };
+        target = Pose.look(new Vec3(eye.x, eyeY, eye.z), yaw, 0.);
+      } else {
+        imm h = b.figure.height;
+        imm chest = b.body.position + new Vec3(0., 0.80 * h, 0.);
+        imm fx = 0. - sin(yaw);
+        imm fz = 0. - cos(yaw);
+        mut want = new Vec3(chest.x - fx * THIRD_BEHIND, chest.y + THIRD_ABOVE, chest.z - fz * THIRD_BEHIND);
+        imm floor = groundHeight(want.x, want.z) + 0.35;
+        if want.y < floor { want = new Vec3(want.x, floor, want.z); }
+        cam = if fresh { want; } else { cam + (want - cam) * k; };
+        imm d = chest - cam;
+        imm flat = libc.sqrtf(d.x * d.x + d.z * d.z);
+        target = Pose.look(cam, libc.atan2f(0. - d.x, 0. - d.z), libc.atan2f(d.y, flat));
+      }
+    }
+    before = if fresh { target; } else { now; };
+    now = target;
+    fresh = false;
+  }
+}
+
+// A hard landing reported by a step: whose, how fast, what it cost
+pub struct Landing {
+  pub part PartId;
+  pub speed f32;
+  pub damage f32;
+}
+
+// The beings, which one the user possesses, and the view
 pub struct Cast {
   pub beings List[Being];
   pub possessed usize;
+  pub rig ViewRig;
+  pub landings List[Landing];
 
-  pub fn empty() Cast { new Cast(List[Being].empty(), 0usize); }
+  pub fn empty() Cast { new Cast(List[Being].empty(), 0usize, ViewRig.make(VIEW_THIRD), List[Landing].empty()); }
 
   // A being added: its index
   pub fn add(self &mut, b Being) usize {
@@ -91,20 +179,57 @@ pub struct Cast {
   }
 
   // The user takes being 'i' over: its intents are the user's controller's
-  // from the next step, and the camera follows it
-  pub fn possess(self &mut, i usize) { if i < beings.len() { possessed = i; } }
+  // from the next step, and the view follows it
+  pub fn possess(self &mut, i usize) {
+    if i < beings.len() { possessed = i; rig.snap(); }
+  }
+
+  // The user takes the next mannequin over (the first after the possessed
+  // one, wrapping round); the same one if there is no other
+  pub fn swap(self &mut) {
+    mut k = 1usize;
+    while k <= beings.len() {
+      imm j = (possessed + k) % beings.len();
+      if beings[j].figure.active { self.possess(j); return; }
+      k = k + 1usize;
+    }
+  }
 
   // The possessed being
   pub fn you(self &) &Being { beings[possessed]; }
 
   // One fixed step of every being: the possessed one by the user's
-  // 'intents', the others standing (no controller of their own yet)
+  // 'intents', the others standing (no controller of their own yet); then
+  // the view; hard landings noted
   pub fn step(self &mut, user Intents, dt f32) {
     mut i = 0usize;
     while i < beings.len() {
       imm b = &mut beings[i];
       b.step(if i == possessed { user; } else { Intents.none(); }, dt);
+      if b.figure.active and b.figure.landed and b.figure.landSpeed >= HARD_LANDING_SPEED {
+        landings.push(new Landing(b.part, b.figure.landSpeed, b.figure.damageOf(b.figure.landSpeed)));
+      }
       i = i + 1usize;
     }
+    self.look(dt);
   }
+
+  // The view brought to the possessed being as it stands (also before any step)
+  pub fn look(self &mut, dt f32) {
+    if beings.len() > 0usize {
+      imm y = &mut beings[possessed];
+      rig.update(y, dt);
+    }
+  }
+
+  // The hard landings since the last call; the list is left empty
+  pub fn takeLandings(self &mut) List[Landing] {
+    mut out = List[Landing].empty();
+    out <=> landings;
+    out;
+  }
+
+  // The camera after the last step, and after the one before
+  pub fn eyes(self &) Pose { rig.now; }
+  pub fn eyesBefore(self &) Pose { rig.before; }
 }

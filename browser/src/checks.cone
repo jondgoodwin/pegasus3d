@@ -301,12 +301,12 @@ fn checkPossession() bool {
   imm second = c.add(Being.make(livePart(&mut s, "second"), Walk.make(new Vec3(5., 0., 0.), 0.)));
   c.possess(first);
   // The user's intents, walking forward, for a second
-  imm forward = new Intents(1., 0., false);
+  imm forward = new Intents(1., 0., false, false);
   mut k = 0;
   while k < 60 { c.step(forward, 1. / 60.); k = k + 1; }
   mut ok = expect("the possessed being walked 3 m along -z", nearly(c.beings[first].body.position.z, -3., 0.0001));
   ok = expect("the other stood", c.beings[second].body.position.z == 0. and c.beings[second].body.position.x == 5.) and ok;
-  mut snap = s.publish(Snapshot.empty(), c.you().eyesBefore(), c.you().eyes());
+  mut snap = s.publish(Snapshot.empty(), c.eyesBefore(), c.eyes());
   ok = expect("the camera is at the first's eyes", nearly(snap.eye(1.).origin.z, -3., 0.0001)
     and nearly(snap.eye(1.).origin.y, 1.7, 0.0001)) and ok;
   c.possess(second);
@@ -314,9 +314,132 @@ fn checkPossession() bool {
   while k < 60 { c.step(forward, 1. / 60.); k = k + 1; }
   ok = expect("possessing the second: it walks, the first stands",
     nearly(c.beings[second].body.position.z, -3., 0.0001) and nearly(c.beings[first].body.position.z, -3., 0.0001)) and ok;
-  snap = s.publish(snap, c.you().eyesBefore(), c.you().eyes());
+  snap = s.publish(snap, c.eyesBefore(), c.eyes());
   ok = expect("and the camera follows the second", nearly(snap.eye(1.).origin.x, 5., 0.0001)
     and nearly(snap.eye(1.).origin.z, -3., 0.0001)) and ok;
+  ok;
+}
+
+fn mannequinBeing(s &mut Scene, name &[]u8, at Vec3, height f32, seed u32) Being {
+  Being.mannequin(livePart(s, name), at, 0., Figure.make(height, seed, List[PartId].empty()));
+}
+
+// A mannequin dropped from 'drop' metres, to the ground: stepped until it
+// lands (at most 5 s); its landing speed, or -1 if it never landed
+fn dropFrom(drop f32, health &mut f32, hard &mut u32, mailed &mut u32) f32 {
+  mut s = Scene.empty();
+  mut c = Cast.empty();
+  imm i = c.add(mannequinBeing(&mut s, "falling", new Vec3(0., drop, 0.), 1.75, 1u32));
+  c.possess(i);
+  c.beings[i].figure.grounded = false;
+  mut k = 0;
+  mut speed = -1.;
+  mut landedAt = -1;
+  while k < 300 {
+    c.step(Intents.none(), 1. / 60.);
+    if landedAt < 0 and c.beings[i].figure.landed { landedAt = k; speed = c.beings[i].figure.landSpeed; }
+    mut ls = c.takeLandings();
+    mut n = 0usize;
+    while n < ls.len() {
+      imm l = *ls[n];
+      s.post(Message.HardLanding[l.part, l.speed, l.damage]);
+      n = n + 1usize;
+    }
+    k = k + 1;
+  }
+  *health = c.beings[i].figure.health;
+  *hard = c.beings[i].figure.hardLandings;
+  *mailed = u32.from(s.door.unread());
+  speed;
+}
+
+fn checkMannequin() bool {
+  print <- "The mannequin:\n";
+  mut health = 1.;
+  mut hard = 0u32;
+  mut mailed = 0u32;
+  // The capsule lands: 0.5 m is 3.13 m/s (v = sqrt(2 g h)), soft and unmailed
+  imm soft = dropFrom(0.5, &mut health, &mut hard, &mut mailed);
+  mut ok = expect("dropped from 0.5 m it lands, at the speed v = sqrt(2 g h) = 3.13 m/s",
+    nearly(soft, 3.13, 0.15));
+  ok = expect("a soft landing is not hard, mails nothing and costs nothing", hard == 0u32 and mailed == 0u32 and health == 1.) and ok;
+  // Dropped from 3.5 m: 8.3 m/s, hard, mailed once, but under the 10 m/s that hurts
+  imm hardSpeed = dropFrom(3.5, &mut health, &mut hard, &mut mailed);
+  ok = expect("dropped from 3.5 m it lands at 8.3 m/s", nearly(hardSpeed, 8.29, 0.3)) and ok;
+  ok = expect("that is a hard landing, mailed once", hard == 1u32 and mailed == 1u32) and ok;
+  ok = expect("and does not yet hurt (it takes 10 m/s)", health == 1.) and ok;
+  // 8 m: 12.5 m/s, (12.5 - 10) / 14 of the health
+  imm hurtSpeed = dropFrom(8., &mut health, &mut hard, &mut mailed);
+  ok = expect("dropped from 8 m it lands at 12.5 m/s", nearly(hurtSpeed, 12.5, 0.4)) and ok;
+  ok = expect("a hard landing, mailed, and it hurts by (12.5 - 10) / 14 = 0.18",
+    hard == 1u32 and mailed == 1u32 and nearly(health, 1. - 0.1786, 0.04)) and ok;
+
+  // Walking: the gait follows the intent, and a planted foot does not move
+  mut s = Scene.empty();
+  mut c = Cast.empty();
+  imm a = c.add(mannequinBeing(&mut s, "one", new Vec3(0., 0., 0.), 1.75, 3u32));
+  imm b = c.add(mannequinBeing(&mut s, "two", new Vec3(3., 0., 0.), 1.62, 11u32));
+  c.possess(a);
+  imm walk = new Intents(1., 0., false, false);
+  mut k = 0;
+  mut worst = 0.;
+  mut stances = 0;
+  mut inFlat = false;
+  mut planted = new Vec3(0., 0., 0.);
+  mut wasFlat = false;
+  while k < 360 {
+    c.step(walk, 1. / 60.);
+    imm f = &c.beings[a].figure;
+    imm yq = Quat.angleAxis(c.beings[a].body.yaw, new Vec3(0., 1., 0.));
+    imm ankle = c.beings[a].body.position + yq * (*f.models[bonepose.FOOT_L]).translation;
+    inFlat = k > 60 and !f.walker.left.swinging and f.walker.left.t > 0.16 and f.walker.left.t < 0.54;
+    if inFlat {
+      if !wasFlat { planted = ankle; stances = stances + 1; }
+      imm d = (ankle - planted).length();
+      if d > worst { worst = d; }
+    }
+    wasFlat = inFlat;
+    k = k + 1;
+  }
+  ok = expect("walked 6 s at the walking pace, 1.8 m/s along -z less the 0.12 m its speed took to ramp up (12 m/s^2)",
+    nearly(c.beings[a].body.position.z, -(1.8 * 6. - 0.12), 0.01)) and ok;
+  ok = expect("the gait's speed followed the intent", nearly(c.beings[a].figure.walker.speed, 1.8, 0.02)) and ok;
+  ok = expect("the left foot planted in the flat of at least 4 stances", stances >= 4) and ok;
+  ok = expect("a planted foot stayed within 1 cm of where it was put", worst < 0.01) and ok;
+  ok = expect("the other mannequin stood: still, and where it was", c.beings[b].body.position.x == 3.
+    and c.beings[b].body.position.z == 0. and c.beings[b].figure.walker.frozen) and ok;
+  // The third-person camera is behind and above the mannequin, 3.2 m back
+  imm eye = c.eyes().origin;
+  imm bz = c.beings[a].body.position.z;
+  ok = expect("the third-person camera is about 3.2 m behind it and above its head",
+    nearly(eye.z - bz, 3.2, 0.35) and eye.y > 1.8 and eye.y < 2.6) and ok;
+  // First person: the eyes socket
+  c.rig.toggle();
+  c.step(walk, 1. / 60.);
+  imm e1 = c.eyes().origin;
+  ok = expect("first person: the camera at the eyes socket, about 1.6 m up, 0.1 m ahead of the body's middle",
+    e1.y > 1.5 and e1.y < 1.66 and nearly(e1.z - c.beings[a].body.position.z, -0.105, 0.04)) and ok;
+
+  // Possession: the other one is taken over and moves; the first stands
+  c.rig.toggle();
+  c.swap();
+  mut j = 0;
+  while j < 60 { c.step(walk, 1. / 60.); j = j + 1; }
+  ok = expect("Tab takes the other mannequin over", c.possessed == b) and ok;
+  imm bpos = c.beings[b].body.position;
+  ok = expect("it walks now (1.8 m less the ramp, after a second)", nearly(bpos.z, -1.68, 0.02)) and ok;
+  j = 0;
+  while j < 120 { c.step(walk, 1. / 60.); j = j + 1; }
+  ok = expect("its feet level with each other and beside the pelvis, 0.0955 H each side, flat on the ground",
+    nearly(c.beings[a].figure.walker.left.ankle.z, c.beings[a].figure.walker.right.ankle.z, 0.001)
+    and nearly(c.beings[a].figure.walker.right.ankle.x - c.beings[a].figure.walker.left.ankle.x, 0.191 * 1.75, 0.001)
+    and nearly(c.beings[a].figure.walker.left.ankle.y, 0.039 * 1.75, 0.001)) and ok;
+  ok = expect("and standing at the height its legs allow (0.9 m)", nearly(c.beings[a].figure.walker.pelvisY, 0.9018, 0.01)) and ok;
+  ok = expect("and the first, no longer driven, has stopped and stands feet flat after two more steps",
+    c.beings[a].figure.speed == 0. and c.beings[a].figure.walker.frozen) and ok;
+  imm eye2 = c.eyes().origin;
+  ok = expect("the camera followed the second", nearly(eye2.x, 3., 0.4)
+    and nearly(eye2.z - c.beings[b].body.position.z, 3.2, 0.5)) and ok;
   ok;
 }
 
@@ -326,5 +449,6 @@ pub fn runChecks() i32 {
   ok = checkTimers() and ok;
   ok = checkAreas() and ok;
   ok = checkPossession() and ok;
+  ok = checkMannequin() and ok;
   if ok { print <- "Checks: OK\n"; 0i32; } else { print <- "Checks: FAILED\n"; 1i32; };
 }
