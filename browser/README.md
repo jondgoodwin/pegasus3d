@@ -471,6 +471,14 @@ yellow-green in the sun, the very sunniest with a hint of spring's red, petioles
 `BarkParams.redMaple`, the pine's `BarkParams.pine` greyed; the pine's needles deep blue-green; hostas one
 blue-grey and one yellow-green, ferns two greens, flowers buttercup, white and violet.
 
+**Glow and flutter** (render's foliage shading, set per material in `vegetation.cone`: `MAPLE_TRANSLUCENCY`,
+`MAPLE_FLUTTER`, `PINE_TRANSLUCENCY`). With the sun behind a leaf, light comes through it in the leaf's own
+colour, so a backlit crown glows coral and orange instead of going dark; the maples' leaves also turn up to about
+seven degrees about their stems, each on its own phase and period (0.6 to 1.8 s), so they catch and lose the light.
+The maples' leaf meshes carry each leaf's pivot and phase in their vertex colours (`FoliageParams.sway`). The
+pines' needles have a little translucency and no flutter. `shots/foliage-*.png` shows the maple before and after,
+with the sun behind the tree and behind the viewer, and two frames 0.25 s apart.
+
 **Counts and cost.** 98 trees (63 pines, 35 forest maples) and 2 specimens, 108 rocks, 150 edging stones, 21
 hostas, 97 ferns, 16 flower clumps: 656 parts in all, 2,959,446 triangles of the world's 3,530,352 drawn (with
 the island, sky and cottage), against 1,336,138 and 67 parts without (`--no-vegetation`). Frame times at the
