@@ -6,10 +6,11 @@
 // is drawn, and the distance along the ray (in multiples of its direction,
 // which is unit length in the world) is the same in every frame.
 //
-// The picking system owns its own table, keyed by part id like the render
-// system's: a copy of each part's positions and triangles, taken when its
-// Show is applied (the render system uploads the mesh and keeps no CPU
-// copy). An anchored part (the ground) is not pickable.
+// The picking system owns its own tables, keyed by id like the render
+// system's: a copy of each mesh's positions and triangles, taken when its
+// DefineMesh is applied (the render system uploads the mesh and keeps no CPU
+// copy), and each shown part's mesh, from its Show. Parts sharing a mesh
+// share its copy. An anchored part (the ground) is not pickable.
 
 pub struct PickShape {
   pub bounds Aabb3;            // in the part's own frame
@@ -27,12 +28,27 @@ pub struct PickHit {
 }
 
 pub struct PickSystem {
-  pub shapes Table[PickShape];
+  pub shapes Table[PickShape];   // keyed by a mesh's id
+  pub parts Table[MeshId];       // keyed by a part's id: the mesh it is drawn as
 
-  pub fn empty() PickSystem { new PickSystem(Table[PickShape].empty()); }
+  pub fn empty() PickSystem { new PickSystem(Table[PickShape].empty(), Table[MeshId].empty()); }
 
-  // Part 'id' is drawn as 'm': keep its positions and triangles
-  pub fn shape(self &mut, id PartId, m &Mesh) {
+  // Part 'id' is drawn as mesh 'mesh'
+  pub fn show(self &mut, id PartId, mesh MeshId) { parts.put(id, mesh); }
+
+  // Part 'id''s mesh's bounds in its own frame; empty if it has none
+  pub fn boundsOf(self &, id PartId) Aabb3 {
+    imm row = parts.find(id);
+    if row != NO_ROW {
+      imm srow = shapes.find(parts.rows[row].id);
+      if srow != NO_ROW { return shapes.rows[srow].bounds; }
+    }
+    new Aabb3(new Vec3(0., 0., 0.), new Vec3(0., 0., 0.));
+  }
+
+  // Mesh 'mesh' is 'm': keep its positions and triangles
+  pub fn shape(self &mut, mesh MeshId, m &Mesh) {
+    imm id = mesh.id;
     mut ps = List[Vec3].withCapacity(m.positions.len());
     mut i = 0usize;
     while i < m.positions.len() { ps.push(*m.positions[i]); i = i + 1usize; }
@@ -42,15 +58,17 @@ pub struct PickSystem {
     shapes.put(id, new PickShape(Aabb3.fromPoints(m.positions.view()), ps, ix));
   }
 
-  pub fn drop(self &mut, id PartId) { shapes.remove(id); }
+  pub fn drop(self &mut, id PartId) { parts.remove(id); }
 
   // The nearest part 'ray' (in the world) hits
   pub fn pick(self &, scene &Scene, ray Ray3) PickHit {
     mut best = new PickHit(PartId.none(), 1.0e30, 0u32, 0u64);
     mut i = 0usize;
-    while i < shapes.len() {
-      imm id = *shapes.ids[i];
-      imm s = shapes.rows[i];
+    while i < parts.len() {
+      imm id = *parts.ids[i];
+      imm srow = shapes.find(parts.rows[i].id);
+      if srow == NO_ROW { i = i + 1usize; continue; }
+      imm s = shapes.rows[srow];
       imm inv = scene.worldMatrix(id).inverse();
       imm own = new Ray3(inv * ray.origin, inv.transformVector(ray.direction));
       imm enter = hitAt(own.intersectAabb(s.bounds));

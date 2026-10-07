@@ -1,0 +1,167 @@
+// The scene's events: its clock and the day it reads, timers on that clock,
+// and areas. Each is posted to the sender as mail through its Door, as a
+// click is (parts.cone, Message).
+//
+// THE SCENE'S CLOCK is scene time: the simulation's fixed steps, each moving
+// it on by its length times the clock's rate: 1, or 0 paused, or FAST_RATE
+// (the pause and x10 keys, for testing). The walk is not slowed or sped by
+// it (the user's being moves in real steps), but everything the world moves
+// by the scene's time is: its motions, the effects, the timers, the day.
+// Whole nanoseconds, so a run on the synthetic clock is exact.
+//
+// THE DAY is DAY_SECONDS of scene time (24 minutes), the clock reading
+// START_HOUR when the scene's time is 0. Dawn is at DAWN_HOUR and dusk at
+// DUSK_HOUR (the island plan's: night about 9 of the 24 minutes); the scene
+// posts Message.Dawn and Message.Dusk as the day clock passes them, from two
+// timers of its own.
+//
+// TIMERS are the timewheel package's wheel, driven by scene time (not the
+// wall's): a Timer request arms one, ringing at its time and, if it repeats,
+// every period after; ringing posts Message.Rang with the sender's token and
+// the time it was set for. The wheel is read at the apply point, so a timer
+// rings at the first apply point whose scene time is at or after the
+// wheel's tick for it (its time, rounded up to the millisecond). Paused, no
+// scene time passes, and none rings; at x10 they ring ten times as soon.
+//
+// AREAS are volumes (a sphere or a box) in a part's own frame, so an area
+// moves with its part and its parents. Once a frame the possessed being's
+// position is tested against each (no physics engine yet), and coming in or
+// going out is posted as Message.Entered or Message.Left.
+
+// A day of scene time, in seconds: 24 minutes
+pub const DAY_SECONDS f64 = 1440d;
+// The day clock's reading at scene time 0, and at dawn and dusk (hours)
+pub const START_HOUR f64 = 7d;
+pub const DAWN_HOUR f64 = 4.5d;
+pub const DUSK_HOUR f64 = 19.5d;
+// The x10 key's rate
+pub const FAST_RATE = 10u64;
+
+// The day clock's reading at scene time 'now': hours, 0 to 24
+pub fn hourAt(now f64) f64 {
+  imm h = START_HOUR + now * 24d / DAY_SECONDS;
+  h - libc.floor(h / 24d) * 24d;
+}
+
+// The first scene time at or after 0 at which the day clock reads 'hour'
+pub fn firstAt(hour f64) f64 {
+  mut d = hour - START_HOUR;
+  if d < 0d { d = d + 24d; }
+  d * DAY_SECONDS / 24d;
+}
+
+pub struct SceneClock {
+  pub ns u64;                 // scene time, nanoseconds
+  pub paused Bool;
+  pub fast Bool;              // running at FAST_RATE
+
+  pub fn start() SceneClock { new SceneClock(0u64, false, false); }
+
+  // How many nanoseconds of scene time a nanosecond of steps is
+  pub fn rate(self &) u64 { if paused { 0u64; } elif fast { FAST_RATE; } else { 1u64; }; }
+
+  // A fixed step of 'stepNs' taken
+  pub fn advance(self &mut, stepNs u64) { ns = ns + stepNs * self.rate(); }
+
+  // Scene time, seconds
+  pub fn seconds(self &) f64 { f64.from(ns) / 1.0e9d; }
+}
+
+// Whose a timer is
+const TIMER_SENDER = 0u32;
+const TIMER_DUSK = 1u32;
+const TIMER_DAWN = 2u32;
+
+struct TimerRow {
+  token u64;
+  everyNs i64;                // 0: once
+  kind u32;
+  id TimerId;
+  live Bool;
+}
+
+// The scene's timers: the wheel, and a row per timer armed (the wheel's
+// token is its row)
+pub struct Timers {
+  wheel Wheel;
+  rows List[TimerRow];
+  free List[u32];             // rows to reuse
+  due List[Expiry];
+  pub armed u64;
+  pub rung u64;
+
+  // Dusk and dawn armed, every day
+  pub fn make() Timers {
+    mut t = new Timers(Wheel.make(Instant.fromNanos(0i64)), List[TimerRow].empty(), List[u32].empty(),
+      List[Expiry].empty(), 0u64, 0u64);
+    imm day = nanosOf(DAY_SECONDS);
+    t.arm(TIMER_DUSK, 0u64, nanosOf(firstAt(DUSK_HOUR)), day);
+    t.arm(TIMER_DAWN, 0u64, nanosOf(firstAt(DAWN_HOUR)), day);
+    t;
+  }
+
+  // How many timers are armed
+  pub fn len(self &) usize { wheel.len(); }
+
+  // A timer of 'kind' armed for 'atNs' (repeating every 'everyNs' if above 0)
+  fn arm(self &mut, kind u32, token u64, atNs i64, everyNs i64) {
+    mut row = rows.len();
+    if free.len() > 0usize {
+      row = usize.from(*free[free.len() - 1usize]);
+      free.pop();
+    }
+    imm id = wheel.insert(Instant.fromNanos(atNs), u64.from(row));
+    imm r = new TimerRow(token, if everyNs > 0i64 { everyNs; } else { 0i64; }, kind, id, true);
+    if row == rows.len() { rows.push(r); } else { rows.set(row, r); }
+    armed = armed + 1u64;
+  }
+
+  fn retire(self &mut, row usize) {
+    imm r = &mut rows[row];
+    r.live = false;
+    free.push(u32.from(row));
+  }
+
+  // Every sender's timer armed with 'token' disarmed: how many
+  pub fn cancel(self &mut, token u64) usize {
+    mut n = 0usize;
+    mut i = 0usize;
+    while i < rows.len() {
+      imm r = *rows[i];
+      if r.live and r.kind == TIMER_SENDER and r.token == token {
+        wheel.cancel(r.id);
+        self.retire(i);
+        n = n + 1usize;
+      }
+      i = i + 1usize;
+    }
+    n;
+  }
+}
+
+// What an area is: a sphere (its radius in 'half.x') or a box (its half
+// sizes), about 'center', in its part's own frame
+pub const VOLUME_SPHERE = 0u32;
+pub const VOLUME_BOX = 1u32;
+
+pub struct Volume {
+  pub kind u32;
+  pub center Vec3;
+  pub half Vec3;
+
+  pub fn sphere(center Vec3, radius f32) Volume { new Volume(VOLUME_SPHERE, center, new Vec3(radius, radius, radius)); }
+  pub fn box(center Vec3, half Vec3) Volume { new Volume(VOLUME_BOX, center, half); }
+
+  // Whether point 'p' (in the volume's frame) is inside it, the surface included
+  pub fn contains(self &, p Vec3) Bool {
+    imm d = p - center;
+    if kind == VOLUME_SPHERE { return d.x * d.x + d.y * d.y + d.z * d.z <= half.x * half.x; }
+    libc.fabsf(d.x) <= half.x and libc.fabsf(d.y) <= half.y and libc.fabsf(d.z) <= half.z;
+  }
+}
+
+// An area's row: its volume, and the being inside it (none: nobody)
+pub struct AreaRow {
+  pub volume Volume;
+  pub inside PartId;
+}

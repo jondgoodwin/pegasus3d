@@ -4,10 +4,26 @@
 // slot and a generation, the pool package's Ref, so an id whose part has gone
 // is detected, never mistaken for whatever takes its slot next). What a part
 // IS lives elsewhere, in tables keyed by its id, each owned by the system the
-// aspect belongs to: the scene owns placement; the render system owns how a
-// part looks, its effects and the sky (rendersys.cone). Later systems
-// (physics, picking, behaviour) add tables of their own the same way, and a
-// part may be in any of them or none.
+// aspect belongs to: the scene owns placement (and the parent relation),
+// listeners, areas and timers; the render system owns how a part looks, its
+// effects and the sky (rendersys.cone). Later systems (physics, picking,
+// behaviour) add tables of their own the same way, and a part may be in any
+// of them or none.
+//
+// RESOURCES are ids from the same registry. A mesh or a material is defined
+// once (DefineMesh, DefineMaterial) and named by its id; a Show names a part's
+// mesh and material, so many parts share one mesh and one material. A
+// resource is not a part: it is never placed, shown or despawned, and it
+// lives as long as the scene (nothing releases one yet). One registry, many
+// tables: what kind of thing an id names is in its record.
+//
+// PLACEMENT IS A TREE. A part's Place is relative to its parent (a Parent
+// request names it; a part with none is placed in the world). The scene
+// keeps the placements ordered parents before children and composes world =
+// parent's world x local in one pass over what changed (placement.cone). A
+// despawned part takes its whole subtree with it. Nobody downstream walks
+// the tree: each frame the scene publishes every part's world matrix in a
+// Snapshot (snapshot.cone), which is what the render system draws from.
 //
 // CHANGES ARRIVE AS REQUESTS. Nothing outside a table's owner writes into it.
 // Whoever wants the scene changed (the browser's own shell, the baked-in
@@ -18,42 +34,63 @@
 // inbox, not what is sent.
 //
 // The one thing a sender does directly is RESERVE an id, so it can name the
-// part in the requests that follow (Bevy's Commands reserve an entity the
-// same way): the part is reserved, not yet live, until its Spawn is applied.
+// part (or the resource) in the requests that follow (Bevy's Commands
+// reserve an entity the same way): the part is reserved, not yet live, until
+// its Spawn is applied; a resource, until its Define is.
 //
 // MESSAGES GO THE OTHER WAY. What the browser tells a sender (a click on a
-// part it listens for: Request.Listen, then Message.Clicked) is posted into
-// the Door's mail by the browser, through the Scene, and the sender takes it
-// out when it next looks: a sender's own inbox, as an actor's would be.
+// part it listens for, a timer it armed, an area entered or left, dusk and
+// dawn: events.cone) is posted into the Door's mail by the browser, through
+// the Scene, and the sender takes it out when it next looks: a sender's own
+// inbox, as an actor's would be.
 //
 // A SENDER IS GIVEN THE DOOR, NOT THE SCENE. The Door holds the registry,
-// the inbox and the mail and offers only reserving ids, sending requests,
-// reading its mail and asking whether an id is still reserved; the
-// placement table, the listeners, posting and the apply
-// methods are the Scene's. This module is the privacy boundary (a member not
-// 'pub' is private to the module that declares its type), so a world handed
-// '&mut scene.door' cannot reach a table or apply anything, and the module is
-// its own (not a file of the browser's root) so that the browser and a world
-// can both reach it without an import loop. (It is called 'parts', not
-// 'scene', because the browser's scene is a global named 'scene'.)
+// the inbox and the mail and offers only reserving ids, defining resources,
+// sending requests, reading its mail and asking whether an id is still
+// reserved; the placement tree, the listeners, the areas, the timers,
+// posting and the apply methods are the Scene's. This module is the privacy
+// boundary (a member not 'pub' is private to the module that declares its
+// type), so a world handed '&mut scene.door' cannot reach a table or apply
+// anything, and the module is its own (not a file of the browser's root) so
+// that the browser and a world can both reach it without an import loop. (It
+// is called 'parts', not 'scene', because the browser's scene is a global
+// named 'scene'.)
+//
+// Its files:
+//   parts.cone       ids, the aspect table, looks, requests, messages, the Door, the Scene
+//   placement.cone   the placement tree: parents before children, world matrices
+//   events.cone      the scene's clock and the day, timers (on the timewheel), areas
+//   snapshot.cone    what the scene publishes each frame for drawing
 
 mod parts;
 
+import libc;
 import collections use *;
 import pool use *;
 import geomath use *;
 import mesh use Mesh;
 import render use Image;
 import vfx use Emitter;
+import controls use Pose;
+import time use Instant;
+import timewheel use Wheel, TimerId, Expiry;
 
-// What the registry holds for a part: its name, for people, and whether its
-// Spawn has been applied
+// What an id names
+pub const KIND_PART = 0u32;
+pub const KIND_MESH = 1u32;
+pub const KIND_MATERIAL = 2u32;
+
+// What the registry holds for an id: its name, for people, what kind of
+// thing it names, and whether its Spawn (or a resource's Define) has been
+// applied
 pub struct PartRecord {
   pub name String;
   pub live Bool;
+  pub kind u32;
 }
 
-// A part's id: a slot of the registry and which occupant of it
+// An id: a slot of the registry and which occupant of it. A part's id, and
+// (wrapped in MeshId or MaterialId) a resource's.
 pub struct PartId {
   pub key Ref[PartRecord];
 
@@ -61,6 +98,24 @@ pub struct PartId {
   pub fn isNone(self) Bool { key.isNone(); }
   pub fn slot(self) u32 { key.slot(); }
   pub fn `==`(self, other PartId) Bool { key == other.key; }
+}
+
+// A mesh resource's id
+pub struct MeshId {
+  pub id PartId;
+
+  pub fn none() MeshId { new MeshId(PartId.none()); }
+  pub fn isNone(self) Bool { id.isNone(); }
+  pub fn `==`(self, other MeshId) Bool { id == other.id; }
+}
+
+// A material resource's id
+pub struct MaterialId {
+  pub id PartId;
+
+  pub fn none() MaterialId { new MaterialId(PartId.none()); }
+  pub fn isNone(self) Bool { id.isNone(); }
+  pub fn `==`(self, other MaterialId) Bool { id == other.id; }
 }
 
 // No row: what 'Table.find' answers for a part not in the table
@@ -120,14 +175,25 @@ pub struct Table[T] {
     index.set(usize.from(id.slot()), 0u32);
     true;
   }
+
+  // Every row taken away; the index keeps its room
+  pub fn clear(self &mut) {
+    mut i = 0usize;
+    while i < ids.len() {
+      index.set(usize.from((*ids[i]).slot()), 0u32);
+      i = i + 1usize;
+    }
+    rows.clear();
+    ids.clear();
+  }
 }
 
 // How a part's surface looks: a colour (linear), a highlight, and
-// optionally a checkerboard of two shades of it. A Show may also carry a
+// optionally a checkerboard of two shades of it. A material may also carry a
 // painted image, which the colour then multiplies. A physical look is drawn
 // with render's physically based material instead (rough or glossy by its
-// roughness, which a Show's ORM map can vary across the surface, and bumpy
-// by a Show's normal map); the others with its Blinn-Phong one.
+// roughness, which the material's ORM map can vary across the surface, and
+// bumpy by its normal map); the others with its Blinn-Phong one.
 pub struct Look {
   pub color Color;
   pub specular f32;           // the highlight's strength; 0: none
@@ -185,28 +251,47 @@ pub enum Request {
     pub id PartId;
     pub name String;
   }
-  // Part 'id' goes, with every aspect it has; its id goes stale
+  // Part 'id' goes, with every aspect it has, and so does every part below
+  // it in the placement tree; their ids go stale
   pub struct Despawn {
     pub id PartId;
   }
-  // Part 'id' is placed at 'at', in the world's coordinates (metres, y up)
+  // Part 'id' is placed at 'at' in its parent's frame (in the world's, if it
+  // has no parent): metres, y up
   pub struct Place {
     pub id PartId;
     pub at Transform3;
   }
-  // Part 'id' is drawn as 'mesh' (moved in: the request owns it until the
-  // render system uploads it) with 'surface', and painted with 'paint' (an
-  // image read through the mesh's uvs, multiplied by the surface's colour;
-  // empty for none), and, if the surface is physical, by its 'maps'. A
-  // non-zero 'anchor' draws it under the viewer wherever the viewer is,
-  // moved only in steps of 'anchor' metres across the ground, so a ground
-  // of that period never ends
-  pub struct Show {
+  // Part 'id''s parent becomes 'parent' (PartId.none(): none, placed in the
+  // world). Its own placement is kept, now relative to the new parent; its
+  // subtree comes with it. Refused if 'parent' is 'id' or below it.
+  pub struct Parent {
     pub id PartId;
-    pub mesh Mesh;
+    pub parent PartId;
+  }
+  // Mesh 'mesh' (reserved by Door.defineMesh) is 'shape' (moved in: the
+  // request owns it until the render system uploads it)
+  pub struct DefineMesh {
+    pub mesh MeshId;
+    pub shape Mesh;
+  }
+  // Material 'material' is 'surface', painted with 'paint' (an image read
+  // through the mesh's uvs, multiplied by the surface's colour; empty for
+  // none) and, if the surface is physical, its 'maps'
+  pub struct DefineMaterial {
+    pub material MaterialId;
     pub surface Look;
     pub paint Image;
     pub maps Maps;
+  }
+  // Part 'id' is drawn as mesh 'mesh' in material 'material', both defined
+  // before. A non-zero 'anchor' draws it under the viewer wherever the
+  // viewer is, moved only in steps of 'anchor' metres across the ground, so
+  // a ground of that period never ends
+  pub struct Show {
+    pub id PartId;
+    pub mesh MeshId;
+    pub material MaterialId;
     pub anchor f32;
   }
   // Part 'id' gives off particles: each layer an emitter, at the part's
@@ -245,6 +330,25 @@ pub enum Request {
     pub id PartId;
     pub look SkyLook;
   }
+  // A timer on the scene's clock: at 'at' (the scene's seconds) the sender
+  // is posted Message.Rang with 'token', and then every 'every' seconds
+  // after if 'every' is above 0. A time already past rings at once.
+  pub struct Timer {
+    pub token u64;
+    pub at f64;
+    pub every f64;
+  }
+  // Every timer armed with 'token' disarmed: it never rings again
+  pub struct Cancel {
+    pub token u64;
+  }
+  // Part 'id' is an area: 'volume', in the part's own frame (it moves with
+  // the part). The possessed being coming into it is posted to the sender
+  // as Message.Entered, going out of it as Message.Left.
+  pub struct Area {
+    pub id PartId;
+    pub volume Volume;
+  }
   // Nothing: what an applied request's place holds once it is taken
   pub struct Done;
 }
@@ -259,19 +363,47 @@ pub enum Message {
   pub struct Clicked {
     pub id PartId;
   }
+  // The timer armed with 'token' rang, for the time 'at' it was set for
+  // (the scene's seconds; it is read at the first apply point at or after)
+  pub struct Rang {
+    pub token u64;
+    pub at f64;
+  }
+  // The day clock passed dusk (DUSK_HOUR), at the scene's time 'at'
+  pub struct Dusk {
+    pub at f64;
+  }
+  // The day clock passed dawn (DAWN_HOUR), at the scene's time 'at'
+  pub struct Dawn {
+    pub at f64;
+  }
+  // Being 'being' came into area 'area'
+  pub struct Entered {
+    pub area PartId;
+    pub being PartId;
+  }
+  // Being 'being' went out of area 'area'
+  pub struct Left {
+    pub area PartId;
+    pub being PartId;
+  }
   // Nothing: what a taken message's place holds
   pub struct Read;
 }
 
-// What a sender is given: reserving ids and sending requests, and reading
-// what it is told; nothing that reaches a table
+// What a sender is given: reserving ids, defining resources, sending
+// requests, and reading what it is told; nothing that reaches a table
 pub struct Door {
   registry Pool[PartRecord];
   inbox List[Request];
   mail List[Message];         // what the browser has told the sender, not yet read
   pub sent u64;               // requests sent through it, ever
+  pub meshes u64;             // meshes defined through it, ever
+  pub materials u64;          // materials defined through it, ever
 
-  pub fn empty() Door { new Door(Pool[PartRecord].empty(), List[Request].empty(), List[Message].empty(), 0u64); }
+  pub fn empty() Door {
+    new Door(Pool[PartRecord].empty(), List[Request].empty(), List[Message].empty(), 0u64, 0u64, 0u64);
+  }
 
   // What the browser has told the sender since it last looked, in order;
   // the mail is left empty
@@ -284,10 +416,10 @@ pub struct Door {
   // How many messages are waiting to be read
   pub fn unread(self &) usize { mail.len(); }
 
-  // A new id, reserved now so the requests that follow can name it; the
-  // part is live once its Spawn is applied
+  // A new part id, reserved now so the requests that follow can name it;
+  // the part is live once its Spawn is applied
   pub fn reserve(self &mut) PartId {
-    new PartId(registry.add(new PartRecord(String.empty(), false)));
+    new PartId(registry.add(new PartRecord(String.empty(), false, KIND_PART)));
   }
 
   // Send a request, to be applied at the frame's apply point
@@ -303,21 +435,56 @@ pub struct Door {
     id;
   }
 
-  // Whether part 'id' has been reserved and not yet despawned
+  // Reserve a part, send its Spawn, and put it under 'parent'
+  pub fn newChild(self &mut, name &[]u8, parent PartId) PartId {
+    imm id = self.newPart(name);
+    self.send(Request.Parent[id, parent]);
+    id;
+  }
+
+  // A mesh defined: its id reserved and its DefineMesh sent
+  pub fn defineMesh(self &mut, shape Mesh) MeshId {
+    imm id = new MeshId(new PartId(registry.add(new PartRecord(String.empty(), false, KIND_MESH))));
+    self.send(Request.DefineMesh[id, shape]);
+    meshes = meshes + 1u64;
+    id;
+  }
+
+  // A material defined: its id reserved and its DefineMaterial sent
+  pub fn defineMaterial(self &mut, surface Look, paint Image, maps Maps) MaterialId {
+    imm id = new MaterialId(new PartId(registry.add(new PartRecord(String.empty(), false, KIND_MATERIAL))));
+    self.send(Request.DefineMaterial[id, surface, paint, maps]);
+    materials = materials + 1u64;
+    id;
+  }
+
+  // A timer armed: 'token' posted back at the scene's time 'at'
+  pub fn timer(self &mut, token u64, at f64) { self.send(Request.Timer[token, at, 0d]); }
+
+  // A timer armed: 'token' posted back at 'at' and every 'every' seconds after
+  pub fn every(self &mut, token u64, at f64, every f64) { self.send(Request.Timer[token, at, every]); }
+
+  // Whether id 'id' has been reserved and not yet despawned
   pub fn isReserved(self &, id PartId) Bool { registry.alive(id.key); }
 }
 
-// The door, and the placement table
+// The door, and the scene's own tables: placement, listeners, areas, timers
+// and the scene's clock
 pub struct Scene {
   pub door Door;
-  placements Table[Transform3];
+  placements Placements;
   listeners Table[Bool];      // the parts whose clicks their sender wants
+  areas Table[AreaRow];       // the parts that are areas
+  timers Timers;
+  pub clock SceneClock;
   pub applied u64;            // requests applied
   pub refused u64;            // requests naming a part that is not live (gone, or never spawned)
   pub posted u64;             // messages posted to the Door, ever
+  resources usize;            // ids of the registry that are resources, not parts
 
   pub fn empty() Scene {
-    new Scene(Door.empty(), Table[Transform3].empty(), Table[Bool].empty(), 0u64, 0u64, 0u64);
+    new Scene(Door.empty(), Placements.empty(), Table[Bool].empty(), Table[AreaRow].empty(), Timers.make(),
+      SceneClock.start(), 0u64, 0u64, 0u64, 0usize);
   }
 
   // Tell the sender something, through its Door: the browser's, never a
@@ -358,56 +525,254 @@ pub struct Scene {
   // How many requests are waiting
   pub fn waiting(self &) usize { door.inbox.len(); }
 
-  // Whether part 'id' is live
+  // Whether part 'id' is live (a part, spawned, not despawned)
   pub fn isLive(self &, id PartId) Bool {
     if !door.registry.alive(id.key) { return false; }
-    door.registry[id.key].live;
+    imm rec = &door.registry[id.key];
+    rec.live and rec.kind == KIND_PART;
   }
 
-  // Whether part 'id' has been reserved and not yet despawned
+  // Whether mesh 'm' is defined
+  pub fn isMesh(self &, m MeshId) Bool {
+    if !door.registry.alive(m.id.key) { return false; }
+    imm rec = &door.registry[m.id.key];
+    rec.live and rec.kind == KIND_MESH;
+  }
+
+  // Whether material 'm' is defined
+  pub fn isMaterial(self &, m MaterialId) Bool {
+    if !door.registry.alive(m.id.key) { return false; }
+    imm rec = &door.registry[m.id.key];
+    rec.live and rec.kind == KIND_MATERIAL;
+  }
+
+  // Whether id 'id' has been reserved and not yet despawned
   pub fn isReserved(self &, id PartId) Bool { door.registry.alive(id.key); }
 
-  // How many parts are reserved or live
-  pub fn partCount(self &) usize { door.registry.len(); }
+  // How many parts are reserved or live (resources not counted)
+  pub fn partCount(self &) usize { door.registry.len() - resources; }
+
+  // How many resources (meshes and materials) are defined
+  pub fn resourceCount(self &) usize { resources; }
 
   // Whether part 'id' has a placement
   pub fn isPlaced(self &, id PartId) Bool { placements.find(id) != NO_ROW; }
+
+  // Part 'id''s parent, or none
+  pub fn parentOf(self &, id PartId) PartId { placements.parentOf(id); }
 
   // ---- What the scene applies itself ----
 
   pub fn applySpawn(self &mut, id PartId, name String) Bool {
     if !door.registry.alive(id.key) { refused = refused + 1u64; return false; }
     imm rec = &mut door.registry[id.key];
+    if rec.kind != KIND_PART { refused = refused + 1u64; return false; }
     rec.name = name;
     rec.live = true;
     applied = applied + 1u64;
     true;
   }
 
+  // A resource's Define, the scene's part of it: the id is now defined.
+  // False (and refused) if it is not a reserved resource of 'kind' or is
+  // defined already.
+  pub fn applyDefine(self &mut, id PartId, kind u32) Bool {
+    if !door.registry.alive(id.key) { refused = refused + 1u64; return false; }
+    imm rec = &mut door.registry[id.key];
+    if rec.kind != kind or rec.live { refused = refused + 1u64; return false; }
+    rec.live = true;
+    resources = resources + 1usize;
+    applied = applied + 1u64;
+    true;
+  }
+
   pub fn applyPlace(self &mut, id PartId, at Transform3) Bool {
     if !self.isLive(id) { refused = refused + 1u64; return false; }
-    placements.put(id, at);
+    placements.place(id, at);
     applied = applied + 1u64;
     true;
   }
 
-  // The scene's own part of a despawn: the placement and the id. The other
-  // systems drop their rows for it first.
-  pub fn applyDespawn(self &mut, id PartId) Bool {
-    if !door.registry.alive(id.key) { refused = refused + 1u64; return false; }
-    placements.remove(id);
-    listeners.remove(id);
-    door.registry.remove(id.key);
+  pub fn applyParent(self &mut, id PartId, parent PartId) Bool {
+    if !self.isLive(id) or !(parent.isNone() or self.isLive(parent)) {
+      refused = refused + 1u64;
+      return false;
+    }
+    if !placements.setParent(id, parent) { refused = refused + 1u64; return false; }
     applied = applied + 1u64;
     true;
   }
 
-  // Where part 'id' is, as a matrix: its placement, or where it was made
-  // (the origin) if it has none
-  pub fn worldMatrix(self &, id PartId) Mat4 {
-    imm row = placements.find(id);
-    if row == NO_ROW { return Mat4.identity(); }
-    imm t = *placements.rows[row];
-    Mat4.fromTrs(t.translation, t.rotation, t.scale);
+  // The scene's own part of a despawn: the subtree's placements, listeners,
+  // areas and ids. The ids that go are put in 'gone' (the part itself first),
+  // for the other systems to drop their rows for them.
+  pub fn applyDespawn(self &mut, id PartId, gone &mut List[PartId]) Bool {
+    if !door.registry.alive(id.key) or door.registry[id.key].kind != KIND_PART {
+      refused = refused + 1u64;
+      return false;
+    }
+    gone.push(id);
+    placements.removeSubtree(id, gone);
+    mut i = 0usize;
+    while i < gone.len() {
+      imm g = *gone[i];
+      listeners.remove(g);
+      areas.remove(g);
+      door.registry.remove(g.key);
+      i = i + 1usize;
+    }
+    applied = applied + 1u64;
+    true;
+  }
+
+  pub fn applyTimer(self &mut, token u64, at f64, every f64) Bool {
+    timers.arm(TIMER_SENDER, token, nanosOf(at), nanosOf(every));
+    applied = applied + 1u64;
+    true;
+  }
+
+  pub fn applyCancel(self &mut, token u64) Bool {
+    timers.cancel(token);
+    applied = applied + 1u64;
+    true;
+  }
+
+  pub fn applyArea(self &mut, id PartId, volume Volume) Bool {
+    if !self.isLive(id) { refused = refused + 1u64; return false; }
+    areas.put(id, new AreaRow(volume, PartId.none()));
+    applied = applied + 1u64;
+    true;
+  }
+
+  // Every world matrix brought up to date, in one pass over what changed
+  pub fn propagate(self &mut) { placements.propagate(); }
+
+  // Where part 'id' is, as a matrix: its world matrix as last propagated
+  // (the parent's world times its own placement), or the origin if it has
+  // no placement
+  pub fn worldMatrix(self &, id PartId) Mat4 { placements.worldOf(id); }
+
+  // World matrices recomputed by 'propagate', ever
+  pub fn recomputed(self &) u64 { placements.recomputed; }
+
+  // ---- The scene's clock, the day, timers and areas (events.cone) ----
+
+  // The scene's time, seconds
+  pub fn now(self &) f64 { clock.seconds(); }
+
+  // The day clock's reading now, hours
+  pub fn hour(self &) f64 { hourAt(clock.seconds()); }
+
+  // A fixed step of 'stepNs' taken: the scene's time moved on at its rate
+  pub fn advanceClock(self &mut, stepNs u64) { clock.advance(stepNs); }
+
+  // The pause key: scene time stops, or goes on
+  pub fn togglePause(self &mut) { clock.paused = !clock.paused; }
+
+  // The x10 key: scene time runs FAST_RATE times as fast, or as it was
+  pub fn toggleFast(self &mut) { clock.fast = !clock.fast; }
+
+  // How many timers are armed (the scene's own dusk and dawn among them)
+  pub fn timerCount(self &) usize { timers.len(); }
+
+  // Timers rung, ever
+  pub fn rung(self &) u64 { timers.rung; }
+
+  // Every timer due by the scene's time now rung: posted to the sender (a
+  // sender's as Rang, the scene's own as Dusk or Dawn), each repeating one
+  // armed again for its next time. How many rang.
+  pub fn ring(self &mut) usize {
+    imm now = Instant.fromNanos(i64.from(clock.ns));
+    mut due = List[Expiry].empty();
+    due <=> timers.due;
+    mut n = 0usize;
+    mut more = true;
+    while more {
+      due.clear();
+      timers.wheel.expired(now, &mut due);
+      more = due.len() > 0usize;
+      mut i = 0usize;
+      while i < due.len() {
+        imm e = *due[i];
+        imm row = usize.from(e.token);
+        imm r = *timers.rows[row];
+        imm atNs = e.deadline.nanos();
+        imm at = f64.from(atNs) / 1.0e9d;
+        if r.kind == TIMER_DUSK {
+          self.post(Message.Dusk[at]);
+        } elif r.kind == TIMER_DAWN {
+          self.post(Message.Dawn[at]);
+        } else {
+          self.post(Message.Rang[r.token, at]);
+        }
+        timers.rung = timers.rung + 1u64;
+        if r.everyNs > 0i64 {
+          // Again, a period on from the time it was set for (one already
+          // past rings in this same call, on the next round)
+          imm id = timers.wheel.insert(Instant.fromNanos(atNs + r.everyNs), e.token);
+          timers.rows.set(row, new TimerRow(r.token, r.everyNs, r.kind, id, true));
+        } else {
+          timers.retire(row);
+        }
+        n = n + 1usize;
+        i = i + 1usize;
+      }
+    }
+    due.clear();
+    due <=> timers.due;
+    n;
+  }
+
+  // The possessed being 'being', at 'at' in the world, tested against every
+  // area: coming into one posted as Entered, going out as Left (to the
+  // sender). An area holds one being at a time: another coming in moves the
+  // one inside out first.
+  pub fn sense(self &mut, being PartId, at Vec3) {
+    mut i = 0usize;
+    while i < areas.len() {
+      imm area = *areas.ids[i];
+      imm row = *areas.rows[i];
+      imm local = placements.worldOf(area).inverse() * at;
+      imm inside = row.volume.contains(local);
+      if inside and !(row.inside == being) {
+        if !row.inside.isNone() { self.post(Message.Left[area, row.inside]); }
+        self.post(Message.Entered[area, being]);
+        areas.rows.set(i, new AreaRow(row.volume, being));
+      } elif !inside and row.inside == being {
+        self.post(Message.Left[area, being]);
+        areas.rows.set(i, new AreaRow(row.volume, PartId.none()));
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // Whether area 'area' holds being 'being'
+  pub fn isInside(self &, area PartId, being PartId) Bool {
+    imm row = areas.find(area);
+    row != NO_ROW and areas.rows[row].inside == being;
+  }
+
+  // ---- Publishing ----
+
+  // The frame's snapshot (snapshot.cone), made in 'into' (the last one,
+  // handed back so its lists are reused): every placed part's world matrix
+  // as last propagated, the scene's time and the day, and the eye between
+  // 'eyeFrom' and 'eyeTo'
+  pub fn publish(self &, into Snapshot, eyeFrom Pose, eyeTo Pose) Snapshot {
+    mut s = into;
+    s.worlds.clear();
+    mut i = 0usize;
+    while i < placements.ids.len() {
+      s.worlds.put(*placements.ids[i], *placements.world[i]);
+      i = i + 1usize;
+    }
+    s.now = clock.seconds();
+    s.hour = hourAt(s.now);
+    s.eyeFrom = eyeFrom;
+    s.eyeTo = eyeTo;
+    s;
   }
 }
+
+// Seconds as whole nanoseconds
+pub fn nanosOf(s f64) i64 { i64.from(s * 1.0e9d + 0.5d); }
