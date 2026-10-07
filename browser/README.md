@@ -8,8 +8,9 @@ ferns and flowers, below) leads to a forest cottage (board and batten, a brick c
 eave wall) with twelve pathway lanterns in six pairs facing across its last 16 m and a black-figure amphora beside it
 with the horn-flower; on its porch a lathed chess rook and two clay pots of flowers stand by the door; a ball
 lies on the lawn where it was left; and behind the cottage, in the backyard, a hot-air balloon with its
-burner alight waits by a launch button, reached round the cottage's east end. Things move: the burner
-fires in bursts, and the button sends the balloon up (and, pressed again, brings it down). A click
+burner alight waits, reached round the cottage's east end, its basket open at the front to walk into.
+Things move: the burner fires in bursts, and the launch button in the basket sends the balloon on a
+2 2/3-minute ride up round the island and back, carrying whoever stands in the basket. A click
 picks what it lands on and highlights it. (Elizabeth's skeletal dragon starship, built from Cone's
 sculpt, vfx, sdf and sdfmesh packages, hovered outside the fence until the scene was assembled; its
 code stays in `src/dragonship/` and `gpu/` for a space scene, and nothing places it now.)
@@ -54,7 +55,7 @@ matrices. Each step Cone's
 skate, feet that roll heel, flat and toe, two-bone IK on the legs reaching each ankle to a place on the
 ground, the pelvis as high as the legs allow, the arms against the legs, and when standing, breathing
 and shifting weight. The body is a kinematic capsule on `groundHeight` (`src/ground.cone`: the island's,
-below) with gravity: a landing at 7 m/s or more (a 2.5 m drop) is
+below) or a platform's floor (the balloon's basket, `src/support.cone`) with gravity: a landing at 7 m/s or more (a 2.5 m drop) is
 HARD, the pelvis crouches, and the scene mails a `HardLanding` to the world; one above 10 m/s hurts the
 being's health, to nothing left at 24 m/s.
 
@@ -134,7 +135,7 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | Space | jump (a mannequin: 4.2 m/s up, 0.9 m) |
 | **V** | **first person or third person**: the camera at the mannequin's eyes socket, or 3.2 m behind it and above, looking at its chest |
 | **Tab** | possess the next mannequin: the controls and the camera go to it, and the one left behind stands |
-| Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button launches or lands the balloon |
+| Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button in the basket sends the balloon on its ride |
 | P | pause scene time, or start it again (the world's motions, the effects, the timers and the day stop; the walk does not) |
 | F | run scene time ten times as fast, or back to normal (for testing the day: dusk comes 50 s after the start instead of 12.5 min) |
 | F11 | fullscreen |
@@ -210,7 +211,14 @@ not move more than 1 cm, its skinned sole (skinned by render's CPU twin of the G
 1 cm of where the planted sole socket carries it, not sliding and on the ground, standing with both feet
 flat and level, the third-person camera 3.2 m behind
 and the first-person one at the eyes socket, and Tab possessing the other mannequin with the camera and
-the controls following it; and the sky (`src/skychecks.cone`): the sun at the clock's noon (36.0 degrees,
+the controls following it; platforms: a mannequin standing on a deck (under a scaled parent) that climbs and
+turns for 6 s stays on it, carried, its feet and planted heel within 1 mm of where they stood on it and its heading
+on it within 0.01 degree; the deck's -x and back walls stop it at its radius; walking out of its open side it falls
+at the deck's velocity plus its own, lands at sqrt(v0^2 + 2 g h), its health emptied, and 2 s later gets up on the
+landing beach; a walker outside a basket is stopped outside its back wall, steps up onto its floor through its open
+front, and does not stand on a floor lifted 3 m over it; the balloon's ride, on the baked island: 2 to 3 minutes, 120
+to 200 m up, no faster than 10 m/s nor turning faster than 10 degrees a second, its basket at least 22 m over the
+ground away from its spot, within 700 m of the island's middle, landing on its spot as it stood; and the sky (`src/skychecks.cone`): the sun at the clock's noon (36.0 degrees,
 due south), dusk and dawn (-0.84 degrees, its centre at the horizon), the sun below the horizon and the
 moon above it every quarter hour from 17:45 to 6:15, the light (noon: 81 000 lux and a few thousand nits of
 ambient; midnight: the moon's 0.18 lux, never black), the exposure (EV 15 at noon, -1 at night, only falling
@@ -237,11 +245,19 @@ it, brightened on coming near at night and dimmed on leaving, and off after dawn
 
 Last, from frame 1340 (`src/assembly.cone`), the plain walker lands on the beach again and the script steers it
 (W, A, D and Shift pushed into SDL's queue as it needs them) the whole way: the path to the steps with eight
-first-person pictures `walk-01` to `walk-08`; round the cottage's east end to the launch button, a click, the balloon rising
-(`balloon-ready`, `balloon-risen`) and a second click bringing it down onto its place; back to the steps at dusk
+first-person pictures `walk-01` to `walk-08`; round the cottage's east end to the boarding spot, facing the basket's open
+front (`balloon-ready`) and the burner close up (`ride-burner`); then the ride (`src/ridescript.cone`): Tab takes the
+first mannequin over, set down there; it walks in at the open front onto the basket's floor (checked on the platform,
+and the world told), turns about to face out, clicks the button on the back rail as the third person's camera shows
+it, and with V rides the whole flight in first person, `ride-01` to `ride-06` from its eyes at six waypoints and
+`ride-third` from outside the basket in the air (every frame its feet are checked to stay within 1 cm of where they
+stood on the floor and its heading on it within 0.1 degree; landed, the balloon on its spot as it stood); it walks out
+onto the lawn, back in, presses again, and at 70 m up walks off the open front: `fall-01` just off it, `fall-02`
+falling, `fall-03` landed (its speed against the drop, its health emptied), `fall-04` up again on the landing beach;
+the empty balloon finishes at x10 scene time and lands on its spot. Then the plain walker goes back to the steps at dusk
 (`dusk-steps`, `dusk-path`); a night walk up the path's last 45 m (`night-01` to `-03`); and the specimen maple at noon
 with the sun in front of and behind the eye (`maple-sun-ahead`, `maple-sun-behind`). Each phase prints what it
-measured (the walk's farthest distance from the path's centre, the balloon's rise and landing, the lamps' glow), and
+measured (the walk's farthest distance from the path's centre, the ride's, the fall's, the lamps' glow), and
 the run fails if one does not finish.
 
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
@@ -269,6 +285,7 @@ along the way when the first frame was presented and when every object was first
 | `src/parts/parts.cone` | the module `parts`: one id registry for parts and resources, aspect tables keyed by id, the requests and messages, the Door senders are given, and the Scene |
 | `src/parts/placement.cone` | the placement tree: parents before children, world matrices in one pass over what changed |
 | `src/parts/events.cone` | the scene's clock and the day, timers on the timewheel, areas |
+| `src/parts/platforms.cone` | platforms: a part's floor and walls, and how each moved since the last frame |
 | `src/parts/snapshot.cone` | what the scene publishes each frame for drawing |
 | `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list (render draws each batch as one instanced draw); a physical material is render's physically based one; a shaded one, a custom pipeline |
 | `src/look.cone` | the look: light in physical units (the sun in lux, the sky and glows in nits), the exposure from the sun's height (EV 15 at noon), AgX tone mapping and bloom through render's Post |
@@ -281,7 +298,9 @@ along the way when the first frame was presented and when every object was first
 | `src/ground.cone` | the ground's height under a point: the island's, the one function everything standing on the ground asks |
 | `src/walk.cone` | a walker's body on the ground, and the user's key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
-| `src/assembly.cone` | the scripted run's last part (frames 1340 on): the walk from the beach to the steps, the balloon's launch from the backyard, dusk at the steps and the night walk, steered by the script's own key events |
+| `src/assembly.cone` | the scripted run's last part (frames 1340 on): the walk from the beach to the steps, round to the balloon, dusk at the steps and the night walk, steered by the script's own key events |
+| `src/ridescript.cone` | the assembly's balloon ride: boarding, the ride, stepping out, the fall and getting up again |
+| `src/support.cone` | what a body stands on (the ground or a platform's floor), platforms' walls, and carrying the bodies on a moving platform |
 | `src/checks.cone` | the scene core's headless checks (`--checks`) |
 | `src/picking.cone` | the picking system: each mesh's triangles, which mesh each part is, and the ray a click casts |
 | `src/watch.cone` | the watched real-time run and the soak |
@@ -315,6 +334,7 @@ scene's inbox:
 | `Area` | a part is an area (a sphere or a box in its own frame): the possessed being coming in or going out is posted as `Entered` or `Left` |
 | `Glow` | a material gives off a radiance (nits) from now on: a lamp switched on, dimmed or off |
 | `Tint` | a part's colour and glow multiplied by a colour from now on: one lamp of many brightened |
+| `Platform` | a part is a platform: a level floor and walls in its own frame, which beings stand on and are carried by |
 
 Once a frame, at the publish phase, the scene actor applies the inbox in order, routing each request to
 the system that owns what it changes (render's moved on to the render actor, in the same order); a
@@ -332,8 +352,8 @@ system keeps the parts it draws in batches by (mesh, material), ready for instan
 **Placement is a tree.** The placement table is kept parents before children, so after the apply point
 the world matrices are composed (world = parent's world x local) in one pass from the first row that
 changed. The balloon is one tree: its envelope is the root, with the skirt, the cables, the burner frame
-(and under it the flame and the pilot light) and the basket (and under it the passengers) beneath, so
-launching it moves only the envelope. The renderer never walks the tree: each frame the scene publishes
+(and under it the burner's coil and valves, the flame and the pilot light) and the basket (and under it its
+rim and the launch button) beneath, so its ride moves only the envelope. The renderer never walks the tree: each frame the scene publishes
 a **snapshot** (`parts/snapshot.cone`), a plain struct of every placed part's world matrix, the scene's
 time, the day clock, the possessed being's eyes and the birds, and the draw phase works from that alone:
 the scene actor moves it to the render actor each frame, and render moves it back once it is presented.
@@ -348,11 +368,60 @@ or driven by another controller, without touching either (`src/being.cone`).
 10 (F); exact on the synthetic clock. A day is 24 minutes of it, the day clock reading 07:00 at the
 start, dusk at 17:28 (628.5 s) and dawn at 06:31 (1411.5 s), each posted to the world as `Dusk` and `Dawn`.
 Timers run on Cone's `timewheel`, driven by scene time. Each
-frame the world reads it and sends its motions as ordinary `Place` and `Fire` requests: the ball's
-height `1.6 |sin(pi t / 1.1)|` m and its spin, 3 rad/s; the button's cap sinking 3 cm for a quarter of
-a second when pressed; the balloon on the ground, its burner firing 3 s in every 4; pressed, rising at
-2.5 m/s with the burner held on to 30 m, then bobbing 0.6 m either way every 7 s with a 2 s burst every
-6 s; pressed again, the burner out, sinking at 1.5 m/s to land.
+frame the world reads it and sends its motions as ordinary `Place` and `Fire` requests: the button's cap
+sinking 2 cm for a quarter of a second when pressed; the balloon on the ground, its burner firing 3 s in
+every 4; pressed, its ride (below). (The ball lies still.)
+
+## The balloon ride
+
+**The basket** holds two standing mannequins: 1.9 m square inside, its wicker walls 1.1 m above its floor
+(the floor 0.12 m up, a step), a dark leather roll on each wall's top, and **open at the front** (its +z
+side, turned to face south-south-east down the lawn route's end), so a walker comes round the cottage's
+east end and steps straight in. The **burner** is one head, nothing pale or wood-toned, so it is not
+taken for a mannequin's head: a dark charcoal steel can (sRGB 44, 46, 50) on four spokes of a charcoal
+square frame 2.75 m above the floor (a 1.75 m figure's head is a metre under it), on uprights from the
+basket's corners; a copper coil (sRGB 150, 68, 36) wound five times round the can; brass valve fittings
+(sRGB 176, 136, 44): two valves on the spokes and a ring at the nozzle. The old two passengers' heads are
+gone. The **launch button** is a red cap on a charcoal mount inside the basket on the back rail, to the
+right of a rider facing out; the ground button is gone (its place in the world's table is kept as the
+*boarding spot*, where the lawn route ends: nothing stands there).
+
+**A part can be a platform** (`parts/platforms.cone`, the `Platform` request): a level floor and walls on
+any of its edges, in the part's own frame, so it moves with the part. The basket is one. The physics lives
+with the bodies in the scene actor (`src/support.cone`): a body stands on the highest of the ground and any
+floor over it no more than a step above its feet (a floor overhead is not one to stand on); a floor's walls
+stop a capsule from the side it came from (inside or out), while its height overlaps theirs; an edge with
+no wall stops nothing. Each frame, once the world's requests are applied and propagated, the scene asks
+how each platform moved since the frame before, and **carries** the bodies standing on it by that move:
+their feet's point, their heading, the gait's planted feet and the camera following the possessed one,
+turned about the platform's origin and moved with it (so a long ride does not drift), before the beings
+are placed, so a rider and its floor are drawn together. A body is held up only by the floor: a mannequin
+that walks off the open front falls, at the floor's velocity as well as its own, under the usual gravity
+and hard landings. A fall that empties its health (24 m/s, a 30 m drop) lays it down for 2 s; then it
+gets up whole on the landing beach. The fence holds only a body on or near the ground from inside it: a
+rider carried by the basket goes where it goes, and one that falls lands where it falls.
+
+**The ride** (`bakedworld/motions.cone`) is a centripetal Catmull-Rom spline through twelve waypoints,
+travelled by its length on the scene's clock in 160 s, easing from rest over 20 s, steady, and to rest
+over the last 20 s, turning as it goes so its open front faces each waypoint's view (a rider who walked in
+and turned about faces them all). Each press while it flies is ignored. The waypoints (x, height above
+the spot, z) and what the open front faces:
+
+| Waypoint | Where | Height | Facing |
+| --- | --- | --- | --- |
+| the spot | (-10, 300) | 0, then 25 straight up | as it stands, the cottage's back |
+| over the lawn | (25, 345) | 75 | the path, the beach and the cove |
+| east lowland | (90, 430) | 130 | the beach's curve, the cove, the south-west peninsula |
+| east shore | (70, 540) | 165 | west along the coast |
+| over the cove (the top) | (-40, 610) | 180 | north: the beach, path, cottage and the hill behind |
+| west coast | (-170, 560) | 170 | north-east over the lowland to the hill |
+| west lowland | (-200, 420) | 150 | east: the cottage, the cove, the south-east peninsula |
+| north-west | (-120, 300) | 110 | south-east over the cottage to the cove |
+| coming down | (-45, 278) | 55 | over the cottage's roof |
+| the spot | (-10, 300) | 25, then down | as it stands |
+
+The burner fires 3.2 s in every 5 on the climb to the top, 1.5 s every 20 s after, and not at all for the
+last 45 s as it sinks to land.
 
 **A click picks.** The picking system keeps a copy of each mesh's triangles (taken when its
 `DefineMesh` is applied) and which mesh each shown part is (not the anchored ground). A left click casts a ray from the eye through the
@@ -366,8 +435,8 @@ a click picks that part, the scene posts `Message.Clicked` into its mail for the
 the world actor with the world's turn at the publish phase of the same frame; the world reads it and
 answers with requests. The scene never reaches into the world, and the world never into the scene's
 tables. Timers (`Rang`), dusk and dawn, and areas (`Entered`,
-`Left`) come back the same way: the baked-in world sets an alarm for 3 s and keeps an area of 5 m
-about the launch button, and prints what it is told.
+`Left`) come back the same way: the baked-in world sets an alarm for 3 s and keeps an area over the
+inside of the balloon's basket, and prints what it is told.
 
 **A world is given a Door, not the scene.** The `parts` module keeps the registry, the inbox and the
 placement table private, and hands a sender a `Door`, which only reserves ids and sends requests. The
@@ -409,9 +478,9 @@ world actor's turn at the publish phase, so frames keep coming while the world a
 | flowers (16 clumps, six variants) | `leafrosette` | 0.4 m | 7,040 | 0.2 |
 | cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
 | path lanterns (twelve, six pairs 2.8 m apart, 3 m across: stake, glass, bulb, cap each, and a pool of light) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 17,712 with the pools | 0.24 |
-| hot-air balloon (envelope, skirt, burner frame, cables, basket, passengers) | `sculpt/examples/balloon.cone`, the chevrons | 25 m | 74,264 | 52 |
+| hot-air balloon (envelope, skirt, burner frame, cables, basket and rim, burner coil and valves, launch button) | `sculpt/examples/balloon.cone`, the chevrons; the basket (open-fronted, for two standing riders), the burner and the button new | 25 m | 77,200 | 51 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
-| launch button (pedestal, cap) | new: a box and a lathed disc; the cap listens for clicks | 1 m | 140 | 0.06 |
+| (launch button) | nothing now: the button is in the balloon's basket; the object keeps its place in the list | | 0 | |
 | ball | new: a sphere, checkered; it lies on the lawn where it was left | 1 m across | 1,984 | 0.03 |
 
 Not in this scene (their code stays): the chess rook (`sculptures.cone`'s `rookMesh`, a lathe and three
