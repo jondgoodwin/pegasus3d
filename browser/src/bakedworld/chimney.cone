@@ -140,6 +140,36 @@ struct BrickTexel {
   rough u8;
 }
 
+// What the sheet's texel (x, y) comes to; 'texel' is a texel's width in metres
+fn brickTexelAt(x i32, y i32, texel f32) BrickTexel {
+  imm py = (f32.from(y) + 0.5) * texel;
+  imm px = (f32.from(x) + 0.5) * texel;
+  imm m = masonryAt(px, py);
+  imm grain = noise.toSigned(noise.hash2(x, y, BRICK_SEED + 1u32).x);
+  imm mottle = noise.fbm2(new Vec2(px * 30., py * 30.), BRICK_SEED + 2u32, 3, 2., 0.5).value;
+  mut h = 0.;
+  mut c Array[f32, 3] = [0., 0., 0.];
+  mut rough = 0.95;
+  if m.mortar {
+    h = 0.06 * (0.5 + 0.5 * grain);
+    imm shade = 1. + 0.05 * grain + 0.06 * mottle;
+    c = [BRICK_SHADES[15usize] * shade, BRICK_SHADES[16usize] * shade, BRICK_SHADES[17usize] * shade];
+  } else {
+    h = smooth01(m.inside / ARRIS) * (0.97 + 0.03 * grain);
+    // One in fourteen darker; the rest one of four shades
+    imm pick = noise.toUnit(m.key);
+    imm which = if pick < 0.07 { 4usize; } else { usize.from(m.key % 4u32); };
+    imm shade = (1. + 0.06 * grain + 0.10 * mottle) * (0.94 + 0.12 * noise.toUnit(m.key >> 3u32));
+    c = [BRICK_SHADES[which * 3usize] * shade, BRICK_SHADES[which * 3usize + 1usize] * shade,
+      BRICK_SHADES[which * 3usize + 2usize] * shade];
+    rough = 0.82 + 0.1 * (1. - h);
+  }
+  // The mortar's recess shades the environment's light a little
+  new BrickTexel(h, u8.from(clampF(c[0usize], 0., 1.) * 255. + 0.5),
+    u8.from(clampF(c[1usize], 0., 1.) * 255. + 0.5), u8.from(clampF(c[2usize], 0., 1.) * 255. + 0.5),
+    u8.from((0.6 + 0.4 * h) * 255. + 0.5), u8.from(rough * 255. + 0.5));
+}
+
 // The sheet's colour (sRGB), normal and ORM maps
 fn brickMaps(colour &mut Image, normal &mut Image, orm &mut Image) {
   imm n = SHEET_TEXELS;
@@ -152,63 +182,22 @@ fn brickMaps(colour &mut Image, normal &mut Image, orm &mut Image) {
   col.resize(usize.from(n * n * 3), 0u8);
   mut occ = List[u8].withCapacity(usize.from(n * n * 3));
   occ.resize(usize.from(n * n * 3), 0u8);
-  // The first pass makes all of a texel's values at once, so it fills one
-  // buffer of them a row to a pass; a pass for each map then copies its own
-  // out, again a row to a pass.
+  // All of a texel's values come from the same samples, so one pass writes the
+  // height, colour and ORM maps together, a row of each to a pass (three
+  // buffers zipped); the normal map follows once the height is complete.
   imm row = usize.from(n);
-  mut texels = List[BrickTexel].withCapacity(row * row);
-  texels.resize(row * row, new BrickTexel(0., 0u8, 0u8, 0u8, 0u8, 0u8));
-  parallel each yy, line in texels.mutChunks(row).indexed() {
-    imm y = i32.from(yy);
-    imm py = (f32.from(y) + 0.5) * texel;
-    each xx, texelOut in line.mutItems().indexed() {
-      imm x = i32.from(xx);
-      imm px = (f32.from(x) + 0.5) * texel;
-      imm m = masonryAt(px, py);
-      imm grain = noise.toSigned(noise.hash2(x, y, BRICK_SEED + 1u32).x);
-      imm mottle = noise.fbm2(new Vec2(px * 30., py * 30.), BRICK_SEED + 2u32, 3, 2., 0.5).value;
-      mut h = 0.;
-      mut c Array[f32, 3] = [0., 0., 0.];
-      mut rough = 0.95;
-      if m.mortar {
-        h = 0.06 * (0.5 + 0.5 * grain);
-        imm shade = 1. + 0.05 * grain + 0.06 * mottle;
-        c = [BRICK_SHADES[15usize] * shade, BRICK_SHADES[16usize] * shade, BRICK_SHADES[17usize] * shade];
-      } else {
-        h = smooth01(m.inside / ARRIS) * (0.97 + 0.03 * grain);
-        // One in fourteen darker; the rest one of four shades
-        imm pick = noise.toUnit(m.key);
-        imm which = if pick < 0.07 { 4usize; } else { usize.from(m.key % 4u32); };
-        imm shade = (1. + 0.06 * grain + 0.10 * mottle) * (0.94 + 0.12 * noise.toUnit(m.key >> 3u32));
-        c = [BRICK_SHADES[which * 3usize] * shade, BRICK_SHADES[which * 3usize + 1usize] * shade,
-          BRICK_SHADES[which * 3usize + 2usize] * shade];
-        rough = 0.82 + 0.1 * (1. - h);
-      }
-      // The mortar's recess shades the environment's light a little
-      *texelOut = new BrickTexel(h, u8.from(clampF(c[0usize], 0., 1.) * 255. + 0.5),
-        u8.from(clampF(c[1usize], 0., 1.) * 255. + 0.5), u8.from(clampF(c[2usize], 0., 1.) * 255. + 0.5),
-        u8.from((0.6 + 0.4 * h) * 255. + 0.5), u8.from(rough * 255. + 0.5));
-    }
-  }
-  imm made = texels.view();
-  parallel each i, v in height.values.mutItems().indexed() {
-    *v = made[i].height;
-  }
-  parallel each y, line in col.mutChunks(row * 3usize).indexed() {
+  parallel each y, hRow, cRow, oRow in height.values.mutChunks(row).zip(col.mutChunks(row * 3usize)).zip(occ.mutChunks(row * 3usize)).indexed() {
     each x in 0usize < row {
-      imm t = made[y * row + x];
-      line[x * 3usize] = t.red;
-      line[x * 3usize + 1usize] = t.green;
-      line[x * 3usize + 2usize] = t.blue;
+      imm t = brickTexelAt(i32.from(x), i32.from(y), texel);
+      hRow[x] = t.height;
+      cRow[x * 3usize] = t.red;
+      cRow[x * 3usize + 1usize] = t.green;
+      cRow[x * 3usize + 2usize] = t.blue;
+      oRow[x * 3usize] = t.occlusion;
+      oRow[x * 3usize + 1usize] = t.rough;
     }
   }
-  parallel each y, line in occ.mutChunks(row * 3usize).indexed() {
-    each x in 0usize < row {
-      imm t = made[y * row + x];
-      line[x * 3usize] = t.occlusion;
-      line[x * 3usize + 1usize] = t.rough;
-    }
-  }
+  // The first pass makes all of a texel's values at once, so it fills one
   imm t1 = sdl.GetPerformanceCounter();
   // The normal map from the height: pbrmaterial's per-texel normal, the
   // height's 0 to 1 being MORTAR_DEPTH of the sheet's width

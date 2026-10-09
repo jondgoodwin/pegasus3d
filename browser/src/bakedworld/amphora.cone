@@ -260,12 +260,13 @@ fn vasePaint(u f32, s f32, r f32, y f32, marks &PaintMarks) u32 {
   GLAZE;                                                            // the foot
 }
 
-// What one texel of the paint comes to: its colour (sRGB bytes) and roughness
-struct VaseTexel {
-  red u8;
-  green u8;
-  blue u8;
-  rough u8;
+// The places on the outline of one row of the paint's two rows of samples:
+// the arc lengths 'sa' and 'sb', and the points 'pa' and 'pb' there
+struct VaseRow {
+  sa f32;
+  sb f32;
+  pa Vec2;
+  pb Vec2;
 }
 
 // The paint (sRGB) and the ORM map (occlusion 1, the colour's roughness,
@@ -280,20 +281,25 @@ fn vaseImages(outline &Outline, paint &mut Image, orm &mut Image) {
   colour.resize(usize.from(w * h * 3), 0u8);
   mut rough = List[u8].withCapacity(usize.from(w * h * 3));
   rough.resize(usize.from(w * h * 3), 0u8);
-  // A texel's paint and roughness come from the same samples, so the first pass
-  // fills one buffer of them a row to a pass, and a pass for each map then
-  // copies its own bytes out, again a row to a pass.
+  // A texel's paint and roughness come from the same samples, so one pass
+  // writes both maps, a row of each to a pass (two buffers zipped). The two
+  // rows of samples' places on the outline depend only on the row, so they are
+  // found once for each row beforehand.
   imm across = usize.from(w);
-  mut texels = List[VaseTexel].withCapacity(across * usize.from(h));
-  texels.resize(across * usize.from(h), new VaseTexel(0u8, 0u8, 0u8, 0u8));
-  parallel each yy, line in texels.mutChunks(across).indexed() {
-    imm y = i32.from(yy);
-    // The two rows of samples' places on the outline
-    imm sa = (f32.from(y) + 0.25) / f32.from(h) * outline.length;
-    imm sb = (f32.from(y) + 0.75) / f32.from(h) * outline.length;
-    imm pa = outline.at(sa);
-    imm pb = outline.at(sb);
-    each xx, texelOut in line.mutItems().indexed() {
+  mut rows = List[VaseRow].withCapacity(usize.from(h));
+  mut r = 0;
+  while r < h {
+    imm sa = (f32.from(r) + 0.25) / f32.from(h) * outline.length;
+    imm sb = (f32.from(r) + 0.75) / f32.from(h) * outline.length;
+    rows.push(new VaseRow(sa, sb, outline.at(sa), outline.at(sb)));
+    r = r + 1;
+  }
+  parallel each yy, colourRow, roughRow in colour.mutChunks(across * 3usize).zip(rough.mutChunks(across * 3usize)).indexed() {
+    imm sa = rows[yy].sa;
+    imm sb = rows[yy].sb;
+    imm pa = rows[yy].pa;
+    imm pb = rows[yy].pb;
+    each xx in 0usize < across {
       imm x = i32.from(xx);
       mut sum Array[f32, 4] = [0., 0., 0., 0.];
       mut k = 0;
@@ -307,25 +313,14 @@ fn vaseImages(outline &Outline, paint &mut Image, orm &mut Image) {
         sum[3usize] = sum[3usize] + VASE_ROUGHNESS[usize.from(c)];
         k = k + 1;
       }
-      *texelOut = new VaseTexel(u8.from(sum[0usize] * 0.25 * 255. + 0.5), u8.from(sum[1usize] * 0.25 * 255. + 0.5),
-        u8.from(sum[2usize] * 0.25 * 255. + 0.5), u8.from(sum[3usize] * 0.25 * 255. + 0.5));
+      colourRow[xx * 3usize] = u8.from(sum[0usize] * 0.25 * 255. + 0.5);
+      colourRow[xx * 3usize + 1usize] = u8.from(sum[1usize] * 0.25 * 255. + 0.5);
+      colourRow[xx * 3usize + 2usize] = u8.from(sum[2usize] * 0.25 * 255. + 0.5);
+      roughRow[xx * 3usize] = 255u8;
+      roughRow[xx * 3usize + 1usize] = u8.from(sum[3usize] * 0.25 * 255. + 0.5);
     }
   }
-  imm made = texels.view();
-  parallel each y, line in colour.mutChunks(across * 3usize).indexed() {
-    each x in 0usize < across {
-      imm t = made[y * across + x];
-      line[x * 3usize] = t.red;
-      line[x * 3usize + 1usize] = t.green;
-      line[x * 3usize + 2usize] = t.blue;
-    }
-  }
-  parallel each y, line in rough.mutChunks(across * 3usize).indexed() {
-    each x in 0usize < across {
-      line[x * 3usize] = 255u8;
-      line[x * 3usize + 1usize] = made[y * across + x].rough;
-    }
-  }
+  // A texel's paint and roughness come from the same samples, so the first pass
   *paint = new Image(w, h, 3, colour);
   *orm = new Image(w, h, 3, rough);
 }
