@@ -129,6 +129,17 @@ pub struct ChimneyStats {
 }
 mut chimneyStats ChimneyStats = new ChimneyStats(0d, 0d);
 
+// What one texel of the sheet comes to: its height, its colour (sRGB bytes) and
+// the ORM map's occlusion and roughness bytes
+struct BrickTexel {
+  height f32;
+  red u8;
+  green u8;
+  blue u8;
+  occlusion u8;
+  rough u8;
+}
+
 // The sheet's colour (sRGB), normal and ORM maps
 fn brickMaps(colour &mut Image, normal &mut Image, orm &mut Image) {
   imm n = SHEET_TEXELS;
@@ -141,14 +152,17 @@ fn brickMaps(colour &mut Image, normal &mut Image, orm &mut Image) {
   col.resize(usize.from(n * n * 3), 0u8);
   mut occ = List[u8].withCapacity(usize.from(n * n * 3));
   occ.resize(usize.from(n * n * 3), 0u8);
-  // each row of the parallel loops writes only its own texels, through raw pointers
-  imm heightOut = height.values.viewMut() as *f32;
-  imm colOut = col.viewMut() as *u8;
-  imm occOut = occ.viewMut() as *u8;
-  parallel each y in 0 < n {
+  // The first pass makes all of a texel's values at once, so it fills one
+  // buffer of them a row to a pass; a pass for each map then copies its own
+  // out, again a row to a pass.
+  imm row = usize.from(n);
+  mut texels = List[BrickTexel].withCapacity(row * row);
+  texels.resize(row * row, new BrickTexel(0., 0u8, 0u8, 0u8, 0u8, 0u8));
+  parallel each yy, line in texels.mutChunks(row).indexed() {
+    imm y = i32.from(yy);
     imm py = (f32.from(y) + 0.5) * texel;
-    mut x = 0;
-    while x < n {
+    each xx, texelOut in line.mutItems().indexed() {
+      imm x = i32.from(xx);
       imm px = (f32.from(x) + 0.5) * texel;
       imm m = masonryAt(px, py);
       imm grain = noise.toSigned(noise.hash2(x, y, BRICK_SEED + 1u32).x);
@@ -170,17 +184,29 @@ fn brickMaps(colour &mut Image, normal &mut Image, orm &mut Image) {
           BRICK_SHADES[which * 3usize + 2usize] * shade];
         rough = 0.82 + 0.1 * (1. - h);
       }
-      imm at = usize.from(y * n + x);
-      *(heightOut + at) = h;
-      mut i = 0usize;
-      while i < 3usize {
-        *(colOut + at * 3usize + i) = u8.from(clampF(c[i], 0., 1.) * 255. + 0.5);
-        i = i + 1usize;
-      }
       // The mortar's recess shades the environment's light a little
-      *(occOut + at * 3usize) = u8.from((0.6 + 0.4 * h) * 255. + 0.5);
-      *(occOut + at * 3usize + 1usize) = u8.from(rough * 255. + 0.5);
-      x = x + 1;
+      *texelOut = new BrickTexel(h, u8.from(clampF(c[0usize], 0., 1.) * 255. + 0.5),
+        u8.from(clampF(c[1usize], 0., 1.) * 255. + 0.5), u8.from(clampF(c[2usize], 0., 1.) * 255. + 0.5),
+        u8.from((0.6 + 0.4 * h) * 255. + 0.5), u8.from(rough * 255. + 0.5));
+    }
+  }
+  imm made = texels.view();
+  parallel each i, v in height.values.mutItems().indexed() {
+    *v = made[i].height;
+  }
+  parallel each y, line in col.mutChunks(row * 3usize).indexed() {
+    each x in 0usize < row {
+      imm t = made[y * row + x];
+      line[x * 3usize] = t.red;
+      line[x * 3usize + 1usize] = t.green;
+      line[x * 3usize + 2usize] = t.blue;
+    }
+  }
+  parallel each y, line in occ.mutChunks(row * 3usize).indexed() {
+    each x in 0usize < row {
+      imm t = made[y * row + x];
+      line[x * 3usize] = t.occlusion;
+      line[x * 3usize + 1usize] = t.rough;
     }
   }
   imm t1 = sdl.GetPerformanceCounter();
@@ -188,18 +214,14 @@ fn brickMaps(colour &mut Image, normal &mut Image, orm &mut Image) {
   // height's 0 to 1 being MORTAR_DEPTH of the sheet's width
   mut nor = List[u8].withCapacity(usize.from(n * n * 3));
   nor.resize(usize.from(n * n * 3), 0u8);
-  imm norOut = nor.viewMut() as *u8;
   imm depth = MORTAR_DEPTH / SHEET;
   imm heightIn = &height;
-  parallel each y in 0 < n {
-    mut x = 0;
-    while x < n {
-      imm nv = pbrmaterial.normalTexel(heightIn, x, y, depth);
-      imm at = usize.from(y * n + x) * 3usize;
-      *(norOut + at) = pbrmaterial.unitByte(nv.x * 0.5 + 0.5);
-      *(norOut + at + 1usize) = pbrmaterial.unitByte(nv.y * 0.5 + 0.5);
-      *(norOut + at + 2usize) = pbrmaterial.unitByte(nv.z * 0.5 + 0.5);
-      x = x + 1;
+  parallel each y, line in nor.mutChunks(row * 3usize).indexed() {
+    each x in 0usize < row {
+      imm nv = pbrmaterial.normalTexel(heightIn, i32.from(x), i32.from(y), depth);
+      line[x * 3usize] = pbrmaterial.unitByte(nv.x * 0.5 + 0.5);
+      line[x * 3usize + 1usize] = pbrmaterial.unitByte(nv.y * 0.5 + 0.5);
+      line[x * 3usize + 2usize] = pbrmaterial.unitByte(nv.z * 0.5 + 0.5);
     }
   }
   imm t2 = sdl.GetPerformanceCounter();
