@@ -1,0 +1,241 @@
+// The stone bridge over the brook, on the lawn route: one low segmental arch of rubble masonry, a small
+// packhorse bridge, its road running north-south (z) and the brook passing under it due west.
+// (Designed in Research/brook-and-bridge.md section 6; the choices there are the dimensions here.)
+//
+//   clear span        3.0 m (the abutments' faces at z +-1.5), springing 0.15 m over the water, rise 0.45 m
+//   the road          2.0 m over all, 1.4 m between the parapets; a flat crest 2.0 m long (z +-1) at 0.58 m
+//                     over the banks, then a ramp of 2.5 m each side (13 degrees) down to the bank at z +-3.5
+//   parapets          0.45 m high, 0.30 m thick, following the road, each capped by rough copings
+//
+// It is built flat-shaded from quads, as the cottage is (cottage.cone's ctQuad): the body (road, sides
+// and ends) in a lichened stone, the underside (the arch's soffit and the abutments' faces) in a mossier
+// one, and a parapet each side. Its frame: x across, y the world's height, z along the road; the root part
+// stands at (BRIDGE_X, 0, BRIDGE_Z). The collision solids (bridgeSolids) are built from the same numbers.
+
+pub const BRIDGE_X f32 = -7.;
+pub const BRIDGE_Z f32 = 314.4;
+
+pub const BRIDGE_HALF_W f32 = 1.0;        // the road's half width over all
+pub const BRIDGE_CREST f32 = 1.0;         // the flat crest runs to here, each way from the middle
+pub const BRIDGE_END f32 = 3.5;           // and the ramps to here
+pub const BRIDGE_CREST_UP f32 = 0.58;     // the crest over the banks
+pub const BRIDGE_SPAN f32 = 1.5;          // half the clear span
+pub const BRIDGE_PARAPET_H f32 = 0.45;
+pub const BRIDGE_PARAPET_T f32 = 0.30;
+const BRIDGE_RISE f32 = 0.45;
+const BRIDGE_SPRING f32 = 0.15;           // the springing over the water
+const BRIDGE_TILE f32 = 2.1;
+
+// The banks' height at the bridge (the lawn, either side of the trench)
+pub fn bridgeBank() f32 {
+  imm a = groundHeight(BRIDGE_X, BRIDGE_Z - 6.);
+  imm b = groundHeight(BRIDGE_X, BRIDGE_Z + 6.);
+  if a > b { a; } else { b; };
+}
+
+// The brook's water level under the bridge
+pub fn bridgeWater() f32 {
+  imm pts = brookPoints();
+  mut best = 1000000.;
+  mut w f32 = 0.;
+  mut k = 0usize;
+  while k < pts.len() {
+    imm d = (pts[k].x - BRIDGE_X) * (pts[k].x - BRIDGE_X) + (pts[k].z - BRIDGE_Z) * (pts[k].z - BRIDGE_Z);
+    if d < best { best = d; w = pts[k].w; }
+    k = k + 1usize;
+  }
+  w;
+}
+
+// The road's height at 'z' along it from the bridge's middle, over banks at 'bank'
+pub fn bridgeDeck(z f32, bank f32) f32 {
+  imm a = if z < 0. { 0. - z; } else { z; };
+  if a <= BRIDGE_CREST { return bank + BRIDGE_CREST_UP; }
+  if a >= BRIDGE_END { return bank; }
+  bank + BRIDGE_CREST_UP * (BRIDGE_END - a) / (BRIDGE_END - BRIDGE_CREST);
+}
+
+// The arch's underside at 'z' from the middle, springing at 'spring'
+fn bridgeArch(z f32, spring f32) f32 {
+  imm r = (BRIDGE_SPAN * BRIDGE_SPAN + BRIDGE_RISE * BRIDGE_RISE) / (2. * BRIDGE_RISE);
+  imm yc = spring + BRIDGE_RISE - r;
+  yc + (r * r - z * z).sqrt();
+}
+
+// The bridge's collision solids: the crest and the two ramps (their tops the road), and a parapet each
+// side of each (a wall 0.45 m over the road, itself sloped on the ramps), all standing from well below the water
+pub fn bridgeSolids(out &mut List[Solid]) {
+  imm bank = bridgeBank();
+  imm low = bridgeWater() - 1.;
+  imm x0 = BRIDGE_X - BRIDGE_HALF_W;
+  imm x1 = BRIDGE_X + BRIDGE_HALF_W;
+  imm crest = bank + BRIDGE_CREST_UP;
+  imm zc0 = BRIDGE_Z - BRIDGE_CREST;
+  imm zc1 = BRIDGE_Z + BRIDGE_CREST;
+  imm ze0 = BRIDGE_Z - BRIDGE_END;
+  imm ze1 = BRIDGE_Z + BRIDGE_END;
+  out.push(Solid.box(x0, zc0, x1, zc1, low, crest));
+  out.push(Solid.ramp(x0, ze0, x1, zc0, low, bank, crest, true));
+  out.push(Solid.ramp(x0, zc1, x1, ze1, low, crest, bank, true));
+  imm t = BRIDGE_PARAPET_T;
+  imm h = BRIDGE_PARAPET_H;
+  mut side = 0;
+  while side < 2 {
+    imm px0 = if side == 0 { x0; } else { x1 - t; };
+    imm px1 = if side == 0 { x0 + t; } else { x1; };
+    out.push(Solid.box(px0, zc0, px1, zc1, low, crest + h));
+    out.push(Solid.ramp(px0, ze0, px1, zc0, low, bank + h, crest + h, true));
+    out.push(Solid.ramp(px0, zc1, px1, ze1, low, crest + h, bank + h, true));
+    side = side + 1;
+  }
+}
+
+pub const BRIDGE_SOLIDS = 9usize;
+
+// ---- The meshes ----
+
+// The stations along the road: every quarter metre
+fn brStations() List[f32] {
+  mut out = List[f32].empty();
+  mut i = 0;
+  while i <= 28 {
+    out.push(0. - BRIDGE_END + f32.from(i) * 0.25);
+    i = i + 1;
+  }
+  out;
+}
+
+// The body: the road's top, the two sides (down to 'foot' under the banks, or the arch's underside inside the span)
+// and the two ends
+fn bridgeBody(bank f32, spring f32, foot f32) mesh.Mesh {
+  imm zs = brStations();
+  mut m = mesh.Mesh.empty();
+  imm w = BRIDGE_HALF_W;
+  mut i = 0usize;
+  while i + 1usize < zs.len() {
+    imm za = *zs[i];
+    imm zb = *zs[i + 1usize];
+    imm ya = bridgeDeck(za, bank);
+    imm yb = bridgeDeck(zb, bank);
+    // the top, facing up
+    ctQuad(&mut m, v(0. - w, ya, za), v(0. - w, yb, zb), v(w, yb, zb), v(w, ya, za), BRIDGE_TILE);
+    // the sides: the lower edge the foot outside the span, the arch's crown inside it
+    imm midz = (za + zb) * 0.5;
+    imm inside = (if midz < 0. { 0. - midz; } else { midz; }) < BRIDGE_SPAN;
+    imm la = if inside { bridgeArch(za, spring); } else { foot; };
+    imm lb = if inside { bridgeArch(zb, spring); } else { foot; };
+    // the +x side (facing +x), and the -x side
+    ctQuad(&mut m, v(w, la, za), v(w, ya, za), v(w, yb, zb), v(w, lb, zb), BRIDGE_TILE);
+    ctQuad(&mut m, v(0. - w, la, za), v(0. - w, lb, zb), v(0. - w, yb, zb), v(0. - w, ya, za), BRIDGE_TILE);
+    i = i + 1usize;
+  }
+  // the ends, at z = -3.5 (facing -z) and +3.5 (facing +z)
+  imm yEnd = bridgeDeck(BRIDGE_END, bank);
+  ctQuad(&mut m, v(0. - w, foot, 0. - BRIDGE_END), v(0. - w, yEnd, 0. - BRIDGE_END), v(w, yEnd, 0. - BRIDGE_END), v(w, foot, 0. - BRIDGE_END), BRIDGE_TILE);
+  ctQuad(&mut m, v(0. - w, foot, BRIDGE_END), v(w, foot, BRIDGE_END), v(w, yEnd, BRIDGE_END), v(0. - w, yEnd, BRIDGE_END), BRIDGE_TILE);
+  m;
+}
+
+// The underside: the arch's soffit (facing down) and the abutments' faces (the spring down to the foot, facing in)
+fn bridgeUnder(spring f32, foot f32) mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  imm w = BRIDGE_HALF_W;
+  imm n = 12;
+  mut i = 0;
+  while i < n {
+    imm za = 0. - BRIDGE_SPAN + 2. * BRIDGE_SPAN * f32.from(i) / f32.from(n);
+    imm zb = 0. - BRIDGE_SPAN + 2. * BRIDGE_SPAN * f32.from(i + 1) / f32.from(n);
+    ctQuad(&mut m, v(0. - w, bridgeArch(za, spring), za), v(w, bridgeArch(za, spring), za), v(w, bridgeArch(zb, spring), zb),
+      v(0. - w, bridgeArch(zb, spring), zb), BRIDGE_TILE);
+    i = i + 1;
+  }
+  // the abutments: at z = -1.5 facing +z, at z = +1.5 facing -z
+  ctQuad(&mut m, v(0. - w, foot, 0. - BRIDGE_SPAN), v(w, foot, 0. - BRIDGE_SPAN), v(w, spring, 0. - BRIDGE_SPAN), v(0. - w, spring, 0. - BRIDGE_SPAN), BRIDGE_TILE);
+  ctQuad(&mut m, v(0. - w, foot, BRIDGE_SPAN), v(0. - w, spring, BRIDGE_SPAN), v(w, spring, BRIDGE_SPAN), v(w, foot, BRIDGE_SPAN), BRIDGE_TILE);
+  m;
+}
+
+// A small hash to vary the copings
+fn brJitter(i i32, salt i32) f32 { noise.toUnit(noise.pcg(u32.from(i * 7919 + salt * 104729 + 17))); }
+
+// A parapet on one side ('side' 0: -x, 1: +x): the wall's sides and top and its ends, and its copings
+fn bridgeParapet(bank f32, side i32) mesh.Mesh {
+  imm zs = brStations();
+  mut m = mesh.Mesh.empty();
+  imm w = BRIDGE_HALF_W;
+  imm t = BRIDGE_PARAPET_T;
+  imm h = BRIDGE_PARAPET_H;
+  imm xo = if side == 0 { 0. - w; } else { w; };            // the outer face
+  imm xi = if side == 0 { 0. - w + t; } else { w - t; };    // the inner face
+  mut i = 0usize;
+  while i + 1usize < zs.len() {
+    imm za = *zs[i];
+    imm zb = *zs[i + 1usize];
+    imm ya = bridgeDeck(za, bank);
+    imm yb = bridgeDeck(zb, bank);
+    // the top, facing up
+    ctQuad(&mut m, v(xo, ya + h, za), v(xo, yb + h, zb), v(xi, yb + h, zb), v(xi, ya + h, za), BRIDGE_TILE);
+    // the faces: the inner one faces the road, the outer away from it
+    if side == 1 {
+      ctQuad(&mut m, v(xo, ya, za), v(xo, ya + h, za), v(xo, yb + h, zb), v(xo, yb, zb), BRIDGE_TILE);
+      ctQuad(&mut m, v(xi, ya, za), v(xi, yb, zb), v(xi, yb + h, zb), v(xi, ya + h, za), BRIDGE_TILE);
+    } else {
+      ctQuad(&mut m, v(xo, ya, za), v(xo, yb, zb), v(xo, yb + h, zb), v(xo, ya + h, za), BRIDGE_TILE);
+      ctQuad(&mut m, v(xi, ya, za), v(xi, ya + h, za), v(xi, yb + h, zb), v(xi, yb, zb), BRIDGE_TILE);
+    }
+    i = i + 1usize;
+  }
+  // the ends, facing along the road
+  imm yEnd = bridgeDeck(BRIDGE_END, bank);
+  ctQuad(&mut m, v(xo, yEnd, 0. - BRIDGE_END), v(xo, yEnd + h, 0. - BRIDGE_END), v(xi, yEnd + h, 0. - BRIDGE_END), v(xi, yEnd, 0. - BRIDGE_END), BRIDGE_TILE);
+  ctQuad(&mut m, v(xo, yEnd, BRIDGE_END), v(xi, yEnd, BRIDGE_END), v(xi, yEnd + h, BRIDGE_END), v(xo, yEnd + h, BRIDGE_END), BRIDGE_TILE);
+  // the copings: rough capstones 0.4 to 0.5 m long, a little wider than the wall, 0.1 to 0.13 m thick, laid along the road
+  mut z = 0. - BRIDGE_END;
+  mut c = 0;
+  while z < BRIDGE_END - 0.05 {
+    imm len = 0.4 + 0.1 * brJitter(c, side);
+    imm z1 = if z + len > BRIDGE_END { BRIDGE_END; } else { z + len; };
+    imm y0 = bridgeDeck(z, bank) + h - 0.01;
+    imm y1 = bridgeDeck(z1, bank) + h - 0.01;
+    imm over = 0.03 + 0.03 * brJitter(c, side + 5);
+    imm thick = 0.10 + 0.03 * brJitter(c, side + 9);
+    imm xa = (if side == 0 { xo - over; } else { xi - over; });
+    ctPara(&mut m, v(xa, y0, z), v(t + 2. * over, 0., 0.), v(0., thick, 0.), v(0., y1 - y0, z1 - z), BRIDGE_TILE);
+    z = z1 + 0.04;
+    c = c + 1;
+  }
+  m;
+}
+
+// A stone material for the bridge: rubble blocks about 0.35 m, lichened; the underside's mossier and darker
+fn bridgeStone(h &mut Hydrated, mossy bool) usize {
+  mut p = surfacepatterns.RockParams.granite(512, if mossy { 7312u32; } else { 7311u32; });
+  p.blockSize = 0.35;
+  p.relief = 0.06;
+  p.colorA = srgb(178., 168., 148.);
+  p.colorB = srgb(98., 90., 80.);
+  p.lichen = srgb(92., 122., 66.);
+  p.lichenAmount = if mossy { 0.85; } else { 0.45; };
+  if mossy {
+    p.colorA = srgb(120., 128., 104.);
+    p.colorB = srgb(58., 68., 54.);
+  }
+  mut tex = surfacepatterns.bakeRock(&p);
+  vegKitMaterial(h, &mut tex, white(), 0u32);
+}
+
+pub const BRIDGE_PARTS = 4usize;
+
+fn hydrateBridge(h &mut Hydrated) {
+  imm bank = bridgeBank();
+  imm water = bridgeWater();
+  imm spring = water + BRIDGE_SPRING;
+  imm foot = water - 0.5;
+  imm stone = bridgeStone(h, false);
+  imm moss = bridgeStone(h, true);
+  imm at = new Transform3(v(BRIDGE_X, 0., BRIDGE_Z), Quat.identity(), v(1., 1., 1.));
+  imm root = h.part("bridge", h.addMesh(bridgeBody(bank, spring, foot)), stone, TOP, at);
+  h.part("bridge underside", h.addMesh(bridgeUnder(spring, foot)), moss, root, Transform3.identity());
+  h.part("bridge parapet west", h.addMesh(bridgeParapet(bank, 0)), stone, root, Transform3.identity());
+  h.part("bridge parapet east", h.addMesh(bridgeParapet(bank, 1)), stone, root, Transform3.identity());
+}
