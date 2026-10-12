@@ -151,7 +151,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // The ripples run a little ahead of the water (2.2 times its speed) so that a stream reads as moving
     // from a walker's distance; bigger than a hand's width (0.6 m across, 1.2 m long) and a smaller layer
     float v = speed * (1.0 - 0.5 * across * across) * 2.2;
-    float fadeR = saturate(1.0 - dist / 45.0) * (1.0 - 0.6 * smoothstep(params.course.x - 16.0, params.course.x - 2.0, uv.y));
+    float fadeR = saturate(1.0 - dist / 45.0) * (1.0 - 0.97 * smoothstep(params.course.x - 16.0, params.course.x - 2.0, uv.y));
     float2 q1 = float2(uv.x / 0.60, (uv.y - v * t) / 1.2);
     float2 q2 = float2(uv.x / 0.28 + 7.0, (uv.y - 1.7 * v * t) / 0.55);
     float2 r1 = rippleSlope(q1) * float2(1.0 / 0.60, 1.0 / 1.2);
@@ -186,6 +186,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float mouth = smoothstep(params.course.x - 16.0, params.course.x - 2.0, uv.y);
     float braid = smoothstep(0.30, 0.60, vnoise(float2(uv.x * 1.9, uv.y * 0.55 - v * t * 0.2)) + 0.25 * vnoise(float2(uv.x * 5.0, uv.y * 0.9)));
     a *= lerp(1.0, 0.25 + 0.75 * braid, mouth * 0.85);
+    color *= 1.0 - 0.35 * mouth;
 
     // Foam, as lace: stretched along the current in streaks and bubbles, thick where the vertices say
     // (strong in the middle of a patch, ragged at its edge), drifting down at the water's own pace
