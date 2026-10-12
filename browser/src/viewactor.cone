@@ -1,0 +1,402 @@
+// The view actor: what each browser shows and picks from, run on the actors
+// package's workers. It owns the view's scene (parts/viewscene.cone: which
+// parts are live and the placement tree for drawing), the picking system
+// (picking.cone), the snapshot for render, and the render actor it draws
+// with. It holds no body, no timer, no area and no world: the truth is the
+// simulation's (simactor.cone), and this half only takes what the simulation
+// sends, over the message link (msglink.cone; what crosses is in simview.cone).
+// The camera it draws from is the simulation's eye, as sent; in single player
+// the view takes the simulation's state as it is, with no prediction and no
+// interpolation.
+//
+// ITS FRAME is one message from the shell, which it answers when the frame is
+// presented:
+//
+//   frame(input)  a click picked (and the part highlighted: the view's own),
+//                 and the frame's controls and the intents of each step put
+//                 in the link's outbox; the packet sent to the simulation; the
+//                 simulation's advance AWAITED (the halves take turns); the
+//                 simulation's packet, which arrived in the view's inbox
+//                 meanwhile, read: the requests applied in the order sent
+//                 (the placement tree, the picking system, and render's kept in
+//                 order), the beings placed and posed from the state, the
+//                 world matrices and THE SNAPSHOT published; the frame DRAWN,
+//                 awaited: the snapshot and render's requests moved to the
+//                 render actor, the snapshot moved back once presented; what
+//                 the view saw told to the simulation (endFrame, awaited),
+//                 which answers with what the shell reports; the shell told
+//
+//   finish()      the end of the run: the simulation's and the world's lines,
+//                 render's, the script's verdict, and the run's exit code to
+//                 the shell
+//
+// Nothing waits a frame: the simulation sends its packet to this actor before it
+// answers advance, so the packet is in this actor's inbox when the answer arrives.
+
+// What the shell hands the view each frame: its steps, the user's intents
+// and the keys and click of the frame, and the window's sizes
+pub struct FrameInput {
+  pub frame u64;
+  pub steps List[Step];       // the fixed steps due this frame, in order
+  pub intents Intents;        // the user's controller's, for the possessed being
+  pub lookKeys f32;           // PageUp 1 to PageDown -1: the view looks up or down
+  pub lookDrag f32;           // the view's pitch change this frame from the right-button drag, radians
+  pub pause bool;             // pressed this frame: P (pause), F (x10), V (first or third person), Tab (the next being)
+  pub fast bool;
+  pub view bool;
+  pub swap bool;
+  pub click bool;             // the left button pressed, at 'pointer'
+  pub pointer Vec2;
+  pub viewSize Vec2;          // the window in its own units (the pointer's)
+  pub alpha f32;              // the picture this far from the step before the last to the last
+  pub resized bool;           // the window changed size: 'width' by 'height' pixels
+  pub width u32;
+  pub height u32;
+}
+
+// What the view tells the shell once a frame is presented
+pub struct FrameReport {
+  pub simulateNs u64;         // the phases, as each actor timed its own
+  pub publishNs u64;
+  pub renderNs u64;
+  pub presentNs u64;
+  pub swapNs u64;             // the present phase's swapchain present and acquire
+  pub acquireNs u64;
+  pub status u32;             // the image acquired's status
+  pub you Walk;               // the possessed being's body
+  pub waiting usize;          // requests waiting after the apply point
+  pub parts usize;            // parts the scene has
+  pub rows usize;             // rows render draws, and particle emitters
+  pub emitters usize;
+  pub worldDone bool;         // every object of the world sent
+  pub worldSentFrame u64;     // the frame that sent its last; 0 before
+
+  // Nothing yet: what the shell holds until a report comes
+  pub fn none() FrameReport {
+    new FrameReport(0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u, Walk.make(new Vec3(0., 0., 0.), 0.), 0usize, 0usize, 0usize,
+      0usize, false, 0u64);
+  }
+}
+
+// Where a being was last placed from
+struct SentBody {
+  position Vec3;
+  yaw f32;
+}
+
+// The view actor's state
+pub struct ViewState {
+  pub scene ViewScene;
+  pub picks PickSystem;       // what each shown part is, for picking
+  pub picked PartId;          // the part highlighted: the last click's
+  pub lastPick PickHit;       // the last click's answer
+  pub clicks u64;
+  pub view Vec2;              // the window in its own units, as the shell last said
+  pub link UpLink;            // the message link's end on this side
+  pub yours PartId;           // the being this client possesses, as the simulation said
+  pub late u64;               // frames whose state did not arrive with the simulation's answer
+  lateNow bool;               // this frame's did not
+  snapshot Snapshot;          // the last published, handed back by render once drawn
+  forRender List[Request];    // render's share of this frame's requests, in order
+  sentBodies List[SentBody];  // each being as it was last placed
+  seq u64;                    // the last input sequence number given
+  recent List[InputSample];   // the last INPUT_KEPT ticks of intents
+  testFixed bool;             // a scripted run's, from the simulation
+  testView Pose;
+  testFov f32;
+  testShot String;
+
+  pub fn make() ViewState {
+    imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
+    new ViewState(ViewScene.empty(), PickSystem.empty(), PartId.none(), new PickHit(PartId.none(), 0., 0u32, 0u64),
+      0u64, new Vec2(HEADLESS_W, HEADLESS_H), UpLink.make(), PartId.none(), 0u64, false, Snapshot.empty(),
+      List[Request].empty(), List[SentBody].empty(), 0u64, List[InputSample].empty(), false, still, FOV, String.empty());
+  }
+
+  // ---- before the simulation's turn ----
+
+  // A click picked and the part highlighted, then the frame's controls and the
+  // intents of each of its steps into the link's outbox
+  fn beforeSim(self &mut, input &FrameInput) {
+    view = input.viewSize;
+    if input.lookDrag != 0. { link.tx.sendReliable(ToSim.Look(input.lookDrag)); }
+    if input.pause { link.tx.sendReliable(ToSim.Command(COMMAND_PAUSE)); }
+    if input.fast { link.tx.sendReliable(ToSim.Command(COMMAND_FAST)); }
+    if input.view { link.tx.sendReliable(ToSim.Command(COMMAND_VIEW)); }
+    if input.swap { link.tx.sendReliable(ToSim.Command(COMMAND_SWAP)); }
+    if input.click { self.click(input.pointer); }
+    // One sample a step; the last INPUT_KEPT sent every frame, newest last
+    mut i = 0usize;
+    while i < input.steps.len() {
+      seq = seq + 1u64;
+      recent.push(new InputSample(seq, input.intents, input.lookKeys));
+      i = i + 1usize;
+    }
+    while recent.len() > INPUT_KEPT {
+      mut keep = List[InputSample].empty();
+      mut q = 1usize;
+      while q < recent.len() { keep.push(*recent[q]); q = q + 1usize; }
+      recent <=> keep;
+    }
+    mut batch = List[InputSample].empty();
+    mut k = 0usize;
+    while k < recent.len() { batch.push(*recent[k]); k = k + 1usize; }
+    link.tx.sendLatest(STREAM_INPUT, InputData.Batch(batch));
+  }
+
+  // A click at 'pointer': the part it hits picked, reported and highlighted
+  // (the one before let go), and told to the simulation, which tells the
+  // part's sender if it listens for its clicks. The eye is where the last
+  // picture was drawn from: the snapshot render handed back.
+  fn click(self &mut, pointer Vec2) {
+    imm eye = snapshot.eyeTo;
+    imm ray = rayThrough(eye, FOV, pointer.x, pointer.y, view.x, view.y);
+    imm t0 = sdl.GetPerformanceCounter();
+    imm hit = picks.pick(&scene, ray);
+    imm us = f64.from(sdl.GetPerformanceCounter() - t0) / f64.from(sdl.GetPerformanceFrequency()) * 1.0e6d;
+    clicks = clicks + 1u64;
+    lastPick = hit;
+    print <- "Click at ("; print <- pointer.x; print <- ", "; print <- pointer.y; print <- "): ";
+    if hit.id.isNone() {
+      print <- "nothing";
+    } else {
+      imm name = scene.nameOf(hit.id);
+      printStr(name.view()); print <- ", "; print <- hit.distance; print <- " m away";
+    }
+    print <- " ("; print <- hit.boxesHit; print <- " boxes entered, "; print <- hit.triangles; print <- " triangles tested, ";
+    print <- us; print <- " us)\n";
+    if !picked.isNone() and !(picked == hit.id) { self.highlight(picked, false); }
+    if !hit.id.isNone() {
+      self.highlight(hit.id, true);
+      link.tx.sendReliable(ToSim.Click(hit.id));
+    }
+    picked = hit.id;
+  }
+
+  // Part 'id' drawn highlighted ('on') or as it is, if it is live
+  fn highlight(self &mut, id PartId, on bool) {
+    if scene.isLive(id) { forRender.push(Request.Highlight(id, on)); }
+  }
+
+  // ---- after the simulation's turn ----
+
+  // The simulation's packet read: its requests applied in the order sent,
+  // the beings placed and posed from the state, the world matrices and the
+  // snapshot for drawing
+  fn afterSim(self &mut) {
+    lateNow = true;
+    testFixed = false;
+    testFov = FOV;
+    mut reliable = link.rx.takeReliable();
+    imm rs = reliable.viewMut();
+    mut i = 0usize;
+    while i < rs.len {
+      mut m ToView = ToView.Nothing;
+      m <=> rs[i];
+      match &mut m {
+        case mut q &mut Requests {
+          mut batch = List[Request].empty();
+          batch <=> q.batch;
+          self.applyRequests(batch);
+        }
+        case mut p &mut Possessed { yours = p.being; }
+        else {}
+      }
+      i = i + 1usize;
+    }
+    mut notices = link.rx.takeNotices();
+    notices.clear();
+    mut latest = link.rx.takeLatest();
+    imm ls = latest.viewMut();
+    mut j = 0usize;
+    while j < ls.len {
+      mut data StateData = StateData.Nothing;
+      data <=> ls[j].value;
+      match &mut data {
+        case mut s &mut State {
+          lateNow = false;
+          imm w = &mut s.state;
+          // The beings placed where they are, and posed
+          self.placeBeings(&mut w.beings);
+          scene.propagate();
+          mut last = Snapshot.empty();
+          last <=> snapshot;
+          snapshot = scene.publish(last, w.now, w.hour, w.eyeFrom, w.eyeTo);
+          snapshot.birds <=> w.birds;
+        }
+        case mut t &mut Test {
+          testFixed = t.test.fixedView;
+          testView = t.test.view;
+          testFov = t.test.fov;
+          testShot = t.test.shot.copy();
+        }
+        else {}
+      }
+      j = j + 1usize;
+    }
+    if lateNow { late = late + 1u64; }
+    snapshot.fixedView = testFixed;
+    snapshot.fov = testFov;
+    if testFixed { snapshot.view = testView; }
+  }
+
+  // Apply every request the simulation sent, in the order sent: the
+  // placement tree and live parts here, the picking system's here, and
+  // render's moved on in the same order (forRender)
+  fn applyRequests(self &mut, batch List[Request]) {
+    mut b = batch;
+    imm requests = b.viewMut();
+    mut i = 0usize;
+    while i < requests.len {
+      mut r Request = Request.Done;
+      r <=> requests[i];
+      mut toRender = false;
+      match &mut r {
+        case mut s &mut Spawn {
+          mut name = String.empty();
+          name <=> s.name;
+          scene.applySpawn(s.id, name);
+        }
+        case mut p &mut Place { scene.applyPlace(p.id, p.at); }
+        case mut pa &mut Parent { scene.applyParent(pa.id, pa.parent); }
+        case mut d &mut Despawn {
+          // The part and its whole subtree: the scene's rows first, then
+          // every other system's for each part that went (render's as a
+          // Despawn of each, in order)
+          mut gone = List[PartId].empty();
+          if scene.applyDespawn(d.id, &mut gone) {
+            mut k = 0usize;
+            while k < gone.len() {
+              imm id = *gone[k];
+              picks.drop(id);
+              forRender.push(Request.Despawn(id));
+              k = k + 1usize;
+            }
+          }
+        }
+        case mut dm &mut DefineMesh {
+          // The picking system keeps its shape; the render system uploads it
+          picks.shape(dm.mesh, &dm.shape);
+          toRender = true;
+        }
+        case mut ds &mut DefineSkinnedMesh {
+          // Picked as modelled; drawn posed
+          picks.shape(ds.mesh, &ds.shape);
+          toRender = true;
+        }
+        case mut bn &mut Bones { toRender = true; }
+        case mut dl &mut DefineMaterial { toRender = true; }
+        case mut sh &mut Show {
+          // The picking system keeps which mesh it is (not the ground's: an
+          // anchored part is drawn wherever the viewer is)
+          if sh.anchor == 0. { picks.show(sh.id, sh.mesh); }
+          toRender = true;
+        }
+        case mut ef &mut Effect { toRender = true; }
+        case mut f &mut Fire { toRender = true; }
+        case mut gl &mut Glow { toRender = true; }
+        case mut tn &mut Tint { toRender = true; }
+        case mut k &mut Sky { toRender = true; }
+        else {}
+      }
+      if toRender { forRender.push(r); }
+      i = i + 1usize;
+    }
+  }
+
+  // Each being's part placed where the state says its body is, when it has
+  // moved, and each mannequin posed by the skinning matrices sent
+  fn placeBeings(self &mut, beings &mut List[BeingState]) {
+    imm bs = beings.viewMut();
+    mut i = 0usize;
+    while i < bs.len {
+      imm part = bs[i].part;
+      imm at = bs[i].position;
+      imm yaw = bs[i].yaw;
+      if i >= sentBodies.len() {
+        sentBodies.push(new SentBody(at, yaw));
+        scene.applyPlace(part, bodyPlacement(at, yaw));
+      } else {
+        imm was = *sentBodies[i];
+        if was.position.x != at.x or was.position.y != at.y or was.position.z != at.z or was.yaw != yaw {
+          sentBodies.set(i, new SentBody(at, yaw));
+          scene.applyPlace(part, bodyPlacement(at, yaw));
+        }
+      }
+      if bs[i].posed and scene.isLive(part) {
+        mut bones = List[Mat4].empty();
+        bones <=> bs[i].bones;
+        forRender.push(Request.Bones(part, bones));
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // What is moved to render for the frame: the snapshot and render's requests,
+  // and the name of a scripted view to save
+  fn drawOrder(self &mut, input &FrameInput) DrawOrder {
+    mut snap = Snapshot.empty();
+    snap <=> snapshot;
+    mut requests = List[Request].empty();
+    requests <=> forRender;
+    new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, testShot.copy());
+  }
+}
+
+actor ViewActor {
+  st ViewState;
+  sim SimActor;
+  render RenderActor;
+  frames Sender[FrameReport];  // the shell's: each frame presented
+  ended Sender[i32];           // the shell's: the run's exit code, at the end
+
+  // The view made, with the simulation and render actors named, and the
+  // shell's two inboxes; it joins the simulation over the link
+  fn init(self &new, sim SimActor, render RenderActor, frames Sender[FrameReport], ended Sender[i32]) {
+    mut state = ViewState.make();
+    state.link.tx.joined(1u32);
+    *self = new Self(state, sim, render, frames, ended);
+  }
+
+  // The link's packets from the simulation
+  pub async do link(self, packet Packet[ToView, StateData]) {
+    st.link.rx.accept(packet);
+  }
+
+  // The frame (above)
+  pub async do frame(self, input FrameInput) {
+    mut inp = input;
+    st.beforeSim(&inp);
+    imm up = st.link.tx.take();
+    sim.link(up);
+    mut steps = List[Step].empty();
+    steps <=> inp.steps;
+    imm adv = await sim.advance(new Advance(inp.frame, steps));
+    imm t1 = sdl.GetTicksNS();
+    st.afterSim();
+    imm order = st.drawOrder(&inp);
+    imm t2 = sdl.GetTicksNS();
+    imm shown = await render.draw(order);
+    mut p = shown;
+    p.snapshot <=> st.snapshot;
+    mut seen = RenderFacts.empty();
+    seen <=> p.facts;
+    imm end = await sim.endFrame(new ViewFacts(inp.frame, seen, st.picked, st.lastPick, st.clicks, st.view, p.shotFailed,
+      st.late > 0u64));
+    frames <- new FrameReport(adv.simulateNs, adv.publishNs + (t2 - t1), p.renderNs, p.presentNs, p.swapNs, p.acquireNs, p.status,
+      end.you, end.waiting, end.parts, p.rows, p.emitters, end.worldDone, end.worldSentFrame);
+  }
+
+  // The end of the run: the simulation's and the world's lines, the link's,
+  // render's, the script's verdict, and the exit code to the shell
+  pub async do finish(self, hasWindow bool) {
+    st.link.tx.left(1u32);
+    sim.link(st.link.tx.take());
+    imm reported = await sim.finishScene();
+    print <- "Link: "; print <- st.link.rx.packets; print <- " packets from the simulation, "; print <- st.link.rx.stale;
+    print <- " stale values dropped; "; print <- st.late; print <- " frames with the state late\n";
+    imm end = await render.finish(hasWindow);
+    imm code = await sim.verdict(end.clean);
+    ended <- code;
+  }
+}

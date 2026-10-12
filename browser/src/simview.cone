@@ -1,0 +1,159 @@
+// What crosses between the browser's two halves, the simulation (simactor.cone)
+// and the view (viewactor.cone), over the message link (msglink.cone). The
+// halves hold no state in common: everything one tells the other is one of
+// these, sent as a reliable message or as latest-wins data on a stream.
+//
+//   view -> simulation
+//     latest-wins, STREAM_INPUT   the last INPUT_KEPT ticks of this client's intents, each with
+//                                 its sequence number (so a lost packet loses nothing)
+//     reliable                    Click (a part picked: the simulation tells its listener),
+//                                 Command (pause, x10, first or third person, possess the
+//                                 next being), Look (the mouse's pitch change)
+//   simulation -> view
+//     reliable                    Requests (the world's, and the browser's own, which the
+//                                 simulation accepted, in the order applied), Possessed
+//                                 (which being is this client's)
+//     latest-wins, STREAM_STATE   the tick's snapshot: scene time, each being's state, the
+//                                 last input sequence applied
+//     latest-wins, STREAM_TEST    a scripted run's camera and the view's file name; a run's
+//                                 own, not the protocol's
+//
+// Notices (a client joined or left) are the link's own.
+
+// How many ticks of intents each input packet carries
+pub const INPUT_KEPT = 10usize;
+
+// The streams
+pub const STREAM_INPUT = 1u32;
+pub const STREAM_STATE = 2u32;
+pub const STREAM_TEST = 3u32;
+
+// The keys the view sends as commands
+pub const COMMAND_PAUSE = 0u32;    // P: scene time stops, or goes on
+pub const COMMAND_FAST = 1u32;     // F: scene time x10, or as it was
+pub const COMMAND_VIEW = 2u32;     // V: first or third person
+pub const COMMAND_SWAP = 3u32;     // Tab: possess the next being
+
+// ---- view -> simulation ----
+
+// One tick of the user's controller: what the possessed being means to do,
+// and the pitch keys held; numbered, rising by one a tick
+pub struct InputSample {
+  pub seq u64;
+  pub intents Intents;
+  pub lookKeys f32;
+}
+
+// Latest-wins on STREAM_INPUT
+pub enum InputData {
+  // The last INPUT_KEPT ticks, oldest first
+  pub struct Batch {
+    pub samples List[InputSample];
+  }
+  pub struct Nothing;
+}
+
+// Reliable
+pub enum ToSim {
+  // The click hit part 'part': its listener, if it has one, is told
+  pub struct Click {
+    pub part PartId;
+  }
+  // A key (COMMAND_...)
+  pub struct Command {
+    pub kind u32;
+  }
+  // The view's pitch changed by 'pitch' radians (a mouse drag)
+  pub struct Look {
+    pub pitch f32;
+  }
+  pub struct Nothing;
+}
+
+// ---- simulation -> view ----
+
+// One being as the tick's snapshot has it
+pub struct BeingState {
+  pub part PartId;
+  pub position Vec3;          // the feet
+  pub yaw f32;                // the heading, radians
+  pub velocity Vec3;          // m/s
+  pub intents Intents;        // the gait's intent: what it was last given
+  pub platform PartId;        // the platform it stands on; none: the ground, or the air
+  pub health f32;             // 1 whole
+  pub posed bool;             // has a skeleton (a mannequin): 'bones' follow
+  // The skinning matrices of the pose its gait wrote. TEMPORARY: the view will
+  // animate the gait itself, from the velocity and the intent; until it does
+  // (it needs the gait's planted-foot state, which the simulation keeps), the
+  // pose crosses as it is, so the pictures are as they were.
+  pub bones List[Mat4];
+}
+
+// Latest-wins on STREAM_STATE: the simulation's snapshot of a tick
+pub struct WorldState {
+  pub now f64;                // the scene's time, seconds
+  pub hour f64;               // the day clock's reading
+  pub appliedInput u64;       // the last input sequence number applied for this client
+  pub beings List[BeingState];
+  // TEMPORARY, as 'bones' is: the camera that follows the possessed being is
+  // run by the simulation (it follows the body step by step and is carried by
+  // a platform). It crosses as the eye at the last two steps.
+  pub eyeFrom Pose;
+  pub eyeTo Pose;
+  // TEMPORARY: the birds, as the simulation's flock left them. Each browser
+  // will fly its own (they are cosmetic).
+  pub birds List[BirdFrame];
+}
+
+// Latest-wins on STREAM_TEST: a scripted run's own
+pub struct TestView {
+  pub fixedView bool;         // drawn from 'view' through 'fov', not from the eyes
+  pub view Pose;
+  pub fov f32;
+  pub shot String;            // the view to save from this frame, by name; empty: none
+}
+
+pub enum StateData {
+  pub struct State {
+    pub state WorldState;
+  }
+  pub struct Test {
+    pub test TestView;
+  }
+  pub struct Nothing;
+}
+
+// Reliable
+pub enum ToView {
+  // The requests the simulation applied, in the order applied, that concern
+  // what the view keeps or draws. They are the world's own requests as hydrated
+  // (the world's objects are not yet spawned by name and hydrated in the view)
+  pub struct Requests {
+    pub batch List[Request];
+  }
+  // Being 'being' is this client's to possess
+  pub struct Possessed {
+    pub being PartId;
+  }
+  pub struct Nothing;
+}
+
+// The link's two ends, as each half holds them
+pub struct UpLink {
+  pub tx Outbox[ToSim, InputData];        // what the view sends
+  pub rx Inbox[ToView, StateData];        // what the view has received
+
+  pub fn make() UpLink { new UpLink(Outbox[ToSim, InputData].empty(), Inbox[ToView, StateData].empty()); }
+}
+
+pub struct DownLink {
+  pub tx Outbox[ToView, StateData];       // what the simulation sends
+  pub rx Inbox[ToSim, InputData];         // what the simulation has received
+
+  pub fn make() DownLink { new DownLink(Outbox[ToView, StateData].empty(), Inbox[ToSim, InputData].empty()); }
+}
+
+// The feet's place as a placement in the world, facing 'yaw'
+pub fn bodyPlacement(position Vec3, yaw f32) Transform3 {
+  new Transform3(position, Quat.angleAxis(yaw, new Vec3(0., 1., 0.)), new Vec3(1., 1., 1.));
+}

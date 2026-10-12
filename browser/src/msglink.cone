@@ -1,0 +1,202 @@
+// The message link: our stand-in for one connection between a client and a
+// server, so that single player runs through the seam a network connection
+// will use. Nothing here knows a socket, a packet size or a byte: a value
+// sent is the value received, delivered between two actors by an actor message
+// (the packet the sender takes out of its Outbox, which the receiving actor
+// puts in its Inbox).
+//
+// It is built to match the protocol package Cone is building (brief:
+// Incubator\Cone\Ruminations\brief-udp-game-protocol-2026-10-11.md, points 3,
+// 9 and 11 to 15), so that swapping the real package in is mechanical: the
+// same two kinds of data, and the same notices.
+//
+//   RELIABLE ORDERED MESSAGES   sendReliable(m): each arrives once, in the
+//                               order sent (the real package resends until
+//                               acked; here nothing is lost)
+//   LATEST-WINS DATA BY STREAM  sendLatest(stream, v): a newer value
+//                               supersedes an older one on the SAME stream
+//                               only, never on another; one that is stale
+//                               (an older sequence than the receiver has)
+//                               is dropped
+//   NOTICES                     joined(peer) and left(peer), which the real
+//                               package's connection actor tells its
+//                               application actor
+//
+// The real package's extras the application may ask for are not here: the
+// round-trip estimate (this link's is zero), a lossy or slow link, and
+// fragmenting a reliable message larger than a packet (brief points 12, 14, 15).
+//
+// A receiver reads in this order each time it looks: the notices, the
+// reliable messages in order, then the newest value of each stream.
+
+// Latest-wins data, as it travels: its stream, the sender's sequence number
+// (rising, so a stale one is told from a fresh one) and the value
+pub struct Latest[L] {
+  pub stream u32;
+  pub seq u64;
+  pub value L;
+}
+
+// Who came and who went
+pub enum Notice {
+  pub struct Joined {
+    pub peer u32;
+  }
+  pub struct Left {
+    pub peer u32;
+  }
+  // Nothing: what a taken notice's place holds
+  pub struct Read;
+}
+
+// What one delivery carries: the actor message between the two ends
+pub struct Packet[R, L] {
+  pub notices List[Notice];
+  pub reliable List[R];
+  pub latest List[Latest[L]];
+}
+
+// The sending end's queue: what the application sends is gathered here and
+// taken out whole to be sent to the peer as one message
+pub struct Outbox[R, L] {
+  notices List[Notice];
+  reliable List[R];
+  latest List[Latest[L]];
+  next u64;                   // the next sequence number
+
+  pub fn empty() Outbox[R, L] {
+    new Outbox[R, L](List[Notice].empty(), List[R].empty(), List[Latest[L]].empty(), 1u64);
+  }
+
+  pub fn joined(self &mut, peer u32) { notices.push(Notice.Joined(peer)); }
+  pub fn left(self &mut, peer u32) { notices.push(Notice.Left(peer)); }
+
+  // A reliable ordered message
+  pub fn sendReliable(self &mut, m R) { reliable.push(m); }
+
+  // Latest-wins data on 'stream': it replaces a value of the same stream not
+  // yet taken (it would be superseded on arrival), and no other stream's
+  pub fn sendLatest(self &mut, stream u32, v L) {
+    imm one = new Latest[L](stream, next, v);
+    next = next + 1u64;
+    mut i = 0usize;
+    while i < latest.len() and latest[i].stream != stream { i = i + 1usize; }
+    if i < latest.len() { latest.set(i, one); } else { latest.push(one); }
+  }
+
+  // Whether anything is waiting to be sent
+  pub fn pending(self &) bool { notices.len() > 0usize or reliable.len() > 0usize or latest.len() > 0usize; }
+
+  // Everything waiting, to be sent; the queue is left empty
+  pub fn take(self &mut) Packet[R, L] {
+    mut n = List[Notice].empty();
+    n <=> notices;
+    mut r = List[R].empty();
+    r <=> reliable;
+    mut l = List[Latest[L]].empty();
+    l <=> latest;
+    new Packet[R, L](n, r, l);
+  }
+}
+
+// The receiving end's queue: packets put in, and read by the application
+// actor in order
+pub struct Inbox[R, L] {
+  notices List[Notice];
+  reliable List[R];
+  latest List[Latest[L]];     // the newest of each stream, not yet read
+  seen List[Latest[u8]];      // each stream's newest sequence ever received (its value unused)
+  pub packets u64;            // packets received, ever
+  pub stale u64;              // latest-wins values dropped as older than one already received
+
+  pub fn empty() Inbox[R, L] {
+    new Inbox[R, L](List[Notice].empty(), List[R].empty(), List[Latest[L]].empty(), List[Latest[u8]].empty(), 0u64, 0u64);
+  }
+
+  // A packet received: its notices and reliable messages kept in order, and
+  // each latest-wins value kept if it is newer than its stream's
+  pub fn accept(self &mut, p Packet[R, L]) {
+    mut pk = p;
+    packets = packets + 1u64;
+    imm ns = pk.notices.viewMut();
+    mut i = 0usize;
+    while i < ns.len {
+      mut n Notice = Notice.Read;
+      n <=> ns[i];
+      notices.push(n);
+      i = i + 1usize;
+    }
+    // The reliable messages carry no placeholder of their own to swap in, so they are
+    // moved by popping them (last first) and putting them back in order
+    mut backwards = List[R].empty();
+    mut moved = List[R].empty();
+    moved <=> pk.reliable;
+    mut more = true;
+    while more {
+      match moved.pop() {
+        case imm m Some { backwards.push(m); }
+        else { more = false; }
+      }
+    }
+    mut k = backwards.len();
+    while k > 0usize {
+      k = k - 1usize;
+      match backwards.pop() {
+        case imm m Some { reliable.push(m); }
+        else {}
+      }
+    }
+    mut left = List[Latest[L]].empty();
+    left <=> pk.latest;
+    mut keep = true;
+    while keep {
+      match left.pop() {
+        case imm one Some { self.offer(one); }
+        else { keep = false; }
+      }
+    }
+  }
+
+  // One latest-wins value: kept if its sequence is newer than any received on
+  // its stream, replacing the one waiting; dropped (and counted) if not
+  fn offer(self &mut, one Latest[L]) {
+    mut s = 0usize;
+    while s < seen.len() and seen[s].stream != one.stream { s = s + 1usize; }
+    if s < seen.len() {
+      if seen[s].seq >= one.seq {
+        stale = stale + 1u64;
+        return;
+      }
+      seen.set(s, new Latest[u8](one.stream, one.seq, 0u8));
+    } else {
+      seen.push(new Latest[u8](one.stream, one.seq, 0u8));
+    }
+    mut i = 0usize;
+    while i < latest.len() and latest[i].stream != one.stream { i = i + 1usize; }
+    if i < latest.len() { latest.set(i, one); } else { latest.push(one); }
+  }
+
+  // Whether anything is waiting to be read
+  pub fn pending(self &) bool { notices.len() > 0usize or reliable.len() > 0usize or latest.len() > 0usize; }
+
+  // The notices since last read, in order; none are left
+  pub fn takeNotices(self &mut) List[Notice] {
+    mut out = List[Notice].empty();
+    out <=> notices;
+    out;
+  }
+
+  // The reliable messages since last read, in the order sent; none are left
+  pub fn takeReliable(self &mut) List[R] {
+    mut out = List[R].empty();
+    out <=> reliable;
+    out;
+  }
+
+  // The newest value of each stream since last read; none are left
+  pub fn takeLatest(self &mut) List[Latest[L]] {
+    mut out = List[Latest[L]].empty();
+    out <=> latest;
+    out;
+  }
+}
