@@ -1,0 +1,119 @@
+// One end of the protocol package's connections (netmsg), as the browser's
+// halves hold it: the events the connections tell, taken from a channel (the
+// connection actors put them there; the halves take them when they choose,
+// which is what keeps single player's frame the same every time), and the
+// connections to send through, by the id each carries (a server numbers its
+// clients from 1; a client's one connection is 1).
+//
+// THREE KINDS OF CONNECTION, one program. Single player joins the simulation
+// and the view in this process with netmsg's pairInProcess: every message is
+// delivered, in order, at once, with no packets. A server (--serve) listens on
+// a UDP port; a client (--connect) dials one. The halves are written once.
+//
+// What is sent here is counted (messages and bytes of payload), so that what a
+// client costs the server can be reported.
+
+pub struct NetPeer {
+  pub id u32;
+  pub conn Connection;
+  pub reliableSent u64;       // reliable messages sent to it
+  pub reliableBytes u64;      // their bytes (payload only, not the protocol's headers)
+  pub latestSent u64;
+  pub latestBytes u64;
+}
+
+pub struct NetSide {
+  pub peers List[NetPeer];
+  pub refused u64;            // sends the protocol refused (over one packet)
+  pub reliableSkipped u64;    // sends not made because the message was empty or too big to try
+  pub maxReliable usize;      // the largest reliable message sent (the limit is MAX_RELIABLE)
+  pub maxLatest usize;        // and the largest latest-wins value (MAX_LATEST)
+  pub maxItem usize;          // the largest single request put in one
+
+  pub fn make() NetSide {
+    new NetSide(List[NetPeer].empty(), 0u64, 0u64, 0usize, 0usize, 0usize);
+  }
+
+  // A connection opened: noted, to send through
+  pub fn open(self &mut, id u32, conn Connection) {
+    mut i = 0usize;
+    while i < peers.len() {
+      if peers[i].id == id {
+        peers.set(i, new NetPeer(id, conn, 0u64, 0u64, 0u64, 0u64));
+        return;
+      }
+      i = i + 1usize;
+    }
+    peers.push(new NetPeer(id, conn, 0u64, 0u64, 0u64, 0u64));
+  }
+
+  // A connection ended
+  pub fn close(self &mut, id u32) {
+    mut i = 0usize;
+    while i < peers.len() {
+      if peers[i].id == id {
+        peers.swap(i, peers.len() - 1usize);
+        peers.pop();
+        return;
+      }
+      i = i + 1usize;
+    }
+  }
+
+  pub fn has(self &, id u32) bool {
+    mut i = 0usize;
+    while i < peers.len() {
+      if peers[i].id == id { return true; }
+      i = i + 1usize;
+    }
+    false;
+  }
+
+  pub fn peer(self &, id u32) &NetPeer {
+    mut i = 0usize;
+    while i < peers.len() {
+      if peers[i].id == id { return peers[i]; }
+      i = i + 1usize;
+    }
+    peers[0usize];
+  }
+
+  fn find(self &, id u32) usize {
+    mut i = 0usize;
+    while i < peers.len() {
+      if peers[i].id == id { return i; }
+      i = i + 1usize;
+    }
+    NO_ROW;
+  }
+
+  // A reliable message to peer 'id'. One over a packet is not sent (counted)
+  pub fn sendReliable(self &mut, id u32, data List[u8]) {
+    imm k = self.find(id);
+    if k == NO_ROW or data.len() == 0usize { return; }
+    if data.len() > MAX_RELIABLE {
+      reliableSkipped = reliableSkipped + 1u64;
+      return;
+    }
+    if data.len() > maxReliable { maxReliable = data.len(); }
+    imm p = &mut peers[k];
+    p.reliableSent = p.reliableSent + 1u64;
+    p.reliableBytes = p.reliableBytes + u64.from(data.len());
+    p.conn.sendReliable(data);
+  }
+
+  // A latest-wins value on 'stream' to peer 'id'
+  pub fn sendLatest(self &mut, id u32, stream u32, data List[u8]) {
+    imm k = self.find(id);
+    if k == NO_ROW or data.len() == 0usize { return; }
+    if data.len() > MAX_LATEST {
+      reliableSkipped = reliableSkipped + 1u64;
+      return;
+    }
+    if data.len() > maxLatest { maxLatest = data.len(); }
+    imm p = &mut peers[k];
+    p.latestSent = p.latestSent + 1u64;
+    p.latestBytes = p.latestBytes + u64.from(data.len());
+    p.conn.sendLatest(u16.from(stream), data);
+  }
+}

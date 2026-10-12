@@ -1,0 +1,118 @@
+// The server and the test runs that go with it (browser.cone's modes):
+//
+//   --serve PORT     a headless simulation (no window, no GPU) listening on a UDP port, ticking at its own
+//                    fixed rate on the real clock, sending each client the world's requests and snapshots of the
+//                    beings. The same SimActor single player runs, with no view in this process.
+//   --impair LOSS LATENCY JITTER
+//                    with --serve: a relay in front of the server that loses LOSS in 1000 packets and delays each
+//                    by LATENCY ms and up to JITTER more, each way (netmsg's LossyRelay), for trying the
+//                    prediction and interpolation on a bad link; the port to connect to is printed
+//   --connect HOST:PORT
+//                    a browser (windowed, or --headless) whose simulation is remote
+//   --autowalk       the controller is a script, not the keyboard: a walk with turns, a run and a jump
+//   --trace          print what the test checks read (see browser/tools/netcheck.py)
+//   --run-for S      stop after S seconds of real time (any mode with a real clock)
+
+// The address 'text' ("a.b.c.d:port" or "localhost:port") as a socket address (an unreadable one is the local machine, port 0)
+fn parseAddress(text &str) SocketAddr {
+  imm b &Array[u8] = text;
+  mut octets = List[u32].empty();
+  mut cur = 0u32;
+  mut port = 0u32;
+  mut inPort = false;
+  mut digits = false;
+  mut i = 0usize;
+  while i < b.len {
+    imm c = b[i];
+    if c >= 48u8 and c <= 57u8 {
+      if inPort { port = port * 10u32 + u32.from(c - 48u8); } else { cur = cur * 10u32 + u32.from(c - 48u8); }
+      digits = true;
+    } elif c == 46u8 and !inPort {
+      octets.push(cur);
+      cur = 0u32;
+    } elif c == 58u8 and !inPort {
+      octets.push(cur);
+      inPort = true;
+      digits = false;
+    }
+    i = i + 1usize;
+  }
+  if octets.len() == 4usize {
+    return SocketAddr.v4(u8.from(*octets[0usize]), u8.from(*octets[1usize]), u8.from(*octets[2usize]), u8.from(*octets[3usize]), u16.from(port));
+  }
+  // "localhost:port" (or anything else without four numbers): this machine
+  SocketAddr.localhost(u16.from(port));
+}
+
+// The script a test's walker follows, by fixed step: stand, walk, walk turning left, run, jump, stand, back up, turn on the spot, stand
+pub fn autoIntents(n u64) Intents {
+  if n < 90u64 { return Intents.none(); }
+  if n < 450u64 { return new Intents(1., 0., false, false); }
+  if n < 510u64 { return new Intents(1., 1., false, false); }
+  if n < 750u64 { return new Intents(1., 0., true, false); }
+  if n < 770u64 { return new Intents(0., 0., false, true); }
+  if n < 830u64 { return Intents.none(); }
+  if n < 950u64 { return new Intents(-1., 0., false, false); }
+  if n < 1010u64 { return new Intents(0., -1., false, false); }
+  Intents.none();
+}
+
+// A server: the island baked, the simulation made, the port bound, and a tick at a time until the run is over
+fn serveRun(config Config) i32 {
+  mut host = Host.open(config);
+  if !host.isOpen() { return 1i32; }
+  imm birds = Birds.make();
+  bakeIsland();
+  vegetationLayout();
+  mut joinedTx Sender[bool];
+  mut joinedRx Receiver[bool];
+  joinedTx, joinedRx = Channel[bool].make();
+  mut servedTx Sender[u64];
+  mut servedRx Receiver[u64];
+  servedTx, servedRx = Channel[u64].make();
+  imm world = new WorldActor(false);
+  imm sim = new SimActor(false, birds, world, true, joinedTx, servedTx.clone());
+  imm simHandler = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [sim] { sim.onNet(ev); }));
+  imm bound = mustListen(SocketAddr.v4(0u8, 0u8, 0u8, 0u8, u16.from(servePort)), NetConfig.defaults(), simHandler);
+  print <- "Serving on UDP port "; print <- u32.from(bound.port); print <- "\n";
+  mut relayOpt Option[LossyRelay] = None;
+  if impairOn {
+    imm link = LinkConfig.lossy(impairLoss, i64.from(impairLatency), i64.from(impairJitter));
+    mut relay = startLossyRelay(SocketAddr.localhost(bound.port), link, link, 1u64);
+    print <- "Relay: port "; print <- u32.from(relay.port); print <- " ("; print <- impairLoss; print <- " per 1000 lost, ";
+    print <- impairLatency; print <- " ms and up to "; print <- impairJitter; print <- " more each way)\n";
+    relayOpt = Some[LossyRelay](relay);
+  }
+  print.flush();
+  imm start = sdl.GetTicksNS();
+  mut e = sdl.Event.empty();
+  while host.beginFrame() {
+    print.flush();
+    if runForSeconds > 0u64 and sdl.GetTicksNS() - start > runForSeconds * 1000000000u64 { break; }
+    while host.nextEvent(&mut e) {}
+    mut steps = List[Step].empty();
+    while host.fixed.next() {
+      steps.push(host.step());
+    }
+    if steps.len() > 0usize {
+      sim.serveTick(new Advance(host.frame, steps, 0u64, 0u64));
+      match servedRx.recv() {
+        case imm t Some {}
+        case is None[u64] { break; }
+      }
+    }
+    thread.sleep(Duration.fromMillis(2i64));
+  }
+  sim.serveEnd();
+  servedRx.recv();
+  match &mut relayOpt {
+    case mut r &mut Some { r.stop(); }
+    else {}
+  }
+  bound.endpoint.shutdown();
+  thread.sleep(Duration.fromMillis(300i64));
+  imm st = actors.stats();
+  print <- "Actors: "; print <- u64.from(st.workers); print <- " workers, "; print <- st.messages; print <- " messages\n";
+  host.finish();
+  0i32;
+}

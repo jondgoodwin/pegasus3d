@@ -90,6 +90,11 @@ import boidflock use Flock, FlockParams;
 import actors;
 import sync use Channel, Sender, Receiver;
 import path use Path;
+import thread;
+import time use Duration;
+import iocore use SocketAddr;
+import netmsg use NetEvent, EventHandler, Connection, Endpoint, NetConfig, LinkConfig, LossyRelay, eventHandler, pairInProcess, mustListen,
+  mustConnect, startLossyRelay;
 
 // The submodules: the scene's parts, ids, tables and requests (parts/), whose
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
@@ -128,6 +133,17 @@ mut scripted bool = false;
 mut shotsDir String;
 mut startedAt u64 = 0u64;     // the performance counter when main began
 mut worldShownAt u64 = 0u64;  // the counter once the frame that sent the world's last object was presented
+// The shared island's modes (server.cone)
+mut serveOn bool = false;     // --serve PORT
+mut servePort u32 = 0u32;
+mut connectTo String;         // --connect HOST:PORT
+mut runForSeconds u64 = 0u64; // --run-for S
+mut autoWalk bool = false;    // --autowalk
+mut traceOn bool = false;     // --trace
+mut impairOn bool = false;    // --impair LOSS LATENCY JITTER
+mut impairLoss u32 = 0u32;
+mut impairLatency u32 = 0u32;
+mut impairJitter u32 = 0u32;
 
 // The view a headless run picks in (no window to measure)
 const HEADLESS_W f32 = 1280.;
@@ -176,6 +192,7 @@ fn @initpure init() {
   user = UserController.bind(&mut ctx);
   clockKeys = ClockActions.bind(&mut ctx);
   shotsDir = String.empty();
+  connectTo = String.empty();
   probeFrom = new Vec3(0., 0., 0.);
   // The scripted run's own (script.cone, assembly.cone): touched only from the
   // scene actor's end of frame
@@ -261,6 +278,8 @@ fn shellRun(config Config) i32 {
   // Making it after the bake would lift the birds (a change to every view
   // with a bird in it), so it is left as it was; the scene actor steps it.
   imm birds = Birds.make();
+  // The view flies a flock of its own (cosmetic, and the same as the simulation's: both are made here)
+  imm viewBirds = Birds.make();
   // The island's land is baked first (the beings stand on it, the world
   // grows on it), here, before any actor starts: from then on it is only
   // read, by every actor
@@ -302,15 +321,62 @@ fn shellRun(config Config) i32 {
     case is None[bool] {}
   }
   if !ready { return 1i32; }
-  imm world = new WorldActor(scripted);
-  imm sim = new SimActor(scripted, birds, world);
-  imm view = new ViewActor(sim, render, framesTx, endTx);
-  // The two halves joined by the message link: the simulation is told its peer
-  // (the view tells it of itself with its first packet)
-  sim.connect(view);
+  // The connection: single player joins the simulation and the view in this process (netmsg's pairInProcess); connected,
+  // the view dials a server's UDP port and its simulation is there. What each end's connection tells comes to its
+  // actor as a message (onNet), in the order told
+  mut joinedTx Sender[bool];
+  mut joinedRx Receiver[bool];
+  joinedTx, joinedRx = Channel[bool].make();
+  imm connected = connectTo.len() > 0usize;
+  mut simOpt Option[SimActor] = None;
+  mut simOpt2 Option[SimActor] = None;
+  mut endpointOpt Option[Endpoint] = None;
+  mut joinsToWait = 1;
+  if !connected {
+    imm world = new WorldActor(scripted);
+    mut servedTx Sender[u64];
+    mut servedRx Receiver[u64];
+    servedTx, servedRx = Channel[u64].make();
+    imm sim = new SimActor(scripted, birds, world, false, joinedTx.clone(), servedTx);
+    simOpt = Some[SimActor](sim);
+    simOpt2 = Some[SimActor](sim);
+    joinsToWait = 2;
+  }
+  imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx);
+  imm viewHandler = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [view] { view.onNet(ev); }));
+  if connected {
+    imm addr = parseAddress(connectTo.view());
+    imm bound = mustConnect(addr, NetConfig.defaults(), viewHandler);
+    // (the other branch hands the same handler on)
+    endpointOpt = Some[Endpoint](bound.endpoint);
+    print <- "Connecting to "; printStr(connectTo.view()); print <- "\n";
+  }
+  if !connected {
+    // Single player: the simulation joins its connection to the view's
+    match &simOpt2 {
+      case imm s Some { s.wire(viewHandler); }
+      else {}
+    }
+  }
+  // Wait until the connection is open at both ends (the first frame has its client)
+  mut allJoined = true;
+  mut waited = 0;
+  while waited < joinsToWait {
+    match joinedRx.recv() {
+      case imm j Some { if !j { allJoined = false; } }
+      case is None[bool] { allJoined = false; }
+    }
+    waited = waited + 1;
+  }
+  if !allJoined {
+    print <- "The connection could not be opened\n";
+    return 1i32;
+  }
   if scripted { pushScript(1u64); }
+  imm runStart = sdl.GetTicksNS();
 
   while host.beginFrame() {
+    if runForSeconds > 0u64 and sdl.GetTicksNS() - runStart > runForSeconds * 1000000000u64 { break; }
     // Input: each event waiting into the input package (the window's own
     // already handled by frame's Host: quit, Escape, F11, a resize)
     host.beginPhase(PHASE_INPUT);
@@ -331,6 +397,7 @@ fn shellRun(config Config) i32 {
     // scene is handed: the user's controller's intents, the keys pressed,
     // a click, the window's sizes
     mut steps = List[Step].empty();
+    imm firstStep = host.fixed.taken;
     while host.fixed.next() {
       host.stats.steps = host.fixed.taken;
       steps.push(host.step());
@@ -344,7 +411,8 @@ fn shellRun(config Config) i32 {
       width = u32.from(s.w);
       height = u32.from(s.h);
     }
-    imm input = new FrameInput(host.frame, steps, user.intents(&ctx), user.lookKeys(&ctx), user.lookDrag(&ctx), ctx.pressed(clockKeys.pause),
+    imm intentsNow = if autoWalk { autoIntents(firstStep); } else { user.intents(&ctx); };
+    imm input = new FrameInput(host.frame, steps, intentsNow, user.lookKeys(&ctx), user.lookDrag(&ctx), ctx.pressed(clockKeys.pause),
       ctx.pressed(clockKeys.fast), ctx.pressed(clockKeys.weather), ctx.pressed(user.actions.view), ctx.pressed(user.actions.swap),
       (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u, new Vec2(inputState.pointer.x, inputState.pointer.y),
       viewSize(&mut host), alpha, resized, width, height);
@@ -378,6 +446,8 @@ fn shellRun(config Config) i32 {
       if watching() { watchTick(&mut host, &report.you, report.waiting, report.rows, report.emitters); }
       if soaking() { soakTick(&mut host, report.worldDone, report.parts, report.waiting, report.rows, report.emitters); }
     }
+    // A run with no window on the real clock would spin: it gives the processor back between frames
+    if !host.hasWindow() and !host.config.synthetic { thread.sleep(Duration.fromMillis(2i64)); }
   }
 
   // The end: the scene's, the world's and render's reports, in that order,
@@ -389,6 +459,12 @@ fn shellRun(config Config) i32 {
     case is None[i32] {}
   }
   if soaking() and soakReport() != 0i32 { code = 1i32; }
+  // A connection closed before the program ends: its socket's thread must stop before the actors' runtime does
+  match &endpointOpt {
+    case imm e Some { e.shutdown(); }
+    else {}
+  }
+  if connected { thread.sleep(Duration.fromMillis(300i64)); }
   imm st = actors.stats();
   print <- "Actors: "; print <- u64.from(st.workers); print <- " workers, "; print <- st.messages; print <- " messages in ";
   print <- st.activations; print <- " turns, "; print <- st.steals; print <- " steals\n";
@@ -434,8 +510,36 @@ fn main(argc i32, argv **u8) i32 {
       config.frames = soakFrames;
       config.synthetic = true;
       a = a + 1i32;
+    } elif libc.strcmp(arg, "--serve") == 0i32 and a + 1i32 < argc {
+      serveOn = true;
+      servePort = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
+      a = a + 1i32;
+    } elif libc.strcmp(arg, "--connect") == 0i32 and a + 1i32 < argc {
+      connectTo = String.fromCStr(*(argv + usize.from(a + 1i32)));
+      a = a + 1i32;
+    } elif libc.strcmp(arg, "--run-for") == 0i32 and a + 1i32 < argc {
+      runForSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
+      a = a + 1i32;
+    } elif libc.strcmp(arg, "--autowalk") == 0i32 {
+      autoWalk = true;
+    } elif libc.strcmp(arg, "--trace") == 0i32 {
+      traceOn = true;
+    } elif libc.strcmp(arg, "--impair") == 0i32 and a + 3i32 < argc {
+      impairOn = true;
+      impairLoss = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
+      impairLatency = u32.from(wholeNumber(*(argv + usize.from(a + 2i32))));
+      impairJitter = u32.from(wholeNumber(*(argv + usize.from(a + 3i32))));
+      a = a + 3i32;
     }
     a = a + 1i32;
+  }
+  // A server, and a client that has a window or not, run on the real clock (--headless alone would make it synthetic)
+  if serveOn or connectTo.len() > 0usize { config.synthetic = false; }
+  if serveOn {
+    config.headless = true;
+    imm served = serveRun(config);
+    finalAll();
+    return served;
   }
   if scripted {
     if config.frames == 0u64 {

@@ -300,12 +300,75 @@ the walk it moves is presented.
 Every run prints, at the end, each object's triangles and the time it took to hydrate and to send, and
 along the way when the first frame was presented and when every object was first on screen.
 
+## Playing together: one server, two browsers
+
+The browser is two programs in one: a **simulation** (the truth: the bodies, the platforms, the world's own
+code, the clock) and a **view** (what is drawn, picked and followed). Single player runs both in this
+process, joined by a connection of Cone's `netmsg` package (the in-process pair: the same messages, in the
+same order, with nothing lost); connected, the simulation is a server's and the view dials it over UDP.
+**The server owns the truth** (after Glenn Fiedler's *Gaffer On Games*):
+
+- **Content stays local.** Every browser has the baked-in world, the island and the mannequin's mesh in its
+  own program; none of it crosses. The server sends an `Object` request, which says *which* object and the
+  ids it reserved for its parts, meshes and materials, and the view builds it itself (so its meshes and
+  images are never in a packet: they would not fit in one). A client that joins late is told the objects
+  and where everything stands (the replay log).
+- **The user's own mannequin is predicted.** The view steps it at once by the same code the server runs (the
+  gait, the collision, the platforms) from each fixed step's intents, so it answers a key in the frame it is
+  pressed, whatever the link's delay. The intents go to the server numbered, the last 10 in every packet
+  (more, up to 30, while the server has not yet applied them), so a lost packet loses nothing. Each snapshot says
+  the last input the server applied; if the body the view predicted after that input is not where the server
+  has it, the view takes the server's, plays its unapplied inputs again, and blends the difference away over
+  0.1 s (a difference over 2 m at once). The camera follows this body, in the view.
+- **The others are drawn in the past.** Every other mannequin is drawn 100 ms behind (or, when the link
+  delivers fewer snapshots, behind enough to have two), on a cubic through the two snapshots either side of
+  that moment (with the velocities they carry), and its gait is animated in the view from the speed and heading.
+  The server's tick is estimated from each snapshot and the round-trip time netmsg measures.
+- **Local and cosmetic:** the birds (each browser flies its own flock), the camera, the gait, the day (a
+  function of scene time).
+
+```
+# the server: a headless simulation on a UDP port (no window, no GPU)
+browser.exe --serve 7777
+
+# each player, on this machine or another (a window each)
+browser.exe --connect 127.0.0.1:7777
+browser.exe --connect 127.0.0.1:7777
+```
+
+Each client that joins gets a mannequin of its own on the landing beach, and sees the others walk (the
+second, idle mannequin stands where it did). The keys are the keys above, except that **Tab** (possess the
+next being) does nothing connected, and **P**, **F** and **T** are the world's: any client changes the scene's
+clock and the weather for everyone. A click on the launch button in the basket sends the balloon off for all.
+A client that leaves takes its mannequin with it.
+
+**Across machines.** The server binds UDP on all its addresses, so another machine can connect to its
+address and port, *but the port must be opened on the server's host* (a firewall rule, and on a cloud VM its
+security group): nothing in this program opens one, and none has been opened. Until that is done, play is on
+one machine (127.0.0.1). There is no encryption or login (netmsg's handshake proves only that a client can
+receive at the address it gives).
+
+Options: `--run-for S` stops a run after S seconds of real time; `--headless` with `--connect` runs a client with no window or
+GPU; `--impair LOSS LATENCY JITTER` (with `--serve`) puts netmsg's lossy relay in front of the server and
+prints its port (LOSS in 1000, LATENCY and JITTER in ms, each way); `--autowalk` and `--trace` are the
+test's.
+
+**The test** (`tools/netcheck.py`, which runs a server and two headless clients on 127.0.0.1 and reads their
+traces): client A walks a script (a walk, a turn, a run, a jump, backing up), client B watches. It checks that
+A's predicted position agrees with the server's at every snapshot, that B's drawing of A follows A's server
+path within 0.3 m, and prints how far in the past B draws and the bandwidth each client uses.
+`python tools/netcheck.py` is the loopback run, and `python tools/netcheck.py --impair 50 100 20` the same through
+the relay with 5% of packets lost and 100 ms and up to 20 ms more each way.
+
 ## How it is put together
 
 | File | What it is |
 | --- | --- |
 | `src/browser.cone` | the shell, on the main thread: the window, input and the user's controller, the clock and the fixed steps (frame's `Host`), the statistics; it makes the three actors and hands the scene each frame (below) |
-| `src/sceneactor.cone` | the scene actor: the scene, the beings and possession, their bodies (the physics, for now), the birds' flock, picking; each frame's steps, the apply point and the snapshot |
+| `src/simactor.cone` | the simulation actor, the truth: the scene's registry and tables, the beings' bodies (the physics), the clients and their inputs, the world actor's turn, the requests and snapshots it tells each client; it runs in this process (single player) or alone (`--serve`) |
+| `src/viewactor.cone` | the view actor: the picking system, the placement tree and platforms for drawing, the snapshot for render; it predicts the being its user drives, interpolates the others, animates every gait, flies its own birds and follows with the camera |
+| `src/simview.cone`, `src/netcodec.cone` | what crosses between them, as values and as the bytes of netmsg's messages (quantised state, input batches, requests); round-trip tests in `src/netchecks.cone` |
+| `src/netlink.cone`, `src/replaylog.cone`, `src/server.cone` | the connections' two ends, what a late client is told, and `--serve` and its test script's controller |
 | `src/worldactor.cone` | the world actor: the world's own code (the baked-in world) behind a Door of its own, its turn once a frame |
 | `src/renderactor.cone` | the render actor: the device and everything on it; it applies render's requests, draws the snapshot and presents |
 | `src/parts/parts.cone` | the module `parts`: one id registry for parts and resources, aspect tables keyed by id, the requests and messages, the Door senders are given, and the Scene |

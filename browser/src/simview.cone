@@ -1,27 +1,38 @@
 // What crosses between the browser's two halves, the simulation (simactor.cone)
-// and the view (viewactor.cone), over the message link (msglink.cone). The
-// halves hold no state in common: everything one tells the other is one of
-// these, sent as a reliable message or as latest-wins data on a stream.
+// and the view (viewactor.cone): the messages, as values the halves use, and
+// (netcodec.cone) as the bytes the protocol package (netmsg) carries between
+// them, whether the halves are in one process (single player), or on either
+// end of a UDP connection (--serve and --connect). The halves hold no state in
+// common: everything one tells the other is one of these, sent as a reliable
+// message or as latest-wins data on a stream.
 //
 //   view -> simulation
 //     latest-wins, STREAM_INPUT   the last INPUT_KEPT ticks of this client's intents, each with
 //                                 its sequence number (so a lost packet loses nothing)
 //     reliable                    Click (a part picked: the simulation tells its listener),
-//                                 Command (pause, x10, first or third person, possess the
-//                                 next being), Look (the mouse's pitch change)
+//                                 Command (pause, x10, the weather, and, in single player,
+//                                 first or third person and possess the next being),
+//                                 Look (the mouse's pitch change; single player's mirror only)
 //   simulation -> view
-//     reliable                    Requests (the world's, and the browser's own, which the
-//                                 simulation accepted, in the order applied), Possessed
-//                                 (which being is this client's)
-//     latest-wins, STREAM_STATE   the tick's snapshot: scene time, each being's state, the
-//                                 last input sequence applied
+//     reliable                    Requests (the world's, and the browser's own, that the
+//                                 simulation accepted, in the order applied; the content every
+//                                 browser holds itself crosses as the Object that names it, not as
+//                                 meshes and images), Possessed (which being is this client's),
+//                                 Weather (when it changed)
+//     latest-wins, STREAM_STATE   the snapshot of a tick: the tick, scene time, each being's
+//                                 state, the last input sequence applied for this client
 //     latest-wins, STREAM_TEST    a scripted run's camera and the view's file name; a run's
 //                                 own, not the protocol's
 //
-// Notices (a client joined or left) are the link's own.
+// Nothing is sent that the view can work out: the bones (the view animates the
+// gait itself, from the state), the camera (the view's own, following the
+// being it drives), the birds (each browser flies its own flock), the hour
+// (the day clock is a function of scene time).
 
 // How many ticks of intents each input packet carries
 pub const INPUT_KEPT = 10usize;
+// ... and the most it carries when more are still waiting to be applied (a slow or lossy link)
+pub const INPUT_MOST = 30usize;
 
 // The streams
 pub const STREAM_INPUT = 1u32;
@@ -31,8 +42,8 @@ pub const STREAM_TEST = 3u32;
 // The keys the view sends as commands
 pub const COMMAND_PAUSE = 0u32;    // P: scene time stops, or goes on
 pub const COMMAND_FAST = 1u32;     // F: scene time x10, or as it was
-pub const COMMAND_VIEW = 2u32;     // V: first or third person
-pub const COMMAND_SWAP = 3u32;     // Tab: possess the next being
+pub const COMMAND_VIEW = 2u32;     // V: first or third person (single player: the simulation's mirror of the view's camera)
+pub const COMMAND_SWAP = 3u32;     // Tab: possess the next being (single player)
 pub const COMMAND_WEATHER = 4u32;  // T: the weather changes to the next state
 
 // ---- view -> simulation ----
@@ -43,15 +54,6 @@ pub struct InputSample {
   pub seq u64;
   pub intents Intents;
   pub lookKeys f32;
-}
-
-// Latest-wins on STREAM_INPUT
-pub enum InputData {
-  // The last INPUT_KEPT ticks, oldest first
-  pub struct Batch {
-    pub samples List[InputSample];
-  }
-  pub struct Nothing;
 }
 
 // Reliable
@@ -68,44 +70,48 @@ pub enum ToSim {
   pub struct Look {
     pub pitch f32;
   }
+  // Single player, where the halves take turns: the view's frame 'frame' has these fixed steps, and the
+  // simulation is to take them now (sent after the frame's inputs, so that they have all arrived)
+  pub struct Frame {
+    pub frame u64;
+    pub steps List[Step];
+  }
   pub struct Nothing;
 }
 
 // ---- simulation -> view ----
 
-// One being as the tick's snapshot has it
+// One being as the tick's snapshot has it. The kinematic state of its body,
+// all that is needed to predict it on (for the being the client drives), to
+// draw it interpolated, and to animate its gait from. 'exact' says the
+// numbers crossed whole (the being this client drives, which it compares its
+// own prediction with); otherwise positions crossed in millimetres, the
+// heading in 16 bits, and the speeds in fixed point.
 pub struct BeingState {
-  pub part PartId;
+  pub being u32;              // its number in the cast
+  pub exact bool;
   pub position Vec3;          // the feet
   pub yaw f32;                // the heading, radians
-  pub velocity Vec3;          // m/s
+  pub speed f32;              // along its heading, m/s
+  pub vy f32;                 // vertical speed, m/s
+  pub airVx f32;              // horizontal velocity while falling
+  pub airVz f32;
+  pub grounded bool;
   pub intents Intents;        // the gait's intent: what it was last given
   pub platform PartId;        // the platform it stands on; none: the ground, or the air
   pub health f32;             // 1 whole
-  pub posed bool;             // has a skeleton (a mannequin): 'bones' follow
-  // The skinning matrices of the pose its gait wrote. TEMPORARY: the view will
-  // animate the gait itself, from the velocity and the intent; until it does
-  // (it needs the gait's planted-foot state, which the simulation keeps), the
-  // pose crosses as it is, so the pictures are as they were.
-  pub bones List[Mat4];
+  pub respawns u32;           // times it has got up again at the landing (counted, mod 256)
+  pub landings u32;           // landings (mod 256), and the speed of the last
+  pub landSpeed f32;
 }
 
 // Latest-wins on STREAM_STATE: the simulation's snapshot of a tick
 pub struct WorldState {
+  pub tick u64;               // the simulation's fixed step, counted from the start
   pub now f64;                // the scene's time, seconds
-  pub hour f64;               // the day clock's reading
+  pub rate u32;               // the scene clock's rate (0 paused, 1, 10)
   pub appliedInput u64;       // the last input sequence number applied for this client
   pub beings List[BeingState];
-  // TEMPORARY, as 'bones' is: the camera that follows the possessed being is
-  // run by the simulation (it follows the body step by step and is carried by
-  // a platform). It crosses as the eye at the last two steps.
-  pub eyeFrom Pose;
-  pub eyeTo Pose;
-  // TEMPORARY: the birds, as the simulation's flock left them. Each browser
-  // will fly its own (they are cosmetic).
-  pub birds List[BirdFrame];
-  // The weather: the blend it left, the state it goes to and when (weather.cone)
-  pub weather Weathering;
 }
 
 // Latest-wins on STREAM_TEST: a scripted run's own
@@ -129,31 +135,26 @@ pub enum StateData {
 // Reliable
 pub enum ToView {
   // The requests the simulation applied, in the order applied, that concern
-  // what the view keeps or draws. They are the world's own requests as hydrated
-  // (the world's objects are not yet spawned by name and hydrated in the view)
+  // what the view keeps or draws
   pub struct Requests {
     pub batch List[Request];
   }
   // Being 'being' is this client's to possess
   pub struct Possessed {
-    pub being PartId;
+    pub being u32;
+  }
+  // The weather changed (weather.cone)
+  pub struct Weather {
+    pub weather Weathering;
+  }
+  // Single player: the simulation has taken the frame it was asked for, and sent everything it had to say about it
+  // (the snapshot of tick 'tick' among it); it spent this long on it, in nanoseconds
+  pub struct FrameDone {
+    pub tick u64;
+    pub simulateNs u64;
+    pub publishNs u64;
   }
   pub struct Nothing;
-}
-
-// The link's two ends, as each half holds them
-pub struct UpLink {
-  pub tx Outbox[ToSim, InputData];        // what the view sends
-  pub rx Inbox[ToView, StateData];        // what the view has received
-
-  pub fn make() UpLink { new UpLink(Outbox[ToSim, InputData].empty(), Inbox[ToView, StateData].empty()); }
-}
-
-pub struct DownLink {
-  pub tx Outbox[ToView, StateData];       // what the simulation sends
-  pub rx Inbox[ToSim, InputData];         // what the simulation has received
-
-  pub fn make() DownLink { new DownLink(Outbox[ToView, StateData].empty(), Inbox[ToSim, InputData].empty()); }
 }
 
 // The feet's place as a placement in the world, facing 'yaw'

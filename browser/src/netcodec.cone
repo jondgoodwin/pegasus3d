@@ -1,0 +1,915 @@
+// The messages as bytes: what simview.cone's values become on the wire, and
+// back. Every number is written most significant byte first (as netmsg's are).
+//
+// THE LIMITS. A message that must arrive (reliable) holds at most
+// MAX_RELIABLE bytes, a latest-wins value at most MAX_LATEST: one packet of
+// netmsg's, whose default is 1,200 bytes (a reliable message 1,173, a value
+// 1,171; fragmentation is not built). Nothing here may be bigger, and the
+// writers that can be (a batch of requests) cut their output into messages
+// that fit.
+//
+// QUANTISED STATE. A being's state crosses with positions in millimetres
+// against the island's bounds (a 24-bit number a coordinate, from
+// POS_ORIGIN_XZ and POS_ORIGIN_Y), the heading in 16 bits, and the speeds in
+// fixed point; the being the client drives crosses whole (32-bit floats), as
+// it is compared with the client's own prediction.
+//
+// A reader that is handed too few bytes, or nonsense, says so (ok is false)
+// and the message is dropped whole: no message from outside is trusted.
+
+// The most a reliable message, and a latest-wins value, may hold (netmsg's, for its default 1,200-byte packet)
+pub const MAX_RELIABLE = 1173usize;
+pub const MAX_LATEST = 1171usize;
+// Requests are cut into messages of at most this many bytes (a little under the limit, for an Object's tail)
+const REQUESTS_BYTES = 1100usize;
+
+// Where each coordinate's millimetres count from (metres), and how many millimetres make a metre
+pub const POS_ORIGIN_XZ f32 = -2048.;
+pub const POS_ORIGIN_Y f32 = -256.;
+const POS_MAX = 16777215.;
+
+// Message tags
+const TOSIM_CLICK = 1u32;
+const TOSIM_COMMAND = 2u32;
+const TOSIM_LOOK = 3u32;
+const TOSIM_FRAME = 4u32;
+const TOVIEW_FRAMEDONE = 4u32;
+const TOVIEW_REQUESTS = 1u32;
+const TOVIEW_POSSESSED = 2u32;
+const TOVIEW_WEATHER = 3u32;
+
+// Request tags
+const R_SPAWN = 1u32;
+const R_PLACE = 2u32;
+const R_PARENT = 3u32;
+const R_DESPAWN = 4u32;
+const R_SHOW = 5u32;
+const R_FIRE = 6u32;
+const R_GLOW = 7u32;
+const R_TINT = 8u32;
+const R_PLATFORM = 9u32;
+const R_OBJECT = 10u32;
+const R_BEING = 11u32;
+const R_LIGHT = 12u32;
+const R_SHADOW = 13u32;
+
+// ---- Writing ----
+
+pub fn w8(out &mut List[u8], v u32) { out.push(u8.from(v & 255u32)); }
+
+pub fn w16(out &mut List[u8], v u32) {
+  w8(out, v >> 8u32);
+  w8(out, v);
+}
+
+pub fn w24(out &mut List[u8], v u32) {
+  w8(out, v >> 16u32);
+  w8(out, v >> 8u32);
+  w8(out, v);
+}
+
+pub fn w32(out &mut List[u8], v u32) {
+  w8(out, v >> 24u32);
+  w8(out, v >> 16u32);
+  w8(out, v >> 8u32);
+  w8(out, v);
+}
+
+pub fn w64(out &mut List[u8], v u64) {
+  w32(out, u32.from(v >> 32u64));
+  w32(out, u32.from(v & 0xFFFFFFFFu64));
+}
+
+pub fn wF32(out &mut List[u8], f f32) { w32(out, f as u32); }
+
+pub fn wF64(out &mut List[u8], f f64) { w64(out, f as u64); }
+
+// A number of any size, 7 bits a byte, the least significant first, the top bit set on all but the last
+pub fn wVar(out &mut List[u8], v u32) {
+  mut x = v;
+  while x >= 128u32 {
+    w8(out, (x & 127u32) | 128u32);
+    x = x >> 7u32;
+  }
+  w8(out, x);
+}
+
+// A signed number in 'bytes' bytes (two's complement), clamped to what they hold
+fn wSigned(out &mut List[u8], n i32, bytes u32) {
+  imm u = n as u32;
+  if bytes == 1u32 { w8(out, u); } else { w16(out, u); }
+}
+
+// A number from -1 to 1 in one signed byte
+pub fn wUnit(out &mut List[u8], x f32) {
+  wSigned(out, clampInt(rounded(x * 127.), -127, 127), 1u32);
+}
+
+// A string: its length, then its bytes
+pub fn wStr(out &mut List[u8], s &str) {
+  imm b &Array[u8] = s;
+  wVar(out, u32.from(b.len));
+  mut i = 0usize;
+  while i < b.len {
+    out.push(b[i]);
+    i = i + 1usize;
+  }
+}
+
+pub fn wId(out &mut List[u8], id PartId) {
+  wVar(out, id.key.slot());
+  wVar(out, id.key.generation());
+}
+
+pub fn wVec3(out &mut List[u8], v Vec3) {
+  wF32(out, v.x);
+  wF32(out, v.y);
+  wF32(out, v.z);
+}
+
+pub fn wColor(out &mut List[u8], c Color) {
+  wF32(out, c.red);
+  wF32(out, c.green);
+  wF32(out, c.blue);
+  wF32(out, c.alpha);
+}
+
+// A list of ids as runs of consecutive slots in one generation: how many runs, then each run's first slot, generation and length
+pub fn wIds(out &mut List[u8], ids &List[PartId]) {
+  mut runs = List[u32].empty();                // slot, generation, length for each
+  mut i = 0usize;
+  while i < ids.len() {
+    imm id = *ids[i];
+    imm n = runs.len();
+    if n >= 3usize and *runs[n - 2usize] == id.key.generation() and *runs[n - 3usize] + *runs[n - 1usize] == id.key.slot() {
+      runs.set(n - 1usize, *runs[n - 1usize] + 1u32);
+    } else {
+      runs.push(id.key.slot());
+      runs.push(id.key.generation());
+      runs.push(1u32);
+    }
+    i = i + 1usize;
+  }
+  wVar(out, u32.from(runs.len() / 3usize));
+  mut k = 0usize;
+  while k < runs.len() {
+    wVar(out, *runs[k]);
+    wVar(out, *runs[k + 1usize]);
+    wVar(out, *runs[k + 2usize]);
+    k = k + 3usize;
+  }
+}
+
+fn rounded(x f32) f32 { libc.floorf(x + 0.5); }
+
+fn clampInt(n f32, lo i32, hi i32) i32 {
+  if n < f32.from(lo) { return lo; }
+  if n > f32.from(hi) { return hi; }
+  i32.from(n);
+}
+
+// A coordinate in millimetres from 'origin', in 24 bits
+fn wMillimetres(out &mut List[u8], v f32, origin f32) {
+  // (in doubles: a coordinate a thousand metres from the origin, in single precision, has already lost a tenth of a millimetre)
+  mut mm = libc.floor((f64.from(v) - f64.from(origin)) * 1000d + 0.5d);
+  if mm < 0d { mm = 0d; }
+  if mm > f64.from(POS_MAX) { mm = f64.from(POS_MAX); }
+  w24(out, u32.from(mm));
+}
+
+// ---- Reading ----
+
+// A message being read: its bytes, where it is, and whether every read so far stayed inside it
+pub struct Rd {
+  pub data List[u8];
+  pub pos usize;
+  pub ok bool;
+
+  pub fn make(d List[u8]) Rd { new Rd(d, 0usize, true); }
+
+  pub fn left(self &) usize { if pos >= data.len() { 0usize; } else { data.len() - pos; }; }
+
+  pub fn r8(self &mut) u32 {
+    if !ok or pos >= data.len() {
+      ok = false;
+      return 0u32;
+    }
+    imm v = u32.from(*data[pos]);
+    pos = pos + 1usize;
+    v;
+  }
+
+  pub fn r16(self &mut) u32 {
+    imm a = self.r8();
+    (a << 8u32) | self.r8();
+  }
+
+  pub fn r24(self &mut) u32 {
+    imm a = self.r8();
+    imm b = self.r8();
+    (a << 16u32) | (b << 8u32) | self.r8();
+  }
+
+  pub fn r32(self &mut) u32 {
+    imm a = self.r8();
+    imm b = self.r8();
+    imm c = self.r8();
+    (a << 24u32) | (b << 16u32) | (c << 8u32) | self.r8();
+  }
+
+  pub fn r64(self &mut) u64 {
+    imm hi = u64.from(self.r32());
+    (hi << 32u64) | u64.from(self.r32());
+  }
+
+  pub fn rF32(self &mut) f32 { self.r32() as f32; }
+
+  pub fn rF64(self &mut) f64 { self.r64() as f64; }
+
+  pub fn rVar(self &mut) u32 {
+    mut v = 0u32;
+    mut shift = 0u32;
+    mut more = true;
+    while more {
+      imm b = self.r8();
+      if !ok { return 0u32; }
+      v = v | ((b & 127u32) << shift);
+      more = (b & 128u32) != 0u32;
+      shift = shift + 7u32;
+      if shift > 28u32 and more {
+        ok = false;
+        return 0u32;
+      }
+    }
+    v;
+  }
+
+  // A signed byte, or two bytes
+  pub fn rS8(self &mut) i32 {
+    imm u = self.r8();
+    if u > 127u32 { (u as i32) - 256; } else { u as i32; };
+  }
+
+  pub fn rS16(self &mut) i32 {
+    imm u = self.r16();
+    if u > 32767u32 { (u as i32) - 65536; } else { u as i32; };
+  }
+
+  pub fn rUnit(self &mut) f32 { f32.from(self.rS8()) / 127.; }
+
+  pub fn rStr(self &mut) String {
+    imm n = usize.from(self.rVar());
+    if !ok or n > self.left() {
+      ok = false;
+      return String.empty();
+    }
+    mut bytes = List[u8].withCapacity(n);
+    mut i = 0usize;
+    while i < n {
+      bytes.push(*data[pos + i]);
+      i = i + 1usize;
+    }
+    pos = pos + n;
+    String.fromBytes(bytes.view());
+  }
+
+  pub fn rId(self &mut) PartId {
+    imm slot = self.rVar();
+    imm gen = self.rVar();
+    if gen == 0u32 { return PartId.none(); }
+    new PartId(Ref[PartRecord].of(slot, gen));
+  }
+
+  pub fn rVec3(self &mut) Vec3 {
+    imm x = self.rF32();
+    imm y = self.rF32();
+    new Vec3(x, y, self.rF32());
+  }
+
+  pub fn rColor(self &mut) Color {
+    imm r = self.rF32();
+    imm g = self.rF32();
+    imm b = self.rF32();
+    new Color(r, g, b, self.rF32());
+  }
+
+  // A list of ids written by wIds. A run longer than the message could hold is refused
+  pub fn rIds(self &mut, out &mut List[PartId]) {
+    imm runs = usize.from(self.rVar());
+    mut r = 0usize;
+    while r < runs and ok {
+      imm slot = self.rVar();
+      imm gen = self.rVar();
+      imm n = self.rVar();
+      if n > 100000u32 {
+        ok = false;
+        return;
+      }
+      mut k = 0u32;
+      while k < n {
+        out.push(new PartId(Ref[PartRecord].of(slot + k, gen)));
+        k = k + 1u32;
+      }
+      r = r + 1usize;
+    }
+  }
+
+  // A millimetre coordinate
+  pub fn rMillimetres(self &mut, origin f32) f32 { f32.from(f64.from(self.r24()) / 1000d + f64.from(origin)); }
+}
+
+// ---- view -> simulation ----
+
+// A reliable message from the view
+pub fn encodeToSim(msg ToSim) List[u8] {
+  mut out = List[u8].empty();
+  mut m = msg;
+  match &m {
+    case imm k Click {
+      w8(&mut out, TOSIM_CLICK);
+      wId(&mut out, k.part);
+    }
+    case imm c Command {
+      w8(&mut out, TOSIM_COMMAND);
+      w8(&mut out, c.kind);
+    }
+    case imm l Look {
+      w8(&mut out, TOSIM_LOOK);
+      wF32(&mut out, l.pitch);
+    }
+    case imm f Frame {
+      w8(&mut out, TOSIM_FRAME);
+      w64(&mut out, f.frame);
+      w8(&mut out, u32.from(f.steps.len()));
+      mut i = 0usize;
+      while i < f.steps.len() {
+        imm s = *f.steps[i];
+        w64(&mut out, s.index);
+        w64(&mut out, s.ns);
+        wF32(&mut out, s.dt);
+        w64(&mut out, s.startNs);
+        w32(&mut out, s.substeps);
+        i = i + 1usize;
+      }
+    }
+    else {}
+  }
+  out;
+}
+
+pub fn decodeToSim(bytes List[u8]) ToSim {
+  mut r = Rd.make(bytes);
+  imm tag = r.r8();
+  mut out ToSim = ToSim.Nothing;
+  if tag == TOSIM_CLICK {
+    imm part = r.rId();
+    if r.ok { out = ToSim.Click(part); }
+  } elif tag == TOSIM_COMMAND {
+    imm kind = r.r8();
+    if r.ok { out = ToSim.Command(kind); }
+  } elif tag == TOSIM_LOOK {
+    imm pitch = r.rF32();
+    if r.ok { out = ToSim.Look(pitch); }
+  } elif tag == TOSIM_FRAME {
+    imm frame = r.r64();
+    imm n = usize.from(r.r8());
+    mut steps = List[Step].empty();
+    mut i = 0usize;
+    while i < n and r.ok {
+      imm index = r.r64();
+      imm ns = r.r64();
+      imm dt = r.rF32();
+      imm startNs = r.r64();
+      imm substeps = r.r32();
+      steps.push(new Step(index, ns, dt, startNs, substeps));
+      i = i + 1usize;
+    }
+    if r.ok { out = ToSim.Frame(frame, steps); }
+  }
+  out;
+}
+
+// The input batch: how many samples, the first's sequence number, then each sample: ahead, turn, flags, look keys
+pub fn encodeInput(samples &List[InputSample]) List[u8] {
+  mut out = List[u8].empty();
+  imm n = samples.len();
+  w8(&mut out, u32.from(n));
+  if n == 0usize { return out; }
+  w32(&mut out, u32.from((*samples[0usize]).seq));
+  mut i = 0usize;
+  while i < n {
+    imm s = *samples[i];
+    wUnit(&mut out, s.intents.ahead);
+    wUnit(&mut out, s.intents.turn);
+    w8(&mut out, (if s.intents.run { 1u32; } else { 0u32; }) | (if s.intents.jump { 2u32; } else { 0u32; }));
+    wUnit(&mut out, s.lookKeys);
+    i = i + 1usize;
+  }
+  out;
+}
+
+// The samples of a batch, oldest first; none (and 'ok' false) if it was malformed
+pub fn decodeInput(bytes List[u8], samples &mut List[InputSample]) bool {
+  mut r = Rd.make(bytes);
+  imm n = usize.from(r.r8());
+  if n == 0usize { return r.ok; }
+  imm first = u64.from(r.r32());
+  mut found = List[InputSample].empty();
+  mut i = 0usize;
+  while i < n and r.ok {
+    imm ahead = r.rUnit();
+    imm turn = r.rUnit();
+    imm flags = r.r8();
+    imm look = r.rUnit();
+    found.push(new InputSample(first + u64.from(u32.from(i)), new Intents(ahead, turn, (flags & 1u32) != 0u32,
+      (flags & 2u32) != 0u32), look));
+    i = i + 1usize;
+  }
+  if !r.ok { return false; }
+  i = 0usize;
+  while i < found.len() {
+    samples.push(*found[i]);
+    i = i + 1usize;
+  }
+  true;
+}
+
+// ---- simulation -> view: requests ----
+
+fn wTransform(out &mut List[u8], t Transform3) {
+  wVec3(out, t.translation);
+  wF32(out, t.rotation.x);
+  wF32(out, t.rotation.y);
+  wF32(out, t.rotation.z);
+  wF32(out, t.rotation.w);
+  wVec3(out, t.scale);
+}
+
+fn rTransform(r &mut Rd) Transform3 {
+  imm t = r.rVec3();
+  imm qx = r.rF32();
+  imm qy = r.rF32();
+  imm qz = r.rF32();
+  imm qw = r.rF32();
+  new Transform3(t, new Quat(qx, qy, qz, qw), r.rVec3());
+}
+
+// Request 'q' written into 'out'; false (and nothing written) if it is not a kind that crosses (the others stay in
+// the simulation, or are made by the view itself)
+pub fn encodeRequest(q &Request, out &mut List[u8]) bool {
+  match q {
+    case imm s Spawn {
+      w8(out, R_SPAWN);
+      wId(out, s.id);
+      wStr(out, s.name.view());
+    }
+    case imm p Place {
+      w8(out, R_PLACE);
+      wId(out, p.id);
+      wTransform(out, p.at);
+    }
+    case imm pa Parent {
+      w8(out, R_PARENT);
+      wId(out, pa.id);
+      wId(out, pa.parent);
+    }
+    case imm d Despawn {
+      w8(out, R_DESPAWN);
+      wId(out, d.id);
+    }
+    case imm sh Show {
+      w8(out, R_SHOW);
+      wId(out, sh.id);
+      wId(out, sh.mesh.id);
+      wId(out, sh.material.id);
+      wF32(out, sh.anchor);
+    }
+    case imm f Fire {
+      w8(out, R_FIRE);
+      wId(out, f.id);
+      w32(out, f.seed);
+      wF64(out, f.start);
+      wF64(out, f.stop);
+    }
+    case imm g Glow {
+      w8(out, R_GLOW);
+      wId(out, g.material.id);
+      wColor(out, g.glow);
+    }
+    case imm t Tint {
+      w8(out, R_TINT);
+      wId(out, t.id);
+      wColor(out, t.tint);
+    }
+    case imm pl Platform {
+      w8(out, R_PLATFORM);
+      wId(out, pl.id);
+      wF32(out, pl.shape.floorY);
+      wF32(out, pl.shape.min.x);
+      wF32(out, pl.shape.min.y);
+      wF32(out, pl.shape.max.x);
+      wF32(out, pl.shape.max.y);
+      wF32(out, pl.shape.wallHeight);
+      w32(out, pl.shape.walls);
+    }
+    case imm ls LightSource {
+      w8(out, R_LIGHT);
+      wId(out, ls.id);
+      w8(out, ls.light.kind);
+      wVec3(out, ls.light.at);
+      wVec3(out, ls.light.direction);
+      wColor(out, ls.light.color);
+      wF32(out, ls.light.candela);
+      wF32(out, ls.light.range);
+      wF32(out, ls.light.radius);
+      wF32(out, ls.light.inner);
+      wF32(out, ls.light.outer);
+      w32(out, ls.light.layers);
+      w8(out, if ls.light.shadow { 1u32; } else { 0u32; });
+    }
+    case imm cs CastsShadow {
+      w8(out, R_SHADOW);
+      wId(out, cs.id);
+      w8(out, if cs.casts { 1u32; } else { 0u32; });
+    }
+    case imm o Object {
+      w8(out, R_OBJECT);
+      w8(out, o.spec.kind);
+      wVar(out, o.spec.index);
+      wF32(out, o.spec.height);
+      wColor(out, o.spec.color);
+      wStr(out, o.spec.name.view());
+      wIds(out, &o.ids);
+    }
+    case imm b BeingAdded {
+      w8(out, R_BEING);
+      wVar(out, b.being);
+      wId(out, b.part);
+      w8(out, if b.plain { 1u32; } else { 0u32; });
+      wF32(out, b.height);
+      w32(out, b.seed);
+    }
+    else { return false; }
+  }
+  true;
+}
+
+// One request read; false if it was malformed (or a tag this version does not know)
+pub fn decodeRequest(r &mut Rd, out &mut List[Request]) bool {
+  imm tag = r.r8();
+  if tag == R_SPAWN {
+    imm id = r.rId();
+    imm name = r.rStr();
+    if r.ok { out.push(Request.Spawn(id, name)); }
+  } elif tag == R_PLACE {
+    imm id = r.rId();
+    imm at = rTransform(r);
+    if r.ok { out.push(Request.Place(id, at)); }
+  } elif tag == R_PARENT {
+    imm id = r.rId();
+    imm parent = r.rId();
+    if r.ok { out.push(Request.Parent(id, parent)); }
+  } elif tag == R_DESPAWN {
+    imm id = r.rId();
+    if r.ok { out.push(Request.Despawn(id)); }
+  } elif tag == R_SHOW {
+    imm id = r.rId();
+    imm mesh = r.rId();
+    imm material = r.rId();
+    imm anchor = r.rF32();
+    if r.ok { out.push(Request.Show(id, new MeshId(mesh), new MaterialId(material), anchor)); }
+  } elif tag == R_FIRE {
+    imm id = r.rId();
+    imm seed = r.r32();
+    imm start = r.rF64();
+    imm stop = r.rF64();
+    if r.ok { out.push(Request.Fire(id, seed, start, stop)); }
+  } elif tag == R_GLOW {
+    imm material = r.rId();
+    imm glow = r.rColor();
+    if r.ok { out.push(Request.Glow(new MaterialId(material), glow)); }
+  } elif tag == R_TINT {
+    imm id = r.rId();
+    imm tint = r.rColor();
+    if r.ok { out.push(Request.Tint(id, tint)); }
+  } elif tag == R_PLATFORM {
+    imm id = r.rId();
+    imm floorY = r.rF32();
+    imm minx = r.rF32();
+    imm miny = r.rF32();
+    imm maxx = r.rF32();
+    imm maxy = r.rF32();
+    imm wallHeight = r.rF32();
+    imm walls = r.r32();
+    if r.ok { out.push(Request.Platform(id, new PlatformShape(floorY, new Vec2(minx, miny), new Vec2(maxx, maxy), wallHeight, walls))); }
+  } elif tag == R_LIGHT {
+    imm id = r.rId();
+    imm kind = r.r8();
+    imm at = r.rVec3();
+    imm direction = r.rVec3();
+    imm color = r.rColor();
+    imm candela = r.rF32();
+    imm range = r.rF32();
+    imm radius = r.rF32();
+    imm inner = r.rF32();
+    imm outer = r.rF32();
+    imm layers = r.r32();
+    imm shadow = r.r8();
+    if r.ok { out.push(Request.LightSource(id, new LightLook(kind, at, direction, color, candela, range, radius, inner, outer, layers, shadow != 0u32))); }
+  } elif tag == R_SHADOW {
+    imm id = r.rId();
+    imm casts = r.r8();
+    if r.ok { out.push(Request.CastsShadow(id, casts != 0u32)); }
+  } elif tag == R_OBJECT {
+    imm kind = r.r8();
+    imm index = r.rVar();
+    imm height = r.rF32();
+    imm color = r.rColor();
+    imm name = r.rStr();
+    mut ids = List[PartId].empty();
+    r.rIds(&mut ids);
+    if r.ok { out.push(Request.Object(new ObjectSpec(kind, index, height, color, name), ids)); }
+  } elif tag == R_BEING {
+    imm being = r.rVar();
+    imm part = r.rId();
+    imm plain = r.r8();
+    imm height = r.rF32();
+    imm seed = r.r32();
+    if r.ok { out.push(Request.BeingAdded(being, part, plain != 0u32, height, seed)); }
+  } else {
+    r.ok = false;
+  }
+  r.ok;
+}
+
+// The requests 'items' (each already encoded by encodeRequest) from index 'from', as one reliable message of at most
+// REQUESTS_BYTES bytes (at least one goes in, so a single one over the size is refused whole by the connection and
+// reported by whoever sends it): the index after the last that went in.
+pub fn packRequests(items &List[List[u8]], from usize, out &mut List[u8]) usize {
+  w8(out, TOVIEW_REQUESTS);
+  imm countAt = out.len();
+  w16(out, 0u32);
+  mut n = 0u32;
+  mut i = from;
+  while i < items.len() {
+    imm one = items[i];
+    if n > 0u32 and out.len() + one.len() > REQUESTS_BYTES { break; }
+    mut k = 0usize;
+    while k < one.len() {
+      out.push(*one[k]);
+      k = k + 1usize;
+    }
+    n = n + 1u32;
+    i = i + 1usize;
+  }
+  out.set(countAt, u8.from((n >> 8u32) & 255u32));
+  out.set(countAt + 1usize, u8.from(n & 255u32));
+  i;
+}
+
+pub fn encodePossessed(being u32) List[u8] {
+  mut out = List[u8].empty();
+  w8(&mut out, TOVIEW_POSSESSED);
+  wVar(&mut out, being);
+  out;
+}
+
+pub fn encodeFrameDone(tick u64, simulateNs u64, publishNs u64) List[u8] {
+  mut out = List[u8].empty();
+  w8(&mut out, TOVIEW_FRAMEDONE);
+  w64(&mut out, tick);
+  w64(&mut out, simulateNs);
+  w64(&mut out, publishNs);
+  out;
+}
+
+pub fn encodeWeather(w &Weathering) List[u8] {
+  mut out = List[u8].empty();
+  w8(&mut out, TOVIEW_WEATHER);
+  wWeatherParams(&mut out, &w.from);
+  w32(&mut out, w.target);
+  wF64(&mut out, w.start);
+  wF32(&mut out, w.duration);
+  out;
+}
+
+fn wWeatherParams(out &mut List[u8], p &WeatherParams) {
+  wF32(out, p.cloudLow);
+  wF32(out, p.cloudHigh);
+  wF32(out, p.density);
+  wF32(out, p.cloudLight);
+  wF32(out, p.skyGrey);
+  wF32(out, p.skyDim);
+  wF32(out, p.sunDim);
+  wF32(out, p.fog);
+  wF32(out, p.ambient);
+  wF32(out, p.tintRed);
+  wF32(out, p.tintGreen);
+  wF32(out, p.tintBlue);
+  wF32(out, p.ev);
+  wF32(out, p.rain);
+  wF32(out, p.snow);
+}
+
+fn rWeatherParams(r &mut Rd) WeatherParams {
+  imm a = r.rF32();
+  imm b = r.rF32();
+  imm c = r.rF32();
+  imm d = r.rF32();
+  imm e = r.rF32();
+  imm f = r.rF32();
+  imm g = r.rF32();
+  imm h = r.rF32();
+  imm i = r.rF32();
+  imm j = r.rF32();
+  imm k = r.rF32();
+  imm l = r.rF32();
+  imm m = r.rF32();
+  imm n = r.rF32();
+  new WeatherParams(a, b, c, d, e, f, g, h, i, j, k, l, m, n, r.rF32());
+}
+
+// A reliable message from the simulation, decoded; Nothing if it was malformed
+pub fn decodeToView(bytes List[u8]) ToView {
+  mut r = Rd.make(bytes);
+  imm tag = r.r8();
+  if tag == TOVIEW_REQUESTS {
+    imm n = r.r16();
+    mut batch = List[Request].empty();
+    mut i = 0u32;
+    while i < n and r.ok {
+      decodeRequest(&mut r, &mut batch);
+      i = i + 1u32;
+    }
+    if r.ok { return ToView.Requests(batch); }
+  } elif tag == TOVIEW_POSSESSED {
+    imm being = r.rVar();
+    if r.ok { return ToView.Possessed(being); }
+  } elif tag == TOVIEW_WEATHER {
+    imm from = rWeatherParams(&mut r);
+    imm target = r.r32();
+    imm start = r.rF64();
+    imm duration = r.rF32();
+    if r.ok { return ToView.Weather(new Weathering(from, target, start, duration)); }
+  } elif tag == TOVIEW_FRAMEDONE {
+    imm tick = r.r64();
+    imm simulateNs = r.r64();
+    imm publishNs = r.r64();
+    if r.ok { return ToView.FrameDone(tick, simulateNs, publishNs); }
+  }
+  ToView.Nothing;
+}
+
+// ---- simulation -> view: the state ----
+
+// The state of a tick for one client: the same bodies for every client, with this client's last input applied
+pub fn encodeState(w &WorldState) List[u8] {
+  mut out = List[u8].empty();
+  w32(&mut out, u32.from(w.tick & 0xFFFFFFFFu64));
+  wF64(&mut out, w.now);
+  w8(&mut out, w.rate);
+  w32(&mut out, u32.from(w.appliedInput & 0xFFFFFFFFu64));
+  w8(&mut out, u32.from(w.beings.len()));
+  mut i = 0usize;
+  while i < w.beings.len() {
+    wBeing(&mut out, w.beings[i]);
+    i = i + 1usize;
+  }
+  out;
+}
+
+fn wBeing(out &mut List[u8], b &BeingState) {
+  wVar(out, b.being);
+  imm hasPlatform = !b.platform.isNone();
+  w8(out, (if b.exact { 1u32; } else { 0u32; }) | (if b.grounded { 2u32; } else { 0u32; })
+    | (if b.intents.run { 4u32; } else { 0u32; }) | (if b.intents.jump { 8u32; } else { 0u32; })
+    | (if hasPlatform { 16u32; } else { 0u32; }));
+  wUnit(out, b.intents.ahead);
+  wUnit(out, b.intents.turn);
+  if b.exact {
+    wVec3(out, b.position);
+    wF32(out, b.yaw);
+    wF32(out, b.speed);
+    wF32(out, b.vy);
+    wF32(out, b.airVx);
+    wF32(out, b.airVz);
+  } else {
+    wMillimetres(out, b.position.x, POS_ORIGIN_XZ);
+    wMillimetres(out, b.position.y, POS_ORIGIN_Y);
+    wMillimetres(out, b.position.z, POS_ORIGIN_XZ);
+    w16(out, u32.from(headingBits(b.yaw)));
+    wSigned(out, clampInt(rounded(b.speed * 1024.), -32767, 32767), 2u32);
+    wSigned(out, clampInt(rounded(b.vy * 512.), -32767, 32767), 2u32);
+    wSigned(out, clampInt(rounded(b.airVx * 512.), -32767, 32767), 2u32);
+    wSigned(out, clampInt(rounded(b.airVz * 512.), -32767, 32767), 2u32);
+  }
+  if hasPlatform { wId(out, b.platform); }
+  w8(out, u32.from(clampInt(rounded(b.health * 255.), 0, 255)));
+  w8(out, b.respawns);
+  w8(out, b.landings);
+  w16(out, u32.from(clampInt(rounded(b.landSpeed * 1024.), 0, 65535)));
+}
+
+// The heading in 16 bits: its turns, 0 to 65535 of a whole one
+fn headingBits(yaw f32) i32 {
+  imm turns = yaw / 6.2831855;
+  imm frac = turns - libc.floorf(turns);
+  imm n = i32.from(rounded(frac * 65536.));
+  n & 65535;
+}
+
+fn rBeing(r &mut Rd) BeingState {
+  imm being = r.rVar();
+  imm flags = r.r8();
+  imm ahead = r.rUnit();
+  imm turn = r.rUnit();
+  imm exact = (flags & 1u32) != 0u32;
+  mut position = new Vec3(0., 0., 0.);
+  mut yaw = 0.;
+  mut speed = 0.;
+  mut vy = 0.;
+  mut airVx = 0.;
+  mut airVz = 0.;
+  if exact {
+    position = r.rVec3();
+    yaw = r.rF32();
+    speed = r.rF32();
+    vy = r.rF32();
+    airVx = r.rF32();
+    airVz = r.rF32();
+  } else {
+    imm x = r.rMillimetres(POS_ORIGIN_XZ);
+    imm y = r.rMillimetres(POS_ORIGIN_Y);
+    imm z = r.rMillimetres(POS_ORIGIN_XZ);
+    position = new Vec3(x, y, z);
+    yaw = f32.from(r.r16()) * 6.2831855 / 65536.;
+    speed = f32.from(r.rS16()) / 1024.;
+    vy = f32.from(r.rS16()) / 512.;
+    airVx = f32.from(r.rS16()) / 512.;
+    airVz = f32.from(r.rS16()) / 512.;
+  }
+  mut platform = PartId.none();
+  if (flags & 16u32) != 0u32 { platform = r.rId(); }
+  imm health = f32.from(r.r8()) / 255.;
+  imm respawns = r.r8();
+  imm landings = r.r8();
+  imm landSpeed = f32.from(r.r16()) / 1024.;
+  new BeingState(being, exact, position, yaw, speed, vy, airVx, airVz, (flags & 2u32) != 0u32,
+    new Intents(ahead, turn, (flags & 4u32) != 0u32, (flags & 8u32) != 0u32), platform, health, respawns, landings, landSpeed);
+}
+
+// A snapshot decoded into 'out' (whose beings are added to); false if malformed
+pub fn decodeState(bytes List[u8], out &mut WorldState) bool {
+  mut r = Rd.make(bytes);
+  imm tick = u64.from(r.r32());
+  imm now = r.rF64();
+  imm rate = r.r8();
+  imm applied = u64.from(r.r32());
+  imm n = usize.from(r.r8());
+  mut beings = List[BeingState].empty();
+  mut i = 0usize;
+  while i < n and r.ok {
+    beings.push(rBeing(&mut r));
+    i = i + 1usize;
+  }
+  if !r.ok { return false; }
+  out.tick = tick;
+  out.now = now;
+  out.rate = rate;
+  out.appliedInput = applied;
+  out.beings <=> beings;
+  true;
+}
+
+// ---- a scripted run's own ----
+
+pub fn encodeTest(t &TestView) List[u8] {
+  mut out = List[u8].empty();
+  w8(&mut out, if t.fixedView { 1u32; } else { 0u32; });
+  wVec3(&mut out, t.view.origin);
+  wF32(&mut out, t.view.orientation.x);
+  wF32(&mut out, t.view.orientation.y);
+  wF32(&mut out, t.view.orientation.z);
+  wF32(&mut out, t.view.orientation.w);
+  wF32(&mut out, t.fov);
+  wStr(&mut out, t.shot.view());
+  out;
+}
+
+pub fn decodeTest(bytes List[u8], out &mut TestView) bool {
+  mut r = Rd.make(bytes);
+  imm fixed = r.r8();
+  imm origin = r.rVec3();
+  imm qx = r.rF32();
+  imm qy = r.rF32();
+  imm qz = r.rF32();
+  imm qw = r.rF32();
+  imm fov = r.rF32();
+  imm shot = r.rStr();
+  if !r.ok { return false; }
+  out.fixedView = fixed != 0u32;
+  out.view = new Pose(origin, new Quat(qx, qy, qz, qw));
+  out.fov = fov;
+  out.shot = shot;
+  true;
+}

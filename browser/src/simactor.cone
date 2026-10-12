@@ -4,31 +4,50 @@
 // timers and the scene's clock: parts/), the beings and their bodies (the cast
 // and possession, being.cone; the mannequins' kinematic capsules,
 // mannequin.cone: the physics), the solids and platforms they stand on
-// (support.cone), the birds' flock (skyrig.cone), and the world actor and its
-// Door. It holds nothing to draw with: no mesh, material, picking table or
-// GPU handle, and no snapshot for render. That is the view's (viewactor.cone).
+// (support.cone), and the world actor and its Door. It holds nothing to draw
+// with: no mesh, material, picking table or GPU handle, and no snapshot for
+// render. That is the view's (viewactor.cone).
 //
-// The two halves meet only over the message link (msglink.cone), through
-// what simview.cone defines, so that single player runs through the seam a
-// network connection will use. This half is the one that would run on a
-// server.
+// THE SERVER OWNS THE TRUTH. This half is the one that runs on a server
+// (--serve): headless, with no window and no GPU, ticking at its own fixed
+// rate, taking each client's inputs and sending each client the world's
+// requests and its snapshots. In single player it runs in the same process as
+// the one view, joined to it by netmsg's in-process connection, with the same
+// messages and the same code; the view and it then take turns each frame
+// (lockstep) so that a frame is the same every time, which a scripted run's
+// exact checks need.
 //
-// ITS FRAME is one message from the view, advance, which it answers when its
-// work is done (the view awaits it, so the halves take turns and a frame is
-// the same sequence it was when they were one actor). Before it, the view has
-// sent the link's packet (link): the client's inputs and commands.
+// The halves meet only over the connections (netlink.cone), through what
+// simview.cone defines and netcodec.cone writes as bytes. The content every
+// browser has locally (the island, the baked-in world, the mannequins) is not
+// sent: the Object request that names it is (parts.cone); and the beings' gait,
+// the camera and the birds are the view's own, from the state.
 //
-//   advance(frame, steps)
-//        the link read: the client's pitch changes, then, for each fixed step,
-//        the intents of the input sequence number due, which move the
-//        possessed being; every being stepped, the birds, the scene's clock
-//        (SIMULATE); then the clock's and the view's keys, hard landings, the
-//        clicks (the listener told), timers and areas posted to the world's
-//        mail; the WORLD'S TURN, awaited; THE APPLY POINT: the inbox applied,
-//        the requests the view needs kept, in order; the bodies on a platform
-//        that moved carried with it (support.cone) (PUBLISH); then the packet
-//        for the view sent: the accepted requests (reliable) and the tick's
-//        snapshot (latest-wins)
+// CLIENTS. Each client that joins is told what has been sent so far (the
+// replay log, replaylog.cone), given a being to drive (single player: the
+// mannequin it starts as; connected: a mannequin of its own, set down on the
+// landing beach), and sent a snapshot of the beings every tick it is due. Its
+// inputs arrive as the last INPUT_KEPT ticks of intents with sequence
+// numbers, so a lost packet loses nothing. The server applies them in order,
+// one a tick: if the next has not come, the being waits for it (a being never
+// guesses what its user did), and a backlog is run off two at a time.
+//
+// ITS FRAME. Single player: the view's Frame message, which follows its inputs on
+// the connection (so they have all arrived), and which this half answers, when its
+// work is done, with a FrameDone said last (so everything before it has arrived).
+// A server: serveTick, from the server's loop, on its own clock. The same work:
+//
+//   the frame
+//        for each fixed step, the intents of the input sequence
+//        number due for each client's being, which move it; every being
+//        stepped, the birds (single player and scripted only: the harness
+//        reads them), the scene's clock (SIMULATE); then the clock's keys, hard
+//        landings, the clicks (the listener told), timers and areas posted to
+//        the world's mail; the WORLD'S TURN, awaited; THE APPLY POINT: the inbox
+//        applied, the requests the clients need kept, in order; the bodies on a
+//        platform that moved carried with it (support.cone) (PUBLISH); then
+//        what the clients are told: the accepted requests (reliable), a weather
+//        change (reliable), and the tick's snapshot (latest-wins)
 //   endFrame(facts)
 //        once the view has drawn the frame: in a scripted run, the script's
 //        checks and its next events, from what the view saw (the picks, what
@@ -39,13 +58,9 @@
 //
 // The scripted run (script.cone and its sister files) is a test fixture that
 // reads and moves the truth directly, so it runs here, beside it; what the
-// view saw it is told in endFrame.
-//
-// INPUT -> CONTROLLER -> A BEING'S INTENTS. The user's controller is the
-// shell's (it reads the input package's actions); the view sends its intents.
-// The camera follows the possessed being's eyes (Cast's view rig, which for now
-// stays in this half: see simview.cone's WorldState); none of the three knows
-// the others.
+// view saw it is told in endFrame. It also reads the camera and the birds, so
+// in single player and scripted runs this half steps its own copies of them
+// (the view draws its own).
 
 // What the simulation tells the shell's frame report once a frame is done
 pub struct EndFrame {
@@ -69,25 +84,89 @@ pub struct ViewFacts {
   pub late bool;              // a frame's state did not arrive with the simulation's answer
 }
 
-// What a frame's advance asks of the simulation: its number, and the fixed
-// steps due
+// What a server's tick is handed: its number and the fixed steps due
 pub struct Advance {
   pub frame u64;
   pub steps List[Step];
+  pub expectReliable u64;
+  pub expectSeq u64;
 }
 
-// What advance answers: the phases, as the simulation timed its own
-pub struct Advanced {
-  pub simulateNs u64;
-  pub publishNs u64;
+// How many input samples may wait for a being before the server runs two a tick
+const BACKLOG = 4usize;
+
+// A connected client, as the simulation keeps it
+pub struct Client {
+  pub id u32;                 // the connection's: a server numbers its clients from 1
+  pub being usize;            // the being it drives (its index in the cast)
+  queue List[InputSample];    // input samples received, not yet applied
+  pub nextSeq u64;            // the input sequence number due next
+  pub applied u64;            // the last input sequence number applied
+  pub cur Intents;            // what its last step used
+  pub curLook f32;            // and the pitch keys held then
+  pub missed u64;             // steps with no input sequence number due (single player used the last intents)
+  pub skipped u64;            // steps a being waited for its input
+  pub extra u64;              // steps run off a backlog
+  pub told usize;             // the being it was last told is its own
+
+  pub fn make(id u32, being usize) Client {
+    new Client(id, being, List[InputSample].empty(), 1u64, 0u64, Intents.none(), 0., 0u64, 0u64, 0u64, being);
+  }
+
+  // Samples received, kept if newer than any before
+  pub fn receive(self &mut, samples &List[InputSample]) {
+    mut k = 0usize;
+    while k < samples.len() {
+      imm s = *samples[k];
+      if s.seq >= nextSeq and (queue.len() == 0usize or s.seq > queue[queue.len() - 1usize].seq) { queue.push(s); }
+      k = k + 1usize;
+    }
+  }
+
+  // The number of samples waiting
+  pub fn waiting(self &) usize { queue.len(); }
+
+  fn dropFront(self &mut) {
+    mut keep = List[InputSample].empty();
+    mut q = 1usize;
+    while q < queue.len() { keep.push(*queue[q]); q = q + 1usize; }
+    queue <=> keep;
+  }
+
+  // The intents of the next input sequence number due, into 'cur'. If it did not come: single player ('repeat') goes
+  // on with the last intents, as a being does that is not told otherwise; a server's being does not step (false)
+  pub fn take(self &mut, repeat bool) bool {
+    while queue.len() > 0usize and queue[0usize].seq < nextSeq { self.dropFront(); }
+    if queue.len() > 0usize and queue[0usize].seq > nextSeq and !repeat {
+      // Lost beyond what the redundancy covers: on from what came
+      missed = missed + (queue[0usize].seq - nextSeq);
+      nextSeq = queue[0usize].seq;
+    }
+    if queue.len() > 0usize and queue[0usize].seq == nextSeq {
+      imm s = *queue[0usize];
+      self.dropFront();
+      nextSeq = nextSeq + 1u64;
+      applied = s.seq;
+      cur = s.intents;
+      curLook = s.lookKeys;
+      return true;
+    }
+    if repeat {
+      missed = missed + 1u64;
+      nextSeq = nextSeq + 1u64;
+      return true;
+    }
+    skipped = skipped + 1u64;
+    false;
+  }
 }
 
 // The simulation actor's state: a struct of its own, so that the scripted
 // run's functions (script.cone and its sister files) can be handed it
 pub struct SimState {
   pub scene Scene;
-  pub cast Cast;              // the beings, and which one the user possesses
-  pub birds Birds;            // the flock, stepped on scene time
+  pub cast Cast;              // the beings, and which one the user possesses (single player)
+  pub birds Birds;            // the flock, stepped on scene time (single player and scripted: the harness reads it)
   pub picks PickSystem;       // a scripted run's only: each shown part's mesh bounds, for its checks
   pub picked PartId;          // told by the view: the part highlighted, the last click's
   pub lastPick PickHit;       // and the last click's answer, for the script
@@ -102,34 +181,54 @@ pub struct SimState {
   pub rendered RenderFacts;   // a scripted run's: what render last drew
   pub worldDone bool;
   pub worldSentFrame u64;     // the frame whose world turn sent the last object
-  pub link DownLink;          // the message link's end on this side
-  pub clients u32;            // clients joined
-  pub missedInput u64;        // steps with no input sequence number due (the last intents were used)
-  forView List[Request];      // the requests the view needs, in the order applied
+  pub net NetSide;            // the connections
+  pub serve bool;             // a server: no view in this process, clients of its own
+  pub lockstep bool;          // single player: the view waits for each frame's answer, and this half for the view's messages
+  pub clients List[Client];
+  pub missedInput u64;        // steps with no input sequence number due (the last intents were used), all clients
+  forView List[Request];      // the requests the clients need, in the order applied
   moves List[PlatformMove];   // how the platforms moved this frame
   pub stepSeconds f32;        // the frame's steps, seconds (the walk's, not scene time)
-  looks List[f32];            // pitch changes from the link, not yet applied
-  commands List[u32];         // keys from the link, not yet applied
-  clicksIn List[PartId];      // clicks from the link, not yet applied
-  queue List[InputSample];    // input samples received, not yet applied
-  nextSeq u64;                // the input sequence number due next
-  lastIntents Intents;        // what the last step used
-  lastLook f32;               // and the pitch keys held then
-  pub appliedInput u64;       // the last input sequence number applied
-  told bool;                  // the possessed being told to the view
+  looks List[f32];            // pitch changes from the view, not yet applied
+  commands List[u32];         // keys from the view, not yet applied
+  clicksIn List[PartId];      // clicks from the clients, not yet applied
+  pub appliedInput u64;       // the last input sequence number applied (the first client's)
   pub weather Weathering;     // the weather, a closed form of scene time (weather.cone)
+  weatherSent Weathering;     // and as the clients were last told
   inObject bool;              // between an ObjectBegin and its Object: the view builds that content itself
+  pub tick u64;               // fixed steps taken, ever
+  pub log ReplayLog;          // what a client that joins later is told
+  given List[Intents];        // each being's intents this step
+  stepIt List[bool];          // and whether it steps
+  gotReliable u64;            // reliable messages received (single player's one client)
+  gotSeq u64;                 // the highest input sequence number received
+  pub skippedRequests u64;    // requests of a kind that does not cross, not sent
+  clientBeings u32;           // beings made for clients
+  lastPublish u64;            // the tick of the last snapshot sent (a server sends them at its own rate)
+  pub snapshotsSent u64;
+  pub stateBytes u64;
+  pub notices u64;            // refusals and surprises heard
+  frameAsked bool;            // single player: the view asked for a frame
+  frameNo u64;
+  frameSteps List[Step];
+  joinedNow bool;             // a client joined since the shell was last told
+  pub simulateNs u64;         // the last frame's phases
+  pub publishNs u64;
 
-  pub fn make(scripted bool, birds Birds) SimState {
+  pub fn make(scripted bool, birds Birds, serve bool) SimState {
     new SimState(Scene.empty(), Cast.empty(), birds, PickSystem.empty(), PartId.none(),
       new PickHit(PartId.none(), 0., 0u32, 0u64), 0u64, 0u64, 0d, 0u64, new Vec2(HEADLESS_W, HEADLESS_H), scripted,
-      true, WorldFacts.empty(), RenderFacts.empty(), false, 0u64, DownLink.make(), 0u32, 0u64, List[Request].empty(),
-      List[PlatformMove].empty(), 0., List[f32].empty(), List[u32].empty(), List[PartId].empty(), List[InputSample].empty(),
-      1u64, Intents.none(), 0., 0u64, false, Weathering.fair(), false);
+      true, WorldFacts.empty(), RenderFacts.empty(), false, 0u64, NetSide.make(), serve, !serve, List[Client].empty(), 0u64,
+      List[Request].empty(), List[PlatformMove].empty(), 0., List[f32].empty(), List[u32].empty(), List[PartId].empty(),
+      0u64, Weathering.fair(), Weathering.fair(), false, 0u64, ReplayLog.empty(), List[Intents].empty(), List[bool].empty(),
+      0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step].empty(), false, 0u64, 0u64);
   }
 
-  // The possessed being's body: where the user is
+  // The possessed being's body: where the user is (single player)
   pub fn youBody(self &) Walk { cast.beings[cast.possessed].body; }
+
+  // Whether this half keeps the camera and the birds for the scripted harness: single player and scripted runs
+  fn legacy(self &) bool { !serve; }
 
   // A mannequin of 'height' metres made, shown and added to the cast standing
   // at 'at' facing 'yaw': the index of its being
@@ -139,12 +238,29 @@ pub struct SimState {
     imm parts = spawnMannequin(&mut scene.door, height, color, root);
     imm spec = new ObjectSpec(OBJ_MANNEQUIN, u32.from(cast.beings.len()), height, color, String.from(name));
     scene.door.endObject(spec);
-    cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, parts)));
+    imm index = cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, parts)));
+    scene.send(Request.BeingAdded(u32.from(index), root, false, height, seed));
+    index;
+  }
+
+  // A mannequin for a client that joined: the k-th, set down on the landing beach and given its own height and colour
+  fn addClientMannequin(self &mut, k u32) usize {
+    imm heights Array[f32, 6] = [1.75, 1.62, 1.82, 1.68, 1.78, 1.58];
+    imm which = usize.from(k % 6u32);
+    mut color = woodColor();
+    if which == 1usize { color = clayColor(); }
+    elif which == 2usize { color = new Color(0.05, 0.16, 0.42, 1.); }
+    elif which == 3usize { color = new Color(0.08, 0.30, 0.08, 1.); }
+    elif which == 4usize { color = new Color(0.42, 0.34, 0.04, 1.); }
+    elif which == 5usize { color = new Color(0.30, 0.08, 0.30, 1.); }
+    imm x = BEACH_X + f32.from(i32.from(k % 4u32) - 1i32) * 1.5;
+    imm z = BEACH_Z - 1.5 * f32.from(k / 4u32);
+    self.addMannequin(clientName(k), standing(x, z), 0., heights[which], 3u32 + 8u32 * k, color);
   }
 
   // The scene before the first frame: the shell's land, sea and sky, and the
   // beings (a scripted run's plain walker and its mannequins, or the user's
-  // mannequin and another)
+  // mannequin and another; a server: the idle mannequin alone)
   fn seed(self &mut) {
     scene.door.beginObject();
     seedScene(&mut scene.door);
@@ -158,11 +274,16 @@ pub struct SimState {
       // it is set down at the old flat world's start (START_X, START_Z) and
       // keeps its exact walk checks from there. It takes the mannequin over by
       // pressing Tab at its end. The mannequins stand off to the right of that start.
-      imm youAt = cast.add(Being.make(scene.newPart("you"), Walk.make(new Vec3(BEACH_X, islandHeight(BEACH_X, BEACH_Z),
+      imm youPart = scene.newPart("you");
+      imm youAt = cast.add(Being.make(youPart, Walk.make(new Vec3(BEACH_X, islandHeight(BEACH_X, BEACH_Z),
         BEACH_Z), 0.)));
+      scene.send(Request.BeingAdded(u32.from(youAt), youPart, true, 0., 0u32));
       cast.possess(youAt);
       self.addMannequin("mannequin", standing(START_X + 5., START_Z), 0., 1.75, 3u32, woodColor());
       self.addMannequin("second mannequin", standing(START_X + 3.5, START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
+    } elif serve {
+      // A server: the mannequin that stands there for anyone to see; each client brings its own
+      self.addMannequin("second mannequin", standing(BEACH_X + 3., BEACH_Z - 4.), 2.356, 1.62, 11u32, clayColor());
     } else {
       // The user's own being: a mannequin on the landing beach, facing -z up
       // the path, possessed, seen from behind and above; another stands a few metres off
@@ -175,122 +296,206 @@ pub struct SimState {
     print <- scene.waiting(); print <- " requests waiting\n";
   }
 
-  // ---- the link ----
+  // ---- the connections ----
 
-  // The link read: notices (a client joined or left), the reliable messages
-  // sorted into what is applied before the steps (the pitch) and after (the
-  // keys and clicks), and the input samples kept for the steps
-  fn receive(self &mut) {
-    mut notices = link.rx.takeNotices();
-    imm ns = notices.viewMut();
-    mut n = 0usize;
-    while n < ns.len {
-      mut note Notice = Notice.Read;
-      note <=> ns[n];
-      match &mut note {
-        case mut j &mut Joined {
-          clients = clients + 1u32;
-          told = false;
-        }
-        case mut l &mut Left { clients = clients - 1u32; }
-        else {}
-      }
-      n = n + 1usize;
-    }
-    mut reliable = link.rx.takeReliable();
-    imm rs = reliable.viewMut();
+  fn clientAt(self &, id u32) usize {
     mut i = 0usize;
-    while i < rs.len {
-      mut m ToSim = ToSim.Nothing;
-      m <=> rs[i];
-      match &mut m {
-        case mut l &mut Look { looks.push(l.pitch); }
-        case mut c &mut Command { commands.push(c.kind); }
-        case mut k &mut Click { clicksIn.push(k.part); }
-        else {}
-      }
+    while i < clients.len() {
+      if clients[i].id == id { return i; }
       i = i + 1usize;
     }
-    mut latest = link.rx.takeLatest();
-    imm ls = latest.viewMut();
-    mut j = 0usize;
-    while j < ls.len {
-      if ls[j].stream == STREAM_INPUT {
-        mut data InputData = InputData.Nothing;
-        data <=> ls[j].value;
-        match &mut data {
-          case mut b &mut Batch {
-            // Those newer than any already received, oldest first
-            mut k = 0usize;
-            while k < b.samples.len() {
-              imm s = *b.samples[k];
-              if s.seq >= nextSeq and (queue.len() == 0usize or s.seq > queue[queue.len() - 1usize].seq) { queue.push(s); }
-              k = k + 1usize;
-            }
+    NO_ROW;
+  }
+
+  // A client has joined: it is told what has been sent so far and which being is its own. Single player's one client
+  // takes the being the user possesses; any other gets a mannequin made for it
+  fn clientJoined(self &mut, id u32, conn Connection) {
+    net.open(id, conn);
+    if self.clientAt(id) != NO_ROW { return; }
+    mut being = cast.possessed;
+    if serve or clients.len() > 0usize {
+      being = self.addClientMannequin(clientBeings);
+      clientBeings = clientBeings + 1u32;
+    }
+    clients.push(Client.make(id, being));
+    joinedNow = true;
+    print <- "Client "; print <- id; print <- " joined: being "; print <- being; print <- "\n";
+    self.sendLog(id);
+    net.sendReliable(id, encodePossessed(u32.from(being)));
+    net.sendReliable(id, encodeWeather(&weather));
+    weatherSent = weather;
+  }
+
+  // A client has gone: its being is taken out of the world
+  fn clientLeft(self &mut, id u32) {
+    imm k = self.clientAt(id);
+    if k == NO_ROW {
+      net.close(id);
+      return;
+    }
+    imm cb = clients[k].being;
+    print <- "Client "; print <- id; print <- " left (being "; print <- cb; print <- ")\n";
+    if net.has(id) {
+      imm p = net.peer(id);
+      print <- "  sent it: "; print <- p.reliableSent; print <- " reliable messages, "; print <- p.reliableBytes; print <- " bytes; ";
+      print <- p.latestSent; print <- " snapshots, "; print <- p.latestBytes; print <- " bytes\n";
+    }
+    net.close(id);
+    imm fb = cast.beings[cb];
+    print <- "FINAL "; print <- cb; print <- " "; print <- millimetres(fb.body.position.x); print <- " "; print <- millimetres(fb.body.position.y);
+    print <- " "; print <- millimetres(fb.body.position.z); print <- " applied "; print <- clients[k].applied; print <- " waited "; print <- clients[k].skipped;
+    print <- " extra "; print <- clients[k].extra; print <- "\n";
+    if serve {
+      imm b = &mut cast.beings[cb];
+      b.gone = true;
+      scene.forget(b.part);
+      scene.send(Request.Despawn(b.part));
+    }
+    clients.swap(k, clients.len() - 1usize);
+    clients.pop();
+  }
+
+  // What the clients have been sent, to a client that has just joined: the log, in messages that fit
+  fn sendLog(self &mut, id u32) {
+    mut items = List[List[u8]].empty();
+    mut i = 0usize;
+    while i < log.len() {
+      items.push(log.copyOf(i));
+      i = i + 1usize;
+    }
+    mut from = 0usize;
+    while from < items.len() {
+      mut msg = List[u8].empty();
+      from = packRequests(&items, from, &mut msg);
+      net.sendReliable(id, msg);
+    }
+  }
+
+  // One event from a connection
+  fn onEvent(self &mut, event NetEvent) {
+    mut ev = event;
+    match ev {
+      case imm j Joined { self.clientJoined(j.id, j.conn); }
+      case imm l Left { self.clientLeft(l.id); }
+      case mut m Message {
+        mut data = List[u8].empty();
+        data <=> m.data;
+        gotReliable = gotReliable + 1u64;
+        mut msg = decodeToSim(data);
+        match &mut msg {
+          case mut l &mut Look { looks.push(l.pitch); }
+          case mut c &mut Command { commands.push(c.kind); }
+          case mut k &mut Click { clicksIn.push(k.part); }
+          case mut f &mut Frame {
+            frameAsked = true;
+            frameNo = f.frame;
+            frameSteps <=> f.steps;
           }
           else {}
         }
       }
-      j = j + 1usize;
+      case mut u Update {
+        if u32.from(u.stream) == STREAM_INPUT {
+          mut data = List[u8].empty();
+          data <=> u.data;
+          mut samples = List[InputSample].empty();
+          if decodeInput(data, &mut samples) {
+            imm k = self.clientAt(u.id);
+            if k != NO_ROW and samples.len() > 0usize {
+              imm cl = &mut clients[k];
+              cl.receive(&samples);
+              imm last = (*samples[samples.len() - 1usize]).seq;
+              if last > gotSeq { gotSeq = last; }
+            }
+          }
+        }
+      }
+      case imm r Refused {
+        notices = notices + 1u64;
+        print <- "A send was refused: "; print <- r.size; print <- " bytes against "; print <- r.limit; print <- "\n";
+      }
     }
-    // The client's being, told on joining (the possession is the simulation's bookkeeping)
-    if !told and clients > 0u32 {
-      link.tx.sendReliable(ToView.Possessed(cast.beings[cast.possessed].part));
-      told = true;
-    }
-  }
-
-  // The intents of the next input sequence number due. If it did not come
-  // (a lost packet that the redundancy did not cover), the last intents go on.
-  fn takeSample(self &mut) Intents {
-    while queue.len() > 0usize and queue[0usize].seq < nextSeq {
-      // One older than due: dropped
-      mut keep = List[InputSample].empty();
-      mut q = 1usize;
-      while q < queue.len() { keep.push(*queue[q]); q = q + 1usize; }
-      queue <=> keep;
-    }
-    if queue.len() > 0usize and queue[0usize].seq == nextSeq {
-      imm s = *queue[0usize];
-      mut keep = List[InputSample].empty();
-      mut q = 1usize;
-      while q < queue.len() { keep.push(*queue[q]); q = q + 1usize; }
-      queue <=> keep;
-      nextSeq = nextSeq + 1u64;
-      appliedInput = s.seq;
-      lastIntents = s.intents;
-      lastLook = s.lookKeys;
-      return s.intents;
-    }
-    missedInput = missedInput + 1u64;
-    nextSeq = nextSeq + 1u64;
-    lastIntents;
   }
 
   // ---- simulate ----
 
   // The frame's fixed steps: the pitch changes, then each step by the
-  // intents of its input sequence number -> the possessed being's intents;
-  // every being stepped; the birds on scene time (paused and x10 with the
-  // day); the scene's clock moved on
+  // intents of the input sequence number due for each client's being; every
+  // being stepped; the birds on scene time (paused and x10 with the day); the
+  // scene's clock moved on
   fn simulate(self &mut, steps &List[Step]) {
     stepSeconds = 0.;
     mut p = 0usize;
     while p < looks.len() {
-      cast.rig.tilt(*looks[p]);
+      if self.legacy() { cast.rig.tilt(*looks[p]); }
       p = p + 1usize;
     }
     looks.clear();
+    // One entry a being, its intents
+    while given.len() < cast.beings.len() { given.push(Intents.none()); stepIt.push(true); }
+    // Single player: the user's being is the one possessed (Tab, or the script, changes it)
+    if self.legacy() and clients.len() > 0usize {
+      imm c0 = &mut clients[0usize];
+      c0.being = cast.possessed;
+    }
     mut i = 0usize;
     while i < steps.len() {
       imm step = *steps[i];
       stepSeconds = stepSeconds + step.dt;
-      imm intents = self.takeSample();
-      cast.rig.tilt(lastLook * LOOK_KEY_RATE * step.dt);
-      cast.step(intents, step.dt);
-      birds.step(step.dt * f32.from(scene.clock.rate()));
+      mut b = 0usize;
+      while b < cast.beings.len() {
+        given.set(b, Intents.none());
+        stepIt.set(b, true);
+        b = b + 1usize;
+      }
+      mut c = 0usize;
+      while c < clients.len() {
+        imm cl = &mut clients[c];
+        imm stepped = cl.take(lockstep);
+        stepIt.set(cl.being, stepped);
+        given.set(cl.being, cl.cur);
+        if c == 0usize {
+          appliedInput = cl.applied;
+          missedInput = cl.missed;
+          if self.legacy() and stepped { cast.rig.tilt(cl.curLook * LOOK_KEY_RATE * step.dt); }
+        }
+        c = c + 1usize;
+      }
+      cast.stepEach(&given, &stepIt, step.dt, self.legacy());
+      // A backlog of a client's inputs is run off, two a tick
+      c = 0usize;
+      while !lockstep and c < clients.len() {
+        imm cl = &mut clients[c];
+        if cl.waiting() > BACKLOG {
+          mut only = 0usize;
+          while only < cast.beings.len() { stepIt.set(only, false); only = only + 1usize; }
+          if cl.take(false) {
+            cl.extra = cl.extra + 1u64;
+            stepIt.set(cl.being, true);
+            given.set(cl.being, cl.cur);
+            cast.stepEach(&given, &stepIt, step.dt, false);
+          }
+        }
+        c = c + 1usize;
+      }
+      if self.legacy() { birds.step(step.dt * f32.from(scene.clock.rate())); }
       scene.advanceClock(step.ns);
+      tick = tick + 1u64;
+      if traceOn { self.traceTick(); }
       i = i + 1usize;
+    }
+  }
+
+  // What a test reads: each client's being where this tick left it, with the wall clock (the performance counter)
+  fn traceTick(self &) {
+    if tick == 1u64 { print <- "QPCFREQ "; print <- sdl.GetPerformanceFrequency(); print <- "\n"; }
+    mut c = 0usize;
+    while c < clients.len() {
+      imm b = cast.beings[clients[c].being];
+      print <- "TS "; print <- tick; print <- " "; print <- sdl.GetPerformanceCounter(); print <- " "; print <- clients[c].being; print <- " ";
+      print <- millimetres(b.body.position.x); print <- " "; print <- millimetres(b.body.position.y); print <- " ";
+      print <- millimetres(b.body.position.z); print <- " "; print <- clients[c].applied; print <- "\n";
+      c = c + 1usize;
     }
   }
 
@@ -298,7 +503,7 @@ pub struct SimState {
 
   // The clock's and the view's keys, the hard landings mailed, the clicks
   // told to their listeners, and the scene's events into the world's mail:
-  // timers due, and the areas the possessed being is in
+  // timers due, and the areas the beings are in
   fn beforeWorld(self &mut) {
     mut c = 0usize;
     while c < commands.len() {
@@ -313,15 +518,14 @@ pub struct SimState {
       } elif kind == COMMAND_WEATHER {
         weather.cycle(scene.now());
         print <- "Weather: "; printStr(weatherName(weather.target)); print <- " at "; print <- scene.now(); print <- " s\n";
-      } elif kind == COMMAND_VIEW {
-        // V: first or third person
+      } elif kind == COMMAND_VIEW and self.legacy() {
+        // V: first or third person (the view's own camera is the one drawn from; this is the harness's mirror)
         cast.rig.toggle();
         print <- "View: "; if cast.rig.mode == VIEW_FIRST { print <- "first person"; } else { print <- "third person"; }; print <- "\n";
-      } elif kind == COMMAND_SWAP {
+      } elif kind == COMMAND_SWAP and self.legacy() {
         // Tab: the next mannequin
         cast.swap();
         print <- "Possessing being "; print <- cast.possessed; print <- "\n";
-        link.tx.sendReliable(ToView.Possessed(cast.beings[cast.possessed].part));
       }
       c = c + 1usize;
     }
@@ -345,8 +549,18 @@ pub struct SimState {
     }
     clicksIn.clear();
     scene.ring();
-    imm you = self.youBody();
-    scene.sense(cast.beings[cast.possessed].part, you.position);
+    if serve {
+      // Each client's being in turn: an area holds the first to come in until it goes out
+      mut s = 0usize;
+      while s < clients.len() {
+        imm b = cast.beings[clients[s].being];
+        scene.senseWith(b.part, b.body.position, false);
+        s = s + 1usize;
+      }
+    } else {
+      imm you = self.youBody();
+      scene.sense(cast.beings[cast.possessed].part, you.position);
+    }
   }
 
   // The world's turn: the registry lent and the mail moved to it
@@ -384,38 +598,62 @@ pub struct SimState {
     setSupports(&scene);
   }
 
-  // The tick's snapshot and the requests the view needs, into the link's
-  // outbox: the accepted requests (reliable), the state (latest-wins), and in
-  // a scripted run its camera and the view's name (latest-wins, on a stream
-  // of its own)
+  // What the clients are told this frame: the accepted requests and a weather
+  // change (reliable), the snapshot of the tick (latest-wins), and in a scripted
+  // run its camera and the view's name (latest-wins, on a stream of its own).
+  // A server sends snapshots at its own rate, every other tick (30 a second).
   fn publish(self &mut, frameNo u64) {
     if forView.len() > 0usize {
-      mut out = List[Request].empty();
-      out <=> forView;
-      link.tx.sendReliable(ToView.Requests(out));
+      mut items = List[List[u8]].empty();
+      mut i = 0usize;
+      while i < forView.len() {
+        mut one = List[u8].empty();
+        if encodeRequest(forView[i], &mut one) {
+          if one.len() > net.maxItem { net.maxItem = one.len(); }
+          log.add(forView[i], copyBytes(&one));
+          items.push(one);
+        } else {
+          skippedRequests = skippedRequests + 1u64;
+        }
+        i = i + 1usize;
+      }
+      forView.clear();
+      mut from = 0usize;
+      while from < items.len() {
+        mut msg = List[u8].empty();
+        from = packRequests(&items, from, &mut msg);
+        self.tellAll(msg);
+      }
     }
+    if !weather.same(&weatherSent) {
+      self.tellAll(encodeWeather(&weather));
+      weatherSent = weather;
+    }
+    if clients.len() == 0usize { return; }
+    // The being a single-player client drives, if it has changed
+    if self.legacy() {
+      imm c0 = &mut clients[0usize];
+      c0.being = cast.possessed;
+      if c0.told != c0.being {
+        c0.told = c0.being;
+        net.sendReliable(c0.id, encodePossessed(u32.from(c0.being)));
+      }
+    }
+    // A snapshot says where the beings are after a tick: none is sent twice, and a server sends them at its own rate
+    if snapshotsSent > 0u64 and tick == lastPublish { return; }
+    if serve and tick < lastPublish + 2u64 { return; }
+    lastPublish = tick;
     mut beings = List[BeingState].empty();
     mut i = 0usize;
     while i < cast.beings.len() {
       imm b = cast.beings[i];
-      mut bones = List[Mat4].empty();
-      mut velocity = new Vec3(0., 0., 0.);
-      if b.figure.active {
-        bones = b.figure.skinning();
-        if b.figure.grounded {
-          velocity = new Vec3(0. - sin(b.body.yaw) * b.figure.speed, 0., 0. - cos(b.body.yaw) * b.figure.speed);
-        } else {
-          velocity = new Vec3(b.figure.airVx, b.figure.vy, b.figure.airVz);
-        }
+      if !b.gone {
+        beings.push(new BeingState(u32.from(i), false, b.body.position, b.body.yaw, b.figure.speed, b.figure.vy, b.figure.airVx,
+          b.figure.airVz, b.figure.grounded, b.intents, b.figure.on, b.figure.health, b.figure.setDowns, b.figure.landCount,
+          b.figure.landSpeed));
       }
-      beings.push(new BeingState(b.part, b.body.position, b.body.yaw, velocity, b.intents, b.figure.on,
-        b.figure.health, b.figure.active, bones));
       i = i + 1usize;
     }
-    mut flock = List[BirdFrame].empty();
-    birds.publish(&mut flock);
-    imm state = new WorldState(scene.now(), scene.hour(), appliedInput, beings, cast.eyesBefore(), cast.eyes(), flock, weather);
-    link.tx.sendLatest(STREAM_STATE, StateData.State(state));
     // A scripted close-up looks from where the script says instead, through its lens
     mut fixedView = scripted and hasView(frameNo);
     mut look = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
@@ -424,7 +662,33 @@ pub struct SimState {
       look = viewAt(self, frameNo);
       fov = viewFov(frameNo);
     }
-    link.tx.sendLatest(STREAM_TEST, StateData.Test(new TestView(fixedView, look, fov, String.from(shotAt(frameNo)))));
+    imm test = new TestView(fixedView, look, fov, String.from(shotAt(frameNo)));
+    mut c = 0usize;
+    while c < clients.len() {
+      imm cl = clients[c];
+      mut w = new WorldState(tick, scene.now(), u32.from(scene.clock.rate()), cl.applied, copyBeings(&beings));
+      // The being the client drives crosses whole: it is compared with the client's own prediction
+      mut k = 0usize;
+      while k < w.beings.len() {
+        if u32.from(cl.being) == w.beings[k].being { w.beings.set(k, exactly(*w.beings[k])); }
+        k = k + 1usize;
+      }
+      imm bytes = encodeState(&w);
+      stateBytes = stateBytes + u64.from(bytes.len());
+      snapshotsSent = snapshotsSent + 1u64;
+      if scripted { net.sendLatest(cl.id, STREAM_TEST, encodeTest(&test)); }
+      net.sendLatest(cl.id, STREAM_STATE, bytes);
+      c = c + 1usize;
+    }
+  }
+
+  // A reliable message to every client
+  fn tellAll(self &mut, msg List[u8]) {
+    mut c = 0usize;
+    while c < clients.len() {
+      net.sendReliable(clients[c].id, copyBytes(&msg));
+      c = c + 1usize;
+    }
   }
 
   // Apply every request waiting, in the order sent: the scene's own here,
@@ -474,6 +738,10 @@ pub struct SimState {
         case mut dl &mut DefineMaterial { toView = scene.applyDefine(dl.material.id, KIND_MATERIAL); }
         case is ObjectBegin { inObject = true; }
         case is Object { inObject = false; toView = true; }
+        case is BeingAdded {
+          toView = true;
+          scene.applied = scene.applied + 1u64;
+        }
         case mut sh &mut Show {
           if !scene.isLive(sh.id) or !scene.isMesh(sh.mesh) or !scene.isMaterial(sh.material) {
             scene.refused = scene.refused + 1u64;
@@ -492,7 +760,10 @@ pub struct SimState {
           if toView { fired = fired + 1u64; }
         }
         case mut l &mut Listen { scene.applyListen(l.id); }
-        case mut pl &mut Platform { scene.applyPlatform(pl.id, pl.shape); }
+        case mut pl &mut Platform {
+          // The clients keep the platforms too: their own bodies stand on them
+          toView = scene.applyPlatform(pl.id, pl.shape);
+        }
         case mut gl &mut Glow {
           if !scene.isMaterial(gl.material) {
             scene.refused = scene.refused + 1u64;
@@ -562,6 +833,55 @@ pub struct SimState {
     print <- "\n";
     print <- "The baked-in world, object by object:\n";
   }
+
+  // What the server sent each client, at the end of the run
+  fn netReport(self &mut) {
+    print <- "Server: "; print <- tick; print <- " ticks, "; print <- snapshotsSent; print <- " snapshots, "; print <- clients.len();
+    print <- " clients now; "; print <- skippedRequests; print <- " requests did not cross, "; print <- net.refused; print <- " sends refused\n";
+    if snapshotsSent > 0u64 {
+      print <- "  a snapshot averages "; print <- stateBytes / snapshotsSent; print <- " bytes\n";
+    }
+    print <- "  the largest reliable message "; print <- net.maxReliable; print <- " bytes (the limit "; print <- MAX_RELIABLE; print <- "), the largest request ";
+    print <- net.maxItem; print <- ", the largest snapshot "; print <- net.maxLatest; print <- " (the limit "; print <- MAX_LATEST; print <- ")\n";
+  }
+}
+
+// A distance in whole millimetres, for a trace
+fn millimetres(v f32) i64 { i64.from(libc.floorf(v * 1000. + 0.5)); }
+
+// The name of the k-th client's mannequin
+fn clientName(k u32) &str {
+  imm names Array[&str, 8] = ["mannequin 1", "mannequin 2", "mannequin 3", "mannequin 4", "mannequin 5", "mannequin 6", "mannequin 7",
+    "mannequin 8"];
+  names[usize.from(k % 8u32)];
+}
+
+// A copy of a list of beings' states
+fn copyBeings(src &List[BeingState]) List[BeingState] {
+  mut out = List[BeingState].withCapacity(src.len());
+  mut i = 0usize;
+  while i < src.len() {
+    out.push(*src[i]);
+    i = i + 1usize;
+  }
+  out;
+}
+
+// A being's state with its numbers whole
+fn exactly(b BeingState) BeingState {
+  new BeingState(b.being, true, b.position, b.yaw, b.speed, b.vy, b.airVx, b.airVz, b.grounded, b.intents, b.platform, b.health,
+    b.respawns, b.landings, b.landSpeed);
+}
+
+// A copy of some bytes
+fn copyBytes(b &List[u8]) List[u8] {
+  mut out = List[u8].withCapacity(b.len());
+  mut i = 0usize;
+  while i < b.len() {
+    out.push(*b[i]);
+    i = i + 1usize;
+  }
+  out;
 }
 
 // The point at (x, z) on the ground, for a being to stand on
@@ -570,47 +890,68 @@ fn standing(x f32, z f32) Vec3 { new Vec3(x, groundHeight(x, z), z); }
 actor SimActor {
   st SimState;
   world WorldActor;
-  peer Option[ViewActor];      // the other end of the link, once connected
+  joined Sender[bool];         // the shell's: whether the first client joined
+  served Sender[u64];          // the shell's: a server's tick done
 
   // The scene seeded (the shell's parts and the beings), with the flock the
-  // shell made and its world actor named
-  fn init(self &new, scripted bool, birds Birds, world WorldActor) {
-    mut state = SimState.make(scripted, birds);
+  // shell made, its world actor named, and the end of the connections
+  fn init(self &new, scripted bool, birds Birds, world WorldActor, serve bool, joined Sender[bool], served Sender[u64]) {
+    mut state = SimState.make(scripted, birds, serve);
     state.seed();
-    imm none Option[ViewActor] = None;
-    *self = new Self(state, world, none);
+    *self = new Self(state, world, joined, served);
   }
 
-  // The link's other end named: this side tells it a client may join
-  pub async do connect(self, view ViewActor) {
-    st.link.tx.joined(0u32);
-    peer = Some[ViewActor](view);
+  // Single player: this simulation's connection joined to the view's (netmsg's in-process pair)
+  pub async do wire(self, viewHandler EventHandler) {
+    imm me = selfactor;
+    imm mine = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [me] { me.onNet(ev); }));
+    imm pair = pairInProcess(mine, 1u32, viewHandler, 1u32);
   }
 
-  // The link's packets from the view: the client's inputs and commands
-  pub async do link(self, packet Packet[ToSim, InputData]) {
-    st.link.rx.accept(packet);
+  // What a connection tells (the connections' handler sends it here): a client joined or left, a message, a value.
+  // In single player the view's frame arrives as a message after its inputs, and the simulation takes it at once
+  pub async do onNet(self, ev NetEvent) {
+    st.onEvent(ev);
+    if st.joinedNow {
+      st.joinedNow = false;
+      joined <- true;
+    }
+    if st.frameAsked {
+      st.frameAsked = false;
+      imm t0 = sdl.GetTicksNS();
+      mut steps = List[Step].empty();
+      steps <=> st.frameSteps;
+      st.simulate(&steps);
+      imm t1 = sdl.GetTicksNS();
+      st.beforeWorld();
+      imm reply = await world.tick(st.worldTurn());
+      st.afterWorld(reply, st.frameNo);
+      st.publish(st.frameNo);
+      imm t2 = sdl.GetTicksNS();
+      // Said last: when the view hears it, it has heard the rest
+      if st.clients.len() > 0usize {
+        st.net.sendReliable(st.clients[0usize].id, encodeFrameDone(st.tick, t1 - t0, t2 - t1));
+      }
+    }
   }
 
-  // The frame (above)
-  pub async do advance(self, turn Advance) Advanced {
-    imm t0 = sdl.GetTicksNS();
+  // A server's tick, answered to the shell's channel (the shell is no actor): the events heard are already taken
+  pub async do serveTick(self, turn Advance) {
     mut t = turn;
-    st.receive();
     st.simulate(&t.steps);
-    imm t1 = sdl.GetTicksNS();
     st.beforeWorld();
     imm reply = await world.tick(st.worldTurn());
     st.afterWorld(reply, t.frame);
     st.publish(t.frame);
-    // The packet to the view, in the same turn: nothing waits a frame
-    imm packet = st.link.tx.take();
-    match &peer {
-      case imm p Some { p.link(packet); }
-      else {}
-    }
-    imm t2 = sdl.GetTicksNS();
-    new Advanced(t1 - t0, t2 - t1);
+    served <- st.tick;
+  }
+
+  // A server's end: the scene's lines, the world's log and what was sent the clients
+  pub async do serveEnd(self) {
+    st.report();
+    imm reported = await world.report();
+    st.netReport();
+    served <- 0u64;
   }
 
   // The frame drawn: what the view saw, and the answer for the shell's report
@@ -622,6 +963,7 @@ actor SimActor {
   pub async do finishScene(self) bool {
     st.report();
     imm reported = await world.report();
+    if st.serve { st.netReport(); }
     reported;
   }
 

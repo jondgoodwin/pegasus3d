@@ -1,37 +1,62 @@
 // The view actor: what each browser shows and picks from, run on the actors
 // package's workers. It owns the view's scene (parts/viewscene.cone: which
-// parts are live and the placement tree for drawing), the picking system
-// (picking.cone), the snapshot for render, and the render actor it draws
-// with. It holds no body, no timer, no area and no world: the truth is the
-// simulation's (simactor.cone), and this half only takes what the simulation
-// sends, over the message link (msglink.cone; what crosses is in simview.cone).
-// The camera it draws from is the simulation's eye, as sent; in single player
-// the view takes the simulation's state as it is, with no prediction and no
-// interpolation.
+// parts are live, the placement tree for drawing and the platforms), the
+// picking system (picking.cone), the snapshot for render, the render actor it
+// draws with, and a body for each being it draws: the one it drives, which it
+// PREDICTS, and the others, which it INTERPOLATES. It holds no timer, no area
+// and no world: the truth is the simulation's (simactor.cone), and this half
+// takes what the simulation sends, over its connection (netlink.cone; what
+// crosses is in simview.cone, as bytes in netcodec.cone), and builds from the
+// content it holds itself what the simulation names (Request.Object).
+//
+// THE BEING THE USER DRIVES is stepped here at once, by the same code the
+// simulation runs (Being.step: the gait, support.cone's collision and
+// platforms) from the intents of each fixed step, so the user's own mannequin
+// answers a key in the frame it is pressed whatever the connection's delay.
+// The intents go to the simulation numbered, the last INPUT_KEPT of them in
+// each packet. When a snapshot arrives with the last input sequence number the
+// simulation has applied, this half compares the body it predicted after that
+// input with the simulation's: if they agree (they do, unless the world
+// differs from what was predicted) nothing happens; if not, its own body is
+// set to the simulation's and the inputs not yet applied are played again, and
+// the difference is blended away over CORRECTION_SECONDS (a large one at once).
+// The camera (the view rig of being.cone) follows this body, here.
+//
+// THE OTHER BEINGS are drawn DELAY_TICKS (100 ms) in the past, between two
+// snapshots, so that a snapshot lost or late does not show; the gait is
+// animated here from the interpolated speed and heading (Figure.poseFrom). In
+// single player, where nothing is late, the delay is none and a being is drawn
+// at the snapshot's state.
+//
+// THE CLOCK. The simulation's tick is estimated from each snapshot and the
+// round-trip time (netmsg's), smoothed; the others are drawn at that tick less
+// the delay. Scene time (the day, the lanterns, the ride) is the snapshot's,
+// carried on by the estimate.
 //
 // ITS FRAME is one message from the shell, which it answers when the frame is
-// presented:
+// presented. In single player (LOCKSTEP) the halves take turns, so that a frame
+// is the same every time:
 //
-//   frame(input)  a click picked (and the part highlighted: the view's own),
-//                 and the frame's controls and the intents of each step put
-//                 in the link's outbox; the packet sent to the simulation; the
-//                 simulation's advance AWAITED (the halves take turns); the
-//                 simulation's packet, which arrived in the view's inbox
-//                 meanwhile, read: the requests applied in the order sent
-//                 (the placement tree, the picking system, and render's kept in
-//                 order), the beings placed and posed from the state, the
-//                 world matrices and THE SNAPSHOT published; the frame DRAWN,
-//                 awaited: the snapshot and render's requests moved to the
-//                 render actor, the snapshot moved back once presented; what
-//                 the view saw told to the simulation (endFrame, awaited),
-//                 which answers with what the shell reports; the shell told
+//   frame(input)  the frame's controls and the intents of each step: the user's
+//                 body predicted, the camera and the birds stepped; the messages
+//                 sent, the last of them a Frame that asks the simulation to take
+//                 the steps; the frame ends (complete) when the simulation's
+//                 FrameDone, said after all else it had to say, arrives; the
+//                 requests applied in the order sent (the placement
+//                 tree, the picking system, and render's kept in order), the
+//                 snapshot of the beings compared with the prediction, the others
+//                 posed, the world matrices and THE SNAPSHOT published; the frame
+//                 DRAWN, awaited: the snapshot and render's requests moved to the
+//                 render actor, the snapshot moved back once presented; what the
+//                 view saw told to the simulation (endFrame, awaited), which
+//                 answers with what the shell reports; the shell told
+//
+// Connected (--connect) the simulation is another process: what has arrived is
+// applied first, then the steps are predicted, and nothing is awaited.
 //
 //   finish()      the end of the run: the simulation's and the world's lines,
 //                 render's, the script's verdict, and the run's exit code to
 //                 the shell
-//
-// Nothing waits a frame: the simulation sends its packet to this actor before it
-// answers advance, so the packet is in this actor's inbox when the answer arrives.
 
 // What the shell hands the view each frame: its steps, the user's intents
 // and the keys and click of the frame, and the window's sizes
@@ -53,6 +78,12 @@ pub struct FrameInput {
   pub resized bool;           // the window changed size: 'width' by 'height' pixels
   pub width u32;
   pub height u32;
+
+  // No frame yet
+  pub fn none() FrameInput {
+    new FrameInput(0u64, List[Step].empty(), Intents.none(), 0., 0., false, false, false, false, false, false, new Vec2(0., 0.),
+      new Vec2(HEADLESS_W, HEADLESS_H), 0., false, 0u32, 0u32);
+  }
 }
 
 // What the view tells the shell once a frame is presented
@@ -79,10 +110,47 @@ pub struct FrameReport {
   }
 }
 
-// Where a being was last placed from
-struct SentBody {
+// No being is known to be the user's
+const NO_BEING = 0xFFFFFFFFu32;
+// The others are drawn this many fixed steps (1/60 s) in the past when connected
+const DELAY_TICKS f64 = 6.;
+const TICKS_PER_SECOND f64 = 60.;
+// A prediction that differs from the simulation's by more than this (metres) is corrected
+const FIX_ERROR f32 = 0.002;
+// A correction up to this (metres) is blended away, over this long; a larger one is made at once
+const SNAP_ERROR f32 = 2.;
+const CORRECTION_SECONDS f32 = 0.1;
+// The most steps of predicted state kept to compare, play again, or wait for
+const HISTORY_MAX = 600usize;
+
+// One of the user's steps: the input, and the body predicted after it
+struct Predicted {
+  seq u64;
+  intents Intents;
+  look f32;
+  dt f32;
+  stepped bool;               // the body was stepped by it here (not, before the first snapshot)
   position Vec3;
   yaw f32;
+  grounded bool;
+  rig ViewRig;                // the camera before the step, so that a step played again moves it as the first did
+}
+
+// A snapshot's state of a being, at the simulation's tick
+struct Sample {
+  tick u64;
+  state BeingState;
+}
+
+// What the view keeps of a being besides its body in the cast
+struct Puppet {
+  samples List[Sample];       // the last snapshots of it, oldest first
+  landings u32;               // landings (mod 256) of it already taken into its gait
+  respawns u32;
+  started bool;               // single player: its body has been set from its first snapshot
+  placed bool;                // its part has been placed
+  placedAt Vec3;              // and where
+  placedYaw f32;
 }
 
 // The view actor's state
@@ -93,13 +161,20 @@ pub struct ViewState {
   pub lastPick PickHit;       // the last click's answer
   pub clicks u64;
   pub view Vec2;              // the window in its own units, as the shell last said
-  pub link UpLink;            // the message link's end on this side
-  pub yours PartId;           // the being this client possesses, as the simulation said
+  pub net NetSide;            // the connection
+  pub cast Cast;              // the beings drawn, and the camera that follows the one driven
+  puppets List[Puppet];       // one for each being of the cast
+  pub own usize;              // the being this client drives (NO_ROW: not known yet)
+  ownWanted u32;              // told to drive, before the being exists
+  ownReady bool;              // its body has been set to the simulation's
+  forceSnap bool;             // the next snapshot of it is taken whole
+  pub birds Birds;            // this browser's flock
+  history List[Predicted];
+  corr Vec3;                  // a correction being blended away: how far the body drawn is from the body
   pub late u64;               // frames whose state did not arrive with the simulation's answer
   lateNow bool;               // this frame's did not
   snapshot Snapshot;          // the last published, handed back by render once drawn
   forRender List[Request];    // render's share of this frame's requests, in order
-  sentBodies List[SentBody];  // each being as it was last placed
   seq u64;                    // the last input sequence number given
   recent List[InputSample];   // the last INPUT_KEPT ticks of intents
   testFixed bool;             // a scripted run's, from the simulation
@@ -107,68 +182,203 @@ pub struct ViewState {
   testFov f32;
   testShot String;
   shared List[MaterialId];    // the materials the world shares across its objects, by key, as built here
+  lockstep bool;              // single player: the halves take turns
+  joined bool;                // the connection is open
+  closed bool;                // and it has ended
+  inbox List[ToView];         // reliable messages received, not yet applied
+  states List[WorldState];    // snapshots received, not yet taken (oldest first)
+  testIn List[TestView];      // scripted runs' own, received
+  reliableGot u64;
+  lastState WorldState;       // the newest snapshot taken
+  hasState bool;
+  weather Weathering;
+  moves List[PlatformMove];
+  stepSeconds f32;            // the frame's steps, seconds
+  given List[Intents];        // scratch for Cast.stepEach
+  stepIt List[bool];
+  localTick u64;              // fixed steps taken here
+  tickOffset f64;             // the simulation's tick less ours, estimated
+  synced bool;
+  pub rttMs i64;
+  rate u32;                   // the scene clock's rate, as the last snapshot said
+  pub sceneNow f64;           // scene time, as estimated
+  pub snapshots u64;          // snapshots taken
+  pub corrections u64;        // predictions found wrong and corrected
+  pub worstError f32;         // the largest difference found (metres)
+  pub stale u64;              // snapshots that arrived out of order and were dropped
+  ownEver bool;               // the user's body has been set to the simulation's at least once
+  pub worldBuilt u32;         // objects of the world built here
+  pub bytesIn u64;            // bytes received, as the connection counts them
+  pub bytesOut u64;
+  frameTick u64;              // the tick the simulation said its last frame ended at (single player)
+  pub resyncs u64;            // times the user's body was set to the simulation's with no prediction to compare (the first snapshots)
+  rttMinMs i64;               // the least round trip lately: the one with the least waiting in it
+  gapMax f64;                 // the longest gap between snapshots lately, in ticks (decaying)
+  joinedNow bool;             // the connection opened since the actor last said so
+  leftNow bool;               // or ended
+  frameDone bool;             // single player: the simulation said its frame was done
+  pub simulateNs u64;         // and how long it took
+  pub publishNs u64;
 
-  pub fn make() ViewState {
+  pub fn make(birds Birds, lockstep bool) ViewState {
     imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
     new ViewState(ViewScene.empty(), PickSystem.empty(), PartId.none(), new PickHit(PartId.none(), 0., 0u32, 0u64),
-      0u64, new Vec2(HEADLESS_W, HEADLESS_H), UpLink.make(), PartId.none(), 0u64, false, Snapshot.empty(),
-      List[Request].empty(), List[SentBody].empty(), 0u64, List[InputSample].empty(), false, still, FOV, String.empty(),
-      List[MaterialId].empty());
+      0u64, new Vec2(HEADLESS_W, HEADLESS_H), NetSide.make(), Cast.empty(), List[Puppet].empty(), NO_ROW, NO_BEING, false,
+      false, birds, List[Predicted].empty(), new Vec3(0., 0., 0.), 0u64, false, Snapshot.empty(), List[Request].empty(), 0u64,
+      List[InputSample].empty(), false, still, FOV, String.empty(), List[MaterialId].empty(), lockstep, false, false,
+      List[ToView].empty(), List[WorldState].empty(), List[TestView].empty(), 0u64,
+      new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), 0.,
+      List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64);
   }
 
-  // An object of the content this browser holds itself, built again from the Object request that named it: the
-  // same code that made it in the simulation, its parts, meshes and materials given the ids the simulation
-  // reserved for them. Its requests are applied here, in order, as any are.
-  fn buildObject(self &mut, spec ObjectSpec, ids List[PartId]) {
-    mut door = Door.empty();
-    door.replayIds(ids);
-    if spec.kind == OBJ_WORLD {
-      mut h = hydrate(spec.index);
-      mut partIds = List[PartId].empty();
-      mut places = List[Transform3].empty();
-      inject(&mut h, &mut door, &mut partIds, &mut places, &mut shared);
-    } elif spec.kind == OBJ_SHELL {
-      seedScene(&mut door);
-    } elif spec.kind == OBJ_MANNEQUIN {
-      imm root = door.newPart(spec.name.view());
-      spawnMannequin(&mut door, spec.height, spec.color, root);
-    } elif spec.kind == OBJ_TESTCUBE {
-      buildTestCube(&mut door);
+  // Reliable messages sent to the simulation, ever
+  pub fn reliableSentCount(self &) u64 {
+    if net.has(1u32) { net.peer(1u32).reliableSent; } else { 0u64; };
+  }
+
+  // ---- the connection ----
+
+  // One event from the connection
+  fn onEvent(self &mut, event NetEvent) {
+    mut ev = event;
+    match ev {
+      case imm j Joined {
+        net.open(j.id, j.conn);
+        joined = true;
+        joinedNow = true;
+      }
+      case imm l Left {
+        net.close(l.id);
+        closed = true;
+        leftNow = true;
+        print <- "The connection ended\n";
+      }
+      case mut m Message {
+        mut data = List[u8].empty();
+        data <=> m.data;
+        reliableGot = reliableGot + 1u64;
+        mut msg = decodeToView(data);
+        match &mut msg {
+          case mut fd &mut FrameDone {
+            frameDone = true;
+            frameTick = fd.tick;
+            simulateNs = fd.simulateNs;
+            publishNs = fd.publishNs;
+          }
+          else { inbox.push(msg); }
+        }
+      }
+      case mut u Update {
+        mut data = List[u8].empty();
+        data <=> u.data;
+        if u32.from(u.stream) == STREAM_STATE {
+          mut w = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+          if decodeState(data, &mut w) { states.push(w); }
+        } elif u32.from(u.stream) == STREAM_TEST {
+          mut t = new TestView(false, Pose.look(new Vec3(0., 0., 0.), 0., 0.), FOV, String.empty());
+          if decodeTest(data, &mut t) { testIn.push(t); }
+        }
+      }
+      case imm r Refused {
+        print <- "A send was refused: "; print <- r.size; print <- " bytes against "; print <- r.limit; print <- "\n";
+      }
     }
-    door.endReplay();
-    self.applyRequests(door.takeInbox());
   }
 
   // ---- before the simulation's turn ----
 
-  // A click picked and the part highlighted, then the frame's controls and the
-  // intents of each of its steps into the link's outbox
+  // The frame's controls, a click picked, the steps predicted and the intents of each step sent
   fn beforeSim(self &mut, input &FrameInput) {
     view = input.viewSize;
-    if input.lookDrag != 0. { link.tx.sendReliable(ToSim.Look(input.lookDrag)); }
-    if input.pause { link.tx.sendReliable(ToSim.Command(COMMAND_PAUSE)); }
-    if input.fast { link.tx.sendReliable(ToSim.Command(COMMAND_FAST)); }
-    if input.weather { link.tx.sendReliable(ToSim.Command(COMMAND_WEATHER)); }
-    if input.view { link.tx.sendReliable(ToSim.Command(COMMAND_VIEW)); }
-    if input.swap { link.tx.sendReliable(ToSim.Command(COMMAND_SWAP)); }
+    stepSeconds = 0.;
+    // The camera's pitch, from the drag: here at once, and told to the simulation's mirror of it
+    if input.lookDrag != 0. {
+      cast.rig.tilt(input.lookDrag);
+      if lockstep { net.sendReliable(1u32, encodeToSim(ToSim.Look(input.lookDrag))); }
+    }
+    if input.pause { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_PAUSE))); }
+    if input.fast { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_FAST))); }
+    if input.weather { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_WEATHER))); }
+    if input.swap and lockstep { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_SWAP))); }
     if input.click { self.click(input.pointer); }
-    // One sample a step; the last INPUT_KEPT sent every frame, newest last
+    // The steps: one input a step, numbered; the user's body and the camera follow it at once, and the birds fly on
     mut i = 0usize;
     while i < input.steps.len() {
-      seq = seq + 1u64;
-      recent.push(new InputSample(seq, input.intents, input.lookKeys));
+      imm step = *input.steps[i];
+      if joined {
+        seq = seq + 1u64;
+        imm sample = new InputSample(seq, input.intents, input.lookKeys);
+        recent.push(sample);
+        self.stepOwn(sample, step);
+      }
+      birds.step(step.dt * f32.from(rate));
+      stepSeconds = stepSeconds + step.dt;
+      localTick = localTick + 1u64;
       i = i + 1usize;
     }
-    while recent.len() > INPUT_KEPT {
+    // V: first or third person, after the steps (as the simulation's mirror does)
+    if input.view {
+      cast.rig.toggle();
+      if lockstep { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_VIEW))); }
+    }
+    // Those the simulation has not yet said it applied are kept (at least the last INPUT_KEPT, at most INPUT_MOST)
+    while recent.len() > INPUT_MOST or (recent.len() > INPUT_KEPT and recent[0usize].seq <= lastState.appliedInput) {
       mut keep = List[InputSample].empty();
       mut q = 1usize;
       while q < recent.len() { keep.push(*recent[q]); q = q + 1usize; }
       recent <=> keep;
     }
-    mut batch = List[InputSample].empty();
-    mut k = 0usize;
-    while k < recent.len() { batch.push(*recent[k]); k = k + 1usize; }
-    link.tx.sendLatest(STREAM_INPUT, InputData.Batch(batch));
+    // The last INPUT_KEPT, every frame (a lost packet loses nothing); single player sends one only when there is a step
+    if joined and recent.len() > 0usize and (input.steps.len() > 0usize or !lockstep) {
+      net.sendLatest(1u32, STREAM_INPUT, encodeInput(&recent));
+    }
+  }
+
+  // One step of the user's body by 'sample': predicted, the camera and the history following it
+  fn stepOwn(self &mut, sample InputSample, step Step) {
+    mut done = false;
+    mut pos = new Vec3(0., 0., 0.);
+    mut yaw = 0.;
+    mut grounded = true;
+    imm rigBefore = cast.rig;
+    if own != NO_ROW and ownReady {
+      self.stepBody(sample.intents, sample.lookKeys, step.dt);
+      self.blendCorrection(step.dt);
+      imm body = cast.beings[own].body;
+      pos = body.position;
+      yaw = body.yaw;
+      grounded = cast.beings[own].figure.grounded;
+      done = true;
+    }
+    history.push(new Predicted(sample.seq, sample.intents, sample.lookKeys, step.dt, done, pos, yaw, grounded, rigBefore));
+    if history.len() > HISTORY_MAX {
+      mut keep = List[Predicted].empty();
+      mut q = history.len() - HISTORY_MAX;
+      while q < history.len() { keep.push(*history[q]); q = q + 1usize; }
+      history <=> keep;
+    }
+  }
+
+  // The user's body stepped by 'intents' (the camera tilted by the look keys first, and following it)
+  fn stepBody(self &mut, intents Intents, lookKeys f32, dt f32) {
+    while given.len() < cast.beings.len() { given.push(Intents.none()); stepIt.push(false); }
+    mut b = 0usize;
+    while b < cast.beings.len() { stepIt.set(b, false); b = b + 1usize; }
+    given.set(own, intents);
+    stepIt.set(own, true);
+    cast.rig.tilt(lookKeys * LOOK_KEY_RATE * dt);
+    cast.stepEach(&given, &stepIt, dt, true);
+  }
+
+  // The correction being blended away eased a step, and the camera moved with what is drawn
+  fn blendCorrection(self &mut, dt f32) {
+    if corr.x == 0. and corr.y == 0. and corr.z == 0. { return; }
+    // The camera is drawn where the body is drawn
+    imm r = &mut cast.rig;
+    r.now = new Pose(r.now.origin + corr, r.now.orientation);
+    imm k = libc.expf(0. - dt / CORRECTION_SECONDS);
+    corr = new Vec3(corr.x * k, corr.y * k, corr.z * k);
+    if corr.length() < 0.0005 { corr = new Vec3(0., 0., 0.); }
   }
 
   // A click at 'pointer': the part it hits picked, reported and highlighted
@@ -195,7 +405,7 @@ pub struct ViewState {
     if !picked.isNone() and !(picked == hit.id) { self.highlight(picked, false); }
     if !hit.id.isNone() {
       self.highlight(hit.id, true);
-      link.tx.sendReliable(ToSim.Click(hit.id));
+      net.sendReliable(1u32, encodeToSim(ToSim.Click(hit.id)));
     }
     picked = hit.id;
   }
@@ -205,67 +415,280 @@ pub struct ViewState {
     if scene.isLive(id) { forRender.push(Request.Highlight(id, on)); }
   }
 
-  // ---- after the simulation's turn ----
+  // ---- after the simulation's turn: what has arrived ----
 
-  // The simulation's packet read: its requests applied in the order sent,
-  // the beings placed and posed from the state, the world matrices and the
-  // snapshot for drawing
-  fn afterSim(self &mut) {
+  // What has arrived applied: the requests in the order sent, the weather, the beings' snapshots (the user's compared with
+  // its prediction, the others kept to be drawn), the scripted run's own
+  fn applyIncoming(self &mut) {
     lateNow = true;
     testFixed = false;
     testFov = FOV;
-    mut reliable = link.rx.takeReliable();
-    imm rs = reliable.viewMut();
+    mut moved = inbox.len() > 0usize;
+    mut messages = List[ToView].empty();
+    messages <=> inbox;
+    imm ms = messages.viewMut();
     mut i = 0usize;
-    while i < rs.len {
+    while i < ms.len {
       mut m ToView = ToView.Nothing;
-      m <=> rs[i];
+      m <=> ms[i];
       match &mut m {
         case mut q &mut Requests {
           mut batch = List[Request].empty();
           batch <=> q.batch;
           self.applyRequests(batch);
         }
-        case mut p &mut Possessed { yours = p.being; }
+        case mut p &mut Possessed { ownWanted = p.being; self.checkOwn(); }
+        case mut w &mut Weather { weather = w.weather; }
         else {}
       }
       i = i + 1usize;
     }
-    mut notices = link.rx.takeNotices();
-    notices.clear();
-    mut latest = link.rx.takeLatest();
-    imm ls = latest.viewMut();
-    mut j = 0usize;
-    while j < ls.len {
-      mut data StateData = StateData.Nothing;
-      data <=> ls[j].value;
-      match &mut data {
-        case mut s &mut State {
-          lateNow = false;
-          imm w = &mut s.state;
-          // The beings placed where they are, and posed
-          self.placeBeings(&mut w.beings);
-          scene.propagate();
-          mut last = Snapshot.empty();
-          last <=> snapshot;
-          snapshot = scene.publish(last, w.now, w.hour, w.eyeFrom, w.eyeTo);
-          snapshot.birds <=> w.birds;
-          snapshot.weather = w.weather;
+    // The platforms as the requests left them, and the bodies on a platform that moved carried with it
+    if moved or stepSeconds > 0. {
+      scene.propagate();
+      scene.platformMoves(&mut moves);
+      carryRiders(&mut cast, &moves, stepSeconds);
+      scene.platformsNow(&mut supports);
+      // The body carried is where the last step left it, for comparing with the simulation's (which carries it too)
+      if own != NO_ROW and ownReady and history.len() > 0usize and moves.len() > 0usize {
+        imm li = history.len() - 1usize;
+        imm lp = *history[li];
+        if lp.stepped {
+          history.set(li, new Predicted(lp.seq, lp.intents, lp.look, lp.dt, true, cast.beings[own].body.position,
+            cast.beings[own].body.yaw, lp.grounded, lp.rig));
         }
-        case mut t &mut Test {
-          testFixed = t.test.fixedView;
-          testView = t.test.view;
-          testFov = t.test.fov;
-          testShot = t.test.shot.copy();
-        }
-        else {}
       }
-      j = j + 1usize;
     }
-    if lateNow { late = late + 1u64; }
-    snapshot.fixedView = testFixed;
-    snapshot.fov = testFov;
-    if testFixed { snapshot.view = testView; }
+    // The snapshots
+    mut got = states.len() > 0usize;
+    imm ss = states.viewMut();
+    mut s = 0usize;
+    while s < ss.len {
+      mut w = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+      w.tick = ss[s].tick;
+      w.now = ss[s].now;
+      w.rate = ss[s].rate;
+      w.appliedInput = ss[s].appliedInput;
+      w.beings <=> ss[s].beings;
+      self.takeState(w);
+      s = s + 1usize;
+    }
+    states.clear();
+    if got or (lockstep and hasState and frameTick <= lastState.tick) { lateNow = false; }
+    if lateNow and lockstep { late = late + 1u64; }
+    // A scripted run's camera and file name
+    imm ts = testIn.viewMut();
+    mut t = 0usize;
+    while t < ts.len {
+      testFixed = ts[t].fixedView;
+      testView = ts[t].view;
+      testFov = ts[t].fov;
+      testShot = ts[t].shot.copy();
+      t = t + 1usize;
+    }
+    testIn.clear();
+  }
+
+  // A snapshot taken: each being's state kept to draw from, the user's body compared with the prediction, the clock
+  // estimated
+  fn takeState(self &mut, w WorldState) {
+    if hasState and w.tick <= lastState.tick {
+      stale = stale + 1u64;
+      return;
+    }
+    snapshots = snapshots + 1u64;
+    mut st = w;
+    // The clock
+    self.syncClock(st.tick);
+    if traceOn {
+      if snapshots == 1u64 { print <- "QPCFREQ "; print <- sdl.GetPerformanceFrequency(); print <- "\n"; }
+      print <- "TA "; print <- st.tick; print <- " "; print <- sdl.GetPerformanceCounter(); print <- " "; print <- rttMs; print <- " "; print <- localTick;
+      print <- "\n";
+    }
+    rate = st.rate;
+    mut k = 0usize;
+    mut ownState = new BeingState(0u32, false, new Vec3(0., 0., 0.), 0., 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32,
+      0u32, 0.);
+    mut hasOwn = false;
+    while k < st.beings.len() {
+      imm b = *st.beings[k];
+      imm idx = usize.from(b.being);
+      if idx < cast.beings.len() {
+        imm p = &mut puppets[idx];
+        p.samples.push(new Sample(st.tick, b));
+        while p.samples.len() > 8usize {
+          mut keep = List[Sample].empty();
+          mut q = 1usize;
+          while q < p.samples.len() { keep.push(*p.samples[q]); q = q + 1usize; }
+          p.samples <=> keep;
+        }
+        if idx == own { ownState = b; hasOwn = true; }
+      }
+      k = k + 1usize;
+    }
+    lastState.tick = st.tick;
+    lastState.now = st.now;
+    lastState.rate = st.rate;
+    lastState.appliedInput = st.appliedInput;
+    hasState = true;
+    if hasOwn { self.reconcile(ownState, st.appliedInput); }
+  }
+
+  // This machine's clock in the simulation's ticks (1/60 s): the clock the estimate of the simulation's is made against.
+  // (Not the steps taken here: a frame that took long drops steps, and they would put the estimate out.)
+  fn nowTick(self &) f64 { f64.from(sdl.GetTicksNS()) / 16666666.67d; }
+
+  // The simulation's tick, estimated from a snapshot of tick 'tick' that has just arrived, and the round-trip time
+  fn syncClock(self &mut, tick u64) {
+    // The one way trip is half the round trip with the least waiting in it (the round trip includes the other end's wait to send)
+    imm rtt = if rttMinMs > 0i64 { rttMinMs; } else { rttMs; };
+    imm oneWay = f64.from(rtt) / 2000. * TICKS_PER_SECOND;
+    if hasState {
+      imm gap = f64.from(tick - lastState.tick);
+      gapMax = if gap > gapMax * 0.99 { gap; } else { gapMax * 0.99; };
+    }
+    imm est = f64.from(tick) + oneWay - self.nowTick();
+    imm off = est - tickOffset;
+    if !synced or off > 12. or off < -12. {
+      tickOffset = est;
+      synced = true;
+    } else {
+      tickOffset = tickOffset + (est - tickOffset) * 0.05;
+    }
+  }
+
+  // The user's body compared with the simulation's after the same input: if they differ, the body is set to the
+  // simulation's, the inputs it has not yet applied are played again, and the difference blended away
+  fn reconcile(self &mut, s BeingState, applied u64) {
+    if own == NO_ROW or !s.exact { return; }
+    // The body we predicted after input 'applied'
+    mut found = NO_ROW;
+    mut h = 0usize;
+    while h < history.len() {
+      if history[h].seq == applied and history[h].stepped { found = h; }
+      h = h + 1usize;
+    }
+    mut wrong = forceSnap or !ownReady;
+    mut err = 0.;
+    if !wrong and found != NO_ROW {
+      imm hp = *history[found];
+      imm dx = hp.position.x - s.position.x;
+      imm dy = hp.position.y - s.position.y;
+      imm dz = hp.position.z - s.position.z;
+      err = libc.sqrtf(dx * dx + dy * dy + dz * dz);
+      imm dyaw = libc.fabsf(wrapPi(hp.yaw - s.yaw));
+      wrong = err > FIX_ERROR or dyaw > 0.001 or hp.grounded != s.grounded;
+    } elif !wrong and applied > 0u64 {
+      // Nothing to compare with (the input was before our history, or we did not step it)
+      wrong = true;
+    }
+    if err > worstError { worstError = err; }
+    if traceOn {
+      print <- "TR "; print <- localTick; print <- " "; print <- applied; print <- " "; print <- i64.from(libc.floorf(err * 1000. + 0.5)); print <- " ";
+      print <- i64.from(wrong); print <- "\n";
+    }
+    if !wrong {
+      self.dropHistory(applied);
+      return;
+    }
+    if found == NO_ROW { resyncs = resyncs + 1u64; } else { corrections = corrections + 1u64; }
+    imm drawn = cast.beings[own].body.position + corr;
+    // The camera as it was before the step the simulation's state is the result of
+    mut rigApplied = cast.rig;
+    mut appliedLook = 0.;
+    mut appliedDt = 0.;
+    mut haveApplied = false;
+    if found != NO_ROW and ownEver and !forceSnap {
+      rigApplied = history[found].rig;
+      appliedLook = history[found].look;
+      appliedDt = history[found].dt;
+      haveApplied = true;
+    }
+    self.dropHistory(applied);
+    mut now = cast.beings[own].body.position;
+    {
+      imm b = &mut cast.beings[own];
+      // The simulation's body, whole
+      b.body.position = s.position;
+      b.body.yaw = s.yaw;
+      b.before = b.body;
+      if b.figure.active {
+        if (b.figure.setDowns & 255u32) != s.respawns {
+          b.figure.setDown(&mut b.body, s.position, s.yaw);
+          b.figure.setDowns = s.respawns;
+        }
+        b.figure.speed = s.speed;
+        b.figure.vy = s.vy;
+        b.figure.airVx = s.airVx;
+        b.figure.airVz = s.airVz;
+        b.figure.grounded = s.grounded;
+        b.figure.on = s.platform;
+        b.figure.health = s.health;
+        b.figure.anchored = false;
+      }
+      b.intents = s.intents;
+    }
+    // Its inputs not yet applied played again, and the camera with them, from where it stood before the first
+    if haveApplied {
+      // The camera followed the step as the simulation's body took it
+      cast.rig = rigApplied;
+      cast.rig.tilt(appliedLook * LOOK_KEY_RATE * appliedDt);
+      cast.look(appliedDt);
+    } elif history.len() > 0usize and ownEver and !forceSnap {
+      imm saved = history[0usize].rig;
+      cast.rig = saved;
+    }
+    mut i = 0usize;
+    while i < history.len() {
+      imm hp = *history[i];
+      self.stepBody(hp.intents, hp.look, hp.dt);
+      imm body = cast.beings[own].body;
+      history.set(i, new Predicted(hp.seq, hp.intents, hp.look, hp.dt, true, body.position, body.yaw,
+        cast.beings[own].figure.grounded, hp.rig));
+      i = i + 1usize;
+    }
+    now = cast.beings[own].body.position;
+    // What is drawn eases from where it was to where the body is now, unless that is far
+    imm back = drawn - now;
+    if forceSnap or !ownReady or back.length() > SNAP_ERROR {
+      corr = new Vec3(0., 0., 0.);
+    } else {
+      corr = back;
+      // The camera is where it was drawn, and eases to where it belongs with the body
+      imm r = &mut cast.rig;
+      r.before = new Pose(r.before.origin + corr, r.before.orientation);
+      r.now = new Pose(r.now.origin + corr, r.now.orientation);
+    }
+    if !ownEver {
+      // The first time: the camera put where the body is
+      cast.rig.snap();
+      cast.look(1. / 60.);
+    }
+    ownEver = true;
+    forceSnap = false;
+    ownReady = true;
+  }
+
+  // History up to input 'applied' let go
+  fn dropHistory(self &mut, applied u64) {
+    mut keep = List[Predicted].empty();
+    mut q = 0usize;
+    while q < history.len() {
+      if history[q].seq > applied { keep.push(*history[q]); }
+      q = q + 1usize;
+    }
+    history <=> keep;
+  }
+
+  // The being this client drives, once it is told which and the being exists
+  fn checkOwn(self &mut) {
+    if ownWanted == NO_BEING or usize.from(ownWanted) >= cast.beings.len() { return; }
+    if own == usize.from(ownWanted) { return; }
+    own = usize.from(ownWanted);
+    cast.possess(own);
+    ownReady = false;
+    forceSnap = true;
+    corr = new Vec3(0., 0., 0.);
   }
 
   // Apply every request the simulation sent, in the order sent: the
@@ -298,10 +721,35 @@ pub struct ViewState {
               imm id = *gone[k];
               picks.drop(id);
               forRender.push(Request.Despawn(id));
+              mut bi = 0usize;
+              while bi < cast.beings.len() {
+                imm bb = &mut cast.beings[bi];
+                if bb.part == id { bb.gone = true; }
+                bi = bi + 1usize;
+              }
               k = k + 1usize;
             }
           }
         }
+        case mut ob &mut Object {
+          // Content this browser holds: built here, with the ids the simulation reserved for it
+          mut objectIds = List[PartId].empty();
+          objectIds <=> ob.ids;
+          self.buildObject(ob.spec.copy(), objectIds);
+        }
+        case mut ba &mut BeingAdded {
+          if usize.from(ba.being) == cast.beings.len() {
+            imm away = new Vec3(0., 0. - 5000., 0.);
+            if ba.plain {
+              cast.add(Being.make(ba.part, Walk.make(away, 0.)));
+            } else {
+              cast.add(Being.mannequin(ba.part, away, 0., Figure.make(ba.height, ba.seed, List[PartId].empty())));
+            }
+            puppets.push(new Puppet(List[Sample].empty(), 0u32, 0u32, false, false, away, 0.));
+            self.checkOwn();
+          }
+        }
+        case mut pl &mut Platform { scene.applyPlatform(pl.id, pl.shape); }
         case mut dm &mut DefineMesh {
           // The picking system keeps its shape; the render system uploads it
           picks.shape(dm.mesh, &dm.shape);
@@ -311,12 +759,6 @@ pub struct ViewState {
           // Picked as modelled; drawn posed
           picks.shape(ds.mesh, &ds.shape);
           toRender = true;
-        }
-        case mut ob &mut Object {
-          // Content this browser holds: built here, with the ids the simulation reserved for it
-          mut objectIds = List[PartId].empty();
-          objectIds <=> ob.ids;
-          self.buildObject(ob.spec.copy(), objectIds);
         }
         case mut bn &mut Bones { toRender = true; }
         case mut dl &mut DefineMaterial { toRender = true; }
@@ -340,32 +782,256 @@ pub struct ViewState {
     }
   }
 
-  // Each being's part placed where the state says its body is, when it has
-  // moved, and each mannequin posed by the skinning matrices sent
-  fn placeBeings(self &mut, beings &mut List[BeingState]) {
-    imm bs = beings.viewMut();
-    mut i = 0usize;
-    while i < bs.len {
-      imm part = bs[i].part;
-      imm at = bs[i].position;
-      imm yaw = bs[i].yaw;
-      if i >= sentBodies.len() {
-        sentBodies.push(new SentBody(at, yaw));
-        scene.applyPlace(part, bodyPlacement(at, yaw));
-      } else {
-        imm was = *sentBodies[i];
-        if was.position.x != at.x or was.position.y != at.y or was.position.z != at.z or was.yaw != yaw {
-          sentBodies.set(i, new SentBody(at, yaw));
-          scene.applyPlace(part, bodyPlacement(at, yaw));
+  // An object of the content this browser holds itself, built again from the Object request that named it: the
+  // same code that made it in the simulation, its parts, meshes and materials given the ids the simulation
+  // reserved for them. Its requests are applied here, in order, as any are.
+  fn buildObject(self &mut, spec ObjectSpec, ids List[PartId]) {
+    mut door = Door.empty();
+    door.replayIds(ids);
+    if spec.kind == OBJ_WORLD {
+      worldBuilt = worldBuilt + 1u32;
+      mut h = hydrate(spec.index);
+      mut partIds = List[PartId].empty();
+      mut places = List[Transform3].empty();
+      inject(&mut h, &mut door, &mut partIds, &mut places, &mut shared);
+    } elif spec.kind == OBJ_SHELL {
+      seedScene(&mut door);
+    } elif spec.kind == OBJ_MANNEQUIN {
+      imm root = door.newPart(spec.name.view());
+      spawnMannequin(&mut door, spec.height, spec.color, root);
+    } elif spec.kind == OBJ_TESTCUBE {
+      buildTestCube(&mut door);
+    }
+    door.endReplay();
+    self.applyRequests(door.takeInbox());
+  }
+
+  // ---- the beings drawn ----
+
+  // The tick the others are drawn at, for the step at 'local' ticks: the simulation's now, less the delay. In single
+  // player, where nothing is late, the newest there is
+  fn drawTick(self &, since f64) f64 {
+    if lockstep or !synced { return 1.0e18; }
+    // 100 ms behind, or, on a link that delivers fewer snapshots (the protocol slows to 10 packets a second when the
+    // round trip is long, or snapshots are lost), enough behind to have two of them
+    imm wanted = gapMax * 1.5 + 1.;
+    since + tickOffset - (if wanted > DELAY_TICKS { wanted; } else { DELAY_TICKS; });
+  }
+
+  // The state of a being at tick 'tick': between the two snapshots either side of it, or the newest
+  fn stateAt(self &, p &Puppet, tick f64) BeingState {
+    imm n = p.samples.len();
+    imm last = p.samples[n - 1usize].state;
+    if tick >= f64.from(p.samples[n - 1usize].tick) {
+      // Beyond the newest snapshot (late, or the clock estimate a little ahead): on at its velocity, for a while
+      mut ahead = tick - f64.from(p.samples[n - 1usize].tick);
+      if ahead > 6. { ahead = 6.; }
+      imm v = velocityOf(&last);
+      return new BeingState(last.being, false, last.position + v * f32.from(ahead / TICKS_PER_SECOND), last.yaw, last.speed, last.vy,
+        last.airVx, last.airVz, last.grounded, last.intents, last.platform, last.health, last.respawns, last.landings, last.landSpeed);
+    }
+    if n == 1usize { return last; }
+    mut i = n - 2usize;
+    while i > 0usize and f64.from(p.samples[i].tick) > tick { i = i - 1usize; }
+    imm a = p.samples[i].state;
+    imm c = p.samples[i + 1usize].state;
+    imm ta = f64.from(p.samples[i].tick);
+    imm tc = f64.from(p.samples[i + 1usize].tick);
+    mut t = 0.;
+    if tc > ta { t = f32.from((tick - ta) / (tc - ta)); }
+    if t < 0. { t = 0.; }
+    if t > 1. { t = 1.; }
+    // The path between two snapshots: a cubic through both places with the velocities they carry (so that a
+    // being that is speeding up or slowing down is not cut short across a gap of lost snapshots)
+    imm span = f32.from((tc - ta) / TICKS_PER_SECOND);
+    imm va = velocityOf(&a);
+    imm vc = velocityOf(&c);
+    imm t2 = t * t;
+    imm t3 = t2 * t;
+    imm h00 = 2. * t3 - 3. * t2 + 1.;
+    imm h10 = t3 - 2. * t2 + t;
+    imm h01 = 0. - 2. * t3 + 3. * t2;
+    imm h11 = t3 - t2;
+    imm pos = a.position * h00 + va * (span * h10) + c.position * h01 + vc * (span * h11);
+    imm yaw = a.yaw + wrapPi(c.yaw - a.yaw) * t;
+    new BeingState(a.being, false, pos, yaw, a.speed + (c.speed - a.speed) * t, a.vy + (c.vy - a.vy) * t, a.airVx, a.airVz,
+      a.grounded, a.intents, a.platform, a.health, a.respawns, a.landings, a.landSpeed);
+  }
+
+  // Every being but the one the user drives posed for each of this frame's steps, from the snapshots
+  fn poseOthers(self &mut, steps &List[Step]) {
+    if lockstep {
+      self.predictOthers(steps);
+      return;
+    }
+    mut k = 0usize;
+    while k < steps.len() {
+      imm step = *steps[k];
+      imm since = self.nowTick() - f64.from(steps.len() - k - 1usize);
+      imm at = self.drawTick(since);
+      mut b = 0usize;
+      while b < cast.beings.len() {
+        if b != own and !cast.beings[b].gone and puppets[b].samples.len() > 0usize {
+          imm s = self.stateAt(puppets[b], at);
+          self.poseOne(b, s, step.dt);
+          if traceOn {
+            print <- "TV "; print <- i64.from(at * 1000d); print <- " "; print <- sdl.GetPerformanceCounter(); print <- " ";
+            print <- b; print <- " "; print <- i64.from(libc.floorf(s.position.x * 1000. + 0.5)); print <- " ";
+            print <- i64.from(libc.floorf(s.position.y * 1000. + 0.5)); print <- " "; print <- i64.from(libc.floorf(s.position.z * 1000. + 0.5));
+            print <- "\n";
+          }
+        }
+        b = b + 1usize;
+      }
+      k = k + 1usize;
+    }
+    // One that has no step this frame is still placed where its snapshot says
+    if steps.len() == 0usize {
+      mut b = 0usize;
+      while b < cast.beings.len() {
+        if b != own and !cast.beings[b].gone and puppets[b].samples.len() > 0usize and !puppets[b].placed {
+          imm s = self.stateAt(puppets[b], self.drawTick(self.nowTick()));
+          self.poseOne(b, s, 0.);
+        }
+        b = b + 1usize;
+      }
+    }
+  }
+
+  // Single player, where each snapshot is the newest there is and nothing is late: the others stepped by the same
+  // physics and gait the simulation steps them by (Being.step), by the intents their snapshot says they were last
+  // given, and set to the snapshot where they differ from it (a script that moved one, a fall): so that a being
+  // that is taken over is exactly as the simulation has it
+  fn predictOthers(self &mut, steps &List[Step]) {
+    mut b = 0usize;
+    while b < cast.beings.len() {
+      if b != own and !cast.beings[b].gone and puppets[b].samples.len() > 0usize {
+        imm n = puppets[b].samples.len();
+        imm s = puppets[b].samples[n - 1usize].state;
+        if !puppets[b].started {
+          // The first snapshot of it: it stands as the snapshot says
+          puppets[b].started = true;
+          self.setBodyTo(b, s);
+        } else {
+          mut k = 0usize;
+          while k < steps.len() {
+            cast.beings[b].step(s.intents, steps[k].dt);
+            k = k + 1usize;
+          }
+          if steps.len() > 0usize {
+            imm being = cast.beings[b];
+            imm dx = being.body.position.x - s.position.x;
+            imm dy = being.body.position.y - s.position.y;
+            imm dz = being.body.position.z - s.position.z;
+            if dx * dx + dy * dy + dz * dz > 0.003 * 0.003 or being.figure.grounded != s.grounded
+              or (being.figure.setDowns & 255u32) != s.respawns {
+              self.setBodyTo(b, s);
+            }
+          }
         }
       }
-      if bs[i].posed and scene.isLive(part) {
-        mut bones = List[Mat4].empty();
-        bones <=> bs[i].bones;
-        forRender.push(Request.Bones(part, bones));
+      b = b + 1usize;
+    }
+  }
+
+  // Being 'b' set whole to state 's'
+  fn setBodyTo(self &mut, b usize, s BeingState) {
+    imm being = &mut cast.beings[b];
+    being.body.position = s.position;
+    being.body.yaw = s.yaw;
+    being.before = being.body;
+    being.intents = s.intents;
+    if being.figure.active {
+      if (being.figure.setDowns & 255u32) != s.respawns {
+        being.figure.setDown(&mut being.body, s.position, s.yaw);
+        being.figure.setDowns = s.respawns;
+      }
+      being.figure.speed = s.speed;
+      being.figure.vy = s.vy;
+      being.figure.airVx = s.airVx;
+      being.figure.airVz = s.airVz;
+      being.figure.grounded = s.grounded;
+      being.figure.on = s.platform;
+      being.figure.health = s.health;
+      being.figure.anchored = false;
+    }
+  }
+
+  // Being 'b' set to state 's' and its gait stepped on by 'dt'
+  fn poseOne(self &mut, b usize, s BeingState, dt f32) {
+    imm being = &mut cast.beings[b];
+    imm p = &mut puppets[b];
+    being.body.position = s.position;
+    being.body.yaw = s.yaw;
+    being.intents = s.intents;
+    if being.figure.active {
+      if p.respawns != s.respawns {
+        p.respawns = s.respawns;
+        being.figure.setDown(&mut being.body, s.position, s.yaw);
+      }
+      if p.landings != s.landings {
+        p.landings = s.landings;
+        being.figure.landedAt(s.landSpeed);
+      }
+      being.figure.speed = s.speed;
+      being.figure.vy = s.vy;
+      being.figure.airVx = s.airVx;
+      being.figure.airVz = s.airVz;
+      being.figure.grounded = s.grounded;
+      being.figure.on = s.platform;
+      being.figure.health = s.health;
+      being.figure.poseFrom(s.position, s.yaw, s.speed, s.intents.turn * TURN_RATE, s.grounded, dt);
+    }
+  }
+
+  // Each being's part placed where its body is, when it has moved, and each mannequin posed by the skinning matrices
+  // of its gait
+  fn placeBeings(self &mut) {
+    mut i = 0usize;
+    while i < cast.beings.len() {
+      imm b = cast.beings[i];
+      if !b.gone and scene.isLive(b.part) {
+        imm p = &mut puppets[i];
+        imm drawn = i == own and ownReady;
+        imm known = drawn or p.samples.len() > 0usize;
+        mut at = b.body.position;
+        if drawn { at = at + corr; }
+        if !known { at = new Vec3(0., 0. - 5000., 0.); }
+        if !p.placed or p.placedAt.x != at.x or p.placedAt.y != at.y or p.placedAt.z != at.z or p.placedYaw != b.body.yaw {
+          p.placed = known;
+          p.placedAt = at;
+          p.placedYaw = b.body.yaw;
+          scene.applyPlace(b.part, bodyPlacement(at, b.body.yaw));
+        }
+        if b.figure.active and known {
+          forRender.push(Request.Bones(b.part, b.figure.skinning()));
+        }
       }
       i = i + 1usize;
     }
+  }
+
+  // The frame's snapshot for drawing: the beings placed, the world matrices, the camera, the birds and the weather
+  fn publishSnapshot(self &mut, steps &List[Step]) {
+    self.poseOthers(steps);
+    self.placeBeings();
+    scene.propagate();
+    // Scene time: the snapshot's, carried on by the estimate when connected
+    mut nowS = lastState.now;
+    if !lockstep and hasState and synced {
+      nowS = lastState.now + (self.nowTick() + tickOffset - f64.from(lastState.tick)) / TICKS_PER_SECOND * f64.from(rate);
+    }
+    sceneNow = nowS;
+    mut last = Snapshot.empty();
+    last <=> snapshot;
+    snapshot = scene.publish(last, nowS, hourAt(nowS), cast.eyesBefore(), cast.eyes());
+    mut flock = List[BirdFrame].empty();
+    birds.publish(&mut flock);
+    snapshot.birds <=> flock;
+    snapshot.weather = weather;
+    snapshot.fixedView = testFixed;
+    snapshot.fov = testFov;
+    if testFixed { snapshot.view = testView; }
   }
 
   // What is moved to render for the frame: the snapshot and render's requests,
@@ -377,62 +1043,165 @@ pub struct ViewState {
     requests <=> forRender;
     new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, testShot.copy());
   }
+
+  // The user's body, for the shell's report
+  pub fn youBody(self &) Walk {
+    if own != NO_ROW and own < cast.beings.len() { return cast.beings[own].body; }
+    Walk.make(new Vec3(0., 0., 0.), 0.);
+  }
 }
 
 actor ViewActor {
   st ViewState;
-  sim SimActor;
+  sim Option[SimActor];
   render RenderActor;
   frames Sender[FrameReport];  // the shell's: each frame presented
   ended Sender[i32];           // the shell's: the run's exit code, at the end
+  joined Sender[bool];         // the shell's: whether the connection opened
+  cur FrameInput;              // the frame being made
 
-  // The view made, with the simulation and render actors named, and the
-  // shell's two inboxes; it joins the simulation over the link
-  fn init(self &new, sim SimActor, render RenderActor, frames Sender[FrameReport], ended Sender[i32]) {
-    mut state = ViewState.make();
-    state.link.tx.joined(1u32);
-    *self = new Self(state, sim, render, frames, ended);
+  // The view made, with the simulation (single player) and render actors named, and the
+  // shell's inboxes, and this browser's flock
+  fn init(self &new, sim Option[SimActor], render RenderActor, frames Sender[FrameReport], ended Sender[i32],
+      birds Birds, lockstep bool, joined Sender[bool]) {
+    *self = new Self(ViewState.make(birds, lockstep), sim, render, frames, ended, joined, FrameInput.none());
   }
 
-  // The link's packets from the simulation
-  pub async do link(self, packet Packet[ToView, StateData]) {
-    st.link.rx.accept(packet);
+  // What the connection tells (its handler sends it here): it opened or ended, a message, a value. In single player the
+  // simulation's FrameDone, said last, finishes the frame that was begun
+  pub async do onNet(self, ev NetEvent) {
+    st.onEvent(ev);
+    if st.joinedNow {
+      st.joinedNow = false;
+      joined <- true;
+    }
+    if st.leftNow {
+      st.leftNow = false;
+      if !st.joined { joined <- false; }
+    }
+    if st.frameDone {
+      st.frameDone = false;
+      st.applyIncoming();
+      selfactor.complete();
+    }
   }
 
-  // The frame (above)
+  // The frame (above). Single player: the user's body predicted, the inputs sent and the simulation asked to take the
+  // frame's steps; the rest of the frame waits for its answer. Connected: what has arrived is applied, the steps
+  // predicted and the frame completed at once
   pub async do frame(self, input FrameInput) {
-    mut inp = input;
-    st.beforeSim(&inp);
-    imm up = st.link.tx.take();
-    sim.link(up);
-    mut steps = List[Step].empty();
-    steps <=> inp.steps;
-    imm adv = await sim.advance(new Advance(inp.frame, steps));
+    cur = input;
+    if st.lockstep {
+      st.beforeSim(&cur);
+      st.net.sendReliable(1u32, encodeToSim(ToSim.Frame(cur.frame, copySteps(&cur.steps))));
+    } else {
+      st.applyIncoming();
+      st.beforeSim(&cur);
+      selfactor.complete();
+    }
+  }
+
+  // The rest of the frame: the snapshot published, the frame drawn, what the view saw told to the simulation, the shell told
+  pub async do complete(self) {
+    imm connected = !st.lockstep;
+    imm frameNo = cur.frame;
     imm t1 = sdl.GetTicksNS();
-    st.afterSim();
-    imm order = st.drawOrder(&inp);
+    st.publishSnapshot(&cur.steps);
+    imm order = st.drawOrder(&cur);
     imm t2 = sdl.GetTicksNS();
     imm shown = await render.draw(order);
     mut p = shown;
     p.snapshot <=> st.snapshot;
     mut seen = RenderFacts.empty();
     seen <=> p.facts;
-    imm end = await sim.endFrame(new ViewFacts(inp.frame, seen, st.picked, st.lastPick, st.clicks, st.view, p.shotFailed,
-      st.late > 0u64));
-    frames <- new FrameReport(adv.simulateNs, adv.publishNs + (t2 - t1), p.renderNs, p.presentNs, p.swapNs, p.acquireNs, p.status,
-      end.you, end.waiting, end.parts, p.rows, p.emitters, end.worldDone, end.worldSentFrame);
+    mut you = st.youBody();
+    mut waiting = 0usize;
+    mut parts = st.scene.partCount();
+    mut worldDone = false;
+    mut worldSent = 0u64;
+    match &sim {
+      case imm s Some {
+        imm end = await s.endFrame(new ViewFacts(frameNo, seen, st.picked, st.lastPick, st.clicks, st.view, p.shotFailed,
+          st.late > 0u64));
+        you = end.you;
+        waiting = end.waiting;
+        parts = end.parts;
+        worldDone = end.worldDone;
+        worldSent = end.worldSentFrame;
+      }
+      else {
+        // Connected: the world is done when the last object has been built here
+        worldDone = st.worldBuilt >= OBJECTS;
+        worldSent = 0u64;
+      }
+    }
+    // Connected: the round-trip time, once a second
+    if connected and frameNo % 60u64 == 30u64 and st.net.has(1u32) {
+      imm conn = st.net.peer(1u32).conn;
+      imm cs = await conn.stats();
+      st.rttMs = cs.rttMs;
+      if cs.rttMs > 0i64 {
+        // The least lately: it creeps up, so that a link that has got slower is believed in time
+        imm creep = st.rttMinMs + st.rttMinMs / 50i64 + 1i64;
+        st.rttMinMs = if st.rttMinMs == 0i64 or cs.rttMs < creep { cs.rttMs; } else { creep; };
+      }
+      st.bytesIn = cs.bytesReceived;
+      st.bytesOut = cs.bytesSent;
+    }
+    if traceOn { print.flush(); }
+    frames <- new FrameReport(st.simulateNs, st.publishNs + (t2 - t1), p.renderNs, p.presentNs, p.swapNs, p.acquireNs, p.status,
+      you, waiting, parts, p.rows, p.emitters, worldDone, worldSent);
   }
 
   // The end of the run: the simulation's and the world's lines, the link's,
   // render's, the script's verdict, and the exit code to the shell
   pub async do finish(self, hasWindow bool) {
-    st.link.tx.left(1u32);
-    sim.link(st.link.tx.take());
-    imm reported = await sim.finishScene();
-    print <- "Link: "; print <- st.link.rx.packets; print <- " packets from the simulation, "; print <- st.link.rx.stale;
-    print <- " stale values dropped; "; print <- st.late; print <- " frames with the state late\n";
+    print <- "Link: "; print <- st.snapshots; print <- " snapshots taken, "; print <- st.stale; print <- " dropped as old; ";
+    print <- st.late; print <- " frames with the state late; "; print <- st.corrections; print <- " corrections (worst "; print <- st.worstError;
+    print <- " m), "; print <- st.resyncs; print <- " resyncs\n";
+    if !st.lockstep {
+      imm fb = st.youBody();
+      print <- "FINAL "; print <- st.own; print <- " "; print <- i64.from(libc.floorf(fb.position.x * 1000. + 0.5)); print <- " ";
+      print <- i64.from(libc.floorf(fb.position.y * 1000. + 0.5)); print <- " "; print <- i64.from(libc.floorf(fb.position.z * 1000. + 0.5)); print <- "\n";
+      if st.net.has(1u32) {
+        imm conn = st.net.peer(1u32).conn;
+        imm cs = await conn.stats();
+        print <- "NET rtt "; print <- cs.rttMs; print <- " ms, loss "; print <- cs.lossPermille; print <- " per 1000; received "; print <- cs.packetsReceived;
+        print <- " packets, "; print <- cs.bytesReceived; print <- " bytes; sent "; print <- cs.packetsSent; print <- " packets, "; print <- cs.bytesSent;
+        print <- " bytes\n";
+      }
+    }
+    mut code = 0i32;
+    match &sim {
+      case imm s Some { imm reported = await s.finishScene(); }
+      else {}
+    }
     imm end = await render.finish(hasWindow);
-    imm code = await sim.verdict(end.clean);
+    if !end.clean { code = 1i32; }
+    match &sim {
+      case imm s Some {
+        imm c = await s.verdict(end.clean);
+        code = c;
+      }
+      else {}
+    }
     ended <- code;
   }
+}
+
+// A being's velocity as its snapshot has it, m/s: along its heading at its speed on the ground, as it fell in the air
+fn velocityOf(s &BeingState) Vec3 {
+  if s.grounded { return new Vec3(0. - libc.sinf(s.yaw) * s.speed, 0., 0. - libc.cosf(s.yaw) * s.speed); }
+  new Vec3(s.airVx, s.vy, s.airVz);
+}
+
+// A copy of the steps of a frame
+fn copySteps(src &List[Step]) List[Step] {
+  mut out = List[Step].withCapacity(src.len());
+  mut i = 0usize;
+  while i < src.len() {
+    out.push(*src[i]);
+    i = i + 1usize;
+  }
+  out;
 }
