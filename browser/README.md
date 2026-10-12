@@ -681,7 +681,7 @@ material arrives, only `weberpenn`'s `foliageMesh` and the leaf material change;
 
 | File | What it is |
 | --- | --- |
-| `src/bakedworld/layout.cone` | where everything stands: the rules and the seed (`vegetationLayout`, a list of `Item`s: kind, variant, x, y, z, yaw, scale, radius) |
+| `src/bakedworld/layout.cone` | where everything stands: the rules and the seed (`layOutVegetation` makes the list of `Item`s, declared in `src/island/island.cone`: kind, variant, x, y, z, yaw, scale, radius, once after the bake; the `Island` holds it and `vegetationLayout(isl)` returns a copy) |
 | `src/bakedworld/vegetation.cone` | the meshes, the textures and the parts of each family, objects 9 (rocks) to 15 |
 | `src/vegscript.cone` | the scripted run's eleven views (frames 1230 to 1339, after glow and glass's: `veg-maple`, `veg-maple-close`, `veg-path-beach`, `veg-path-forest`, `veg-cottage-trees`, `veg-cottage-above`, `veg-plants`, `veg-flowers`, `veg-rocks`, `veg-edging`, `veg-overview`), worked out from the layout |
 | `src/vegchecks.cone` | the layout's checks, part of `--checks` |
