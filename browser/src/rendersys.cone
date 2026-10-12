@@ -144,7 +144,13 @@ pub struct RenderSystem {
   pub poses Table[PoseRow];   // keyed by a skinned part's id: where its skinning matrices are
   pub poseBones List[Mat4];   // every skinned part's skinning matrices, a run a part
   pub skinned usize;          // skinned parts in the last draw list
+  styles List[u32];           // each emitter's style (EFFECT_...), by the same index as 'emitters'
+  counts List[u32];           // and how many particles it drew at the last aimEffects
   pub glows u64 = 0u64;       // Glow requests applied, ever
+  // The sky's light on smoke, in the frame's units (the pre-exposed frame):
+  // smoke's colours are albedos, scaled by this as they are drawn, so smoke is
+  // pale grey by day and dim at night (renderactor sets it every frame)
+  pub smokeLight f32 = 1.;
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
@@ -152,7 +158,7 @@ pub struct RenderSystem {
       Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
       List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
-      List[Mat4].empty(), 0usize);
+      List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty());
   }
 
   // Apply a DefineMesh: upload it
@@ -430,8 +436,11 @@ pub struct RenderSystem {
       imm layer = layers[k];
       if reuse {
         emitters.set(usize.from(first) + k, layer.emitter);
+        styles.set(usize.from(first) + k, layer.style);
       } else {
         emitters.push(layer.emitter);
+        styles.push(layer.style);
+        counts.push(0u32);
         handles.push(particles.addEmitter(device, layer.style));
       }
       k = k + 1usize;
@@ -549,11 +558,39 @@ pub struct RenderSystem {
       mut k = 0u32;
       while k < r.count {
         imm e = usize.from(r.first + k);
-        particles.update(device, *handles[e], emitters[e], &ev, snap.now);
+        if *styles[e] == EFFECT_SMOKE {
+          // Smoke's colours are albedos: lit by the sky as drawn
+          mut lit = *emitters[e];
+          mut c = 0usize;
+          while c < 4usize {
+            lit.colors[c].red = lit.colors[c].red * smokeLight;
+            lit.colors[c].green = lit.colors[c].green * smokeLight;
+            lit.colors[c].blue = lit.colors[c].blue * smokeLight;
+            c = c + 1usize;
+          }
+          counts.set(e, particles.update(device, *handles[e], &lit, &ev, snap.now));
+        } else {
+          counts.set(e, particles.update(device, *handles[e], emitters[e], &ev, snap.now));
+        }
         k = k + 1u32;
       }
       i = i + 1usize;
     }
+  }
+
+  // How many particles part 'id''s effect drew at the last aimEffects (0:
+  // none, or it has no effect)
+  pub fn effectParticles(self &, id PartId) u32 {
+    imm row = effects.find(id);
+    if row == NO_ROW { return 0u32; }
+    imm r = *effects.rows[row];
+    mut total = 0u32;
+    mut k = 0u32;
+    while k < r.count {
+      total = total + *counts[usize.from(r.first + k)];
+      k = k + 1u32;
+    }
+    total;
   }
 
   // Whether there are particles to draw
