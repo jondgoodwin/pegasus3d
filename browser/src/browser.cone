@@ -124,7 +124,7 @@ use bakedworld { BakedWorld, LATHED_ROOK, BALL, BALLOON, BUTTON as LAUNCH_BUTTON
   COTTAGE_ROOT, COTTAGE_ROOF, COTTAGE_DOOR, COTTAGE_STACK, COTTAGE_PORCH, COTTAGE_PANES, COTTAGE_LANTERNS, COTTAGE_PARTS, LANTERN_PARTS,
   COTTAGE_LIGHTS, LANTERN_LIGHTS, lanternLight, CD_LANTERN,
   ALARM_AT, Lights, GlowMaterials, nitsAt, FADE_SECONDS, NEAR_GAIN, NEAR_SECONDS, NEAR_RADIUS,
-  vegetationParts, vegetationMeshSurplus, setVegetation, vegStats, vegetationLayout, Item, K_SPECIMEN, K_PINE, K_MAPLE, K_ROCK,
+  vegetationParts, vegetationMeshSurplus, vegStats, vegetationLayout, Item, K_SPECIMEN, K_PINE, K_MAPLE, K_ROCK,
   K_EDGING, K_HOSTA, K_FERN, K_FLOWER, nearCottage, MAX_TREES, vegetationLayoutAgain, Flight, OBJECTS, ROCK_REACH,
   lanternSpots, LANTERN_COUNT, LANTERN_PAIRS, sharedKeys, hydrate, inject,
   BALLOON_FRAME, BALLOON_BASKET, BALLOON_CAP, FLIGHT_SECONDS, FlightPose, ridePose, rideLength, rideSpeed, rideTopTime,
@@ -135,23 +135,8 @@ use bakedworld { BakedWorld, LATHED_ROOK, BALL, BALLOON, BUTTON as LAUNCH_BUTTON
 
 // ---- The shell's state (the main thread's alone) ----
 
-mut skyOff bool = false;      // --no-sky: the static sky and light, no birds (to time what the day costs)
-mut npcsEnabled bool = true;  // --no-npcs: no villagers (to time what they cost, and to compare a run with and without)
-mut automated bool = false;   // a run of a fixed number of frames: real input ignored
-mut scripted bool = false;
-mut startedAt u64 = 0u64;     // the performance counter when main began
-mut worldShownAt u64 = 0u64;  // the counter once the frame that sent the world's last object was presented
-// The shared island's modes (server.cone)
-mut serveOn bool = false;     // --serve PORT
-mut servePort u32 = 0u32;
-mut serveLoopback bool = false; // --loopback: the server listens on this machine only (no firewall prompt; tests)
-mut runForSeconds u64 = 0u64; // --run-for S
-mut autoWalk bool = false;    // --autowalk
-mut traceOn bool = false;     // --trace
-mut impairOn bool = false;    // --impair LOSS LATENCY JITTER
-mut impairLoss u32 = 0u32;
-mut impairLatency u32 = 0u32;
-mut impairJitter u32 = 0u32;
+// (What the arguments set is not a global: RunOptions, ServeOptions and Watch are made by main and handed down in Startup; the run's
+// own times and "automated" are locals of shellRun.)
 
 // The view a headless run picks in (no window to measure)
 const HEADLESS_W f32 = 1280.;
@@ -243,8 +228,7 @@ const FIGURE_MESHES = 1u64;
 
 fn @initpure init() {
   audioCounts = AudioCounts.make();  // the sound's counters (audioview.cone)
-  audioHeap = AudioHeap.make();
-  probeFrom = new Vec3(0., 0., 0.);
+  audioHeap = AudioHeap.make();      // the heap's own allocate and resize, known before main (audioview.cone)
   // The scripted run's own (script.cone, assembly.cone): touched only from the
   // scene actor's end of frame
   clickAt = new Vec2(0., 0.);
@@ -259,15 +243,16 @@ fn @initpure init() {
   leftAt = new Vec3(0., 0., 0.);
 }
 
-fn millisSinceStart() f64 {
-  f64.from(sdl.GetPerformanceCounter() - startedAt) / f64.from(sdl.GetPerformanceFrequency()) * 1000d;
+// Milliseconds since 'startedAt', the performance counter when main began
+fn millisSince(startedAt u64) f64 {
+  f64.from(sdl.GetPerformanceCounter() - startedAt) /f64.from(sdl.GetPerformanceFrequency()) * 1000d;
 }
 
 // ---- input ----
 
 // Whether an event may reach the walk: any, when someone is at the
 // keyboard; only the script's own in a run of a fixed number of frames
-fn accepted(e &sdl.Event) bool {
+fn accepted(e &sdl.Event, automated bool) bool {
   if !automated { return true; }
   if e.type == sdl.EVENT_KEY_DOWN or e.type == sdl.EVENT_KEY_UP {
     return (e as &sdl.KeyboardEvent).which == SCRIPT_DEVICE;
@@ -328,8 +313,43 @@ struct Startup {
   shotsDir String;            // --shots DIR
   connectTo String;           // --connect HOST:PORT
   audio AudioOptions;
+  opts RunOptions;
+  serve ServeOptions;
+  watch Watch;                // --watch and --soak (watch.cone)
+  startedAt u64;              // the performance counter when main began
 
-  fn make() Startup { new Startup(String.empty(), String.empty(), AudioOptions.make()); }
+  fn make(startedAt u64) Startup {
+    new Startup(String.empty(), String.empty(), AudioOptions.make(), RunOptions.make(), ServeOptions.make(), Watch.make(), startedAt);
+  }
+}
+
+// What the arguments say that the actors and the shell act on. Made by main; the actors that read it keep a copy in their state.
+pub struct RunOptions {
+  scripted bool;              // --script
+  skyOff bool;                // --no-sky: the static sky and light, no birds (to time what the day costs)
+  npcsEnabled bool;           // false for --no-npcs: no villagers (to time what they cost, and to compare a run with and without)
+  traceOn bool;               // --trace
+  cullMode u32;               // --cull N: how the scene is culled (rendersys.cone)
+  hudOnly bool;               // --hud-only: just the HUD's part of the scripted run (hudscript.cone)
+  audioWalk bool;             // --audio-walk: the scripted walk that is listened to (audiowalk.cone)
+  autoWalk bool;              // --autowalk
+  runForSeconds u64;          // --run-for S
+  vegetationOff bool;         // --no-vegetation: no trees, rocks or ground cover (to time what they cost); carried by the Island
+
+  fn make() RunOptions { new RunOptions(false, false, true, false, 2u32, false, false, false, 0u64, false); }
+}
+
+// The shared island's modes (server.cone): --serve PORT, --loopback and --impair LOSS LATENCY JITTER
+struct ServeOptions {
+  on bool;
+  port u32;
+  loopback bool;              // the server listens on this machine only (no firewall prompt; tests)
+  impairOn bool;
+  impairLoss u32;
+  impairLatency u32;
+  impairJitter u32;
+
+  fn make() ServeOptions { new ServeOptions(false, 0u32, false, false, 0u32, 0u32, 0u32); }
 }
 
 // The view the mouse's places are in: the window's own units, or a fixed
@@ -349,7 +369,11 @@ fn shellRun(config Config, startup Startup) i32 {
   mut host = Host.open(config);
   if !host.isOpen() { return 1i32; }
   mut shell = ShellInput.make();
-  automated = host.config.frames > 0u64 or watching();
+  imm opts = startup.opts;
+  imm startedAt = startup.startedAt;
+  mut watch = startup.watch;
+  mut worldShownAt = 0u64;      // the counter once the frame that sent the world's last object was presented
+  imm automated = host.config.frames > 0u64 or watch.watching();   // a run of a fixed number of frames: real input ignored
   // The flock is made before the island is baked, as it was when the sky rig
   // was a global made by the module's initializer: its home's height and its
   // birds' first heights are read off the ground before there is one (0 m).
@@ -363,7 +387,7 @@ fn shellRun(config Config, startup Startup) i32 {
   // grows on it), here, before any actor starts: from then on it is only
   // read, by every actor
   imm bakeStart = sdl.GetPerformanceCounter();
-  imm land = bakeIsland();   // shared, read-only, by every actor
+  imm land = bakeIsland().withVegetation(!opts.vegetationOff);   // shared, read-only, by every actor
   imm isl = &land;
   print <- "The island: baked in "; print <- f64.from(sdl.GetPerformanceCounter() - bakeStart) * 1000d
     / f64.from(sdl.GetPerformanceFrequency()); print <- " ms\n";
@@ -394,7 +418,7 @@ fn shellRun(config Config, startup Startup) i32 {
     width = u32.from(size.w);
     height = u32.from(size.h);
   }
-  imm render = new RenderActor(window, width, height, skyOff, scripted, startup.shotsDir.copy(), readyTx, land.share());
+  imm render = new RenderActor(window, width, height, opts, startup.shotsDir.copy(), readyTx, land.share());
   mut ready = false;
   match readyRx.recv() {
     case imm r Some { ready = r; }
@@ -413,16 +437,16 @@ fn shellRun(config Config, startup Startup) i32 {
   mut endpointOpt Option[Endpoint] = None;
   mut joinsToWait = 1;
   if !connected {
-    imm world = new WorldActor(scripted, land.share());
+    imm world = new WorldActor(opts.scripted, land.share());
     mut servedTx Sender[u64];
     mut servedRx Receiver[u64];
     servedTx, servedRx = Channel[u64].make();
-    imm sim = new SimActor(scripted, birds, world, false, joinedTx.clone(), servedTx, land.share());
+    imm sim = new SimActor(opts, birds, world, false, joinedTx.clone(), servedTx, land.share());
     simOpt = Some[SimActor](sim);
     simOpt2 = Some[SimActor](sim);
     joinsToWait = 2;
   }
-  imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx, startup.audio.copy(), automated, land.share());
+  imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx, startup.audio.copy(), automated, opts, land.share());
   imm viewHandler = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [view] { view.onNet(ev); }));
   if connected {
     imm addr = parseAddress(startup.connectTo.view());
@@ -452,11 +476,11 @@ fn shellRun(config Config, startup Startup) i32 {
     print <- "The connection could not be opened\n";
     return 1i32;
   }
-  if scripted { pushScript(1u64); }
+  if opts.scripted { pushScript(&opts, 1u64); }
   imm runStart = sdl.GetTicksNS();
 
   while host.beginFrame() {
-    if runForSeconds > 0u64 and sdl.GetTicksNS() - runStart > runForSeconds * 1000000000u64 { break; }
+    if opts.runForSeconds > 0u64 and sdl.GetTicksNS() - runStart > opts.runForSeconds * 1000000000u64 { break; }
     // Input: each event waiting into the input package (the window's own
     // already handled by frame's Host: quit, Escape, F11, a resize)
     host.beginPhase(PHASE_INPUT);
@@ -468,8 +492,8 @@ fn shellRun(config Config, startup Startup) i32 {
         resized = true;
       }
       shell.beginInput(host.frame);
-      if watching() { watchEvent(&e); }
-      if accepted(&e) { shell.state.handle(&e); }
+      if watch.watching() { watch.event(&e); }
+      if accepted(&e, automated) { shell.state.handle(&e); }
     }
     host.endPhase(PHASE_INPUT);
 
@@ -492,8 +516,8 @@ fn shellRun(config Config, startup Startup) i32 {
       width = u32.from(s.w);
       height = u32.from(s.h);
     }
-    if audioWalk { audioWalkKeys(host.frame); }
-    imm intentsNow = if audioWalk { audioWalkIntents(firstStep); } elif autoWalk { autoIntents(firstStep); } else { shell.user.intents(&shell.ctx); };
+    if opts.audioWalk { audioWalkKeys(host.frame); }
+    imm intentsNow = if opts.audioWalk { audioWalkIntents(firstStep); } elif opts.autoWalk { autoIntents(firstStep); } else { shell.user.intents(&shell.ctx); };
     imm input = new FrameInput(host.frame, steps, intentsNow, shell.user.lookKeys(&shell.ctx), shell.user.lookDrag(&shell.ctx),
       shell.ctx.pressed(shell.clockKeys.pause), shell.ctx.pressed(shell.clockKeys.fast), shell.ctx.pressed(shell.clockKeys.weather),
       shell.ctx.pressed(shell.user.actions.view), shell.ctx.pressed(shell.user.actions.swap),
@@ -512,22 +536,20 @@ fn shellRun(config Config, startup Startup) i32 {
     host.stats.phase(PHASE_RENDER).add(report.renderNs, host.frame);
     host.stats.phase(PHASE_PRESENT).add(report.presentNs, host.frame);
     if host.frame == 1u64 {
-      print <- "The first frame presented "; print <- millisSinceStart(); print <- " ms after main began\n";
+      print <- "The first frame presented "; print <- millisSince(startedAt); print <- " ms after main began\n";
     }
     // The first frame on screen with every object of the world in it
     if report.worldDone and worldShownAt == 0u64 and host.frame >= report.worldSentFrame {
       worldShownAt = sdl.GetPerformanceCounter();
       print <- "The world: every object visible at frame "; print <- host.frame; print <- ", ";
-      print <- millisSinceStart(); print <- " ms after main began\n";
+      print <- millisSince(startedAt); print <- " ms after main began\n";
     }
-    if watching() or soaking() {
+    if watch.watching() or watch.soaking() {
       if host.hasWindow() {
-        watchPresentNs = watchPresentNs + report.swapNs;
-        watchAcquireNs = watchAcquireNs + report.acquireNs;
-        watchTexture(report.status);
+        watch.presented(report.swapNs, report.acquireNs, report.status);
       }
-      if watching() { watchTick(&mut host, &report.you, report.waiting, report.rows, report.emitters); }
-      if soaking() { soakTick(&mut host, report.worldDone, report.parts, report.waiting, report.rows, report.emitters); }
+      if watch.watching() { watch.tick(&mut host, &report.you, report.waiting, report.rows, report.emitters); }
+      if watch.soaking() { watch.soakTick(&mut host, report.worldDone, report.parts, report.waiting, report.rows, report.emitters); }
     }
     // A run with no window on the real clock would spin: it gives the processor back between frames
     if !host.hasWindow() and !host.config.synthetic { thread.sleep(Duration.fromMillis(2i64)); }
@@ -541,7 +563,7 @@ fn shellRun(config Config, startup Startup) i32 {
     case imm c Some { code = c; }
     case is None[i32] {}
   }
-  if soaking() and soakReport() != 0i32 { code = 1i32; }
+  if watch.soaking() and watch.soakReport() != 0i32 { code = 1i32; }
   // A connection closed before the program ends: its socket's thread must stop before the actors' runtime does
   match &endpointOpt {
     case imm e Some { e.shutdown(); }
@@ -559,10 +581,9 @@ fn shellRun(config Config, startup Startup) i32 {
 
 fn main(argc i32, argv **u8) i32 {
   initAll();
-  startedAt = sdl.GetPerformanceCounter();
   mut config = Config.fromArgs(argc, argv);
   config.setTitle("Pegasus3D in Cone: a baked-in world");
-  mut startup = Startup.make();
+  mut startup = Startup.make(sdl.GetPerformanceCounter());
   mut a = 1i32;
   while a < argc {
     imm arg = cstr.fromPtr(*(argv + usize.from(a)));     // argv's strings each end in a NUL
@@ -584,12 +605,12 @@ fn main(argc i32, argv **u8) i32 {
       finalAll();
       return if ok { 0i32; } else { 1i32; };
     } elif libc.strcmp(arg, "--script") == 0i32 {
-      scripted = true;
+      startup.opts.scripted = true;
     } elif libc.strcmp(arg, "--no-sky") == 0i32 {
-      skyOff = true;
+      startup.opts.skyOff = true;
     } elif libc.strcmp(arg, "--audio-walk") == 0i32 and a + 1i32 < argc {
       // A scripted walk past the brook and over the bridge, recorded to a WAV (audiowalk.cone)
-      audioWalkOn();
+      startup.opts.audioWalk = true;
       startup.audio.setWavPath(String.fromCStr(*(argv + usize.from(a + 1i32))));
       config.frames = AUDIO_WALK_FRAMES;
       config.synthetic = true;
@@ -604,67 +625,67 @@ fn main(argc i32, argv **u8) i32 {
       startup.audio.setWavPath(String.fromCStr(*(argv + usize.from(a + 1i32))));
       a = a + 1i32;
     } elif libc.strcmp(arg, "--no-vegetation") == 0i32 {
-      setVegetation(false);
+      startup.opts.vegetationOff = true;
     } elif libc.strcmp(arg, "--no-npcs") == 0i32 {
-      npcsEnabled = false;
+      startup.opts.npcsEnabled = false;
     } elif libc.strcmp(arg, "--cull") == 0i32 and a + 1i32 < argc {
       // How the scene is culled: 0 not at all (the draw list, as before), 1 the frustum, 2 and levels of detail and
       // ranges (the default), 3 and the depth pyramid; see cullMode (rendersys.cone)
-      cullMode = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
+      startup.opts.cullMode = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
       a = a + 1i32;
     } elif libc.strcmp(arg, "--shots") == 0i32 and a + 1i32 < argc {
       startup.shotsDir = String.fromCStr(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
     } elif libc.strcmp(arg, "--watch") == 0i32 and a + 1i32 < argc {
-      watchSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
+      startup.watch.watchSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
     } elif libc.strcmp(arg, "--soak") == 0i32 and a + 1i32 < argc {
-      soakFrames = wholeNumber(*(argv + usize.from(a + 1i32)));
-      config.frames = soakFrames;
+      startup.watch.soakFrames = wholeNumber(*(argv + usize.from(a + 1i32)));
+      config.frames = startup.watch.soakFrames;
       config.synthetic = true;
       a = a + 1i32;
     } elif libc.strcmp(arg, "--serve") == 0i32 and a + 1i32 < argc {
-      serveOn = true;
-      servePort = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
+      startup.serve.on = true;
+      startup.serve.port = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
       a = a + 1i32;
     } elif libc.strcmp(arg, "--connect") == 0i32 and a + 1i32 < argc {
       startup.connectTo = String.fromCStr(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
     } elif libc.strcmp(arg, "--run-for") == 0i32 and a + 1i32 < argc {
-      runForSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
+      startup.opts.runForSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
     } elif libc.strcmp(arg, "--hud-only") == 0i32 {
       // Only the HUD's part of the scripted run (hudscript.cone), to look at it quickly: the walk to the cottage, then the HUD
-      scripted = true;
-      hudOnly = true;
+      startup.opts.scripted = true;
+      startup.opts.hudOnly = true;
     } elif libc.strcmp(arg, "--autowalk") == 0i32 {
-      autoWalk = true;
+      startup.opts.autoWalk = true;
     } elif libc.strcmp(arg, "--loopback") == 0i32 {
-      serveLoopback = true;
+      startup.serve.loopback = true;
     } elif libc.strcmp(arg, "--trace") == 0i32 {
-      traceOn = true;
+      startup.opts.traceOn = true;
     } elif libc.strcmp(arg, "--impair") == 0i32 and a + 3i32 < argc {
-      impairOn = true;
-      impairLoss = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
-      impairLatency = u32.from(wholeNumber(*(argv + usize.from(a + 2i32))));
-      impairJitter = u32.from(wholeNumber(*(argv + usize.from(a + 3i32))));
+      startup.serve.impairOn = true;
+      startup.serve.impairLoss = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
+      startup.serve.impairLatency = u32.from(wholeNumber(*(argv + usize.from(a + 2i32))));
+      startup.serve.impairJitter = u32.from(wholeNumber(*(argv + usize.from(a + 3i32))));
       a = a + 3i32;
     }
     a = a + 1i32;
   }
   // A server, and a client that has a window or not, run on the real clock (--headless alone would make it synthetic)
-  if serveOn or startup.connectTo.len() > 0usize { config.synthetic = false; }
-  if serveOn {
+  if startup.serve.on or startup.connectTo.len() > 0usize { config.synthetic = false; }
+  if startup.serve.on {
     config.headless = true;
-    imm served = serveRun(config);
+    imm served = serveRun(config, &startup);
     finalAll();
     return served;
   }
-  if hudOnly and config.frames == 0u64 {
-    config.frames = hudScriptEnd();
+  if startup.opts.hudOnly and config.frames == 0u64 {
+    config.frames = hudScriptEnd(&startup.opts);
     config.synthetic = true;
   }
-  if scripted and !hudOnly {
+  if startup.opts.scripted and !startup.opts.hudOnly {
     if config.frames == 0u64 {
       config.frames = SCRIPT_FRAMES;
       config.synthetic = true;
