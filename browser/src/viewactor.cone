@@ -205,7 +205,9 @@ pub struct ViewState {
   pub sceneNow f64;           // scene time, as estimated
   pub snapshots u64;          // snapshots taken
   pub corrections u64;        // predictions found wrong and corrected
-  pub worstError f32;         // the largest difference found (metres)
+  pub worstError f32;         // the largest difference found (metres), set-downs not counted
+  pub setDowned u64;          // times the simulation set the user's body down (a respawn, a script's hook): not a misprediction, so not a correction
+  pub worstSetDown f32;       // the farthest of them (metres)
   pub stale u64;              // snapshots that arrived out of order and were dropped
   ownEver bool;               // the user's body has been set to the simulation's at least once
   pub worldBuilt u32;         // objects of the world built here
@@ -229,7 +231,7 @@ pub struct ViewState {
       List[InputSample].empty(), false, still, FOV, String.empty(), List[MaterialId].empty(), lockstep, false, false,
       List[ToView].empty(), List[WorldState].empty(), List[TestView].empty(), 0u64,
       new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
-      List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64);
+      List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64);
   }
 
   // Reliable messages sent to the simulation, ever
@@ -602,7 +604,11 @@ pub struct ViewState {
       // Nothing to compare with (the input was before our history, or we did not step it)
       wrong = true;
     }
-    if err > worstError { worstError = err; }
+    // The simulation set the body down somewhere (setDown counts them, and the snapshot carries the count): the body is taken whole
+    // there, which is the intended result and not a prediction found wrong, so it is counted apart from the corrections
+    imm setDown = (cast.beings[own].figure.setDowns & 255u32) != s.respawns;
+    if setDown and found != NO_ROW and ownReady { wrong = true; }
+    if setDown { if err > worstSetDown { worstSetDown = err; } } elif err > worstError { worstError = err; }
     if traceOn {
       print <- "TR "; print <- localTick; print <- " "; print <- applied; print <- " "; print <- i64.from(libc.floorf(err * 1000. + 0.5)); print <- " ";
       print <- i64.from(wrong); print <- "\n";
@@ -611,7 +617,8 @@ pub struct ViewState {
       self.dropHistory(applied);
       return;
     }
-    if found == NO_ROW { resyncs = resyncs + 1u64; } else { corrections = corrections + 1u64; }
+    if setDown and ownEver { setDowned = setDowned + 1u64; }
+    elif found == NO_ROW { resyncs = resyncs + 1u64; } else { corrections = corrections + 1u64; }
     imm drawn = cast.beings[own].body.position + corr;
     // The camera as it was before the step the simulation's state is the result of
     mut rigApplied = cast.rig;
@@ -645,6 +652,8 @@ pub struct ViewState {
         b.figure.on = s.platform;
         b.figure.health = s.health;
         b.figure.anchored = false;
+      } else {
+        b.figure.setDowns = s.respawns;
       }
       b.intents = s.intents;
     }
@@ -1197,7 +1206,8 @@ actor ViewActor {
   pub async do finish(self, hasWindow bool) {
     print <- "Link: "; print <- st.snapshots; print <- " snapshots taken, "; print <- st.stale; print <- " dropped as old; ";
     print <- st.late; print <- " frames with the state late; "; print <- st.corrections; print <- " corrections (worst "; print <- st.worstError;
-    print <- " m), "; print <- st.resyncs; print <- " resyncs\n";
+    print <- " m), "; print <- st.resyncs; print <- " resyncs, "; print <- st.setDowned; print <- " set-downs (farthest "; print <- st.worstSetDown;
+    print <- " m)\n";
     if !st.lockstep {
       imm fb = st.youBody();
       print <- "FINAL "; print <- st.own; print <- " "; print <- i64.from(libc.floorf(fb.position.x * 1000. + 0.5)); print <- " ";
@@ -1223,6 +1233,17 @@ actor ViewActor {
         code = c;
       }
       else {}
+    }
+    // The script's walkers are put down by Being.setDown (counted, and the snapshot carries the count), so what the view counts as a
+    // correction is a real misprediction: the script lifts one mannequin 6 m on purpose, and nothing in it is out by more than that
+    if scripted {
+      imm okSets = st.setDowned >= 1u64 and st.worstSetDown > 100.;
+      imm okFix = st.worstError < 6.5;
+      print <- "Corrections: the script's set-downs are counted apart ("; print <- st.setDowned; print <- ", farthest "; print <- st.worstSetDown;
+      print <- " m): "; if okSets { print <- "yes\n"; } else { print <- "NO\n"; }
+      print <- "Corrections: none of the "; print <- st.corrections; print <- " is out by more than the 6 m the script lifts a mannequin (worst ";
+      print <- st.worstError; print <- " m): "; if okFix { print <- "yes\n"; } else { print <- "NO\n"; }
+      if !okSets or !okFix { code = 1i32; }
     }
     ended <- code;
   }
