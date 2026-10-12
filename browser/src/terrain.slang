@@ -186,6 +186,31 @@ float3 rockColor(float3 p, float3 n) {
     return lerp(ROCK_A, ROCK_B, t);
 }
 
+// Wet gravel for the brook's bed: rounded pebbles about 0.15 m across, each its own grey or tan, dark in the
+// gaps between them (a cellular pattern)
+float3 gravelColor(float2 xz) {
+    float2 g = xz * 6.5;
+    float2 i = floor(g);
+    float2 f = frac(g);
+    float best = 2.0;
+    float id = 0.0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            float2 o = float2(float(x), float(y));
+            float2 j = float2(hash21(i + o), hash21(i + o + 7.7));
+            float d = length(o + j - f);
+            if (d < best) {
+                best = d;
+                id = hash21(i + o + 3.1);
+            }
+        }
+    }
+    float3 stone = lerp(float3(0.040, 0.043, 0.042), float3(0.115, 0.100, 0.075), id);
+    stone *= 0.75 + 0.5 * hash21(floor(xz * 6.5) + 11.0);
+    float rim = smoothstep(0.32, 0.62, best);
+    return lerp(stone, float3(0.012, 0.012, 0.010), rim);
+}
+
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target {
     float3 p = input.world;
@@ -250,6 +275,20 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
 
     float3 albedo = sand * wSand + grass * wGrass + litterCol * wLitter + rock * wRock;
     albedo = lerp(albedo, earth, wPath);
+
+    // The brook's margin (the mask's blue: metres to the course over 8, smoothed across the 2 m grid):
+    // a damp darker margin in the grass, mud and moss on the banks and a dark wet gravel bed
+    float bd = mask.b * 8.0 + (fbm4(xz * 1.3 + 12.0) - 0.5) * 0.9;
+    float wDamp = smoothstep(4.6, 2.4, bd);
+    float wMud = smoothstep(2.5, 1.5, bd);
+    float wBed = smoothstep(1.55, 0.95, bd);
+    float mossy = smoothstep(0.35, 0.7, vnoise(xz * 3.1 + 5.0) * 0.6 + vnoise(xz * 11.0) * 0.4);
+    float3 mud = lerp(float3(0.060, 0.042, 0.024), float3(0.032, 0.085, 0.022), mossy * 0.8);
+    mud *= 0.8 + 0.4 * vnoise(xz * 17.0);
+    float3 damp = albedo * float3(0.50, 0.66, 0.42);
+    albedo = lerp(albedo, damp, wDamp * 0.85);
+    albedo = lerp(albedo, mud, wMud * 0.85);
+    albedo = lerp(albedo, gravelColor(xz), wBed);
     albedo *= input.tint.rgb;    // A touch of bump from the fine noise, near the eye
     float bx = vnoise(xz * 9.0 + float2(0.7, 0.0)) - vnoise(xz * 9.0 - float2(0.7, 0.0));
     float bz = vnoise(xz * 9.0 + float2(0.0, 0.7)) - vnoise(xz * 9.0 - float2(0.0, 0.7));
