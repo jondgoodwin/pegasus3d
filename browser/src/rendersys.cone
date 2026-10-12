@@ -125,6 +125,15 @@ fn fieldTexture(renderer &mut Renderer, device &mut Device, field &mut Field) Te
   texture;
 }
 
+// A part that is a light: its handle in render's light set, what it is (in
+// its part's frame), and where it was last put in the world
+pub struct LampRow {
+  pub handle LightHandle;
+  pub look LightLook;
+  pub position Vec3;
+  pub direction Vec3;
+}
+
 pub struct RenderSystem {
   pub meshes Table[MeshRow];          // keyed by a mesh's id
   pub materials Table[MaterialRow];   // keyed by a material's id
@@ -152,6 +161,11 @@ pub struct RenderSystem {
   // smoke's colours are albedos, scaled by this as they are drawn, so smoke is
   // pale grey by day and dim at night (renderactor sets it every frame)
   pub smokeLight f32 = 1.;
+  // The point and spot lights parts are (LightSource), in render's light set,
+  // and the parts drawn without casting shadows (CastsShadow false)
+  pub lamps Table[LampRow] = Table[LampRow].empty();
+  pub quiet Table[u32] = Table[u32].empty();
+  pub lampsMoved u64 = 0u64;   // lights moved because their part did, ever
 
   // Drawing particles into targets of 'colorFormat' (the swapchain's)
   pub fn make(device &mut Device, colorFormat u32) RenderSystem {
@@ -248,6 +262,7 @@ pub struct RenderSystem {
       material = Material.shiny(surface.color, surface.specular, surface.shininess);
     }
     material.emissive = surface.glow;
+    material.lightLayers = surface.lightLayers;
     material.alphaMode = surface.alphaMode;
     material.alphaCutoff = surface.alphaCutoff;
     if !paint.isEmpty() {
@@ -307,6 +322,7 @@ pub struct RenderSystem {
     mut pbr = PbrMaterial.standard(c, surface.metallic, surface.roughness).glowing(surface.glow, 1.);
     pbr.alphaMode = surface.alphaMode;
     pbr.alphaCutoff = surface.alphaCutoff;
+    pbr.lightLayers = surface.lightLayers;
     pbr.transmission = surface.translucency;
     pbr.flutter = surface.flutter;
     if !paint.isEmpty() {
@@ -380,6 +396,82 @@ pub struct RenderSystem {
     r.tint = tint;
     rows.rows.set(row, r);
     true;
+  }
+
+  // Apply a LightSource: part 'id' is the light 'look' says, made in render's
+  // light set if it is not one yet, otherwise changed to it (only what differs
+  // is written, so a steady light costs nothing). It is put where its part is
+  // by 'aimLights'.
+  pub fn lightSource(self &mut, renderer &mut Renderer, id PartId, look &LightLook) {
+    imm row = lamps.find(id);
+    if row == NO_ROW {
+      imm far = new Vec3(1.0e30, 1.0e30, 1.0e30);
+      mut h = LightHandle.none();
+      if look.kind == LIGHT_SPOT {
+        h = renderer.lights.addSpot(far, look.direction, look.color, look.candela, look.range, look.inner, look.outer);
+      } else {
+        h = renderer.lights.addPoint(far, look.color, look.candela, look.range);
+      }
+      renderer.lights.setSourceRadius(h, look.radius);
+      renderer.lights.setLayers(h, look.layers);
+      renderer.lights.setCastsShadow(h, look.shadow);
+      lamps.put(id, new LampRow(h, *look, far, far));
+      return;
+    }
+    mut r = *lamps.rows[row];
+    imm was = r.look;
+    imm h = r.handle;
+    if look.color.red != was.color.red or look.color.green != was.color.green or look.color.blue != was.color.blue
+      or look.candela != was.candela {
+      renderer.lights.setLight(h, look.color, look.candela);
+    }
+    if look.range != was.range { renderer.lights.setRange(h, look.range); }
+    if look.radius != was.radius { renderer.lights.setSourceRadius(h, look.radius); }
+    if look.kind == LIGHT_SPOT and (look.inner != was.inner or look.outer != was.outer) {
+      renderer.lights.setCone(h, look.inner, look.outer);
+    }
+    if look.layers != was.layers { renderer.lights.setLayers(h, look.layers); }
+    if look.shadow != was.shadow { renderer.lights.setCastsShadow(h, look.shadow); }
+    r.look = *look;
+    lamps.rows.set(row, r);
+  }
+
+  // Apply a CastsShadow: part 'id' drawn casting shadows, or not
+  pub fn castsShadow(self &mut, id PartId, casts bool) {
+    if casts { quiet.remove(id); return; }
+    if quiet.find(id) == NO_ROW { quiet.put(id, 1u32); }
+  }
+
+  // Every light put where its part is, aimed where its part turns it, from
+  // the snapshot's world matrices; written only where it moved
+  pub fn aimLights(self &mut, renderer &mut Renderer, snap &Snapshot) {
+    mut i = 0usize;
+    while i < lamps.len() {
+      imm world = snap.worldOf(*lamps.ids[i]);
+      imm r = *lamps.rows[i];
+      imm at = world * r.look.at;
+      mut moved = false;
+      if at.x != r.position.x or at.y != r.position.y or at.z != r.position.z {
+        renderer.lights.move(r.handle, at);
+        moved = true;
+      }
+      mut dir = r.direction;
+      if r.look.kind == LIGHT_SPOT {
+        dir = world.transformVector(r.look.direction).normalize();
+        if dir.x != r.direction.x or dir.y != r.direction.y or dir.z != r.direction.z {
+          renderer.lights.aim(r.handle, dir);
+          moved = true;
+        }
+      }
+      if moved {
+        mut n = r;
+        n.position = at;
+        n.direction = dir;
+        lamps.rows.set(i, n);
+        lampsMoved = lampsMoved + 1u64;
+      }
+      i = i + 1usize;
+    }
   }
 
   // Part 'id''s tint (white if it is not drawn)
@@ -517,6 +609,15 @@ pub struct RenderSystem {
     skies.put(id, look);
   }
 
+  // A despawned part that is a light: the light goes from render's set
+  pub fn dropLamp(self &mut, renderer &mut Renderer, id PartId) {
+    quiet.remove(id);
+    imm row = lamps.find(id);
+    if row == NO_ROW { return; }
+    renderer.lights.remove(lamps.rows[row].handle);
+    lamps.remove(id);
+  }
+
   // A despawned part's rows go (its mesh and material stay: they are
   // resources, perhaps shared); its effect is stilled
   pub fn drop(self &mut, device &mut Device, id PartId) {
@@ -576,6 +677,7 @@ pub struct RenderSystem {
           } else {
             list.addTinted(meshH, material, model, r.tint);
           }
+          if quiet.len() > 0usize and quiet.find(id) != NO_ROW { list.dontCastShadow(); }
           drawnNow = drawnNow + 1usize;
           k = k + 1usize;
         }

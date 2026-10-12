@@ -255,7 +255,10 @@ actor RenderActor {
       match &mut r {
         // The scene's Despawn has taken the subtree; each part that went
         // comes as one Despawn of its own
-        case mut d &mut Despawn { g.sys.drop(&mut g.device, d.id); }
+        case mut d &mut Despawn {
+          g.sys.dropLamp(&mut g.renderer, d.id);
+          g.sys.drop(&mut g.device, d.id);
+        }
         case mut dm &mut DefineMesh { g.sys.defineMesh(&mut g.renderer, &mut g.device, dm.mesh, &dm.shape); }
         case mut ds &mut DefineSkinnedMesh {
           g.sys.defineSkinnedMesh(&mut g.renderer, &mut g.device, ds.mesh, &ds.shape, &ds.skin);
@@ -269,6 +272,8 @@ actor RenderActor {
         case mut f &mut Fire { g.sys.fire(f.id, f.seed, f.start, f.stop); }
         case mut gl &mut Glow { g.sys.glow(&mut g.renderer, &mut g.device, gl.material, gl.glow); }
         case mut tn &mut Tint { g.sys.tint(tn.id, tn.tint); }
+        case mut ls &mut LightSource { g.sys.lightSource(&mut g.renderer, ls.id, &ls.light); }
+        case mut cs &mut CastsShadow { g.sys.castsShadow(cs.id, cs.casts); }
         case mut hl &mut Highlight { g.sys.highlight(&mut g.renderer, &mut g.device, hl.id, hl.on); }
         case mut k &mut Sky { g.sys.sky(k.id, k.look); }
         else {}
@@ -312,6 +317,7 @@ actor RenderActor {
     imm sunShare = if sunUp > 0. { sunUp; } else { 0.; };
     g.sys.smokeLight = g.renderer.exposure * (luma(sky.ambient) + luma(sky.sunColor) * sunShare * 0.3183);
     g.sys.build(snapshot, pose.origin);
+    g.sys.aimLights(&mut g.renderer, snapshot);
     if dayLit {
       rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds);
       // The fog after the sky: depth slabs over what lies beyond them
@@ -398,6 +404,12 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, rig &mut SkyR
   imm environment = environmentSky();
   renderer.setSky(&mut device, &environment);
   renderer.drawSky = false;
+  // The shadows by the GPU's tier (shadows.cone, lightshadow.cone): the sun's at
+  // high on a discrete GPU, low on an integrated one; the lanterns' at medium
+  // on a discrete GPU (the nearest four of the point lights get cube maps),
+  // none on an integrated one. PEGASUS_SHADOWS and PEGASUS_LIGHT_SHADOWS
+  // (off, low, medium, high) override them, to measure what each costs.
+  setShadowTiers(&mut renderer, &mut device, adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT);
   if !renderer.isValid() or !sys.particles.isValid() or !post.isValid() {
     print <- "The renderer could not be made\n";
@@ -412,6 +424,30 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, rig &mut SkyR
   imm target = swapchain.getCurrentTexture(&mut device);
   Some[Gfx](new Gfx(Buffer.none(), String.empty(), target, post, sys, renderer, swapchain, device, adapter, surface,
     instance, camera));
+}
+
+// The sun's shadows and the point lights' by the tier of the GPU
+fn setShadowTiers(renderer &mut Renderer, device &mut Device, integrated bool) {
+  mut sun = if integrated { ShadowSettings.low(); } else { ShadowSettings.high(); };
+  mut local = if integrated { LightShadowSettings.off(); } else { LightShadowSettings.medium(); };
+  imm s = libc.getenv("PEGASUS_SHADOWS");
+  if (s as usize) != 0usize {
+    imm t = cstr.fromPtr(s);
+    if libc.strcmp(t, "off") == 0i32 { sun = ShadowSettings.off(); }
+    elif libc.strcmp(t, "low") == 0i32 { sun = ShadowSettings.low(); }
+    elif libc.strcmp(t, "medium") == 0i32 { sun = ShadowSettings.medium(); }
+    elif libc.strcmp(t, "high") == 0i32 { sun = ShadowSettings.high(); }
+  }
+  imm ls = libc.getenv("PEGASUS_LIGHT_SHADOWS");
+  if (ls as usize) != 0usize {
+    imm t = cstr.fromPtr(ls);
+    if libc.strcmp(t, "off") == 0i32 { local = LightShadowSettings.off(); }
+    elif libc.strcmp(t, "low") == 0i32 { local = LightShadowSettings.low(); }
+    elif libc.strcmp(t, "medium") == 0i32 { local = LightShadowSettings.medium(); }
+    elif libc.strcmp(t, "high") == 0i32 { local = LightShadowSettings.high(); }
+  }
+  renderer.setShadows(device, &sun);
+  renderer.setLightShadows(device, &local);
 }
 
 // A colour's luminance (Rec. 709 weights, linear)

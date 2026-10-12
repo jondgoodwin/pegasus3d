@@ -229,6 +229,11 @@ pub struct Look {
   // their stems in the breeze, in radians (0: still)
   pub translucency f32 = 0.;
   pub flutter f32 = 0.;
+  // Which of the point and spot lights reach it: render's light layers, a mask
+  // of bits (a light lights a material where they share one). Bit 0 is the
+  // default both start on; a lantern's frame is on bits 0 and 1 (3), so its
+  // small interior light (bit 1 alone) lights it and not the path
+  pub lightLayers u32 = 1u32;
 
   pub fn plain(color Color) Look { new Look(color, 0., 1., false, 1., false, 1., 0.); }
   // The same look, backlit-translucent by 'amount' (see 'translucency')
@@ -250,6 +255,12 @@ pub struct Look {
     mut l = self;
     l.color.alpha = alpha;
     l.alphaMode = ALPHA_BLEND;
+    l;
+  }
+  // The same look, reached by the lights on the layers of 'mask'
+  pub fn onLayers(self, mask u32) Look {
+    mut l = self;
+    l.lightLayers = mask;
     l;
   }
   // The same look, cut out where its paint's alpha is below 'cutoff'
@@ -316,9 +327,7 @@ pub const SHADER_STANDARD = 0u32;     // not shaded: Blinn-Phong or physically b
 pub const SHADER_HEIGHTFIELD = 1u32;  // a grid lifted by its Field, coloured by height (shaders.cone)
 pub const SHADER_TERRAIN = 10u32;     // the island's ground: its Field lifts the grid, the paint is its mask (terrain.slang)
 pub const SHADER_WATER = 11u32;       // the sea: Gerstner waves, depth tint and foam from the Field (water.slang)
-// A pool of light painted on the ground: added, see-through, soft from its
-// uvs' middle out; params: its colour in nits (rgb), how sharp its core (w)
-pub const SHADER_LIGHT_POOL = 12u32;
+// (12 was a pool of light painted on the ground; render's point and spot lights light it now)
 // A lit room seen through a window: dim by day, its params' glow (rgb, nits)
 // at night, a lamp's warmth high in the middle and curtains at the sides
 pub const SHADER_INTERIOR = 13u32;
@@ -343,6 +352,38 @@ pub const EFFECT_SMOKE = 2u32;      // soft puffs drawn over what is behind them
 pub struct EffectLayer {
   pub emitter Emitter;
   pub style u32;              // EFFECT_SPRITES, EFFECT_TRAILS or EFFECT_SMOKE
+}
+
+// A point or spot light's kind
+pub const LIGHT_POINT = 0u32;
+pub const LIGHT_SPOT = 1u32;
+
+// What a light is: its kind, where it sits and where a spot light shines (in
+// its part's frame), its colour and candela, how far it reaches (metres), the
+// radius of its source (a bulb's), a spot light's cone (the half angle of its
+// full cone, then of its outer edge, radians), the layers it lights and
+// whether it casts a shadow
+pub struct LightLook {
+  pub kind u32;
+  pub at Vec3;
+  pub direction Vec3;
+  pub color Color;
+  pub candela f32;
+  pub range f32;
+  pub radius f32;
+  pub inner f32;
+  pub outer f32;
+  pub layers u32;
+  pub shadow bool;
+
+  // A point light of 'candela' at 'at', reaching 'range' metres
+  pub fn point(at Vec3, color Color, candela f32, range f32) LightLook {
+    new LightLook(LIGHT_POINT, at, new Vec3(0., 0., 1.), color, candela, range, 0.02, 0., 0., 1u32, false);
+  }
+  // A spot light at 'at' shining along 'direction'
+  pub fn spot(at Vec3, direction Vec3, color Color, candela f32, range f32, inner f32, outer f32) LightLook {
+    new LightLook(LIGHT_SPOT, at, direction, color, candela, range, 0.02, inner, outer, 1u32, false);
+  }
 }
 
 // A change to the scene, as sent. The system that owns what it changes
@@ -481,6 +522,22 @@ pub enum Request {
   pub struct Tint {
     pub id PartId;
     pub tint Color;
+  }
+  // Part 'id' is a point or spot light, placed by the part (its 'at' and
+  // 'direction' are in the part's own frame, turned with it). Sent again for a
+  // part that is one, it changes the light it is: colour, intensity
+  // (candela), range, source radius, cone, layers and whether it casts a
+  // shadow. Colour times candela is the light's intensity in the scene's
+  // physical units (render's lights.cone).
+  pub struct LightSource {
+    pub id PartId;
+    pub light LightLook;
+  }
+  // Part 'id' drawn without casting the sun's or a light's shadow ('casts'
+  // false), or casting again (an opaque part's default)
+  pub struct CastsShadow {
+    pub id PartId;
+    pub casts bool;
   }
   // Part 'id' is a platform: 'shape' (a floor and walls, in the part's own
   // frame: platforms.cone). A being standing on its floor is held up by it
@@ -637,6 +694,12 @@ pub struct Door {
 
   // Material 'material' made to give off 'glow' (nits; black: off)
   pub fn glow(self &mut, material MaterialId, glow Color) { self.send(Request.Glow(material, glow)); }
+
+  // Part 'id' a light, or the light it is changed (Request.LightSource)
+  pub fn light(self &mut, id PartId, look LightLook) { self.send(Request.LightSource(id, look)); }
+
+  // Part 'id' drawn casting shadows ('casts') or not
+  pub fn castsShadow(self &mut, id PartId, casts bool) { self.send(Request.CastsShadow(id, casts)); }
 
   // Part 'id' drawn tinted by 'tint' (white: as its material is)
   pub fn tint(self &mut, id PartId, tint Color) { self.send(Request.Tint(id, tint)); }

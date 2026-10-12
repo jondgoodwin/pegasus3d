@@ -1,9 +1,11 @@
-// The world's lights: what glows, when, and how near you are to it. No
-// light here lights anything else (no point lights, by design for now):
-// lamps glow (their materials' emissive colour, which the picture's bloom
-// spreads), see-through glass glows over them, and the light they would
-// throw on the ground is painted there as a pool (SHADER_LIGHT_POOL), a
-// fixed, simulated effect.
+// The world's lights: what glows, when, and how near you are to it. Lamps
+// glow (their materials' emissive colour, which the picture's bloom spreads),
+// see-through glass glows over them, and each lantern is also a real point
+// light (render's lights: a part with a Request.LightSource), so the light it
+// throws falls on whatever stands in it, in that thing's own colour, and is
+// shadowed by what is in the way. A lit window throws a spot light out onto
+// the porch and the ground. (Pools of light painted on the ground were these
+// lights' stand-ins until render could light a scene; they are gone.)
 //
 // ON AND OFF. The lamps go on at dusk and off at dawn: the scene's
 // Message.Dusk and Message.Dawn, read from the world's mail. Each switch
@@ -21,16 +23,21 @@
 // reference photograph's light), and about 3 (blooming)
 // at night, as an eye adapting to the dark sees a lamp grow brighter, but not
 // so bright that AgX washes the rooms' amber out to peach. Every other glow
-// is a share of the bulb's (GLOW_ shares).
+// is a share of the bulb's (GLOW_ shares), and every light's intensity is the
+// bulb's radiance times a number of candela a nit (CD_ constants): the same
+// exposure that shows the bulb shows the light it throws, at the same share
+// of it at every hour. That share is worked from the ground: a light on the
+// path, 1 m from the bulb, lights a mid-brown ground (an albedo of 0.2) to
+// 0.04 of the bulb's radiance, as the painted pool read before.
 //
 // NEARNESS. Each path lantern has an Area round it (NEAR_RADIUS); the
-// possessed being coming into it brightens that lantern's glass, bulb and
-// pool by NEAR_GAIN (a Tint on those three parts), over NEAR_SECONDS, and
-// going out dims them back: the event machinery made visible.
+// possessed being coming into it brightens that lantern's glass and bulb
+// (a Tint on those two parts) and its lights' intensity by NEAR_GAIN, over
+// NEAR_SECONDS, and going out dims them back: the event machinery made visible.
 //
 // Every change is sent through the Door as requests (Glow on a material,
-// Tint on a part), only when it has changed by more than a hundredth, so a
-// lamp that is steady costs nothing.
+// Tint on a part, a LightSource on a light's part), only when it has changed
+// by more than a hundredth, so a lamp that is steady costs nothing.
 
 // The lamps' warm colour: about 2700 K, an incandescent bulb's, as linear
 // RGB. 2700 K is about sRGB (255, 169, 87) (Mitchell Charity's blackbody
@@ -41,9 +48,8 @@ pub fn lampColor() Color { new Color(1., 0.397, 0.0953, 1.); }
 pub fn roomColor() Color { new Color(1., 0.25, 0.028, 1.); }
 
 // The amber the lantern's panes and lining glow: deeper than the bulb, so that the tone mapping
-// leaves the interior amber and not peach; and the richer amber of the light pools on the ground
+// leaves the interior amber and not peach
 pub fn glassColor() Color { new Color(1., 0.3, 0.045, 1.); }
-pub fn poolColor() Color { new Color(1., 0.33, 0.05, 1.); }
 pub const GLOW_HEAD f32 = 0.0015;        // a lantern's roof and frame: a faint warm lift, not a light
 
 // How long a switch on or off takes (scene seconds: a minute is an hour)
@@ -56,9 +62,51 @@ pub const NEAR_SECONDS f32 = 0.4;
 // Each glow's share of the bulb's radiance
 pub const GLOW_BULB f32 = 1.;
 pub const GLOW_GLASS f32 = 0.09;        // the panes and the lining inside: the interior lit amber (the bulb is brighter)
-pub const GLOW_LANTERN_POOL f32 = 0.04; // the pool on the ground under a lantern
 pub const GLOW_ROOM f32 = 0.4;          // a lit room behind a window
-pub const GLOW_WINDOW_POOL f32 = 0.05;  // the light a window throws on the deck or ground
+
+// Each light's intensity, candela for each nit of the bulb's radiance
+pub const CD_LANTERN f32 = 0.63;        // a path or wall lantern's light on its surroundings, 5 m of range
+pub const CD_INTERIOR f32 = 0.006;      // its small interior light, on the lantern's own frame, 0.35 m of range
+pub const CD_WINDOW f32 = 3.1;          // a lit window's spot light on the deck and ground
+pub const CD_WALL f32 = 1.6;            // a wall lantern's, hung 1.7 m over the deck
+pub const WINDOW_CONE_INNER f32 = 0.5;  // a window light's cone: full inside 29 degrees of its axis, none beyond 69
+pub const WINDOW_CONE_OUTER f32 = 1.2;
+pub const RANGE_LANTERN f32 = 5.;
+pub const RANGE_INTERIOR f32 = 0.35;
+pub const RANGE_WINDOW f32 = 6.;
+// The lantern lights' layers: the path's light on layer 0, the interior's on layer 1 alone
+pub const LAYER_WORLD u32 = 1u32;
+pub const LAYER_INTERIOR u32 = 2u32;
+// and the layers a lantern's frame, roof and base plate are lit on
+pub const LAYER_FRAME u32 = 3u32;
+
+// A lantern's light on its surroundings: a point light at its bulb, a source of 2 cm, warm amber, dark until
+// the hour sets its candela; it casts a shadow (render gives the nearest few the shadow maps there are)
+pub fn lanternLight() LightLook {
+  mut l = LightLook.point(new Vec3(0., 0., 0.), lampColor(), 0., RANGE_LANTERN);
+  l.radius = 0.02;
+  l.layers = LAYER_WORLD;
+  l.shadow = true;
+  l;
+}
+
+// and its small interior light, on its own layer, 35 cm of range: it lights the lantern's frame, the
+// underside of its roof and its floor plate, and nothing else
+pub fn interiorLight() LightLook {
+  mut l = LightLook.point(new Vec3(0., 0., 0.), lampColor(), 0., RANGE_INTERIOR);
+  l.radius = 0.02;
+  l.layers = LAYER_INTERIOR;
+  l;
+}
+
+// A lit window's light: a spot light, a broad cone out and down from just in front of the glass, a source
+// of 30 cm (the glass), warm, dark until the hour sets its candela; it casts no shadow
+pub fn windowLight() LightLook {
+  mut l = LightLook.spot(new Vec3(0., 0., 0.), new Vec3(0., -0.5, 1.).normalize(), roomColor(), 0., RANGE_WINDOW,
+    WINDOW_CONE_INNER, WINDOW_CONE_OUTER);
+  l.radius = 0.3;
+  l;
+}
 
 // A bulb's radiance (nits) with the day clock at 'hour': log-linear between
 // hours of an evening (the morning's are the evening's mirrored about noon,
@@ -87,14 +135,11 @@ pub fn nitsAt(hour f64) f32 {
 pub struct GlowMaterials {
   pub bulb MaterialId;
   pub glass MaterialId;
-  pub lanternPool MaterialId;
   pub room MaterialId;
-  pub windowPool MaterialId;
   pub head MaterialId;        // a lantern's roof and frame: the faint warm rim of the light inside
 
   pub fn none() GlowMaterials {
-    new GlowMaterials(MaterialId.none(), MaterialId.none(), MaterialId.none(), MaterialId.none(), MaterialId.none(),
-      MaterialId.none());
+    new GlowMaterials(MaterialId.none(), MaterialId.none(), MaterialId.none(), MaterialId.none());
   }
 }
 
@@ -104,10 +149,24 @@ pub struct LanternRow {
   pub area PartId;
   pub glass PartId;
   pub bulb PartId;
-  pub pool PartId;
   pub near bool;              // the possessed being is in its area
   pub gain f32;               // how much brighter it is drawn now (1 to NEAR_GAIN)
   pub sentGain f32;
+}
+
+// No lantern: a lamp that nearness does not brighten
+pub const NO_LANTERN = 0xFFFFFFFFusize;
+
+// One light the world switches: the part it is (a LightSource sent for it),
+// what it is when lit (its candela is set from the hour), its candela for
+// each nit of the bulb's radiance, the lantern whose nearness brightens it,
+// and the candela last sent
+pub struct LampRow {
+  pub part PartId;
+  pub look LightLook;
+  pub perNit f32;
+  pub lantern usize;
+  pub sent f32;
 }
 
 pub struct Lights {
@@ -116,16 +175,18 @@ pub struct Lights {
   pub fromLevel f32;          // the level when it switched
   pub level f32;              // 0 off to 1 fully on, as last ticked
   pub lanterns List[LanternRow];
-  sent Array[f32, 6];         // each glow's radiance last sent (bulb, glass, lantern pool, room, window pool, head)
+  sent Array[f32, 4];         // each glow's radiance last sent (bulb, glass, room, head)
   lastTick f64;
   pub glowsSent u64;          // Glow requests sent, ever
   pub tintsSent u64;          // Tint requests sent, ever
   pub switches u64;           // dusks and dawns read
   pub comings u64;            // lantern areas entered
   arrived bool;
+  pub lamps List[LampRow] = List[LampRow].empty();
+  pub lampsSent u64 = 0u64;   // LightSource requests sent, ever
 
   pub fn make() Lights {
-    new Lights(false, -1.0e9d, 0., 0., List[LanternRow].empty(), [-1., -1., -1., -1., -1., -1.], 0d, 0u64, 0u64, 0u64, 0u64,
+    new Lights(false, -1.0e9d, 0., 0., List[LanternRow].empty(), [-1., -1., -1., -1.], 0d, 0u64, 0u64, 0u64, 0u64,
       false);
   }
 
@@ -143,9 +204,17 @@ pub struct Lights {
   }
 
   // A path lantern whose area is part 'area' (sent its Area already), its
-  // glass, bulb and pool to brighten
-  pub fn addLantern(self &mut, area PartId, glass PartId, bulb PartId, pool PartId) {
-    lanterns.push(new LanternRow(area, glass, bulb, pool, false, 1., 1.));
+  // glass and bulb to brighten; the index it has
+  pub fn addLantern(self &mut, area PartId, glass PartId, bulb PartId) usize {
+    lanterns.push(new LanternRow(area, glass, bulb, false, 1., 1.));
+    lanterns.len() - 1usize;
+  }
+
+  // A light the world switches: part 'part' (already sent as the light 'look'
+  // says, dark), of 'perNit' candela a nit of the bulb's radiance, brightened by
+  // lantern 'lantern''s nearness (NO_LANTERN: not)
+  pub fn addLamp(self &mut, part PartId, look LightLook, perNit f32, lantern usize) {
+    lamps.push(new LampRow(part, look, perNit, lantern, -1.));
   }
 
   // The mail's dusk (for scene time 'at'): on
@@ -186,17 +255,16 @@ pub struct Lights {
   }
 
   // Once a frame at scene time 'now': the level faded on, every glow's
-  // radiance worked out and sent where it changed, and each lantern's
-  // nearness brightening eased towards its target and sent where it changed
+  // radiance worked out and sent where it changed, each lantern's
+  // nearness brightening eased towards its target and sent where it changed,
+  // and each light's intensity
   pub fn tick(self &mut, door &mut Door, now f64, mats &GlowMaterials) {
     level = self.levelAt(now);
     imm n = level * nitsAt(hourAt(now));
     self.send(door, 0usize, mats.bulb, lampColor(), n * GLOW_BULB);
     self.send(door, 1usize, mats.glass, glassColor(), n * GLOW_GLASS);
-    self.send(door, 2usize, mats.lanternPool, poolColor(), n * GLOW_LANTERN_POOL);
-    self.send(door, 5usize, mats.head, glassColor(), n * GLOW_HEAD);
-    self.send(door, 3usize, mats.room, roomColor(), n * GLOW_ROOM);
-    self.send(door, 4usize, mats.windowPool, roomColor(), n * GLOW_WINDOW_POOL);
+    self.send(door, 3usize, mats.head, glassColor(), n * GLOW_HEAD);
+    self.send(door, 2usize, mats.room, roomColor(), n * GLOW_ROOM);
     // Nearness: only a lit lantern brightens
     imm dt = f32.from(now - lastTick);
     lastTick = now;
@@ -212,11 +280,28 @@ pub struct Lights {
         imm tint = new Color(g, g, g, 1.);
         door.tint(row.glass, tint);
         door.tint(row.bulb, tint);
-        if !row.pool.isNone() { door.tint(row.pool, tint); }
         tintsSent = tintsSent + 1u64;
         row.sentGain = g;
       }
       lanterns.set(i, row);
+      i = i + 1usize;
+    }
+    // The lights: the hour's intensity, brightened by their lantern's nearness
+    i = 0usize;
+    while i < lamps.len() {
+      mut lamp = *lamps[i];
+      imm gain = if lamp.lantern == NO_LANTERN { 1.; } else { lanterns[lamp.lantern].gain; };
+      imm candela = n * lamp.perNit * gain;
+      imm last = lamp.sent;
+      imm changed = last < 0. or (candela == 0.) != (last == 0.) or absF(candela - last) > 0.01 * maxF(last, candela);
+      if changed {
+        mut look = lamp.look;
+        look.candela = candela;
+        door.light(lamp.part, look);
+        lamp.sent = candela;
+        lamps.set(i, lamp);
+        lampsSent = lampsSent + 1u64;
+      }
       i = i + 1usize;
     }
   }
@@ -233,56 +318,13 @@ pub struct Lights {
     glowsSent = glowsSent + 1u64;
   }
 
-  // The radiance last sent for glow 'k' (bulb 0, glass 1, lantern pool 2,
-  // room 3, window pool 4), nits; negative if none yet
+  // The radiance last sent for glow 'k' (bulb 0, glass 1, room 2, head 3), nits;
+  // negative if none yet
   pub fn sentNits(self &, k usize) f32 { sent[k]; }
+
+  // The candela last sent for light 'k' (in the order added), negative if none yet
+  pub fn sentCandela(self &, k usize) f32 { lamps[k].sent; }
 }
 
 fn absF(x f32) f32 { if x < 0. { 0. - x; } else { x; }; }
 fn maxF(a f32, b f32) f32 { if a > b { a; } else { b; }; }
-
-// ---- Light pools: the meshes ----
-
-// A pool of light lying on the ground: a grid 'cells' by 'cells' over the
-// rectangle 'halfX' by 'halfZ' about (cx, cz) in the frame 'origin' is in
-// (its own y is subtracted), each vertex 'lift' above 'ground' there (a
-// function of the world's x and z), its uvs 0 to 1 across (the pool
-// shader's falloff runs from their middle). Normals from the ground's
-// slope, so a steep bank holds less light.
-pub fn poolMesh(ground &<fn(x f32, z f32) f32, origin Vec3, cx f32, cz f32, halfX f32, halfZ f32, cells i32, lift f32)
-    mesh.Mesh {
-  mut m = mesh.Mesh.empty();
-  imm n = cells;
-  mut j = 0;
-  while j <= n {
-    mut i = 0;
-    while i <= n {
-      imm u = f32.from(i) / f32.from(n);
-      imm w = f32.from(j) / f32.from(n);
-      imm x = cx - halfX + 2. * halfX * u;
-      imm z = cz - halfZ + 2. * halfZ * w;
-      imm wx = origin.x + x;
-      imm wz = origin.z + z;
-      imm y = ground(wx, wz) - origin.y + lift;
-      m.positions.push(v(x, y, z));
-      // The ground's normal from its slope, 10 cm either way
-      imm dx = ground(wx + 0.1, wz) - ground(wx - 0.1, wz);
-      imm dz = ground(wx, wz + 0.1) - ground(wx, wz - 0.1);
-      m.normals.push(v(0. - dx, 0.2, 0. - dz).normalize());
-      m.uvs.push(p2(u, 1. - w));
-      if i > 0 and j > 0 {
-        imm a = u32.from((j - 1) * (n + 1) + i - 1);
-        imm b = u32.from((j - 1) * (n + 1) + i);
-        imm c = u32.from(j * (n + 1) + i);
-        imm d = u32.from(j * (n + 1) + i - 1);
-        // Counterclockwise seen from above (+y): a, d, c and a, c, b
-        m.indices.push(a); m.indices.push(d); m.indices.push(c);
-        m.indices.push(a); m.indices.push(c); m.indices.push(b);
-      }
-      i = i + 1;
-    }
-    j = j + 1;
-  }
-  m;
-}
-

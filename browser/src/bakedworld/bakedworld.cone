@@ -146,6 +146,16 @@ pub struct PartDesc {
   pub material usize;
   pub parent usize;
   pub at Transform3;
+  pub casts bool = true;      // false: it casts no shadow
+}
+
+// One light of an object: a part with no mesh, a point or spot light on it,
+// under part 'parent' (TOP: none), placed at 'at' in its parent's frame
+pub struct LampDesc {
+  pub name String;
+  pub parent usize;
+  pub at Transform3;
+  pub look LightLook;
 }
 
 // One effect of an object: its layers, its parent (one of the object's
@@ -175,9 +185,24 @@ pub struct Hydrated {
   pub materials List[MaterialDesc];
   pub parts List[PartDesc];
   pub effects List[EffectDesc];
+  pub lamps List[LampDesc] = List[LampDesc].empty();
 
   pub fn empty() Hydrated {
     new Hydrated(List[mesh.Mesh].empty(), List[MaterialDesc].empty(), List[PartDesc].empty(), List[EffectDesc].empty());
+  }
+
+  // A light on a part of its own, under part 'parent' at 'at'. Its part
+  // comes after the object's parts and effects, in the order the lights were
+  // added.
+  pub fn lamp(self &mut, name &str, parent usize, at Transform3, look LightLook) {
+    lamps.push(new LampDesc(String.from(name), parent, at, look));
+  }
+
+  // Part 'i' casts no shadow
+  pub fn noShadow(self &mut, i usize) {
+    mut p = *parts[i];
+    p.casts = false;
+    parts.set(i, p);
   }
 
   // A mesh of the object: its index
@@ -449,6 +474,7 @@ pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mu
     door.send(Request.Place(id, p.at));
     if p.parent != TOP { door.send(Request.Parent(id, *ids[first + p.parent])); }
     door.send(Request.Show(id, *meshIds[p.mesh], *materialIds[p.material], 0.));
+    if !p.casts { door.castsShadow(id, false); }
     ids.push(id);
     places.push(p.at);
     i = i + 1usize;
@@ -466,6 +492,18 @@ pub fn inject(h &mut Hydrated, door &mut Door, ids &mut List[PartId], places &mu
     door.send(Request.Effect(id, layers, e.seed, e.start, e.stop));
     ids.push(id);
     places.push(e.at);
+    i = i + 1usize;
+  }
+  // The lights, a part each, after the effects
+  i = 0usize;
+  while i < h.lamps.len() {
+    imm l = h.lamps[i];
+    imm id = door.newPart(l.name.view());
+    door.send(Request.Place(id, l.at));
+    if l.parent != TOP { door.send(Request.Parent(id, *ids[first + l.parent])); }
+    door.light(id, l.look);
+    ids.push(id);
+    places.push(l.at);
     i = i + 1usize;
   }
 }
@@ -518,8 +556,7 @@ pub struct BakedWorld {
   // The materials the lights glow, as far as they are defined yet
   pub fn glowMaterials(self &) GlowMaterials {
     new GlowMaterials(self.sharedOf(SHARED_LANTERN_BULB), self.sharedOf(SHARED_LANTERN_GLASS),
-      self.sharedOf(SHARED_LANTERN_POOL), self.sharedOf(SHARED_WINDOW_ROOM), self.sharedOf(SHARED_WINDOW_POOL),
-      self.sharedOf(SHARED_LANTERN_HEAD));
+      self.sharedOf(SHARED_WINDOW_ROOM), self.sharedOf(SHARED_LANTERN_HEAD));
   }
 
   // The material shared under 'key', or none if it is not defined yet
@@ -666,7 +703,7 @@ pub struct BakedWorld {
     imm t0 = sdl.GetPerformanceCounter();
     mut h = hydrate(next);
     imm t1 = sdl.GetPerformanceCounter();
-    imm parts = u32.from(h.parts.len() + h.effects.len());
+    imm parts = u32.from(h.parts.len() + h.effects.len() + h.lamps.len());
     imm tris = h.triangles();
     firstOf.push(ids.len());
     inject(&mut h, door, &mut ids, &mut places, &mut shared);
@@ -680,15 +717,34 @@ pub struct BakedWorld {
     }
     if next == LANTERNS {
       // Each path lantern's stake is an area; coming near brightens its
-      // glass, bulb and pool (cottage.cone: four parts a lantern, then the pools)
+      // glass, bulb and lights (cottage.cone: four parts a lantern, then the plates, then
+      // the lights, two a lantern)
       imm first = *firstOf[usize.from(LANTERNS)];
       mut k = 0usize;
       while k < LANTERN_COUNT {
         imm stake = *ids[first + k * 4usize];
         door.send(Request.Area(stake, Volume.sphere(v(0., 0.2, 0.), NEAR_RADIUS)));
-        lights.addLantern(stake, *ids[first + k * 4usize + 1usize], *ids[first + k * 4usize + 2usize],
-          *ids[first + LANTERN_POOLS + k]);
+        imm row = lights.addLantern(stake, *ids[first + k * 4usize + 1usize], *ids[first + k * 4usize + 2usize]);
+        lights.addLamp(*ids[first + LANTERN_PARTS + k * 2usize], lanternLight(), CD_LANTERN, row);
+        lights.addLamp(*ids[first + LANTERN_PARTS + k * 2usize + 1usize], interiorLight(), CD_INTERIOR, row);
         k = k + 1usize;
+      }
+    }
+    if next == COTTAGE {
+      // The lights, after the parts and the chimney's smoke (cottage.cone): the two wall lanterns'
+      // (their light and their interior light), then the windows' spot lights
+      imm first = *firstOf[usize.from(COTTAGE)] + COTTAGE_PARTS + 1usize;
+      mut k = 0usize;
+      while k < 2usize {
+        lights.addLamp(*ids[first + k * 2usize], lanternLight(), CD_WALL, NO_LANTERN);
+        lights.addLamp(*ids[first + k * 2usize + 1usize], interiorLight(), CD_INTERIOR, NO_LANTERN);
+        k = k + 1usize;
+      }
+      imm shares = windowShares();
+      mut w = 0usize;
+      while w < 5usize {
+        lights.addLamp(*ids[first + 4usize + w], windowLight(), CD_WINDOW * shares[w], NO_LANTERN);
+        w = w + 1usize;
       }
     }
     imm t2 = sdl.GetPerformanceCounter();
