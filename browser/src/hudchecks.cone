@@ -1,0 +1,223 @@
+// The HUD's headless checks (part of 'browser.exe --checks'): the layout's numbers and the model's behaviour, read off
+// the Ui and its draw list with no GPU, the map's picture, and that the HUD's keys are taken by nothing else. Text is
+// measured through a system font where there is one (Segoe UI, Arial); with none, the measure falls back to a width a
+// character and the checks that compare text widths say so and are skipped.
+
+// Every key the browser binds, and the window's (Escape quits and F11 is fullscreen, frame's Host), and the HUD's
+fn hudKeysInUse() List[u32] {
+  mut keys = List[u32].empty();
+  // walk.cone: move, turn, run, jump, view, swap, look
+  keys.push(sdl.SCANCODE_W);
+  keys.push(sdl.SCANCODE_S);
+  keys.push(sdl.SCANCODE_A);
+  keys.push(sdl.SCANCODE_D);
+  keys.push(SCANCODE_UP);
+  keys.push(SCANCODE_DOWN);
+  keys.push(SCANCODE_LEFT);
+  keys.push(SCANCODE_RIGHT);
+  keys.push(sdl.SCANCODE_LSHIFT);
+  keys.push(SCANCODE_SPACE);
+  keys.push(SCANCODE_V);
+  keys.push(SCANCODE_TAB);
+  keys.push(SCANCODE_PAGEUP);
+  keys.push(SCANCODE_PAGEDOWN);
+  // browser.cone: the clock and the weather
+  keys.push(SCANCODE_P);
+  keys.push(SCANCODE_F);
+  keys.push(SCANCODE_T);
+  // the window's
+  keys.push(sdl.SCANCODE_ESCAPE);
+  keys.push(sdl.SCANCODE_F11);
+  // the HUD's: H, and F1 to F8
+  keys.push(SCANCODE_H);
+  mut n = 0u32;
+  while n < HOTBAR_SLOTS {
+    keys.push(SCANCODE_F1 + n);
+    n = n + 1u32;
+  }
+  keys;
+}
+
+fn hudFrameAt(x f32, z f32, yaw f32, keys u32) HudFrame {
+  new HudFrame(true, 12.5, WEATHER_RAIN, 6.4, false, 0i64, new Vec3(x, 0., z), yaw, List[Vec3].empty(), keys, 0.016);
+}
+
+fn hudHasFont(m &HudModel) bool {
+  match &m.font {
+    case imm f Some { return true; }
+    else {}
+  }
+  false;
+}
+
+// The map's texel at world (x, z), packed 0xRRGGBB
+fn hudMapTexel(px &List[u8], x f32, z f32) u32 {
+  imm i = usize.from(i32.from((x + HALF) / CELL + 0.5));
+  imm j = usize.from(i32.from((z + HALF) / CELL + 0.5));
+  imm at = (j * MAP_SIDE + i) * 4usize;
+  (u32.from(*px[at]) << 16u32) | (u32.from(*px[at + 1usize]) << 8u32) | u32.from(*px[at + 2usize]);
+}
+
+fn hudRed(c u32) i32 { i32.from((c >> 16u32) & 255u32); }
+fn hudGreen(c u32) i32 { i32.from((c >> 8u32) & 255u32); }
+fn hudBlue(c u32) i32 { i32.from(c & 255u32); }
+
+// Whether the draw list has a text of exactly 's'
+fn hudHasText(list &uilayout.DrawList, s &str) bool {
+  mut i = 0usize;
+  while i < list.cmds.len() {
+    if list.cmds[i].kind == uilayout.DC_TEXT and list.textOf(i) == s { return true; }
+    i = i + 1usize;
+  }
+  false;
+}
+
+fn checkHud() bool {
+  print <- "The HUD:\n";
+  bakeIsland();
+  mut ok = true;
+
+  // No two actions share a key
+  imm keys = hudKeysInUse();
+  mut clash = 0usize;
+  mut i = 0usize;
+  while i < keys.len() {
+    mut j = i + 1usize;
+    while j < keys.len() {
+      if *keys[i] == *keys[j] { clash = clash + 1usize; }
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+  ok = yesNo("H and F1 to F8 collide with no key the browser or the window binds", clash == 0usize) and ok;
+
+  // The map: the island from above, 1025 x 1025 texels
+  imm map = buildMapPixels();
+  ok = yesNo("the map is 1025 x 1025 RGBA texels", map.len() == MAP_SIDE * MAP_SIDE * 4usize) and ok;
+  imm sea = hudMapTexel(&map, -1000., -1000.);
+  ok = yesNo("far out at sea the map is water (blue over red)", hudBlue(sea) > hudRed(sea) + 40i32) and ok;
+  imm line = pathCentreline();
+  imm onPath = hudMapTexel(&map, (*line[line.len() / 2usize]).x, (*line[line.len() / 2usize]).z);
+  ok = yesNo("the path's middle is path-coloured (red and green over blue)", hudRed(onPath) > hudBlue(onPath) + 40i32 and hudGreen(onPath) > hudBlue(onPath) + 30i32) and ok;
+  imm spring = brookPoints();
+  imm inBrook = hudMapTexel(&map, (*spring[spring.len() / 2usize]).x, (*spring[spring.len() / 2usize]).z);
+  ok = yesNo("the brook's middle is water (blue over red)", hudBlue(inBrook) > hudRed(inBrook) + 40i32) and ok;
+  mut pine = 0usize;
+  mut found = false;
+  imm items = vegetationLayout();
+  mut k = 0usize;
+  while k < items.len() and !found {
+    if items[k].kind == K_PINE { pine = k; found = true; }
+    k = k + 1usize;
+  }
+  imm underPine = hudMapTexel(&map, items[pine].x, items[pine].z);
+  ok = yesNo("a pine's centre is the pine's dark green", found and hudGreen(underPine) < 100i32 and hudRed(underPine) < 60i32) and ok;
+
+  // The words
+  ok = yesNo("the clock reads \"12:30   rain\" at 12.5 h in the rain", hudClock(12.5, WEATHER_RAIN) == "12:30   rain") and ok;
+  ok = yesNo("the day's end wraps: 23.99 h reads \"00:00\"", hudClock(23.999, WEATHER_FAIR) == "00:00   fair") and ok;
+  ok = yesNo("6.4 ms reads \"6.4 ms   156 fps\"", hudFrameText(6.4) == "6.4 ms   156 fps") and ok;
+  ok = yesNo("no frame time reads \"frame time off\"", hudFrameText(0.) == "frame time off") and ok;
+  ok = yesNo("single player and connected read as they are", hudMode(false, 0i64) == "single player" and hudMode(true, 12i64) == "connected   12 ms") and ok;
+
+  // The layout at 1280 x 720, 100 %
+  mut model = HudModel.make(1280., 720., 1.);
+  print <- "  font: "; if hudHasFont(&model) { print <- "a system font\n"; } else { print <- "none found: text measured by a width a character\n"; }
+  model.update(&hudFrameAt(BEACH_X, BEACH_Z, 0., 0u32), 1280., 720.);
+  imm bar = model.ui.nodes[model.bar];
+  ok = near("the hotbar's width (8 slots of 46, 7 gaps of 4)", bar.w, 396., 1.) and ok;
+  ok = near("the hotbar is centred: its middle x", bar.gx + bar.w * 0.5, 640., 1.) and ok;
+  ok = near("and 16 above the bottom edge: its bottom", bar.gy + bar.h, 704., 1.) and ok;
+  imm mapNode = model.ui.nodes[model.mapFrame];
+  ok = near("the minimap's right edge is 14 in", mapNode.gx + mapNode.w, 1266., 1.) and ok;
+  ok = near("and its top 14 down", mapNode.gy, 14., 1.) and ok;
+  ok = near("and it is 176 across", mapNode.w, 176., 1.) and ok;
+  imm status = model.ui.nodes[model.status];
+  ok = near("the status panel's left edge", status.gx, 14., 1.) and ok;
+  ok = near("and top", status.gy, 14., 1.) and ok;
+  ok = near("and width", status.w, 172., 1.) and ok;
+  mut keysOk = true;
+  mut n = 0u32;
+  while n < HOTBAR_SLOTS {
+    imm slot = uilayout.hotbarSlot(&model.ui, model.bar, n);
+    if model.ui.hotslots[model.ui.nodes[slot].data].key != uilayout.KEY_F1 + n { keysOk = false; }
+    n = n + 1u32;
+  }
+  ok = yesNo("the slots are bound to F1 to F8, in order", keysOk) and ok;
+  imm s0 = uilayout.hotbarSlot(&model.ui, model.bar, 0u32);
+  imm s3 = uilayout.hotbarSlot(&model.ui, model.bar, 3u32);
+  ok = yesNo("F1 to F3 hold placeholders (a colour, no icon) and F4 to F8 are empty",
+    model.ui.hotslots[model.ui.nodes[s0].data].kind != uilayout.BK_NONE and model.ui.hotslots[model.ui.nodes[s0].data].icon == 0u32
+    and model.ui.hotslots[model.ui.nodes[s3].data].kind == uilayout.BK_NONE) and ok;
+  ok = yesNo("no slot is cooling before a key", uilayout.hotbarCooldown(&model.ui, s0) == 0.) and ok;
+  ok = yesNo("the draw list has the minimap's image, once, and a text for each of F1 to F8",
+    model.list.count(uilayout.DC_IMAGE) == 1usize and hudHasText(&model.list, "F1") and hudHasText(&model.list, "F8")
+    and !hudHasText(&model.list, "F9")) and ok;
+  if hudHasFont(&model) {
+    ok = yesNo("the status words are in the list", hudHasText(&model.list, "12:30   rain") and hudHasText(&model.list, "6.4 ms   156 fps")
+      and hudHasText(&model.list, "single player")) and ok;
+  }
+  model.update(&hudFrameAt(-15., 340., 0., 0u32), 1280., 720.);
+  ok = yesNo("the player's place is under the map: \"x -15   z 340\" at the set-down", hudHasText(&model.list, "x -15   z 340")) and ok;
+
+  // F1 starts its slot's cooldown; a second press while it runs does not start it again
+  model.update(&hudFrameAt(BEACH_X, BEACH_Z, 0., 1u32), 1280., 720.);
+  imm first = uilayout.hotbarCooldown(&model.ui, s0);
+  model.update(&hudFrameAt(BEACH_X, BEACH_Z, 0., 1u32), 1280., 720.);
+  imm second = uilayout.hotbarCooldown(&model.ui, s0);
+  ok = yesNo("F1 starts its slot's cooldown (1.5 s, so just under 1)", first > 0.95 and first < 1.)  and ok;
+  ok = yesNo("F1 again while it cools does not restart it", second < first and second > 0.9) and ok;
+  ok = yesNo("F2's slot did not cool", uilayout.hotbarCooldown(&model.ui, uilayout.hotbarSlot(&model.ui, model.bar, 1u32)) == 0.) and ok;
+
+  // The map follows the player and shows the heading and the others
+  mut others = List[Vec3].empty();
+  others.push(new Vec3(100., 0., 100.));
+  model.update(&new HudFrame(true, 12., WEATHER_FAIR, 6., false, 0i64, new Vec3(200., 0., -300.), 1.5707964, others, 0u32, 0.016), 1280., 720.);
+  imm md = model.ui.nodes[model.mapFrame].data;
+  ok = near("the map's centre u follows the player (x 200 of 2048 from the west edge)", model.ui.minimaps[md].cu, (200. + HALF) / (2. * HALF), 0.00001) and ok;
+  ok = near("and v (z -300)", model.ui.minimaps[md].cv, (0. - 300. + HALF) / (2. * HALF), 0.00001) and ok;
+  mut mine = 0usize;
+  mut tickU = 0.;
+  mut tickV = 0.;
+  mut m = 0usize;
+  while m < model.ui.markers.len() {
+    if model.ui.markers[m].owner == model.mapFrame {
+      mine = mine + 1usize;
+      if model.ui.markers[m].size == 4. { tickU = model.ui.markers[m].u; tickV = model.ui.markers[m].v; }
+    }
+    m = m + 1usize;
+  }
+  ok = yesNo("three markers: the other being, the heading's tick, the player", mine == 3usize) and ok;
+  // A quarter turn left from facing -z faces -x: the tick is 16 m west of the player, level
+  ok = near("turned a quarter left, the tick is 16 m west (u less by 16/2048)", model.ui.minimaps[md].cu - tickU, 16. / 2048., 0.0001) and ok;
+  ok = near("and level (v the same)", tickV - model.ui.minimaps[md].cv, 0., 0.0001) and ok;
+  // The view the frame shows is 1/6 of the island across
+  imm mv = uilayout.minimapView(&model.ui, model.mapFrame);
+  ok = near("the minimap shows 1/6 of the island across (340 m)", mv.max.x - mv.min.x, 1. / 6., 0.00001) and ok;
+
+  // A window of another size: the same margins from its edges
+  model.update(&hudFrameAt(BEACH_X, BEACH_Z, 0., 0u32), 1000., 600.);
+  imm bar2 = model.ui.nodes[model.bar];
+  imm map2 = model.ui.nodes[model.mapFrame];
+  ok = near("at 1000 x 600 the hotbar's bottom is 16 up", bar2.gy + bar2.h, 584., 1.) and ok;
+  ok = near("and the minimap's right edge 14 in", map2.gx + map2.w, 986., 1.) and ok;
+
+  // 150 %: the same layout in logical units, at 1.5 pixels each
+  mut big = HudModel.make(1920., 1080., 1.5);
+  big.update(&hudFrameAt(BEACH_X, BEACH_Z, 0., 0u32), 1920., 1080.);
+  imm bar3 = big.ui.nodes[big.bar];
+  imm map3 = big.ui.nodes[big.mapFrame];
+  ok = near("at 150 % on 1920 x 1080 the layout is the 1280 x 720 one: the hotbar's middle", bar3.gx + bar3.w * 0.5, 640., 1.) and ok;
+  ok = near("the minimap's right edge", map3.gx + map3.w, 1266., 1.) and ok;
+  model.update(&hudFrameAt(BEACH_X, BEACH_Z, 0., 0u32), 1280., 720.);
+  if hudHasFont(&model) {
+    // (text laid out at the pixel size, measured back in logical units: the same to within the shape of the glyphs' rounding)
+    imm w1 = model.ui.nodes[model.timeLabel].w;
+    imm w2 = big.ui.nodes[big.timeLabel].w;
+    ok = yesNo("a text measured at 150 % comes out as wide, in logical units, as at 100 % (within 2 %)",
+      w2 > w1 * 0.98 and w2 < w1 * 1.02 and w1 > 20.) and ok;
+  } else {
+    print <- "  (no font: the text-width comparison is skipped)\n";
+  }
+  ok;
+}
