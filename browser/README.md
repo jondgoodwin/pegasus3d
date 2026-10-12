@@ -153,7 +153,7 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | Space | jump (a mannequin: 4.2 m/s up, 0.9 m) |
 | PageUp / PageDown, or drag with the right mouse button held | look up / down: the camera's pitch (first and third person, and the plain walker), held within 80 degrees of level; the walking direction does not change; it starts level and stays where you leave it (mouse yaw is not bound: A/D or Left/Right turn) |
 | **V** | **first person or third person**: the camera at the mannequin's eyes socket, or 3.2 m behind it and above, looking at its chest |
-| **Tab** | possess the next mannequin: the controls and the camera go to it, and the one left behind stands |
+| **Tab** | possess the next mannequin (never a villager): the controls and the camera go to it, and the one left behind stands |
 | Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button in the basket sends the balloon on its ride |
 | P | pause scene time, or start it again (the world's motions, the effects, the timers and the day stop; the walk does not) |
 | F | run scene time ten times as fast, or back to normal (for testing the day: dusk comes 50 s after the start instead of 12.5 min) |
@@ -173,6 +173,7 @@ browser.exe --no-sky                  the static sky and light, no birds (to tim
 browser.exe --frames 600              600 frames on frame's synthetic clock
 browser.exe --soak 12000              12000 frames, checking nothing grows (below)
 browser.exe --watch 300               300 s in real time, a line a second and a key probe (below)
+browser.exe --navpic PREFIX           the villagers' navigation mesh drawn top-down as PREFIX-region.bmp, -cottage.bmp and -bridge.bmp
 ```
 
 `--script` pushes key events into SDL's own queue (never the operating system's), so nothing reaches
@@ -300,6 +301,43 @@ the walk it moves is presented.
 Every run prints, at the end, each object's triangles and the time it took to hydrate and to send, and
 along the way when the first frame was presented and when every object was first on screen.
 
+## The villagers
+
+Four mannequins (beings 3 to 6, after the user's and the idle one) live on the island and walk by themselves. They
+are **the simulation's** (`src/npcs.cone`): each is a being like the user's, walked by the same character
+controller and posed by `walkgait`, whose intents (a turn and an ahead, never a key) come from a mind instead of
+the keyboard. They cross in the snapshot as every being does, and the view draws them as it draws the idle mannequin
+(single player: stepped from the snapshot's intents; connected: interpolated). Every mode has them (a script's, a
+server's, the user's); **Tab skips them** (`Being.ai`).
+
+| Villager | What it does | Made of |
+| --- | --- | --- |
+| villager (blue) | walks a round of the cottage's front, the bridge's crest and the beach, 8 s at each, by the path where there is one (ground off it costs three times as much a metre, so a route follows the path's windings, kept within 1.3 m of its centre, rather than cutting across the forest) | navmesh A* and funnel; `PathFollower` |
+| gardener (green) | idles about the lawn by the horn-flower and the ball: walks and stands in turns, within 5 m of home | `npcbehave.Grazer` (a behaviour tree, Wander) |
+| follower (ochre) | keeps about 6 m from the nearest player: trails him when he walks, backs off when he comes close | a route to the spot at that distance on the line from the player; `PathFollower` |
+| shy villager (purple) | keeps away from the player (runs inside 5 m until he is beyond 9 m), goes home when he is not near it | `npcbehave` `evade`, then a route home |
+
+**The navigation mesh** (`navmesh`, after Recast and Detour) is built at start-up in 0.2 to 0.5 s from the baked island
+inside the window x -110 to 90, z 290 to 515: the island's heightfield cells inside the fence and above the wading
+line as triangles (the island's own diagonals), a circle obstacle for each trunk and rock and the balloon's basket, a
+box obstacle for each box solid taller than 2.2 m (the cottage), and for each lower box solid (the porch deck and
+steps, the bridge's crest, ramps and parapets) its top as walkable triangles, level or sloped; a disc every 2 m along the
+path's centreline marks the ground under it as the path's area. The agent is the
+capsule's: 0.3 m radius, 1.9 m tall, climbing 0.4 m (`STEP_UP`) and not ground steeper than 40 degrees; the voxels are
+0.2 m by 0.1 m (0.3 m by 0.2 m left the bridge's 1.4 m road, between parapets, too narrow to cross). `browser.exe
+--navpic PREFIX` draws it.
+
+**Steering and containment.** A mind asks for an acceleration on the ground plane (npcbehave); its `Body2` is set to
+where the real body is, and the velocity it then wishes (which builds up at the steering's acceleration) is held to the mesh (walked half a metre along it with
+`moveAlongSurface`: a wall turns the wish along it or stops it) and turned into intents: a turn as fast as the body
+turns (`TURN_RATE`), an ahead that falls as the turn needed grows, both rounded to 1/127 (the snapshot's resolution),
+so the view stepping a villager from the snapshot's intents does what the simulation did. Villagers do not avoid each
+other or the player except as the shy one flees: characters pass through one another, as every body does here.
+
+A step of the four minds takes about 2 to 8 microseconds (measured by `--checks` and the run's last lines); a route
+query a few tenths of a millisecond. `--no-npcs` leaves them out (a scripted run without them is byte-identical in its
+shots to a run before they were added).
+
 ## Playing together: one server, two browsers
 
 The browser is two programs in one: a **simulation** (the truth: the bodies, the platforms, the world's own
@@ -394,6 +432,7 @@ the relay with 5% of packets lost and 100 ms and up to 20 ms more each way.
 | `src/ridescript.cone` | the assembly's balloon ride: boarding, the ride, stepping out, the fall and getting up again |
 | `src/support.cone` | what a body stands on (the ground or a platform's floor), platforms' walls, and carrying the bodies on a moving platform |
 | `src/checks.cone` | the scene core's headless checks (`--checks`) |
+| `src/npcs.cone`, `src/npcchecks.cone` | the villagers (below): the navigation mesh built from the island and its solids, the four minds, and the intents they give their beings; their checks (a 520 s run in the physics world) and `--navpic` |
 | `src/picking.cone` | the picking system: each mesh's triangles, which mesh each part is, and the ray a click casts |
 | `src/watch.cone` | the watched real-time run and the soak |
 | `src/bakedworld/` | the module `bakedworld`, the baked-in world: its objects' descriptions, hydrating and injecting them, its motions (`motions.cone`), and its lights (`lights.cone`: glow on at dusk and off at dawn, nearness, pools of light) |

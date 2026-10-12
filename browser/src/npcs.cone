@@ -1,0 +1,636 @@
+// The villagers: autonomous mannequins on the island, in the simulation.
+//
+// WHAT THEY ARE. Beings like the player's: a mannequin each, a body walked by the same rigiddynamics character
+// controller and posed by walkgait (being.cone, mannequin.cone). The only difference is who decides their
+// intents: a controller of this file's (the AI controller being.cone's header had in mind), where the player's
+// is the keyboard. They are the truth's, so they live in the simulation (simactor.cone), cross in the snapshot as
+// every being does, and the view draws them as it draws the second mannequin; the view needs no navigation.
+//
+// FINDING THE WAY. navmesh (after Recast and Detour): at start-up the walkable ground (the island's heightfield
+// inside the fence, above the wading line, round the beach, the path, the cottage, the lawn and the bridge) and the world's static
+// Solids make one navigation mesh for an agent as big as the mannequin's capsule:
+//   - the ground is triangles, two to a cell of the island's grid with the island's own diagonal, so the mesh
+//     and the capsule's ground are the same surface;
+//   - a tree trunk or a rock is a circle obstacle; a high box (the cottage's walls and chimney) a box obstacle;
+//   - a box whose top could be walked on (the porch deck and steps, the bridge's crest, its ramps and parapets)
+//     is its top alone, two walkable triangles, level or sloped: what stands beside it is a step up or down by the
+//     mesh's own rule (a rise within the controller's step is walked, a higher one is a wall, a drop of more is an
+//     edge), so the road over the bridge is on the mesh and a parapet 0.55 m above it is a wall;
+//   - the balloon's basket (a platform, not a Solid) is a circle obstacle at its spot.
+// The mesh agrees with the controller's rules: it climbs 0.4 m (STEP_UP), will not take ground steeper than 40
+// degrees (the capsule slides down 45), and keeps a radius of 0.3 m from every wall (the capsule is 0.24 to
+// 0.27), at the resolution of its voxels (0.2 m by 0.1 m: the bridge's road between its parapets is 1.4 m wide).
+//
+// DECIDING AND STEERING. npcbehave: each villager is one of its archetypes, here made of its layers. A route
+// (navmesh's A* over the polygons and its funnel: the corners) is followed by npcbehave's PathFollower (Reynolds'
+// path following); the wanderer is its Grazer (a behaviour tree of walking and grazing, Wander steering); the
+// shy one is its Fleer's rule (evade the player inside an alarm radius, keep going until a calm one, then home).
+// All of them ask for an acceleration on the ground plane; the Body2 each carries is put where the real body is at
+// every step and integrated for the velocity it WISHES (which builds up at the steering's acceleration, as the
+// real speed does under the controller's). Two things then stand between that wish and the intents:
+//   - CONTAINMENT. The wish is walked a little way along the mesh (Detour's moveAlongSurface): where a wall
+//     stops it, the wish slides along the wall or stops. Free-roaming archetypes (the grazer, the shy one) rely on
+//     it; a character on a route rarely meets it.
+//   - THE INTENTS. The wish becomes the intents any being takes: a turn (proportional, to the heading the wish
+//     asks for, as fast as the body turns: TURN_RATE) and an ahead, slower the more it must still turn (so a
+//     corner is turned on the spot, within the corridor, not swung wide). Both are quantised to the 1/127 the
+//     snapshot carries intents at, so the view's own stepping of an NPC from the snapshot's intents is the
+//     simulation's, step for step.
+//
+// WHERE THEY STAND. The characters collide with the ground and the Solids, never with each other or a ragdoll
+// (physics.cone), and they do not avoid each other or the player beyond the shy one's flight: ORCA (npcbehave's
+// crowd layer) is for crowds, not a handful.
+//
+// WHAT THEY FOLLOW. The 'players' of a step are the beings the clients drive (single player: the one the user
+// possesses): the follower keeps its distance from the nearest, the shy one flees the nearest, and none of them
+// does anything about a player that is not there.
+
+// How many villagers the scene has (villagers() below)
+pub const VILLAGERS = 4usize;
+
+// The kinds of villager
+pub const NPC_PATROL = 0u32;      // walks a round of places along routes, pausing at each
+pub const NPC_GRAZE = 1u32;       // idles in a place: walks and stands in turns, never straying far
+pub const NPC_FOLLOW = 2u32;      // keeps its distance from the nearest player, trailing and standing off
+pub const NPC_SHY = 3u32;         // keeps away from players; goes home when they have gone
+
+// The navigation mesh's window on the island: x from -110 to 90, z from 290 to 515 (the beach, the path, the
+// cottage, the lawn, the brook and the balloon's field)
+const NAV_X0 f32 = -110.;
+const NAV_X1 f32 = 90.;
+const NAV_Z0 f32 = 290.;
+const NAV_Z1 f32 = 515.;
+// Ground below this (metres under the sea) is not walked on: ankle deep and no more
+const NAV_WET f32 = 0.3;
+// A box whose top is within this of the ground under it is geometry with a walkable top (the bridge's crest is 1.4 m
+// over the 2 m grid's ground in its dingle), a taller one (the cottage's walls) a wall with no top to walk on
+const NAV_LOW_BOX f32 = 2.2;
+// The voxels: 0.2 m across and 0.1 m high, so a 1.4 m road between parapets is seven cells, and the controller's
+// 0.4 m step is four
+const NAV_CELL f32 = 0.2;
+const NAV_CELL_HEIGHT f32 = 0.1;
+// The agent: the controller's capsule is 0.15 H round, H from 1.58 to 1.82 m
+const NAV_RADIUS f32 = 0.3;
+const NAV_HEIGHT f32 = 1.9;
+// The steepest ground it takes (the capsule slides down 45 degrees)
+const NAV_SLOPE f32 = 0.6981317;
+// How near the mesh a villager must stay to be on it (the radius, and a cell's rounding)
+pub const NAV_STRAY f32 = 0.55;
+// The path's area (navmesh's areas 1 to 4 are its examples'; this is the caller's), the radius of the discs that mark
+// it (the path's half width is 0.9 m, and edging stones lie just outside it), and what walking on other ground costs
+// against it: a route follows the path rather than cutting across the forest unless that is under a third as far
+pub const AREA_PATH u8 = 5u8;
+const NAV_PATH_RADIUS f32 = 1.2;
+const GROUND_COST f32 = 3.;
+
+// The navigation mesh and what queries it
+pub struct NavWorld {
+  pub nav navmesh.NavMesh;
+  pub filter navmesh.QueryFilter;
+  pub ext Vec3;               // the half extents a point is snapped to the mesh within
+  pub triangles usize;        // the input's
+  pub obstacles usize;
+  pub polygons usize;
+  pub buildNs u64;            // the whole build
+  pub queries u64;
+  pub queryNs u64;
+
+  // A mesh of one triangle: what there is before the island's is built
+  pub fn empty() NavWorld {
+    mut input = navmesh.NavInput.empty();
+    input.addTriangle(new Vec3(0., 0., 0.), new Vec3(0., 0., 1.), new Vec3(1., 0., 0.), navmesh.AreaGround);
+    imm params = navmesh.NavParams.standard();
+    new NavWorld(navmesh.buildNavMesh(&mut input, &params), navmesh.QueryFilter.standard(), new Vec3(1.2, 2., 1.2), 1usize, 0usize, 1usize,
+      0u64, 0u64, 0u64);
+  }
+
+  // A route from 'from' to 'to' as corner points on the ground plane, 'out' cleared first: whether there is one
+  // (a partial one, that stops short, is none)
+  pub fn route(self &mut, from Vec2, to Vec2, out &mut List[Vec2]) bool {
+    imm t0 = sdl.GetTicksNS();
+    out.clear();
+    imm a = new Vec3(from.x, groundHeight(from.x, from.y), from.y);
+    imm b = new Vec3(to.x, groundHeight(to.x, to.y), to.y);
+    imm r = navmesh.findRoute(&nav, a, b, ext, &filter);
+    queries = queries + 1u64;
+    mut ok = r.found and !r.partial;
+    if ok {
+      mut k = 0usize;
+      while k < r.points.len() {
+        imm p = r.points[k].pos;
+        out.push(new Vec2(p.x, p.z));
+        k = k + 1usize;
+      }
+      ok = out.len() >= 2usize;
+    }
+    queryNs = queryNs + (sdl.GetTicksNS() - t0);
+    ok;
+  }
+
+  // The mesh's nearest point to 'p' within 'radius' metres, on the ground plane, into 'out': whether there is one
+  pub fn nearestOnMesh(self &mut, p Vec2, radius f32, out &mut Vec2) bool {
+    imm at = new Vec3(p.x, groundHeight(p.x, p.y), p.y);
+    imm near = navmesh.findNearestPoly(&nav, at, radius, 3., radius, &filter);
+    if !near.found { return false; }
+    *out = new Vec2(near.pos.x, near.pos.z);
+    true;
+  }
+
+  // How far from the mesh the ground-plane point 'p' is, metres (large where there is none within the snap box)
+  pub fn strayOf(self &, p Vec2) f32 {
+    imm at = new Vec3(p.x, groundHeight(p.x, p.y), p.y);
+    imm near = navmesh.findNearestPoly(&nav, at, 3., 3., 3., &filter);
+    if !near.found { return 99.; }
+    imm dx = near.pos.x - at.x;
+    imm dz = near.pos.z - at.z;
+    libc.sqrtf(dx * dx + dz * dz);
+  }
+}
+
+// The lowest and highest of four corners' ground heights under a box
+fn groundSpan(x0 f32, z0 f32, x1 f32, z1 f32, lo &mut f32, hi &mut f32) {
+  imm h0 = groundHeight(x0, z0);
+  imm h1 = groundHeight(x1, z0);
+  imm h2 = groundHeight(x0, z1);
+  imm h3 = groundHeight(x1, z1);
+  mut a = h0;
+  mut b = h0;
+  if h1 < a { a = h1; } if h2 < a { a = h2; } if h3 < a { a = h3; }
+  if h1 > b { b = h1; } if h2 > b { b = h2; } if h3 > b { b = h3; }
+  *lo = a;
+  *hi = b;
+}
+
+// The navigation mesh of the island's walkable ground and 'solids': the windows' ground cells inside the fence and
+// above the wading line, a circle obstacle for each circle solid, and each box solid a wall or a walkable top
+// (see the header). The island must be baked.
+pub fn buildNavWorld(solids &List[Solid]) NavWorld {
+  imm t0 = sdl.GetTicksNS();
+  mut input = navmesh.NavInput.empty();
+  imm hs = heightGrid();
+  imm i0 = i32.from(libc.floorf((NAV_X0 + HALF) / CELL));
+  imm i1 = i32.from(libc.floorf((NAV_X1 + HALF) / CELL));
+  imm j0 = i32.from(libc.floorf((NAV_Z0 + HALF) / CELL));
+  imm j1 = i32.from(libc.floorf((NAV_Z1 + HALF) / CELL));
+  mut j = j0;
+  while j < j1 {
+    mut i = i0;
+    while i < i1 {
+      imm xa = 0. - HALF + f32.from(i) * CELL;
+      imm za = 0. - HALF + f32.from(j) * CELL;
+      imm ha = *hs[usize.from(j * N + i)];
+      imm hb = *hs[usize.from(j * N + i + 1)];
+      imm hc = *hs[usize.from((j + 1) * N + i)];
+      imm hd = *hs[usize.from((j + 1) * N + i + 1)];
+      imm wet = 0. - NAV_WET;
+      if insideIslandFence(xa + CELL * 0.5, za + CELL * 0.5) and ha > wet and hb > wet and hc > wet and hd > wet {
+        // a = (i, j), b = (i + 1, j), c = (i, j + 1), d = (i + 1, j + 1): the island's two ways of cutting a cell
+        imm a = new Vec3(xa, ha, za);
+        imm b = new Vec3(xa + CELL, hb, za);
+        imm c = new Vec3(xa, hc, za + CELL);
+        imm d = new Vec3(xa + CELL, hd, za + CELL);
+        if !diagonalFlipped(i, j) {
+          input.addTriangle(a, c, d, navmesh.AreaGround);
+          input.addTriangle(a, d, b, navmesh.AreaGround);
+        } else {
+          input.addTriangle(a, c, b, navmesh.AreaGround);
+          input.addTriangle(d, b, c, navmesh.AreaGround);
+        }
+      }
+      i = i + 1;
+    }
+    j = j + 1;
+  }
+  mut obstacles = 0usize;
+  mut k = 0usize;
+  while k < solids.len() {
+    imm s = *solids[k];
+    if s.kind == SOLID_CIRCLE {
+      if s.x0 > NAV_X0 - 2. and s.x0 < NAV_X1 + 2. and s.z0 > NAV_Z0 - 2. and s.z0 < NAV_Z1 + 2. {
+        input.addCircleObstacle(s.x0, s.z0, s.x1, s.y0, s.y1, navmesh.AreaNull);
+        obstacles = obstacles + 1usize;
+      }
+    } elif s.x1 > NAV_X0 and s.x0 < NAV_X1 and s.z1 > NAV_Z0 and s.z0 < NAV_Z1 {
+      mut lo = 0.;
+      mut hi = 0.;
+      groundSpan(s.x0, s.z0, s.x1, s.z1, &mut lo, &mut hi);
+      imm top = if s.y1 > s.y2 { s.y1; } else { s.y2; };
+      if s.axis == 0u32 and top - hi > NAV_LOW_BOX {
+        // A high box: a wall
+        input.addBoxObstacle((s.x0 + s.x1) * 0.5, (s.z0 + s.z1) * 0.5, (s.x1 - s.x0) * 0.5, (s.z1 - s.z0) * 0.5, 0., s.y0, s.y1, navmesh.AreaNull);
+        obstacles = obstacles + 1usize;
+      } else {
+        // A box with a top to walk on, level or sloped: that top, two triangles counterclockwise from above, and
+        // nothing else. What stands beside it is a step up or down by the mesh's own rule (a rise of the controller's
+        // step is walked, a higher one is a wall, a drop of more is an edge), the same rule the capsule meets
+        // the solid by, and the sides need not be built (they would be walls across the joints of a bridge's parts).
+        imm p00 = new Vec3(s.x0, s.topAt(s.x0, s.z0), s.z0);
+        imm p10 = new Vec3(s.x1, s.topAt(s.x1, s.z0), s.z0);
+        imm p01 = new Vec3(s.x0, s.topAt(s.x0, s.z1), s.z1);
+        imm p11 = new Vec3(s.x1, s.topAt(s.x1, s.z1), s.z1);
+        input.addTriangle(p00, p01, p10, navmesh.AreaGround);
+        input.addTriangle(p10, p01, p11, navmesh.AreaGround);
+      }
+    }
+    k = k + 1usize;
+  }
+  // The balloon's basket: a platform, not a solid, with walls a body would stop at
+  imm basket = placeXZ(BALLOON);
+  input.addCircleObstacle(basket.x, basket.y, 2.2, groundHeight(basket.x, basket.y) - 2., groundHeight(basket.x, basket.y) + 4., navmesh.AreaNull);
+  obstacles = obstacles + 1usize;
+  // The path: ground marked as path along its centreline (a disc every 2 m, which a navigation mesh paints its area
+  // over), so that a route can prefer it
+  imm line = pathCentreline();
+  mut p = 0usize;
+  while p < line.len() {
+    imm c = line[p];
+    if c.x > NAV_X0 and c.x < NAV_X1 and c.z > NAV_Z0 and c.z < NAV_Z1 {
+      input.addCircleObstacle(c.x, c.z, NAV_PATH_RADIUS, c.y - 1., c.y + 2., AREA_PATH);
+      obstacles = obstacles + 1usize;
+    }
+    p = p + 2usize;
+  }
+  mut params = navmesh.NavParams.standard();
+  params.agentRadius = NAV_RADIUS;
+  params.agentHeight = NAV_HEIGHT;
+  params.agentMaxClimb = STEP_UP;
+  params.agentMaxSlope = NAV_SLOPE;
+  params.cellSize = NAV_CELL;
+  params.cellHeight = NAV_CELL_HEIGHT;
+  imm tris = input.triangleCount();
+  mut nav = navmesh.buildNavMesh(&mut input, &params);
+  imm polys = nav.polyCount();
+  mut filter = navmesh.QueryFilter.standard();
+  filter.setCost(navmesh.AreaGround, GROUND_COST);
+  filter.setCost(AREA_PATH, 1.);
+  new NavWorld(nav, filter, new Vec3(1.2, 2., 1.2), tris, obstacles, polys, sdl.GetTicksNS() - t0, 0u64, 0u64);
+}
+
+// ---- one villager ----
+
+// A villager's walk speed, m/s (the controller's WALK_SPEED is the mannequin's purposeful walk)
+const NPC_SPEED f32 = 1.4;
+const NPC_ACCEL f32 = 3.;
+// How the heading error (radians) reduces the walk: none under this, none at all over the next
+const TURN_FREE f32 = 0.3;
+const TURN_STOP f32 = 1.1;
+// Seconds of wanting to walk and not moving before a villager gives its route up and plans again
+const STALL_SECONDS f32 = 4.;
+
+pub struct Npc {
+  pub being usize;            // its index in the cast
+  pub kind u32;
+  pub name String;
+  pub body npcbehave.Body2;   // set from the real body each step, integrated for the velocity it wishes
+  pub home Vec2;              // where it lives: a patrol's first place, the grazer's and the shy one's home
+  pub places List[Vec2];      // a patrol's round
+  pub next usize;             // the place it is going to
+  pub dwell f32;              // seconds at each place
+  pub dwellLeft f32;
+  pub path List[Vec2];        // the route it follows
+  pub follower npcbehave.PathFollower;
+  pub havePath bool;
+  pub grazer npcbehave.Grazer;
+  pub distance f32;           // a follower's: how far from the player it keeps
+  pub alarm f32;              // the shy one's: the player this near frightens it, and it runs until he is calm
+  pub calm f32;
+  pub afraid bool;
+  pub moving bool;            // a follower on its way to its spot
+  pub replanT f32;            // seconds until a follower looks again
+  pub stallT f32;             // seconds it has wanted to walk and not moved
+  pub lastPos Vec2;
+  // What happened to it, for the checks and the report
+  pub arrivals List[u32];     // a patrol: times it arrived at each place
+  pub blocked u64;            // steps its wish was stopped or turned along a wall
+  pub stalls u32;             // times it gave a route up
+  pub replans u32;
+  pub noRoute u32;            // times there was no route to where it meant to go
+  pub walked f32;             // metres walked
+  pub wishT f32;              // seconds it wished to walk
+
+  fn make(being usize, kind u32, name &str, at Vec2, seed u32) Npc {
+    new Npc(being, kind, String.from(name), npcbehave.Body2.make(at, 0.3, NPC_SPEED, NPC_ACCEL), at, List[Vec2].empty(), 0usize, 0., 0.,
+      List[Vec2].empty(), npcbehave.PathFollower.make(), false, npcbehave.Grazer.make(npcbehave.Body2.make(at, 0.3, NPC_SPEED * 0.7, NPC_ACCEL), at, 5., seed),
+      6., 5., 9., false, false, 0., 0., at, List[u32].empty(), 0u64, 0u32, 0u32, 0u32, 0., 0.);
+  }
+
+  // A villager who walks the round of 'places', pausing 'dwell' seconds at each
+  pub fn patrol(being usize, name &str, places List[Vec2], dwell f32) Npc {
+    mut n = Npc.make(being, NPC_PATROL, name, *places[0usize], 1u32);
+    n.dwell = dwell;
+    n.next = 1usize;
+    mut k = 0usize;
+    while k < places.len() { n.arrivals.push(0u32); n.places.push(*places[k]); k = k + 1usize; }
+    n;
+  }
+
+  // One who idles about 'home', never farther from it than 'leash'
+  pub fn grazing(being usize, name &str, home Vec2, leash f32, seed u32) Npc {
+    mut n = Npc.make(being, NPC_GRAZE, name, home, seed);
+    n.grazer = npcbehave.Grazer.make(npcbehave.Body2.make(home, 0.3, NPC_SPEED * 0.7, NPC_ACCEL), home, leash, seed);
+    n;
+  }
+
+  // One who keeps about 'distance' from the nearest player
+  pub fn following(being usize, name &str, at Vec2, distance f32) Npc {
+    mut n = Npc.make(being, NPC_FOLLOW, name, at, 3u32);
+    n.distance = distance;
+    n;
+  }
+
+  // One who keeps away from players (runs when one comes within 'alarm', until he is beyond 'calm') and goes home after
+  pub fn shy(being usize, name &str, home Vec2, alarm f32, calm f32) Npc {
+    mut n = Npc.make(being, NPC_SHY, name, home, 4u32);
+    n.alarm = alarm;
+    n.calm = calm;
+    n;
+  }
+
+  // Stand still: brake to rest where it is
+  fn rest(self &mut, dt f32) {
+    body.integrate(npcbehave.arrive(body.pos, body.vel, body.pos, body.maxAccel, body.maxSpeed, 0.1, 1., 0.25), dt);
+  }
+
+  // A route to 'to' made the path to follow; false (and counted) if there is none
+  fn plan(self &mut, world &mut NavWorld, to Vec2) bool {
+    path.clear();
+    follower.restart();
+    replans = replans + 1u32;
+    if world.route(body.pos, to, &mut path) {
+      havePath = true;
+      return true;
+    }
+    havePath = false;
+    noRoute = noRoute + 1u32;
+    false;
+  }
+
+  // Along the route, arriving at its end: true when it has
+  fn follow(self &mut, dt f32) bool {
+    imm a = follower.accel(body.pos, body.vel, path.view(), body.maxAccel, body.maxSpeed, 0.5, 1.2, 0.6, 2.5);
+    body.integrate(a, dt);
+    follower.done;
+  }
+
+  // A patrol: dwell, then to the next place
+  fn stepPatrol(self &mut, world &mut NavWorld, dt f32) {
+    if dwellLeft > 0. {
+      dwellLeft = dwellLeft - dt;
+      self.rest(dt);
+      return;
+    }
+    if !havePath {
+      if !self.plan(world, *places[next]) {
+        // No way: try the next place after a pause
+        next = (next + 1usize) % places.len();
+        dwellLeft = 2.;
+        self.rest(dt);
+        return;
+      }
+    }
+    if self.follow(dt) {
+      havePath = false;
+      arrivals.set(next, *arrivals[next] + 1u32);
+      next = (next + 1usize) % places.len();
+      dwellLeft = dwell;
+    }
+  }
+
+  // The nearest player to this one on the ground plane: whether there is one, where
+  fn nearest(self &, players &List[Vec3], at &mut Vec2) bool {
+    mut best = 1.0e30;
+    mut found = false;
+    mut k = 0usize;
+    while k < players.len() {
+      imm p = new Vec2(players[k].x, players[k].z);
+      imm d = p.distance(body.pos);
+      if d < best { best = d; *at = p; found = true; }
+      k = k + 1usize;
+    }
+    found;
+  }
+
+  // A follower: goes to the spot at its distance from the player on the line to itself when it is too near or too
+  // far, and stands there
+  fn stepFollow(self &mut, world &mut NavWorld, players &List[Vec3], dt f32) {
+    mut pp = new Vec2(0., 0.);
+    if !self.nearest(players, &mut pp) { self.rest(dt); return; }
+    imm away = body.pos - pp;
+    imm dist = away.length();
+    if moving {
+      if dist > distance * 0.85 and dist < distance * 1.2 { moving = false; havePath = false; }
+    } elif dist < distance * 0.7 or dist > distance * 1.5 {
+      moving = true;
+      replanT = 0.;
+    }
+    if !moving { self.rest(dt); return; }
+    // Looks again twice a second (not every step, whether or not the last look found a way)
+    replanT = replanT - dt;
+    if replanT <= 0. {
+      replanT = 0.6;
+      imm dir = if dist > 0.01 { away * (1. / dist); } else { new Vec2(1., 0.); };
+      // The spot, or the mesh's nearest point to it if it is off the mesh (a tree, the cottage); a player out of reach
+      // of the mesh (up in the balloon, past its window) is waited for
+      imm want = pp + dir * distance;
+      mut spot = want;
+      if !world.nearestOnMesh(want, 8., &mut spot) { havePath = false; }
+      elif !self.plan(world, spot) { havePath = false; }
+    }
+    if !havePath { self.rest(dt); return; }
+    if self.follow(dt) { havePath = false; moving = false; }
+  }
+
+  // The shy one: evades a player who comes inside 'alarm' until he is beyond 'calm'; then walks home
+  fn stepShy(self &mut, world &mut NavWorld, players &List[Vec3], dt f32) {
+    mut pp = new Vec2(0., 0.);
+    imm seen = self.nearest(players, &mut pp);
+    if seen {
+      imm d = body.pos.distance(pp);
+      if d < alarm { afraid = true; }
+      elif d > calm { afraid = false; }
+    } else {
+      afraid = false;
+    }
+    if afraid {
+      havePath = false;
+      body.integrate(npcbehave.evade(body.pos, body.vel, body.maxAccel, pp, new Vec2(0., 0.), 1.), dt);
+      return;
+    }
+    // Home is safe only if the player is not near it: while he is, it stands off where it is
+    if seen and pp.distance(home) < calm {
+      havePath = false;
+      self.rest(dt);
+      return;
+    }
+    if body.pos.distance(home) > 1. {
+      replanT = replanT - dt;
+      if !havePath and replanT <= 0. {
+        replanT = 0.6;
+        self.plan(world, home);
+      }
+      if !havePath { self.rest(dt); return; }
+      if self.follow(dt) { havePath = false; }
+    } else {
+      havePath = false;
+      self.rest(dt);
+    }
+  }
+
+  // A grazer: its behaviour tree decides to walk or to graze; steered by wander and held to its leash
+  fn stepGraze(self &mut, dt f32) {
+    grazer.body.pos = body.pos;
+    grazer.body.vel = body.vel;
+    grazer.step(dt);
+    body.vel = grazer.body.vel;
+  }
+
+  // What this villager wishes to do this step: its Body2's velocity, as its mind has accelerated it from the last step's
+  fn decide(self &mut, world &mut NavWorld, players &List[Vec3], dt f32) {
+    if kind == NPC_PATROL { self.stepPatrol(world, dt); }
+    elif kind == NPC_GRAZE { self.stepGraze(dt); }
+    elif kind == NPC_FOLLOW { self.stepFollow(world, players, dt); }
+    else { self.stepShy(world, players, dt); }
+  }
+}
+
+// The wish held to the mesh: walked half a metre or so along it, where a wall stops it the wish turns along the wall
+// (slower) or stops
+fn contain(world &mut NavWorld, pos Vec2, wish Vec2, blocked &mut u64) Vec2 {
+  imm sp = wish.length();
+  if sp < 0.05 { return wish; }
+  imm dir = wish * (1. / sp);
+  imm reach = 0.45 + sp * 0.4;
+  imm at = new Vec3(pos.x, groundHeight(pos.x, pos.y), pos.y);
+  imm near = navmesh.findNearestPoly(&world.nav, at, 0.8, 2., 0.8, &world.filter);
+  if !near.found { return wish; }
+  imm to = new Vec3(pos.x + dir.x * reach, near.pos.y, pos.y + dir.y * reach);
+  imm mv = navmesh.moveAlongSurface(&world.nav, near.ref, near.pos, to, &world.filter, 16usize);
+  imm dx = mv.pos.x - near.pos.x;
+  imm dz = mv.pos.z - near.pos.z;
+  imm got = libc.sqrtf(dx * dx + dz * dz);
+  if got >= reach * 0.9 { return wish; }
+  *blocked = *blocked + 1u64;
+  if got < 0.04 { return new Vec2(0., 0.); }
+  new Vec2(dx / got * sp * (if got / reach > 0.35 { got / reach; } else { 0.35; }), dz / got * sp * (if got / reach > 0.35 { got / reach; } else { 0.35; }));
+}
+
+fn quantise(x f32) f32 { libc.floorf(x * 127. + 0.5) / 127.; }
+
+// The intents a wish of 'wish' (a velocity on the ground plane) asks of a body facing 'yaw': a turn to the heading
+// it asks for as fast as the body turns, an ahead that falls as the turn needed grows (none past TURN_STOP)
+pub fn intentsFor(yaw f32, wish Vec2, dt f32) Intents {
+  imm sp = wish.length();
+  if sp < 0.05 { return Intents.none(); }
+  imm want = libc.atan2f(0. - wish.x, 0. - wish.y);
+  imm err = wrapPi(want - yaw);
+  imm turn = clampUnit(err / (TURN_RATE * dt));
+  imm mag = if err < 0. { 0. - err; } else { err; };
+  mut align = 1.;
+  if mag > TURN_STOP { align = 0.; }
+  elif mag > TURN_FREE { align = 1. - (mag - TURN_FREE) / (TURN_STOP - TURN_FREE); }
+  imm speed = if sp > WALK_SPEED { WALK_SPEED; } else { sp; };
+  new Intents(quantise(speed / WALK_SPEED * align), quantise(turn), false, false);
+}
+
+// One fixed step of every villager: each one's intents into 'given' (the entry of its being)
+pub fn thinkNpcs(world &mut NavWorld, npcs &mut List[Npc], cast &Cast, players &List[Vec3], given &mut List[Intents], dt f32) {
+  mut i = 0usize;
+  while i < npcs.len() {
+    imm n = &mut npcs[i];
+    imm b = cast.beings[n.being];
+    if b.gone or b.figure.mode != FIG_WALK {
+      given.set(n.being, Intents.none());
+      i = i + 1usize;
+      continue;
+    }
+    imm yaw = b.body.yaw;
+    imm pos = new Vec2(b.body.position.x, b.body.position.z);
+    imm spd = if b.figure.grounded { b.figure.speed; } else { 0.; };
+    // Where it is is the real body's; the velocity it wishes goes on from the last step's (a wish builds up at the
+    // steering's acceleration, as a body's real speed builds under the controller's), except that a wish is not
+    // let run far ahead of the speed it is walked at when that is held back
+    n.body.pos = pos;
+    imm wasWish = n.body.vel.length();
+    if wasWish > spd + 0.8 {
+      n.body.vel = n.body.vel * ((spd + 0.8) / wasWish);
+    }
+    n.decide(world, players, dt);
+    imm wish = contain(world, pos, n.body.vel, &mut n.blocked);
+    n.body.vel = wish;
+    // Walking and not getting anywhere: it gives its route up
+    imm moved = pos.distance(n.lastPos);
+    n.lastPos = pos;
+    n.walked = n.walked + moved;
+    if wish.length() > 0.3 {
+      n.wishT = n.wishT + dt;
+      if moved < 0.15 * dt {
+        n.stallT = n.stallT + dt;
+      } else {
+        n.stallT = 0.;
+      }
+      if n.stallT > STALL_SECONDS {
+        n.stallT = 0.;
+        n.stalls = n.stalls + 1u32;
+        n.havePath = false;
+      }
+    } else {
+      n.stallT = 0.;
+    }
+    given.set(n.being, intentsFor(yaw, wish, dt));
+    i = i + 1usize;
+  }
+}
+
+// The village: the navigation mesh and the villagers' minds (the simulation holds one)
+pub struct Village {
+  pub world NavWorld;
+  pub npcs List[Npc];
+  pub players List[Vec3];     // this step's: where the beings clients drive are
+  pub steps u64;
+  pub thinkNs u64;
+
+  pub fn empty() Village { new Village(NavWorld.empty(), List[Npc].empty(), List[Vec3].empty(), 0u64, 0u64); }
+
+  pub fn step(self &mut, cast &Cast, given &mut List[Intents], dt f32) {
+    if npcs.len() == 0usize { return; }
+    imm t0 = sdl.GetTicksNS();
+    thinkNpcs(&mut world, &mut npcs, cast, &players, given, dt);
+    thinkNs = thinkNs + (sdl.GetTicksNS() - t0);
+    steps = steps + 1u64;
+  }
+}
+
+// The places a villager patrols: the cottage's front, the bridge's crest and the landing beach
+pub fn villagePlaces() List[Vec2] {
+  mut out = List[Vec2].empty();
+  out.push(lawnRouteAt(0usize));
+  out.push(new Vec2(BRIDGE_X, BRIDGE_Z));
+  out.push(new Vec2(BEACH_X, BEACH_Z - 8.));
+  out;
+}
+
+// The garden: the lawn east of the path, by the horn-flower and the ball
+pub fn gardenHome() Vec2 { new Vec2(-7., 345.); }
+// Where the shy one lives: the lawn west of the cottage's front
+pub fn shyHome() Vec2 { new Vec2(-26., 340.); }
+
+// A villager as the scene is made with: its mind, its height and colour, the seed of its gait, the way it first faces
+pub struct Villager {
+  pub npc Npc;
+  pub height f32;
+  pub color Color;
+  pub seed u32;
+  pub yaw f32;
+}
+
+// The four villagers: one who walks a round of the cottage, the bridge and the beach; one who idles in the garden;
+// one who keeps its distance from the nearest player; one who keeps away from players and goes home. (The cast
+// index of each is the scene's to say: 'being' is set when it is added.)
+pub fn villagers() List[Villager] {
+  mut out = List[Villager].empty();
+  out.push(new Villager(Npc.patrol(0usize, "villager", villagePlaces(), 8.), 1.68, new Color(0.05, 0.16, 0.42, 1.), 21u32, 0.));
+  out.push(new Villager(Npc.grazing(0usize, "gardener", gardenHome(), 5., 7u32), 1.58, new Color(0.08, 0.30, 0.08, 1.), 29u32, 1.));
+  out.push(new Villager(Npc.following(0usize, "follower", new Vec2(-25., 342.), 6.), 1.78, new Color(0.42, 0.34, 0.04, 1.), 37u32, 0.));
+  out.push(new Villager(Npc.shy(0usize, "shy villager", shyHome(), 5., 9.), 1.66, new Color(0.30, 0.08, 0.30, 1.), 45u32, 0.5));
+  out;
+}

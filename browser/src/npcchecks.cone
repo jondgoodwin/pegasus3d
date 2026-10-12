@@ -1,0 +1,382 @@
+// The villagers' --checks (part of runChecks): the navigation mesh built from the baked island and its solids, routes
+// across it between the places that matter, and the four villagers (npcs.cone) walked for 520 s of simulated time
+// in the physics world with a player who comes and goes, headless and with no frames. What is checked:
+//
+//   the mesh        it has polygons; a route exists between the cottage's front, the bridge's crest, the beach and
+//                   the garden, and each is the walker's walkable distance or less than twice the straight one
+//   the patrol      it arrived at each of its three places, and within a metre of each
+//   the gardener    it never strayed far from home (its leash and a margin) and walked about
+//   the follower    it came to its distance from the player and kept it as the player stood, walked and stood again
+//   the shy one     it kept away from the player who came near, and went home after
+//   all of them     never off the mesh by more than the agent's radius and a cell, never with the middle of the
+//                   body inside a solid the feet cannot step up onto, never stalled; and the same run twice gives
+//                   the same places to the millimetre
+// and prints what the mesh cost to build and the villagers' minds a step.
+
+// How far from the mesh a villager may be: the radius its polygons keep from a wall is 0.3, the capsule's is 0.27
+const CHECK_STRAY f32 = 0.55;
+
+// Where the player is, t seconds in: at the cottage's steps; to the west lawn where the shy one lives, near it for
+// a good while; then down the path to the beach, standing there; then 40 s out of the mesh's reach (past its window,
+// as a player in the balloon is), and back on the beach
+fn playerAt(t f32) Vec3 {
+  imm a = new Vec3(-16., 0., 337.);
+  imm b = new Vec3(-27., 0., 339.);
+  imm c = new Vec3(-22., 0., 470.);
+  mut p = a;
+  if t < 40. { p = a; }
+  elif t < 70. { p = a + (b - a) * ((t - 40.) / 30.); }
+  elif t < 130. { p = b; }
+  elif t < 270. { p = b + (c - b) * ((t - 130.) / 140.); }
+  elif t < 400. { p = c; }
+  elif t < 440. { p = new Vec3(150., 0., 450.); }
+  else { p = c; }
+  new Vec3(p.x, groundHeight(p.x, p.z), p.z);
+}
+
+struct VillageRun {
+  names List[String];
+  finalAt List[Vec3];
+  maxStray List[f32];
+  solidHits List[u32];
+  stalls List[u32];
+  noRoutes List[u32];
+  walked List[f32];
+  maxHome List[f32];          // the farthest from its home
+  arrivals List[u32];         // the patrol's, per place
+  arrivalErr f32;             // the farthest from a place when it was counted arrived there
+  followBand List[f32];       // the follower's distance from the player at sampled times
+  shyBand List[f32];
+  thinkUs f32;                // microseconds the village's step took, mean
+  fall bool;                  // a villager fell (left its feet)
+  plans List[u32];            // routes each planned
+  pathOff f32;                // the patrol's farthest from the path's centre while it was on the path's length
+  onPath u32;                 // steps it was on it
+}
+
+// Whether the middle of a body at 'p' is inside a solid it cannot step up onto
+fn insideSolid(solids &List[Solid], p Vec3) bool {
+  mut k = 0usize;
+  while k < solids.len() {
+    imm so = solids[k];
+    if so.over(p.x, p.z) {
+      imm top = so.topAt(p.x, p.z);
+      if top > p.y + STEP_UP + 0.05 and so.y0 < p.y + 0.5 { return true; }
+    }
+    k = k + 1usize;
+  }
+  false;
+}
+
+// The villagers walked 'seconds' in the physics world (the village's mesh used again), with the player of playerAt
+fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun {
+  mut scene = Scene.empty();
+  mut c = Cast.empty();
+  c.phys.ensureGround();
+  c.phys.setSolids(solids);
+  village.npcs.clear();
+  mut list = villagers();
+  mut v = 0usize;
+  while v < list.len() {
+    imm one = &mut list[v];
+    mut npc Npc = Npc.shy(0usize, "", new Vec2(0., 0.), 1., 2.);
+    npc <=> one.npc;
+    imm at = npc.body.pos;
+    imm index = c.add(mannequinBeing(&mut scene, npc.name.view(), new Vec3(at.x, groundHeight(at.x, at.y), at.y), one.height, one.seed));
+    c.beings[index].ai = true;
+    c.beings[index].body.yaw = one.yaw;
+    c.beings[index].before = c.beings[index].body;
+    npc.being = index;
+    village.npcs.push(npc);
+    v = v + 1usize;
+  }
+  imm n = village.npcs.len();
+  mut run = new VillageRun(List[String].empty(), List[Vec3].empty(), List[f32].empty(), List[u32].empty(), List[u32].empty(), List[u32].empty(),
+    List[f32].empty(), List[f32].empty(), List[u32].empty(), 0., List[f32].empty(), List[f32].empty(), 0., false, List[u32].empty(), 0., 0u32);
+  mut k = 0usize;
+  while k < n {
+    run.maxStray.push(0.);
+    run.solidHits.push(0u32);
+    run.maxHome.push(0.);
+    k = k + 1usize;
+  }
+  mut given = List[Intents].empty();
+  mut stepIt = List[bool].empty();
+  while given.len() < c.beings.len() { given.push(Intents.none()); stepIt.push(true); }
+  imm dt = 1. / 60.;
+  imm steps = i32.from(seconds * 60.);
+  mut thinkNs = 0u64;
+  mut lastCounts = List[u32].empty();
+  mut a = 0usize;
+  while a < village.npcs[0usize].arrivals.len() { lastCounts.push(0u32); a = a + 1usize; }
+  mut s = 0;
+  while s < steps {
+    imm t = f32.from(s) * dt;
+    village.players.clear();
+    village.players.push(playerAt(t));
+    mut b = 0usize;
+    while b < c.beings.len() { given.set(b, Intents.none()); b = b + 1usize; }
+    imm t0 = sdl.GetTicksNS();
+    village.step(&c, &mut given, dt);
+    thinkNs = thinkNs + (sdl.GetTicksNS() - t0);
+    c.stepEach(&given, &stepIt, dt, false);
+    // What each one did
+    k = 0usize;
+    while k < n {
+      imm npc = village.npcs[k];
+      imm body = c.beings[npc.being].body;
+      imm p = new Vec2(body.position.x, body.position.z);
+      if c.beings[npc.being].figure.mode != FIG_WALK { run.fall = true; }
+      if s % 6 == 0 {
+        imm stray = village.world.strayOf(p);
+        if stray > *run.maxStray[k] { run.maxStray.set(k, stray); }
+      }
+      if s % 3 == 0 and insideSolid(solids, body.position) { run.solidHits.set(k, *run.solidHits[k] + 1u32); }
+      imm home = p.distance(npc.home);
+      if home > *run.maxHome[k] { run.maxHome.set(k, home); }
+      k = k + 1usize;
+    }
+    // The patrol (the first villager): how far from the path's centre it walks along the path's length (the beach and
+    // the cottage's lawn are not the path), the place it has just arrived at, and how near it was
+    imm patrol = village.npcs[0usize];
+    {
+      imm pb = c.beings[patrol.being].body.position;
+      if pb.z > 350. and pb.z < 485. {
+        imm off = pathDistanceAt(pb.x, pb.z);
+        if off > run.pathOff { run.pathOff = off; }
+        run.onPath = run.onPath + 1u32;
+      }
+    }
+    a = 0usize;
+    while a < patrol.arrivals.len() {
+      if *patrol.arrivals[a] != *lastCounts[a] {
+        lastCounts.set(a, *patrol.arrivals[a]);
+        imm err = new Vec2(c.beings[patrol.being].body.position.x, c.beings[patrol.being].body.position.z).distance(*patrol.places[a]);
+        if err > run.arrivalErr { run.arrivalErr = err; }
+      }
+      a = a + 1usize;
+    }
+    // The follower's and the shy one's distances from the player, at the times the checks read them
+    if s == 3600 or s == 6000 or s == 7500 or s == steps - 1 {
+      imm pl = playerAt(t);
+      imm fb = c.beings[village.npcs[2usize].being].body.position;
+      imm sb = c.beings[village.npcs[3usize].being].body.position;
+      run.followBand.push(flatDist(fb.x, fb.z, pl.x, pl.z));
+      run.shyBand.push(flatDist(sb.x, sb.z, pl.x, pl.z));
+    }
+    s = s + 1;
+  }
+  k = 0usize;
+  while k < n {
+    imm npc = village.npcs[k];
+    run.names.push(npc.name.copy());
+    run.finalAt.push(c.beings[npc.being].body.position);
+    run.stalls.push(npc.stalls);
+    run.noRoutes.push(npc.noRoute);
+    run.walked.push(npc.walked);
+    run.plans.push(npc.replans);
+    k = k + 1usize;
+  }
+  a = 0usize;
+  while a < village.npcs[0usize].arrivals.len() { run.arrivals.push(*village.npcs[0usize].arrivals[a]); a = a + 1usize; }
+  if steps > 0 { run.thinkUs = f32.from(thinkNs) / f32.from(steps) / 1000.; }
+  run;
+}
+
+fn checkVillage() bool {
+  print <- "The villagers:\n";
+  bakeIsland();
+  imm solids = worldSolids();
+  mut village = Village.empty();
+  village.world = buildNavWorld(&solids);
+  print <- "  the navigation mesh: "; print <- village.world.polygons; print <- " polygons from "; print <- village.world.triangles;
+  print <- " triangles and "; print <- village.world.obstacles; print <- " obstacles, built in ";
+  print <- f64.from(village.world.buildNs) / 1000000d; print <- " ms\n";
+  mut ok = expect("the mesh has polygons", village.world.polygons > 300usize);
+  // Tab skips a villager: of two mannequins with a villager between them, the next after the first is the second
+  {
+    mut scene = Scene.empty();
+    mut cast = Cast.empty();
+    imm first = cast.add(mannequinBeing(&mut scene, "one", new Vec3(0., 0., 0.), 1.75, 3u32));
+    imm vil = cast.add(mannequinBeing(&mut scene, "villager", new Vec3(3., 0., 0.), 1.7, 5u32));
+    imm last = cast.add(mannequinBeing(&mut scene, "two", new Vec3(6., 0., 0.), 1.6, 7u32));
+    cast.beings[vil].ai = true;
+    cast.possess(first);
+    cast.swap();
+    imm skipped = cast.possessed == last;
+    cast.swap();
+    ok = expect("Tab skips a villager: it goes from the first mannequin to the other and back", skipped and cast.possessed == first) and ok;
+  }
+  // Routes between the places that matter
+  imm places = villagePlaces();
+  imm garden = gardenHome();
+  imm shy = shyHome();
+  mut spots = List[Vec2].empty();
+  spots.push(*places[0usize]); spots.push(*places[1usize]); spots.push(*places[2usize]); spots.push(garden); spots.push(shy);
+  mut routesOk = true;
+  mut worst = 0.;
+  mut f = 0usize;
+  while f < spots.len() {
+    mut g = f + 1usize;
+    while g < spots.len() {
+      mut path = List[Vec2].empty();
+      if !village.world.route(*spots[f], *spots[g], &mut path) {
+        routesOk = false;
+        print <- "    no route from ("; print <- spots[f].x; print <- ", "; print <- spots[f].y; print <- ") to ("; print <- spots[g].x;
+        print <- ", "; print <- spots[g].y; print <- ")\n";
+      } else {
+        mut len = 0.;
+        mut q = 1usize;
+        while q < path.len() { len = len + path[q].distance(*path[q - 1usize]); q = q + 1usize; }
+        imm straight = spots[f].distance(*spots[g]);
+        imm ratio = if straight > 1. { len / straight; } else { 1.; };
+        if ratio > worst { worst = ratio; }
+      }
+      g = g + 1usize;
+    }
+    f = f + 1usize;
+  }
+  ok = expect("a route exists between the cottage's front, the bridge, the beach, the garden and the shy one's home", routesOk) and ok;
+  print <- "    the longest route against the straight line: x"; print <- worst; print <- "\n";
+
+  // The run
+  imm t0 = sdl.GetTicksNS();
+  imm run = runVillage(&mut village, &solids, 520.);
+  print <- "  520 s walked in "; print <- f64.from(sdl.GetTicksNS() - t0) / 1000000d; print <- " ms\n";
+  print <- "    the patrol walked "; print <- run.onPath; print <- " steps along the path's length, at worst "; print <- run.pathOff; print <- " m from its centre (its half width is 0.9)\n";
+  ok = expect("the patrol kept to the path along its length (within 2.5 m of its centre)", run.onPath > 3000u32 and run.pathOff < 2.5) and ok;
+  mut v = 0usize;
+  while v < run.names.len() {
+    print <- "    "; printStr(run.names[v].view()); print <- ": ended ("; print <- run.finalAt[v].x; print <- ", "; print <- run.finalAt[v].z;
+    print <- "), walked "; print <- *run.walked[v]; print <- " m, farthest from the mesh "; print <- *run.maxStray[v];
+    print <- " m, from home "; print <- *run.maxHome[v]; print <- " m, stalls "; print <- *run.stalls[v]; print <- ", no route "; print <- *run.noRoutes[v];
+    print <- "\n";
+    v = v + 1usize;
+  }
+  print <- "    the patrol arrived "; print <- *run.arrivals[0usize]; print <- ", "; print <- *run.arrivals[1usize]; print <- ", ";
+  print <- *run.arrivals[2usize]; print <- " times at its three places, at worst "; print <- run.arrivalErr; print <- " m off\n";
+  print <- "    the follower was "; print <- *run.followBand[0usize]; print <- " m from the player at 60 s, "; print <- *run.followBand[1usize];
+  print <- " at 100 s, "; print <- *run.followBand[run.followBand.len() - 1usize]; print <- " at the end\n";
+  print <- "    the shy one was "; print <- *run.shyBand[1usize]; print <- " m from the player at 100 s, "; print <- *run.shyBand[run.shyBand.len() - 1usize];
+  print <- " at the end\n";
+  ok = expect("the patrol reached each of its three places", *run.arrivals[0usize] >= 1u32 and *run.arrivals[1usize] >= 1u32 and *run.arrivals[2usize] >= 1u32) and ok;
+  ok = expect("and was within a metre of each when it counted itself there", run.arrivalErr < 1.0) and ok;
+  ok = expect("the gardener walked about (over 15 m) and never strayed past its leash and a margin (5 + 2.5 m)",
+    *run.walked[1usize] > 15. and *run.maxHome[1usize] < 7.5) and ok;
+  imm fe = *run.followBand[run.followBand.len() - 1usize];
+  imm f100 = *run.followBand[1usize];
+  ok = expect("the follower came to 4 to 9 m from the player (its distance is 6) and kept it as he stood, walked and stood again",
+    f100 > 4. and f100 < 9. and fe > 4. and fe < 9.) and ok;
+  ok = expect("the shy one kept 4.5 m or more from the player who came to it, and walked home after (within 2 m)",
+    *run.shyBand[1usize] > 4.5 and flatDist(run.finalAt[3usize].x, run.finalAt[3usize].z, shy.x, shy.y) < 2.) and ok;
+  mut strayOk = true;
+  mut solidOk = true;
+  mut stallOk = true;
+  mut plansOk = true;
+  v = 0usize;
+  while v < run.names.len() {
+    if *run.plans[v] > 1000u32 { plansOk = false; }
+    if *run.maxStray[v] > CHECK_STRAY { strayOk = false; }
+    if *run.solidHits[v] != 0u32 { solidOk = false; }
+    if *run.stalls[v] != 0u32 or *run.noRoutes[v] != 0u32 { stallOk = false; }
+    v = v + 1usize;
+  }
+  ok = expect("every villager stayed on the mesh (within the radius and a cell: 0.55 m)", strayOk) and ok;
+  ok = expect("none had the middle of its body inside a solid it could not step onto", solidOk) and ok;
+  ok = expect("none stalled or found no route", stallOk) and ok;
+  ok = expect("none planned more than a route a half second (the follower waited for the player who was out of reach)", plansOk) and ok;
+  ok = expect("none fell", !run.fall) and ok;
+  print <- "    the village's step took "; print <- run.thinkUs; print <- " us on average for four villagers; "; print <- village.world.queries;
+  print <- " route queries took "; print <- f64.from(village.world.queryNs) / 1000000d; print <- " ms in all\n";
+  // The same again, shorter: the same places to the millimetre
+  imm one = runVillage(&mut village, &solids, 60.);
+  imm two = runVillage(&mut village, &solids, 60.);
+  mut same = one.finalAt.len() == two.finalAt.len();
+  v = 0usize;
+  while same and v < one.finalAt.len() {
+    if millimetres(one.finalAt[v].x) != millimetres(two.finalAt[v].x) or millimetres(one.finalAt[v].z) != millimetres(two.finalAt[v].z) {
+      same = false;
+    }
+    v = v + 1usize;
+  }
+  ok = expect("the same run twice gives the same places to the millimetre", same) and ok;
+  ok;
+}
+
+// ---- the pictures of the mesh (browser.exe --navpic PREFIX) ----
+
+// A top-down picture of the mesh over the window x0..x1, z0..z1 at 'scale' pixels a metre, with the solids drawn
+// in grey and the routes of 'routes' in red: PREFIX plus 'suffix'
+fn navPicture(world &NavWorld, solids &List[Solid], routes &List[List[Vec2]], prefix &str, suffix &str, x0 f32, z0 f32, x1 f32, z1 f32,
+              scale f32) bool {
+  mut cv = navmesh.Canvas.make(x0, z0, x1, z1, scale);
+  navmesh.drawNavMesh(&mut cv, &world.nav);
+  mut k = 0usize;
+  while k < solids.len() {
+    imm s = *solids[k];
+    if s.kind == SOLID_CIRCLE {
+      cv.ring(s.x0, s.z0, s.x1, 90u8, 90u8, 90u8);
+    } else {
+      cv.line(s.x0, s.z0, s.x1, s.z0, 90u8, 90u8, 90u8);
+      cv.line(s.x1, s.z0, s.x1, s.z1, 90u8, 90u8, 90u8);
+      cv.line(s.x1, s.z1, s.x0, s.z1, 90u8, 90u8, 90u8);
+      cv.line(s.x0, s.z1, s.x0, s.z0, 90u8, 90u8, 90u8);
+    }
+    k = k + 1usize;
+  }
+  k = 0usize;
+  while k < routes.len() {
+    imm r = routes[k];
+    mut q = 1usize;
+    while q < r.len() {
+      cv.line(r[q - 1usize].x, r[q - 1usize].y, r[q].x, r[q].y, 220u8, 30u8, 30u8);
+      q = q + 1usize;
+    }
+    k = k + 1usize;
+  }
+  mut px = List[u8].empty();
+  px <=> cv.pix;
+  imm img = new Image(cv.w, cv.h, 3, px);
+  mut file = String.from(prefix);
+  file <- suffix;
+  file <- ".bmp";
+  print <- "  wrote "; printStr(file.view()); print <- " ("; print <- cv.w; print <- " x "; print <- cv.h; print <- ")\n";
+  img.save(&Path.from(file.view()));
+}
+
+// The mesh drawn: the whole window, the cottage's front and the bridge close up
+pub fn writeNavPictures(prefix &str) bool {
+  bakeIsland();
+  imm solids = worldSolids();
+  mut world = buildNavWorld(&solids);
+  print <- "Navigation: "; print <- world.polygons; print <- " polygons from "; print <- world.triangles; print <- " triangles and ";
+  print <- world.obstacles; print <- " obstacles in "; print <- f64.from(world.buildNs) / 1000000d; print <- " ms\n";
+  describeBridge();
+  mut routes = List[List[Vec2]].empty();
+  imm places = villagePlaces();
+  mut k = 0usize;
+  while k < places.len() {
+    mut path = List[Vec2].empty();
+    if world.route(*places[k], *places[(k + 1usize) % places.len()], &mut path) { routes.push(path); }
+    k = k + 1usize;
+  }
+  mut ok = navPicture(&world, &solids, &routes, prefix, "-region.png", NAV_X0, NAV_Z0, NAV_X1, NAV_Z1, 5.);
+  ok = navPicture(&world, &solids, &routes, prefix, "-cottage.png", -45., 295., 15., 360., 24.) and ok;
+  ok = navPicture(&world, &solids, &routes, prefix, "-bridge.png", -16., 306., 2., 324., 60.) and ok;
+  ok;
+}
+
+// The bridge's two ends against the ground there (for --navpic): the road's height at each end of its ramps and the
+// island's ground beside it, metres
+pub fn describeBridge() {
+  imm bank = bridgeBank();
+  mut side = 0;
+  while side < 2 {
+    imm z = if side == 0 { BRIDGE_Z - BRIDGE_END; } else { BRIDGE_Z + BRIDGE_END; };
+    imm which = if side == 0 { "north"; } else { "south"; };
+    print <- "  the bridge's "; printStr(which); print <- " end (z "; print <- z; print <- "): the road "; print <- bridgeDeck(z - BRIDGE_Z, bank);
+    print <- " m, the ground at its middle "; print <- groundHeight(BRIDGE_X, z); print <- " m, on its sides "; print <- groundHeight(BRIDGE_X - 1.5, z);
+    print <- " and "; print <- groundHeight(BRIDGE_X + 1.5, z); print <- " m\n";
+    side = side + 1;
+  }
+}

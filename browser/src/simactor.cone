@@ -215,6 +215,7 @@ pub struct SimState {
   joinedNow bool;             // a client joined since the shell was last told
   pub simulateNs u64;         // the last frame's phases
   pub publishNs u64;
+  pub village Village;        // the navigation mesh and the villagers' minds (npcs.cone)
 
   pub fn make(scripted bool, birds Birds, serve bool) SimState {
     new SimState(Scene.empty(), Cast.empty(), birds, PickSystem.empty(), PartId.none(),
@@ -222,7 +223,7 @@ pub struct SimState {
       true, WorldFacts.empty(), RenderFacts.empty(), false, 0u64, NetSide.make(), serve, !serve, List[Client].empty(), 0u64,
       List[Request].empty(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0., List[f32].empty(), List[u32].empty(), List[PartId].empty(),
       0u64, Weathering.fair(), Weathering.fair(), false, 0u64, ReplayLog.empty(), List[Intents].empty(), List[bool].empty(),
-      0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step].empty(), false, 0u64, 0u64);
+      0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step].empty(), false, 0u64, 0u64, Village.empty());
   }
 
   // The possessed being's body: where the user is (single player)
@@ -293,9 +294,42 @@ pub struct SimState {
       self.addMannequin("second mannequin", standing(BEACH_X + 3., BEACH_Z - 4.), 2.356, 1.62, 11u32, clayColor());
       cast.possess(youAt);
     }
+    self.seedVillage(&solids);
     cast.look(1. / 60.);
     print <- "Scene: "; print <- scene.partCount(); print <- " parts reserved, ";
     print <- scene.waiting(); print <- " requests waiting\n";
+  }
+
+  // A villager: a mannequin made, shown, added to the cast and given to the village's minds
+  fn addVillager(self &mut, npc Npc, height f32, color Color, seed u32, yaw f32) {
+    imm at = npc.body.pos;
+    imm index = self.addMannequin(npc.name.view(), standing(at.x, at.y), yaw, height, seed, color);
+    imm b = &mut cast.beings[index];
+    b.ai = true;
+    mut n = npc;
+    n.being = index;
+    village.npcs.push(n);
+  }
+
+  // The navigation mesh built from the island and 'solids', and the villagers set down on it: one who walks a round
+  // of the cottage, the bridge and the beach, one who idles in the garden, one who keeps its distance from the
+  // player, one who keeps away from the player and goes home (npcs.cone). They are the simulation's, so every
+  // mode has them: a server's, a script's, the user's
+  fn seedVillage(self &mut, solids &List[Solid]) {
+    if !npcsEnabled { return; }
+    village.world = buildNavWorld(solids);
+    imm w = &village.world;
+    print <- "Navigation: "; print <- w.polygons; print <- " polygons from "; print <- w.triangles; print <- " triangles and ";
+    print <- w.obstacles; print <- " obstacles in "; print <- f64.from(w.buildNs) / 1000000d; print <- " ms\n";
+    mut list = villagers();
+    mut v = 0usize;
+    while v < list.len() {
+      imm one = &mut list[v];
+      mut npc Npc = Npc.shy(0usize, "", new Vec2(0., 0.), 1., 2.);
+      npc <=> one.npc;
+      self.addVillager(npc, one.height, one.color, one.seed, one.yaw);
+      v = v + 1usize;
+    }
   }
 
   // ---- the connections ----
@@ -463,6 +497,14 @@ pub struct SimState {
         }
         c = c + 1usize;
       }
+      // The villagers decide their intents, from where the players are
+      village.players.clear();
+      c = 0usize;
+      while c < clients.len() {
+        village.players.push(cast.beings[clients[c].being].body.position);
+        c = c + 1usize;
+      }
+      village.step(&cast, &mut given, step.dt);
       cast.stepEach(&given, &stepIt, step.dt, self.legacy());
       // A backlog of a client's inputs is run off, two a tick
       c = 0usize;
@@ -834,6 +876,23 @@ pub struct SimState {
     print <- " h; timers rung "; print <- scene.rung(); print <- ", armed "; print <- scene.timerCount(); print <- "\n";
     print <- "Input: last sequence number applied "; print <- appliedInput; print <- ", steps with none due "; print <- missedInput;
     print <- "\n";
+    if village.npcs.len() > 0usize and village.steps > 0u64 {
+      mut walked = 0.;
+      mut stalls = 0u32;
+      mut v = 0usize;
+      while v < village.npcs.len() { walked = walked + village.npcs[v].walked; stalls = stalls + village.npcs[v].stalls; v = v + 1usize; }
+      print <- "Villagers: "; print <- village.npcs.len(); print <- " on a navigation mesh of "; print <- village.world.polygons; print <- " polygons (built in ";
+      print <- f64.from(village.world.buildNs) / 1000000d; print <- " ms); their minds took "; print <- f64.from(village.thinkNs) / f64.from(village.steps) / 1000d;
+      print <- " us a step; walked "; print <- walked; print <- " m in all, "; print <- stalls; print <- " stalls, "; print <- village.world.queries;
+      print <- " route queries in "; print <- f64.from(village.world.queryNs) / 1000000d; print <- " ms\n";
+      v = 0usize;
+      while v < village.npcs.len() {
+        imm n = village.npcs[v];
+        print <- "  "; printStr(n.name.view()); print <- ": walked "; print <- n.walked; print <- " m, "; print <- n.replans; print <- " routes planned, "; print <- n.stalls;
+        print <- " stalls, wall touched on "; print <- n.blocked; print <- " steps, "; print <- n.noRoute; print <- " times no route\n";
+        v = v + 1usize;
+      }
+    }
     print <- "The baked-in world, object by object:\n";
   }
 
