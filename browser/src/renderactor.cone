@@ -74,15 +74,22 @@ pub struct RenderFacts {
   pub gpu bool;               // the run has the GPU side
   drawn Table[DrawnFact];
   emitting Table[u32];        // the particles it drew at the last frame
+  lighting Table[u32];        // the parts that are lights
 
-  pub fn empty() RenderFacts { new RenderFacts(false, Table[DrawnFact].empty(), Table[u32].empty()); }
+  pub fn empty() RenderFacts { new RenderFacts(false, Table[DrawnFact].empty(), Table[u32].empty(), Table[u32].empty()); }
 
   // The render system's tables now, into 'dest' (its lists reused)
   fn take(sys &RenderSystem, dest &mut RenderFacts) {
     dest.gpu = true;
     dest.drawn.clear();
     dest.emitting.clear();
+    dest.lighting.clear();
     mut i = 0usize;
+    while i < sys.lamps.ids.len() {
+      dest.lighting.put(*sys.lamps.ids[i], 1u32);
+      i = i + 1usize;
+    }
+    i = 0usize;
     while i < sys.rows.ids.len() {
       imm id = *sys.rows.ids[i];
       dest.drawn.put(id, new DrawnFact(sys.materialOf(id), sys.isPhysical(id), sys.tintOf(id)));
@@ -101,8 +108,13 @@ pub struct RenderFacts {
     if row == NO_ROW { 0u32; } else { *emitting.rows[row]; };
   }
 
-  // Whether part 'id' is drawn, or gives off particles
-  pub fn isDrawn(self &, id PartId) bool { drawn.find(id) != NO_ROW or emitting.find(id) != NO_ROW; }
+  // Whether part 'id' is drawn, gives off particles, or is a light
+  pub fn isDrawn(self &, id PartId) bool {
+    drawn.find(id) != NO_ROW or emitting.find(id) != NO_ROW or lighting.find(id) != NO_ROW;
+  }
+
+  // How many parts are lights
+  pub fn lightCount(self &) usize { lighting.len(); }
 
   // Whether part 'id' is drawn physically based
   pub fn isPhysical(self &, id PartId) bool {
@@ -429,7 +441,9 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, rig &mut SkyR
 // The sun's shadows and the point lights' by the tier of the GPU
 fn setShadowTiers(renderer &mut Renderer, device &mut Device, integrated bool) {
   mut sun = if integrated { ShadowSettings.low(); } else { ShadowSettings.high(); };
-  mut local = if integrated { LightShadowSettings.off(); } else { LightShadowSettings.medium(); };
+  mut lamplit = if integrated { LightShadowSettings.off(); } else { LightShadowSettings.medium(); };
+  // (the lanterns' tracery casts fine shadows: a wider filter keeps them soft)
+  if !integrated { lamplit.pcfTaps = 12u32; lamplit.pcfRadius = 2.5; }
   imm s = libc.getenv("PEGASUS_SHADOWS");
   if (s as usize) != 0usize {
     imm t = cstr.fromPtr(s);
@@ -441,13 +455,13 @@ fn setShadowTiers(renderer &mut Renderer, device &mut Device, integrated bool) {
   imm ls = libc.getenv("PEGASUS_LIGHT_SHADOWS");
   if (ls as usize) != 0usize {
     imm t = cstr.fromPtr(ls);
-    if libc.strcmp(t, "off") == 0i32 { local = LightShadowSettings.off(); }
-    elif libc.strcmp(t, "low") == 0i32 { local = LightShadowSettings.low(); }
-    elif libc.strcmp(t, "medium") == 0i32 { local = LightShadowSettings.medium(); }
-    elif libc.strcmp(t, "high") == 0i32 { local = LightShadowSettings.high(); }
+    if libc.strcmp(t, "off") == 0i32 { lamplit = LightShadowSettings.off(); }
+    elif libc.strcmp(t, "low") == 0i32 { lamplit = LightShadowSettings.low(); }
+    elif libc.strcmp(t, "medium") == 0i32 { lamplit = LightShadowSettings.medium(); }
+    elif libc.strcmp(t, "high") == 0i32 { lamplit = LightShadowSettings.high(); }
   }
   renderer.setShadows(device, &sun);
-  renderer.setLightShadows(device, &local);
+  renderer.setLightShadows(device, &lamplit);
 }
 
 // A colour's luminance (Rec. 709 weights, linear)

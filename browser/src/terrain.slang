@@ -25,6 +25,8 @@
 // forest litter, green the distance to the path over 16 m) and render's sampler.
 
 import renderframe;
+import shadowing;
+import locallights;
 
 struct Params {
     float4 grid;                   // x0, z0 (the grid's first sample), the cell's metres, spare
@@ -342,9 +344,21 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float bz = vnoise(xz * 9.0 + float2(0.0, 0.7)) - vnoise(xz * 9.0 - float2(0.0, 0.7));
     float3 nn = normalize(n + float3(bx, 0.0, bz) * 0.18 * near);
 
-    float diffuse = max(dot(nn, frame.lightDirection.xyz), 0.0);
+    // How much of the sun arrives (render's cascaded shadow maps: the trees, the cottage and the hill
+    // shade the ground); the derivatives it takes need every pixel of a quad to call it
+    float visible = sunVisibility(p, n, frame.lightDirection.xyz, input.position.xy);
+    float diffuse = max(dot(nn, frame.lightDirection.xyz), 0.0) * visible;
     // Ambient: more from above than from the side
     float3 amb = frame.ambient.rgb * (0.65 + 0.35 * nn.y);
     float3 color = albedo * (amb + frame.lightColor.rgb * (diffuse / RENDER_PI));
+    // The point and spot lights of the fragment's cluster (render's locallights.slang): the lanterns'
+    // and the windows', in the ground's own colour, diffuse only
+    if (lightParams.grid.w > 0.5) {
+        float3 v = normalize(frame.cameraPosition.xyz - p);
+        float3 localDiffuse;
+        float3 localSpecular;
+        litLocalLights(p, nn, v, 1.0, input.position.xy, 1u, localDiffuse, localSpecular);
+        color += albedo * localDiffuse * (1.0 / RENDER_PI);
+    }
     return float4(color * frame.exposure.x, 1.0);
 }
