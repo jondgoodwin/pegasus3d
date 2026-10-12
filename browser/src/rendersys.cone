@@ -60,6 +60,14 @@ pub struct PoseRow {
   pub count u32;
 }
 
+// What a part was drawn as last frame, for temporal AA's motion list: its world matrix, and where its
+// skinning matrices are in the system's 'prevBones' (count 0: it is not skinned)
+pub struct PrevRow {
+  pub model Mat4;
+  pub first u32;
+  pub count u32;
+}
+
 // The parts drawn with one mesh and one material
 pub struct Batch {
   pub mesh MeshId;
@@ -92,6 +100,16 @@ pub struct EffectRow {
   pub seed u32;
   pub start f64;
   pub stop f64;
+}
+
+// Whether two matrices are the same, to the last bit
+fn matricesEqual(a &Mat4, b &Mat4) bool {
+  mut k = 0usize;
+  while k < 16usize {
+    if a.m[k] != b.m[k] { return false; }
+    k = k + 1usize;
+  }
+  true;
 }
 
 // A highlighted part's material: its colour half way to a warm yellow,
@@ -160,6 +178,12 @@ pub struct RenderSystem {
   // and the parts drawn without casting shadows (CastsShadow false)
   pub lamps Table[LampRow];
   pub quiet Table[u32];
+  // Temporal AA's motion: what each part was drawn as last frame, and the draw items that are not where
+  // they were (handed to ImageFx each frame: see build)
+  pub motion MotionList;
+  prevRows Table[PrevRow];
+  prevBones List[Mat4];
+  nextBones List[Mat4];
   pub glows u64 = 0u64;       // Glow requests applied, ever
   // The sky's light on smoke, in the frame's units (the pre-exposed frame):
   // smoke's colours are albedos, scaled by this as they are drawn, so smoke is
@@ -174,7 +198,8 @@ pub struct RenderSystem {
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
       List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
       List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty(), List[EmitterHandle].empty(),
-      Table[LampRow].empty(), Table[u32].empty());
+      Table[LampRow].empty(), Table[u32].empty(), MotionList.empty(), Table[PrevRow].empty(), List[Mat4].empty(),
+      List[Mat4].empty());
   }
 
   // The rain's and the snow's particle slots (once, with the device)
@@ -627,6 +652,7 @@ pub struct RenderSystem {
       rows.remove(id);
     }
     poses.remove(id);
+    prevRows.remove(id);
     imm e = effects.find(id);
     if e != NO_ROW {
       self.still(device, *effects.rows[e]);
@@ -670,14 +696,45 @@ pub struct RenderSystem {
           }
           imm material = if r.highlighted { mat.lit; } else { mat.handle; };
           imm posed = poses.find(id);
+          // What it was last frame, to name it to temporal AA if it moved
+          imm before = prevRows.find(id);
+          mut oldRow = new PrevRow(model, 0u32, 0u32);
+          if before != NO_ROW { oldRow = *prevRows.rows[before]; }
+          mut moved = before != NO_ROW and !matricesEqual(&oldRow.model, &model);
+          mut nowFirst = 0u32;
+          mut nowCount = 0u32;
           if posed != NO_ROW {
             imm pr = *poses.rows[posed];
             imm from = usize.from(pr.first);
             list.addSkinnedTinted(meshH, material, model, r.tint, &allBones[from..<from + usize.from(pr.count)]);
             skinnedNow = skinnedNow + 1usize;
+            nowFirst = u32.from(nextBones.len());
+            nowCount = pr.count;
+            mut j = 0usize;
+            while j < usize.from(pr.count) {
+              nextBones.push(*poseBones[from + j]);
+              j = j + 1usize;
+            }
+            if before != NO_ROW and oldRow.count == nowCount {
+              j = 0usize;
+              while j < usize.from(nowCount) {
+                if !matricesEqual(prevBones[usize.from(oldRow.first) + j], poseBones[from + j]) { moved = true; }
+                j = j + 1usize;
+              }
+            }
           } else {
             list.addTinted(meshH, material, model, r.tint);
           }
+          if moved {
+            imm item = list.len() - 1usize;
+            if nowCount > 0u32 and oldRow.count == nowCount {
+              imm pb = prevBones.view();
+              motion.addPosed(item, oldRow.model, &pb[usize.from(oldRow.first)..<usize.from(oldRow.first + nowCount)]);
+            } else {
+              motion.add(item, oldRow.model);
+            }
+          }
+          prevRows.put(id, new PrevRow(model, nowFirst, nowCount));
           if quiet.len() > 0usize and quiet.find(id) != NO_ROW { list.dontCastShadow(); }
           drawnNow = drawnNow + 1usize;
           k = k + 1usize;
@@ -687,6 +744,8 @@ pub struct RenderSystem {
     }
     drawn = drawnNow;
     skinned = skinnedNow;
+    prevBones <=> nextBones;
+    nextBones.clear();
   }
 
   // Each effect's emitters fired where its part is now, as they are at the

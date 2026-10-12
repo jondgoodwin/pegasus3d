@@ -24,6 +24,12 @@ struct Gfx {
   pub shotName String;        // the file the frame read back goes to; empty: none
   pub target SurfaceTexture;
   pub post Post;              // the HDR frame drawn into, bloomed and tone-mapped into the target
+  pub fx ImageFx;             // image quality (TAA or FXAA, auto-exposure, ambient occlusion, froxel fog) around it
+  pub fxTier u32;             // 0 off (the plain path), 1 low (an integrated GPU), 2 high
+  pub fxMeter bool;           // PEGASUS_DBG=meter: print what the auto-exposure measured at each shot
+  pub lastEye Vec3;           // the camera last frame, to tell a cut (a teleport) from a move
+  pub lastForward Vec3;
+  pub haveLast bool;
   pub sys RenderSystem;
   pub renderer Renderer;
   pub swapchain SwapChain;
@@ -332,21 +338,61 @@ actor RenderActor {
     g.sys.aimLights(&mut g.renderer, snapshot);
     if dayLit {
       rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds);
-      // The fog after the sky: depth slabs over what lies beyond them
-      imm aspect = f32.from(g.target.texture.width) / f32.from(g.target.texture.height);
-      rig.drawFog(&mut g.sys.list, pose.origin, pose.orientation, snapshot.fov, aspect, g.renderer.exposure);
+      // The fog after the sky: depth slabs over what lies beyond them (with image quality on, the froxel
+      // fog of ImageFx does it, from the same weather)
+      if g.fxTier == 0u32 {
+        imm aspect = f32.from(g.target.texture.width) / f32.from(g.target.texture.height);
+        rig.drawFog(&mut g.sys.list, pose.origin, pose.orientation, snapshot.fov, aspect, g.renderer.exposure);
+      }
     }
     mut encoder = g.device.createCommandEncoder();
     // Into the HDR frame (the size of the target), then bloomed and
     // tone-mapped into the target
     g.post.resize(&mut g.device, g.target.texture.width, g.target.texture.height);
-    g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
-    if g.sys.hasEffects() {
-      g.sys.aimEffects(&mut g.device, snapshot);
-      g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
-      g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
+    if g.fxTier == 0u32 {
+      g.sys.motion.clear();
+      g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
+      if g.sys.hasEffects() {
+        g.sys.aimEffects(&mut g.device, snapshot);
+        g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
+        g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
+      }
+      g.post.apply(&mut encoder, &g.target.texture);
+    } else {
+      // The passes' settings this frame: the tier's, the exposure's trim from the day clock, and the fog from
+      // the weather (the froxel fog is made only while there is some: switching it makes its textures)
+      mut fxs = fxBase(g.fxTier);
+      fxs.exposure.compensationEv = autoExposureTrim(rig.sunSine(), weather.ev);
+      fxs.exposure.minEv = AUTO_EXPOSURE_MIN;
+      fxs.exposure.maxEv = AUTO_EXPOSURE_MAX;
+      if weather.fog > FOG_THIN {
+        fxs.fog.enabled = true;
+        fxs.fog.density = weather.fog;
+        fxs.fog.anisotropy = 0.3;
+      }
+      g.fx.configure(&fxs);
+      // A cut (a teleport or a snap round) has no history to reproject
+      imm forward = pose.orientation * new Vec3(0., 0., -1.);
+      if g.haveLast {
+        imm moved = (pose.origin - g.lastEye).length();
+        if moved > 3. or forward.dot(g.lastForward) < 0.9 { g.fx.cutHistory(); }
+      } else {
+        g.fx.cutHistory();
+      }
+      g.lastEye = pose.origin;
+      g.lastForward = forward;
+      g.haveLast = true;
+      // What moved since last frame, for temporal AA
+      g.fx.motion <=> g.sys.motion;
+      g.fx.renderScene(&mut g.device, &mut encoder, &mut g.renderer, &mut g.post, &g.camera, &light, &g.sys.list);
+      // The particles, into the frame before the passes that resolve it, through the camera the scene was drawn with
+      if g.sys.hasEffects() {
+        g.sys.aimEffects(&mut g.device, snapshot);
+        g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
+        g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.fx.depth, &g.fx.sceneCamera);
+      }
+      g.fx.renderFinish(&mut g.device, &mut encoder, &mut g.renderer, &mut g.post, &g.sys.list, &g.target.texture);
     }
-    g.post.apply(&mut encoder, &g.target.texture);
 
     // A scripted view to save: copied now, written once presented
     if shotsDir.len() > 0usize and shot.len > 0usize {
@@ -360,7 +406,20 @@ actor RenderActor {
       name <- ".bmp";
       g.shotName = name;
     }
+    // (a measuring run: what the auto-exposure metered, at each scripted view)
+    mut meter = Buffer.none();
+    if g.fxMeter and g.fxTier != 0u32 and shot.len > 0usize {
+      meter = g.device.createBuffer(16u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+      encoder.copyBufferToBuffer(&g.post.exposureBuffer, 0u64, &meter, 0u64, 16u64);
+    }
     g.device.queue.submit(encoder.finish());
+    if meter.isValid() {
+      g.device.waitIdle();
+      imm f = meter.mappedRange() as *f32;
+      print <- "Meter "; printStr(shot); print <- ": exposure "; print <- *f; print <- ", mean log2 luminance ";
+      print <- *(f + 1usize); print <- ", target "; print <- *(f + 2usize); print <- ", sun sine ";
+      print <- rig.sunSine(); print <- ", weather ev "; print <- weather.ev; print <- "\n";
+    }
   }
 
   // The scripted view copied this frame, written once presented; false if it
@@ -423,6 +482,13 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, rig &mut SkyR
   // (off, low, medium, high) override them, to measure what each costs.
   setShadowTiers(&mut renderer, &mut device, adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT);
+  imm fxTier = fxTierFor(adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
+  mut fx = ImageFx.create(&mut device, &renderer, &mut post);
+  imm fxStart = fxBase(fxTier);
+  fx.configure(&fxStart);
+  mut fxMeter = false;
+  imm dbgEnv = libc.getenv("PEGASUS_DBG");
+  if (dbgEnv as usize) != 0usize { fxMeter = libc.strcmp(cstr.fromPtr(dbgEnv), "meter") == 0i32; }
   if !renderer.isValid() or !sys.particles.isValid() or !post.isValid() {
     print <- "The renderer could not be made\n";
     return None;
@@ -434,16 +500,49 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, rig &mut SkyR
   camera.near = 0.1;
   camera.far = 6000.;           // the island is 1.3 km across, the sea runs to the horizon
   imm target = swapchain.getCurrentTexture(&mut device);
-  Some[Gfx](new Gfx(Buffer.none(), String.empty(), target, post, sys, renderer, swapchain, device, adapter, surface,
-    instance, camera));
+  Some[Gfx](new Gfx(Buffer.none(), String.empty(), target, post, fx, fxTier, fxMeter, new Vec3(0., 0., 0.),
+    new Vec3(0., 0., -1.), false, sys, renderer, swapchain, device, adapter, surface, instance, camera));
 }
+
+// Image quality by the GPU's tier: 2 high on a discrete GPU (temporal AA, auto-exposure, ambient occlusion),
+// 1 low on an integrated one (FXAA and a cheap auto-exposure); 0 off. PEGASUS_FX (off, low, medium, high)
+// overrides it, to measure what it costs.
+fn fxTierFor(integrated bool) u32 {
+  mut tier = if integrated { 1u32; } else { 2u32; };
+  imm e = libc.getenv("PEGASUS_FX");
+  if (e as usize) != 0usize {
+    imm t = cstr.fromPtr(e);
+    if libc.strcmp(t, "off") == 0i32 { tier = 0u32; }
+    elif libc.strcmp(t, "low") == 0i32 { tier = 1u32; }
+    elif libc.strcmp(t, "high") == 0i32 { tier = 2u32; }
+  }
+  tier;
+}
+
+// The tier's settings, with the froxel fog set to reach the horizon as the slabs did and left off until
+// the weather has some
+fn fxBase(tier u32) FxSettings {
+  mut s = if tier == 1u32 { FxSettings.low(); } else { FxSettings.high(); };
+  s.fog = if tier == 1u32 { FogSettings.low(); } else { FogSettings.high(); };
+  s.fog.enabled = false;
+  s.fog.maxDistance = FOG_REACH;
+  s.exposure.enabled = true;
+  s;
+}
+
+// The farthest the froxel fog reaches, metres: the slabs' (skyrig.cone's FOG_FAR)
+const FOG_REACH f32 = 2400.;
+// The weather's fog below this extinction is none (skyrig's FOG_MIN)
+const FOG_THIN f32 = 0.00001;
 
 // The sun's shadows and the point lights' by the tier of the GPU
 fn setShadowTiers(renderer &mut Renderer, device &mut Device, integrated bool) {
   mut sun = if integrated { ShadowSettings.low(); } else { ShadowSettings.high(); };
   mut lamplit = if integrated { LightShadowSettings.off(); } else { LightShadowSettings.medium(); };
   // (the lanterns' tracery casts fine shadows: a wider filter keeps them soft)
-  if !integrated { lamplit.pcfTaps = 12u32; lamplit.pcfRadius = 2.5; }
+  // and a shadow fades with its light's rank against the best light left unshadowed (four lanterns get
+  // maps), so that a pool does not change as you walk
+  if !integrated { lamplit.pcfTaps = 12u32; lamplit.pcfRadius = 3.5; lamplit.fade = 2.; }
   imm s = libc.getenv("PEGASUS_SHADOWS");
   if (s as usize) != 0usize {
     imm t = cstr.fromPtr(s);
