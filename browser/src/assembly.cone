@@ -81,40 +81,54 @@ const PH_NIGHT_END = 16u32;
 const PH_SUN = 17u32;
 const PH_DONE = 18u32;
 
-mut phase u32 = 0u32;
-mut phaseFrom u64 = 0u64;
-mut asmOk bool = true;
-mut pictures u32 = 0u32;           // pictures taken by the phases above
-mut walkShot usize = 0usize;       // the next of the walk's pictures along the path
-mut clickDownAt u64 = 0u64;        // the frame the launch button's click is pressed
+// The assembly's script state: the simulation's ('SimState.asm'), made with it, touched only from the scene actor's end of frame
+pub struct Assembly {
+  pub phase u32;
+  pub phaseFrom u64;
+  pub asmOk bool;
+  pub pictures u32;           // pictures taken by the phases above
+  pub walkShot usize;         // the next of the walk's pictures along the path
+  pub clickDownAt u64;        // the frame the launch button's click is pressed
+  pub keyW bool;              // the keys the script holds
+  pub keyShift bool;
+  pub keyA bool;
+  pub keyD bool;
+  pub shotFrame u64;          // the frame whose picture is saved, and what it is called
+  pub shotId u32;
+  pub viewFrame u64;          // the frame drawn from the script's own eye, and where that is
+  pub viewEye Vec3;
+  pub viewTarget Vec3;
+  pub viewLens f32;
+  pub tapKey u32;             // a key tapped, and the frame it is let go
+  pub tapUpAt u64;
+
+  pub fn make() Assembly {
+    new Assembly(0u32, 0u64, true, 0u32, 0usize, 0u64, false, false, false, false, 0u64, 0u32, 0u64,
+      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), 1.0471976, 0u, 0u64);
+  }
+}
 
 // The hour the day clock is set to for dusk (17:48 the next evening: the lamps' fade has
 // finished, as glowscript.cone's) and for night (23:00)
 const EVENING_HOUR f32 = 41.8083;
 const NIGHT_HOUR f32 = 47.;
 
-// The keys the script holds
-mut keyW bool = false;
-mut keyShift bool = false;
-mut keyA bool = false;
-mut keyD bool = false;
-
 // A heading error within this many radians (0.7 degrees) is left alone; a turn is 1 degree a step
 const TURN_BAND f32 = 0.012;
 
 // Walk forward (W), running (Shift too) when 'fast'
-fn holdAhead(on bool, fast bool) {
+fn holdAhead(a &mut Assembly, on bool, fast bool) {
   imm run = on and fast;
-  if on != keyW { keyW = on; pushKey(sdl.SCANCODE_W, on); }
-  if run != keyShift { keyShift = run; pushKey(sdl.SCANCODE_LSHIFT, run); }
+  if on != a.keyW { a.keyW = on; pushKey(sdl.SCANCODE_W, on); }
+  if run != a.keyShift { a.keyShift = run; pushKey(sdl.SCANCODE_LSHIFT, run); }
 }
 
 // Turn left while 'err' (radians the target is to the left; negative: to the right) is past the band
-fn holdTurn(err f32) {
+fn holdTurn(a &mut Assembly, err f32) {
   imm wantA = err > TURN_BAND;
   imm wantD = err < 0. - TURN_BAND;
-  if wantA != keyA { keyA = wantA; pushKey(sdl.SCANCODE_A, wantA); }
-  if wantD != keyD { keyD = wantD; pushKey(sdl.SCANCODE_D, wantD); }
+  if wantA != a.keyA { a.keyA = wantA; pushKey(sdl.SCANCODE_A, wantA); }
+  if wantD != a.keyD { a.keyD = wantD; pushKey(sdl.SCANCODE_D, wantD); }
 }
 
 fn wrapPi(a f32) f32 {
@@ -198,7 +212,7 @@ pub struct Route {
 
   // One frame of following the route: the nearest point found, the heading steered towards a
   // point 'ahead' metres further on; true once the last point is within 0.7 m
-  fn follow(self &mut, w &Walk, ahead f32) bool {
+  fn follow(self &mut, a &mut Assembly, w &Walk, ahead f32) bool {
     imm n = points.len();
     mut best = at;
     mut bestD = flatDist(w.position.x, w.position.z, (*points[best]).x, (*points[best]).y);
@@ -214,7 +228,7 @@ pub struct Route {
     while j + 1usize < n and *along[j] - *along[best] < ahead { j = j + 1usize; }
     imm target = *points[j];
     imm err = yawError(w, target.x, target.y);
-    holdTurn(err);
+    holdTurn(a, err);
     imm last = *points[n - 1usize];
     imm toGo = flatDist(w.position.x, w.position.z, last.x, last.y);
     // Run only when headed right, on the route, and not close to its end: a run turns in a circle 11 m across
@@ -256,33 +270,26 @@ const SHOT_NIGHT = 12u32;
 // How far along the path (of its length) each picture but the first and last is taken
 imm WALK_AT Array[f32, 6] = [0.12, 0.26, 0.40, 0.55, 0.70, 0.86];
 
-mut shotFrame u64 = 0u64;      // the frame whose picture is saved, and what it is called
-mut shotId u32 = 0u32;
-mut viewFrame u64 = 0u64;      // the frame drawn from the script's own eye, and where that is
-mut viewEye Vec3;
-mut viewTarget Vec3;
-mut viewLens f32 = 1.0471976;
-
 // A picture of frame 'f' from the walker's eye
-fn takePicture(f u64, id u32) {
-  shotFrame = f;
-  shotId = id;
-  pictures = pictures + 1u32;
+fn takePicture(a &mut Assembly, f u64, id u32) {
+  a.shotFrame = f;
+  a.shotId = id;
+  a.pictures = a.pictures + 1u32;
 }
 
 // A picture of frame 'f' from 'eye', looking at 'target' through a lens of 'lens' radians
-fn takeView(f u64, id u32, eye Vec3, target Vec3, lens f32) {
-  takePicture(f, id);
-  viewFrame = f;
-  viewEye = eye;
-  viewTarget = target;
-  viewLens = lens;
+fn takeView(a &mut Assembly, f u64, id u32, eye Vec3, target Vec3, lens f32) {
+  takePicture(a, f, id);
+  a.viewFrame = f;
+  a.viewEye = eye;
+  a.viewTarget = target;
+  a.viewLens = lens;
 }
 
-pub fn asmShotAt(f u64) &str { if f == shotFrame and shotFrame > 0u64 { SHOT_NAMES[usize.from(shotId)]; } else { ""; }; }
-pub fn asmHasView(f u64) bool { f == viewFrame and viewFrame > 0u64; }
-pub fn asmView(f u64) Pose { lookFrom(viewEye, viewTarget); }
-pub fn asmFov(f u64) f32 { viewLens; }
+pub fn asmShotAt(a &Assembly, f u64) &str { if f == a.shotFrame and a.shotFrame > 0u64 { SHOT_NAMES[usize.from(a.shotId)]; } else { ""; }; }
+pub fn asmHasView(a &Assembly, f u64) bool { f == a.viewFrame and a.viewFrame > 0u64; }
+pub fn asmView(a &Assembly, f u64) Pose { lookFrom(a.viewEye, a.viewTarget); }
+pub fn asmFov(a &Assembly, f u64) f32 { a.viewLens; }
 
 // ---- The hooks ----
 
@@ -315,25 +322,23 @@ fn setHour(st &mut SimState, h f32) {
 pub fn asmClicks(st &mut SimState, f u64, w &Walk) {
   if f < ASM_FROM { return; }
   asmStep(st, f, w);
-  if f == clickDownAt and clickDownAt > 0u64 {
+  if f == st.asm.clickDownAt and st.asm.clickDownAt > 0u64 {
     // Where the cap's top is drawn from the camera (the rider's, in third person)
-    clickAt = placeOnView(st.cast.eyes(), FOV, partPoint(&st.scene, st.world.buttonCap(), 0.025), st.view.x, st.view.y);
-    pushButton(clickAt.x, clickAt.y, true);
+    st.run.clickAt = placeOnView(st.cast.eyes(), FOV, partPoint(&st.scene, st.world.buttonCap(), 0.025), st.view.x, st.view.y);
+    pushButton(st.run.clickAt.x, st.run.clickAt.y, true);
   }
-  if f == clickDownAt + 2u64 and clickDownAt > 0u64 { pushButton(clickAt.x, clickAt.y, false); }
-  if f == tapUpAt and tapUpAt > 0u64 { pushKey(tapKey, false); }
+  if f == st.asm.clickDownAt + 2u64 and st.asm.clickDownAt > 0u64 { pushButton(st.run.clickAt.x, st.run.clickAt.y, false); }
+  if f == st.asm.tapUpAt and st.asm.tapUpAt > 0u64 { pushKey(st.asm.tapKey, false); }
 }
 
 // A key pressed for frame 'f' and let go two frames after (Tab, V, F)
-mut tapKey u32 = 0u;
-mut tapUpAt u64 = 0u64;
-fn tap(f u64, key u32) {
+fn tap(a &mut Assembly, f u64, key u32) {
   pushKey(key, true);
-  tapKey = key;
-  tapUpAt = f + 2u64;
+  a.tapKey = key;
+  a.tapUpAt = f + 2u64;
 }
 
-fn goTo(next u32, f u64) { phase = next; phaseFrom = f; }
+fn goTo(a &mut Assembly, next u32, f u64) { a.phase = next; a.phaseFrom = f; }
 
 // The way from the steps' foot to the button along the lawn, or back
 fn routeToButton(rt &mut Route, w &Walk) {
@@ -371,9 +376,9 @@ fn say(f u64, what &str) {
 
 // The state machine: frame 'f's pushes, from the walker 'w' as the last frame left it
 fn asmStep(st &mut SimState, f u64, w &Walk) {
-  if (phase >= PH_FACE_BASKET and phase < PH_BACK) or phase >= PH_RIDE {
+  if (st.asm.phase >= PH_FACE_BASKET and st.asm.phase < PH_BACK) or st.asm.phase >= PH_RIDE {
     // The balloon's ride and the fall from it (ridescript.cone)
-    rideStep(st, f, w, f - phaseFrom);
+    rideStep(st, f, w, f - st.asm.phaseFrom);
     return;
   }
   imm scene = &st.scene;
@@ -381,35 +386,35 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
   imm cast = &mut st.cast;
   imm sceneNow = st.sceneNow;
   imm fired = st.fired;
-  imm since = f - phaseFrom;
-  if phase == PH_START {
+  imm since = f - st.asm.phaseFrom;
+  if st.asm.phase == PH_START {
     // Standing on the beach for the first picture, then up the path
-    if f == ASM_FROM + 4u64 { takePicture(f + 2u64, 0u32); }
+    if f == ASM_FROM + 4u64 { takePicture(&mut st.asm, f + 2u64, 0u32); }
     if f == ASM_FROM + 8u64 {
       st.route.fromPath(&st.land, 0usize, pathCentreline(&st.land).len() - 1usize);
       print <- "Frame "; print <- f; print <- ": the walk from the beach begins, a path "; print <- st.route.length(); print <- " m long\n";
       st.route.frames = f;
-      walkShot = 0usize;
-      goTo(PH_WALK, f);
+      st.asm.walkShot = 0usize;
+      goTo(&mut st.asm, PH_WALK, f);
     }
     return;
   }
-  if phase == PH_WALK {
-    imm arrived = st.route.follow(w, 4.);
-    holdAhead(!arrived and st.route.go, st.route.fast);
-    if walkShot < 6usize and *st.route.along[st.route.at] >= WALK_AT[walkShot] * st.route.length() {
-      takePicture(f + 1u64, u32.from(walkShot) + 1u32);
-      walkShot = walkShot + 1usize;
+  if st.asm.phase == PH_WALK {
+    imm arrived = st.route.follow(&mut st.asm, w,4.);
+    holdAhead(&mut st.asm, !arrived and st.route.go, st.route.fast);
+    if st.asm.walkShot < 6usize and *st.route.along[st.route.at] >= WALK_AT[st.asm.walkShot] * st.route.length() {
+      takePicture(&mut st.asm, f + 1u64, u32.from(st.asm.walkShot) + 1u32);
+      st.asm.walkShot = st.asm.walkShot + 1usize;
     }
-    if arrived { goTo(PH_STEPS, f); st.route.frames = f - st.route.frames; }
-    elif since > 2600u64 { say(f, "the walk to the steps did NOT finish"); asmOk = false; goTo(PH_STEPS, f); st.route.frames = since; }
+    if arrived { goTo(&mut st.asm, PH_STEPS, f); st.route.frames = f - st.route.frames; }
+    elif since > 2600u64 { say(f, "the walk to the steps did NOT finish"); st.asm.asmOk = false; goTo(&mut st.asm, PH_STEPS, f); st.route.frames = since; }
     return;
   }
-  if phase == PH_STEPS {
-    holdTurn(0.);
+  if st.asm.phase == PH_STEPS {
+    holdTurn(&mut st.asm, 0.);
     if since == 1u64 {
       // Facing the door, at the steps' foot
-      takePicture(f + 3u64, 7u32);
+      takePicture(&mut st.asm, f + 3u64, 7u32);
     }
     if since == 6u64 {
       imm line = pathCentreline(&st.land);
@@ -418,64 +423,64 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
       print <- " s) at 12 m/s, never farther than "; print <- st.route.dev; print <- " m from the path's centreline (want under 1.8; its half width is 0.9)\n";
       print <- "  ended "; print <- flatDist(w.position.x, w.position.z, end.x, end.z); print <- " m from the steps' foot ("; print <- end.x;
       print <- ", "; print <- end.z; print <- "), facing "; print <- w.yaw; print <- " rad from -z\n";
-      if st.route.dev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { asmOk = false; print <- "  the walk is WRONG\n"; }
+      if st.route.dev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { st.asm.asmOk = false; print <- "  the walk is WRONG\n"; }
       routeToButton(&mut st.route, w);
       st.route.frames = f;
-      goTo(PH_TO_BUTTON, f);
+      goTo(&mut st.asm, PH_TO_BUTTON, f);
     }
     return;
   }
-  if phase == PH_TO_BUTTON {
-    imm arrived = st.route.follow(w, 3.);
-    holdAhead(!arrived and st.route.go, st.route.fast);
-    if arrived { goTo(PH_FACE_BASKET, f); }
-    elif since > 1500u64 { say(f, "the walk to the basket did NOT finish"); asmOk = false; goTo(PH_FACE_BASKET, f); }
+  if st.asm.phase == PH_TO_BUTTON {
+    imm arrived = st.route.follow(&mut st.asm, w,3.);
+    holdAhead(&mut st.asm, !arrived and st.route.go, st.route.fast);
+    if arrived { goTo(&mut st.asm, PH_FACE_BASKET, f); }
+    elif since > 1500u64 { say(f, "the walk to the basket did NOT finish"); st.asm.asmOk = false; goTo(&mut st.asm, PH_FACE_BASKET, f); }
     return;
   }
-  if phase == PH_BACK {
-    imm arrived = st.route.follow(w, 3.);
-    holdAhead(!arrived and st.route.go, st.route.fast);
-    if arrived { goTo(PH_FACE_DOOR, f); }
-    elif since > 1500u64 { say(f, "the walk back to the steps did NOT finish"); asmOk = false; goTo(PH_FACE_DOOR, f); }
+  if st.asm.phase == PH_BACK {
+    imm arrived = st.route.follow(&mut st.asm, w,3.);
+    holdAhead(&mut st.asm, !arrived and st.route.go, st.route.fast);
+    if arrived { goTo(&mut st.asm, PH_FACE_DOOR, f); }
+    elif since > 1500u64 { say(f, "the walk back to the steps did NOT finish"); st.asm.asmOk = false; goTo(&mut st.asm, PH_FACE_DOOR, f); }
     return;
   }
-  if phase == PH_FACE_DOOR {
-    holdTurn(yawError(w, -16., 330.));
+  if st.asm.phase == PH_FACE_DOOR {
+    holdTurn(&mut st.asm, yawError(w, -16., 330.));
     if absF(yawError(w, -16., 330.)) <= TURN_BAND and since > 4u64 {
       setHour(st, EVENING_HOUR);
-      goTo(PH_DUSK, f);
+      goTo(&mut st.asm, PH_DUSK, f);
     }
     return;
   }
-  if phase == PH_DUSK {
-    if since == 12u64 { takePicture(f + 1u64, SHOT_DUSK_STEPS); }
+  if st.asm.phase == PH_DUSK {
+    if since == 12u64 { takePicture(&mut st.asm, f + 1u64, SHOT_DUSK_STEPS); }
     if since == 14u64 {
       checkLamps(st, f, "at the steps");
-      goTo(PH_FACE_PATH, f);
+      goTo(&mut st.asm, PH_FACE_PATH, f);
     }
     return;
   }
-  if phase == PH_FACE_PATH {
+  if st.asm.phase == PH_FACE_PATH {
     // Turned about to look down the path (the twelve lanterns stand in pairs along its last stretch)
     imm err = yawError(w, -16., 380.);
-    holdTurn(err);
+    holdTurn(&mut st.asm, err);
     if absF(err) <= TURN_BAND and since > 8u64 {
-      takePicture(f + 3u64, SHOT_DUSK_PATH);
-      goTo(PH_DUSK_PATH, f);
+      takePicture(&mut st.asm, f + 3u64, SHOT_DUSK_PATH);
+      goTo(&mut st.asm, PH_DUSK_PATH, f);
     }
     return;
   }
-  if phase == PH_DUSK_PATH {
+  if st.asm.phase == PH_DUSK_PATH {
     // The six pairs of lanterns at dusk: from 22 m out up the path to the door, and from the steps
     // back down the rows
     if since == 5u64 {
       imm eye = pathBack(&st.land, 22.);
-      takeView(f + 1u64, SHOT_LANTERNS, new Vec3(eye.x, eye.y + 1.7, eye.z), doorLookAt(&st.land), 0.9);
+      takeView(&mut st.asm, f + 1u64, SHOT_LANTERNS, new Vec3(eye.x, eye.y + 1.7, eye.z), doorLookAt(&st.land), 0.9);
     }
     if since == 9u64 {
       imm foot = pathBack(&st.land, 0.);
       imm far = pathBack(&st.land, 16.);
-      takeView(f + 1u64, SHOT_LANTERNS + 1u32, new Vec3(foot.x, foot.y + 2.1, foot.z), new Vec3(far.x, far.y + 0.5, far.z), 0.9);
+      takeView(&mut st.asm, f + 1u64, SHOT_LANTERNS + 1u32, new Vec3(foot.x, foot.y + 2.1, foot.z), new Vec3(far.x, far.y + 0.5, far.z), 0.9);
     }
     if since == 12u64 {
       // Night: the clock at 23:00, and the walker set down 45 m short of the steps on the path, facing them
@@ -488,60 +493,60 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
       imm next = *st.route.points[3usize];
       imm b = &mut cast.beings[0usize];
       b.setDown(new Vec3(from.x, groundHeight(&st.land, from.x, from.y), from.y), wrapPi(libc.atan2f(0. - (next.x - from.x), 0. - (next.y - from.y))));
-      holdTurn(0.);
-      takePicture(f + 8u64, SHOT_NIGHT);
+      holdTurn(&mut st.asm, 0.);
+      takePicture(&mut st.asm, f + 8u64, SHOT_NIGHT);
       st.route.frames = f;
-      walkShot = 0usize;
-      goTo(PH_NIGHT_WALK, f);
+      st.asm.walkShot = 0usize;
+      goTo(&mut st.asm, PH_NIGHT_WALK, f);
     }
     return;
   }
-  if phase == PH_NIGHT_WALK {
+  if st.asm.phase == PH_NIGHT_WALK {
     // The rows by night, from 19 m out up the path to the door
     if since == 9u64 {
       imm eye = pathBack(&st.land, 19.);
-      takeView(f + 1u64, SHOT_LANTERNS + 2u32, new Vec3(eye.x, eye.y + 1.7, eye.z), doorLookAt(&st.land), 0.9);
+      takeView(&mut st.asm, f + 1u64, SHOT_LANTERNS + 2u32, new Vec3(eye.x, eye.y + 1.7, eye.z), doorLookAt(&st.land), 0.9);
     }
     if since < 10u64 { return; }
-    imm arrived = st.route.follow(w, 5.);
-    holdAhead(!arrived and st.route.go, st.route.fast);
-    if walkShot == 0usize and *st.route.along[st.route.at] >= 0.5 * st.route.length() {
-      takePicture(f + 1u64, SHOT_NIGHT + 1u32);
-      walkShot = 1usize;
+    imm arrived = st.route.follow(&mut st.asm, w,5.);
+    holdAhead(&mut st.asm, !arrived and st.route.go, st.route.fast);
+    if st.asm.walkShot == 0usize and *st.route.along[st.route.at] >= 0.5 * st.route.length() {
+      takePicture(&mut st.asm, f + 1u64, SHOT_NIGHT + 1u32);
+      st.asm.walkShot = 1usize;
     }
-    if arrived { goTo(PH_NIGHT_END, f); }
-    elif since > 1200u64 { say(f, "the night walk did NOT finish"); asmOk = false; goTo(PH_NIGHT_END, f); }
+    if arrived { goTo(&mut st.asm, PH_NIGHT_END, f); }
+    elif since > 1200u64 { say(f, "the night walk did NOT finish"); st.asm.asmOk = false; goTo(&mut st.asm, PH_NIGHT_END, f); }
     return;
   }
-  if phase == PH_NIGHT_END {
-    holdTurn(0.);
-    if since == 1u64 { takePicture(f + 3u64, SHOT_NIGHT + 2u32); }
+  if st.asm.phase == PH_NIGHT_END {
+    holdTurn(&mut st.asm, 0.);
+    if since == 1u64 { takePicture(&mut st.asm, f + 3u64, SHOT_NIGHT + 2u32); }
     if since == 8u64 {
       imm line = pathCentreline(&st.land);
       imm end = *line[line.len() - 1usize];
       print <- "Frame "; print <- f; print <- ", the night walk (the clock at "; print <- hourAt(scene.now()); print <- " h): "; print <- f - st.route.frames;
       print <- " frames, never farther than "; print <- st.route.dev; print <- " m from the path; ended ";
       print <- flatDist(w.position.x, w.position.z, end.x, end.z); print <- " m from the steps' foot\n";
-      if st.route.dev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { asmOk = false; print <- "  the night walk is WRONG\n"; }
+      if st.route.dev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { st.asm.asmOk = false; print <- "  the night walk is WRONG\n"; }
       checkLamps(st, f, "at the steps by night");
       // Then noon again, for the autumn maple with the sun behind it and in front of it
       setHour(st, 60.);
-      goTo(PH_SUN, f);
+      goTo(&mut st.asm, PH_SUN, f);
     }
     return;
   }
-  if phase == PH_SUN {
+  if st.asm.phase == PH_SUN {
     // The first specimen maple, 14 m off at eye height: looking south into the noon sun (the tree
     // between), and looking north with the sun behind the eye
     imm m = vegItem(&st.land, K_SPECIMEN, 0usize);
     imm target = new Vec3(m.x, m.y + 5., m.z);
     if since == 10u64 {
-      takeView(f + 1u64, SHOT_NIGHT + 3u32, new Vec3(m.x + 2., groundHeight(&st.land, m.x + 2., m.z - 14.) + 1.7, m.z - 14.), target, 1.0471976);
+      takeView(&mut st.asm, f + 1u64, SHOT_NIGHT + 3u32, new Vec3(m.x + 2., groundHeight(&st.land, m.x + 2., m.z - 14.) + 1.7, m.z - 14.), target, 1.0471976);
     }
     if since == 20u64 {
-      takeView(f + 1u64, SHOT_NIGHT + 4u32, new Vec3(m.x + 2., groundHeight(&st.land, m.x + 2., m.z + 14.) + 1.7, m.z + 14.), target, 1.0471976);
+      takeView(&mut st.asm, f + 1u64, SHOT_NIGHT + 4u32, new Vec3(m.x + 2., groundHeight(&st.land, m.x + 2., m.z + 14.) + 1.7, m.z + 14.), target, 1.0471976);
     }
-    if since == 24u64 { goTo(PH_DONE, f); }
+    if since == 24u64 { goTo(&mut st.asm, PH_DONE, f); }
     return;
   }
 }
@@ -561,16 +566,16 @@ fn checkLamps(st &mut SimState, f u64, place &str) {
   print <- " nits (want "; print <- want * GLOW_ROOM; print <- "), a lantern's light "; print <- pool; print <- " cd\n";
   imm ok = lights.on and lights.level == 1. and bulb > want * 0.98 and bulb < want * 1.02 and room > want * GLOW_ROOM * 0.98
     and room < want * GLOW_ROOM * 1.02 and pool > 0.;
-  if !ok { print <- "  the lamps are WRONG\n"; asmOk = false; }
+  if !ok { print <- "  the lamps are WRONG\n"; st.asm.asmOk = false; }
 }
 
 // The checks the state machine has not made as it went: the last frame finds it done, every
 // picture taken
-pub fn checkAssembly(f u64, w &Walk) bool {
+pub fn checkAssembly(a &mut Assembly, f u64, w &Walk) bool {
   if f == ASM_FROM + ASM_FRAMES - 2u64 {
-    print <- "The assembly's walk: "; print <- pictures; print <- " pictures taken (want "; print <- SHOTS; print <- "), the last phase "; print <- phase;
+    print <- "The assembly's walk: "; print <- a.pictures; print <- " pictures taken (want "; print <- SHOTS; print <- "), the last phase "; print <- a.phase;
     print <- " (want "; print <- PH_DONE; print <- ")\n";
-    if phase != PH_DONE or pictures != SHOTS { asmOk = false; print <- "  the assembly's run did NOT finish\n"; }
+    if a.phase != PH_DONE or a.pictures != SHOTS { a.asmOk = false; print <- "  the assembly's run did NOT finish\n"; }
   }
-  asmOk;
+  a.asmOk;
 }

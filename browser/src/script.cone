@@ -91,12 +91,12 @@ fn lookFrom(eye Vec3, target Vec3) Pose {
 }
 
 // Whether frame 'f' is drawn from a close-up's eye
-pub fn hasView(opts &RunOptions, f u64) bool {
+pub fn hasView(opts &RunOptions, asm &Assembly, f u64) bool {
   if f >= NPC_FROM { return npcHasView(opts, f); }
   if f >= FALL_FROM { return fallHasView(f); }
   if f >= WX_FROM { return wxHasView(f); }
   if f >= BROOK_FROM { return true; }
-  if f >= ASM_FROM { return asmHasView(f); }
+  if f >= ASM_FROM { return asmHasView(asm, f); }
   (f >= 600u64 and f < MANNEQUIN_FROM) or (f >= 700u64 and f < 730u64) or (f >= 892u64 and f < 920u64)
     or f >= COTTAGE_FROM;
 }
@@ -108,7 +108,7 @@ pub fn viewAt(st &mut SimState, f u64) Pose {
   if f >= FALL_FROM { return fallView(st, f); }
   if f >= WX_FROM { return wxView(&st.land, f); }
   if f >= BROOK_FROM { return brookView(&st.land, f); }
-  if f >= ASM_FROM { return asmView(f); }
+  if f >= ASM_FROM { return asmView(&st.asm, f); }
   if f >= VEG_FROM { return vegView(&st.land, f); }
   if f >= GLOW_FROM { return glowView(st, f); }
   if f >= SKY_FROM { return skyView(st, f); }
@@ -180,10 +180,10 @@ pub const AMPHORA_EYE_DISTANCE f32 = 4.8;
 pub const AMPHORA_FOV f32 = 0.34906585;
 
 // The close-up's vertical field of view: the amphora's longer lens, or the walk's
-pub fn viewFov(f u64) f32 {
+pub fn viewFov(asm &Assembly, f u64) f32 {
   if f >= WX_FROM { FOV; }
   elif f >= BROOK_FROM { brookFov(f); }
-  elif f >= ASM_FROM { asmFov(f); }
+  elif f >= ASM_FROM { asmFov(asm, f); }
   elif f >= VEG_FROM { vegFov(f); }
   elif f >= GLOW_FROM { glowFov(f); }
   elif f >= SKY_FROM { skyFov(f); }
@@ -258,11 +258,21 @@ fn pushButton(x f32, y f32, down bool) {
   sdl.PushEvent(&mut e);
 }
 
-// Where the script clicks, and on what. (The script's own bookkeeping, here
-// and in assembly.cone, is module globals: every hook of the script runs in
-// the scene actor, at the end of a frame, so no other actor touches them.)
-mut clickAt Vec2;             // set by the module's init
-mut rookClick bool = false;   // the click on the rook landed where the rook is drawn
+// The script's own bookkeeping, here and in assembly.cone: the simulation's ('SimState.run'), made
+// with it. Every hook of the script runs in the scene actor, at the end of a frame, so no other
+// actor touches it.
+pub struct ScriptRun {
+  pub clickAt Vec2;           // where the script clicks
+  pub ballRest Vec3;          // the ball's rest: where it was placed (on the ground, its radius up), the same at any time
+  pub tempPart PartId;        // a part made and taken away again through the scene's requests, and a request sent afterwards to its stale id, which must be refused
+  pub tempApplied u64;        // the scene's counts just before it was made
+  pub tempRefused u64;
+  pub tempSent u64;
+  pub pausedAt f64;           // the scene time when the clock was paused
+  pub fastFrom f64;           // and when it was run fast
+
+  pub fn make() ScriptRun { new ScriptRun(new Vec2(0., 0.), new Vec3(0., 0., 0.), PartId.none(), 0u64, 0u64, 0u64, 0d, 0d); }
+}
 
 // Where world point 'p' is drawn for a viewer at 'w' (the walk is still
 // when the script clicks), in a window of 'size'
@@ -280,21 +290,18 @@ fn partPoint(scene &Scene, id PartId, up f32) Vec3 {
 pub fn pushClicks(st &mut SimState, f u64, w &Walk) {
   if f == 120u64 {
     // The lathed rook on the porch deck, 0.28 m up its 0.56
-    clickAt = seen(st.view, w, partPoint(&st.scene, st.world.partOf(LATHED_ROOK, 0usize), 0.28));
-    pushButton(clickAt.x, clickAt.y, true);
+    st.run.clickAt = seen(st.view, w, partPoint(&st.scene, st.world.partOf(LATHED_ROOK, 0usize), 0.28));
+    pushButton(st.run.clickAt.x, st.run.clickAt.y, true);
   }
   if f == 145u64 {
     // The sky, at the top edge, well to the right (the balloon's envelope stands in the middle of the
     // view from here, and a tall pine higher than 10% down)
-    clickAt = new Vec2(st.view.x * 0.9, st.view.y * 0.004);
-    pushButton(clickAt.x, clickAt.y, true);
+    st.run.clickAt = new Vec2(st.view.x * 0.9, st.view.y * 0.004);
+    pushButton(st.run.clickAt.x, st.run.clickAt.y, true);
   }
-  if f == 122u64 or f == 147u64 { pushButton(clickAt.x, clickAt.y, false); }
+  if f == 122u64 or f == 147u64 { pushButton(st.run.clickAt.x, st.run.clickAt.y, false); }
   asmClicks(st, f, w);
 }
-
-// The ball's rest: where it was placed (on the ground, its radius up), the same at any time
-mut ballRest Vec3;
 
 // The script's checks of the clicks and the motions at frame 'f'
 fn checkMotions(st &mut SimState, f u64) bool {
@@ -324,7 +331,7 @@ fn checkMotions(st &mut SimState, f u64) bool {
     // The ball lies on the lawn where it was left: its foot on the ground, at the world's table's place
     imm ball = scene.worldMatrix(world.partOf(BALL, 0usize));
     imm at = placeXZ(BALL);
-    ballRest = new Vec3(ball.m[12], ball.m[13], ball.m[14]);
+    st.run.ballRest = new Vec3(ball.m[12], ball.m[13], ball.m[14]);
     print <- "Frame 29, the ball on the lawn:\n";
     ok = near("x", ball.m[12], at.x, 0.0005) and ok;
     ok = near("z", ball.m[14], at.y, 0.0005) and ok;
@@ -334,9 +341,9 @@ fn checkMotions(st &mut SimState, f u64) bool {
     // Still where it was at frame 29, whatever the scene's time
     print <- "Frame "; print <- f; print <- ", the ball at "; print <- sceneNow; print <- " s:\n";
     imm ball = scene.worldMatrix(world.partOf(BALL, 0usize));
-    ok = near("x", ball.m[12], ballRest.x, 0.) and ok;
-    ok = near("height", ball.m[13], ballRest.y, 0.) and ok;
-    ok = near("z", ball.m[14], ballRest.z, 0.) and ok;
+    ok = near("x", ball.m[12], st.run.ballRest.x, 0.) and ok;
+    ok = near("height", ball.m[13], st.run.ballRest.y, 0.) and ok;
+    ok = near("z", ball.m[14], st.run.ballRest.z, 0.) and ok;
   }
   ok;
 }
@@ -344,10 +351,6 @@ fn checkMotions(st &mut SimState, f u64) bool {
 
 // A part made and taken away again through the scene's requests, and a
 // request sent afterwards to its stale id, which must be refused
-mut tempPart PartId;          // set by the module's init
-mut tempApplied u64 = 0u64;   // the scene's counts just before it was made
-mut tempRefused u64 = 0u64;
-mut tempSent u64 = 0u64;
 
 // The script's red cube, as requests through 'door' (the view builds the same when told of it): its part
 pub fn buildTestCube(door &mut Door) PartId {
@@ -370,15 +373,15 @@ pub fn driveScene(st &mut SimState, f u64) {
   imm scene = &mut st.scene;
   imm cast = &mut st.cast;
   if f == 3u64 {
-    tempApplied = scene.applied;
-    tempRefused = scene.refused;
-    tempSent = scene.door.sent;
+    st.run.tempApplied = scene.applied;
+    st.run.tempRefused = scene.refused;
+    st.run.tempSent = scene.door.sent;
     scene.door.beginObject();
-    tempPart = buildTestCube(&mut scene.door);
+    st.run.tempPart = buildTestCube(&mut scene.door);
     scene.door.endObject(ObjectSpec.of(OBJ_TESTCUBE, 0u32));
   }
-  if f == 5u64 { scene.send(Request.Despawn(tempPart)); }
-  if f == 7u64 { scene.send(Request.Place(tempPart, Transform3.identity())); }
+  if f == 5u64 { scene.send(Request.Despawn(st.run.tempPart)); }
+  if f == 7u64 { scene.send(Request.Place(st.run.tempPart, Transform3.identity())); }
   // The plain walker, after its beach walk, is set down on the lawn, 10 m
   // in front of the porch and a metre to the path's right, facing it, where the
   // rest of the first walk begins
@@ -397,14 +400,14 @@ pub fn driveScene(st &mut SimState, f u64) {
 }
 
 // The view saved at frame 'f', or an empty name
-pub fn shotAt(opts &RunOptions, f u64) &str {
+pub fn shotAt(opts &RunOptions, asm &Assembly, f u64) &str {
   imm hudShot = hudShotAt(opts, f);
   if hudShot.len() > 0usize { return hudShot; }
   if f >= NPC_FROM { return npcShotAt(opts, f); }
   if f >= FALL_FROM { return fallShotAt(f); }
   if f >= WX_FROM { return wxShotAt(f); }
   if f >= BROOK_FROM { return brookShotAt(f); }
-  if f >= ASM_FROM { return asmShotAt(f); }
+  if f >= ASM_FROM { return asmShotAt(asm, f); }
   if f == 20u64 { return "start"; }
   if f == 160u64 { return "walked"; }
   if f == 210u64 { return "turned"; }
@@ -617,9 +620,6 @@ fn checkCottage(st &mut SimState) bool {
   ok;
 }
 
-// The scene's time when the script's P and F keys took effect
-mut pausedAt f64 = 0d;
-mut fastFrom f64 = 0d;
 
 // The scene clock's keys, and the events on the scene's clock, at frame 'f'
 fn checkClock(st &mut SimState, f u64) bool {
@@ -629,22 +629,22 @@ fn checkClock(st &mut SimState, f u64) bool {
   mut ok = true;
   imm step = 1d / 60d;
   if f == 256u64 {
-    pausedAt = sceneNow;
+    st.run.pausedAt = sceneNow;
     if !scene.clock.paused { print <- "Frame 256: P did NOT pause scene time\n"; ok = false; }
   }
   if f == 270u64 {
     // Paused since frame 256's publish: 14 frames of steps, no scene time
     print <- "Frame 270, scene time paused since frame 256:\n";
-    ok = near("scene time", f32.from(sceneNow), f32.from(pausedAt), 0.) and ok;
+    ok = near("scene time", f32.from(sceneNow), f32.from(st.run.pausedAt), 0.) and ok;
   }
   if f == 276u64 {
-    fastFrom = sceneNow;
+    st.run.fastFrom = sceneNow;
     if scene.clock.rate() != 10u64 { print <- "Frame 276: F did NOT run scene time x10\n"; ok = false; }
   }
   if f == 290u64 {
     // From frame 276: frames 277 to 286 at x10, 287 to 290 at x1
     print <- "Frame 290, after 10 frames at x10 and 4 at x1:\n";
-    ok = near("scene time run", f32.from(sceneNow - fastFrom), f32.from(104d * step), 0.00001) and ok;
+    ok = near("scene time run", f32.from(sceneNow - st.run.fastFrom), f32.from(104d * step), 0.00001) and ok;
     if scene.clock.paused or scene.clock.rate() != 1u64 { print <- "  the clock NOT back to x1\n"; ok = false; }
   }
   if f == 200u64 {
@@ -802,13 +802,13 @@ pub fn checkScript(st &mut SimState, f u64, w &Walk) bool {
   if f == 9u64 {
     // Since frame 3: the temporary cube spawned and shown, despawned, the
     // Place to its stale id refused; the world's requests all applied
-    imm sent = scene.door.sent - tempSent;
-    print <- "Frame 9: since frame 3, sent "; print <- sent; print <- ", applied "; print <- scene.applied - tempApplied;
-    print <- " (want "; print <- sent - 1u64; print <- "), refused "; print <- scene.refused - tempRefused;
+    imm sent = scene.door.sent - st.run.tempSent;
+    print <- "Frame 9: since frame 3, sent "; print <- sent; print <- ", applied "; print <- scene.applied - st.run.tempApplied;
+    print <- " (want "; print <- sent - 1u64; print <- "), refused "; print <- scene.refused - st.run.tempRefused;
     print <- " (want 1)";
-    if scene.isReserved(tempPart) { print <- ", the stale id still RESERVED"; ok = false; }
+    if scene.isReserved(st.run.tempPart) { print <- ", the stale id still RESERVED"; ok = false; }
     print <- "\n";
-    if scene.applied - tempApplied != sent - 1u64 or scene.refused - tempRefused != 1u64 { ok = false; }
+    if scene.applied - st.run.tempApplied != sent - 1u64 or scene.refused - st.run.tempRefused != 1u64 { ok = false; }
   }
   if f == 29u64 {
     ok = checkWorld(st) and ok;
@@ -852,10 +852,10 @@ pub fn checkScript(st &mut SimState, f u64, w &Walk) bool {
     ok = near("z", w.position.z, SET_Z - 5.196152, 0.002) and ok;
   }
   if f == 590u64 { ok = checkWorld(st) and ok; ok = checkSmoke(st) and ok; }
-  ok = checkAssembly(f, w) and ok;
-  ok = checkWeatherRun() and ok;
-  ok = checkFallRun() and ok;
-  ok = checkNpcRun() and ok;
+  ok = checkAssembly(&mut st.asm, f, w) and ok;
+  ok = checkWeatherRun(st) and ok;
+  ok = checkFallRun(st) and ok;
+  ok = checkNpcRun(st) and ok;
   ok;
 }
 
