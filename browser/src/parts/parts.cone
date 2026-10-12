@@ -386,6 +386,27 @@ pub struct LightLook {
   }
 }
 
+// Which object of the content every browser has locally an Object request names
+pub const OBJ_SHELL = 0u32;         // the island's land, the sea and the sky (shell.cone)
+pub const OBJ_WORLD = 1u32;         // an object of the baked-in world: 'index' is its number (bakedworld.cone)
+pub const OBJ_MANNEQUIN = 2u32;     // a mannequin: 'height', 'color' and 'name'
+pub const OBJ_TESTCUBE = 3u32;      // a scripted run's red cube
+
+// What to build locally: the object, and the few numbers that make it
+pub struct ObjectSpec {
+  pub kind u32;
+  pub index u32;
+  pub height f32;
+  pub color Color;
+  pub name String;
+
+  pub fn of(kind u32, index u32) ObjectSpec {
+    new ObjectSpec(kind, index, 0., new Color(1., 1., 1., 1.), String.empty());
+  }
+
+  pub fn copy(self &) ObjectSpec { new ObjectSpec(kind, index, height, color, name.copy()); }
+}
+
 // A change to the scene, as sent. The system that owns what it changes
 // applies it, in the order sent.
 pub enum Request {
@@ -546,6 +567,19 @@ pub enum Request {
     pub id PartId;
     pub shape PlatformShape;
   }
+  // An object's requests follow, up to its Object: the receiver that keeps
+  // the object's content locally applies them to what it holds and sends them
+  // no further (the Object that closes them says what to build)
+  pub struct ObjectBegin;
+  // The requests since ObjectBegin made one object of the content every
+  // browser has locally (ObjectSpec says which). 'ids' are the ids those
+  // requests reserved, in the order reserved: a receiver builds the object
+  // itself and gives its parts, meshes and materials these ids, so neither
+  // meshes nor images cross
+  pub struct Object {
+    pub spec ObjectSpec;
+    pub ids List[PartId];
+  }
   // Nothing: what an applied request's place holds once it is taken
   pub struct Done;
 }
@@ -620,9 +654,58 @@ pub struct Door {
   pub sent u64;               // requests sent through it, ever
   pub meshes u64;             // meshes defined through it, ever
   pub materials u64;          // materials defined through it, ever
+  recording bool;             // an object is being made: the ids reserved are noted
+  recorded List[PartId];
+  replay List[PartId];        // an object being built again: the ids to give, in order
+  replayAt usize;
+  replaying bool;
 
   pub fn empty() Door {
-    new Door(Pool[PartRecord].empty(), List[Request].empty(), List[Message].empty(), 0u64, 0u64, 0u64);
+    new Door(Pool[PartRecord].empty(), List[Request].empty(), List[Message].empty(), 0u64, 0u64, 0u64, false,
+      List[PartId].empty(), List[PartId].empty(), 0usize, false);
+  }
+
+  // An id for a record: a new one from the registry (noted, if an object is
+  // being made), or, when an object is being built again, the next of the
+  // ids it was given
+  fn fresh(self &mut, rec PartRecord) PartId {
+    if replaying {
+      imm id = *replay[replayAt];
+      replayAt = replayAt + 1usize;
+      return id;
+    }
+    imm id = new PartId(registry.add(rec));
+    if recording { recorded.push(id); }
+    id;
+  }
+
+  // The requests that follow make one object (see Request.Object); the ids they reserve are noted
+  pub fn beginObject(self &mut) {
+    inbox.push(Request.ObjectBegin);
+    recorded.clear();
+    recording = true;
+  }
+
+  // The object made: an Object request closes it, naming what to build and the ids reserved
+  pub fn endObject(self &mut, spec ObjectSpec) {
+    recording = false;
+    mut ids = List[PartId].empty();
+    ids <=> recorded;
+    inbox.push(Request.Object(spec, ids));
+  }
+
+  // This door builds an object again, giving the ids 'ids' in order to each part, mesh and material it reserves
+  // (a receiver building an Object it was told of: its requests are applied there, not sent on)
+  pub fn replayIds(self &mut, ids List[PartId]) {
+    replay = ids;
+    replayAt = 0usize;
+    replaying = true;
+  }
+
+  // Done building again
+  pub fn endReplay(self &mut) {
+    replaying = false;
+    replay.clear();
   }
 
   // What the browser has told the sender since it last looked, in order;
@@ -639,7 +722,7 @@ pub struct Door {
   // A new part id, reserved now so the requests that follow can name it;
   // the part is live once its Spawn is applied
   pub fn reserve(self &mut) PartId {
-    new PartId(registry.add(new PartRecord(String.empty(), false, KIND_PART)));
+    self.fresh(new PartRecord(String.empty(), false, KIND_PART));
   }
 
   // Send a request, to be applied at the frame's apply point
@@ -664,7 +747,7 @@ pub struct Door {
 
   // A mesh defined: its id reserved and its DefineMesh sent
   pub fn defineMesh(self &mut, shape Mesh) MeshId {
-    imm id = new MeshId(new PartId(registry.add(new PartRecord(String.empty(), false, KIND_MESH))));
+    imm id = new MeshId(self.fresh(new PartRecord(String.empty(), false, KIND_MESH)));
     self.send(Request.DefineMesh(id, shape));
     meshes = meshes + 1u64;
     id;
@@ -672,7 +755,7 @@ pub struct Door {
 
   // A skinned mesh defined: its id reserved and its DefineSkinnedMesh sent
   pub fn defineSkinnedMesh(self &mut, shape Mesh, skin Skin) MeshId {
-    imm id = new MeshId(new PartId(registry.add(new PartRecord(String.empty(), false, KIND_MESH))));
+    imm id = new MeshId(self.fresh(new PartRecord(String.empty(), false, KIND_MESH)));
     self.send(Request.DefineSkinnedMesh(id, shape, skin));
     meshes = meshes + 1u64;
     id;
@@ -680,7 +763,7 @@ pub struct Door {
 
   // A material defined: its id reserved and its DefineMaterial sent
   pub fn defineMaterial(self &mut, surface Look, paint Image, maps Maps) MaterialId {
-    imm id = new MaterialId(new PartId(registry.add(new PartRecord(String.empty(), false, KIND_MATERIAL))));
+    imm id = new MaterialId(self.fresh(new PartRecord(String.empty(), false, KIND_MATERIAL)));
     self.send(Request.DefineMaterial(id, surface, paint, maps));
     materials = materials + 1u64;
     id;
@@ -755,7 +838,14 @@ pub struct Door {
     while i < requests.len {
       mut r Request = Request.Done;
       r <=> requests[i];
-      self.send(r);
+      // An object's markers are not requests to count
+      mut marker = false;
+      match &r {
+        case is ObjectBegin { marker = true; }
+        case is Object { marker = true; }
+        else {}
+      }
+      if marker { inbox.push(r); } else { self.send(r); }
       i = i + 1usize;
     }
     meshes = meshes + meshesDefined;
