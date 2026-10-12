@@ -175,7 +175,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float a = saturate(0.30 + 0.12 * saturate(speed) + 0.62 * F);
 
     // Foam, broken up and drifting down
-    float cells = foamTexture(float2(uv.x * 3.2, (uv.y - 1.3 * speed * t) * 2.6));
+    float cells = foamTexture(float2(uv.x * 9.0, (uv.y - 1.3 * speed * t) * 7.0));
     float f = foam * smoothstep(0.30, 0.62, cells * 0.75 + vnoise(float2(uv.x * 6.0, (uv.y - speed * t) * 4.0)) * 0.45);
     float3 foamColor = float3(0.85, 0.86, 0.85) * lightOn;
     color = lerp(color, foamColor, f);

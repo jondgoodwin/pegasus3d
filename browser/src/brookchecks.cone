@@ -108,4 +108,173 @@ fn checkBrookCourse() bool {
   ok;
 }
 
-fn checkBrook() bool { checkBrookCourse(); }
+// A walker walked 'seconds' from (x, y, z) facing 'yaw' on the world's solids: where it ends, and the highest it got
+fn walkFrom(s &mut Scene, c &mut Cast, at Vec3, yaw f32, seconds f32, highest &mut f32) Vec3 {
+  imm w = putWalker(s, c, at, yaw);
+  imm go = new Intents(1., 0., false, false);
+  mut k = 0;
+  imm n = i32.from(seconds * 60.);
+  *highest = at.y;
+  while k < n {
+    c.step(go, 1. / 60.);
+    if c.beings[w].body.position.y > *highest { *highest = c.beings[w].body.position.y; }
+    k = k + 1;
+  }
+  c.beings[w].body.position;
+}
+
+// The bridge, walked: up the south ramp, over the crest and down the north ramp at the road's heights, the
+// parapets stop a walker on the crest and on a ramp, the water is no wall, and the bed is ground
+fn checkBridgeWalk() bool {
+  print <- "The bridge:\n";
+  bakeIsland();
+  imm list = worldSolids();
+  setSolids(&list);
+  imm bank = bridgeBank();
+  imm crest = bank + BRIDGE_CREST_UP;
+  mut ok = expect("it has nine solids: a crest, two ramps and a parapet's three each side", BRIDGE_SOLIDS == 9usize);
+  print <- "  (banks "; print <- bank; print <- " m, the road's crest "; print <- crest; print <- " m, the water "; print <- bridgeWater(); print <- " m)\n";
+  // Up and over, from 6 m south of the middle, facing north (-z)
+  mut s = Scene.empty();
+  mut c = Cast.empty();
+  imm w = putWalker(&mut s, &mut c, new Vec3(BRIDGE_X, groundHeight(BRIDGE_X, BRIDGE_Z + 6.), BRIDGE_Z + 6.), 0.);
+  imm go = new Intents(1., 0., false, false);
+  mut worstOff f32 = 0.;
+  mut top f32 = 0.;
+  mut sawUp = false;
+  mut sawCrest = false;
+  mut sawDown = false;
+  mut k = 0;
+  while k < 720 {
+    c.step(go, 1. / 60.);
+    imm p = c.beings[w].body.position;
+    imm dz = p.z - BRIDGE_Z;
+    if p.y > top { top = p.y; }
+    if dz > -BRIDGE_END + 0.4 and dz < BRIDGE_END - 0.4 {
+      imm want = bridgeDeck(dz, bank);
+      // (the footprint's highest point is up to a radius up the slope)
+      imm off = libc.fabsf(p.y - want);
+      if off > worstOff { worstOff = off; }
+      if dz > 1.2 and dz < 3. and p.y > bank + 0.1 { sawUp = true; }
+      if dz > -0.9 and dz < 0.9 and nearly(p.y, crest, 0.01) { sawCrest = true; }
+      if dz < -1.2 and dz > -3. and p.y > bank + 0.1 and p.y < crest - 0.05 { sawDown = true; }
+    }
+    k = k + 1;
+  }
+  imm end = c.beings[w].body.position;
+  print <- "  (walked from 6 m south to z "; print <- end.z - BRIDGE_Z; print <- "; the highest "; print <- top - bank; print <- " m over the banks; off the road's height by at most ";
+  print <- worstOff; print <- " m)\n";
+  ok = expect("a walker climbs the south ramp, crosses the crest at 0.58 m over the banks and comes down the north ramp onto the ground beyond",
+    sawUp and sawCrest and sawDown and end.z < BRIDGE_Z - BRIDGE_END and nearly(end.y, groundHeight(end.x, end.z), 0.0001)) and ok;
+  ok = expect("on the road it is at the road's height, within the slope under its feet (0.08 m)", worstOff < 0.08 and nearly(top, crest, 0.01)) and ok;
+  // The parapets: on the crest facing east, then on the south ramp facing west
+  mut hi f32 = 0.;
+  imm east = walkFrom(&mut s, &mut c, new Vec3(BRIDGE_X, crest, BRIDGE_Z), 0. - 0.5 * pi, 3., &mut hi);
+  print <- "  (walked east from the crest: stopped at x "; print <- east.x - BRIDGE_X; print <- ", the parapet's face at 0.7)\n";
+  ok = expect("the east parapet stops a walker on the crest, a radius from its inner face, still on the road",
+    nearly(east.x - BRIDGE_X, 0.7 - 0.2625, 0.01) and nearly(east.y, crest, 0.01)) and ok;
+  imm west = walkFrom(&mut s, &mut c, new Vec3(BRIDGE_X, bridgeDeck(2.2, bank), BRIDGE_Z + 2.2), 0.5 * pi, 3., &mut hi);
+  print <- "  (walked west from the south ramp: stopped at x "; print <- west.x - BRIDGE_X; print <- ", y "; print <- west.y - bank; print <- " over the banks)\n";
+  ok = expect("so does the west parapet on the south ramp (sloped like the road)",
+    nearly(west.x - BRIDGE_X, 0. - 0.7 + 0.2625, 0.01) and nearly(west.y, bridgeDeck(2.2, bank), 0.07)) and ok;
+  // From the bank beside the bridge the parapet is a wall, not a step: walked at from the east at the ramp's foot
+  imm side = walkFrom(&mut s, &mut c, new Vec3(BRIDGE_X + 4., groundHeight(BRIDGE_X + 4., BRIDGE_Z + 3.), BRIDGE_Z + 3.), 0.5 * pi, 4., &mut hi);
+  mut si = 0usize;
+  while si < list.len() {
+    if list[si].over(side.x, side.z) { print <- "    (over solid "; print <- si; print <- " kind "; print <- list[si].kind; print <- ", top "; print <- list[si].topAt(side.x, side.z) - bank; print <- " over the banks)\n"; }
+    si = si + 1usize;
+  }
+  print <- "  (walked west at the south ramp from the bank: stopped at x ";print <- side.x - BRIDGE_X; print <- ", z "; print <- side.z - BRIDGE_Z; print <- ", y "; print <- side.y - groundHeight(side.x, side.z); print <- " over the ground)\n";
+  // (its footprint's edge rests on the road's edge under the parapet, so its feet stand at the road's height there)
+  ok = expect("walked at from the bank beside a ramp the parapet is a wall: it stops outside it, no higher than the road's edge",
+    nearly(side.x - BRIDGE_X, 1.0 + 0.2625, 0.01) and side.y <= bridgeDeck(3., bank) + 0.01) and ok;
+  // The bed: the channel is ordinary ground, walked down the yard and down the dingle
+  mut bedOk = true;
+  mut moved = 0.;
+  mut g = 0;
+  while g < 2 {
+    imm x0 = if g == 0 { -26.; } else { -53.; };
+    imm z0 = if g == 0 { 313.7; } else { 382.; };
+    imm yaw = if g == 0 { 0.5 * pi; } else { pi; };
+    mut p0 = 0usize;
+    imm pts = brookPoints();
+    mut best = 1000000.;
+    mut q = 0usize;
+    while q < pts.len() {
+      imm d = (pts[q].x - x0) * (pts[q].x - x0) + (pts[q].z - z0) * (pts[q].z - z0);
+      if d < best { best = d; p0 = q; }
+      q = q + 1usize;
+    }
+    imm sx = pts[p0].x;
+    imm sz = pts[p0].z;
+    imm start = new Vec3(sx, groundHeight(sx, sz), sz);
+    imm after = walkFrom(&mut s, &mut c, start, yaw, 4., &mut hi);
+    imm run = ((after.x - sx) * (after.x - sx) + (after.z - sz) * (after.z - sz)).sqrt();
+    print <- "  (walked down the "; print <- (if g == 0 { "yard"; } else { "dingle"; }); print <- ": "; print <- run; print <- " m in 4 s, on ground "; print <- after.y - groundHeight(after.x, after.z); print <- ")\n";
+    moved = run;
+    if run < 5. or !nearly(after.y, groundHeight(after.x, after.z), 0.45) { bedOk = false; }
+    g = g + 1;
+  }
+  ok = expect("the channel bed is walkable: a walker set on it walks along the yard's and the dingle's bed (5 m or more in 4 s)", bedOk) and ok;
+  mut none = List[Solid].empty();
+  setSolids(&none);
+  ok;
+}
+
+// The layout against the brook: no tree, rock (but the bed stones in the water), fern, hosta or flower in its channel
+// (within 2.4 m of the course), and the bed stones' tops over the water and a step or less over the bed
+fn checkBrookLayout() bool {
+  print <- "The brook's layout:\n";
+  bakeIsland();
+  imm items = vegetationLayout();
+  imm pts = brookPoints();
+  mut inChannel = 0usize;
+  mut nearest f32 = 1000.;
+  mut stones = 0usize;
+  mut lips = 0usize;
+  mut worstAbove f32 = 0.;
+  mut least f32 = 1000.;
+  mut most f32 = -1000.;
+  mut i = 0usize;
+  imm squat = rockVariant(0u32).bounds().max.y;
+  imm squat3 = rockVariant(3u32).bounds().max.y;
+  print <- "  (the squat rocks' meshes stand "; print <- squat; print <- " and "; print <- squat3; print <- " m; the layout assumes "; print <- SQUAT_ROCK_TOP; print <- ")\n";
+  while i < items.len() {
+    imm it = items[i];
+    imm d = brookDistanceAt(it.x, it.z);
+    if vegBedStone(it) {
+      stones = stones + 1usize;
+      imm top = it.y + rockTop(if it.variant == 0u32 { squat; } else { squat3; }, it.scale);
+      imm bed = groundHeight(it.x, it.z);
+      mut k = 0usize;
+      imm w = pts[0usize].w;
+      mut idx = 0usize;
+      brookNearest(it.x, it.z, &mut idx);
+      imm over = top - pts[idx].w;
+      if over < least { least = over; }
+      if over > most { most = over; }
+      if top - bed > worstAbove { worstAbove = top - bed; }
+    } elif vegLipStone(it) {
+      lips = lips + 1usize;
+    } else {
+      if d < nearest { nearest = d; }
+      if d < 2.4 { inChannel = inChannel + 1usize; }
+    }
+    i = i + 1usize;
+  }
+  print <- "  ("; print <- stones; print <- " bed stones, tops "; print <- least; print <- " to "; print <- most; print <- " m over the water, at most "; print <- worstAbove;
+  print <- " m over the bed; "; print <- lips; print <- " lip stones; the nearest other item "; print <- nearest; print <- " m from the course)\n";
+  mut ok = expect("no tree, rock, fern, hosta or flower stands in the channel (within 2.4 m of the course)", inChannel == 0usize);
+  ok = expect("a good number of bed stones (60 to 140) and of lip stones (80 or more)", stones > 60usize and stones < 140usize and lips >= 80usize) and ok;
+  ok = expect("a bed stone's top is 0 to 0.2 m over the water, so it shows", least > 0. and most < 0.2) and ok;
+  ok = expect("and no more than a step (0.4 m) over the bed, so a walker wades over it", worstAbove <= STEP_UP) and ok;
+  ok;
+}
+
+fn checkBrook() bool {
+  mut ok = checkBrookCourse();
+  ok = checkBrookLayout() and ok;
+  ok;
+}
+
+fn checkBridge() bool { checkBridgeWalk(); }

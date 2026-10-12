@@ -613,6 +613,50 @@ fading with distance so nothing shimmers), tinted by the depth of the same heigh
 first) over a sand bed, with Schlick Fresnel reflection of the frame's sky, a sun glint, ripples, and foam in
 a band that comes and goes along the shoreline.
 
+## The brook and the stone bridge
+
+A small brook runs 435 m from a spring on the hill (outside the fence, seen from the balloon) down to the lawn,
+under the stone bridge on the lawn route, west across the back yard, south down the west side of the clearing
+through a dingle cut across the lowland's rim (the pad is a shallow bowl: its lowest saddle is 6.1 m, the water
+at 4.3), and down a cascade to the sea 32 m west of where you land. Designed in `Research/brook-and-bridge.md`.
+
+**The land carries it** (`src/island/brook.cone`, run after the path in `bake()`). The heightfield is 2 m a
+sample and cannot hold a 1 m channel, so the land gets a wide shallow trench (the yard's flat bed is about 4.4 m
+across, the banks 1 in 2.2, joined to the ground by a smooth minimum; the dingle is up to 2.8 m deep at the rim,
+banks 1 in 3) and the water is a ribbon lying in it. The course is a Catmull-Rom curve through `BROOK_CONTROLS`,
+a point about every metre (`brookPoints`); the water's level at each control is a table, held to the ground's
+smoothed height less 0.3 m, never rising, falling at least 0.3% in the yard, and in steps of 0.3 m down the
+cascade. `--checks` walk the course: the ground under the ribbon is never within 0.08 m of the water, the water
+never rises, it keeps 8 m off the path and inside the fence, and the yard centreline stays 15 m behind the
+cottage's front wall (a cottage turned a quarter turn, its side wall up to 12 m long running back, leaves 3.6 m
+to the centreline). The distance to the course (8 m at most) is the ground mask's blue channel
+(`brookDistanceAt`).
+
+**The water** (`src/brook.slang`, `bakedworld/brook.cone`) is one see-through ribbon mesh, seven vertices across
+a station every half metre, drawn after the opaque things (premultiplied alpha, depth tested, not written). The
+vertex data is packed into the three streams (uv: across and along in metres; normal: speed, foam, half width).
+Two layers of value noise scroll downstream at speeds that differ, the middle faster than the edges, their slopes
+tilting the normal in the ribbon's own frame (found from screen derivatives); the colour is the sea's way: a faint
+tea-green body, the sky by Schlick's Fresnel, the sun's glint on the ripples, foam round the bed stones and at the
+foot of each step, an edge that fades and an end that fades away at the sea. The speed follows the fall (about
+0.4 m/s in the yard, a metre in the dingle). Water is not solid and not part of `groundHeight`: a walker wades
+along the bed.
+
+**The bed and its edge** are items of the vegetation's layout (`layout.cone`, last, so existing placement only
+shifts where the brook's clearing discs cut it): about 70 squat rocks in the water (tops 5 cm over the surface and
+at most 0.36 m over the bed, so a walker wades over them: a low solid is a step), 100 edging stones along the
+yard's lips, and ferns beside them; a disc every 3 m along the course (2.6 m, 3.2 m in the dingle) keeps every
+tree, rock and plant out of the channel.
+
+**The bridge** (`bakedworld/bridge.cone`) is a single low segmental arch of rubble masonry on the lawn route at
+(-7.0, 314.4): 3.0 m clear span, 2.0 m wide over all, 1.4 m between its parapets, a flat crest 2.0 m long at
+0.58 m over the banks, ramps of 2.5 m each side (13 degrees), parapets 0.55 m high with rough copings. Four
+parts built flat-shaded from quads in `surfacepatterns` rock (0.35 m blocks, lichen; the underside mossier). Its
+collision is nine `Solid`s built from the same numbers (`bridgeSolids`): the crest, the two ramps (a sloped
+top: `Solid.ramp`, a box whose top rises linearly along x or z, general, usable for any ramp) and a parapet on
+each side of each. `--checks`: a walker climbs the south ramp, crosses the crest at 0.58 m and comes down the
+north ramp at the road's height; the parapets stop it on the crest, on a ramp, and from the bank beside it.
+
 ## The cottage, measured from the reference frame
 
 The frame is `forest-cottage-dusk.jpg` (640 x 1136; `C:\src\reference-images\cottage`). The ruler is its
