@@ -127,6 +127,13 @@ pub struct UserController {
   pub fn bind(ctx &mut Context) UserController { new UserController(WalkActions.bind(ctx)); }
 
   // This frame's intents, from the actions
+  // The view's pitch keys this frame: PageUp 1 (look up) to PageDown -1
+  pub fn lookKeys(self &, ctx &Context) f32 { clampUnit(ctx.axis1(actions.look)); }
+
+  // The view's pitch change this frame from the mouse, in radians: a drag
+  // upward with the right button held looks up
+  pub fn lookDrag(self &, ctx &Context) f32 { 0. - ctx.axis2(actions.drag).y * LOOK_PER_UNIT; }
+
   pub fn intents(self &, ctx &Context) Intents {
     new Intents(clampUnit(ctx.axis1(actions.move)), clampUnit(ctx.axis1(actions.turn)), ctx.down(actions.run),
       ctx.down(actions.jump));
@@ -137,6 +144,12 @@ pub struct UserController {
 pub const VIEW_FIRST = 0u32;
 // Third person: behind and above
 pub const VIEW_THIRD = 1u32;
+
+// The view's pitch: radians a window unit of mouse drag turns it, how fast
+// PageUp/PageDown turn it (rad/s), and how far from level it may go (80 degrees)
+pub const LOOK_PER_UNIT = 0.004;
+pub const LOOK_KEY_RATE = 1.2;
+pub const LOOK_LIMIT = 1.3962634;
 
 // How far behind the third-person camera is, and how far above the chest
 pub const THIRD_BEHIND = 3.2;
@@ -150,10 +163,16 @@ pub struct ViewRig {
   cam Vec3;                   // the third-person camera's smoothed place
   eyeY f32;                   // the first-person eye's smoothed height
   fresh bool;                 // the next update snaps to its target
+  pub pitch f32;              // the user's look up (+) or down (-), radians, added to the view's own; 0 is as it was
 
   pub fn make(mode u32) ViewRig {
     imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
-    new ViewRig(mode, still, still, new Vec3(0., 0., 0.), 0., true);
+    new ViewRig(mode, still, still, new Vec3(0., 0., 0.), 0., true, 0.);
+  }
+
+  // Look up (+) or down (-) by 'd' radians, held short of straight up or down
+  pub fn tilt(self &mut, d f32) {
+    pitch = clampPitch(pitch + d);
   }
 
   pub fn toggle(self &mut) { mode = if mode == VIEW_FIRST { VIEW_THIRD; } else { VIEW_FIRST; }; fresh = true; }
@@ -184,7 +203,7 @@ pub struct ViewRig {
         // so the walk's bob is half what the head does
         imm eye = target.origin;
         eyeY = if fresh { eye.y; } else { eyeY + (eye.y - eyeY) * (1. - libc.expf(-18. * dt)); };
-        target = Pose.look(new Vec3(eye.x, eyeY, eye.z), yaw, 0.);
+        target = Pose.look(new Vec3(eye.x, eyeY, eye.z), yaw, clampPitch(pitch));
       } else {
         imm h = b.figure.height;
         imm chest = b.body.position + new Vec3(0., 0.80 * h, 0.);
@@ -196,13 +215,22 @@ pub struct ViewRig {
         cam = if fresh { want; } else { cam + (want - cam) * k; };
         imm d = chest - cam;
         imm flat = libc.sqrtf(d.x * d.x + d.z * d.z);
-        target = Pose.look(cam, libc.atan2f(0. - d.x, 0. - d.z), libc.atan2f(d.y, flat));
+        target = Pose.look(cam, libc.atan2f(0. - d.x, 0. - d.z), clampPitch(libc.atan2f(d.y, flat) + pitch));
       }
+    } elif pitch != 0. {
+      // The plain walker's eyes, tilted
+      target = Pose.look(target.origin, b.body.yaw, clampPitch(pitch));
     }
     before = if fresh { target; } else { now; };
     now = target;
     fresh = false;
   }
+}
+
+fn clampPitch(p f32) f32 {
+  if p > LOOK_LIMIT { return LOOK_LIMIT; }
+  if p < 0. - LOOK_LIMIT { return 0. - LOOK_LIMIT; }
+  p;
 }
 
 // A hard landing reported by a step: whose, how fast, what it cost

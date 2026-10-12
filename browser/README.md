@@ -81,7 +81,7 @@ Forty birds (`boidflock`) keep to within 90 m of the cottage (`BIRD_HOME_X/Z`, a
 separation, alignment and cohesion on their 7 nearest neighbours, steer round the ground and the hill (the
 flock is asked the ground's height, `ground.cone`), and beat their wings at 7 Hz on the level, up to 13 Hz
 climbing and down to 4.5 Hz diving, gliding between bursts. A bird is **one mesh drawn once, instanced** (a body,
-head and beak, a forked tail and two wings of ten stations with three primaries each, 0.54 m across): the flap
+head and beak, a forked tail and two wings of ten stations with three primaries each, `BIRD_SCALE` 2.2, so about 1.08 m across, dark grey-brown above and below so a flock reads as a silhouette against the sky): the flap
 is done in the vertex stage (`src/birdshader.slang`) from the phase and amplitude the flock gives each instance,
 so there is no CPU vertex work and one draw for all of them. The flock steps on scene time (paused with P, x10
 with F).
@@ -133,6 +133,7 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | D or Right | turn right |
 | Shift (held) | run (the mannequin 4.5 m/s; the plain walker four times as fast) |
 | Space | jump (a mannequin: 4.2 m/s up, 0.9 m) |
+| PageUp / PageDown, or drag with the right mouse button held | look up / down: the camera's pitch (first and third person, and the plain walker), held within 80 degrees of level; the walking direction does not change; it starts level and stays where you leave it (mouse yaw is not bound: A/D or Left/Right turn) |
 | **V** | **first person or third person**: the camera at the mannequin's eyes socket, or 3.2 m behind it and above, looking at its chest |
 | **Tab** | possess the next mannequin: the controls and the camera go to it, and the one left behind stands |
 | Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button in the basket sends the balloon on its ride |

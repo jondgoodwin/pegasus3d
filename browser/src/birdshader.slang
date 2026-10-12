@@ -28,9 +28,9 @@
 // no other animation data. The body does not flap.
 //
 // LIGHTING: two-sided (a wing is seen from above and below): the normal is
-// turned to face the eye, a wing seen from underneath is pale grey, from
-// above dark brown; the body is pale below and dark above by the mesh's own
-// normal; the beak orange. Lit by the frame's light and ambient, times the exposure.
+// turned to face the eye, a wing seen from underneath is dark grey-brown, from
+// above darker brown; the body is dark brown too, a little paler below (a crow's or a swift's
+// silhouette against the sky); the beak orange. Lit by the frame's light and ambient, times the exposure.
 
 import renderframe;
 
@@ -101,11 +101,11 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     bool seenFromAbove = dot(n, view) >= 0.0;
     if (!seenFromAbove) { n = -n; }
     float3 back = float3(0.075, 0.062, 0.050);
-    float3 belly = float3(0.55, 0.52, 0.46);
+    float3 belly = float3(0.10, 0.085, 0.070);   // dark too: seen from the ground a bird is a silhouette against the sky
     float3 albedo;
     if (wing) {
-        // Above dark brown with a paler edge's worth of variation by the tint, below a pale grey
-        albedo = seenFromAbove ? back : float3(0.46, 0.44, 0.40);
+        // Above dark brown with a paler edge's worth of variation by the tint, below a dark grey-brown
+        albedo = seenFromAbove ? back : float3(0.11, 0.095, 0.080);
     } else {
         albedo = lerp(belly, back, smoothstep(-0.35, 0.35, input.restUp.x));
         if (input.flags.y > 0.5) { albedo = float3(0.70, 0.45, 0.12); }
