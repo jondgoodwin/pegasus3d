@@ -196,6 +196,43 @@ def main():
         print(f'     B draws A about {mean/60*1000:.0f} ms in the past (the server\'s tick now less the one drawn, by the wall clock: '
               f'{lags[0]:.1f} to {lags[-1]:.1f} ticks, median {lags[len(lags)//2]:.1f})')
 
+    # The villagers (npcs.cone), the simulation's own beings: B's drawing of each (TV) against the server's path for it (TN)
+    npath = {}
+    for line in S:
+        if line.startswith('TN '):
+            _, tick, qpc, being, x, y, z = line.split()
+            ticks, pos = npath.setdefault(int(being), ([], []))
+            ticks.append(int(tick)); pos.append((int(x) / 1000.0, int(y) / 1000.0, int(z) / 1000.0))
+    check(len(npath) >= 1, f'the server walked {len(npath)} villagers')
+    for vb in sorted(npath):
+        vticks, vpos = npath[vb]
+        vtv = []
+        for l in B:
+            if l.startswith('TV '):
+                _, at, qpc, being, x, y, z = l.split()
+                if int(being) == vb:
+                    vtv.append((int(at) / 1000.0, int(qpc), (int(x) / 1000.0, int(y) / 1000.0, int(z) / 1000.0)))
+        vq0 = vtv[0][1] + 3 * (freq or 10000000.0) if vtv else 0
+        verrs = []
+        vmoved = 0.0
+        vlast = None
+        for at, qpc, p in vtv:
+            if qpc < vq0 or at < vticks[0] or at > vticks[-1]:
+                continue
+            sp = interp(vticks, vpos, at)
+            verrs.append(((p[0] - sp[0]) ** 2 + (p[1] - sp[1]) ** 2 + (p[2] - sp[2]) ** 2) ** 0.5)
+            if vlast is not None:
+                vmoved += ((p[0] - vlast[0]) ** 2 + (p[2] - vlast[2]) ** 2) ** 0.5
+            vlast = p
+        if verrs:
+            verrs.sort()
+            sm = sum(((vpos[i][0] - vpos[i - 1][0]) ** 2 + (vpos[i][2] - vpos[i - 1][2]) ** 2) ** 0.5 for i in range(1, len(vpos)))
+            print(f'     villager {vb}: the server walked it {sm:.1f} m; B drew it {len(verrs)} times, {vmoved:.1f} m, worst {verrs[-1]:.3f} m from the '
+                  f'server\'s path, 95th percentile {verrs[int(len(verrs)*0.95)]:.3f} m')
+            check(verrs[-1] <= args.tolerance, f'B follows villager {vb}\'s server path within {args.tolerance} m')
+        else:
+            check(False, f'B drew villager {vb}')
+
     # Bandwidth
     secs = args.seconds
     for line in S:

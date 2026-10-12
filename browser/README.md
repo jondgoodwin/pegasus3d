@@ -307,8 +307,10 @@ Four mannequins (beings 3 to 6, after the user's and the idle one) live on the i
 are **the simulation's** (`src/npcs.cone`): each is a being like the user's, walked by the same character
 controller and posed by `walkgait`, whose intents (a turn and an ahead, never a key) come from a mind instead of
 the keyboard. They cross in the snapshot as every being does, and the view draws them as it draws the idle mannequin
-(single player: stepped from the snapshot's intents; connected: interpolated). Every mode has them (a script's, a
-server's, the user's); **Tab skips them** (`Being.ai`).
+(single player: stepped from the snapshot's intents; connected: interpolated). Every mode has them from the start (a
+server's, the user's) except a scripted run, which makes them at the end of its own part (`src/npcscript.cone`: four
+pictures, `npc-villager`, `npc-gardener`, `npc-follower` and `npc-shy`), so that the shots of everything before are of
+the world alone. **Tab skips them** (`Being.ai`).
 
 | Villager | What it does | Made of |
 | --- | --- | --- |
