@@ -74,7 +74,7 @@ def main():
     alog = os.path.join(args.out, f'{tag}-clientA.log')
     blog = os.path.join(args.out, f'{tag}-clientB.log')
 
-    server_cmd = [exe, '--serve', str(args.port), '--run-for', str(args.seconds + 50), '--trace']
+    server_cmd = [exe, '--serve', str(args.port), '--loopback', '--run-for', str(args.seconds + 50), '--trace']
     if args.impair:
         server_cmd += ['--impair'] + [str(v) for v in args.impair]
     procs = []
