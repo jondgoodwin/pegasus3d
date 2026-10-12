@@ -273,26 +273,88 @@ pub const PAD_HEIGHT f32 = 4.6;
 
 // ---- The grid, stored ----
 
-mut heights List[f32];
-mut pathDistance List[f32];   // metres to the path's centre, capped
-fn @initpure init() {
-  heights = List[f32].empty();
-  pathDistance = List[f32].empty();
-  centre = List[Vec3].empty();
-  centreXZ = List[Vec2].empty();
-  fence = List[Vec2].empty();
-  brook = List[BrookPoint].empty();
-  brookDistance = List[f32].empty();
-}
-mut baked bool = false;
-mut bakeMs f64 = 0d;
-mut hillScale f32 = 1.;
+// What the bake makes, and every query reads: the land's heights and the distance grids, the path's centreline, the fence and the
+// brook's course. It is made whole in a local by bake() and then published (below); nothing changes it after.
+struct Island {
+  heights List[f32];
+  pathDistance List[f32];     // metres to the path's centre, capped
+  centre List[Vec3];          // the path's centreline, a point every metre, on the ground
+  fence List[Vec2];
+  brook List[BrookPoint];
+  brookDistance List[f32];    // metres to the course, capped at BROOK_NEAR
 
-// Sample (i, j) of the field; clamped to the grid
-fn sample(i i32, j i32) f32 {
-  imm ci = if i < 0 { 0; } elif i >= N { N - 1; } else { i; };
-  imm cj = if j < 0 { 0; } elif j >= N { N - 1; } else { j; };
-  *heights[usize.from(cj * N + ci)];
+  fn empty() Island {
+    new Island(List[f32].empty(), List[f32].empty(), List[Vec3].empty(), List[Vec2].empty(), List[BrookPoint].empty(),
+      List[f32].empty());
+  }
+
+  // Sample (i, j) of the field; clamped to the grid
+  fn sample(self &, i i32, j i32) f32 {
+    imm ci = if i < 0 { 0; } elif i >= N { N - 1; } else { i; };
+    imm cj = if j < 0 { 0; } elif j >= N { N - 1; } else { j; };
+    *heights[usize.from(cj * N + ci)];
+  }
+
+  // The ground's height at (x, z), exact against the drawn fine mesh's triangles (outside the grid: the sea floor's depth at its
+  // edge)
+  fn heightAt(self &, x f32, z f32) f32 {
+    imm gx = (x + HALF) / CELL;
+    imm gz = (z + HALF) / CELL;
+    if gx < 0. or gz < 0. or gx >= f32.from(N - 1) or gz >= f32.from(N - 1) { return -30.; }
+    imm i = i32.from(libc.floorf(gx));
+    imm j = i32.from(libc.floorf(gz));
+    imm fx = gx - f32.from(i);
+    imm fz = gz - f32.from(j);
+    imm a = self.sample(i, j);
+    imm b = self.sample(i + 1, j);
+    imm c = self.sample(i, j + 1);
+    imm d = self.sample(i + 1, j + 1);
+    if !diagonalFlipped(i, j) {
+      // The diagonal from a to d
+      if fx >= fz { return a + fx * (b - a) + fz * (d - b); }
+      return a + fx * (d - c) + fz * (c - a);
+    }
+    // The diagonal from b to c
+    if fx + fz <= 1. { return a + fx * (b - a) + fz * (c - a); }
+    d + (1. - fx) * (c - d) + (1. - fz) * (b - d);
+  }
+
+  // The point of the fence's edge nearest (x, z), and how far it is
+  fn nearestOnFence(self &, x f32, z f32, onEdge &mut Vec2) f32 {
+    mut best f32 = 1000000.;
+    mut k = 0usize;
+    while k < fence.len() {
+      imm a = *fence[k];
+      imm b = *fence[if k + 1usize == fence.len() { 0usize; } else { k + 1usize; }];
+      imm abx = b.x - a.x;
+      imm abz = b.y - a.y;
+      imm t = clamp01(((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz));
+      imm px = a.x + abx * t;
+      imm pz = a.y + abz * t;
+      imm d = len2(x - px, z - pz);
+      if d < best { best = d; *onEdge = new Vec2(px, pz); }
+      k = k + 1usize;
+    }
+    best;
+  }
+
+  // Whether (x, z) is inside the fence
+  fn inside(self &, x f32, z f32) bool { polygonContains(fence.view(), new Vec2(x, z)); }
+}
+
+// The baked island, published once by bake() through an atomic pointer (an 'imm' global holding an atomic, the one form a global
+// may take that is set after startup): null until then. The queries below are free functions called from every actor's thread,
+// which read it only after bake() has returned on the main thread, before the actors start. It is never freed.
+imm islandCell Atomic[*Island];
+
+fn @initpure init() {
+  islandCell = Atomic[*Island].of(null);
+}
+
+fn publishIsland(isl Island) {
+  imm p = libc.malloc(mem.sizeof[Island]()) as *Island;
+  mem.writeRaw[Island](p, isl);
+  islandCell.store(p);
 }
 
 // Whether the quad (i, j) of the mesh is split along its other diagonal,
@@ -303,26 +365,10 @@ pub fn diagonalFlipped(i i32, j i32) bool { ((i + j) & 1) == 1; }
 // The ground's height at (x, z), exact against the drawn fine mesh's triangles
 // (outside the grid: the sea floor's depth at its edge)
 pub fn groundHeight(x f32, z f32) f32 {
-  if !baked { return 0.; }
-  imm gx = (x + HALF) / CELL;
-  imm gz = (z + HALF) / CELL;
-  if gx < 0. or gz < 0. or gx >= f32.from(N - 1) or gz >= f32.from(N - 1) { return -30.; }
-  imm i = i32.from(libc.floorf(gx));
-  imm j = i32.from(libc.floorf(gz));
-  imm fx = gx - f32.from(i);
-  imm fz = gz - f32.from(j);
-  imm a = sample(i, j);
-  imm b = sample(i + 1, j);
-  imm c = sample(i, j + 1);
-  imm d = sample(i + 1, j + 1);
-  if !diagonalFlipped(i, j) {
-    // The diagonal from a to d
-    if fx >= fz { return a + fx * (b - a) + fz * (d - b); }
-    return a + fx * (d - c) + fz * (c - a);
-  }
-  // The diagonal from b to c
-  if fx + fz <= 1. { return a + fx * (b - a) + fz * (c - a); }
-  d + (1. - fx) * (c - d) + (1. - fz) * (b - d);
+  imm p = islandCell.load();
+  if p == null { return 0.; }
+  imm isl = &*p;
+  isl.heightAt(x, z);
 }
 
 // The ground's slope (rise over run) at (x, z), by differences either side
@@ -335,7 +381,7 @@ pub fn groundSlope(x f32, z f32) f32 {
 
 // ---- The bake ----
 
-fn bakeGrid() {
+fn bakeGrid(isl &mut Island) {
   imm total = usize.from(N * N);
   // 1. The hill's scale: its raw summit, found on a coarse grid, set to HILL_HEIGHT
   mut top f32 = 0.;
@@ -351,12 +397,11 @@ fn bakeGrid() {
     }
     j = j + 16;
   }
-  hillScale = HILL_HEIGHT / top;
+  imm scale = HILL_HEIGHT / top;
   // 2. The raw hill on the grid (where it is not zero)
   mut raw = List[f32].withCapacity(total);
   raw.resize(total, 0.);
   // each of the parallel loops fills one buffer a row to a pass
-  imm scale = hillScale;
   imm row = usize.from(N);
   parallel each jj, line in raw.mutChunks(row).indexed() {
     imm j = i32.from(jj);
@@ -399,7 +444,7 @@ fn bakeGrid() {
       *v = landHeight(x, z, *eroded[jj * row + ii]);
     }
   }
-  heights = land;
+  isl.heights = land;
 }
 
 // ---- The path ----
@@ -415,8 +460,6 @@ pub const PATH_HALF_WIDTH f32 = 0.9;
 // How far the path's carve reaches
 const PATH_REACH f32 = 6.;
 
-mut centre List[Vec3];        // the path's centreline, a point every metre, on the ground
-mut centreXZ List[Vec2];
 
 // Catmull-Rom through four points, at t from 0 to 1 between the middle two
 fn catmull(p0 f32, p1 f32, p2 f32, p3 f32, t f32) f32 {
@@ -425,8 +468,8 @@ fn catmull(p0 f32, p1 f32, p2 f32, p3 f32, t f32) f32 {
 }
 
 // The path's polyline, sampled every metre or so along the curve
-fn buildCentre() {
-  centreXZ = List[Vec2].empty();
+fn buildCentre() List[Vec2] {
+  mut centreXZ = List[Vec2].empty();
   imm n = 9usize;
   mut k = 0usize;
   while k + 1usize < n {
@@ -451,18 +494,19 @@ fn buildCentre() {
     k = k + 1usize;
   }
   centreXZ.push(new Vec2(PATH_CONTROLS[16], PATH_CONTROLS[17]));
+  centreXZ;
 }
 
 // The path pressed into the ground: its height smoothed along it (a box of
 // about 9 m, twice), then within PATH_REACH of it the ground eased to that
 // height less 6 cm; and the grid of distances to it
-fn carvePath() {
-  buildCentre();
+fn carvePath(isl &mut Island) {
+  imm centreXZ = buildCentre();
   imm n = centreXZ.len();
   mut hp = List[f32].withCapacity(n);
   mut k = 0usize;
   while k < n {
-    hp.push(groundHeight(centreXZ[k].x, centreXZ[k].y));
+    hp.push(isl.heightAt(centreXZ[k].x, centreXZ[k].y));
     k = k + 1usize;
   }
   mut pass = 0;
@@ -488,12 +532,12 @@ fn carvePath() {
   hp.set(n - 1usize, PAD_HEIGHT);
   mut best = List[f32].withCapacity(usize.from(N * N));
   mut target = List[f32].withCapacity(usize.from(N * N));
-  pathDistance = List[f32].withCapacity(usize.from(N * N));
+  isl.pathDistance = List[f32].withCapacity(usize.from(N * N));
   mut q = 0;
   while q < N * N {
     best.push(99.);
     target.push(0.);
-    pathDistance.push(16.);
+    isl.pathDistance.push(16.);
     q = q + 1;
   }
   k = 0usize;
@@ -524,7 +568,7 @@ fn carvePath() {
         if d < *best[idx] {
           best.set(idx, d);
           target.set(idx, mixf(ha, hb, t));
-          pathDistance.set(idx, minf(d, 16.));
+          isl.pathDistance.set(idx, minf(d, 16.));
         }
         i = i + 1;
       }
@@ -541,16 +585,16 @@ fn carvePath() {
       imm x = f32.from(i32.from(idx) % N) * CELL - HALF;
       imm z = f32.from(i32.from(idx) / N) * CELL - HALF;
       imm press = 0.05 * smooth(5., 14., len2(x - PATH_CONTROLS[16], z - PATH_CONTROLS[17]));
-      heights.set(idx, mixf(*heights[idx], *target[idx] - press, w));
+      isl.heights.set(idx, mixf(*isl.heights[idx], *target[idx] - press, w));
     }
     idx = idx + 1usize;
   }
   // The centreline on the carved ground
-  centre = List[Vec3].withCapacity(n);
+  isl.centre = List[Vec3].withCapacity(n);
   k = 0usize;
   while k < n {
     imm p = *centreXZ[k];
-    centre.push(new Vec3(p.x, groundHeight(p.x, p.y), p.y));
+    isl.centre.push(new Vec3(p.x, isl.heightAt(p.x, p.y), p.y));
     k = k + 1usize;
   }
 }
@@ -559,15 +603,21 @@ fn carvePath() {
 // about every metre, on the ground (x, y, z), for lanterns, edging stones and
 // walkers to follow
 pub fn pathCentreline() List[Vec3] {
-  mut out = List[Vec3].withCapacity(centre.len());
+  imm p = islandCell.load();
+  if p == null { return List[Vec3].empty(); }
+  imm isl = &*p;
+  mut out = List[Vec3].withCapacity(isl.centre.len());
   mut k = 0usize;
-  while k < centre.len() { out.push(*centre[k]); k = k + 1usize; }
+  while k < isl.centre.len() { out.push(*isl.centre[k]); k = k + 1usize; }
   out;
 }
 
 // How far (x, z) is from the path's centre, in metres (16 at the most)
 pub fn pathDistanceAt(x f32, z f32) f32 {
-  if !baked or pathDistance.len() == 0usize { return 16.; }
+  imm p = islandCell.load();
+  if p == null { return 16.; }
+  imm isl = &*p;
+  if isl.pathDistance.len() == 0usize { return 16.; }
   imm gx = clamp01((x + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
   imm gz = clamp01((z + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
   imm i = minf(libc.floorf(gx), f32.from(N - 2));
@@ -576,10 +626,10 @@ pub fn pathDistanceAt(x f32, z f32) f32 {
   imm fz = gz - j;
   imm ii = i32.from(i);
   imm jj = i32.from(j);
-  imm a = *pathDistance[usize.from(jj * N + ii)];
-  imm b = *pathDistance[usize.from(jj * N + ii + 1)];
-  imm c = *pathDistance[usize.from((jj + 1) * N + ii)];
-  imm d = *pathDistance[usize.from((jj + 1) * N + ii + 1)];
+  imm a = *isl.pathDistance[usize.from(jj * N + ii)];
+  imm b = *isl.pathDistance[usize.from(jj * N + ii + 1)];
+  imm c = *isl.pathDistance[usize.from((jj + 1) * N + ii)];
+  imm d = *isl.pathDistance[usize.from((jj + 1) * N + ii + 1)];
   mixf(mixf(a, b, fx), mixf(c, d, fx), fz);
 }
 
@@ -592,44 +642,31 @@ imm FENCE_CORNERS Array[f32, 22] = [
   -190., 285.,   175., 285.,   200., 430.,   175., 540.,   120., 552.,   60., 525.,
   0., 507.,   -60., 505.,   -120., 512.,   -200., 545.,   -215., 420.];
 
-mut fence List[Vec2];
-
 pub fn fencePolygon() List[Vec2] {
-  mut out = List[Vec2].withCapacity(fence.len());
+  imm p = islandCell.load();
+  if p == null { return List[Vec2].empty(); }
+  imm isl = &*p;
+  mut out = List[Vec2].withCapacity(isl.fence.len());
   mut k = 0usize;
-  while k < fence.len() { out.push(*fence[k]); k = k + 1usize; }
+  while k < isl.fence.len() { out.push(*isl.fence[k]); k = k + 1usize; }
   out;
 }
 
-fn buildFence() {
-  fence = List[Vec2].empty();
+fn buildFence(isl &mut Island) {
+  isl.fence = List[Vec2].empty();
   mut k = 0usize;
   while k < 11usize {
-    fence.push(new Vec2(FENCE_CORNERS[k * 2usize], FENCE_CORNERS[k * 2usize + 1usize]));
+    isl.fence.push(new Vec2(FENCE_CORNERS[k * 2usize], FENCE_CORNERS[k * 2usize + 1usize]));
     k = k + 1usize;
   }
 }
 
 // Whether (x, z) is inside the fence
-pub fn insideFence(x f32, z f32) bool { polygonContains(fence.view(), new Vec2(x, z)); }
-
-// The point of the fence's edge nearest (x, z), and how far it is
-fn nearestOnFence(x f32, z f32, onEdge &mut Vec2) f32 {
-  mut best f32 = 1000000.;
-  mut k = 0usize;
-  while k < fence.len() {
-    imm a = *fence[k];
-    imm b = *fence[if k + 1usize == fence.len() { 0usize; } else { k + 1usize; }];
-    imm abx = b.x - a.x;
-    imm abz = b.y - a.y;
-    imm t = clamp01(((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz));
-    imm px = a.x + abx * t;
-    imm pz = a.y + abz * t;
-    imm d = len2(x - px, z - pz);
-    if d < best { best = d; *onEdge = new Vec2(px, pz); }
-    k = k + 1usize;
-  }
-  best;
+pub fn insideFence(x f32, z f32) bool {
+  imm p = islandCell.load();
+  if p == null { return polygonContains(List[Vec2].empty().view(), new Vec2(x, z)); }
+  imm isl = &*p;
+  isl.inside(x, z);
 }
 
 // The deepest water a walker may wade into (metres below the sea's level)
@@ -641,11 +678,13 @@ pub const WADE_DEPTH f32 = 0.6;
 // it); and shallow water only knee deep, never farther (the same, along the
 // axis that is clear). Positions are on the ground plane (x, z); y is kept.
 pub fn constrain(from Vec3, to Vec3) Vec3 {
-  if !baked { return to; }
+  imm cell = islandCell.load();
+  if cell == null { return to; }
+  imm isl = &*cell;
   mut p = to;
-  if !insideFence(p.x, p.z) {
+  if !isl.inside(p.x, p.z) {
     mut edge = new Vec2(from.x, from.z);
-    imm d = nearestOnFence(p.x, p.z, &mut edge);
+    imm d = isl.nearestOnFence(p.x, p.z, &mut edge);
     // A hair inside: from where it meant to go to the edge's nearest point is
     // the way in, square to the edge
     imm inx = edge.x - p.x;
@@ -654,11 +693,11 @@ pub fn constrain(from Vec3, to Vec3) Vec3 {
     p = if il > 0.0001 and d > 0. {
       new Vec3(edge.x + inx / il * 0.02, p.y, edge.y + inz / il * 0.02);
     } else { new Vec3(from.x, p.y, from.z); };
-    if !insideFence(p.x, p.z) { p = new Vec3(from.x, p.y, from.z); }
+    if !isl.inside(p.x, p.z) { p = new Vec3(from.x, p.y, from.z); }
   }
-  if groundHeight(p.x, p.z) < 0. - WADE_DEPTH {
-    if groundHeight(p.x, from.z) >= 0. - WADE_DEPTH { p = new Vec3(p.x, p.y, from.z); }
-    elif groundHeight(from.x, p.z) >= 0. - WADE_DEPTH { p = new Vec3(from.x, p.y, p.z); }
+  if isl.heightAt(p.x, p.z) < 0. - WADE_DEPTH {
+    if isl.heightAt(p.x, from.z) >= 0. - WADE_DEPTH { p = new Vec3(p.x, p.y, from.z); }
+    elif isl.heightAt(from.x, p.z) >= 0. - WADE_DEPTH { p = new Vec3(from.x, p.y, p.z); }
     else { p = new Vec3(from.x, p.y, from.z); }
   }
   p;
@@ -685,6 +724,8 @@ pub fn forestDensity(x f32, z f32) f32 {
 // path's distance is a field of its own, pathGrid: a byte is too coarse for
 // it). Rows from the grid's -z edge (row 0), as the heights are.
 pub fn maskImage() Image {
+  imm cell = islandCell.load();
+  imm isl = &*cell;
   mut px = List[u8].withCapacity(usize.from(N * N * 4));
   mut j = 0;
   while j < N {
@@ -693,8 +734,8 @@ pub fn maskImage() Image {
       imm x = f32.from(i) * CELL - HALF;
       imm z = f32.from(j) * CELL - HALF;
       imm litter = clamp01(forestDensity(x, z) * 1.4);
-      imm pd = *pathDistance[usize.from(j * N + i)];
-      imm bd = *brookDistance[usize.from(j * N + i)];
+      imm pd = *isl.pathDistance[usize.from(j * N + i)];
+      imm bd = *isl.brookDistance[usize.from(j * N + i)];
       px.push(u8.from(litter * 255.));
       px.push(u8.from(clamp01(pd / 16.) * 255.));
       px.push(u8.from(clamp01(bd / BROOK_NEAR) * 255.));
@@ -708,30 +749,36 @@ pub fn maskImage() Image {
 
 // The height grid, for the GPU (one f32 a sample, row by row from -z)
 pub fn heightGrid() List[f32] {
-  mut out = List[f32].withCapacity(heights.len());
+  imm p = islandCell.load();
+  if p == null { return List[f32].empty(); }
+  imm isl = &*p;
+  mut out = List[f32].withCapacity(isl.heights.len());
   mut k = 0usize;
-  while k < heights.len() { out.push(*heights[k]); k = k + 1usize; }
+  while k < isl.heights.len() { out.push(*isl.heights[k]); k = k + 1usize; }
   out;
 }
 
 // The distance to the path at every sample (metres, 16 at most), for the GPU:
 // one f32 a sample, row by row from -z, as the heights are
 pub fn pathGrid() List[f32] {
-  mut out = List[f32].withCapacity(pathDistance.len());
+  imm p = islandCell.load();
+  if p == null { return List[f32].empty(); }
+  imm isl = &*p;
+  mut out = List[f32].withCapacity(isl.pathDistance.len());
   mut k = 0usize;
-  while k < pathDistance.len() { out.push(*pathDistance[k]); k = k + 1usize; }
+  while k < isl.pathDistance.len() { out.push(*isl.pathDistance[k]); k = k + 1usize; }
   out;
 }
 
 // Bake the island (once)
 pub fn bake() {
-  if baked { return; }
-  bakeGrid();
-  baked = true;
-  centre = List[Vec3].empty();
-  buildFence();
-  carvePath();
-  carveBrook();
+  if islandCell.load() != null { return; }
+  mut isl = Island.empty();
+  bakeGrid(&mut isl);
+  buildFence(&mut isl);
+  carvePath(&mut isl);
+  carveBrook(&mut isl);
+  publishIsland(isl);
 }
 
 // ---- The meshes ----
@@ -858,15 +905,17 @@ fn markPixel(px &mut List[u8], x f32, z f32, r u8, g u8, b u8, radius i32) {
 // sea by depth, land by height with contour lines every 10 m, shaded by the slope
 pub fn writePreview(file &str) bool {
   bake();
+  imm cell = islandCell.load();
+  imm isl = &*cell;
   mut px = List[u8].withCapacity(usize.from(N * N * 3));
   // Bottom row first: image row 0 is the south (largest z)
   mut j = N - 1;
   while j >= 0 {
     mut i = 0;
     while i < N {
-      imm h = sample(i, j);
-      imm hx = (sample(i + 1, j) - sample(i - 1, j)) / (2. * CELL);
-      imm hz = (sample(i, j + 1) - sample(i, j - 1)) / (2. * CELL);
+      imm h = isl.sample(i, j);
+      imm hx = (isl.sample(i + 1, j) - isl.sample(i - 1, j)) / (2. * CELL);
+      imm hz = (isl.sample(i, j + 1) - isl.sample(i, j - 1)) / (2. * CELL);
       imm lit = clamp01(0.62 + 0.8 * (hx * 0.5 + hz * 0.6));
       mut r f32 = 0.;
       mut g f32 = 0.;
@@ -895,20 +944,20 @@ pub fn writePreview(file &str) bool {
   }
   // The path in red-brown, the fence in white, the cottage a yellow dot
   mut m = 0usize;
-  while m < centre.len() {
-    markPixel(&mut px, centre[m].x, centre[m].z, 200u8, 80u8, 40u8, 1);
+  while m < isl.centre.len() {
+    markPixel(&mut px, isl.centre[m].x, isl.centre[m].z, 200u8, 80u8, 40u8, 1);
     m = m + 1usize;
   }
   // The brook in blue
   m = 0usize;
-  while m < brook.len() {
-    markPixel(&mut px, brook[m].x, brook[m].z, 60u8, 140u8, 255u8, 1);
+  while m < isl.brook.len() {
+    markPixel(&mut px, isl.brook[m].x, isl.brook[m].z, 60u8, 140u8, 255u8, 1);
     m = m + 1usize;
   }
   m = 0usize;
-  while m < fence.len() {
-    imm a = *fence[m];
-    imm b = *fence[if m + 1usize == fence.len() { 0usize; } else { m + 1usize; }];
+  while m < isl.fence.len() {
+    imm a = *isl.fence[m];
+    imm b = *isl.fence[if m + 1usize == isl.fence.len() { 0usize; } else { m + 1usize; }];
     mut t f32 = 0.;
     while t < 1. {
       markPixel(&mut px, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, 255u8, 255u8, 255u8, 0);

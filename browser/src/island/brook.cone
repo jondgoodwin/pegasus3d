@@ -71,9 +71,6 @@ pub struct BrookPoint {
   pub t f32;
 }
 
-mut brook List[BrookPoint];
-mut brookDistance List[f32];   // metres to the course, capped at BROOK_NEAR
-
 pub const BROOK_NEAR f32 = 8.;
 
 fn table(a &Array[f32, 26], k usize, t f32) f32 { mixf(a[k], a[if k + 1usize < BROOK_N { k + 1usize; } else { k; }], t); }
@@ -84,8 +81,8 @@ fn brookPointAt(k usize, t f32, x f32, z f32) BrookPoint {
 }
 
 // The course sampled about every metre along the curve (a point's s the length of the polyline before it)
-fn buildBrook() {
-  brook = List[BrookPoint].empty();
+fn buildBrook(isl &mut Island) {
+  isl.brook = List[BrookPoint].empty();
   mut k = 0usize;
   while k + 1usize < BROOK_N {
     imm i0 = if k == 0usize { 0usize; } else { k - 1usize; };
@@ -102,18 +99,18 @@ fn buildBrook() {
     mut s = 0;
     while s < steps {
       imm t = f32.from(s) / f32.from(steps);
-      brook.push(brookPointAt(k, t, catmull(ax, bx, cx, dx, t), catmull(az, bz, cz, dz, t)));
+      isl.brook.push(brookPointAt(k, t, catmull(ax, bx, cx, dx, t), catmull(az, bz, cz, dz, t)));
       s = s + 1;
     }
     k = k + 1usize;
   }
-  brook.push(brookPointAt(BROOK_N - 2usize, 1., BROOK_CONTROLS[(BROOK_N - 1usize) * 2usize], BROOK_CONTROLS[(BROOK_N - 1usize) * 2usize + 1usize]));
+  isl.brook.push(brookPointAt(BROOK_N - 2usize, 1., BROOK_CONTROLS[(BROOK_N - 1usize) * 2usize], BROOK_CONTROLS[(BROOK_N - 1usize) * 2usize + 1usize]));
   // Metres along
   mut run f32 = 0.;
   mut i = 1usize;
-  while i < brook.len() {
-    run = run + len2(brook[i].x - brook[i - 1usize].x, brook[i].z - brook[i - 1usize].z);
-    brook.set(i, atLength(*brook[i], run));
+  while i < isl.brook.len() {
+    run = run + len2(isl.brook[i].x - isl.brook[i - 1usize].x, isl.brook[i].z - isl.brook[i - 1usize].z);
+    isl.brook.set(i, atLength(*isl.brook[i], run));
     i = i + 1usize;
   }
 }
@@ -125,12 +122,12 @@ fn atLength(p BrookPoint, s f32) BrookPoint {
 // The water's level along the course: the table, held to the ground's smoothed height (a 9 m box twice)
 // less 0.3 m, in steps down the cascade, never rising and falling at least the reach's least, and not
 // below the sea's edge
-fn brookLevels() {
-  imm n = brook.len();
+fn brookLevels(isl &mut Island) {
+  imm n = isl.brook.len();
   mut hp = List[f32].withCapacity(n);
   mut k = 0usize;
   while k < n {
-    hp.push(groundHeight(brook[k].x, brook[k].z));
+    hp.push(isl.heightAt(isl.brook[k].x, isl.brook[k].z));
     k = k + 1usize;
   }
   mut pass = 0;
@@ -158,7 +155,7 @@ fn brookLevels() {
   mut out = List[BrookPoint].withCapacity(n);
   k = 0usize;
   while k < n {
-    imm p = *brook[k];
+    imm p = *isl.brook[k];
     mut w = minf(p.w, *hp[k] - 0.3);
     if p.ctl >= BROOK_CASCADE_FROM and p.ctl < BROOK_CASCADE_TO {
       imm u = (w - endW) / BROOK_STEP;
@@ -166,7 +163,7 @@ fn brookLevels() {
       w = endW + BROOK_STEP * (fl + smooth(0.86, 1.0, u - fl));
     }
     if k > 0usize {
-      imm ds = p.s - brook[k - 1usize].s;
+      imm ds = p.s - isl.brook[k - 1usize].s;
       imm fall = table(&BROOK_FALL, p.ctl, p.t);
       w = minf(w, prev - fall * ds);
     }
@@ -176,31 +173,31 @@ fn brookLevels() {
     out.push(new BrookPoint(p.x, p.z, w, p.width, p.s, p.halfBed, p.side, p.blend, p.depth, p.ctl, p.t));
     k = k + 1usize;
   }
-  brook = out;
+  isl.brook = out;
 }
 
 // The land cut into a trench along the course, and the grid of distances to it
-fn carveBrook() {
-  buildBrook();
-  brookLevels();
-  imm n = brook.len();
+fn carveBrook(isl &mut Island) {
+  buildBrook(isl);
+  brookLevels(isl);
+  imm n = isl.brook.len();
   imm cells = usize.from(N * N);
   mut best = List[f32].withCapacity(cells);
   mut bestK = List[u32].withCapacity(cells);
   mut bestT = List[f32].withCapacity(cells);
-  brookDistance = List[f32].withCapacity(cells);
+  isl.brookDistance = List[f32].withCapacity(cells);
   mut q = 0usize;
   while q < cells {
     best.push(99.);
     bestK.push(0u32);
     bestT.push(0.);
-    brookDistance.push(BROOK_NEAR);
+    isl.brookDistance.push(BROOK_NEAR);
     q = q + 1usize;
   }
   mut k = 0usize;
   while k + 1usize < n {
-    imm a = *brook[k];
-    imm b = *brook[k + 1usize];
+    imm a = *isl.brook[k];
+    imm b = *isl.brook[k + 1usize];
     imm reach = minf(a.halfBed + 5.2 / a.side, 20.) + 1.;
     imm minx = minf(a.x, b.x) - reach;
     imm maxx = maxf(a.x, b.x) + reach;
@@ -240,16 +237,16 @@ fn carveBrook() {
     if d < 98. {
       imm kk = usize.from(*bestK[idx]);
       imm t = *bestT[idx];
-      imm a = *brook[kk];
-      imm b = *brook[kk + 1usize];
+      imm a = *isl.brook[kk];
+      imm b = *isl.brook[kk + 1usize];
       imm bed = mixf(a.w - a.depth, b.w - b.depth, t);
       imm halfBed = mixf(a.halfBed, b.halfBed, t);
       imm side = mixf(a.side, b.side, t);
       imm blend = mixf(a.blend, b.blend, t);
       imm trench = bed + maxf(0., d - halfBed) * side;
-      imm g = *heights[idx];
-      if trench < g + blend { heights.set(idx, smin(g, trench, blend)); }
-      brookDistance.set(idx, minf(d, BROOK_NEAR));
+      imm g = *isl.heights[idx];
+      if trench < g + blend { isl.heights.set(idx, smin(g, trench, blend)); }
+      isl.brookDistance.set(idx, minf(d, BROOK_NEAR));
     }
     idx = idx + 1usize;
   }
@@ -258,18 +255,29 @@ fn carveBrook() {
 
 // The course, from the spring to the sea: a point about every metre
 pub fn brookPoints() List[BrookPoint] {
-  mut out = List[BrookPoint].withCapacity(brook.len());
+  imm p = islandCell.load();
+  if p == null { return List[BrookPoint].empty(); }
+  imm isl = &*p;
+  mut out = List[BrookPoint].withCapacity(isl.brook.len());
   mut k = 0usize;
-  while k < brook.len() { out.push(*brook[k]); k = k + 1usize; }
+  while k < isl.brook.len() { out.push(*isl.brook[k]); k = k + 1usize; }
   out;
 }
 
 // The course's length, metres
-pub fn brookLength() f32 { if brook.len() == 0usize { 0.; } else { brook[brook.len() - 1usize].s; }; }
+pub fn brookLength() f32 {
+  imm p = islandCell.load();
+  if p == null { return 0.; }
+  imm isl = &*p;
+  if isl.brook.len() == 0usize { 0.; } else { isl.brook[isl.brook.len() - 1usize].s; };
+}
 
 // How far (x, z) is from the course, in metres (BROOK_NEAR at the most)
 pub fn brookDistanceAt(x f32, z f32) f32 {
-  if !baked or brookDistance.len() == 0usize { return BROOK_NEAR; }
+  imm p = islandCell.load();
+  if p == null { return BROOK_NEAR; }
+  imm isl = &*p;
+  if isl.brookDistance.len() == 0usize { return BROOK_NEAR; }
   imm gx = clamp01((x + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
   imm gz = clamp01((z + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
   imm i = minf(libc.floorf(gx), f32.from(N - 2));
@@ -278,19 +286,22 @@ pub fn brookDistanceAt(x f32, z f32) f32 {
   imm fz = gz - j;
   imm ii = i32.from(i);
   imm jj = i32.from(j);
-  imm a = *brookDistance[usize.from(jj * N + ii)];
-  imm b = *brookDistance[usize.from(jj * N + ii + 1)];
-  imm c = *brookDistance[usize.from((jj + 1) * N + ii)];
-  imm d = *brookDistance[usize.from((jj + 1) * N + ii + 1)];
+  imm a = *isl.brookDistance[usize.from(jj * N + ii)];
+  imm b = *isl.brookDistance[usize.from(jj * N + ii + 1)];
+  imm c = *isl.brookDistance[usize.from((jj + 1) * N + ii)];
+  imm d = *isl.brookDistance[usize.from((jj + 1) * N + ii + 1)];
   mixf(mixf(a, b, fx), mixf(c, d, fx), fz);
 }
 
 // The nearest point of the course to (x, z): its index in brookPoints, and how far (metres)
 pub fn brookNearest(x f32, z f32, index &mut usize) f32 {
   mut best f32 = 1000000.;
+  imm p = islandCell.load();
+  if p == null { return best; }
+  imm isl = &*p;
   mut k = 0usize;
-  while k < brook.len() {
-    imm d = len2(x - brook[k].x, z - brook[k].z);
+  while k < isl.brook.len() {
+    imm d = len2(x - isl.brook[k].x, z - isl.brook[k].z);
     if d < best { best = d; *index = k; }
     k = k + 1usize;
   }

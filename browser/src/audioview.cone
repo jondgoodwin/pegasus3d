@@ -74,29 +74,45 @@ pub const SCANCODE_N = 17u;
 // way (auInRender), so the game side's allocations (lists grown, the recording) are not
 // counted. Installed by the checks (auCountAllocations), not by a normal run.
 
-// The sound's globals, in one struct so the shell's init makes them with one assignment (the module's init is the only place a
-// global may be given its value)
-struct AudioGlobals {
+// The sound's counters, shared by the shell (mute presses), the view's thread (reads them) and the checks (allocations). Atomics
+// in an 'imm' global; the module's init gives it its value.
+struct AudioCounts {
   allocs Atomic[u64];           // heap allocations seen during renders
   inRender Atomic[u64];        // 1 while a render is under way
   mutePresses Atomic[u64];      // presses of the mute key, told by the shell, read by the view
+
+  fn make() AudioCounts { new AudioCounts(Atomic[u64].of(0u64), Atomic[u64].of(0u64), Atomic[u64].of(0u64)); }
+}
+
+imm audioCounts AudioCounts;
+
+// The heap's own allocate and resize, kept while the checks count allocations through wrappers (the checks only)
+struct AudioHeap {
   realAlloc &fn(r *MemRegion, bytes usize, align usize) *u8;
   realResize &fn(r *MemRegion, block *u8, oldBytes usize, newBytes usize, align usize) *u8;
+
+  fn make() AudioHeap {
+    imm heap = heapRegion();
+    new AudioHeap(heap.allocFn, heap.resizeFn);
+  }
+}
+
+mut audioHeap AudioHeap;
+
+// What the arguments say about the sound; built by main, given to audioOpen
+struct AudioOptions {
   forceDevice bool;             // --audio-device: the real device's thread even in an automated run
   off bool;                     // --no-audio
   wavPath String;               // --audio-wav FILE: record the offline mix
   recording bool;
   startMuted bool;              // --audio-muted
-  view AudioView;               // the view's: touched only from the view actor's turns
 
-  fn make() AudioGlobals {
-    imm heap = heapRegion();
-    new AudioGlobals(Atomic[u64].of(0u64), Atomic[u64].of(0u64), Atomic[u64].of(0u64), heap.allocFn, heap.resizeFn, false, false,
-      String.empty(), false, false, AudioView.silent());
-  }
+  fn make() AudioOptions { new AudioOptions(false, false, String.empty(), false, false); }
+
+  fn copy(self &) AudioOptions { new AudioOptions(forceDevice, off, wavPath.copy(), recording, startMuted); }
+
+  fn setWavPath(self &mut, p String) { wavPath = p; recording = true; }
 }
-
-mut audioG AudioGlobals;
 
 // The mute key's action (the shell binds it beside the clock's)
 struct AudioKeys {
@@ -109,25 +125,23 @@ struct AudioKeys {
   }
 }
 
-mut audioKeys AudioKeys;
-
 fn auCountingAlloc(r *MemRegion, bytes usize, align usize) *u8 {
-  if audioG.inRender.load() != 0u64 { audioG.allocs.add(1u64); }
-  imm f = audioG.realAlloc;
+  if audioCounts.inRender.load() != 0u64 { audioCounts.allocs.add(1u64); }
+  imm f = audioHeap.realAlloc;
   f(r, bytes, align);
 }
 
 fn auCountingResize(r *MemRegion, block *u8, oldBytes usize, newBytes usize, align usize) *u8 {
-  if audioG.inRender.load() != 0u64 { audioG.allocs.add(1u64); }
-  imm f = audioG.realResize;
+  if audioCounts.inRender.load() != 0u64 { audioCounts.allocs.add(1u64); }
+  imm f = audioHeap.realResize;
   f(r, block, oldBytes, newBytes, align);
 }
 
 // Start counting the allocations a mixer render makes
 pub fn auCountAllocations() {
   imm heap = heapRegion();
-  audioG.realAlloc = heap.allocFn;
-  audioG.realResize = heap.resizeFn;
+  audioHeap.realAlloc = heap.allocFn;
+  audioHeap.realResize = heap.resizeFn;
   heap.allocFn = &auCountingAlloc;
   heap.resizeFn = &auCountingResize;
 }
@@ -135,42 +149,39 @@ pub fn auCountAllocations() {
 // Stop counting, put the heap's own functions back
 pub fn auStopCounting() {
   imm heap = heapRegion();
-  heap.allocFn = audioG.realAlloc;
-  heap.resizeFn = audioG.realResize;
+  heap.allocFn = audioHeap.realAlloc;
+  heap.resizeFn = audioHeap.realResize;
 }
 
-pub fn auAllocationsCounted() u64 { audioG.allocs.load(); }
+pub fn auAllocationsCounted() u64 { audioCounts.allocs.load(); }
 
 // ---- what the shell and the arguments say ----
 
 // Once a frame, from the shell: a press of the mute key is told to the view (which reads it on its own thread)
-pub fn audioKeyFrame(ctx &Context) {
-  if ctx.pressed(audioKeys.mute) { audioG.mutePresses.add(1u64); }
+pub fn audioKeyFrame(keys &AudioKeys, ctx &Context) {
+  if ctx.pressed(keys.mute) { audioCounts.mutePresses.add(1u64); }
 }
 
 // The mute toggled (the key's effect; the checks use it too)
-pub fn audioToggleMute() { audioG.mutePresses.add(1u64); }
-
-pub fn audioSetOff() { audioG.off = true; }
-pub fn audioSetForceDevice() { audioG.forceDevice = true; }
-// --audio-muted: the device is opened but starts muted (a press of N un-mutes), for trying the device without a sound
-pub fn audioSetStartMuted() { audioG.startMuted = true; }
-pub fn audioSetWavPath(p String) { audioG.wavPath = p; audioG.recording = true; }
+pub fn audioToggleMute() { audioCounts.mutePresses.add(1u64); }
 
 // The sink for this run, decided once before the actors start: automated runs render offline (the same every
-// time, no device needed), an interactive one tries the default playback device and is silent if there is none
-pub fn audioOpen(automated bool) {
-  if audioG.off { return; }
-  if automated and !audioG.forceDevice {
-    audioG.view = AudioView.offline(audioG.recording);
+// time, no device needed), an interactive one tries the default playback device and is silent if there is none.
+// The view it answers is the view actor's own from then on.
+pub fn audioOpen(opts &AudioOptions, automated bool) AudioView {
+  mut view = AudioView.silent();
+  if opts.off { return view; }
+  if automated and !opts.forceDevice {
+    view = AudioView.offline(opts.recording, opts.wavPath.copy());
   } else {
     match audiodevice.Device.start(AU_RATE, AU_VOICES, AU_AHEAD_MS) {
-      case mut s Ok { audioG.view = AudioView.onDevice(s); }
+      case mut s Ok { view = AudioView.onDevice(s); }
       case is Error { print <- "No audio device: silent\n"; }
     }
   }
   // (the view has read the mute count already: one more press is the first frame's)
-  if audioG.startMuted { audioG.mutePresses.add(1u64); }
+  if opts.startMuted { audioCounts.mutePresses.add(1u64); }
+  view;
 }
 
 // ---- small numbers ----
@@ -386,6 +397,7 @@ pub struct AudioView {
   owed f64;                     // frames of the steps not yet rendered (the fraction)
   pub record List[f32];         // the offline mix, interleaved stereo, when recording
   recording bool;
+  wavPath String;               // where the recording is written (--audio-wav), when 'recording'
   trail List[Vec3];             // the listener at each update, with the seconds it was heard at in its y... (see 'trailT')
   trailT List[f64];
   prepared bool;
@@ -407,10 +419,10 @@ pub struct AudioView {
   pub frames u64;               // frames of audio rendered here
   pub peakSeen f32;
 
-  fn assemble(mode u32, control Control, rx Receiver[Cmd], device Option[audiodevice.Started], recording bool) AudioView {
+  fn assemble(mode u32, control Control, rx Receiver[Cmd], device Option[audiodevice.Started], recording bool, wavPath String) AudioView {
     imm none = new Vec3(0., 0., 0.);
     new AudioView(mode, control, device, Engine.make(f32.from(AU_RATE), usize.from(AU_VOICES), rx), List[f32].empty(), 0d, List[f32].empty(),
-      recording, List[Vec3].empty(), List[f64].empty(), false, false, audioG.mutePresses.load(), Listener.make(), none, false, 0u32, 0u32,
+      recording, wavPath, List[Vec3].empty(), List[f64].empty(), false, false, audioCounts.mutePresses.load(), Listener.make(), none, false, 0u32, 0u32,
       new Vec2(0., 0.), 0.25, BrookState.empty(), List[Burner].empty(), List[FootMemory].empty(), 1u32, 0u32, [0u32, 0u32, 0u32, 0u32],
       0u64, 0.);
   }
@@ -420,15 +432,15 @@ pub struct AudioView {
     mut c Control;
     mut rx Receiver[Cmd];
     c, rx = commandQueue(8u64);
-    AudioView.assemble(AU_SILENT, c, rx, None[audiodevice.Started], false);
+    AudioView.assemble(AU_SILENT, c, rx, None[audiodevice.Started], false, String.empty());
   }
 
   // The mixer rendered here, with the control that talks to it
-  pub fn offline(recording bool) AudioView {
+  pub fn offline(recording bool, wavPath String) AudioView {
     mut c Control;
     mut rx Receiver[Cmd];
     c, rx = commandQueue(1024u64);
-    AudioView.assemble(AU_OFFLINE, c, rx, None[audiodevice.Started], recording);
+    AudioView.assemble(AU_OFFLINE, c, rx, None[audiodevice.Started], recording, wavPath);
   }
 
   // The speakers: a running device and the control audiodevice made (the Started kept whole; its control is swapped out for ours to use)
@@ -438,7 +450,7 @@ pub struct AudioView {
     mut rx Receiver[Cmd];
     c, rx = commandQueue(8u64);
     c <=> st.control;
-    AudioView.assemble(AU_DEVICE, c, rx, Some(st), false);
+    AudioView.assemble(AU_DEVICE, c, rx, Some(st), false, String.empty());
   }
 
   pub fn isSilent(self &) bool { mode == AU_SILENT; }
@@ -580,7 +592,7 @@ pub struct AudioView {
     if mode == AU_SILENT { return; }
     if !prepared { self.prepare(); }
     // The mute key: each press toggles; the master gain follows over 80 ms
-    imm presses = audioG.mutePresses.load();
+    imm presses = audioCounts.mutePresses.load();
     if presses != muteSeen {
       if (presses - muteSeen) % 2u64 == 1u64 { muted = !muted; }
       muteSeen = presses;
@@ -760,9 +772,9 @@ pub struct AudioView {
     owed = owed - f64.from(n);
     while n > 0usize {
       imm chunk = if n > AU_CHUNK { AU_CHUNK; } else { n; };
-      audioG.inRender.store(1u64);
+      audioCounts.inRender.store(1u64);
       engine.render(scratch.viewMut(), chunk);
-      audioG.inRender.store(0u64);
+      audioCounts.inRender.store(0u64);
       mut i = 0usize;
       while i < chunk * 2usize {
         imm v = *scratch[i];
@@ -808,9 +820,9 @@ pub struct AudioView {
     mut all = new Sound(AU_RATE, 2u32, List[f32].empty());
     all.samples <=> record;
     imm text = encodeWav(&all, false);
-    imm p = Path.from(audioG.wavPath.view());
+    imm p = Path.from(wavPath.view());
     match fs.writeFile(&p, text.view()) {
-      case is Ok { print <- "  wrote "; printStr(audioG.wavPath.view()); print <- " ("; print <- text.len(); print <- " bytes)\n"; }
+      case is Ok { print <- "  wrote "; printStr(wavPath.view()); print <- " ("; print <- text.len(); print <- " bytes)\n"; }
       case is Error { print <- "  could not write the WAV\n"; }
     }
     imm window = usize.from(AU_RATE) * 2usize;
@@ -856,10 +868,10 @@ const STEP_RANGE f32 = 32.;
 // ---- the view's calls ----
 
 // A burner the world fires: noted when its Effect (the first burst) or a Fire (the next) is applied, if the part is the balloon's burner
-pub fn audioNoteEffect(scene &ViewScene, id PartId, start f64, stop f64) {
-  if audioG.view.isSilent() { return; }
+pub fn audioNoteEffect(audio &mut AudioView, scene &ViewScene, id PartId, start f64, stop f64) {
+  if audio.isSilent() { return; }
   imm name = scene.nameOf(id);
-  if name.view() == "balloon burner flame" { audioG.view.noteBurst(id, start, stop); }
+  if name.view() == "balloon burner flame" { audio.noteBurst(id, start, stop); }
 }
 
 // A figured being as the audio needs it
@@ -870,8 +882,8 @@ pub fn audioBeingOf(index usize, being &Being) AudioBeing {
 }
 
 // The frame's sound, from the view's state after its beings are posed: the listener is the player's head turned with the camera
-pub fn audioFromView(st &ViewState, steps &List[Step]) {
-  if audioG.view.isSilent() { return; }
+pub fn audioFromView(st &mut ViewState, steps &List[Step]) {
+  if st.audio.isSilent() { return; }
   mut f = AudioFrame.empty();
   mut k = 0usize;
   while k < steps.len() { f.dt = f.dt + steps[k].dt; k = k + 1usize; }
@@ -889,15 +901,12 @@ pub fn audioFromView(st &ViewState, steps &List[Step]) {
     if !being.gone and being.figure.active { f.beings.push(audioBeingOf(b, being)); }
     b = b + 1usize;
   }
-  imm parts = audioG.view.burnerParts();
+  imm parts = st.audio.burnerParts();
   k = 0usize;
   while k < parts.len() {
     imm m = st.scene.worldMatrix(*parts[k]);
     f.burnerAt.push(new Vec3(m.m[12], m.m[13], m.m[14]));
     k = k + 1usize;
   }
-  audioG.view.update(&f);
+  st.audio.update(&f);
 }
-
-// The end of the run
-pub fn audioFinish() { audioG.view.finish(); }

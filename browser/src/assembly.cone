@@ -137,86 +137,91 @@ fn yawError(w &Walk, tx f32, tz f32) f32 {
 
 // ---- The route being walked ----
 
-mut route List[Vec2];          // the points to pass through (the module's init makes the lists)
-mut routeS List[f32];          // the way along them to each point
-mut routeAt usize = 0usize;    // the point the walker is nearest, never going back
-mut routeDev f32 = 0.;         // the farthest the walker has been from the route's nearest point
-mut routeFrames u64 = 0u64;    // frames spent on it
-mut routeFast bool = false;    // the walker is headed right and may run
-mut routeGo bool = true;       // the walker is facing within 30 degrees of the way, else it turns where it stands
+// The route: the simulation's script state ('SimState.route'), made with it, touched only from the scene actor's end of frame
+pub struct Route {
+  pub points List[Vec2];       // the points to pass through
+  pub along List[f32];         // the way along them to each point
+  pub at usize;                // the point the walker is nearest, never going back
+  pub dev f32;                 // the farthest the walker has been from the route's nearest point
+  pub frames u64;              // frames spent on it
+  pub fast bool;               // the walker is headed right and may run
+  pub go bool;                 // the walker is facing within 30 degrees of the way, else it turns where it stands
 
-fn routeClear() {
-  route.clear();
-  routeS.clear();
-  routeAt = 0usize;
-  routeDev = 0.;
-}
+  pub fn make() Route { new Route(List[Vec2].empty(), List[f32].empty(), 0usize, 0., 0u64, false, true); }
 
-// A point on the route; a long step from the last is cut into steps of a metre at most, so the
-// route's nearest point is never far off it
-fn routeAdd(x f32, z f32) {
-  imm n = route.len();
-  if n > 0usize {
-    imm p = *route[n - 1usize];
-    imm d = flatDist(p.x, p.y, x, z);
-    if d > 1. {
-      imm pieces = u32.from(libc.ceilf(d));
-      mut i = 1u32;
-      while i < pieces {
-        imm t = f32.from(i) / f32.from(pieces);
-        routeAdd(p.x + (x - p.x) * t, p.y + (z - p.y) * t);
-        i = i + 1u32;
+  fn clear(self &mut) {
+    points.clear();
+    along.clear();
+    at = 0usize;
+    dev = 0.;
+  }
+
+  // A point on the route; a long step from the last is cut into steps of a metre at most, so the
+  // route's nearest point is never far off it
+  fn add(self &mut, x f32, z f32) {
+    imm n = points.len();
+    if n > 0usize {
+      imm p = *points[n - 1usize];
+      imm d = flatDist(p.x, p.y, x, z);
+      if d > 1. {
+        imm pieces = u32.from(libc.ceilf(d));
+        mut i = 1u32;
+        while i < pieces {
+          imm t = f32.from(i) / f32.from(pieces);
+          self.add(p.x + (x - p.x) * t, p.y + (z - p.y) * t);
+          i = i + 1u32;
+        }
       }
     }
+    imm m = points.len();
+    if m == 0usize { along.push(0.); }
+    else {
+      imm q = *points[m - 1usize];
+      along.push(*along[m - 1usize] + flatDist(q.x, q.y, x, z));
+    }
+    points.push(new Vec2(x, z));
   }
-  imm m = route.len();
-  if m == 0usize { routeS.push(0.); }
-  else {
-    imm q = *route[m - 1usize];
-    routeS.push(*routeS[m - 1usize] + flatDist(q.x, q.y, x, z));
-  }
-  route.push(new Vec2(x, z));
-}
 
-// The path from point 'from' to point 'to' of its centreline
-fn routeFromPath(from usize, to usize) {
-  routeClear();
-  imm line = pathCentreline();
-  mut k = from;
-  while k <= to {
-    imm p = *line[k];
-    routeAdd(p.x, p.z);
-    k = k + 1usize;
+  // The path from point 'from' to point 'to' of its centreline
+  fn fromPath(self &mut, from usize, to usize) {
+    self.clear();
+    imm line = pathCentreline();
+    mut k = from;
+    while k <= to {
+      imm p = *line[k];
+      self.add(p.x, p.z);
+      k = k + 1usize;
+    }
   }
-}
 
-fn routeLength() f32 { *routeS[routeS.len() - 1usize]; }
+  fn length(self &) f32 { *along[along.len() - 1usize]; }
 
-// One frame of following the route: the nearest point found, the heading steered towards a
-// point 'ahead' metres further on; true once the last point is within 0.7 m
-fn followRoute(w &Walk, ahead f32) bool {
-  imm n = route.len();
-  mut best = routeAt;
-  mut bestD = flatDist(w.position.x, w.position.z, (*route[best]).x, (*route[best]).y);
-  mut k = routeAt + 1usize;
-  while k < n and *routeS[k] - *routeS[routeAt] < 12. {
-    imm d = flatDist(w.position.x, w.position.z, (*route[k]).x, (*route[k]).y);
-    if d < bestD { bestD = d; best = k; }
-    k = k + 1usize;
+  // One frame of following the route: the nearest point found, the heading steered towards a
+  // point 'ahead' metres further on; true once the last point is within 0.7 m
+  fn follow(self &mut, w &Walk, ahead f32) bool {
+    imm n = points.len();
+    mut best = at;
+    mut bestD = flatDist(w.position.x, w.position.z, (*points[best]).x, (*points[best]).y);
+    mut k = at + 1usize;
+    while k < n and *along[k] - *along[at] < 12. {
+      imm d = flatDist(w.position.x, w.position.z, (*points[k]).x, (*points[k]).y);
+      if d < bestD { bestD = d; best = k; }
+      k = k + 1usize;
+    }
+    at = best;
+    if bestD > dev { dev = bestD; }
+    mut j = best;
+    while j + 1usize < n and *along[j] - *along[best] < ahead { j = j + 1usize; }
+    imm target = *points[j];
+    imm err = yawError(w, target.x, target.y);
+    holdTurn(err);
+    imm last = *points[n - 1usize];
+    imm toGo = flatDist(w.position.x, w.position.z, last.x, last.y);
+    // Run only when headed right, on the route, and not close to its end: a run turns in a circle 11 m across
+    fast = absF(err) < 0.08 and bestD < 0.6 and toGo > 8.;
+    go = absF(err) < 0.5;
+    toGo < 0.7;
   }
-  routeAt = best;
-  if bestD > routeDev { routeDev = bestD; }
-  mut j = best;
-  while j + 1usize < n and *routeS[j] - *routeS[best] < ahead { j = j + 1usize; }
-  imm target = *route[j];
-  imm err = yawError(w, target.x, target.y);
-  holdTurn(err);
-  imm last = *route[n - 1usize];
-  imm toGo = flatDist(w.position.x, w.position.z, last.x, last.y);
-  // Run only when headed right, on the route, and not close to its end: a run turns in a circle 11 m across
-  routeFast = absF(err) < 0.08 and bestD < 0.6 and toGo > 8.;
-  routeGo = absF(err) < 0.5;
-  toGo < 0.7;
 }
 
 // ---- The pictures ----
@@ -331,29 +336,29 @@ fn tap(f u64, key u32) {
 fn goTo(next u32, f u64) { phase = next; phaseFrom = f; }
 
 // The way from the steps' foot to the button along the lawn, or back
-fn routeToButton(w &Walk) {
-  routeClear();
-  routeAdd(w.position.x, w.position.z);
+fn routeToButton(rt &mut Route, w &Walk) {
+  rt.clear();
+  rt.add(w.position.x, w.position.z);
   mut i = 0usize;
   while i < LAWN_ROUTE_N {
     imm p = lawnRouteAt(i);
-    routeAdd(p.x, p.y);
+    rt.add(p.x, p.y);
     i = i + 1usize;
   }
 }
 
-fn routeFromButton(w &Walk) {
-  routeClear();
-  routeAdd(w.position.x, w.position.z);
+fn routeFromButton(rt &mut Route, w &Walk) {
+  rt.clear();
+  rt.add(w.position.x, w.position.z);
   mut i = LAWN_ROUTE_N;
   while i > 0usize {
     i = i - 1usize;
     imm p = lawnRouteAt(i);
-    routeAdd(p.x, p.y);
+    rt.add(p.x, p.y);
   }
   imm line = pathCentreline();
   imm end = *line[line.len() - 1usize];
-  routeAdd(end.x, end.z);
+  rt.add(end.x, end.z);
 }
 
 // The balloon's mouth (its envelope's root) in the world
@@ -381,23 +386,23 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
     // Standing on the beach for the first picture, then up the path
     if f == ASM_FROM + 4u64 { takePicture(f + 2u64, 0u32); }
     if f == ASM_FROM + 8u64 {
-      routeFromPath(0usize, pathCentreline().len() - 1usize);
-      print <- "Frame "; print <- f; print <- ": the walk from the beach begins, a path "; print <- routeLength(); print <- " m long\n";
-      routeFrames = f;
+      st.route.fromPath(0usize, pathCentreline().len() - 1usize);
+      print <- "Frame "; print <- f; print <- ": the walk from the beach begins, a path "; print <- st.route.length(); print <- " m long\n";
+      st.route.frames = f;
       walkShot = 0usize;
       goTo(PH_WALK, f);
     }
     return;
   }
   if phase == PH_WALK {
-    imm arrived = followRoute(w, 4.);
-    holdAhead(!arrived and routeGo, routeFast);
-    if walkShot < 6usize and *routeS[routeAt] >= WALK_AT[walkShot] * routeLength() {
+    imm arrived = st.route.follow(w, 4.);
+    holdAhead(!arrived and st.route.go, st.route.fast);
+    if walkShot < 6usize and *st.route.along[st.route.at] >= WALK_AT[walkShot] * st.route.length() {
       takePicture(f + 1u64, u32.from(walkShot) + 1u32);
       walkShot = walkShot + 1usize;
     }
-    if arrived { goTo(PH_STEPS, f); routeFrames = f - routeFrames; }
-    elif since > 2600u64 { say(f, "the walk to the steps did NOT finish"); asmOk = false; goTo(PH_STEPS, f); routeFrames = since; }
+    if arrived { goTo(PH_STEPS, f); st.route.frames = f - st.route.frames; }
+    elif since > 2600u64 { say(f, "the walk to the steps did NOT finish"); asmOk = false; goTo(PH_STEPS, f); st.route.frames = since; }
     return;
   }
   if phase == PH_STEPS {
@@ -409,27 +414,27 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
     if since == 6u64 {
       imm line = pathCentreline();
       imm end = *line[line.len() - 1usize];
-      print <- "The walk from the beach to the steps: "; print <- routeFrames; print <- " frames ("; print <- f64.from(routeFrames) / 60d;
-      print <- " s) at 12 m/s, never farther than "; print <- routeDev; print <- " m from the path's centreline (want under 1.8; its half width is 0.9)\n";
+      print <- "The walk from the beach to the steps: "; print <- st.route.frames; print <- " frames ("; print <- f64.from(st.route.frames) / 60d;
+      print <- " s) at 12 m/s, never farther than "; print <- st.route.dev; print <- " m from the path's centreline (want under 1.8; its half width is 0.9)\n";
       print <- "  ended "; print <- flatDist(w.position.x, w.position.z, end.x, end.z); print <- " m from the steps' foot ("; print <- end.x;
       print <- ", "; print <- end.z; print <- "), facing "; print <- w.yaw; print <- " rad from -z\n";
-      if routeDev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { asmOk = false; print <- "  the walk is WRONG\n"; }
-      routeToButton(w);
-      routeFrames = f;
+      if st.route.dev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { asmOk = false; print <- "  the walk is WRONG\n"; }
+      routeToButton(&mut st.route, w);
+      st.route.frames = f;
       goTo(PH_TO_BUTTON, f);
     }
     return;
   }
   if phase == PH_TO_BUTTON {
-    imm arrived = followRoute(w, 3.);
-    holdAhead(!arrived and routeGo, routeFast);
+    imm arrived = st.route.follow(w, 3.);
+    holdAhead(!arrived and st.route.go, st.route.fast);
     if arrived { goTo(PH_FACE_BASKET, f); }
     elif since > 1500u64 { say(f, "the walk to the basket did NOT finish"); asmOk = false; goTo(PH_FACE_BASKET, f); }
     return;
   }
   if phase == PH_BACK {
-    imm arrived = followRoute(w, 3.);
-    holdAhead(!arrived and routeGo, routeFast);
+    imm arrived = st.route.follow(w, 3.);
+    holdAhead(!arrived and st.route.go, st.route.fast);
     if arrived { goTo(PH_FACE_DOOR, f); }
     elif since > 1500u64 { say(f, "the walk back to the steps did NOT finish"); asmOk = false; goTo(PH_FACE_DOOR, f); }
     return;
@@ -478,14 +483,14 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
       setHour(st, NIGHT_HOUR);
       imm line = pathCentreline();
       imm n = line.len();
-      routeFromPath(n - 46usize, n - 1usize);
-      imm from = *route[0usize];
-      imm next = *route[3usize];
+      st.route.fromPath(n - 46usize, n - 1usize);
+      imm from = *st.route.points[0usize];
+      imm next = *st.route.points[3usize];
       imm b = &mut cast.beings[0usize];
       b.setDown(new Vec3(from.x, groundHeight(from.x, from.y), from.y), wrapPi(libc.atan2f(0. - (next.x - from.x), 0. - (next.y - from.y))));
       holdTurn(0.);
       takePicture(f + 8u64, SHOT_NIGHT);
-      routeFrames = f;
+      st.route.frames = f;
       walkShot = 0usize;
       goTo(PH_NIGHT_WALK, f);
     }
@@ -498,9 +503,9 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
       takeView(f + 1u64, SHOT_LANTERNS + 2u32, new Vec3(eye.x, eye.y + 1.7, eye.z), doorLookAt(), 0.9);
     }
     if since < 10u64 { return; }
-    imm arrived = followRoute(w, 5.);
-    holdAhead(!arrived and routeGo, routeFast);
-    if walkShot == 0usize and *routeS[routeAt] >= 0.5 * routeLength() {
+    imm arrived = st.route.follow(w, 5.);
+    holdAhead(!arrived and st.route.go, st.route.fast);
+    if walkShot == 0usize and *st.route.along[st.route.at] >= 0.5 * st.route.length() {
       takePicture(f + 1u64, SHOT_NIGHT + 1u32);
       walkShot = 1usize;
     }
@@ -514,10 +519,10 @@ fn asmStep(st &mut SimState, f u64, w &Walk) {
     if since == 8u64 {
       imm line = pathCentreline();
       imm end = *line[line.len() - 1usize];
-      print <- "Frame "; print <- f; print <- ", the night walk (the clock at "; print <- hourAt(scene.now()); print <- " h): "; print <- f - routeFrames;
-      print <- " frames, never farther than "; print <- routeDev; print <- " m from the path; ended ";
+      print <- "Frame "; print <- f; print <- ", the night walk (the clock at "; print <- hourAt(scene.now()); print <- " h): "; print <- f - st.route.frames;
+      print <- " frames, never farther than "; print <- st.route.dev; print <- " m from the path; ended ";
       print <- flatDist(w.position.x, w.position.z, end.x, end.z); print <- " m from the steps' foot\n";
-      if routeDev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { asmOk = false; print <- "  the night walk is WRONG\n"; }
+      if st.route.dev > 1.8 or flatDist(w.position.x, w.position.z, end.x, end.z) > 1. { asmOk = false; print <- "  the night walk is WRONG\n"; }
       checkLamps(st, f, "at the steps by night");
       // Then noon again, for the autumn maple with the sun behind it and in front of it
       setHour(st, 60.);
