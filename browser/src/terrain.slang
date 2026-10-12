@@ -188,27 +188,62 @@ float3 rockColor(float3 p, float3 n) {
 
 // Wet gravel for the brook's bed: rounded pebbles about 0.15 m across, each its own grey or tan, dark in the
 // gaps between them (a cellular pattern)
-float3 gravelColor(float2 xz) {
-    float2 g = xz * 9.0;
+// (Stones of all sizes, long and short, turned every way, a cobble layer over a pebble layer, sunk in dark
+// silt; the detail fades to the mean as a stone shrinks toward a pixel, so a far bed is a smooth dark tone.)
+// One layer: a jittered lattice, each cell's stone with its own size, elongation, turn and colour; where two
+// meet the one nearer its own centre (in its own stretched frame) is on top, so they overlap; some sit deep
+// in the silt (darker). Returns the colour in rgb and the stone's cover in a (0 gap, 1 stone).
+float4 stoneLayer(float2 p, float scale, int seed) {
+    float2 g = p * scale;
     float2 i = floor(g);
     float2 f = frac(g);
-    float best = 2.0;
-    float id = 0.0;
+    float best = 9.0;
+    float3 col = float3(0.0, 0.0, 0.0);
     for (int y = -1; y <= 1; y++) {
         for (int x = -1; x <= 1; x++) {
             float2 o = float2(float(x), float(y));
-            float2 j = float2(hash21(i + o), hash21(i + o + 7.7));
-            float d = length(o + j - f);
-            if (d < best) {
-                best = d;
-                id = hash21(i + o + 3.1);
+            float2 c = i + o + float2(float(seed), float(seed * 3));
+            float2 j = float2(hash21(c), hash21(c + float2(17.0, 5.0)));
+            float rad = 0.30 + 0.34 * hash21(c + float2(3.0, 29.0));
+            float el = 1.0 + 1.3 * pow(hash21(c + float2(41.0, 7.0)), 1.5);
+            float ang = 6.2831853 * hash21(c + float2(13.0, 61.0));
+            float2 d = o + j - f;
+            float cs = cos(ang);
+            float sn = sin(ang);
+            float2 r = float2(cs * d.x + sn * d.y, -sn * d.x + cs * d.y);
+            float e = length(float2(r.x / (rad * el), r.y / rad));
+            e *= 1.0 + 0.18 * (hash21(c + float2(77.0, 3.0)) - 0.5);    // a lumpy edge
+            if (e < best) {
+                best = e;
+                float k = hash21(c + float2(5.0, 91.0));
+                float k2 = hash21(c + float2(23.0, 47.0));
+                float3 slate = float3(0.060, 0.064, 0.066);
+                float3 tan = float3(0.125, 0.108, 0.080);
+                float3 rust = float3(0.092, 0.062, 0.046);
+                float3 grey = float3(0.105, 0.105, 0.098);
+                col = k < 0.35 ? lerp(slate, grey, k / 0.35) : (k < 0.75 ? lerp(grey, tan, (k - 0.35) / 0.4) : lerp(tan, rust, (k - 0.75) / 0.25));
+                col *= 0.65 + 0.7 * k2;
+                col *= 1.0 - 0.45 * smoothstep(0.62, 0.9, hash21(c + float2(61.0, 11.0)));    // sunk in the silt
+                col *= 1.15 - 0.5 * min(e, 1.0) * min(e, 1.0);    // a dome: lit on top, shaded at its rim
             }
         }
     }
-    float3 stone = lerp(float3(0.040, 0.043, 0.042), float3(0.115, 0.100, 0.075), id);
-    stone *= 0.75 + 0.5 * hash21(i + 11.0);
-    float rim = smoothstep(0.32, 0.62, best);
-    return lerp(stone, float3(0.012, 0.012, 0.010), rim);
+    float cover = 1.0 - smoothstep(0.82, 1.0, best);
+    col *= lerp(0.45, 1.0, smoothstep(0.55, 0.95, best));    // the shadow in the crack beside each stone
+    return float4(col, cover);
+}
+
+// fp: the metres a pixel covers; farB: 0 near, 1 far (the mean tone greens with distance)
+float3 gravelColor(float2 xz, float fp, float farB) {
+    float3 mean = lerp(float3(0.060, 0.058, 0.048), float3(0.028, 0.055, 0.022), farB);
+    float3 silt = float3(0.016, 0.015, 0.012);
+    float4 small = stoneLayer(xz + float2(3.3, 1.7), 11.0, 0);
+    float4 big = stoneLayer(xz, 4.5, 5);
+    float wS = 1.0 - smoothstep(0.25, 0.7, fp * 11.0);
+    float wB = 1.0 - smoothstep(0.25, 0.7, fp * 4.5);
+    float3 bed = lerp(mean, lerp(silt, small.rgb, small.a), wS);
+    float3 cob = lerp(bed, big.rgb, big.a);
+    return lerp(lerp(mean, bed, 0.5), cob, wB);
 }
 
 [shader("fragment")]
@@ -283,12 +318,25 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float wMud = smoothstep(2.5, 1.5, bd);
     float wBed = smoothstep(1.55, 0.95, bd);
     float mossy = smoothstep(0.35, 0.7, vnoise(xz * 3.1 + 5.0) * 0.6 + vnoise(xz * 11.0) * 0.4);
-    float3 mud = lerp(float3(0.060, 0.042, 0.024), float3(0.032, 0.085, 0.022), mossy * 0.8);
+    float fp = length(float2(length(ddx(xz)), length(ddy(xz))));
+    float farB = smoothstep(20.0, 80.0, dist);
+    float sandW = saturate(wSand);
+    // Mud and moss at the water's edge (greener far off); on the beach, sand darkened with wet instead
+    float3 mud = lerp(float3(0.050, 0.040, 0.024), float3(0.030, 0.090, 0.020), mossy * 0.8);
     mud *= 0.8 + 0.4 * vnoise(xz * 17.0);
-    float3 damp = albedo * lerp(float3(0.50, 0.66, 0.42), float3(0.55, 0.52, 0.48), saturate(wSand));
+    mud = lerp(mud, mud * float3(0.8, 1.2, 0.7), farB);
+    mud = lerp(mud, sand * 0.38, sandW);
+    // The lush margin: the damp ground bears thick, dark, deep green growth (grass, rush, sedge)
+    float lush = smoothstep(4.8, 2.6, bd) * smoothstep(0.7, 1.6, bd) * (1.0 - sandW);
+    float3 lushCol = lerp(float3(0.030, 0.085, 0.018), float3(0.045, 0.115, 0.022), vnoise(xz * 2.3 + 8.0)) * (0.8 + 0.4 * vnoise(xz * 9.0));
+    float3 damp = albedo * lerp(float3(0.46, 0.62, 0.38), float3(0.42, 0.40, 0.36), sandW);
     albedo = lerp(albedo, damp, wDamp * 0.85);
+    albedo = lerp(albedo, lushCol, lush * 0.8);
     albedo = lerp(albedo, mud, wMud * 0.85);
-    albedo = lerp(albedo, gravelColor(xz), wBed);
+    // The bed: gravel in the grass; at the beach, wet sand
+    float3 wetSand = sand * (0.27 + 0.10 * vnoise(xz * 3.0));
+    float3 bed = lerp(gravelColor(xz, fp, farB), wetSand, smoothstep(0.35, 0.8, sandW));
+    albedo = lerp(albedo, bed, wBed);
     albedo *= input.tint.rgb;    // A touch of bump from the fine noise, near the eye
     float bx = vnoise(xz * 9.0 + float2(0.7, 0.0)) - vnoise(xz * 9.0 - float2(0.7, 0.0));
     float bz = vnoise(xz * 9.0 + float2(0.0, 0.7)) - vnoise(xz * 9.0 - float2(0.0, 0.7));

@@ -151,13 +151,20 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // The ripples run a little ahead of the water (2.2 times its speed) so that a stream reads as moving
     // from a walker's distance; bigger than a hand's width (0.6 m across, 1.2 m long) and a smaller layer
     float v = speed * (1.0 - 0.5 * across * across) * 2.2;
-    float fadeR = saturate(1.0 - dist / 45.0) * (1.0 - 0.97 * smoothstep(params.course.x - 16.0, params.course.x - 2.0, uv.y));
+    // The detail's fade: with distance, and as a ripple shrinks toward a pixel (fu: the metres of the ribbon a
+    // pixel covers), so the far water is smooth and does not speckle
+    float fu = max(length(dux), length(duy));
+    float mouth = smoothstep(params.course.x - 16.0, params.course.x - 2.0, uv.y);
+    float farW = smoothstep(18.0, 90.0, dist);
+    float fadeR = saturate(1.0 - dist / 45.0) * (1.0 - 0.97 * mouth);
+    float fine = 1.0 - smoothstep(0.03, 0.10, fu);
+    float coarse = 1.0 - smoothstep(0.08, 0.25, fu);
     float2 q1 = float2(uv.x / 0.60, (uv.y - v * t) / 1.2);
     float2 q2 = float2(uv.x / 0.28 + 7.0, (uv.y - 1.7 * v * t) / 0.55);
     float2 r1 = rippleSlope(q1) * float2(1.0 / 0.60, 1.0 / 1.2);
     float2 r2 = rippleSlope(q2) * float2(1.0 / 0.28, 1.0 / 0.55);
     float amp = 0.026 + 0.012 * saturate(speed);
-    float2 slope = (r1 * amp + r2 * (amp * 0.45)) * fadeR;
+    float2 slope = (r1 * amp * coarse + r2 * (amp * 0.45) * fine) * fadeR;
     float3 n = normalize(N - Tu * slope.x - Tv * slope.y);
 
     float3 L = frame.lightDirection.xyz;
@@ -168,32 +175,42 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // The body, and the sky and sun reflected
     float c = saturate(dot(n, V));
     float F = min(0.02 + 0.98 * pow(1.0 - c, 5.0), 0.65);
+    // Far water is a thin line that flashes the sky: its ripples are finer than a pixel, so the surface
+    // is in effect rough and reflects more at every angle; from far or high up the sky dominates
+    F = lerp(F, max(F, 0.62), farW);
     // Deeper (the middle) is darker and more opaque: the bed's pebbles show at the edges
-    float3 body = params.body.rgb * lightOn * lerp(1.0, 0.30, mid);
+    float3 body = params.body.rgb * lightOn * lerp(1.0, lerp(0.30, 0.65, farW), mid);
     float3 R = reflect(-V, n);
     R.y = abs(R.y);
     // The sky in the water: bluer overhead, paler and warmer toward the horizon
     float3 skyColor = skyLight * lerp(float3(1.3, 1.5, 1.9), float3(2.6, 2.6, 2.7), pow(1.0 - R.y, 2.0));
-    float glint = pow(max(dot(R, L), 0.0), 240.0) * 60.0 * fadeR;
+    float glint = pow(max(dot(R, L), 0.0), 240.0) * 60.0 * fadeR * fine;
     float3 sparkle = frame.lightColor.rgb * (glint / RENDER_PI);
     float3 color = body * (1.0 - F) + skyColor * F;
     // Long streaks of light running with the current, in the faster middle
     float streak = pow(vnoise(float2(uv.x * 7.0 + 3.0, (uv.y - v * t) * 0.8)), 3.0);
-    color += skyLight * (0.45 * streak * mid * fadeR) * (1.0 - F);
+    color += skyLight * (0.45 * streak * mid * fadeR * fine) * (1.0 - F);
     float a = saturate(0.34 + 0.34 * mid + 0.08 * saturate(speed) + 0.6 * F);
+    a = lerp(a, max(a, 0.82), farW * mid);
 
-    // The mouth: in the last metres the water fans out into the sea over the sand in braided rills
-    float mouth = smoothstep(params.course.x - 16.0, params.course.x - 2.0, uv.y);
-    float braid = smoothstep(0.30, 0.60, vnoise(float2(uv.x * 1.9, uv.y * 0.55 - v * t * 0.2)) + 0.25 * vnoise(float2(uv.x * 5.0, uv.y * 0.9)));
-    a *= lerp(1.0, 0.25 + 0.75 * braid, mouth * 0.85);
-    color *= 1.0 - 0.35 * mouth;
+    // The mouth: in the last metres the water fans out into the sea over the sand in a few shallow rills,
+    // wavering, thin and clear, with the wet sand dark between them. Smooth: no fine noise
+    float fan = uv.x / max(hw, 0.4);    // -1 to 1 across the fan
+    float rillN = vnoise(float2(fan * 2.6 + 4.0, uv.y * 0.11 - v * t * 0.03)) + 0.35 * vnoise(float2(fan * 5.5, uv.y * 0.2));
+    float rill = smoothstep(0.55, 0.95, 1.0 - abs(rillN * 1.35 - 0.95) * 2.4);
+    a *= lerp(1.0, 0.18 + 0.82 * rill, mouth);
+    color = lerp(color, lerp(color, skyColor, 0.5) * 0.9, mouth);
 
     // Foam, as lace: stretched along the current in streaks and bubbles, thick where the vertices say
     // (strong in the middle of a patch, ragged at its edge), drifting down at the water's own pace
     float cells = foamTexture(float2(uv.x * 7.0, (uv.y - 1.1 * v * t) * 4.0));
     float lace = vnoise(float2(uv.x * 12.0, (uv.y - v * t) * 2.2)) * 0.55 + vnoise(float2(uv.x * 29.0 + 5.0, (uv.y - 1.3 * v * t) * 5.0)) * 0.45;
     float froth = lace * 0.8 + cells * 0.35 + foam * 0.75 - 0.55;
-    float f = smoothstep(0.0, 0.22, froth) * smoothstep(0.02, 0.2, foam);
+    // Foam is a few centimetres of lace: it fades out with distance (gone by 40 m, where it would only be
+    // white dashes), and its patches are uneven along the course so no two stones foam alike
+    float foamNear = 1.0 - smoothstep(8.0, 40.0, dist);
+    float patch = 0.35 + 0.65 * smoothstep(0.15, 0.7, vnoise(float2(uv.y * 0.31 + uv.x * 0.4, 9.0)));
+    float f = smoothstep(0.0, 0.22, froth) * smoothstep(0.02, 0.2, foam * patch) * foamNear * (1.0 - mouth);
     float3 foamColor = float3(0.92, 0.93, 0.91) * lightOn * (0.8 + 0.4 * lace);
     color = lerp(color, foamColor, f);
     a = max(a, f * 0.95);
