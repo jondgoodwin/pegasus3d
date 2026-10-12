@@ -160,7 +160,7 @@ fn flowerPaint(petal Color, centre Color) Image {
 // edging stones, two hostas, two ferns, six flower clumps) in 13 materials (the
 // maples' bark and leaf, the pines', the granite and the edging stone, two
 // hostas and two ferns, three flowers)
-pub fn vegetationMeshSurplus() u64 { if vegetationOff { 0u64; } else { 23u64; }; }
+pub fn vegetationMeshSurplus() u64 { if vegetationOff { 0u64; } else { 55u64; }; }   // 23, and the eight tree variants' four coarser meshes each
 
 // How many parts the layout makes: a tree's two (its bark and its foliage), the rest's one
 pub fn vegetationParts() usize {
@@ -198,10 +198,119 @@ const MAPLE_TRANSLUCENCY f32 = 1.2;
 const MAPLE_FLUTTER f32 = 0.12;
 const PINE_TRANSLUCENCY f32 = 0.4;
 
-// What a tree variant is made of: its meshes' indices in the object
+// What a tree variant is made of: its meshes' indices in the object, and its two coarser levels (LOD 1 and 2)
 struct TreeVariant {
   bark usize;
   leaves usize;
+  bark1 usize;
+  bark2 usize;
+  leaves1 usize;
+  leaves2 usize;
+}
+
+// ---- Levels of detail and ranges (Request.Cull) ----
+//
+// Every tree, rock, plant and stone is a thing of render's scene (visibility.cone): culled by each camera's
+// frustum (and by the depth pyramid), drawn instanced from the visible set. A tree is three meshes of one
+// look, LOD 0 the full one (unchanged: close up the picture is the one drawn before), LOD 1 and 2 coarser,
+// drawn by the projected size of the tree's bounding sphere (Unreal's "screen size": pixels across, in a view
+// as high as the window) and cross-faded by dither between levels. The levels are made from the same grown
+// tree, the published way trees are simplified:
+//   - bark: the limbs of the finest orders left out, fewer sides and cuts to a segment (Weber and Penn's
+//     levels are what a tree is built of, so dropping the last is dropping its twigs);
+//   - maple leaves: only every third (LOD 1) or ninth (LOD 2) leaf, each grown to keep the leaf area (times
+//     3, so the width times root 3: Boulanger et al. 2006 and SpeedTree's leaf reduction), with fewer outline
+//     points;
+//   - pine plumes: the limbs' plumes all stay, only every other (LOD 1) or none (LOD 2) of the twigs'
+//     plumes remain, and the plumes grow wider to keep the crown's cover.
+// A small thing (a stone, a plant, a flower) has one level and a range: not drawn beyond it, the last part of
+// it faded out by dither (Godot's visibility ranges), where it is a pixel or two across.
+
+// The ranges (metres) beyond which the small things are not drawn: where they are a pixel or two across (an
+// edging stone's 0.4 m is 2 pixels at 140 m in a view 720 pixels high with a 60 degree lens; a plant's 0.8 m
+// is 2 at 280 m, but its cover is lost in the ground's grain long before), faded out over the last 30%
+const EDGING_RANGE f32 = 140.;
+const PLANT_RANGE f32 = 170.;
+const FLOWER_RANGE f32 = 110.;
+
+// A tree's levels are used from this many pixels of its sphere's diameter (LOD 0), and this many (LOD 1)
+const TREE_LOD0_PX f32 = 240.;
+const TREE_LOD1_PX f32 = 80.;
+
+// Keep every 'every'th of the leaf sites
+fn thinSites(tree &mut weberpenn.Tree, every usize) {
+  mut w = 0usize;
+  mut i = 0usize;
+  while i < tree.sites.len() {
+    if i % every == 0usize {
+      if w != i { tree.sites.swap(w, i); }
+      w = w + 1usize;
+    }
+    i = i + 1usize;
+  }
+  tree.sites.truncate(w);
+}
+
+// Keep every 'every'th of the stems of level 'fromLevel' and above (all of the others); 'drop': none of them
+fn thinStems(tree &mut weberpenn.Tree, fromLevel i32, every usize, drop bool) {
+  mut w = 0usize;
+  mut seen = 0usize;
+  mut i = 0usize;
+  while i < tree.stems.len() {
+    mut keep = true;
+    if tree.stems[i].level >= fromLevel {
+      keep = !drop and seen % every == 0usize;
+      seen = seen + 1usize;
+    }
+    if keep {
+      if w != i { tree.stems.swap(w, i); }
+      w = w + 1usize;
+    }
+    i = i + 1usize;
+  }
+  tree.stems.truncate(w);
+}
+
+// A tree's bark with the limbs above 'maxLevel' left out
+fn barkLevel(tree &weberpenn.Tree, maxLevel i32, subdivide i32, fat i32, mid i32) mesh.Mesh {
+  mut tp = new weberpenn.TubeParams();
+  tp.maxLevel = maxLevel;
+  tp.subdivide = subdivide;
+  tp.fatSides = fat;
+  tp.midSides = mid;
+  weberpenn.branchMesh(tree, &tp);
+}
+
+// Part 'root' (the bark) and part 'crown' (the foliage) of a tree are culled and levelled
+fn cullTree(h &mut Hydrated, root usize, crown usize, tv &TreeVariant) {
+  mut sizes = List[f32].empty();
+  sizes.push(TREE_LOD0_PX);
+  sizes.push(TREE_LOD1_PX);
+  sizes.push(0.);
+  mut barks = List[usize].empty();
+  barks.push(tv.bark1);
+  barks.push(tv.bark2);
+  mut leaves = List[usize].empty();
+  leaves.push(tv.leaves1);
+  leaves.push(tv.leaves2);
+  mut sizes2 = List[f32].empty();
+  sizes2.push(TREE_LOD0_PX);
+  sizes2.push(TREE_LOD1_PX);
+  sizes2.push(0.);
+  h.cull(root, barks, sizes, 0., 0.);
+  h.cull(crown, leaves, sizes2, 0., 0.);
+}
+
+// A small thing: culled, not drawn beyond 'rangeMax' (its edge faded over 'margin')
+fn cullSmall(h &mut Hydrated, part usize, rangeMax f32, margin f32) {
+  h.cull(part, List[usize].empty(), List[f32].empty(), rangeMax, margin);
+}
+
+fn printLevels(what &str, v u32, tris Array[usize, 6]) {
+  print <- "    "; printStr(what); print <- " "; print <- v; print <- " levels (bark + foliage): ";
+  print <- tris[0usize]; print <- " + "; print <- tris[1usize]; print <- ", ";
+  print <- tris[2usize]; print <- " + "; print <- tris[3usize]; print <- ", ";
+  print <- tris[4usize]; print <- " + "; print <- tris[5usize]; print <- " triangles\n";
 }
 
 const SPECIMEN_SEEDS Array[u32, 2] = [3u32, 2u32];
@@ -285,7 +394,7 @@ fn hydrateSpecimens(h &mut Hydrated) {
     imm t0 = sdl.GetPerformanceCounter();
     mut p = weberpenn.redMaple(SPECIMEN_SEEDS[usize.from(v)], SPECIMEN_HEIGHTS[usize.from(v)]);
     p.leafSites = 5;
-    imm tree = weberpenn.grow(&p);
+    mut tree = weberpenn.grow(&p);
     mut fp = weberpenn.mapleFoliage(900u32 + v);
     fp.leafSize = 0.2;
     fp.sway = true;
@@ -297,7 +406,21 @@ fn hydrateSpecimens(h &mut Hydrated) {
     print <- "  specimen maple "; print <- v; print <- ": "; print <- tree.stems.len(); print <- " stems, "; print <- tree.sites.len();
     print <- " leaves, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, "; print <- tree.height;
     print <- " m tall, "; print <- tree.reach * 2.; print <- " m across\n";
-    variants.push(new TreeVariant(h.addMesh(bm), h.addMesh(lm)));
+    // The coarser levels: limbs of the finest orders left out, a third and then a ninth of the leaves, each
+    // grown to keep the area, the outline of a leaf simpler
+    imm bm1 = barkLevel(&tree, 2, 1, 8, 5);
+    imm bm2 = barkLevel(&tree, 1, 1, 6, 4);
+    thinSites(&mut tree, 3usize);
+    fp.leafSize = fp.leafSize * 1.7320508;
+    fp.detail = 5;
+    imm lm1 = weberpenn.foliageMesh(&tree, &fp);
+    thinSites(&mut tree, 3usize);
+    fp.leafSize = fp.leafSize * 1.7320508;
+    imm lm2 = weberpenn.foliageMesh(&tree, &fp);
+    printLevels("specimen maple", v, [bm.triangleCount(), lm.triangleCount(), bm1.triangleCount(), lm1.triangleCount(),
+      bm2.triangleCount(), lm2.triangleCount()]);
+    imm tv = new TreeVariant(h.addMesh(bm), h.addMesh(lm), h.addMesh(bm1), h.addMesh(bm2), h.addMesh(lm1), h.addMesh(lm2));
+    variants.push(tv);
     v = v + 1u32;
   }
   mut i = 0usize;
@@ -306,7 +429,8 @@ fn hydrateSpecimens(h &mut Hydrated) {
     if it.kind == K_SPECIMEN {
       imm tv = *variants[usize.from(it.variant)];
       imm root = h.part("specimen maple", tv.bark, bark, TOP, itemAt(it, 0.));
-      h.part("specimen maple leaves", tv.leaves, leaf, root, Transform3.identity());
+      imm crown = h.part("specimen maple leaves", tv.leaves, leaf, root, Transform3.identity());
+      cullTree(h, root, crown, &tv);
       vegStats.copies = vegStats.copies + 2u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + u64.from(h.meshes[tv.bark].triangleCount() + h.meshes[tv.leaves].triangleCount());
     }
@@ -338,7 +462,7 @@ fn hydrateForestMaples(h &mut Hydrated) {
     mut l2 = p.levelParams[2usize];
     l2.branches = 0.;
     p.levelParams[2usize] = l2;
-    imm tree = weberpenn.grow(&p);
+    mut tree = weberpenn.grow(&p);
     mut fp = weberpenn.mapleFoliage(950u32 + v);
     fp.leafSize = 0.34;
     fp.sway = true;
@@ -349,7 +473,19 @@ fn hydrateForestMaples(h &mut Hydrated) {
     vegStats.treeTriangles = vegStats.treeTriangles + u64.from(bm.triangleCount()) + u64.from(lm.triangleCount());
     print <- "  forest maple "; print <- v; print <- ": "; print <- tree.stems.len(); print <- " stems, "; print <- tree.sites.len();
     print <- " leaves, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, "; print <- tree.height; print <- " m tall\n";
-    variants.push(new TreeVariant(h.addMesh(bm), h.addMesh(lm)));
+    // The coarser levels (as for the specimens; the outline is already the simplest)
+    imm bm1 = barkLevel(&tree, 1, 1, 6, 4);
+    imm bm2 = barkLevel(&tree, 0, 1, 6, 4);
+    thinSites(&mut tree, 3usize);
+    fp.leafSize = fp.leafSize * 1.7320508;
+    imm lm1 = weberpenn.foliageMesh(&tree, &fp);
+    thinSites(&mut tree, 3usize);
+    fp.leafSize = fp.leafSize * 1.7320508;
+    imm lm2 = weberpenn.foliageMesh(&tree, &fp);
+    printLevels("forest maple", v, [bm.triangleCount(), lm.triangleCount(), bm1.triangleCount(), lm1.triangleCount(),
+      bm2.triangleCount(), lm2.triangleCount()]);
+    imm tv = new TreeVariant(h.addMesh(bm), h.addMesh(lm), h.addMesh(bm1), h.addMesh(bm2), h.addMesh(lm1), h.addMesh(lm2));
+    variants.push(tv);
     v = v + 1u32;
   }
   mut i = 0usize;
@@ -358,7 +494,8 @@ fn hydrateForestMaples(h &mut Hydrated) {
     if it.kind == K_MAPLE {
       imm tv = *variants[usize.from(it.variant)];
       imm root = h.part("maple", tv.bark, bark, TOP, itemAt(it, 0.));
-      h.part("maple leaves", tv.leaves, leaf, root, Transform3.identity());
+      imm crown = h.part("maple leaves", tv.leaves, leaf, root, Transform3.identity());
+      cullTree(h, root, crown, &tv);
       vegStats.copies = vegStats.copies + 2u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + u64.from(h.meshes[tv.bark].triangleCount() + h.meshes[tv.leaves].triangleCount());
     }
@@ -396,7 +533,7 @@ fn hydratePines(h &mut Hydrated) {
     mut l2 = p.levelParams[2usize];
     l2.curveRes = 4;
     p.levelParams[2usize] = l2;
-    imm tree = weberpenn.grow(&p);
+    mut tree = weberpenn.grow(&p);
     mut fp = weberpenn.pineFoliage(970u32 + v);
     fp.plumeFromLevel = 1;
     fp.plumeStart = 0.2;
@@ -409,7 +546,22 @@ fn hydratePines(h &mut Hydrated) {
     vegStats.treeTriangles = vegStats.treeTriangles + u64.from(bm.triangleCount()) + u64.from(lm.triangleCount());
     print <- "  pine "; print <- v; print <- ": "; print <- tree.stems.len(); print <- " stems, "; print <- tree.sites.len();
     print <- " sprays, "; print <- bm.triangleCount(); print <- " + "; print <- lm.triangleCount(); print <- " triangles, "; print <- tree.height; print <- " m tall\n";
-    variants.push(new TreeVariant(h.addMesh(bm), h.addMesh(lm)));
+    // The coarser levels: the twigs left out of the bark; of the plumes, every other twig's and then none,
+    // the rest wider (the limbs' plumes make the crown)
+    imm bm1 = barkLevel(&tree, 1, 1, 6, 4);
+    imm bm2 = barkLevel(&tree, 0, 1, 6, 4);
+    thinStems(&mut tree, 2, 2usize, false);
+    fp.plumeWidth = fp.plumeWidth * 1.3;
+    fp.plumeMax = fp.plumeMax * 1.3;
+    imm lm1 = weberpenn.foliageMesh(&tree, &fp);
+    thinStems(&mut tree, 2, 1usize, true);
+    fp.plumeWidth = fp.plumeWidth * 1.5;
+    fp.plumeMax = fp.plumeMax * 1.5;
+    imm lm2 = weberpenn.foliageMesh(&tree, &fp);
+    printLevels("pine", v, [bm.triangleCount(), lm.triangleCount(), bm1.triangleCount(), lm1.triangleCount(),
+      bm2.triangleCount(), lm2.triangleCount()]);
+    imm tv = new TreeVariant(h.addMesh(bm), h.addMesh(lm), h.addMesh(bm1), h.addMesh(bm2), h.addMesh(lm1), h.addMesh(lm2));
+    variants.push(tv);
     v = v + 1u32;
   }
   mut i = 0usize;
@@ -418,7 +570,8 @@ fn hydratePines(h &mut Hydrated) {
     if it.kind == K_PINE {
       imm tv = *variants[usize.from(it.variant)];
       imm root = h.part("pine", tv.bark, bark, TOP, itemAt(it, 0.));
-      h.part("pine needles", tv.leaves, needles, root, Transform3.identity());
+      imm crown = h.part("pine needles", tv.leaves, needles, root, Transform3.identity());
+      cullTree(h, root, crown, &tv);
       vegStats.copies = vegStats.copies + 2u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + u64.from(h.meshes[tv.bark].triangleCount() + h.meshes[tv.leaves].triangleCount());
     }
@@ -496,7 +649,8 @@ fn hydrateRocks(h &mut Hydrated) {
   while i < items.len() {
     imm it = items[i];
     if it.kind == K_ROCK {
-      h.part("rock", *meshes[usize.from(it.variant)], granite, TOP, itemAt(it, ROCK_SINK * 2.));
+      imm rp = h.part("rock", *meshes[usize.from(it.variant)], granite, TOP, itemAt(it, ROCK_SINK * 2.));
+      cullSmall(h, rp, 0., 0.);
       vegStats.copies = vegStats.copies + 1u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + tris / u64.from(ROCK_VARIANTS);
     }
@@ -524,7 +678,8 @@ fn hydrateEdging(h &mut Hydrated) {
     imm it = items[i];
     if it.kind == K_EDGING {
       // a low stone, about 0.1 m tall at scale 1, sunk a quarter of that into the ground
-      h.part("edging stone", *meshes[usize.from(it.variant)], stone, TOP, itemAt(it, EDGING_SINK));
+      imm ep = h.part("edging stone", *meshes[usize.from(it.variant)], stone, TOP, itemAt(it, EDGING_SINK));
+      cullSmall(h, ep, EDGING_RANGE, EDGING_RANGE * 0.3);
       vegStats.copies = vegStats.copies + 1u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + tris / u64.from(EDGING_VARIANTS);
     }
@@ -577,12 +732,14 @@ fn hydrateGroundcover(h &mut Hydrated) {
     imm it = items[i];
     if it.kind == K_HOSTA {
       imm mat = if it.variant == 0u32 { hostaA; } else { hostaB; };
-      h.part("hosta", *hostaMeshes[usize.from(it.variant)], mat, TOP, itemAt(it, 0.));
+      imm hp = h.part("hosta", *hostaMeshes[usize.from(it.variant)], mat, TOP, itemAt(it, 0.));
+      cullSmall(h, hp, PLANT_RANGE, PLANT_RANGE * 0.3);
       vegStats.copies = vegStats.copies + 1u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + hostaTris / u64.from(HOSTA_VARIANTS);
     } elif it.kind == K_FERN {
       imm mat = if it.variant == 0u32 { fernA; } else { fernB; };
-      h.part("fern", *fernMeshes[usize.from(it.variant)], mat, TOP, itemAt(it, 0.));
+      imm fp = h.part("fern", *fernMeshes[usize.from(it.variant)], mat, TOP, itemAt(it, 0.));
+      cullSmall(h, fp, PLANT_RANGE, PLANT_RANGE * 0.3);
       vegStats.copies = vegStats.copies + 1u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + fernTris / u64.from(FERN_VARIANTS);
     }
@@ -623,7 +780,8 @@ fn hydrateFlowers(h &mut Hydrated) {
   while i < items.len() {
     imm it = items[i];
     if it.kind == K_FLOWER {
-      h.part("flowers", *meshes[usize.from(it.variant)], *mats[usize.from(it.variant / 2u32)], TOP, itemAt(it, 0.));
+      imm fl = h.part("flowers", *meshes[usize.from(it.variant)], *mats[usize.from(it.variant / 2u32)], TOP, itemAt(it, 0.));
+      cullSmall(h, fl, FLOWER_RANGE, FLOWER_RANGE * 0.3);
       vegStats.copies = vegStats.copies + 1u64;
       vegStats.drawnTriangles = vegStats.drawnTriangles + tris / u64.from(FLOWER_VARIANTS);
     }
