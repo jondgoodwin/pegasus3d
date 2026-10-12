@@ -93,6 +93,10 @@ import boidflock use Flock, FlockParams;
 import actors;
 import sync use Channel, Sender, Receiver;
 import path use Path;
+import fs;
+import uilayout use Ui, DrawCmd;
+import msdftext use Font, Atlas, AtlasConfig, TextRenderer, TextStyle, TextHandle, LayoutOptions, layoutText, overlayTransform,
+  SPACE_OVERLAY, GlyphQuad, TextLayout, PlacedGlyph, LineInfo;
 import thread;
 import time use Duration;
 import iocore use SocketAddr;
@@ -103,7 +107,6 @@ import audiomixer use Control, Engine, Cmd, Listener, Attenuation, commandQueue,
   BUS_MASTER, BUS_EFFECTS, BUS_AMBIENCE, MATERIAL_GRASS, MATERIAL_WOOD, MATERIAL_STONE, Sound, encodeWav, spectrum, bandFraction,
   centroid, dominantFreq;
 import audiodevice;
-import fs;
 
 // The submodules: the scene's parts, ids, tables and requests (parts/), whose
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
@@ -134,6 +137,7 @@ mut inputState Input;
 mut ctx Context;
 mut user UserController;      // the user's: the actions into the possessed being's intents
 mut clockKeys ClockActions;   // the pause and x10 keys
+mut hudKeys HudActions;       // the HUD's: H and F1 to F8
 mut skyOff bool = false;      // --no-sky: the static sky and light, no birds (to time what the day costs)
 mut ctxFrame u64 = 0u64;      // the frame whose actions are in 'ctx'
 mut inputFrame u64 = 0u64;    // the frame whose events are in 'input'
@@ -190,6 +194,53 @@ struct ClockActions {
   }
 }
 
+// The HUD's keys (hud.cone): H hides and shows it, F1 to F8 use the hotbar's eight slots
+struct HudActions {
+  pub hide Action;
+  pub s0 Action;
+  pub s1 Action;
+  pub s2 Action;
+  pub s3 Action;
+  pub s4 Action;
+  pub s5 Action;
+  pub s6 Action;
+  pub s7 Action;
+
+  fn slot(ctx &mut Context, n u32) Action {
+    imm a = ctx.action("hud.slot", BUTTON);
+    ctx.bind(a, Binding.key(SCANCODE_F1 + n));
+    a;
+  }
+
+  pub fn bind(ctx &mut Context) HudActions {
+    imm hide = ctx.action("hud.hide", BUTTON);
+    ctx.bind(hide, Binding.key(SCANCODE_H));
+    imm a0 = HudActions.slot(ctx, 0u32);
+    imm a1 = HudActions.slot(ctx, 1u32);
+    imm a2 = HudActions.slot(ctx, 2u32);
+    imm a3 = HudActions.slot(ctx, 3u32);
+    imm a4 = HudActions.slot(ctx, 4u32);
+    imm a5 = HudActions.slot(ctx, 5u32);
+    imm a6 = HudActions.slot(ctx, 6u32);
+    imm a7 = HudActions.slot(ctx, 7u32);
+    new HudActions(hide, a0, a1, a2, a3, a4, a5, a6, a7);
+  }
+
+  // The slots pressed this frame, as bits
+  pub fn pressedSlots(self &, ctx &Context) u32 {
+    mut bits = 0u32;
+    if ctx.pressed(s0) { bits = bits | 1u32; }
+    if ctx.pressed(s1) { bits = bits | 2u32; }
+    if ctx.pressed(s2) { bits = bits | 4u32; }
+    if ctx.pressed(s3) { bits = bits | 8u32; }
+    if ctx.pressed(s4) { bits = bits | 16u32; }
+    if ctx.pressed(s5) { bits = bits | 32u32; }
+    if ctx.pressed(s6) { bits = bits | 64u32; }
+    if ctx.pressed(s7) { bits = bits | 128u32; }
+    bits;
+  }
+}
+
 // How many parts a mannequin is (its own, shown as its skinned body) and
 // how many meshes (the body)
 const FIGURE_PARTS = 1usize;
@@ -202,6 +253,7 @@ fn @initpure init() {
   clockKeys = ClockActions.bind(&mut ctx);
   audioG = AudioGlobals.make();  // the sound's globals (audioview.cone)
   audioKeys = AudioKeys.bind(&mut ctx);   // N: mute
+  hudKeys = HudActions.bind(&mut ctx);
   shotsDir = String.empty();
   connectTo = String.empty();
   probeFrom = new Vec3(0., 0., 0.);
@@ -426,7 +478,7 @@ fn shellRun(config Config) i32 {
     imm input = new FrameInput(host.frame, steps, intentsNow, user.lookKeys(&ctx), user.lookDrag(&ctx), ctx.pressed(clockKeys.pause),
       ctx.pressed(clockKeys.fast), ctx.pressed(clockKeys.weather), ctx.pressed(user.actions.view), ctx.pressed(user.actions.swap),
       (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u, new Vec2(inputState.pointer.x, inputState.pointer.y),
-      viewSize(&mut host), alpha, resized, width, height);
+      viewSize(&mut host), alpha, resized, width, height, ctx.pressed(hudKeys.hide), hudKeys.pressedSlots(&ctx));
     view.frame(input);
 
     // The frame comes back presented, with each actor's phases
@@ -526,6 +578,11 @@ fn main(argc i32, argv **u8) i32 {
       a = a + 1i32;
     } elif libc.strcmp(arg, "--no-vegetation") == 0i32 {
       setVegetation(false);
+    } elif libc.strcmp(arg, "--cull") == 0i32 and a + 1i32 < argc {
+      // How the scene is culled: 0 not at all (the draw list, as before), 1 the frustum, 2 and levels of detail and
+      // ranges (the default), 3 and the depth pyramid; see cullMode (rendersys.cone)
+      cullMode = u32.from(wholeNumber(*(argv + usize.from(a + 1i32))));
+      a = a + 1i32;
     } elif libc.strcmp(arg, "--shots") == 0i32 and a + 1i32 < argc {
       shotsDir = String.fromCStr(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
@@ -547,6 +604,10 @@ fn main(argc i32, argv **u8) i32 {
     } elif libc.strcmp(arg, "--run-for") == 0i32 and a + 1i32 < argc {
       runForSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
+    } elif libc.strcmp(arg, "--hud-only") == 0i32 {
+      // Only the HUD's part of the scripted run (hudscript.cone), to look at it quickly: the walk to the cottage, then the HUD
+      scripted = true;
+      hudOnly = true;
     } elif libc.strcmp(arg, "--autowalk") == 0i32 {
       autoWalk = true;
     } elif libc.strcmp(arg, "--trace") == 0i32 {
@@ -568,7 +629,11 @@ fn main(argc i32, argv **u8) i32 {
     finalAll();
     return served;
   }
-  if scripted {
+  if hudOnly and config.frames == 0u64 {
+    config.frames = hudScriptEnd();
+    config.synthetic = true;
+  }
+  if scripted and !hudOnly {
     if config.frames == 0u64 {
       config.frames = SCRIPT_FRAMES;
       config.synthetic = true;

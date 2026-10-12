@@ -52,6 +52,27 @@ pub struct Renderable {
   pub batch u32;              // its batch
   pub member u32;             // and its place among the batch's members
   pub tint Color = new Color(1., 1., 1., 1.);   // its colour and glow multiplied by this (Tint)
+  pub scenic bool = false;    // a thing of render's scene (Cull): in 'scenery', not in the draw list
+}
+
+// How the scene's culling is used (--cull N): 0 not at all (every part is a draw list item, as before),
+// 1 parts that are Culled are scene items, culled by the camera's frustum and drawn instanced from the visible
+// set, 2 and drawn as the coarser levels by projected size and not beyond their range, 3 and culled by the
+// hierarchical-Z depth pyramid. The default is 2: in this scene (an open island of trees one behind another,
+// ~1,000 items) the pyramid costs about 4 ms of CPU a frame for no visible gain (measured, vegcull lane).
+pub mut cullMode u32 = 2u32;
+
+// A part that is a scene item (Request.Cull): what the request said, the item once it is made (on the first
+// frame the snapshot places the part), and what it was last given
+pub struct SceneRow {
+  pub levels List[MeshId];
+  pub sizes List[f32];
+  pub rangeMax f32;
+  pub margin f32;
+  pub handle SceneHandle;
+  pub model Mat4;
+  pub tint Color;
+  pub lit bool;               // drawn in its material's highlighted version
 }
 
 // Where a skinned part's skinning matrices are in 'poseBones'
@@ -184,6 +205,11 @@ pub struct RenderSystem {
   prevRows Table[PrevRow];
   prevBones List[Mat4];
   nextBones List[Mat4];
+  pub scenery Table[SceneRow];   // the parts that are scene items, keyed by part (Cull)
+  pub sceneEye Vec3 = new Vec3(0., 0., 0.);   // the eye at the last 'syncScene': a jump of it is a cut, with no fade
+  pub sceneNow f64 = 0d;    // the snapshot time of the last 'syncScene', for the fades' step
+  pub sceneMade u64 = 0u64;   // scene items made, ever
+  pub sceneMoved u64 = 0u64;  // scene items moved because their part did, ever
   pub glows u64 = 0u64;       // Glow requests applied, ever
   // The sky's light on smoke, in the frame's units (the pre-exposed frame):
   // smoke's colours are albedos, scaled by this as they are drawn, so smoke is
@@ -199,7 +225,7 @@ pub struct RenderSystem {
       List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
       List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty(), List[EmitterHandle].empty(),
       Table[LampRow].empty(), Table[u32].empty(), MotionList.empty(), Table[PrevRow].empty(), List[Mat4].empty(),
-      List[Mat4].empty());
+      List[Mat4].empty(), Table[SceneRow].empty());
   }
 
   // The rain's and the snow's particle slots (once, with the device)
@@ -507,6 +533,128 @@ pub struct RenderSystem {
     rows.rows[row].tint;
   }
 
+  // Apply a Cull: part 'id' (already shown) becomes a thing of render's scene, made on the first frame the
+  // snapshot places it (syncScene), drawn as the coarser meshes 'levels' (those defined here) by projected
+  // size ('sizes': level 0's first) and not beyond 'rangeMax' (0: no limit). Nothing at cullMode 0. False if
+  // it is not drawn here, or anchored (drawn under the viewer: not a static thing).
+  pub fn cull(self &mut, id PartId, levels &List[MeshId], sizes &List[f32], rangeMax f32, margin f32) bool {
+    if cullMode == 0u32 { return false; }
+    imm row = rows.find(id);
+    if row == NO_ROW { return false; }
+    mut r = *rows.rows[row];
+    if r.anchor > 0. { return false; }
+    mut lv = List[MeshId].empty();
+    mut sz = List[f32].empty();
+    sz.push(if sizes.len() > 0usize { *sizes[0usize]; } else { 0.; });
+    mut k = 0usize;
+    while k < levels.len() {
+      if meshes.find(levels[k].id) != NO_ROW {
+        lv.push(*levels[k]);
+        sz.push(if k + 1usize < sizes.len() { *sizes[k + 1usize]; } else { 0.; });
+      }
+      k = k + 1usize;
+    }
+    r.scenic = true;
+    rows.rows.set(row, r);
+    scenery.put(id, new SceneRow(lv, sz, rangeMax, margin, SceneHandle.none(), Mat4.identity(), new Color(1., 1., 1., 1.), false));
+    true;
+  }
+
+  // The scene's items brought up to date with the snapshot, before the frame is drawn: a part's item made the
+  // first frame the snapshot places it (with its levels and range), moved when the part's world matrix is not
+  // what it was, its tint and highlight followed; and the visibility system's settings for the mode
+  // (cullMode) and its fades stepped by the scene time that passed.
+  pub fn syncScene(self &mut, renderer &mut Renderer, snap &Snapshot, eye Vec3) {
+    // A cut (a teleport): the levels change at once, as nothing seen before is still in view
+    renderer.vis.settings.crossFade = (eye - sceneEye).length() < 3.;
+    sceneEye = eye;
+    renderer.vis.settings.frustumCulling = cullMode >= 1u32;
+    renderer.vis.settings.lod = cullMode >= 2u32;
+    renderer.vis.settings.ranges = cullMode >= 2u32;
+    renderer.vis.settings.occlusion = cullMode >= 3u32;
+    renderer.vis.settings.occlusionStats = false;
+    mut dt = snap.now - sceneNow;
+    sceneNow = snap.now;
+    if dt <= 0d or dt > 0.25d { dt = 0.0166667d; }
+    renderer.vis.settings.timeStep = f32.from(dt);
+    mut failed = List[PartId].empty();
+    mut i = 0usize;
+    while i < scenery.len() {
+      imm id = *scenery.ids[i];
+      imm rrow = rows.find(id);
+      if rrow != NO_ROW and snap.worlds.find(id) != NO_ROW {
+        imm r = *rows.rows[rrow];
+        imm model = snap.worldOf(id);
+        imm mrow = materials.find(r.material.id);
+        imm sr = &mut scenery.rows[i];
+        if sr.handle.isNone() {
+          imm meshH = meshes.rows[meshes.find(r.mesh.id)].handle;
+          imm matH = materials.rows[mrow].handle;
+          imm h = renderer.addSceneItem(meshH, matH, model, r.tint);
+          if h.isNone() {
+            failed.push(id);
+          } else {
+            if sr.levels.len() > 0usize {
+              mut chain = LodChain.empty(0.1);
+              chain.add(meshH, *sr.sizes[0usize]);
+              mut k = 0usize;
+              while k < sr.levels.len() {
+                chain.add(meshes.rows[meshes.find(sr.levels[k].id)].handle, *sr.sizes[k + 1usize]);
+                k = k + 1usize;
+              }
+              renderer.setSceneLod(h, &chain);
+            }
+            if sr.rangeMax > 0. { renderer.setSceneRange(h, 0., sr.rangeMax, sr.margin); }
+            if quiet.len() > 0usize and quiet.find(id) != NO_ROW { renderer.setSceneCastsShadow(h, false); }
+            sr.handle = h;
+            sr.model = model;
+            sr.tint = r.tint;
+            sceneMade = sceneMade + 1u64;
+          }
+        } else {
+          if !matricesEqual(&sr.model, &model) {
+            renderer.moveSceneItem(sr.handle, model);
+            sr.model = model;
+            sceneMoved = sceneMoved + 1u64;
+          }
+          if r.tint.red != sr.tint.red or r.tint.green != sr.tint.green or r.tint.blue != sr.tint.blue
+            or r.tint.alpha != sr.tint.alpha {
+            renderer.setSceneTint(sr.handle, r.tint);
+            sr.tint = r.tint;
+          }
+          if r.highlighted != sr.lit {
+            imm lit = materials.rows[mrow].lit;
+            renderer.setSceneMaterial(sr.handle, if r.highlighted and !lit.isNone() { lit; } else { materials.rows[mrow].handle; });
+            sr.lit = r.highlighted;
+          }
+        }
+      }
+      i = i + 1usize;
+    }
+    // Parts the scene cannot hold are drawn from the draw list after all
+    i = 0usize;
+    while i < failed.len() {
+      imm id = *failed[i];
+      imm rrow = rows.find(id);
+      if rrow != NO_ROW {
+        mut r = *rows.rows[rrow];
+        r.scenic = false;
+        rows.rows.set(rrow, r);
+      }
+      scenery.remove(id);
+      i = i + 1usize;
+    }
+  }
+
+  // A despawned part that is a scene item: the item goes from render's scene
+  pub fn dropScene(self &mut, renderer &mut Renderer, id PartId) {
+    imm row = scenery.find(id);
+    if row == NO_ROW { return; }
+    imm h = scenery.rows[row].handle;
+    if !h.isNone() { renderer.removeSceneItem(h); }
+    scenery.remove(id);
+  }
+
   // The batch for (mesh, material), made if there is none
   fn batchOf(self &mut, mesh MeshId, material MaterialId) usize {
     mut b = 0usize;
@@ -688,6 +836,8 @@ pub struct RenderSystem {
         while k < batch.members.len() {
           imm id = *batch.members[k];
           imm r = *rows.rows[rows.find(id)];
+          // A thing of render's scene is drawn from there (syncScene), not from the list
+          if r.scenic { k = k + 1usize; continue; }
           mut model = snap.worldOf(id);
           if r.anchor > 0. {
             imm sx = libc.floorf(eye.x / r.anchor) * r.anchor;
