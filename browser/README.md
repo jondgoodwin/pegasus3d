@@ -202,8 +202,12 @@ the frame time, where the beings are, which F-keys were pressed); no game state 
 yet: they go to the world's picking.
 
 It is laid out in logical units and drawn at the display's scale (`PEGASUS_UI_SCALE=1.5` to force 150 %), with
-the text laid out at the pixel size. No font is shipped: it reads Segoe UI, or Arial, or Cascadia Mono from the
-system's font folder, and draws no text where none can be read. `PEGASUS_HUD=off` starts it hidden (to time the
+the text laid out at the pixel size. The font is Inter (Regular, and SemiBold which no label uses yet), from
+`fonts/` (Rasmus Andersson and the Inter Project Authors, https://github.com/rsms/inter, version 4.1; SIL Open Font
+License 1.1, in `fonts/Inter-LICENSE.txt`). The program looks for `fonts/Inter-Regular.ttf` beside the executable,
+two folders above it (the source tree, where the executable is `build\release\browser.exe`) and in the working
+folder; where none can be read it falls back to Segoe UI, or Arial, or Cascadia Mono from the system's font
+folder, and draws no text where none can be read. `PEGASUS_HUD=off` starts it hidden (to time the
 picture without it). A scripted run starts with it hidden, so its other views are as they were, and turns it on in
 its last part (`src/hudscript.cone`); `browser.exe --hud-only --shots DIR` runs only that part, for looking at it.
 
