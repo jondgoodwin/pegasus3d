@@ -158,8 +158,31 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | P | pause scene time, or start it again (the world's motions, the effects, the timers and the day stop; the walk does not) |
 | F | run scene time ten times as fast, or back to normal (for testing the day: dusk comes 50 s after the start instead of 12.5 min) |
 | T | the weather changes to the next of six states (clear, fair, cloudy, overcast, rain, snow), crossfading over 12 s of scene time |
+| N | mute the sound, or un-mute it (the master gain fades over 80 ms) |
 | F11 | fullscreen |
 | Escape | quit |
+
+## Sound
+
+The browser has sound (`src/audioview.cone`): Cone's `audiomixer` (a mixer in Cone: voices, buses, 3-D placement, procedural
+recipes after Andy Farnell's *Designing Sound*) sent to the speakers by `audiodevice` (an SDL3 audio push stream fed by a Cone
+thread). Nothing is a file; every sound is a recipe. It is the view's, never the simulation's: it reads what the view has (the
+camera, the beings' feet, the weather, the world's burner bursts) and sends nothing back, so a server has none.
+
+| Sound | How |
+| --- | --- |
+| wind | not placed: a breeze and a gale recipe crossfaded at constant power by the wind's strength, which is a function of the weather's numbers (clear 0.13 ... rain 0.87) so it follows the weather's own crossfade, and which rises with height over the land |
+| the brook | placed along its course: the closest point of the course to the listener carries a trickle and a rush recipe, crossfaded by the water's speed there; the three nearest bed stones, the arch under the bridge and the cascade in the dingle are louder emitters of their own |
+| the balloon's burner | a fire recipe at the burner's part, on while the world's burst lasts (the Effect and Fire requests the view already applies), following the balloon |
+| footsteps | one step recipe each time a foot comes down (the walker's foot goes from swinging to planted), at the heel, by what is underfoot: grass, stone (rocks, edging stones), wood (the porch, the basket) or the bridge (stone with a hollow note under it) |
+
+The listener is the player's head turned with the camera. A placed sound beyond its range plays no voice. Interactive runs use the
+default playback device; every automated run (`--script`, `--checks`, `--soak`, `--audio-walk`) and any machine without a device
+renders the mixer on the game thread, a fixed 48000 / 60 frames to each fixed step, so it is the same every time and needs no
+device. Options: `--no-audio`; `--audio-device` (use the device even in an automated run, e.g. with `SDL_AUDIODRIVER=dummy`);
+`--audio-muted` (open the device but start muted); `--audio-wav FILE` (record the offline mix); `--audio-walk FILE` (the
+scripted walk of `src/audiowalk.cone`, past the brook and over the bridge, recorded to FILE and described by its spectrum;
+add `--headless` for no window).
 
 ## Automated runs
 

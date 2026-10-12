@@ -98,6 +98,12 @@ import time use Duration;
 import iocore use SocketAddr;
 import netmsg use NetEvent, EventHandler, Connection, Endpoint, NetConfig, LinkConfig, LossyRelay, eventHandler, pairInProcess, mustListen,
   mustConnect, startLossyRelay;
+// The sound (audioview.cone)
+import audiomixer use Control, Engine, Cmd, Listener, Attenuation, commandQueue, SYNTH_WIND, SYNTH_WATER, SYNTH_FIRE, SYNTH_STEP,
+  BUS_MASTER, BUS_EFFECTS, BUS_AMBIENCE, MATERIAL_GRASS, MATERIAL_WOOD, MATERIAL_STONE, Sound, encodeWav, spectrum, bandFraction,
+  centroid, dominantFreq;
+import audiodevice;
+import fs;
 
 // The submodules: the scene's parts, ids, tables and requests (parts/), whose
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
@@ -194,6 +200,8 @@ fn @initpure init() {
   ctx = Context.empty();
   user = UserController.bind(&mut ctx);
   clockKeys = ClockActions.bind(&mut ctx);
+  audioG = AudioGlobals.make();  // the sound's globals (audioview.cone)
+  audioKeys = AudioKeys.bind(&mut ctx);   // N: mute
   shotsDir = String.empty();
   connectTo = String.empty();
   probeFrom = new Vec3(0., 0., 0.);
@@ -272,6 +280,7 @@ fn shellRun(config Config) i32 {
   mut host = Host.open(config);
   if !host.isOpen() { return 1i32; }
   automated = host.config.frames > 0u64 or watching();
+  audioOpen(automated);          // the sound's sink: the speakers, or the mixer rendered in step (audioview.cone)
   // The flock is made before the island is baked, as it was when the sky rig
   // was a global made by the module's initializer: its home's height and its
   // birds' first heights are read off the ground before there is one (0 m).
@@ -403,6 +412,7 @@ fn shellRun(config Config) i32 {
       steps.push(host.step());
     }
     updateActions(host.frame);
+    audioKeyFrame(&ctx);
     imm alpha = host.alpha();
     mut width = 0u32;
     mut height = 0u32;
@@ -411,7 +421,8 @@ fn shellRun(config Config) i32 {
       width = u32.from(s.w);
       height = u32.from(s.h);
     }
-    imm intentsNow = if autoWalk { autoIntents(firstStep); } else { user.intents(&ctx); };
+    if audioWalk { audioWalkKeys(host.frame); }
+    imm intentsNow = if audioWalk { audioWalkIntents(firstStep); } elif autoWalk { autoIntents(firstStep); } else { user.intents(&ctx); };
     imm input = new FrameInput(host.frame, steps, intentsNow, user.lookKeys(&ctx), user.lookDrag(&ctx), ctx.pressed(clockKeys.pause),
       ctx.pressed(clockKeys.fast), ctx.pressed(clockKeys.weather), ctx.pressed(user.actions.view), ctx.pressed(user.actions.swap),
       (inputState.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u, new Vec2(inputState.pointer.x, inputState.pointer.y),
@@ -497,6 +508,22 @@ fn main(argc i32, argv **u8) i32 {
       scripted = true;
     } elif libc.strcmp(arg, "--no-sky") == 0i32 {
       skyOff = true;
+    } elif libc.strcmp(arg, "--audio-walk") == 0i32 and a + 1i32 < argc {
+      // A scripted walk past the brook and over the bridge, recorded to a WAV (audiowalk.cone)
+      audioWalkOn();
+      audioSetWavPath(String.fromCStr(*(argv + usize.from(a + 1i32))));
+      config.frames = AUDIO_WALK_FRAMES;
+      config.synthetic = true;
+      a = a + 1i32;
+    } elif libc.strcmp(arg, "--no-audio") == 0i32 {
+      audioSetOff();
+    } elif libc.strcmp(arg, "--audio-muted") == 0i32 {
+      audioSetStartMuted();
+    } elif libc.strcmp(arg, "--audio-device") == 0i32 {
+      audioSetForceDevice();
+    } elif libc.strcmp(arg, "--audio-wav") == 0i32 and a + 1i32 < argc {
+      audioSetWavPath(String.fromCStr(*(argv + usize.from(a + 1i32))));
+      a = a + 1i32;
     } elif libc.strcmp(arg, "--no-vegetation") == 0i32 {
       setVegetation(false);
     } elif libc.strcmp(arg, "--shots") == 0i32 and a + 1i32 < argc {
