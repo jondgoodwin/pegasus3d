@@ -65,8 +65,26 @@ The sky is the day's, drawn by one custom pipeline (`src/skyshader.slang`, a ful
 `src/skyrig.cone`) over the sky of Cone's `analyticdaylight` package: Preetham, Shirley and Smits's analytic daylight
 (coefficients read from the paper, not from memory), a twilight patch for the sun below 6 degrees, a night floor,
 the sun's disc, a moon that is always up at night with a phase and seas, and a field of stars that turns with
-the hour; with two layers of cloud (a low one 1800 m up, cirrus at 7500 m) drifting on scene time, lit by the
-sun's colour so they redden at dusk and by the moon at night. The day is **45 degrees north on 15 October** (day 288, autumn, to match the maples; so the
+the hour; with two layers of cloud (a low one 1800 m up, cirrus at 7500 m) carried east (+x) by the world's wind
+(7 m/s at the low layer, 11 m/s at the cirrus, so the layers slide past each other) while each octave of the cloud's
+noise turns slowly on a small circle of its own, so the clouds grow, thin and break up as they go (both closed forms in
+scene time, so a paused or scrubbed clock puts them where they were), lit by the
+sun's colour so they redden at dusk and by the moon at night. The wind is one value for the world
+(`src/parts/weather.cone`): the clouds, the chimney's smoke and the snow lean on it.
+
+**The weather** (`src/parts/weather.cone`, press **T**) is six states: clear, fair, cloudy, overcast, rain and snow,
+each a set of numbers (the two layers' cover, the clouds' density and light, how grey and how bright the sky is, how
+much of the sun gets through, the fog's thickness, the ambient light's scale and tint, the exposure's offset in stops,
+the rain's and the snow's strength). T crossfades to the next state over 12 s of scene time: the simulation keeps the
+blend it left, the state it goes to and when it began; the view draws from the closed form, a smoothstep of scene
+time. **Fair** is the look the browser had before there was weather. The sky shader takes the covers, the grey and
+dimming, and a horizon haze; the render actor dims the sun, scales and tints the ambient and opens the exposure; the
+fog is a stack of 48 see-through quads facing the camera, 8 m to 2.4 km away (`src/fogshader.slang`, drawn
+alpha-blended with the depth test, so each veils only what lies beyond it, and none are drawn in clear or fair
+weather); rain and snow are particle fields (the `vfx` smoke style) in a disc over the eye, so they move with the camera
+and fall indoors too. Not done: wet ground and snow cover.
+
+The day is **45 degrees north on 15 October** (day 288, autumn, to match the maples; so the
 clock's dawn at 6:31 and dusk at 17:28 are the sun's centre at the horizon and the night is 13 of the 24 minutes), the sun rising in the east (+x) and
 setting in the west, due south (+z) at noon, 36.0 degrees up. Turbidity 2.5.
 
@@ -139,6 +157,7 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | Left click | pick what is under the pointer: it is named on the console and highlighted; the launch button in the basket sends the balloon on its ride |
 | P | pause scene time, or start it again (the world's motions, the effects, the timers and the day stop; the walk does not) |
 | F | run scene time ten times as fast, or back to normal (for testing the day: dusk comes 50 s after the start instead of 12.5 min) |
+| T | the weather changes to the next of six states (clear, fair, cloudy, overcast, rain, snow), crossfading over 12 s of scene time |
 | F11 | fullscreen |
 | Escape | quit |
 
@@ -262,6 +281,11 @@ with the sun in front of and behind the eye (`maple-sun-ahead`, `maple-sun-behin
 measured (the walk's farthest distance from the path's centre, the ride's, the fall's, the lamps' glow), and
 the run fails if one does not finish.
 
+After the assembly (`src/weatherscript.cone`) the clock is set to noon of a fourth day: `weather-sky-a` and
+`weather-sky-b` are the sky from the lawn 60 s of scene time apart (the clouds carried east and changed), then the cottage
+in each weather, `weather-clear`, `-fair`, `-cloudy`, `-overcast`, `-rain` and `-snow`; and T is pushed through SDL's queue
+in snow and the weather is checked to be going to clear.
+
 `--soak N` runs N frames on the synthetic clock and, once the world is in, checks every frame that the
 scene's inbox is empty after the apply point and that the parts, the rows drawn and the particle
 emitters stay as many as they were, and every 3000 frames that the browser's own work a frame (input,
@@ -289,6 +313,9 @@ along the way when the first frame was presented and when every object was first
 | `src/parts/events.cone` | the scene's clock and the day, timers on the timewheel, areas |
 | `src/parts/platforms.cone` | platforms: a part's floor and walls, and how each moved since the last frame |
 | `src/parts/snapshot.cone` | what the scene publishes each frame for drawing |
+| `src/parts/weather.cone` | the wind, the six weather states and their crossfade, the rain and snow emitters |
+| `src/fogshader.slang` | the fog's depth slabs (compiled and embedded in `skyrig.cone` by `tools/shaders/shaders.py`) |
+| `src/weatherscript.cone` | the scripted run's last part: the sky 60 s apart, the cottage in each weather, the T key |
 | `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list (render draws each batch as one instanced draw); a physical material is render's physically based one; a shaded one, a custom pipeline |
 | `src/look.cone` | the look: light in physical units (the sun in lux, the sky and glows in nits), the exposure from the sun's height (EV 15 at noon), AgX tone mapping and bloom through render's Post |
 | `src/shaders.cone` | the browser's own shaders, which a shaded Look names: the heightfield (`heightfield.slang`), a pool of light (`lightpool.slang`, see-through) and a lit room behind a window (`interior.slang`); after editing a `.slang`, run Cone's `tools/shaders/shaders.py src` to compile and embed it |

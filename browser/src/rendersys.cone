@@ -146,6 +146,7 @@ pub struct RenderSystem {
   pub skinned usize;          // skinned parts in the last draw list
   styles List[u32];           // each emitter's style (EFFECT_...), by the same index as 'emitters'
   counts List[u32];           // and how many particles it drew at the last aimEffects
+  weatherHandles List[EmitterHandle];   // the rain's and the snow's particle slots (made by 'makeWeather')
   pub glows u64 = 0u64;       // Glow requests applied, ever
   // The sky's light on smoke, in the frame's units (the pre-exposed frame):
   // smoke's colours are albedos, scaled by this as they are drawn, so smoke is
@@ -158,7 +159,45 @@ pub struct RenderSystem {
       Table[EffectRow].empty(), Table[SkyLook].empty(), DrawList.empty(),
       ParticleRenderer.create(device, colorFormat, TEXTURE_FORMAT_DEPTH32_FLOAT), List[Emitter].empty(),
       List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
-      List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty());
+      List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty(), List[EmitterHandle].empty());
+  }
+
+  // The rain's and the snow's particle slots (once, with the device)
+  pub fn makeWeather(self &mut, device &mut Device) {
+    if weatherHandles.len() > 0usize { return; }
+    weatherHandles.push(particles.addEmitter(device, EFFECT_SMOKE));
+    weatherHandles.push(particles.addEmitter(device, EFFECT_SMOKE));
+  }
+
+  // The rain and snow field aimed at an eye at 'eye', as the weather 'w' has
+  // it at the snapshot's scene time: each emitter's rate follows its strength
+  // (and none is drawn below a fiftieth of it); their colours are albedos,
+  // lit by the sky as the smoke is
+  pub fn aimWeather(self &mut, device &mut Device, snap &Snapshot, eye Vec3, w &WeatherParams) {
+    if weatherHandles.len() < 2usize { return; }
+    imm frame = weatherFieldFrame(eye);
+    mut k = 0usize;
+    while k < 2usize {
+      imm strength = if k == 0usize { w.rain; } else { w.snow; };
+      mut e = if k == 0usize { rainEmitter(); } else { snowEmitter(); };
+      imm seed = if k == 0usize { 7101u32; } else { 7102u32; };
+      if strength > 0.02 {
+        e.rate = e.rate * strength;
+        mut c = 0usize;
+        while c < 4usize {
+          e.colors[c].red = e.colors[c].red * smokeLight;
+          e.colors[c].green = e.colors[c].green * smokeLight;
+          e.colors[c].blue = e.colors[c].blue * smokeLight;
+          c = c + 1usize;
+        }
+        imm ev = Event.at(seed, 0d, frame);
+        particles.update(device, *weatherHandles[k], &e, &ev, snap.now);
+      } else {
+        imm never = Event.at(seed, 1000000000d, frame);
+        particles.update(device, *weatherHandles[k], &e, &never, 0d);
+      }
+      k = k + 1usize;
+    }
   }
 
   // Apply a DefineMesh: upload it
@@ -594,5 +633,5 @@ pub struct RenderSystem {
   }
 
   // Whether there are particles to draw
-  pub fn hasEffects(self &) bool { effects.len() > 0usize; }
+  pub fn hasEffects(self &) bool { effects.len() > 0usize or weatherHandles.len() > 0usize; }
 }

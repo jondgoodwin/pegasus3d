@@ -287,6 +287,10 @@ actor RenderActor {
     // Once the world has sent a sky, the day's: the sun, moon and ambient from
     // the day clock (skyrig.cone), and the exposure from the sun's height
     imm dayLit = g.sys.skies.len() > 0usize and rig.made;
+    // The weather at this moment of scene time: a closed form, so a paused
+    // clock holds it and a scrubbed one finds it (parts/weather.cone)
+    imm weather = snapshot.weather.at(snapshot.now);
+    rig.setWeather(weather);
     if dayLit {
       rig.setHour(f32.from(snapshot.hour));
       sky = rig.look();
@@ -300,14 +304,20 @@ actor RenderActor {
     // The shaders' clock: the scene's time (the sea's waves, the swash), stopped when it is
     g.renderer.time = f32.from(snapshot.now);
     imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
-    g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()); } else { exposureFor(&sky); };
+    // (under a dull sky the exposure opens up by the weather's stops)
+    g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()) * rig.exposureScale(); } else { exposureFor(&sky); };
     // Smoke is lit by the sky: white radiance under the ambient light and the
     // sun's (or the moon's) share on a surface turned to it, times the exposure
     imm sunUp = sky.sunDirection.normalize().y;
     imm sunShare = if sunUp > 0. { sunUp; } else { 0.; };
     g.sys.smokeLight = g.renderer.exposure * (luma(sky.ambient) + luma(sky.sunColor) * sunShare * 0.3183);
     g.sys.build(snapshot, pose.origin);
-    if dayLit { rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds); }
+    if dayLit {
+      rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds);
+      // The fog after the sky: depth slabs over what lies beyond them
+      imm aspect = f32.from(g.target.texture.width) / f32.from(g.target.texture.height);
+      rig.drawFog(&mut g.sys.list, pose.origin, pose.orientation, snapshot.fov, aspect, g.renderer.exposure);
+    }
     mut encoder = g.device.createCommandEncoder();
     // Into the HDR frame (the size of the target), then bloomed and
     // tone-mapped into the target
@@ -315,6 +325,7 @@ actor RenderActor {
     g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
     if g.sys.hasEffects() {
       g.sys.aimEffects(&mut g.device, snapshot);
+      g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
       g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
     }
     g.post.apply(&mut encoder, &g.target.texture);
@@ -393,6 +404,7 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, rig &mut SkyR
     return None;
   }
   if !skyOff { rig.makeGpu(&mut renderer, &mut device); }
+  sys.makeWeather(&mut device);
   mut camera = Camera.make();
   camera.fov = FOV;
   camera.near = 0.1;

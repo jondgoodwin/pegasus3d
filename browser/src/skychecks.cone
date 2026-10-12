@@ -102,5 +102,80 @@ pub fn checkSky() bool {
     i = i + 1usize;
   }
   ok = expect("after 5 s every bird is within 150 m of the cottage and 3 m above the ground", closeBy) and ok;
+  ok = checkWeather() and ok;
+  ok;
+}
+
+// The weather's wiring (parts/weather.cone): the wind, the crossfade, and
+// that the fair state is the look the browser had before there was weather
+fn checkWeather() bool {
+  mut ok = true;
+  print <- "The weather:\n";
+  // The wind carries a layer's pattern speed x time along +x: the low clouds' 7 m/s, the cirrus's 11
+  imm low = cloudOffset(false, 60d);
+  imm high = cloudOffset(true, 60d);
+  print <- "  after 60 s the low layer is carried "; print <- low.x; print <- " m, the cirrus "; print <- high.x; print <- " m\n";
+  ok = expect("the low clouds are carried 7 m/s x 60 s = 420 m east (+x), none north or south",
+    nearly(low.x, 420., 0.001) and nearly(low.y, 0., 0.0001)) and ok;
+  ok = expect("the cirrus 11 m/s x 60 s = 660 m east", nearly(high.x, 660., 0.001) and nearly(high.y, 0., 0.0001)) and ok;
+  ok = expect("the wind is a unit vector towards +x and the cirrus is faster",
+    nearly(WIND_DIR_X * WIND_DIR_X + WIND_DIR_Z * WIND_DIR_Z, 1., 0.00001) and WIND_DIR_X > 0. and WIND_HIGH > WIND_LOW) and ok;
+  ok = expect("the offset is nothing at time 0 and grows in a line with time",
+    cloudOffset(false, 0d).x == 0. and nearly(cloudOffset(false, 600d).x, 10. * low.x, 0.01)) and ok;
+  // A crossfade is the state it left until it begins, a blend, and the target from its end on
+  mut w = Weathering.fair();
+  w.goTo(WEATHER_RAIN, 100d, 12.);
+  imm rain = WeatherParams.state(WEATHER_RAIN);
+  imm fair = WeatherParams.state(WEATHER_FAIR);
+  imm snow = WeatherParams.state(WEATHER_SNOW);
+  ok = expect("a crossfade to rain begun at 100 s is the fair state at 100 s", w.at(100d).same(&fair) and w.at(50d).same(&fair)) and ok;
+  imm mid = w.at(106d);
+  ok = expect("and half way through (smoothstep 0.5) every field is the mean of the two",
+    nearly(mid.cloudLow, (fair.cloudLow + rain.cloudLow) * 0.5, 0.0001) and nearly(mid.fog, (fair.fog + rain.fog) * 0.5, 0.000001)
+    and nearly(mid.rain, 0.5, 0.0001) and nearly(mid.ev, (fair.ev + rain.ev) * 0.5, 0.0001)) and ok;
+  ok = expect("it is exactly the target at start + duration (112 s) and after", w.at(112d).same(&rain) and w.at(5000d).same(&rain)) and ok;
+  mut monotone = true;
+  mut t = 100d;
+  mut last = 0.;
+  while t <= 112d {
+    imm r = w.at(t).rain;
+    if r < last - 0.000001 { monotone = false; }
+    last = r;
+    t = t + 0.5d;
+  }
+  ok = expect("the rain's strength only rises through the fade", monotone) and ok;
+  // A press part way starts from what is on screen
+  w.goTo(WEATHER_SNOW, 106d, 12.);
+  ok = expect("a key part way through starts from the blend then on screen, and ends on the new target",
+    w.at(106d).same(&mid) and w.at(118d).same(&snow)) and ok;
+  mut c = Weathering.fair();
+  mut cycled = true;
+  mut s = 0u32;
+  while s < WEATHER_STATES {
+    c.cycle(0d);
+    if c.target != (WEATHER_FAIR + 1u32 + s) % WEATHER_STATES { cycled = false; }
+    s = s + 1u32;
+  }
+  ok = expect("the key cycles through the six states and back to where it began", cycled and c.target == WEATHER_FAIR) and ok;
+  // Fair is the look before weather: the cover the sky had, and everything else as the day gives it
+  ok = expect("fair is the old cover, 0.42 and 0.5", fair.cloudLow == 0.42 and fair.cloudHigh == 0.5) and ok;
+  ok = expect("and nothing else changed: full density, light, sun, ambient and tint, no grey, dimming, fog, exposure offset, rain or snow",
+    fair.density == 1. and fair.cloudLight == 1. and fair.skyGrey == 0. and fair.skyDim == 1. and fair.sunDim == 1. and fair.fog == 0.
+    and fair.ambient == 1. and fair.tintRed == 1. and fair.tintGreen == 1. and fair.tintBlue == 1. and fair.ev == 0. and fair.rain == 0.
+    and fair.snow == 0.) and ok;
+  ok = expect("a world that has had no key is fair at any time", Weathering.fair().at(0d).same(&fair) and Weathering.fair().at(86400d).same(&fair)) and ok;
+  mut rig = SkyRig.make();
+  rig.setHour(12.);
+  imm plain = rig.look();
+  rig.setWeather(fair);
+  imm lit = rig.look();
+  ok = expect("under fair weather the rig's light is the day's own, to the bit",
+    lit.sunColor.red == rig.lighting.lightColor.x and lit.sunColor.green == rig.lighting.lightColor.y
+    and lit.ambient.red == rig.lighting.ambient.x and lit.ambient.blue == rig.lighting.ambient.z
+    and lit.sunColor.red == plain.sunColor.red and rig.exposureScale() == 1.) and ok;
+  rig.setWeather(rain);
+  imm wet = rig.look();
+  ok = expect("under rain the direct light is gone, the ambient is dimmer, and the exposure opens up",
+    wet.sunColor.red == 0. and wet.ambient.green < lit.ambient.green and rig.exposureScale() > 2.) and ok;
   ok;
 }
