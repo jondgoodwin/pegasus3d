@@ -91,7 +91,7 @@ with F).
 **Nothing casts light yet: no point lights.** The lamps glow, glass is see-through, and the light a lamp would
 throw on the ground is painted there. All of it is the world's lights (`src/bakedworld/lights.cone`):
 
-- **What glows:** the five lanterns' bulbs and frosted glass chimneys, and a lit room behind every window and
+- **What glows:** the fourteen lanterns' bulbs and clear glass panes (square lanterns, each lit from its bulb), and a lit room behind every window and
   door pane (`src/interior.slang`: a card 9 mm behind the glass, a lampshade a little left of centre, its warm
   light falling off round it, the dark back of a sofa across the lower third, curtains gathered at both sides).
   Their glow is their material's emissive colour, which the picture's bloom spreads. The lamps are about 2700 K
@@ -105,7 +105,7 @@ throw on the ground is painted there. All of it is the world's lights (`src/bake
   - The exposure rises about 5000-fold over the same hours.
   - The bulb is about 1.2 of the display's white at 17:28, 2.7 at 17:48 and 3 at night: brighter as the night
     deepens, as the eye adapting sees a lamp.
-  - Every other glow is a share of the bulb's: the glass 0.22, a room 0.4, a lantern's pool 0.04, a window's
+  - Every other glow is a share of the bulb's: the glass 0.015, a room 0.4, a lantern's pool 0.04, a window's
     pool 0.05.
 - **Nearness:** each path lantern's stake is an `Area` 4 m round. The possessed being coming into it brightens
   that lantern's glass, bulb and pool 1.45 times over 0.4 s (a `Tint` on the three parts), and going out dims
@@ -116,8 +116,8 @@ throw on the ground is painted there. All of it is the world's lights (`src/bake
   each wall lantern and before each lit porch window and the door, on the deck; and one on the ground before
   the wing's windows.
 - **Glass:** the window and door panes are physically based and see-through (alpha 0.1, a faint grey-green, so
-  they reflect the sky at a glancing angle). The lanterns' chimneys are frosted (alpha 0.45), so the bulb shows
-  through as a paler oval.
+  they reflect the sky at a glancing angle). The lanterns' panes are clear (alpha 0.2), so the bulb shows
+  through them, and the dark frame and arched tracery read as silhouettes against its glow.
 
 The requests are `Glow` (a material's emissive colour, or a shaded look's first three parameters) and `Tint` (a
 part's colour and glow multiplied). A `Look` is see-through with `.translucent(alpha)` and cut out with
@@ -174,7 +174,7 @@ the chimney stack are the sizes they were built to (the amphora 1.484 m to its t
 widest; the stack 47 courses, 3.525 m, and 5 x 4 bricks at its top course) and drawn physically based;
 and that the cottage is as measured: its door 2.0 m by 0.8 m with its floor 0.6 m up, its ridge at 7.0 m
 and its wing's far wall 5.3 m left of the door, its chimney stack standing on its shaft at the eave
-against the right eave wall, all 26 of its parts one tree under its plinth, the five lanterns' glass,
+against the right eave wall, all 26 of its parts one tree under its plinth, the fourteen lanterns' glass,
 bulbs and metal one shared material each, and its panes drawn as parts of their own.
 It also presses P (frames 256 and 271) and F (276 and 286) while the walker stands, and checks that
 scene time stood still while paused and ran ten times as fast at x10; that the world's alarm (a timer
@@ -236,8 +236,9 @@ for the lights:
 - `glow-glass-dusk`, `glow-glass-night`: the porch's right bay window close up;
 - `glow-dusk-photo`, and `glow-dusk-vs-photo.png` beside the reference photograph: the photograph's view at
   17:48 (taken at 19:50 in May's evening; the reference photograph's light was then);
-- `glow-lantern-night`: the nearest path lantern close up. The walker was set down within its area two windows
-  before, so the lantern is brightened.
+- `glow-lantern-dusk`, `glow-lantern-night`: the nearest path lantern close up, from 1.2 m at a three-quarter angle
+  (like the front lantern of `C:\src\reference-images\lantern\solar-path-lanterns.jpg`, beside which `lantern-vs-photo.png` puts it).
+  The walker was set down within its area, so the lantern is brightened.
 
 At frame 1222 the lights are checked: on, the bulb at the hour's brightness, the lantern beside the walker
 brightened 1.45 times, and the next one not. `--checks` runs the same lights on a scene of their own: off by day
@@ -478,7 +479,7 @@ world actor's turn at the publish phase, so frames keep coming while the world a
 | hostas and ferns (118, two each) | `leafrosette` | 0.5 to 1 m | 60,048 | 0.5 |
 | flowers (16 clumps, six variants) | `leafrosette` | 0.4 m | 7,040 | 0.2 |
 | cottage (26 parts: plinth, walls, battens, roofs, trim, window frames and panes, door and its panes, porch deck, skirt, posts, roof and steps, chimney shaft, stack, flaunching and pot, two wall lanterns) | new (`cottage.cone`, `chimney.cone`): measured from the reference frame with the door as the ruler (below); boxes, prisms and slabs; board, shingle, deck and flagstone maps from the `surfacepatterns` texture kit; the chimney is the stack of step 4 on a brick shaft from the ground, 3.3 m + 4 m | 7 m to the ridge, 7.3 m to the pot | 5,044 | 870 (the texture kit's four bakes 610, the chimney's maps 260) |
-| path lanterns (twelve, six pairs 2.8 m apart, 3 m across: stake, glass, bulb, cap each, and a pool of light) | new (`cottage.cone`): four lathes and a sphere in three shared materials | 0.5 m | 17,712 with the pools | 0.24 |
+| path lanterns (twelve, six pairs 2.8 m apart, 3 m across: stake, glass, bulb, cap each, and a pool of light) | new (`cottage.cone`): a lathed round post, and a square head of boxes (plinth, corner posts, arched tracery, flared hipped roof, solar-panel block), four clear panes and a bulb sphere, in three shared materials | 0.5 m | 17,712 with the pools | 0.24 |
 | hot-air balloon (envelope, skirt, burner frame, cables, basket and rim, burner coil and valves, launch button) | `sculpt/examples/balloon.cone`, the chevrons; the basket (open-fronted, for two standing riders), the burner and the button new | 25 m | 77,200 | 51 |
 | burner flame (core, tongue, embers) and pilot light | `vfx/examples/burner.cone`, live, fired in bursts | 3 m | particles | (in the balloon's) |
 | (launch button) | nothing now: the button is in the balloon's basket; the object keeps its place in the list | | 0 | |
@@ -672,5 +673,6 @@ camera changes the roof's pixels by 8.0 grey levels on average before, 1.9 to 2.
 two GPUs; the deck's, 6.3 before, 1.7 to 2.3 after; the mips cost about 0.1 s on the first frame the
 world is published). The brick chimney is `chimney.cone`'s stack, unchanged, standing on a shaft of 44
 more courses of the same bond from the ground to the eave, on the right eave wall; its pot is 0.3 m above the
-ridge. The three path lanterns and the two wall lanterns are one family (stake or bracket, glass, bulb, cap), the
+ridge. The twelve path lanterns and the two wall lanterns are one family, square in plan like a solar path light (post
+or bracket, glass, bulb, and the head: bronze frame with arched tracery, flared hipped roof and solar panel), the
 glass and the bulb each its own part, in three materials the world shares.
