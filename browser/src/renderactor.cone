@@ -18,6 +18,10 @@
 // (the one that made the window, as SDL wants); from then on only this
 // actor's messages reach it, on whichever worker runs them.
 
+// The CPU time spent in render's own call (the scene's culling, batching and recording), summed, and its count
+mut renderCallTicks u64 = 0u64;
+mut renderCalls u64 = 0u64;
+
 // The GPU side, made by the initializer; the device outlives what it made
 struct Gfx {
   pub readback Buffer;
@@ -237,6 +241,10 @@ actor RenderActor {
         print <- "Parts drawn: "; print <- some.sys.drawn; print <- "; draws ";
         print <- u64.from(some.renderer.drawCalls); print <- ", triangles "; print <- some.renderer.triangles;
         print <- "\n";
+        if renderCalls > 0u64 {
+          print <- "Render call: "; print <- f64.from(renderCallTicks) / f64.from(sdl.GetPerformanceFrequency()) * 1000d / f64.from(renderCalls);
+          print <- " ms CPU a frame, mean of "; print <- renderCalls; print <- " frames\n";
+        }
       }
       else {}
     }
@@ -275,6 +283,7 @@ actor RenderActor {
         // comes as one Despawn of its own
         case mut d &mut Despawn {
           g.sys.dropLamp(&mut g.renderer, d.id);
+          g.sys.dropScene(&mut g.renderer, d.id);
           g.sys.drop(&mut g.device, d.id);
         }
         case mut dm &mut DefineMesh { g.sys.defineMesh(&mut g.renderer, &mut g.device, dm.mesh, &dm.shape); }
@@ -292,6 +301,7 @@ actor RenderActor {
         case mut tn &mut Tint { g.sys.tint(tn.id, tn.tint); }
         case mut ls &mut LightSource { g.sys.lightSource(&mut g.renderer, ls.id, &ls.light); }
         case mut cs &mut CastsShadow { g.sys.castsShadow(cs.id, cs.casts); }
+        case mut cu &mut Cull { g.sys.cull(cu.id, &cu.levels, &cu.sizes, cu.rangeMax, cu.margin); }
         case mut hl &mut Highlight { g.sys.highlight(&mut g.renderer, &mut g.device, hl.id, hl.on); }
         case mut k &mut Sky { g.sys.sky(k.id, k.look); }
         else {}
@@ -334,6 +344,7 @@ actor RenderActor {
     imm sunUp = sky.sunDirection.normalize().y;
     imm sunShare = if sunUp > 0. { sunUp; } else { 0.; };
     g.sys.smokeLight = g.renderer.exposure * (luma(sky.ambient) + luma(sky.sunColor) * sunShare * 0.3183);
+    g.sys.syncScene(&mut g.renderer, snapshot, pose.origin);
     g.sys.build(snapshot, pose.origin);
     g.sys.aimLights(&mut g.renderer, snapshot);
     if dayLit {
@@ -351,7 +362,10 @@ actor RenderActor {
     g.post.resize(&mut g.device, g.target.texture.width, g.target.texture.height);
     if g.fxTier == 0u32 {
       g.sys.motion.clear();
+      imm callFrom = sdl.GetPerformanceCounter();
       g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
+      renderCallTicks = renderCallTicks + (sdl.GetPerformanceCounter() - callFrom);
+      renderCalls = renderCalls + 1u64;
       if g.sys.hasEffects() {
         g.sys.aimEffects(&mut g.device, snapshot);
         g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
@@ -384,7 +398,10 @@ actor RenderActor {
       g.haveLast = true;
       // What moved since last frame, for temporal AA
       g.fx.motion <=> g.sys.motion;
+      imm callFrom = sdl.GetPerformanceCounter();
       g.fx.renderScene(&mut g.device, &mut encoder, &mut g.renderer, &mut g.post, &g.camera, &light, &g.sys.list);
+      renderCallTicks = renderCallTicks + (sdl.GetPerformanceCounter() - callFrom);
+      renderCalls = renderCalls + 1u64;
       // The particles, into the frame before the passes that resolve it, through the camera the scene was drawn with
       if g.sys.hasEffects() {
         g.sys.aimEffects(&mut g.device, snapshot);
@@ -413,6 +430,16 @@ actor RenderActor {
       encoder.copyBufferToBuffer(&g.post.exposureBuffer, 0u64, &meter, 0u64, 16u64);
     }
     g.device.queue.submit(encoder.finish());
+    if shot.len > 0usize {
+      // What this view cost to draw, for comparing the culling's modes (--cull N): draw calls and triangles, then
+      // the scene's items: in it, past the frustum, put to draw (a cross-fade is two), dropped by range, level switches
+      imm vs = g.renderer.vis.stats;
+      print <- "Draws "; printStr(shot); print <- ": calls "; print <- u64.from(g.renderer.drawCalls); print <- ", triangles ";
+      print <- g.renderer.triangles; print <- "; scene items "; print <- u64.from(vs.items); print <- ", past frustum ";
+      print <- u64.from(vs.candidates); print <- ", drawn "; print <- u64.from(vs.drawn); print <- ", range-culled ";
+      print <- u64.from(vs.rangeCulled); print <- ", level switches "; print <- u64.from(vs.lodSwitches); print <- ", fading ";
+      print <- u64.from(vs.fading); print <- "\n";
+    }
     if meter.isValid() {
       g.device.waitIdle();
       imm f = meter.mappedRange() as *f32;
