@@ -1,0 +1,145 @@
+// The brook's water: one ribbon mesh along the course (island/brook.cone), seven vertices across at
+// a station every half metre, drawn see-through by brook.slang (SHADER_BROOK). The land under it is
+// the trench the island carved; the ribbon lies at the water's level there, or a hand's breadth over
+// the ground if the ground rises past it (a bank, a cobble's wet top), so it never sinks out of sight.
+//
+// The per-vertex data brook.slang reads (it is packed into the mesh's three streams):
+//   uv      across (metres from the course, signed), along (metres from the spring)
+//   normal  speed (m/s), foam (0 to 1), the wet half width
+//
+// THE SPEED follows the course's fall: 0.15 + 4.5 sqrt(slope), the slope taken over six metres: about
+// 0.4 m/s on the yard's 0.3%, a metre a second in the dingle, two on the rill.
+// THE FOAM is baked here: round each bed stone (a rock the layout set in the water: its wake reaches
+// 0.8 m downstream), and at the foot of each step of the cascade, fading over the next four stations.
+
+// Metres between stations
+const BROOK_STATION f32 = 0.5;
+// The ribbon runs this far beyond the wet half width as a feather that fades
+const BROOK_FEATHER f32 = 0.3;
+// The metres over which the water fades away at the sea
+const BROOK_FADE f32 = 8.;
+
+// The water's body colour: a faint tea-green, near clear
+const BROOK_BODY_R f32 = 0.05;
+const BROOK_BODY_G f32 = 0.085;
+const BROOK_BODY_B f32 = 0.07;
+
+// The rocks in the water: the layout's rocks that stand within 1.4 m of the course (x, z, radius)
+pub fn brookStones() List[Vec3] {
+  imm items = vegetationLayout();
+  mut out = List[Vec3].empty();
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_ROCK and brookDistanceAt(it.x, it.z) < 1.4 { out.push(new Vec3(it.x, it.z, it.radius)); }
+    i = i + 1usize;
+  }
+  out;
+}
+
+// The ribbon's mesh
+fn brookRibbon() mesh.Mesh {
+  imm pts = brookPoints();
+  imm n = pts.len();
+  imm stones = brookStones();
+  // The speed and the step foam at each point (one a metre), from the fall
+  mut speed = List[f32].withCapacity(n);
+  mut stepFoam = List[f32].withCapacity(n);
+  mut i = 0usize;
+  while i < n {
+    imm a = if i >= 3usize { i - 3usize; } else { 0usize; };
+    imm b = if i + 3usize < n { i + 3usize; } else { n - 1usize; };
+    imm run = pts[b].s - pts[a].s + 0.0001;
+    imm fall = (pts[a].w - pts[b].w) / run;
+    speed.push(minf(3., 0.15 + 4.5 * (if fall > 0. { fall; } else { 0.; }).sqrt()));
+    // A step: the water drops more than 0.15 m a metre over the one metre
+    imm drop = if i + 1usize < n { pts[i].w - pts[i + 1usize].w; } else { 0.; };
+    stepFoam.push(clamp01(drop / 0.12));
+    i = i + 1usize;
+  }
+  mut m = mesh.Mesh.empty();
+  imm stations = i32.from(pts[n - 1usize].s / BROOK_STATION) + 1;
+  mut at = 0usize;
+  mut st = 0;
+  while st < stations {
+    imm s = f32.from(st) * BROOK_STATION;
+    while at + 2usize < n and pts[at + 1usize].s < s { at = at + 1usize; }
+    imm p = pts[at];
+    imm q = pts[at + 1usize];
+    imm span = q.s - p.s + 0.0001;
+    imm u = clamp01((s - p.s) / span);
+    imm x = mixf(p.x, q.x, u);
+    imm z = mixf(p.z, q.z, u);
+    imm w = mixf(p.w, q.w, u);
+    imm hw = mixf(p.width, q.width, u) * 0.5;
+    imm v = mixf(*speed[at], *speed[at + 1usize], u);
+    // The direction downstream, and across it
+    imm tx = q.x - p.x;
+    imm tz = q.z - p.z;
+    imm tl = (tx * tx + tz * tz).sqrt() + 0.0001;
+    imm nx = (0. - tz) / tl;
+    imm nz = tx / tl;
+    // The foam at the foot of a step, drifting down for four stations: the strongest of the points upstream
+    mut stepF f32 = 0.;
+    mut back = 0usize;
+    while back < 4usize and back <= at {
+      imm f = *stepFoam[at - back] * (1. - f32.from(back) * 0.22);
+      if f > stepF { stepF = f; }
+      back = back + 1usize;
+    }
+    mut row = 0;
+    while row < 7 {
+      imm across = (f32.from(row) - 3.) / 3. * (hw + BROOK_FEATHER);
+      // The seven rows: 0, then 1/3 and 2/3 of the way to the feather's end, each side (the wet edge is
+      // near the 2/3 row at hw 0.55 and a feather of 0.3)
+      imm px = x + nx * across;
+      imm pz = z + nz * across;
+      imm g = groundHeight(px, pz);
+      imm y = if g + 0.02 > w { g + 0.02; } else { w; };
+      // Foam round the bed stones: strongest at a stone, reaching its radius and 0.4 m more, its wake
+      // 0.8 m downstream
+      mut foam = stepF * (1. - 0.6 * (across * across) / ((hw + BROOK_FEATHER) * (hw + BROOK_FEATHER)));
+      mut k = 0usize;
+      while k < stones.len() {
+        imm r = *stones[k];
+        imm dx = px - r.x - tx / tl * 0.4;
+        imm dz = pz - r.y - tz / tl * 0.4;
+        imm d = (dx * dx + dz * dz).sqrt();
+        imm reach = r.z + 0.7;
+        if d < reach {
+          imm f = 1. - d / reach;
+          if f > foam { foam = f; }
+        }
+        k = k + 1usize;
+      }
+      m.positions.push(new Vec3(px, y, pz));
+      m.normals.push(new Vec3(v, clamp01(foam), hw));
+      m.uvs.push(new Vec2(across, s));
+      row = row + 1;
+    }
+    st = st + 1;
+  }
+  mut a = 0;
+  while a + 1 < stations {
+    mut row = 0;
+    while row < 6 {
+      imm i0 = u32.from(a * 7 + row);
+      imm i1 = i0 + 1u32;
+      imm i2 = i0 + 7u32;
+      imm i3 = i2 + 1u32;
+      m.indices.push(i0); m.indices.push(i2); m.indices.push(i3);
+      m.indices.push(i0); m.indices.push(i3); m.indices.push(i1);
+      row = row + 1;
+    }
+    a = a + 1;
+  }
+  m;
+}
+
+// The brook as an object: one see-through part, the water, placed at the world's origin (its vertices are
+// the world's)
+fn hydrateBrook(h &mut Hydrated) {
+  imm ribbon = brookRibbon();
+  imm look = Look.shaded(SHADER_BROOK, [brookLength(), BROOK_FADE, 0., 0., BROOK_BODY_R, BROOK_BODY_G, BROOK_BODY_B, 0.]);
+  h.add("brook water", ribbon, look, Image.empty(), Transform3.identity());
+}
