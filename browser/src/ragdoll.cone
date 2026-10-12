@@ -1,0 +1,266 @@
+// Falls become ragdolls.
+//
+// A mannequin that is falling faster than RAGDOLL_FALL_SPEED (a drop of about 1.3 m: more than a jump or a
+// kerb) goes limp: the simulation switches it from its capsule to a ragdoll of ragdollrig in the physics
+// world (physics.cone), keeping its momentum, the fall and the landing left to the solver. When the
+// ragdoll has been still for LIE_SECONDS it plays the get-up clip for the way it lies and stands again,
+// where it is; or, if it is dead (its health emptied) or lies somewhere it cannot walk from (outside the
+// fence, in deep water, or lost far below), it is set down on the landing beach, as a fatal fall always did.
+//
+// WHO RUNS IT. The simulation (Phys.authority) alone makes a ragdoll and steps it; it is the server's.
+// A browser, its own or a server's, draws what the snapshot says: the mode, and in a ragdoll the 14
+// bodies' rotations (the pelvis' place is the being's own place). Each browser keeps a parked ragdoll
+// of its own in its physics world only to turn those rotations into a skeleton pose, and to find the
+// get-up clip's start from the pose it last had; it never steps one. The one a browser drives is not
+// predicted while it is limp: it shows the server's.
+//
+// HURT. The ragdoll's landing peak is the hardest speed the ground took off its centre of mass in one
+// episode, 1.1 to 1.3 times the speed it hit at (ragdollrig/events.cone); dividing by PEAK_OVER_SPEED
+// brings it back to the fall speed the health table (Figure.damageOf) is written in. A harder landing
+// than any so far this fall charges the difference, and mails a hard landing once.
+
+// Falling this fast (m/s down) makes a mannequin limp
+pub const RAGDOLL_FALL_SPEED = 5.;
+// Seconds a ragdoll lies still before it gets up, or is set down on the beach
+pub const LIE_SECONDS = 2.;
+// The ragdoll's landing peak over the speed it hit at (ragdollrig measured 1.1 to 1.3). Dropped from 3.5, 8 and 45 m here, the
+// peak divided by 1.2 came 9 to 11 percent short of sqrt(2 g h), so the ratio for these falls is 1.09 to 1.11
+pub const PEAK_OVER_SPEED = 1.1;
+// Below this (metres) a ragdoll is lost (fell off the world), and after this long (seconds) one that never settles is given up on
+const RAG_LOST_Y = -60.;
+const RAG_MAX_SECONDS = 40.;
+// The get-up blends from the ragdoll's last pose into the clip over this long
+const GETUP_MATCH = 0.3;
+// The deepest water (metres below the sea) a walker may wade into: a ragdoll lying deeper is not somewhere to get up from
+const REACH_DEPTH = 0.6;
+// The ragdoll's total mass (kg)
+const RAG_MASS = 70.;
+
+// A ragdoll in the physics world, and what it needs to get up
+pub struct RigSlot {
+  pub active bool;                    // in the simulation (stepped), else parked: asleep and colliding with nothing
+  pub rig ragdollrig.Ragdoll;
+  pub spec ragdollrig.RigSpec;
+  pub clips ragdollrig.GetUpClips;
+  pub getup ragdollrig.GetUp;
+  pub rest bonepose.Pose;             // the rest pose: the bones' local translations
+}
+
+fn upAxis() Vec3 { new Vec3(0., 1., 0.); }
+
+// The slot of figure 'f''s ragdoll in the physics world, made (parked) the first time
+fn slotFor(phys &mut Phys, f &mut Figure) usize {
+  if f.rag >= 0i32 { return usize.from(u32.from(f.rag)); }
+  mut spec = ragdollrig.humanoidSpec(&f.skeleton, f.height, RAG_MASS);
+  // Free fall is gravity's alone, so the landing speed is the fall's (the spec's air drag would take 15 percent off a 45 m drop)
+  spec.linearDamping = 0.;
+  imm rig = ragdollrig.Ragdoll.make(&mut phys.w, &f.skeleton, &spec, rigidcollide.Rigid.identity(), u32.from(phys.rigs.len()));
+  imm clips = ragdollrig.getUpClips(&f.skeleton, &spec);
+  imm rest = f.skeleton.restPose();
+  imm getup = new ragdollrig.GetUp(ragdollrig.LIE_UPRIGHT, 2, rest.copy(), rigidcollide.Rigid.identity(), 0., GETUP_MATCH);
+  phys.rigs.push(new RigSlot(true, rig, spec, clips, getup, rest));
+  imm at = phys.rigs.len() - 1usize;
+  parkSlot(phys, at);
+  f.rag = i32.from(at);
+  at;
+}
+
+// The ragdoll asleep and colliding with nothing
+fn parkSlot(phys &mut Phys, at usize) {
+  imm s = &mut phys.rigs[at];
+  s.active = false;
+  mut k = 0usize;
+  while k < s.rig.links.len() {
+    imm id = s.rig.links[k].body;
+    phys.w.setLayers(id, 0u32, 0u32);
+    phys.w.setLinearVelocity(id, new Vec3(0., 0., 0.));
+    phys.w.setAngularVelocity(id, new Vec3(0., 0., 0.));
+    phys.w.sleep(id);
+    k = k + 1usize;
+  }
+}
+
+// The ragdoll let loose: colliding with the world and (as its spec says) not with its own kind
+fn unparkSlot(phys &mut Phys, at usize) {
+  imm s = &mut phys.rigs[at];
+  s.active = true;
+  imm mask = if s.spec.selfCollide { 0xffffffffu32; } else { 0xfffffffdu32; };
+  mut k = 0usize;
+  while k < s.rig.links.len() {
+    phys.w.setLayers(s.rig.links[k].body, ragdollrig.LAYER_RAGDOLL, mask);
+    k = k + 1usize;
+  }
+}
+
+// Figure 'f' goes limp where it is, in the pose and with the velocity it has
+pub fn startRagdoll(phys &mut Phys, f &mut Figure, body &Walk) {
+  imm at = slotFor(phys, f);
+  unparkSlot(phys, at);
+  imm s = &mut phys.rigs[at];
+  imm placement = new rigidcollide.Rigid(body.position, Quat.angleAxis(body.yaw, upAxis()));
+  s.rig.poseToBodies(&mut phys.w, &f.skeleton, &f.pose, placement);
+  imm v = new Vec3(f.airVx, f.vy, f.airVz);
+  mut k = 0usize;
+  while k < s.rig.links.len() {
+    phys.w.setLinearVelocity(s.rig.links[k].body, v);
+    k = k + 1usize;
+  }
+  ragdollrig.resetEvents(&mut s.rig, &phys.w);
+  ragdollrig.resetPeak(&mut s.rig);
+  f.mode = FIG_RAG;
+  f.modeT = 0.;
+  f.lieT = 0.;
+  f.hurtSpeed = 0.;
+  f.grounded = false;
+  f.on = PartId.none();
+}
+
+// The skeleton's pose and model transforms read from the ragdoll's bodies, and the body put at its pelvis
+fn poseFromRagdoll(phys &mut Phys, f &mut Figure, body &mut Walk) {
+  imm s = &mut phys.rigs[usize.from(u32.from(f.rag))];
+  imm p = phys.w.positionOf(s.rig.bodyOfBone(bonepose.PELVIS));
+  body.position = p;
+  body.yaw = 0.;
+  f.pose = s.rig.bodiesToPose(&phys.w, &f.skeleton, &s.rest, rigidcollide.Rigid.at(p));
+  f.skeleton.modelTransforms(&f.pose, &mut f.models);
+}
+
+// The 14 bodies' rotations, for the snapshot
+pub fn ragRotations(phys &mut Phys, f &Figure) Array[Quat, 14] {
+  mut out = noRots();
+  if f.rag < 0i32 { return out; }
+  imm s = &mut phys.rigs[usize.from(u32.from(f.rag))];
+  mut k = 0usize;
+  while k < s.rig.links.len() and k < RAG_BODIES {
+    out[k] = phys.w.rotationOf(s.rig.links[k].body);
+    k = k + 1usize;
+  }
+  out;
+}
+
+// How many bodies a ragdoll has (the same for every humanoid)
+pub const RAG_BODIES = 14usize;
+
+// Whether a standing figure could walk on from (x, z)
+fn reachable(x f32, z f32) bool {
+  // (before the island is baked, as in a unit check, there is no fence, and anywhere is reachable)
+  (insideIslandFence(x, z) or fencePolygon().len() == 0usize) and groundHeight(x, z) >= 0. - REACH_DEPTH;
+}
+
+// The yaw of a rotation about up
+fn yawOf(q Quat) f32 { libc.atan2f(2. * q.w * q.y, 1. - 2. * q.y * q.y); }
+
+// Figure 'f''s turn of a step after the physics world has stepped (the simulation's): the pose from the
+// ragdoll, what the landing cost, and the lying, the getting up and the setting down; true if it was set
+// down on the beach
+pub fn ragdollTurn(phys &mut Phys, f &mut Figure, body &mut Walk, dt f32) bool {
+  if f.mode == FIG_RAG {
+    f.modeT = f.modeT + dt;
+    imm at = usize.from(u32.from(f.rag));
+    imm speed = phys.rigs[at].rig.peak / PEAK_OVER_SPEED;
+    if speed > f.hurtSpeed + 0.05 {
+      f.landSpeed = speed;
+      f.landCount = f.landCount + 1u32;
+      f.landed = speed >= HARD_LANDING_SPEED and f.hurtSpeed < HARD_LANDING_SPEED;
+      if f.landed { f.hardLandings = f.hardLandings + 1u32; }
+      f.health = f.health - (f.damageOf(speed) - f.damageOf(f.hurtSpeed));
+      if f.health < 0. { f.health = 0.; }
+      f.hurtSpeed = speed;
+    }
+    poseFromRagdoll(phys, f, body);
+    if phys.rigs[at].rig.settled { f.lieT = f.lieT + dt; } else { f.lieT = 0.; }
+    imm p = body.position;
+    imm lost = p.y < RAG_LOST_Y or f.modeT > RAG_MAX_SECONDS;
+    if f.lieT >= LIE_SECONDS or lost {
+      if f.health <= 0. or lost or !reachable(p.x, p.z) {
+        parkSlot(phys, at);
+        f.setDown(body, new Vec3(BEACH_X, groundHeight(BEACH_X, BEACH_Z), BEACH_Z), 0.);
+        f.respawns = f.respawns + 1u32;
+        print <- "A mannequin's fall left it dead or beyond walking from: it gets up again on the landing beach\n";
+        return true;
+      }
+      // Up where it lies: the clip for how it lies, placed under the pelvis on the floor
+      imm groundY = phys.floorAt(p.x, p.z, p.y);
+      imm s = &mut phys.rigs[at];
+      s.getup = ragdollrig.beginGetUp(&s.rig, &phys.w, &f.skeleton, &s.rest, groundY, GETUP_MATCH);
+      parkSlot(phys, at);
+      f.mode = FIG_GETUP;
+      f.modeT = 0.;
+      poseFromGetUp(phys, f, body);
+    }
+  } elif f.mode == FIG_GETUP {
+    f.modeT = f.modeT + dt;
+    imm at = usize.from(u32.from(f.rag));
+    phys.rigs[at].getup.advance(dt);
+    poseFromGetUp(phys, f, body);
+    if phys.rigs[at].getup.done(&phys.rigs[at].clips) {
+      f.standUp(body);
+    }
+  }
+  false;
+}
+
+// The pose of the get-up in progress (its model space placed on the floor under the pelvis), and the body put there
+fn poseFromGetUp(phys &mut Phys, f &mut Figure, body &mut Walk) {
+  imm s = &mut phys.rigs[usize.from(u32.from(f.rag))];
+  body.position = s.getup.placement.pos;
+  body.yaw = yawOf(s.getup.placement.rot);
+  f.pose = s.getup.pose(&s.clips);
+  f.skeleton.modelTransforms(&f.pose, &mut f.models);
+}
+
+// ---- a browser's side: the snapshot's word ----
+
+// Figure 'f' of a being the snapshot says is in mode 's.mode' made so: the ragdoll's pose from the rotations, the
+// get-up's from its time. True if the figure is limp or getting up (nothing else moves it), false if it is walking
+// (and, if it was limp, stands again where the snapshot says)
+pub fn followServer(phys &mut Phys, f &mut Figure, body &mut Walk, s &BeingState) bool {
+  if s.mode == FIG_WALK {
+    if f.mode != FIG_WALK {
+      body.position = s.position;
+      body.yaw = s.yaw;
+      f.standUp(body);
+    }
+    return false;
+  }
+  imm at = slotFor(phys, f);
+  body.position = s.position;
+  body.yaw = s.yaw;
+  if s.mode == FIG_RAG {
+    f.mode = FIG_RAG;
+    imm slot = &mut phys.rigs[at];
+    // The bodies set to the rotations (their places do not matter to the pose, but the pelvis' does)
+    mut k = 0usize;
+    while s.hasRots and k < slot.rig.links.len() and k < RAG_BODIES {
+      imm id = slot.rig.links[k].body;
+      phys.w.setTransform(id, s.position, s.rots[k]);
+      k = k + 1usize;
+    }
+    if s.hasRots { poseFromRagdoll(phys, f, body); }
+    body.position = s.position;
+    body.yaw = s.yaw;
+  } else {
+    if f.mode != FIG_GETUP {
+      // The get-up begins from the ragdoll as it last lay: its clip is the one the simulation chose (from the pelvis'
+      // rotation), placed where the snapshot says (under the pelvis, turned as it says), its start the pose the bodies hold
+      imm slot = &mut phys.rigs[at];
+      imm pelvisId = slot.rig.bodyOfBone(bonepose.PELVIS);
+      imm pelvisRot = phys.w.rotationOf(pelvisId) * slot.rig.links[0].shapeRot.conjugate();
+      imm kind = ragdollrig.lyingFrom(pelvisRot);
+      imm front = pelvisRot * new Vec3(0., 0., -1.);
+      mut clip = 2;
+      if kind == ragdollrig.LIE_FACE_UP or (kind == ragdollrig.LIE_SIDE and front.y >= 0.) { clip = 0; }
+      elif kind == ragdollrig.LIE_FACE_DOWN or kind == ragdollrig.LIE_SIDE { clip = 1; }
+      imm placement = new rigidcollide.Rigid(s.position, Quat.angleAxis(s.yaw, upAxis()));
+      imm start = slot.rig.bodiesToPose(&phys.w, &f.skeleton, &slot.rest, placement);
+      slot.getup = new ragdollrig.GetUp(kind, clip, start, placement, 0., GETUP_MATCH);
+      f.mode = FIG_GETUP;
+    }
+    imm slot = &mut phys.rigs[at];
+    slot.getup.t = s.modeT;
+    poseFromGetUp(phys, f, body);
+    body.position = s.position;
+    body.yaw = s.yaw;
+  }
+  true;
+}

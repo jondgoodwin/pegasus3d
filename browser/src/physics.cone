@@ -1,0 +1,290 @@
+// The island's bodies, in one rigid-body World that the simulation owns (rigiddynamics),
+// and what the mannequins walk on.
+//
+// A PHYS is one World with no module globals behind it, so a server and its clients in one
+// process cannot race on it: the simulation makes one (authority: it makes the ragdolls, and
+// steps them), and each view makes one of its own (a read-only copy of the same statics, for
+// predicting the mannequin it drives; it never makes a ragdoll, it shows the server's).
+// Both are built from the same numbers, so the same step gives the same answer in both.
+//
+// WHAT IS IN IT
+//   the ground       the island's heights as a heightfield (the island's own samples, one every
+//                    CELL metres), or, before the island is baked (a unit check), a flat floor
+//   the solids       worldSolids(): trunks and rocks (cylinders), the cottage, the deck, steps,
+//                    parapets (boxes) and the bridge's ramps (hulls), each a static body
+//   the platforms    each platform of the scene (the balloon's basket) a kinematic body of the
+//                    floor and the walls, put where the scene has it each frame (syncPlatforms)
+//   ragdolls         dynamic bodies of ragdollrig, made when a mannequin falls (ragdoll.cone)
+//
+// LAYERS. LAYER_GROUND is the heightfield, LAYER_WORLD everything else that stands still or is
+// carried (solids, platforms), LAYER_RAGDOLL (ragdollrig's) the falling figures. A character
+// collides with the first two and never with a ragdoll or another character.
+
+pub const LAYER_GROUND = 4u32;
+pub const LAYER_WORLD = 1u32;
+pub const LAYER_WALK = 5u32;          // what a mannequin's capsule collides with
+const NO_BODY = 0xffffffffu32;
+
+// How far a mannequin on the ground may stand from the drawn ground's height, metres: the heightfield cuts each cell
+// along one diagonal and the island's triangles alternate (island.cone), so on a curved patch the two surfaces differ
+pub const GROUND_SLACK f32 = 0.05;
+// The thickness of a platform's wall slab, outside the floor's edge (metres): a body inside meets the edge, one outside meets this beyond it
+pub const PLATFORM_WALL f32 = 0.08;
+
+// A platform's body
+struct PlatBody {
+  part PartId;
+  body u32;
+  scale f32;                          // the part's size when the shape was made
+  seen bool;                          // in the last sync
+}
+
+pub struct Phys {
+  pub w rigiddynamics.World;
+  pub authority bool;                 // the simulation's: it makes the ragdolls
+  groundMade bool;
+  groundBody u32;
+  solidBodies List[u32];
+  plats List[PlatBody];
+  pub rigs List[RigSlot];             // the ragdolls (ragdoll.cone)
+  pub steps u64;                      // worlds stepped
+  solidList List[Solid];              // the numbers the solid bodies were made from, and the platforms as last synced,
+  platsNow List[PlatformNow];         // for the gait's foot query (floorAt)
+
+  pub fn make(authority bool) Phys {
+    mut w = rigiddynamics.World.make();
+    ragdollrig.tuneWorld(&mut w);
+    new Phys(w, authority, false, NO_BODY, List[u32].empty(), List[PlatBody].empty(), List[RigSlot].empty(), 0u64,
+      List[Solid].empty(), List[PlatformNow].empty());
+  }
+
+  // The ground made (once): the island's heights, or a flat floor if the island is not baked
+  pub fn ensureGround(self &mut) {
+    if groundMade { return; }
+    groundMade = true;
+    mut heights = heightGrid();
+    if heights.len() > 0usize {
+      imm prim = rigidcollide.Prim.heightfield(heights, u32.from(N), u32.from(N), CELL, CELL, new Vec3(0. - HALF, 0., 0. - HALF));
+      imm shape = w.addShape(rigidcollide.Shape.single(prim));
+      mut def = rigiddynamics.BodyDef.staticAt(shape, new Vec3(0., 0., 0.));
+      def.layer = LAYER_GROUND;
+      groundBody = w.createBody(def);
+    } else {
+      imm shape = w.addShape(rigidcollide.Shape.single(rigidcollide.Prim.box(new Vec3(4000., 5., 4000.))));
+      mut def = rigiddynamics.BodyDef.staticAt(shape, new Vec3(0., -5., 0.));
+      def.layer = LAYER_GROUND;
+      groundBody = w.createBody(def);
+    }
+  }
+
+  // The static solids replaced by 'list': a cylinder for a circle, a box, or a hull for a sloped top
+  pub fn setSolids(self &mut, list &List[Solid]) {
+    mut i = 0usize;
+    while i < solidBodies.len() { imm id = *solidBodies[i]; w.destroyBody(id); i = i + 1usize; }
+    solidBodies.clear();
+    solidList.clear();
+    i = 0usize;
+    while i < list.len() { solidList.push(*list[i]); i = i + 1usize; }
+    i = 0usize;
+    while i < list.len() {
+      imm s = *list[i];
+      imm cy = (s.y0 + s.y1) * 0.5;
+      if s.kind == SOLID_CIRCLE {
+        imm half = atLeast((s.y1 - s.y0) * 0.5, 0.01);
+        imm shape = w.addShape(rigidcollide.Shape.single(rigidcollide.Prim.cylinder(s.x1, half)));
+        mut def = rigiddynamics.BodyDef.staticAt(shape, new Vec3(s.x0, cy, s.z0));
+        def.layer = LAYER_WORLD;
+        solidBodies.push(w.createBody(def));
+      } elif s.axis == 0u32 {
+        imm half = new Vec3((s.x1 - s.x0) * 0.5, atLeast((s.y1 - s.y0) * 0.5, 0.01), (s.z1 - s.z0) * 0.5);
+        imm shape = w.addShape(rigidcollide.Shape.single(rigidcollide.Prim.box(half)));
+        mut def = rigiddynamics.BodyDef.staticAt(shape, new Vec3((s.x0 + s.x1) * 0.5, cy, (s.z0 + s.z1) * 0.5));
+        def.layer = LAYER_WORLD;
+        solidBodies.push(w.createBody(def));
+      } else {
+        // A ramp: the bottom flat, the top a line from y1 to y2 along x (axis 1) or z (axis 2)
+        imm ax = s.axis == 1u32;
+        imm ta = s.y1;
+        imm tb = s.y2;
+        imm pts = [new Vec3(s.x0, s.y0, s.z0), new Vec3(s.x1, s.y0, s.z0), new Vec3(s.x0, s.y0, s.z1), new Vec3(s.x1, s.y0, s.z1),
+          new Vec3(s.x0, if ax { ta; } else { ta; }, s.z0), new Vec3(s.x1, if ax { tb; } else { ta; }, s.z0),
+          new Vec3(s.x0, if ax { ta; } else { tb; }, s.z1), new Vec3(s.x1, if ax { tb; } else { tb; }, s.z1)];
+        imm hull = rigidcollide.convexHull(&pts);
+        imm shape = w.addShape(rigidcollide.Shape.single(hull));
+        mut def = rigiddynamics.BodyDef.staticAt(shape, new Vec3(0., 0., 0.));
+        def.layer = LAYER_WORLD;
+        solidBodies.push(w.createBody(def));
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // ---- platforms ----
+
+  // The platforms as the scene has them now: a body for each (made when first seen, its shape
+  // the floor and the walls in the part's own frame at the part's size), put where the part is;
+  // a platform that has gone loses its body. The carrying of what stands on one is
+  // support.cone's, so the bodies are placed, not moved by a velocity.
+  pub fn syncPlatforms(self &mut, list &List[PlatformNow]) {
+    platsNow.clear();
+    mut i = 0usize;
+    while i < list.len() { platsNow.push(*list[i]); i = i + 1usize; }
+    i = 0usize;
+    while i < plats.len() { plats.set(i, withSeen(*plats[i], false)); i = i + 1usize; }
+    i = 0usize;
+    while i < list.len() {
+      imm p = *list[i];
+      imm k = frameScale(&p);
+      mut at = NO_ROW;
+      mut j = 0usize;
+      while j < plats.len() { if plats[j].part == p.id { at = j; } j = j + 1usize; }
+      if at != NO_ROW and libc.fabsf(plats[at].scale - k) > 0.0001 {
+        w.destroyBody(plats[at].body);
+        plats.swap(at, plats.len() - 1usize);
+        plats.pop();
+        at = NO_ROW;
+      }
+      imm at0 = p.world * new Vec3(0., 0., 0.);
+      imm yaw = libc.atan2f(p.world.m[8], p.world.m[10]);
+      imm rot = Quat.angleAxis(yaw, new Vec3(0., 1., 0.));
+      if at == NO_ROW {
+        imm shape = w.addShape(platformShape(&p.shape, k));
+        mut def = rigiddynamics.BodyDef.kinematicAt(shape, at0);
+        def.rot = rot;
+        def.layer = LAYER_WORLD;
+        plats.push(new PlatBody(p.id, w.createBody(def), k, true));
+      } else {
+        w.setTransform(plats[at].body, at0, rot);
+        plats.set(at, withSeen(*plats[at], true));
+      }
+      i = i + 1usize;
+    }
+    // Gone
+    i = 0usize;
+    while i < plats.len() {
+      if !plats[i].seen {
+        w.destroyBody(plats[i].body);
+        plats.swap(i, plats.len() - 1usize);
+        plats.pop();
+      } else {
+        i = i + 1usize;
+      }
+    }
+  }
+
+  // The platform part a body is (none: not a platform's)
+  pub fn partOf(self &, body u32) PartId {
+    mut i = 0usize;
+    while i < plats.len() {
+      if plats[i].body == body { return plats[i].part; }
+      i = i + 1usize;
+    }
+    PartId.none();
+  }
+
+  // ---- ragdolls ----
+
+  // The world stepped once for the ragdolls that are loose, each with its passes around the step (ragdollrig's
+  // prepareStep and endStep); nothing happens, and nothing is spent, when there are none
+  pub fn stepRagdolls(self &mut, dt f32) {
+    mut any = false;
+    mut i = 0usize;
+    while i < rigs.len() {
+      if rigs[i].active {
+        imm s = &mut rigs[i];
+        ragdollrig.prepareStep(&mut s.rig, &mut w, dt);
+        any = true;
+      }
+      i = i + 1usize;
+    }
+    if !any { return; }
+    w.step(dt);
+    steps = steps + 1u64;
+    imm events = w.takeEvents();
+    i = 0usize;
+    while i < rigs.len() {
+      if rigs[i].active {
+        imm s = &mut rigs[i];
+        ragdollrig.endStep(&mut s.rig, &w, &events, dt);
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // ---- what a foot stands on ----
+
+  // The height of the highest support under (x, z) for feet at 'from': the ground, or the top of a
+  // solid or a platform's floor that is no higher than a step above the feet. This is the gait's question
+  // (where does this foot go down), asked through walkgait's plain-function hook, which cannot change the
+  // world; so it reads the numbers the bodies were made from (the solids, the platforms as last synced),
+  // not the World, and the ground as the island draws it (the feet meet the picture).
+  pub fn floorAt(self &, x f32, z f32, from f32) f32 {
+    mut top = groundHeight(x, z);
+    imm reach = from + STEP_UP;
+    mut i = 0usize;
+    while i < platsNow.len() {
+      imm p = *platsNow[i];
+      imm there = p.inverse * new Vec3(x, from, z);
+      if p.shape.over(there.x, there.z) {
+        imm floor = (p.world * new Vec3(there.x, p.shape.floorY, there.z)).y;
+        if floor <= reach and floor > top { top = floor; }
+      }
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < solidList.len() {
+      imm so = solidList[i];
+      if so.over(x, z) {
+        imm t = so.topAt(x, z);
+        if t > top and t <= reach { top = t; }
+      }
+      i = i + 1usize;
+    }
+    top;
+  }
+}
+
+fn atLeast(v f32, lo f32) f32 { if v < lo { lo; } else { v; }; }
+
+fn withSeen(p PlatBody, seen bool) PlatBody { new PlatBody(p.part, p.body, p.scale, seen); }
+
+// Platforms are taken as level and scaled alike every way: a world length in the part's frame is the world
+// length times this
+fn frameScale(p &PlatformNow) f32 {
+  imm c = p.inverse.transformVector(new Vec3(1., 0., 0.));
+  1. / c.length();
+}
+
+// A platform's shape as one compound of boxes in the part's frame at its size 'k': the floor, a slab under
+// its top; and, on each edge that has a wall, a slab outside the edge (its inner face on the edge) from the
+// floor to the wall's height
+fn platformShape(sh &PlatformShape, k f32) rigidcollide.Shape {
+  mut out = rigidcollide.Shape.compound();
+  imm thick = 0.25;
+  imm x0 = sh.min.x * k;
+  imm x1 = sh.max.x * k;
+  imm z0 = sh.min.y * k;
+  imm z1 = sh.max.y * k;
+  imm top = sh.floorY * k;
+  out.add(rigidcollide.Prim.box(new Vec3((x1 - x0) * 0.5, thick * 0.5, (z1 - z0) * 0.5)),
+    rigidcollide.Rigid.at(new Vec3((x0 + x1) * 0.5, top - thick * 0.5, (z0 + z1) * 0.5)));
+  imm wh = atLeast(sh.wallHeight * k, 0.05);
+  imm wt = PLATFORM_WALL;
+  if (sh.walls & WALL_MIN_X) != 0u32 {
+    out.add(rigidcollide.Prim.box(new Vec3(wt * 0.5, wh * 0.5, (z1 - z0) * 0.5 + wt)),
+      rigidcollide.Rigid.at(new Vec3(x0 - wt * 0.5, top + wh * 0.5, (z0 + z1) * 0.5)));
+  }
+  if (sh.walls & WALL_MAX_X) != 0u32 {
+    out.add(rigidcollide.Prim.box(new Vec3(wt * 0.5, wh * 0.5, (z1 - z0) * 0.5 + wt)),
+      rigidcollide.Rigid.at(new Vec3(x1 + wt * 0.5, top + wh * 0.5, (z0 + z1) * 0.5)));
+  }
+  if (sh.walls & WALL_MIN_Z) != 0u32 {
+    out.add(rigidcollide.Prim.box(new Vec3((x1 - x0) * 0.5 + wt, wh * 0.5, wt * 0.5)),
+      rigidcollide.Rigid.at(new Vec3((x0 + x1) * 0.5, top + wh * 0.5, z0 - wt * 0.5)));
+  }
+  if (sh.walls & WALL_MAX_Z) != 0u32 {
+    out.add(rigidcollide.Prim.box(new Vec3((x1 - x0) * 0.5 + wt, wh * 0.5, wt * 0.5)),
+      rigidcollide.Rigid.at(new Vec3((x0 + x1) * 0.5, top + wh * 0.5, z1 + wt * 0.5)));
+  }
+  out;
+}

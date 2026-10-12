@@ -119,9 +119,9 @@ fn checkNet() bool {
   // The state: quantised (positions to a millimetre, the heading to a 16th of a degree's tenth, speeds in fixed point) and whole
   mut beings = List[BeingState].empty();
   beings.push(new BeingState(0u32, false, new Vec3(-23.4567, 12.7891, 499.1234), 3.0, 1.8, 0., 0., 0., true, new Intents(1., -1., true, false),
-    PartId.none(), 0.5, 3u32, 250u32, 7.5));
+    PartId.none(), 0.5, 3u32, 250u32, 7.5, 0u32, 0., false, noRots()));
   beings.push(new BeingState(1u32, true, new Vec3(-10.123456, 33.5, 301.987654), -2.5, -1.8, -4.2, 1.1, -0.9, false, new Intents(0., 0., false, true),
-    idOf(21u32), 1., 1u32, 2u32, 0.));
+    idOf(21u32), 1., 1u32, 2u32, 0., 0u32, 0., false, noRots()));
   mut w = new WorldState(4294967295u64, 1234.567d, 10u32, 987654u64, beings);
   imm bytes = encodeState(&w);
   mut back = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
@@ -148,13 +148,52 @@ fn checkNet() bool {
   k = 0u32;
   while k < 40u32 {
     many.push(new BeingState(k, k == 0u32, new Vec3(-23.4567, 12.7891, 499.1234), 3.0, 1.8, 0., 0., 0., true, new Intents(1., 0., false, false),
-      PartId.none(), 1., 0u32, 0u32, 0.));
+      PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots()));
     k = k + 1u32;
   }
   mut manyState = new WorldState(1u64, 1d, 1u32, 1u64, many);
   imm big = encodeState(&manyState);
   print <- "  a snapshot of forty beings: "; print <- big.len(); print <- " bytes (the limit "; print <- MAX_LATEST; print <- ")\n";
   ok = expect("a snapshot of forty beings fits a packet", big.len() <= MAX_LATEST) and ok;
+  // A ragdoll: its 14 bodies' rotations (4 bytes each), a get-up's time
+  mut spun = noRots();
+  k = 0u32;
+  while k < 14u32 {
+    spun[usize.from(k)] = Quat.angleAxis(0.3 * f32.from(k) - 1.7, new Vec3(0.3, 0.9, -0.2).normalize());
+    k = k + 1u32;
+  }
+  mut rag = List[BeingState].empty();
+  rag.push(new BeingState(0u32, false, new Vec3(5., 3., 7.), 0.5, 0., -3., 0., 0., false, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 1u32, 0., true, spun));
+  rag.push(new BeingState(1u32, false, new Vec3(6., 0., 8.), 1.5, 0., 0., 0., 0., true, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 2u32, 1.234, false, noRots()));
+  imm ragBytes = encodeState(&new WorldState(5u64, 1d, 1u32, 1u64, rag));
+  mut ragBack = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+  imm ragOk = decodeState(copyBytes(&ragBytes), &mut ragBack) and ragBack.beings.len() == 2usize;
+  mut spinErr = 0.;
+  if ragOk and ragBack.beings[0usize].hasRots {
+    k = 0u32;
+    while k < 14u32 {
+      imm q = ragBack.beings[0usize].rots[usize.from(k)];
+      imm p = spun[usize.from(k)];
+      imm d = libc.fabsf(q.x * p.x + q.y * p.y + q.z * p.z + q.w * p.w);
+      imm e = 2. * libc.acosf(if d > 1. { 1.; } else { d; });
+      if e > spinErr { spinErr = e; }
+      k = k + 1u32;
+    }
+  } else { spinErr = 9.; }
+  print <- "  a ragdoll's snapshot: "; print <- ragBytes.len(); print <- " bytes for two beings, its rotations within "; print <- spinErr * 57.29578; print <- " degrees\n";
+  ok = expect("a ragdoll's 14 rotations come back within 0.2 degrees, with its mode, and a get-up's time within a millisecond",
+    ragOk and spinErr < 0.0035 and ragBack.beings[0usize].mode == 1u32 and ragBack.beings[1usize].mode == 2u32
+    and libc.fabsf(ragBack.beings[1usize].modeT - 1.234) < 0.0011) and ok;
+  // Forty ragdolls do not fit: the snapshot still fits a packet, the beings that did not get room come as walkers
+  mut limp = List[BeingState].empty();
+  k = 0u32;
+  while k < 40u32 {
+    limp.push(new BeingState(k, false, new Vec3(5., 3., 7.), 0.5, 0., -3., 0., 0., false, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 1u32, 0., true, spun));
+    k = k + 1u32;
+  }
+  imm limpBytes = encodeState(&new WorldState(5u64, 1d, 1u32, 1u64, limp));
+  print <- "  a snapshot of forty ragdolls: "; print <- limpBytes.len(); print <- " bytes\n";
+  ok = expect("a snapshot of forty ragdolls still fits a packet", limpBytes.len() <= MAX_LATEST) and ok;
 
   // The inputs: the last INPUT_MOST of them, numbered
   mut samples = List[InputSample].empty();

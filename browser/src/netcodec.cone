@@ -772,18 +772,70 @@ pub fn encodeState(w &WorldState) List[u8] {
   w8(&mut out, u32.from(w.beings.len()));
   mut i = 0usize;
   while i < w.beings.len() {
-    wBeing(&mut out, w.beings[i]);
+    // A ragdoll's rotations go in while the beings still to come keep room for the least a being takes
+    imm fits = out.len() + 32usize + RAG_BYTES + 30usize * (w.beings.len() - i - 1usize) + 16usize <= MAX_LATEST;
+    wBeing(&mut out, w.beings[i], fits);
     i = i + 1usize;
   }
   out;
 }
 
-fn wBeing(out &mut List[u8], b &BeingState) {
+// A quaternion in 32 bits: which component is largest (2 bits) and the other three to 10 bits each, within
+// 1/724 of 0.7071 (a rotation within about 0.1 degree)
+fn wQuat(out &mut List[u8], q Quat) {
+  mut c Array[f32, 4] = [q.x, q.y, q.z, q.w];
+  mut big = 0usize;
+  mut k = 1usize;
+  while k < 4usize {
+    if libc.fabsf(c[k]) > libc.fabsf(c[big]) { big = k; }
+    k = k + 1usize;
+  }
+  imm sign = if c[big] < 0. { -1.; } else { 1.; };
+  mut word = u32.from(big);
+  k = 0usize;
+  while k < 4usize {
+    if k != big {
+      imm v = c[k] * sign;
+      imm n = clampInt(rounded((v * 1.4142135 + 1.) * 0.5 * 1023.), 0, 1023);
+      word = (word << 10u32) | u32.from(n);
+    }
+    k = k + 1usize;
+  }
+  w32(out, word);
+}
+
+fn rQuat(r &mut Rd) Quat {
+  imm word = r.r32();
+  imm big = usize.from((word >> 30u32) & 3u32);
+  mut c Array[f32, 4] = [0., 0., 0., 0.];
+  mut rest = word;
+  mut sum = 0.;
+  // The three smaller, written in index order, so the highest index is in the lowest bits
+  mut n = 3;
+  while n >= 0 {
+    if usize.from(n) != big {
+      imm v = (f32.from(rest & 1023u32) / 1023. * 2. - 1.) * 0.70710677;
+      c[usize.from(n)] = v;
+      sum = sum + v * v;
+      rest = rest >> 10u32;
+    }
+    n = n - 1;
+  }
+  c[big] = libc.sqrtf(if sum < 1. { 1. - sum; } else { 0.; });
+  new Quat(c[0usize], c[1usize], c[2usize], c[3usize]);
+}
+
+// What a ragdoll's rotations take on the wire
+const RAG_BYTES = 56usize;
+
+fn wBeing(out &mut List[u8], b &BeingState, rotsFit bool) {
   wVar(out, b.being);
   imm hasPlatform = !b.platform.isNone();
+  imm sendRots = b.mode == FIG_RAG and b.hasRots and rotsFit;
   w8(out, (if b.exact { 1u32; } else { 0u32; }) | (if b.grounded { 2u32; } else { 0u32; })
     | (if b.intents.run { 4u32; } else { 0u32; }) | (if b.intents.jump { 8u32; } else { 0u32; })
-    | (if hasPlatform { 16u32; } else { 0u32; }));
+    | (if hasPlatform { 16u32; } else { 0u32; }) | (if b.mode == FIG_RAG { 32u32; } else { 0u32; })
+    | (if b.mode == FIG_GETUP { 64u32; } else { 0u32; }) | (if sendRots { 128u32; } else { 0u32; }));
   wUnit(out, b.intents.ahead);
   wUnit(out, b.intents.turn);
   if b.exact {
@@ -808,6 +860,11 @@ fn wBeing(out &mut List[u8], b &BeingState) {
   w8(out, b.respawns);
   w8(out, b.landings);
   w16(out, u32.from(clampInt(rounded(b.landSpeed * 1024.), 0, 65535)));
+  if sendRots {
+    mut k = 0usize;
+    while k < RAG_BODIES { wQuat(out, b.rots[k]); k = k + 1usize; }
+  }
+  if b.mode == FIG_GETUP { w16(out, u32.from(clampInt(rounded(b.modeT * 1000.), 0, 65535))); }
 }
 
 // The heading in 16 bits: its turns, 0 to 65535 of a whole one
@@ -854,8 +911,19 @@ fn rBeing(r &mut Rd) BeingState {
   imm respawns = r.r8();
   imm landings = r.r8();
   imm landSpeed = f32.from(r.r16()) / 1024.;
+  mut rots = noRots();
+  imm hasRots = (flags & 128u32) != 0u32;
+  if hasRots {
+    mut k = 0usize;
+    while k < RAG_BODIES and r.ok { rots[k] = rQuat(r); k = k + 1usize; }
+  }
+  mut mode = FIG_WALK;
+  mut modeT = 0.;
+  if (flags & 32u32) != 0u32 { mode = FIG_RAG; }
+  if (flags & 64u32) != 0u32 { mode = FIG_GETUP; modeT = f32.from(r.r16()) / 1000.; }
   new BeingState(being, exact, position, yaw, speed, vy, airVx, airVz, (flags & 2u32) != 0u32,
-    new Intents(ahead, turn, (flags & 4u32) != 0u32, (flags & 8u32) != 0u32), platform, health, respawns, landings, landSpeed);
+    new Intents(ahead, turn, (flags & 4u32) != 0u32, (flags & 8u32) != 0u32), platform, health, respawns, landings, landSpeed,
+    mode, modeT, hasRots, rots);
 }
 
 // A snapshot decoded into 'out' (whose beings are added to); false if malformed

@@ -193,6 +193,7 @@ pub struct ViewState {
   hasState bool;
   weather Weathering;
   moves List[PlatformMove];
+  platformsNow List[PlatformNow];
   stepSeconds f32;            // the frame's steps, seconds
   given List[Intents];        // scratch for Cast.stepEach
   stepIt List[bool];
@@ -223,11 +224,11 @@ pub struct ViewState {
   pub fn make(birds Birds, lockstep bool) ViewState {
     imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
     new ViewState(ViewScene.empty(), PickSystem.empty(), PartId.none(), new PickHit(PartId.none(), 0., 0u32, 0u64),
-      0u64, new Vec2(HEADLESS_W, HEADLESS_H), NetSide.make(), Cast.empty(), List[Puppet].empty(), NO_ROW, NO_BEING, false,
+      0u64, new Vec2(HEADLESS_W, HEADLESS_H), NetSide.make(), Cast.client(), List[Puppet].empty(), NO_ROW, NO_BEING, false,
       false, birds, List[Predicted].empty(), new Vec3(0., 0., 0.), 0u64, false, Snapshot.empty(), List[Request].empty(), 0u64,
       List[InputSample].empty(), false, still, FOV, String.empty(), List[MaterialId].empty(), lockstep, false, false,
       List[ToView].empty(), List[WorldState].empty(), List[TestView].empty(), 0u64,
-      new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), 0.,
+      new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
       List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64);
   }
 
@@ -448,7 +449,8 @@ pub struct ViewState {
       scene.propagate();
       scene.platformMoves(&mut moves);
       carryRiders(&mut cast, &moves, stepSeconds);
-      scene.platformsNow(&mut supports);
+      scene.platformsNow(&mut platformsNow);
+      cast.phys.syncPlatforms(&platformsNow);
       // The body carried is where the last step left it, for comparing with the simulation's (which carries it too)
       if own != NO_ROW and ownReady and history.len() > 0usize and moves.len() > 0usize {
         imm li = history.len() - 1usize;
@@ -508,7 +510,7 @@ pub struct ViewState {
     rate = st.rate;
     mut k = 0usize;
     mut ownState = new BeingState(0u32, false, new Vec3(0., 0., 0.), 0., 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32,
-      0u32, 0.);
+      0u32, 0., FIG_WALK, 0., false, noRots());
     mut hasOwn = false;
     while k < st.beings.len() {
       imm b = *st.beings[k];
@@ -561,6 +563,24 @@ pub struct ViewState {
   // simulation's, the inputs it has not yet applied are played again, and the difference blended away
   fn reconcile(self &mut, s BeingState, applied u64) {
     if own == NO_ROW or !s.exact { return; }
+    // Limp, or getting up: the simulation's alone (it is not predicted); on its word that it stands again, the body is taken whole
+    {
+      imm ob = &mut cast.beings[own];
+      if ob.figure.active and (s.mode != FIG_WALK or ob.figure.mode != FIG_WALK) {
+        if followServer(&mut cast.phys, &mut ob.figure, &mut ob.body, &s) {
+          ob.before = ob.body;
+          ob.intents = s.intents;
+          ob.figure.health = s.health;
+          self.dropHistory(applied);
+          corr = new Vec3(0., 0., 0.);
+          ownReady = true;
+          ownEver = true;
+          forceSnap = true;
+          return;
+        }
+        forceSnap = true;
+      }
+    }
     // The body we predicted after input 'applied'
     mut found = NO_ROW;
     mut h = 0usize;
@@ -822,19 +842,23 @@ pub struct ViewState {
   fn stateAt(self &, p &Puppet, tick f64) BeingState {
     imm n = p.samples.len();
     imm last = p.samples[n - 1usize].state;
+    // Limp or getting up: the newest the simulation said (its pose is not blended)
+    if last.mode != FIG_WALK { return last; }
     if tick >= f64.from(p.samples[n - 1usize].tick) {
       // Beyond the newest snapshot (late, or the clock estimate a little ahead): on at its velocity, for a while
       mut ahead = tick - f64.from(p.samples[n - 1usize].tick);
       if ahead > 6. { ahead = 6.; }
       imm v = velocityOf(&last);
       return new BeingState(last.being, false, last.position + v * f32.from(ahead / TICKS_PER_SECOND), last.yaw, last.speed, last.vy,
-        last.airVx, last.airVz, last.grounded, last.intents, last.platform, last.health, last.respawns, last.landings, last.landSpeed);
+        last.airVx, last.airVz, last.grounded, last.intents, last.platform, last.health, last.respawns, last.landings, last.landSpeed,
+        FIG_WALK, 0., false, noRots());
     }
     if n == 1usize { return last; }
     mut i = n - 2usize;
     while i > 0usize and f64.from(p.samples[i].tick) > tick { i = i - 1usize; }
     imm a = p.samples[i].state;
     imm c = p.samples[i + 1usize].state;
+    if c.mode != FIG_WALK { return c; }
     imm ta = f64.from(p.samples[i].tick);
     imm tc = f64.from(p.samples[i + 1usize].tick);
     mut t = 0.;
@@ -855,7 +879,7 @@ pub struct ViewState {
     imm pos = a.position * h00 + va * (span * h10) + c.position * h01 + vc * (span * h11);
     imm yaw = a.yaw + wrapPi(c.yaw - a.yaw) * t;
     new BeingState(a.being, false, pos, yaw, a.speed + (c.speed - a.speed) * t, a.vy + (c.vy - a.vy) * t, a.airVx, a.airVz,
-      a.grounded, a.intents, a.platform, a.health, a.respawns, a.landings, a.landSpeed);
+      a.grounded, a.intents, a.platform, a.health, a.respawns, a.landings, a.landSpeed, FIG_WALK, 0., false, noRots());
   }
 
   // Every being but the one the user drives posed for each of this frame's steps, from the snapshots
@@ -908,14 +932,19 @@ pub struct ViewState {
       if b != own and !cast.beings[b].gone and puppets[b].samples.len() > 0usize {
         imm n = puppets[b].samples.len();
         imm s = puppets[b].samples[n - 1usize].state;
-        if !puppets[b].started {
+        if cast.beings[b].figure.active and followServer(&mut cast.phys, &mut cast.beings[b].figure, &mut cast.beings[b].body, &s) {
+          // Limp or getting up: shown as the simulation says, not stepped
+          puppets[b].started = true;
+          cast.beings[b].before = cast.beings[b].body;
+          cast.beings[b].intents = s.intents;
+        } elif !puppets[b].started {
           // The first snapshot of it: it stands as the snapshot says
           puppets[b].started = true;
           self.setBodyTo(b, s);
         } else {
           mut k = 0usize;
           while k < steps.len() {
-            cast.beings[b].step(s.intents, steps[k].dt);
+            cast.beings[b].step(&mut cast.phys, s.intents, steps[k].dt);
             k = k + 1usize;
           }
           if steps.len() > 0usize {
@@ -964,6 +993,10 @@ pub struct ViewState {
     being.body.position = s.position;
     being.body.yaw = s.yaw;
     being.intents = s.intents;
+    if being.figure.active and followServer(&mut cast.phys, &mut being.figure, &mut being.body, &s) {
+      being.before = being.body;
+      return;
+    }
     if being.figure.active {
       if p.respawns != s.respawns {
         p.respawns = s.respawns;
@@ -980,7 +1013,7 @@ pub struct ViewState {
       being.figure.grounded = s.grounded;
       being.figure.on = s.platform;
       being.figure.health = s.health;
-      being.figure.poseFrom(s.position, s.yaw, s.speed, s.intents.turn * TURN_RATE, s.grounded, dt);
+      being.figure.poseFrom(&mut cast.phys, s.position, s.yaw, s.speed, s.intents.turn * TURN_RATE, s.grounded, dt);
     }
   }
 
@@ -1064,7 +1097,12 @@ actor ViewActor {
   // shell's inboxes, and this browser's flock
   fn init(self &new, sim Option[SimActor], render RenderActor, frames Sender[FrameReport], ended Sender[i32],
       birds Birds, lockstep bool, joined Sender[bool]) {
-    *self = new Self(ViewState.make(birds, lockstep), sim, render, frames, ended, joined, FrameInput.none());
+    mut state = ViewState.make(birds, lockstep);
+    // The physics this browser predicts its own mannequin by: the same ground and solids as the simulation's, its own world
+    imm solids = worldSolids();
+    state.cast.phys.ensureGround();
+    state.cast.phys.setSolids(&solids);
+    *self = new Self(state, sim, render, frames, ended, joined, FrameInput.none());
   }
 
   // What the connection tells (its handler sends it here): it opened or ended, a message, a value. In single player the

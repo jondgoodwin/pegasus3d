@@ -67,24 +67,13 @@ pub struct Being {
   }
 
   // One fixed step of 'dt' seconds, by 'given'
-  pub fn step(self &mut, given Intents, dt f32) {
+  pub fn step(self &mut, phys &mut Phys, given Intents, dt f32) {
     intents = given;
     before = body;
     respawned = false;
     if figure.active {
-      // Down after a fall that emptied its health: it lies RESPAWN_AFTER
-      // seconds, then gets up on the landing beach, where the island begins
-      if figure.health <= 0. {
-        figure.downFor = figure.downFor + dt;
-        if figure.downFor >= RESPAWN_AFTER {
-          figure.setDown(&mut body, new Vec3(BEACH_X, groundHeight(BEACH_X, BEACH_Z), BEACH_Z), 0.);
-          figure.respawns = figure.respawns + 1u32;
-          before = body;
-          respawned = true;
-          print <- "A mannequin's fall emptied its health: it gets up again on the landing beach\n";
-        }
-      }
-      figure.step(&mut body, if figure.health <= 0. { Intents.none(); } else { given; }, dt);
+      // (A fall that empties its health is a ragdoll's: it lies, then is set down on the landing beach, ragdoll.cone)
+      figure.step(phys, &mut body, if figure.health <= 0. { Intents.none(); } else { given; }, dt);
       // Held by the island's fence and wading limit (it slides along them),
       // but only on or near the ground (walking, or a jump) from inside it:
       // a body a platform carries is not stopped by the fence, and one that
@@ -98,6 +87,17 @@ pub struct Being {
     } else {
       body.step(intents.ahead, intents.turn, intents.run, dt);
     }
+  }
+
+  // After the physics world's step (the simulation's alone): a limp or getting-up figure's pose from the ragdoll,
+  // what its landing cost, its lying and getting up, and its setting down on the beach if it is dead
+  pub fn afterWorld(self &mut, phys &mut Phys, dt f32) {
+    if !figure.active or figure.mode == FIG_WALK or !phys.authority { return; }
+    imm was = body;
+    figure.landed = false;
+    if ragdollTurn(phys, &mut figure, &mut body, dt) { respawned = true; }
+    before = if respawned { body; } else { was; };
+    body.eyeHeight = figure.eyeModel().y;
   }
 
   // A mannequin set down standing at 'at' facing 'yaw' (a script's hook):
@@ -247,8 +247,12 @@ pub struct Cast {
   pub possessed usize;
   pub rig ViewRig;
   pub landings List[Landing];
+  pub phys Phys;              // the physics world the beings walk in (physics.cone): this half's own
 
-  pub fn empty() Cast { new Cast(List[Being].empty(), 0usize, ViewRig.make(VIEW_THIRD), List[Landing].empty()); }
+  // The simulation's cast (it makes the ragdolls)
+  pub fn empty() Cast { new Cast(List[Being].empty(), 0usize, ViewRig.make(VIEW_THIRD), List[Landing].empty(), Phys.make(true)); }
+  // A view's cast: its physics world is a read-only copy for predicting the being it drives
+  pub fn client() Cast { new Cast(List[Being].empty(), 0usize, ViewRig.make(VIEW_THIRD), List[Landing].empty(), Phys.make(false)); }
 
   // A being added: its index
   pub fn add(self &mut, b Being) usize {
@@ -284,16 +288,43 @@ pub struct Cast {
     mut i = 0usize;
     while i < beings.len() {
       imm b = &mut beings[i];
-      b.step(if i == possessed { user; } else { Intents.none(); }, dt);
+      b.step(&mut phys, if i == possessed { user; } else { Intents.none(); }, dt);
       if b.figure.active and b.figure.landed and b.figure.landSpeed >= HARD_LANDING_SPEED {
         landings.push(new Landing(b.part, b.figure.landSpeed, b.figure.damageOf(b.figure.landSpeed)));
       }
       if b.respawned and i == possessed { moved = true; }
       i = i + 1usize;
     }
+    if self.worldTurn(dt, possessed) { moved = true; }
     // The camera goes with a possessed being that got up somewhere else
     if moved { rig.snap(); }
     self.look(dt);
+  }
+
+  // The physics world's step for the ragdolls, and each limp figure's turn after it; hard landings noted. True if the
+  // possessed being was set down somewhere else
+  fn worldTurn(self &mut, dt f32, snapFor usize) bool {
+    if !phys.authority { return false; }
+    phys.stepRagdolls(dt);
+    mut moved = false;
+    mut i = 0usize;
+    while i < beings.len() {
+      imm b = &mut beings[i];
+      if !b.gone and b.figure.active {
+        // One that stands again (set down by a script, say) lets its ragdoll go
+        if b.figure.mode == FIG_WALK and b.figure.rag >= 0i32 and phys.rigs[usize.from(u32.from(b.figure.rag))].active {
+          parkSlot(&mut phys, usize.from(u32.from(b.figure.rag)));
+        }
+        b.respawned = false;
+        b.afterWorld(&mut phys, dt);
+        if b.figure.mode != FIG_WALK and b.figure.landed and b.figure.landSpeed >= HARD_LANDING_SPEED {
+          landings.push(new Landing(b.part, b.figure.landSpeed, b.figure.damageOf(b.figure.landSpeed)));
+        }
+        if b.respawned and i == snapFor { moved = true; }
+      }
+      i = i + 1usize;
+    }
+    moved;
   }
 
   // One fixed step of every being by the intents of its own: 'given[i]' for being i. A being whose 'stepIt[i]'
@@ -305,7 +336,7 @@ pub struct Cast {
     while i < beings.len() {
       imm b = &mut beings[i];
       if !b.gone and *stepIt[i] {
-        b.step(*given[i], dt);
+        b.step(&mut phys, *given[i], dt);
         if b.figure.active and b.figure.landed and b.figure.landSpeed >= HARD_LANDING_SPEED {
           landings.push(new Landing(b.part, b.figure.landSpeed, b.figure.damageOf(b.figure.landSpeed)));
         }
@@ -313,6 +344,7 @@ pub struct Cast {
       }
       i = i + 1usize;
     }
+    if self.worldTurn(dt, possessed) { moved = true; }
     if withView {
       if moved { rig.snap(); }
       self.look(dt);

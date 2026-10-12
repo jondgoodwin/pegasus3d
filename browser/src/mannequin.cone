@@ -32,19 +32,21 @@
 //     the landing and what it cost;
 //   - rigid attachments, parts of their own (none yet).
 //
-// THE CAPSULE is kinematic, not a rigid body: the body's feet are on the
-// height of what it stands on (support.cone: the island's ground, or a
-// platform's floor such as the balloon's basket, the highest of its
-// footprint) when it stands, and a platform's walls stop it; standing on a
-// platform it is carried by it, held up only by the floor; it
-// follows the ground up and down within a step of 0.4 m, stays stuck to it
-// going down within 0.35 m, and otherwise falls under gravity (9.81 m/s^2,
-// at most 55 m/s) until the ground is reached, which is a landing at the
-// impact speed. A landing of 7 m/s or more (a drop of 2.5 m: v = sqrt(2 g h))
-// is HARD: the pelvis crouches (the Walker's impact) and the cast reports it
-// to the scene, which mails it. Its cost is a number in the being's own
-// state, health, by (speed - 10) / (24 - 10) clamped to 0 to 1 of it:
-// harmless to 10 m/s (a 5 m drop), fatal at 24 m/s (a 30 m drop).
+// THE CAPSULE is rigiddynamics' character controller (a kinematic capsule, not a
+// rigid body) walking the physics world (physics.cone): the island's ground as a
+// heightfield, the solids, and the platforms' floors and walls (the balloon's
+// basket). It slides along walls, climbs steps of 0.4 m, will not walk up
+// ground steeper than 45 degrees (it slides down it), stays stuck to the
+// ground going down within 0.35 m, and otherwise falls under gravity (9.81
+// m/s^2, at most 55 m/s) until the ground is reached, which is a landing at
+// the impact speed. Standing on a platform it is carried by it (support.cone),
+// held up only by the floor. A landing of 7 m/s or more is HARD: the pelvis
+// crouches (the Walker's impact) and the cast reports it to the scene, which
+// mails it. Its cost is a number in the being's own state, health, by
+// (speed - 10) / (24 - 10) clamped to 0 to 1 of it: harmless to 10 m/s (a 5 m
+// drop), fatal at 24 m/s (a 30 m drop). A fall faster than 5 m/s down (a drop
+// of 1.3 m) goes limp instead: a ragdoll (ragdoll.cone), whose landing is
+// what hurts.
 
 // The capsule's radius is 0.15 H; its height is H
 pub const CAPSULE_RADIUS_OVER_H = 0.15;
@@ -53,6 +55,7 @@ pub const GRAVITY = 9.81;
 pub const TERMINAL_SPEED = 55.;
 pub const HARD_LANDING_SPEED = 7.;
 pub const STEP_UP = 0.4;
+pub const CAPSULE_SKIN = 0.004;       // the gap the capsule keeps from what it stands on and walks against, m
 pub const SNAP_DOWN = 0.35;
 pub const WALK_SPEED = 1.8;           // m/s: a purposeful walk, under the walk-run change at 2.1
 pub const RUN_SPEED = 4.5;
@@ -60,8 +63,27 @@ pub const GROUND_ACCEL = 12.;         // m/s^2
 pub const JUMP_SPEED = 4.2;           // m/s up: a jump to 0.9 m
 pub const TURN_RATE = 1.0471976;      // rad/s: the same quarter turn in 1.5 s as the walker
 
+// A figure's mode: walking (the capsule), a ragdoll falling or lying, getting up from one (ragdoll.cone)
+pub const FIG_WALK = 0u32;
+pub const FIG_RAG = 1u32;
+pub const FIG_GETUP = 2u32;
+
+// The kinematic capsule of a figure 'h' tall: 0.15 h round, climbing steps of STEP_UP and following the ground
+// down within SNAP_DOWN; it collides with the solids, the platforms and the ground, never a ragdoll
+fn characterOf(h f32) rigiddynamics.Character {
+  mut s = rigiddynamics.CharacterSettings.person(CAPSULE_RADIUS_OVER_H * h, h);
+  s.mask = LAYER_WALK;
+  s.stepHeight = STEP_UP;
+  s.stickDistance = SNAP_DOWN;
+  s.skin = CAPSULE_SKIN;
+  s.gravity = GRAVITY;
+  s.maxFallSpeed = TERMINAL_SPEED;
+  s.pushStrength = 0.;
+  rigiddynamics.Character.make(s, new Vec3(0., 0., 0.));
+}
+
 pub struct Figure {
-  pub active bool;                    // false: this being is a plain walker, with no figure
+  pub active bool;                   // false: this being is a plain walker, with no figure
   pub height f32;
   pub skeleton bonepose.Skeleton;
   pub pose bonepose.Pose;
@@ -87,11 +109,17 @@ pub struct Figure {
   pub anchored bool;
   pub landCount u32;                  // landings (of any speed), counted
   pub setDowns u32;                   // times it has been set down somewhere (setDown: a respawn, or a script's hook), counted
+  pub ch rigiddynamics.Character;     // the kinematic capsule that walks the physics world (physics.cone)
+  pub mode u32;                       // FIG_WALK, FIG_RAG (a ragdoll), FIG_GETUP (getting up from one): ragdoll.cone
+  pub rag i32;                        // its ragdoll in the physics world (a slot of Phys.rigs), or -1
+  pub modeT f32;                      // seconds in this mode
+  pub lieT f32;                       // seconds the ragdoll has been settled
+  pub hurtSpeed f32;                  // the landing speed its health has been charged for, this fall
 
   pub fn none() Figure {
     new Figure(false, 0., bonepose.Skeleton.empty(), bonepose.Pose.empty(), List[Transform3].empty(), walkgait.Walker.make(1., 0u32),
       List[PartId].empty(), List[Mat4].empty(), 0., 0., 0., 0., true, 1., false, 0., 0u32, PartId.none(), new Vec3(0., 0., 0.), 0., 0u32,
-      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32);
+      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32, characterOf(1.), FIG_WALK, -1i32, 0., 0., 0.);
   }
 
   // A standing figure of 'height' metres, with the rigid attachments 'parts'
@@ -108,14 +136,16 @@ pub struct Figure {
     }
     new Figure(true, height, skel, pose, List[Transform3].empty(), walkgait.Walker.make(height, seed), parts, bind,
       0., 0., 0., 0., true, 1., false, 0., 0u32, PartId.none(), new Vec3(0., 0., 0.), 0., 0u32,
-      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32);
+      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32, characterOf(height), FIG_WALK, -1i32, 0., 0., 0.);
   }
 
   // Posed where the state of a body the figure does not move says it is (a being driven by another process, drawn
   // from its snapshots): the gait animated from its heading, speed and turn, with no physics of its own
-  pub fn poseFrom(self &mut, pos Vec3, yaw f32, spd f32, turnRate f32, onGround bool, dt f32) {
-    standFrom(pos.y);
-    walker.update(&skeleton, &mut pose, &mut models, pos, yaw, if onGround { spd; } else { 0.; }, turnRate, onGround, &supportHeight, dt);
+  pub fn poseFrom(self &mut, phys &mut Phys, pos Vec3, yaw f32, spd f32, turnRate f32, onGround bool, dt f32) {
+    phys.ensureGround();
+    imm feet = pos.y;
+    imm floor = fn(x f32, z f32) f32 { phys.floorAt(x, z, feet); };
+    walker.update(&skeleton, &mut pose, &mut models, pos, yaw, if onGround { spd; } else { 0.; }, turnRate, onGround, &floor, dt);
   }
 
   // A landing at 'impact' m/s that a snapshot told of: the gait takes it as a step of its own would
@@ -164,66 +194,51 @@ pub struct Figure {
   // ground point and yaw): turn, accelerate, jump or fall, land, and pose.
   // What it stands on is the ground or a platform's floor (support.cone),
   // and a platform's walls stop it.
-  pub fn step(self &mut, body &mut Walk, it Intents, dt f32) {
+  pub fn step(self &mut, phys &mut Phys, body &mut Walk, it Intents, dt f32) {
     landed = false;
+    if mode != FIG_WALK {
+      // A ragdoll or a get-up: the physics world's turn moves it (ragdoll.cone), not an intent
+      return;
+    }
+    phys.ensureGround();
     imm wasOn = on;
-    standFrom(body.position.y);
     body.yaw = body.yaw + it.turn * TURN_RATE * dt;
     imm fx = 0. - sin(body.yaw);
     imm fz = 0. - cos(body.yaw);
-    mut pos = body.position;
-    imm was = pos;
+    imm was = body.position;
     // Leaving a platform, it goes on at the platform's velocity as well as its own
     imm carry = if on.isNone() { new Vec3(0., 0., 0.); } else { platformVel; };
+    mut wish = new Vec3(0., 0., 0.);
+    mut jump = 0.;
     if grounded {
       imm target = it.ahead * (if it.run { RUN_SPEED; } else { WALK_SPEED; });
       imm dv = GROUND_ACCEL * dt;
       if target > speed + dv { speed = speed + dv; }
       elif target < speed - dv { speed = speed - dv; }
       else { speed = target; }
-      pos = new Vec3(pos.x + fx * speed * dt, pos.y, pos.z + fz * speed * dt);
+      wish = new Vec3(fx * speed, 0., fz * speed);
       if it.jump {
-        grounded = false;
-        vy = JUMP_SPEED + carry.y;
-        airVx = fx * speed + carry.x;
-        airVz = fz * speed + carry.z;
+        jump = JUMP_SPEED + carry.y;
+        wish = new Vec3(fx * speed + carry.x, 0., fz * speed + carry.z);
       }
     } else {
-      vy = vy - GRAVITY * dt;
-      if vy < 0. - TERMINAL_SPEED { vy = 0. - TERMINAL_SPEED; }
-      pos = new Vec3(pos.x + airVx * dt, pos.y, pos.z + airVz * dt);
+      wish = new Vec3(airVx, 0., airVz);
     }
-    pos = hitWalls(was, pos, self.radius(), height);
-    pos = hitSolids(was, pos, self.radius(), height);
-    mut under = PartId.none();
-    imm ground = supportFootprint(pos.x, pos.z, self.radius(), was.y, &mut under);
-    if grounded {
-      if ground > pos.y + STEP_UP {
-        // Too high a step: blocked, stopped
-        pos = new Vec3(was.x, pos.y, was.z);
-        speed = 0.;
-      } elif pos.y - ground <= SNAP_DOWN {
-        pos = new Vec3(pos.x, ground, pos.z);
-        on = under;
-      } else {
-        // Walked off an edge: falling, keeping its way (and its platform's)
-        grounded = false;
-        vy = carry.y;
-        airVx = fx * speed + carry.x;
-        airVz = fz * speed + carry.z;
-      }
+    // The capsule is where the body is, and as grounded as the figure says (a script or a correction may have moved it)
+    ch.pos = was;
+    if ch.grounded != grounded {
+      ch.grounded = grounded;
+      if !grounded { ch.groundBody = rigiddynamics.NoBody; }
     }
-    if !grounded { on = PartId.none(); }
-    if !grounded {
-      pos = new Vec3(pos.x, pos.y + vy * dt, pos.z);
-      if pos.y <= ground and vy <= 0. {
-        landSpeed = 0. - vy;
-        pos = new Vec3(pos.x, ground, pos.z);
-        vy = 0.;
-        grounded = true;
+    ch.vel = new Vec3(0., vy, 0.);
+    rigiddynamics.updateCharacter(&mut phys.w, &mut ch, wish, jump, dt);
+    imm pos = ch.pos;
+    if ch.grounded {
+      if !grounded {
+        // Landed
+        landSpeed = ch.landSpeed;
         landed = true;
         landCount = landCount + 1u32;
-        on = under;
         // On the ground it goes on at the speed along its heading it had
         speed = airVx * fx + airVz * fz;
         if landSpeed >= HARD_LANDING_SPEED {
@@ -235,12 +250,57 @@ pub struct Figure {
           walker.impact(landSpeed * 0.4);
         }
       }
+      grounded = true;
+      vy = 0.;
+      on = phys.partOf(ch.groundBody);
+    } else {
+      if grounded {
+        // Left the ground (a jump, or off an edge): on, keeping its way (and its platform's)
+        if jump > 0. {
+          vy = ch.vel.y;
+          airVx = wish.x;
+          airVz = wish.z;
+        } else {
+          vy = carry.y;
+          airVx = fx * speed + carry.x;
+          airVz = fz * speed + carry.z;
+        }
+      } else {
+        vy = ch.vel.y;
+      }
+      grounded = false;
+      on = PartId.none();
     }
     body.position = pos;
     // On another floor (or none): where it stands on it is found afresh
     if !(on == wasOn) { anchored = false; }
+    imm feet = pos.y;
+    imm floor = fn(x f32, z f32) f32 { phys.floorAt(x, z, feet); };
     walker.update(&skeleton, &mut pose, &mut models, pos, body.yaw, if grounded { speed; } else { 0.; },
-      it.turn * TURN_RATE, grounded, &supportHeight, dt);
+      it.turn * TURN_RATE, grounded, &floor, dt);
+    // Falling fast: limp (the simulation's alone; a browser waits for the snapshot to say so)
+    if !grounded and vy < 0. - RAGDOLL_FALL_SPEED and phys.authority {
+      startRagdoll(phys, self, body);
+    }
+  }
+
+  // Standing again where the body is, whole as it is, after a ragdoll's get-up: its gait started afresh
+  pub fn standUp(self &mut, body &Walk) {
+    mode = FIG_WALK;
+    modeT = 0.;
+    lieT = 0.;
+    hurtSpeed = 0.;
+    speed = 0.;
+    vy = 0.;
+    airVx = 0.;
+    airVz = 0.;
+    grounded = true;
+    on = PartId.none();
+    anchored = false;
+    walker.started = false;
+    walker.crouchDepth = 0.;
+    ch.teleport(body.position);
+    ch.grounded = true;
   }
 
   // Set down standing at 'at' facing 'yaw' (getting up again after a fall
@@ -262,6 +322,12 @@ pub struct Figure {
     downFor = 0.;
     walker.started = false;
     walker.crouchDepth = 0.;
+    mode = FIG_WALK;
+    modeT = 0.;
+    lieT = 0.;
+    hurtSpeed = 0.;
+    ch.teleport(at);
+    ch.grounded = true;
   }
 
   // What a landing at 'impact' m/s costs, as a fraction of health: nothing
