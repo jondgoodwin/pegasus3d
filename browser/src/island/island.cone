@@ -44,6 +44,7 @@
 mod island;
 
 import collections use *;
+import sync use Arc;
 import geomath use *;
 import libc;
 import actors;
@@ -273,9 +274,59 @@ pub const PAD_HEIGHT f32 = 4.6;
 
 // ---- The grid, stored ----
 
-// What the bake makes, and every query reads: the land's heights and the distance grids, the path's centreline, the fence and the
-// brook's course. It is made whole in a local by bake() and then published (below); nothing changes it after.
-struct Island {
+// Sample (i, j) of the field; clamped to the grid
+fn sampleIn(heights &List[f32], i i32, j i32) f32 {
+  imm ci = if i < 0 { 0; } elif i >= N { N - 1; } else { i; };
+  imm cj = if j < 0 { 0; } elif j >= N { N - 1; } else { j; };
+  *heights[usize.from(cj * N + ci)];
+}
+
+// The ground's height at (x, z), exact against the drawn fine mesh's triangles (outside the grid: the sea floor's depth at its
+// edge); 0 where there are no heights (the island is not baked: a unit check's flat floor)
+fn heightIn(heights &List[f32], x f32, z f32) f32 {
+  if heights.len() == 0usize { return 0.; }
+  imm gx = (x + HALF) / CELL;
+  imm gz = (z + HALF) / CELL;
+  if gx < 0. or gz < 0. or gx >= f32.from(N - 1) or gz >= f32.from(N - 1) { return -30.; }
+  imm i = i32.from(libc.floorf(gx));
+  imm j = i32.from(libc.floorf(gz));
+  imm fx = gx - f32.from(i);
+  imm fz = gz - f32.from(j);
+  imm a = sampleIn(heights, i, j);
+  imm b = sampleIn(heights, i + 1, j);
+  imm c = sampleIn(heights, i, j + 1);
+  imm d = sampleIn(heights, i + 1, j + 1);
+  if !diagonalFlipped(i, j) {
+    // The diagonal from a to d
+    if fx >= fz { return a + fx * (b - a) + fz * (d - b); }
+    return a + fx * (d - c) + fz * (c - a);
+  }
+  // The diagonal from b to c
+  if fx + fz <= 1. { return a + fx * (b - a) + fz * (c - a); }
+  d + (1. - fx) * (c - d) + (1. - fz) * (b - d);
+}
+
+// The point of the fence's edge nearest (x, z), and how far it is
+fn nearestOnFenceIn(fence &List[Vec2], x f32, z f32, onEdge &mut Vec2) f32 {
+  mut best f32 = 1000000.;
+  mut k = 0usize;
+  while k < fence.len() {
+    imm a = *fence[k];
+    imm b = *fence[if k + 1usize == fence.len() { 0usize; } else { k + 1usize; }];
+    imm abx = b.x - a.x;
+    imm abz = b.y - a.y;
+    imm t = clamp01(((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz));
+    imm px = a.x + abx * t;
+    imm pz = a.y + abz * t;
+    imm d = len2(x - px, z - pz);
+    if d < best { best = d; *onEdge = new Vec2(px, pz); }
+    k = k + 1usize;
+  }
+  best;
+}
+
+// The island as the bake builds it: plain lists, filled in by the bake's steps, each reading what the steps before it made
+struct Baking {
   heights List[f32];
   pathDistance List[f32];     // metres to the path's centre, capped
   centre List[Vec3];          // the path's centreline, a point every metre, on the ground
@@ -283,78 +334,55 @@ struct Island {
   brook List[BrookPoint];
   brookDistance List[f32];    // metres to the course, capped at BROOK_NEAR
 
-  fn empty() Island {
-    new Island(List[f32].empty(), List[f32].empty(), List[Vec3].empty(), List[Vec2].empty(), List[BrookPoint].empty(),
+  fn empty() Baking {
+    new Baking(List[f32].empty(), List[f32].empty(), List[Vec3].empty(), List[Vec2].empty(), List[BrookPoint].empty(),
       List[f32].empty());
   }
 
-  // Sample (i, j) of the field; clamped to the grid
-  fn sample(self &, i i32, j i32) f32 {
-    imm ci = if i < 0 { 0; } elif i >= N { N - 1; } else { i; };
-    imm cj = if j < 0 { 0; } elif j >= N { N - 1; } else { j; };
-    *heights[usize.from(cj * N + ci)];
+  fn heightAt(self &, x f32, z f32) f32 { heightIn(&heights, x, z); }
+}
+
+// The baked island, which every query reads: the land's heights and the distance grids, the path's centreline, the fence and the
+// brook's course. Made once by bake() and never changed; each list is a shared read-only owner, so a copy ('share') is a handful
+// of counts and every actor, and the physics world, holds one.
+pub struct Island {
+  heights Arc[imm, List[f32]];
+  pathDistance Arc[imm, List[f32]];
+  centre Arc[imm, List[Vec3]];
+  fence Arc[imm, List[Vec2]];
+  brook Arc[imm, List[BrookPoint]];
+  brookDistance Arc[imm, List[f32]];
+
+  // An island with nothing in it: not baked (the ground is 0 m, there is no fence)
+  pub fn empty() Island { Island.of(Baking.empty()); }
+
+  fn of(b Baking) Island {
+    mut src = b;
+    mut heights = List[f32].empty();
+    mut pathDistance = List[f32].empty();
+    mut centre = List[Vec3].empty();
+    mut fence = List[Vec2].empty();
+    mut brook = List[BrookPoint].empty();
+    mut brookDistance = List[f32].empty();
+    heights <=> src.heights;
+    pathDistance <=> src.pathDistance;
+    centre <=> src.centre;
+    fence <=> src.fence;
+    brook <=> src.brook;
+    brookDistance <=> src.brookDistance;
+    new Island(new Arc[imm, List[f32]](heights), new Arc[imm, List[f32]](pathDistance), new Arc[imm, List[Vec3]](centre),
+      new Arc[imm, List[Vec2]](fence), new Arc[imm, List[BrookPoint]](brook), new Arc[imm, List[f32]](brookDistance));
   }
 
-  // The ground's height at (x, z), exact against the drawn fine mesh's triangles (outside the grid: the sea floor's depth at its
-  // edge)
-  fn heightAt(self &, x f32, z f32) f32 {
-    imm gx = (x + HALF) / CELL;
-    imm gz = (z + HALF) / CELL;
-    if gx < 0. or gz < 0. or gx >= f32.from(N - 1) or gz >= f32.from(N - 1) { return -30.; }
-    imm i = i32.from(libc.floorf(gx));
-    imm j = i32.from(libc.floorf(gz));
-    imm fx = gx - f32.from(i);
-    imm fz = gz - f32.from(j);
-    imm a = self.sample(i, j);
-    imm b = self.sample(i + 1, j);
-    imm c = self.sample(i, j + 1);
-    imm d = self.sample(i + 1, j + 1);
-    if !diagonalFlipped(i, j) {
-      // The diagonal from a to d
-      if fx >= fz { return a + fx * (b - a) + fz * (d - b); }
-      return a + fx * (d - c) + fz * (c - a);
-    }
-    // The diagonal from b to c
-    if fx + fz <= 1. { return a + fx * (b - a) + fz * (c - a); }
-    d + (1. - fx) * (c - d) + (1. - fz) * (b - d);
-  }
+  // Another owner of the same island (what each actor, and the physics world, keeps)
+  pub fn share(self &) Island { new Island(heights, pathDistance, centre, fence, brook, brookDistance); }
 
-  // The point of the fence's edge nearest (x, z), and how far it is
-  fn nearestOnFence(self &, x f32, z f32, onEdge &mut Vec2) f32 {
-    mut best f32 = 1000000.;
-    mut k = 0usize;
-    while k < fence.len() {
-      imm a = *fence[k];
-      imm b = *fence[if k + 1usize == fence.len() { 0usize; } else { k + 1usize; }];
-      imm abx = b.x - a.x;
-      imm abz = b.y - a.y;
-      imm t = clamp01(((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz));
-      imm px = a.x + abx * t;
-      imm pz = a.y + abz * t;
-      imm d = len2(x - px, z - pz);
-      if d < best { best = d; *onEdge = new Vec2(px, pz); }
-      k = k + 1usize;
-    }
-    best;
-  }
+  fn sample(self &, i i32, j i32) f32 { sampleIn(&*heights, i, j); }
+  fn heightAt(self &, x f32, z f32) f32 { heightIn(&*heights, x, z); }
+  fn nearestOnFence(self &, x f32, z f32, onEdge &mut Vec2) f32 { nearestOnFenceIn(&*fence, x, z, onEdge); }
 
   // Whether (x, z) is inside the fence
   fn inside(self &, x f32, z f32) bool { polygonContains(fence.view(), new Vec2(x, z)); }
-}
-
-// The baked island, published once by bake() through an atomic pointer (an 'imm' global holding an atomic, the one form a global
-// may take that is set after startup): null until then. The queries below are free functions called from every actor's thread,
-// which read it only after bake() has returned on the main thread, before the actors start. It is never freed.
-imm islandCell Atomic[*Island];
-
-fn @initpure init() {
-  islandCell = Atomic[*Island].of(null);
-}
-
-fn publishIsland(isl Island) {
-  imm p = libc.malloc(mem.sizeof[Island]()) as *Island;
-  mem.writeRaw[Island](p, isl);
-  islandCell.store(p);
 }
 
 // Whether the quad (i, j) of the mesh is split along its other diagonal,
@@ -364,24 +392,21 @@ pub fn diagonalFlipped(i i32, j i32) bool { ((i + j) & 1) == 1; }
 
 // The ground's height at (x, z), exact against the drawn fine mesh's triangles
 // (outside the grid: the sea floor's depth at its edge)
-pub fn groundHeight(x f32, z f32) f32 {
-  imm p = islandCell.load();
-  if p == null { return 0.; }
-  imm isl = &*p;
+pub fn groundHeight(isl &Island, x f32, z f32) f32 {
   isl.heightAt(x, z);
 }
 
 // The ground's slope (rise over run) at (x, z), by differences either side
-pub fn groundSlope(x f32, z f32) f32 {
+pub fn groundSlope(isl &Island, x f32, z f32) f32 {
   imm e f32 = 1.;
-  imm dx = (groundHeight(x + e, z) - groundHeight(x - e, z)) / (2. * e);
-  imm dz = (groundHeight(x, z + e) - groundHeight(x, z - e)) / (2. * e);
+  imm dx = (groundHeight(isl, x + e, z) - groundHeight(isl, x - e, z)) / (2. * e);
+  imm dz = (groundHeight(isl, x, z + e) - groundHeight(isl, x, z - e)) / (2. * e);
   len2(dx, dz);
 }
 
 // ---- The bake ----
 
-fn bakeGrid(isl &mut Island) {
+fn bakeGrid(isl &mut Baking) {
   imm total = usize.from(N * N);
   // 1. The hill's scale: its raw summit, found on a coarse grid, set to HILL_HEIGHT
   mut top f32 = 0.;
@@ -500,7 +525,7 @@ fn buildCentre() List[Vec2] {
 // The path pressed into the ground: its height smoothed along it (a box of
 // about 9 m, twice), then within PATH_REACH of it the ground eased to that
 // height less 6 cm; and the grid of distances to it
-fn carvePath(isl &mut Island) {
+fn carvePath(isl &mut Baking) {
   imm centreXZ = buildCentre();
   imm n = centreXZ.len();
   mut hp = List[f32].withCapacity(n);
@@ -602,10 +627,7 @@ fn carvePath(isl &mut Island) {
 // The path's centreline, from the landing beach to the steps' foot: a point
 // about every metre, on the ground (x, y, z), for lanterns, edging stones and
 // walkers to follow
-pub fn pathCentreline() List[Vec3] {
-  imm p = islandCell.load();
-  if p == null { return List[Vec3].empty(); }
-  imm isl = &*p;
+pub fn pathCentreline(isl &Island) List[Vec3] {
   mut out = List[Vec3].withCapacity(isl.centre.len());
   mut k = 0usize;
   while k < isl.centre.len() { out.push(*isl.centre[k]); k = k + 1usize; }
@@ -613,10 +635,7 @@ pub fn pathCentreline() List[Vec3] {
 }
 
 // How far (x, z) is from the path's centre, in metres (16 at the most)
-pub fn pathDistanceAt(x f32, z f32) f32 {
-  imm p = islandCell.load();
-  if p == null { return 16.; }
-  imm isl = &*p;
+pub fn pathDistanceAt(isl &Island, x f32, z f32) f32 {
   if isl.pathDistance.len() == 0usize { return 16.; }
   imm gx = clamp01((x + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
   imm gz = clamp01((z + HALF) / (CELL * f32.from(N - 1))) * f32.from(N - 1);
@@ -642,17 +661,14 @@ imm FENCE_CORNERS Array[f32, 22] = [
   -190., 285.,   175., 285.,   200., 430.,   175., 540.,   120., 552.,   60., 525.,
   0., 507.,   -60., 505.,   -120., 512.,   -200., 545.,   -215., 420.];
 
-pub fn fencePolygon() List[Vec2] {
-  imm p = islandCell.load();
-  if p == null { return List[Vec2].empty(); }
-  imm isl = &*p;
+pub fn fencePolygon(isl &Island) List[Vec2] {
   mut out = List[Vec2].withCapacity(isl.fence.len());
   mut k = 0usize;
   while k < isl.fence.len() { out.push(*isl.fence[k]); k = k + 1usize; }
   out;
 }
 
-fn buildFence(isl &mut Island) {
+fn buildFence(isl &mut Baking) {
   isl.fence = List[Vec2].empty();
   mut k = 0usize;
   while k < 11usize {
@@ -662,10 +678,7 @@ fn buildFence(isl &mut Island) {
 }
 
 // Whether (x, z) is inside the fence
-pub fn insideFence(x f32, z f32) bool {
-  imm p = islandCell.load();
-  if p == null { return polygonContains(List[Vec2].empty().view(), new Vec2(x, z)); }
-  imm isl = &*p;
+pub fn insideFence(isl &Island, x f32, z f32) bool {
   isl.inside(x, z);
 }
 
@@ -677,10 +690,8 @@ pub const WADE_DEPTH f32 = 0.6;
 // fence's nearest edge point (a walker pressing on the fence slides along
 // it); and shallow water only knee deep, never farther (the same, along the
 // axis that is clear). Positions are on the ground plane (x, z); y is kept.
-pub fn constrain(from Vec3, to Vec3) Vec3 {
-  imm cell = islandCell.load();
-  if cell == null { return to; }
-  imm isl = &*cell;
+pub fn constrain(isl &Island, from Vec3, to Vec3) Vec3 {
+  if isl.heights.len() == 0usize { return to; }   // not baked
   mut p = to;
   if !isl.inside(p.x, p.z) {
     mut edge = new Vec2(from.x, from.z);
@@ -708,11 +719,11 @@ pub fn constrain(from Vec3, to Vec3) Vec3 {
 // How thickly forest grows at (x, z), 0 to 1: from above the beach to part
 // way up the hill, clear of the path and of the cottage's lawn, in patches.
 // A scatter places trees by it; the ground's litter is painted from it.
-pub fn forestDensity(x f32, z f32) f32 {
-  imm h = groundHeight(x, z);
+pub fn forestDensity(isl &Island, x f32, z f32) f32 {
+  imm h = groundHeight(isl, x, z);
   imm lowland = smooth(2.8, 4.2, h) * (1. - smooth(50., 85., h));
   imm clearing = smooth(34., 58., len2(x - PAD_X, z - PAD_Z));
-  imm offPath = smooth(2.2, 4.5, pathDistanceAt(x, z));
+  imm offPath = smooth(2.2, 4.5, pathDistanceAt(isl, x, z));
   imm patches = 0.55 + 0.45 * smooth(-0.25, 0.3, fbm(x / 55., z / 55., 61u32, 3));
   lowland * clearing * offPath * patches;
 }
@@ -723,9 +734,7 @@ pub fn forestDensity(x f32, z f32) f32 {
 // red the forest litter (the forest's density, softened), the rest spare (the
 // path's distance is a field of its own, pathGrid: a byte is too coarse for
 // it). Rows from the grid's -z edge (row 0), as the heights are.
-pub fn maskImage() Image {
-  imm cell = islandCell.load();
-  imm isl = &*cell;
+pub fn maskImage(isl &Island) Image {
   mut px = List[u8].withCapacity(usize.from(N * N * 4));
   mut j = 0;
   while j < N {
@@ -733,7 +742,7 @@ pub fn maskImage() Image {
     while i < N {
       imm x = f32.from(i) * CELL - HALF;
       imm z = f32.from(j) * CELL - HALF;
-      imm litter = clamp01(forestDensity(x, z) * 1.4);
+      imm litter = clamp01(forestDensity(isl, x, z) * 1.4);
       imm pd = *isl.pathDistance[usize.from(j * N + i)];
       imm bd = *isl.brookDistance[usize.from(j * N + i)];
       px.push(u8.from(litter * 255.));
@@ -748,10 +757,7 @@ pub fn maskImage() Image {
 }
 
 // The height grid, for the GPU (one f32 a sample, row by row from -z)
-pub fn heightGrid() List[f32] {
-  imm p = islandCell.load();
-  if p == null { return List[f32].empty(); }
-  imm isl = &*p;
+pub fn heightGrid(isl &Island) List[f32] {
   mut out = List[f32].withCapacity(isl.heights.len());
   mut k = 0usize;
   while k < isl.heights.len() { out.push(*isl.heights[k]); k = k + 1usize; }
@@ -760,10 +766,7 @@ pub fn heightGrid() List[f32] {
 
 // The distance to the path at every sample (metres, 16 at most), for the GPU:
 // one f32 a sample, row by row from -z, as the heights are
-pub fn pathGrid() List[f32] {
-  imm p = islandCell.load();
-  if p == null { return List[f32].empty(); }
-  imm isl = &*p;
+pub fn pathGrid(isl &Island) List[f32] {
   mut out = List[f32].withCapacity(isl.pathDistance.len());
   mut k = 0usize;
   while k < isl.pathDistance.len() { out.push(*isl.pathDistance[k]); k = k + 1usize; }
@@ -771,14 +774,13 @@ pub fn pathGrid() List[f32] {
 }
 
 // Bake the island (once)
-pub fn bake() {
-  if islandCell.load() != null { return; }
-  mut isl = Island.empty();
+pub fn bake() Island {
+  mut isl = Baking.empty();
   bakeGrid(&mut isl);
   buildFence(&mut isl);
   carvePath(&mut isl);
   carveBrook(&mut isl);
-  publishIsland(isl);
+  Island.of(isl);
 }
 
 // ---- The meshes ----
@@ -904,9 +906,8 @@ fn markPixel(px &mut List[u8], x f32, z f32, r u8, g u8, b u8, radius i32) {
 // A picture of the island, N x N pixels, north (-z) up, as a BMP at 'file':
 // sea by depth, land by height with contour lines every 10 m, shaded by the slope
 pub fn writePreview(file &str) bool {
-  bake();
-  imm cell = islandCell.load();
-  imm isl = &*cell;
+  imm baked = bake();
+  imm isl = &baked;
   mut px = List[u8].withCapacity(usize.from(N * N * 3));
   // Bottom row first: image row 0 is the south (largest z)
   mut j = N - 1;

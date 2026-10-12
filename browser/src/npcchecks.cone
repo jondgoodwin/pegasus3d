@@ -19,7 +19,7 @@ const CHECK_STRAY f32 = 0.55;
 // Where the player is, t seconds in: at the cottage's steps; to the west lawn where the shy one lives, near it for
 // a good while; then down the path to the beach, standing there; then 40 s out of the mesh's reach (past its window,
 // as a player in the balloon is), and back on the beach
-fn playerAt(t f32) Vec3 {
+fn playerAt(isl &Island, t f32) Vec3 {
   imm a = new Vec3(-16., 0., 337.);
   imm b = new Vec3(-27., 0., 339.);
   imm c = new Vec3(-22., 0., 470.);
@@ -31,7 +31,7 @@ fn playerAt(t f32) Vec3 {
   elif t < 400. { p = c; }
   elif t < 440. { p = new Vec3(150., 0., 450.); }
   else { p = c; }
-  new Vec3(p.x, groundHeight(p.x, p.z), p.z);
+  new Vec3(p.x, groundHeight(isl, p.x, p.z), p.z);
 }
 
 struct VillageRun {
@@ -69,9 +69,9 @@ fn insideSolid(solids &List[Solid], p Vec3) bool {
 }
 
 // The villagers walked 'seconds' in the physics world (the village's mesh used again), with the player of playerAt
-fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun {
+fn runVillage(isl &Island, village &mut Village, solids &List[Solid], seconds f32) VillageRun {
   mut scene = Scene.empty();
-  mut c = Cast.empty();
+  mut c = Cast.empty(isl.share());
   c.phys.ensureGround();
   c.phys.setSolids(solids);
   village.npcs.clear();
@@ -82,7 +82,7 @@ fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun
     mut npc Npc = Npc.shy(0usize, "", new Vec2(0., 0.), 1., 2.);
     npc <=> one.npc;
     imm at = npc.body.pos;
-    imm index = c.add(mannequinBeing(&mut scene, npc.name.view(), new Vec3(at.x, groundHeight(at.x, at.y), at.y), one.height, one.seed));
+    imm index = c.add(mannequinBeing(&mut scene, npc.name.view(), new Vec3(at.x, groundHeight(isl, at.x, at.y), at.y), one.height, one.seed));
     c.beings[index].ai = true;
     c.beings[index].body.yaw = one.yaw;
     c.beings[index].before = c.beings[index].body;
@@ -113,11 +113,11 @@ fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun
   while s < steps {
     imm t = f32.from(s) * dt;
     village.players.clear();
-    village.players.push(playerAt(t));
+    village.players.push(playerAt(isl, t));
     mut b = 0usize;
     while b < c.beings.len() { given.set(b, Intents.none()); b = b + 1usize; }
     imm t0 = sdl.GetTicksNS();
-    village.step(&c, &mut given, dt);
+    village.step(isl, &c, &mut given, dt);
     thinkNs = thinkNs + (sdl.GetTicksNS() - t0);
     c.stepEach(&given, &stepIt, dt, false);
     // What each one did
@@ -128,7 +128,7 @@ fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun
       imm p = new Vec2(body.position.x, body.position.z);
       if c.beings[npc.being].figure.mode != FIG_WALK { run.fall = true; }
       if s % 6 == 0 {
-        imm stray = village.world.strayOf(p);
+        imm stray = village.world.strayOf(isl, p);
         if stray > *run.maxStray[k] { run.maxStray.set(k, stray); }
       }
       if s % 3 == 0 and insideSolid(solids, body.position) { run.solidHits.set(k, *run.solidHits[k] + 1u32); }
@@ -142,7 +142,7 @@ fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun
     {
       imm pb = c.beings[patrol.being].body.position;
       if pb.z > 350. and pb.z < 485. {
-        imm off = pathDistanceAt(pb.x, pb.z);
+        imm off = pathDistanceAt(isl, pb.x, pb.z);
         if off > run.pathOff { run.pathOff = off; }
         run.onPath = run.onPath + 1u32;
       }
@@ -158,7 +158,7 @@ fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun
     }
     // The follower's and the shy one's distances from the player, at the times the checks read them
     if s == 3600 or s == 6000 or s == 7500 or s == steps - 1 {
-      imm pl = playerAt(t);
+      imm pl = playerAt(isl, t);
       imm fb = c.beings[village.npcs[2usize].being].body.position;
       imm sb = c.beings[village.npcs[3usize].being].body.position;
       run.followBand.push(flatDist(fb.x, fb.z, pl.x, pl.z));
@@ -183,12 +183,11 @@ fn runVillage(village &mut Village, solids &List[Solid], seconds f32) VillageRun
   run;
 }
 
-fn checkVillage() bool {
+fn checkVillage(isl &Island) bool {
   print <- "The villagers:\n";
-  bakeIsland();
-  imm solids = worldSolids();
+  imm solids = worldSolids(isl);
   mut village = Village.empty();
-  village.world = buildNavWorld(&solids);
+  village.world = buildNavWorld(isl, &solids);
   print <- "  the navigation mesh: "; print <- village.world.polygons; print <- " polygons from "; print <- village.world.triangles;
   print <- " triangles and "; print <- village.world.obstacles; print <- " obstacles, built in ";
   print <- f64.from(village.world.buildNs) / 1000000d; print <- " ms\n";
@@ -196,7 +195,7 @@ fn checkVillage() bool {
   // Tab skips a villager: of two mannequins with a villager between them, the next after the first is the second
   {
     mut scene = Scene.empty();
-    mut cast = Cast.empty();
+    mut cast = Cast.empty(isl.share());
     imm first = cast.add(mannequinBeing(&mut scene, "one", new Vec3(0., 0., 0.), 1.75, 3u32));
     imm vil = cast.add(mannequinBeing(&mut scene, "villager", new Vec3(3., 0., 0.), 1.7, 5u32));
     imm last = cast.add(mannequinBeing(&mut scene, "two", new Vec3(6., 0., 0.), 1.6, 7u32));
@@ -220,7 +219,7 @@ fn checkVillage() bool {
     mut g = f + 1usize;
     while g < spots.len() {
       mut path = List[Vec2].empty();
-      if !village.world.route(*spots[f], *spots[g], &mut path) {
+      if !village.world.route(isl, *spots[f], *spots[g], &mut path) {
         routesOk = false;
         print <- "    no route from ("; print <- spots[f].x; print <- ", "; print <- spots[f].y; print <- ") to ("; print <- spots[g].x;
         print <- ", "; print <- spots[g].y; print <- ")\n";
@@ -241,7 +240,7 @@ fn checkVillage() bool {
 
   // The run
   imm t0 = sdl.GetTicksNS();
-  imm run = runVillage(&mut village, &solids, 520.);
+  imm run = runVillage(isl, &mut village, &solids, 520.);
   print <- "  520 s walked in "; print <- f64.from(sdl.GetTicksNS() - t0) / 1000000d; print <- " ms\n";
   print <- "    the patrol walked "; print <- run.onPath; print <- " steps along the path's length, at worst "; print <- run.pathOff; print <- " m from its centre (its half width is 0.9)\n";
   ok = expect("the patrol kept to the path along its length (within 2.5 m of its centre)", run.onPath > 3000u32 and run.pathOff < 2.5) and ok;
@@ -289,8 +288,8 @@ fn checkVillage() bool {
   print <- "    the village's step took "; print <- run.thinkUs; print <- " us on average for four villagers; "; print <- village.world.queries;
   print <- " route queries took "; print <- f64.from(village.world.queryNs) / 1000000d; print <- " ms in all\n";
   // The same again, shorter: the same places to the millimetre
-  imm one = runVillage(&mut village, &solids, 60.);
-  imm two = runVillage(&mut village, &solids, 60.);
+  imm one = runVillage(isl, &mut village, &solids, 60.);
+  imm two = runVillage(isl, &mut village, &solids, 60.);
   mut same = one.finalAt.len() == two.finalAt.len();
   v = 0usize;
   while same and v < one.finalAt.len() {
@@ -346,18 +345,19 @@ fn navPicture(world &NavWorld, solids &List[Solid], routes &List[List[Vec2]], pr
 
 // The mesh drawn: the whole window, the cottage's front and the bridge close up
 pub fn writeNavPictures(prefix &str) bool {
-  bakeIsland();
-  imm solids = worldSolids();
-  mut world = buildNavWorld(&solids);
+  imm baked = bakeIsland();
+  imm isl = &baked;
+  imm solids = worldSolids(isl);
+  mut world = buildNavWorld(isl, &solids);
   print <- "Navigation: "; print <- world.polygons; print <- " polygons from "; print <- world.triangles; print <- " triangles and ";
   print <- world.obstacles; print <- " obstacles in "; print <- f64.from(world.buildNs) / 1000000d; print <- " ms\n";
-  describeBridge();
+  describeBridge(isl);
   mut routes = List[List[Vec2]].empty();
   imm places = villagePlaces();
   mut k = 0usize;
   while k < places.len() {
     mut path = List[Vec2].empty();
-    if world.route(*places[k], *places[(k + 1usize) % places.len()], &mut path) { routes.push(path); }
+    if world.route(isl, *places[k], *places[(k + 1usize) % places.len()], &mut path) { routes.push(path); }
     k = k + 1usize;
   }
   mut ok = navPicture(&world, &solids, &routes, prefix, "-region.png", NAV_X0, NAV_Z0, NAV_X1, NAV_Z1, 5.);
@@ -368,15 +368,15 @@ pub fn writeNavPictures(prefix &str) bool {
 
 // The bridge's two ends against the ground there (for --navpic): the road's height at each end of its ramps and the
 // island's ground beside it, metres
-pub fn describeBridge() {
-  imm bank = bridgeBank();
+pub fn describeBridge(isl &Island) {
+  imm bank = bridgeBank(isl);
   mut side = 0;
   while side < 2 {
     imm z = if side == 0 { BRIDGE_Z - BRIDGE_END; } else { BRIDGE_Z + BRIDGE_END; };
     imm which = if side == 0 { "north"; } else { "south"; };
     print <- "  the bridge's "; printStr(which); print <- " end (z "; print <- z; print <- "): the road "; print <- bridgeDeck(z - BRIDGE_Z, bank);
-    print <- " m, the ground at its middle "; print <- groundHeight(BRIDGE_X, z); print <- " m, on its sides "; print <- groundHeight(BRIDGE_X - 1.5, z);
-    print <- " and "; print <- groundHeight(BRIDGE_X + 1.5, z); print <- " m\n";
+    print <- " m, the ground at its middle "; print <- groundHeight(isl, BRIDGE_X, z); print <- " m, on its sides "; print <- groundHeight(isl, BRIDGE_X - 1.5, z);
+    print <- " and "; print <- groundHeight(isl, BRIDGE_X + 1.5, z); print <- " m\n";
     side = side + 1;
   }
 }

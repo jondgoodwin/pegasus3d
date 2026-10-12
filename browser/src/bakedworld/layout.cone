@@ -114,7 +114,7 @@ pub fn nearCottage(x f32, z f32, r f32, margin f32) bool {
 // on the porch, inside the cottage's footprint), each (x, z, radius). The balloon's reach is its
 // envelope's (9.4 m at the equator) and a pine's crown beyond it, so a tree never touches it
 // as it rises
-pub fn worldObjects() List[Vec3] {
+pub fn worldObjects(isl &Island) List[Vec3] {
   mut out = List[Vec3].empty();
   imm ids Array[u32, 5] = [AMPHORA, HORNFLOWER, BALL, BUTTON, BALLOON];
   imm reach Array[f32, 5] = [1.2, 1.6, 1., 1.5, BALLOON_CLEAR];
@@ -132,7 +132,7 @@ pub fn worldObjects() List[Vec3] {
   }
   // The brook: a disc every 3 m along its course (2.6 m round, 3.2 m in the dingle), so no tree, rock, fern, hosta
   // or flower stands in its channel or its banks; and the bridge's footprint, its two ends
-  imm course = brookPoints();
+  imm course = brookPoints(isl);
   mut next f32 = 0.;
   i = 0usize;
   while i < course.len() {
@@ -168,8 +168,9 @@ struct Ground {
   items List[Item];
   objects List[Vec3];
   lanterns List[Vec2];
+  island Island;               // the ground items stand on
 
-  fn make() Ground { new Ground(List[Item].empty(), worldObjects(), lanternSpots()); }
+  fn make(isl &Island) Ground { new Ground(List[Item].empty(), worldObjects(isl), lanternSpots(isl), isl.share()); }
 
   // Whether a circle of 'r' at (x, z) is clear of what stands (anything laid out, the cottage, the
   // world's objects, the lanterns)
@@ -218,14 +219,14 @@ struct Ground {
   }
 
   fn add(self &mut, kind u32, variant u32, x f32, z f32, yaw f32, scale f32, radius f32) {
-    items.push(new Item(kind, variant, x, groundHeight(x, z), z, yaw, scale, radius));
+    items.push(new Item(kind, variant, x, groundHeight(&island, x, z), z, yaw, scale, radius));
   }
 }
 
 // Whether (x, z) is somewhere something may stand: on the island's land above the beach, inside
 // the fence, and not on the path
-fn standable(x f32, z f32, minHeight f32, pathClear f32) bool {
-  insideFence(x, z) and groundHeight(x, z) > minHeight and pathDistanceAt(x, z) > pathClear;
+fn standable(isl &Island, x f32, z f32, minHeight f32, pathClear f32) bool {
+  insideFence(isl, x, z) and groundHeight(isl, x, z) > minHeight and pathDistanceAt(isl, x, z) > pathClear;
 }
 
 // ---- The forest's candidates, nearest the path first ----
@@ -255,7 +256,7 @@ fn anchors(g &mut Ground, rng &mut VRng) {
   }
 }
 
-fn forest(g &mut Ground, rng &mut VRng) {
+fn forest(isl &Island, g &mut Ground, rng &mut VRng) {
   mut cands = List[Cand].empty();
   imm cell = 6.;
   mut z = 300.;
@@ -264,9 +265,9 @@ fn forest(g &mut Ground, rng &mut VRng) {
     while x < 210. {
       imm cx = x + rng.unit() * cell;
       imm cz = z + rng.unit() * cell;
-      if standable(cx, cz, 2.6, 4.5) and groundSlope(cx, cz) < 0.42 {
-        imm d = forestDensity(cx, cz);
-        imm pd = pathDistanceAt(cx, cz);
+      if standable(isl, cx, cz, 2.6, 4.5) and groundSlope(isl, cx, cz) < 0.42 {
+        imm d = forestDensity(isl, cx, cz);
+        imm pd = pathDistanceAt(isl, cx, cz);
         if d > 0.18 and pd < 70. { cands.push(new Cand(cx, cz, pd + rng.unit() * 10., d)); }
       }
       x = x + cell;
@@ -289,7 +290,7 @@ fn forest(g &mut Ground, rng &mut VRng) {
   }
 }
 
-fn rocks(g &mut Ground, rng &mut VRng) {
+fn rocks(isl &Island, g &mut Ground, rng &mut VRng) {
   mut n = 0usize;
   // the beach and the shore: a scatter about where you land
   mut tries = 0;
@@ -297,8 +298,8 @@ fn rocks(g &mut Ground, rng &mut VRng) {
     tries = tries + 1;
     imm x = START_X + rng.signed() * 55.;
     imm z = START_Z - 40. + rng.unit() * 70.;
-    imm h = groundHeight(x, z);
-    if insideFence(x, z) and h > 0.15 and h < 2.2 and pathDistanceAt(x, z) > 3.5 and dist2(x, z, START_X, START_Z) > 6. {
+    imm h = groundHeight(isl, x, z);
+    if insideFence(isl, x, z) and h > 0.15 and h < 2.2 and pathDistanceAt(isl, x, z) > 3.5 and dist2(x, z, START_X, START_Z) > 6. {
       imm s = 0.5 + 1.6 * rng.unit() * rng.unit();
       if g.clear(x, z, 0.5 * s) { g.add(K_ROCK, rng.below(ROCK_VARIANTS), x, z, rng.unit() * 6.28, s, 0.55 * s); n = n + 1usize; }
     }
@@ -309,8 +310,8 @@ fn rocks(g &mut Ground, rng &mut VRng) {
     tries = tries + 1;
     imm x = -170. + rng.unit() * 340.;
     imm z = 300. + rng.unit() * 190.;
-    if standable(x, z, 2.6, 3.5) and pathDistanceAt(x, z) < 60. {
-      imm slope = groundSlope(x, z);
+    if standable(isl, x, z, 2.6, 3.5) and pathDistanceAt(isl, x, z) < 60. {
+      imm slope = groundSlope(isl, x, z);
       imm want = 0.06 + 2.2 * (if slope > 0.1 { slope - 0.1; } else { 0.; });
       if rng.unit() < want {
         imm s = 0.45 + 1.7 * rng.unit() * rng.unit();
@@ -319,7 +320,7 @@ fn rocks(g &mut Ground, rng &mut VRng) {
     }
   }
   // at the path's side, every dozen metres or so, past the edging stones
-  imm line = pathCentreline();
+  imm line = pathCentreline(isl);
   mut k = 20usize;
   mut side = 1.;
   while k + 8usize < line.len() {
@@ -332,10 +333,10 @@ fn rocks(g &mut Ground, rng &mut VRng) {
     imm off = side * (2.3 + 1.4 * rng.unit());
     imm x = c.x + (0. - tz) / tl * off;
     imm z = c.z + tx / tl * off;
-    if rng.unit() < 0.7 and standable(x, z, 2.6, 1.8) {
+    if rng.unit() < 0.7 and standable(isl, x, z, 2.6, 1.8) {
       imm s = 0.55 + 0.9 * rng.unit();
       // the whole rock stays off the walking surface and the edging stones' row, whichever way the path bends
-      if standable(x, z, 2.6, PATH_HALF_WIDTH + 0.45 + ROCK_REACH * s) and g.clear(x, z, 0.55 * s) { g.add(K_ROCK, rng.below(ROCK_VARIANTS), x, z, rng.unit() * 6.28, s, 0.55 * s); }
+      if standable(isl, x, z, 2.6, PATH_HALF_WIDTH + 0.45 + ROCK_REACH * s) and g.clear(x, z, 0.55 * s) { g.add(K_ROCK, rng.below(ROCK_VARIANTS), x, z, rng.unit() * 6.28, s, 0.55 * s); }
     }
     side = 0. - side;
     k = k + 9usize + usize.from(rng.below(7u32));
@@ -345,8 +346,8 @@ fn rocks(g &mut Ground, rng &mut VRng) {
 // Edging stones along both edges of the path, in order along it: small low stones (0.25 to 0.45 m
 // across), one every 0.7 to 1.1 m, each just outside the walking surface (its near side 0.03 to 0.2 m
 // beyond the edge), a few missing, a little bigger where the path bends
-fn edging(g &mut Ground, rng &mut VRng) {
-  imm line = pathCentreline();
+fn edging(isl &Island, g &mut Ground, rng &mut VRng) {
+  imm line = pathCentreline(isl);
   mut side = -1;
   while side <= 1 {
     mut k = 1usize;
@@ -376,7 +377,7 @@ fn edging(g &mut Ground, rng &mut VRng) {
         imm x = c.x + sx * u + (0. - sz) / sl * off;
         imm z = c.z + sz * u + sx / sl * off;
         pos = pos + 0.7 + 0.4 * rng.unit();
-        if rng.unit() > 0.06 and groundHeight(x, z) > 2.7 and insideFence(x, z) and !nearCottage(x, z, 0.1, 0.6) {
+        if rng.unit() > 0.06 and groundHeight(isl, x, z) > 2.7 and insideFence(isl, x, z) and !nearCottage(x, z, 0.1, 0.6) {
           if g.clear(x, z, 0.1) { g.add(K_EDGING, rng.below(EDGING_VARIANTS), x, z, rng.unit() * 6.28, s, r); }
         }
       }
@@ -387,7 +388,7 @@ fn edging(g &mut Ground, rng &mut VRng) {
   }
 }
 
-fn hostas(g &mut Ground, rng &mut VRng) {
+fn hostas(isl &Island, g &mut Ground, rng &mut VRng) {
   // by the cottage's foundation: along the wing's and the main block's front, and the east wall
   imm fx Array[f32, 12] = [-21., -19.6, -18., -12.9, -12.4, -11.6, -22.4, -22.4, -11.7, -11.8, -22.3, -12.4];
   imm fz Array[f32, 12] = [331.2, 331.6, 333.4, 333.8, 332.2, 329.4, 326., 328.7, 326.4, 324.2, 324.4, 322.4];
@@ -395,13 +396,13 @@ fn hostas(g &mut Ground, rng &mut VRng) {
   while i < 12usize {
     imm x = fx[i] + 0.3 * rng.signed();
     imm z = fz[i] + 0.3 * rng.signed();
-    if g.count(K_HOSTA) < MAX_HOSTAS and pathDistanceAt(x, z) > 1.5 and g.clearAt(x, z, 0.4, 0.15) {
+    if g.count(K_HOSTA) < MAX_HOSTAS and pathDistanceAt(isl, x, z) > 1.5 and g.clearAt(x, z, 0.4, 0.15) {
       g.add(K_HOSTA, rng.below(HOSTA_VARIANTS), x, z, rng.unit() * 6.28, 1.15 + 0.6 * rng.unit(), 0.6);
     }
     i = i + 1usize;
   }
   // along the path's last 30 m, both sides, 1.6 to 2.6 m out
-  imm line = pathCentreline();
+  imm line = pathCentreline(isl);
   mut k = line.len() - 2usize;
   while k > line.len() - 32usize and k > 2usize {
     imm a = *line[k - 1usize];
@@ -413,14 +414,14 @@ fn hostas(g &mut Ground, rng &mut VRng) {
     imm off = (if rng.unit() < 0.5 { 1.; } else { -1.; }) * (1.7 + 0.9 * rng.unit());
     imm x = c.x + (0. - tz) / tl * off;
     imm z = c.z + tx / tl * off;
-    if rng.unit() < 0.45 and g.count(K_HOSTA) < MAX_HOSTAS and standable(x, z, 2.6, 1.3) and g.clearAt(x, z, 0.45, 0.2) {
+    if rng.unit() < 0.45 and g.count(K_HOSTA) < MAX_HOSTAS and standable(isl, x, z, 2.6, 1.3) and g.clearAt(x, z, 0.45, 0.2) {
       g.add(K_HOSTA, rng.below(HOSTA_VARIANTS), x, z, rng.unit() * 6.28, 1.15 + 0.6 * rng.unit(), 0.6);
     }
     k = k - 1usize;
   }
 }
 
-fn ferns(g &mut Ground, rng &mut VRng) {
+fn ferns(isl &Island, g &mut Ground, rng &mut VRng) {
   // two or three clumps round each tree
   imm trees = g.items.len();
   mut i = 0usize;
@@ -437,7 +438,7 @@ fn ferns(g &mut Ground, rng &mut VRng) {
         imm r = 1.4 + 3.4 * rng.unit();
         imm x = tx + a.cos() * r;
         imm z = tz + a.sin() * r;
-        if standable(x, z, 2.6, 1.4) and groundSlope(x, z) < 0.45 and g.count(K_FERN) < MAX_FERNS and g.clearAt(x, z, 0.5, 0.2) {
+        if standable(isl, x, z, 2.6, 1.4) and groundSlope(isl, x, z) < 0.45 and g.count(K_FERN) < MAX_FERNS and g.clearAt(x, z, 0.5, 0.2) {
           g.add(K_FERN, rng.below(FERN_VARIANTS), x, z, rng.unit() * 6.28, 1.0 + 0.6 * rng.unit(), 0.75);
         }
         j = j + 1;
@@ -446,7 +447,7 @@ fn ferns(g &mut Ground, rng &mut VRng) {
     i = i + 1usize;
   }
   // along the lane
-  imm line = pathCentreline();
+  imm line = pathCentreline(isl);
   mut k = 4usize;
   while k + 2usize < line.len() {
     imm a = *line[k - 1usize];
@@ -458,14 +459,14 @@ fn ferns(g &mut Ground, rng &mut VRng) {
     imm off = (if rng.unit() < 0.5 { 1.; } else { -1.; }) * (1.6 + 2.2 * rng.unit());
     imm x = c.x + (0. - tz) / tl * off;
     imm z = c.z + tx / tl * off;
-    if rng.unit() < 0.55 and g.count(K_FERN) < MAX_FERNS and standable(x, z, 2.7, 1.35) and g.clearAt(x, z, 0.5, 0.2) {
+    if rng.unit() < 0.55 and g.count(K_FERN) < MAX_FERNS and standable(isl, x, z, 2.7, 1.35) and g.clearAt(x, z, 0.5, 0.2) {
       g.add(K_FERN, rng.below(FERN_VARIANTS), x, z, rng.unit() * 6.28, 1.0 + 0.6 * rng.unit(), 0.75);
     }
     k = k + 3usize;
   }
 }
 
-fn flowers(g &mut Ground, rng &mut VRng) {
+fn flowers(isl &Island, g &mut Ground, rng &mut VRng) {
   // the beds on the porch's front, either side of the steps and the path's end (x -17.1 to -14.8)
   mut x = -18.2;
   while x < -13.2 {
@@ -474,7 +475,7 @@ fn flowers(g &mut Ground, rng &mut VRng) {
       while j < 2 {
         imm fx = x + 0.3 * rng.signed();
         imm fz = 332.5 + 0.5 * rng.unit() + 0.45 * f32.from(j);
-        if g.count(K_FLOWER) < MAX_FLOWERS and pathDistanceAt(fx, fz) > 1.25 and g.clearAt(fx, fz, 0.25, 0.1) {
+        if g.count(K_FLOWER) < MAX_FLOWERS and pathDistanceAt(isl, fx, fz) > 1.25 and g.clearAt(fx, fz, 0.25, 0.1) {
           g.add(K_FLOWER, rng.below(FLOWER_VARIANTS), fx, fz, rng.unit() * 6.28, 1.1 + 0.4 * rng.unit(), 0.3);
         }
         j = j + 1;
@@ -491,13 +492,13 @@ fn flowers(g &mut Ground, rng &mut VRng) {
     imm r = 0.9 + 1.0 * rng.unit();
     imm fx = ax + a.cos() * r;
     imm fz = az + a.sin() * r;
-    if g.count(K_FLOWER) < MAX_FLOWERS and pathDistanceAt(fx, fz) > 1.4 and g.clear(fx, fz, 0.25) {
+    if g.count(K_FLOWER) < MAX_FLOWERS and pathDistanceAt(isl, fx, fz) > 1.4 and g.clear(fx, fz, 0.25) {
       g.add(K_FLOWER, rng.below(FLOWER_VARIANTS), fx, fz, rng.unit() * 6.28, 1.1 + 0.4 * rng.unit(), 0.3);
     }
     i = i + 1;
   }
   // by the path's last 25 m
-  imm line = pathCentreline();
+  imm line = pathCentreline(isl);
   mut k = line.len() - 2usize;
   while k > line.len() - 27usize and k > 2usize {
     imm a = *line[k - 1usize];
@@ -509,7 +510,7 @@ fn flowers(g &mut Ground, rng &mut VRng) {
     imm off = (if rng.unit() < 0.5 { 1.; } else { -1.; }) * (1.5 + 0.9 * rng.unit());
     imm fx = c.x + (0. - tz) / tl * off;
     imm fz = c.z + tx / tl * off;
-    if rng.unit() < 0.6 and g.count(K_FLOWER) < MAX_FLOWERS and standable(fx, fz, 2.6, 1.3) and g.clearAt(fx, fz, 0.25, 0.1) {
+    if rng.unit() < 0.6 and g.count(K_FLOWER) < MAX_FLOWERS and standable(isl, fx, fz, 2.6, 1.3) and g.clearAt(fx, fz, 0.25, 0.1) {
       g.add(K_FLOWER, rng.below(FLOWER_VARIANTS), fx, fz, rng.unit() * 6.28, 1.1 + 0.4 * rng.unit(), 0.3);
     }
     k = k - 1usize;
@@ -528,11 +529,11 @@ const BED_STONE_ABOVE f32 = 0.05;
 
 // How far from the course (x, z), going out along (nx, nz) on 'side' (+-1), the bank's lip lies: the first
 // quarter metre where the ground is within 0.12 m of its height 9 m out
-fn lipDistance(x f32, z f32, nx f32, nz f32, side f32) f32 {
-  imm ref = groundHeight(x + nx * side * 9., z + nz * side * 9.);
+fn lipDistance(isl &Island, x f32, z f32, nx f32, nz f32, side f32) f32 {
+  imm ref = groundHeight(isl, x + nx * side * 9., z + nz * side * 9.);
   mut d = 1.;
   while d < 8. {
-    if groundHeight(x + nx * side * d, z + nz * side * d) >= ref - 0.12 { return d; }
+    if groundHeight(isl, x + nx * side * d, z + nz * side * d) >= ref - 0.12 { return d; }
     d = d + 0.25;
   }
   d;
@@ -540,8 +541,8 @@ fn lipDistance(x f32, z f32, nx f32, nz f32, side f32) f32 {
 
 // Stones in the water (squat rocks, tops about 9 cm over the surface, a step or less over the bed: a walker wades
 // over them), lip stones along the yard's banks (the path's edging kind), and ferns beside them
-fn brookItems(g &mut Ground, rng &mut VRng) {
-  imm pts = brookPoints();
+fn brookItems(isl &Island, g &mut Ground, rng &mut VRng) {
+  imm pts = brookPoints(isl);
   imm n = pts.len();
   // bed stones: every 3 to 5 m in the yard, every 1.6 to 3 m from the dingle down; inside the fence only
   mut nextStone f32 = 0.;
@@ -589,7 +590,7 @@ fn brookItems(g &mut Ground, rng &mut VRng) {
         imm z = p.z + nz * side * (lip - 0.2);
         imm s = 0.9 + 0.5 * rng.unit();
         imm onBridge = (x - BRIDGE_X) * (x - BRIDGE_X) + (z - BRIDGE_Z) * (z - BRIDGE_Z) < 16.;
-        if rng.unit() < 0.55 and !onBridge and lip < 4.5 and insideFence(x, z) and !nearCottage(x, z, 0.1, 0.6) {
+        if rng.unit() < 0.55 and !onBridge and lip < 4.5 and insideFence(isl, x, z) and !nearCottage(x, z, 0.1, 0.6) {
           imm r = EDGING_RADIUS * s;
           imm vr = rng.below(EDGING_VARIANTS);
           imm yw = rng.unit() * 6.28;
@@ -600,7 +601,7 @@ fn brookItems(g &mut Ground, rng &mut VRng) {
           imm fo = lip + 0.8 + 2.0 * rng.unit();
           imm fx = p.x + nx * side * fo;
           imm fz = p.z + nz * side * fo;
-          if insideFence(fx, fz) and g.count(K_FERN) < MAX_FERNS + MAX_BROOK_FERNS and groundSlope(fx, fz) < 0.45 and g.clearAt(fx, fz, 0.5, 0.2) {
+          if insideFence(isl, fx, fz) and g.count(K_FERN) < MAX_FERNS + MAX_BROOK_FERNS and groundSlope(isl, fx, fz) < 0.45 and g.clearAt(fx, fz, 0.5, 0.2) {
             g.add(K_FERN, rng.below(FERN_VARIANTS), fx, fz, rng.unit() * 6.28, 1.0 + 0.6 * rng.unit(), 0.75);
           }
         }
@@ -616,10 +617,10 @@ mut layoutDone bool = false;
 fn @initpure init() { layoutCache = List[Item].empty(); }
 
 // The layout built afresh from its seed (what a check compares the cached one to)
-pub fn vegetationLayoutAgain() List[Item] {
+pub fn vegetationLayoutAgain(isl &Island) List[Item] {
   layoutDone = false;
   layoutCache.clear();
-  vegetationLayout();
+  vegetationLayout(isl);
 }
 
 // Whether the vegetation is left out (browser.exe --no-vegetation, to time what it costs)
@@ -627,19 +628,19 @@ mut vegetationOff bool = false;
 pub fn setVegetation(on bool) { vegetationOff = !on; }
 
 // The whole layout (built once)
-pub fn vegetationLayout() List[Item] {
+pub fn vegetationLayout(isl &Island) List[Item] {
   if vegetationOff { return List[Item].empty(); }
   if !layoutDone {
-    mut g = Ground.make();
+    mut g = Ground.make(isl);
     mut rng = vrng(1u32);
     anchors(&mut g, &mut rng);
-    forest(&mut g, &mut rng);
-    rocks(&mut g, &mut rng);
-    hostas(&mut g, &mut rng);
-    flowers(&mut g, &mut rng);
-    ferns(&mut g, &mut rng);
-    edging(&mut g, &mut rng);
-    brookItems(&mut g, &mut rng);
+    forest(isl, &mut g, &mut rng);
+    rocks(isl, &mut g, &mut rng);
+    hostas(isl, &mut g, &mut rng);
+    flowers(isl, &mut g, &mut rng);
+    ferns(isl, &mut g, &mut rng);
+    edging(isl, &mut g, &mut rng);
+    brookItems(isl, &mut g, &mut rng);
     layoutCache <=> g.items;
     layoutDone = true;
   }

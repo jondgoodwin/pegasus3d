@@ -93,7 +93,7 @@ import vfx use ParticleRenderer, EmitterHandle, Emitter, Event;
 import analyticdaylight use DayConfig, DaySky, DayLighting, lumaOf;
 import boidflock use Flock, FlockParams;
 import actors;
-import sync use Channel, Sender, Receiver;
+import sync use Channel, Sender, Receiver, Arc;
 import path use Path;
 import fs;
 import uilayout use Ui, DrawCmd;
@@ -115,7 +115,7 @@ import audiodevice;
 // of parts that imports it
 use parts;
 // The island: its land baked once, and what the browser asks of it
-use island { writePreview, bake as bakeIsland, heightGrid, pathGrid, pathDistanceAt, maskImage, fineMesh, coarseMesh, waterMesh, CELL, N, HALF,
+use island { Island, writePreview, bake as bakeIsland, heightGrid, pathGrid, pathDistanceAt, maskImage, fineMesh, coarseMesh, waterMesh, CELL, N, HALF,
   FINE_I0, FINE_J0, FINE_I1, FINE_J1, groundHeight as islandHeight, constrain as islandConstrain, WORLD_DX, WORLD_DZ,
   START_X as BEACH_X, START_Z as BEACH_Z, insideFence as insideIslandFence, fencePolygon, pathCentreline, diagonalFlipped,
   BrookPoint, brookPoints, brookLength, brookDistanceAt, brookNearest, BROOK_NEAR, BROOK_BRIDGE };
@@ -355,19 +355,21 @@ fn shellRun(config Config, startup Startup) i32 {
   // birds' first heights are read off the ground before there is one (0 m).
   // Making it after the bake would lift the birds (a change to every view
   // with a bird in it), so it is left as it was; the scene actor steps it.
-  imm birds = Birds.make();
+  imm unbaked = Island.empty();
+  imm birds = Birds.make(&unbaked);
   // The view flies a flock of its own (cosmetic, and the same as the simulation's: both are made here)
-  imm viewBirds = Birds.make();
+  imm viewBirds = Birds.make(&unbaked);
   // The island's land is baked first (the beings stand on it, the world
   // grows on it), here, before any actor starts: from then on it is only
   // read, by every actor
   imm bakeStart = sdl.GetPerformanceCounter();
-  bakeIsland();
+  imm land = bakeIsland();   // shared, read-only, by every actor
+  imm isl = &land;
   print <- "The island: baked in "; print <- f64.from(sdl.GetPerformanceCounter() - bakeStart) * 1000d
     / f64.from(sdl.GetPerformanceFrequency()); print <- " ms\n";
   // The vegetation's layout is laid out here too, before any actor starts: the scene
   // actor's solids (trunks, rocks) and the world actor's trees read the same list
-  vegetationLayout();
+  vegetationLayout(isl);
 
   // The shell's three inboxes: render's word that it could make the GPU
   // side, each frame's report, and the run's exit code
@@ -392,7 +394,7 @@ fn shellRun(config Config, startup Startup) i32 {
     width = u32.from(size.w);
     height = u32.from(size.h);
   }
-  imm render = new RenderActor(window, width, height, skyOff, scripted, startup.shotsDir.copy(), readyTx);
+  imm render = new RenderActor(window, width, height, skyOff, scripted, startup.shotsDir.copy(), readyTx, land.share());
   mut ready = false;
   match readyRx.recv() {
     case imm r Some { ready = r; }
@@ -411,16 +413,16 @@ fn shellRun(config Config, startup Startup) i32 {
   mut endpointOpt Option[Endpoint] = None;
   mut joinsToWait = 1;
   if !connected {
-    imm world = new WorldActor(scripted);
+    imm world = new WorldActor(scripted, land.share());
     mut servedTx Sender[u64];
     mut servedRx Receiver[u64];
     servedTx, servedRx = Channel[u64].make();
-    imm sim = new SimActor(scripted, birds, world, false, joinedTx.clone(), servedTx);
+    imm sim = new SimActor(scripted, birds, world, false, joinedTx.clone(), servedTx, land.share());
     simOpt = Some[SimActor](sim);
     simOpt2 = Some[SimActor](sim);
     joinsToWait = 2;
   }
-  imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx, startup.audio.copy(), automated);
+  imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx, startup.audio.copy(), automated, land.share());
   imm viewHandler = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [view] { view.onNet(ev); }));
   if connected {
     imm addr = parseAddress(startup.connectTo.view());
