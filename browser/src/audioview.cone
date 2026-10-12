@@ -1,0 +1,903 @@
+// The browser's sound: wind, the brook, the balloon's burner and footsteps, played by
+// Cone's audiomixer (a mixer in Cone: voices, buses, 3-D placement, procedural recipes)
+// and sent to the speakers by audiodevice (SDL3's push stream). The sounds are
+// recipes, not files ("ship the program, not the data"): Andy Farnell's structures,
+// which the audiomixer package holds (wind, water, fire, step).
+//
+// WHERE IT LIVES. Sound is presentational, so it is the VIEW's, never the
+// simulation's (shared-island.md): each browser listens to what it shows. It reads
+// what the view already has (the camera, the beings' bodies and feet, the weather
+// of the snapshot, the world's burner bursts, which arrive as the Effect and Fire
+// requests the view applies) and sends nothing back. The simulation does not know
+// there is sound; a server has none. `audioFrame` (below) is the one call the view
+// makes each frame, from `publishSnapshot`; the rest is this file's.
+//
+// WHAT IS HEARD, and the method for each (named; every choice is the report's):
+//
+//   wind      not placed (it is everywhere): two recipes of the one wind voice, a breeze
+//             (intensity 0.25) and a gale (0.9), CROSSFADED at constant power by the
+//             wind's strength, the standard layered-loop method (Wwise/FMOD blend
+//             containers) when a recipe's own parameter cannot change after it starts.
+//             The strength is a function of the weather's numbers (windStrength), so
+//             it follows the weather's own crossfade, and rises with height over the
+//             ground (the balloon's ride).
+//   brook     placed ALONG ITS COURSE: the closest point of the course's polyline to the
+//             listener carries the water (the "closest point on a spline" emitter, as
+//             a river is done in Unreal/Wwise), as a trickle and a rush recipe
+//             crossfaded by the water's speed there (the shader's own: fall over six
+//             metres), plus fixed emitters where the water is loud: the three nearest
+//             BED STONES (rushing water, short range), the arch under the BRIDGE and
+//             the CASCADE in the dingle.
+//   burner    a fire recipe (roar 1) at the balloon's burner part, gated by the world's
+//             bursts (start and stop in scene time), a short attack and a longer
+//             release; it follows the balloon.
+//   steps     one step recipe each time a foot comes DOWN (the walker's foot goes from
+//             swinging to planted), at the foot's heel, by the surface under it
+//             (surfaceAt): grass, stone (rocks, edging stones), wood (the porch, the
+//             basket) and the bridge (stone with a hollow arch under it).
+//
+// THE LISTENER rides the camera's orientation and the player's head (the third-person
+// convention: sound is heard from the character, turned with the view).
+//
+// VOICE VIRTUALISATION. A placed emitter beyond its range plays no voice (stopped with a
+// fade, restarted when it comes in range), so the cost follows what can be heard.
+//
+// THE SINK. Interactive: audiodevice's feeder thread renders on its own thread and
+// pushes to the speakers; this thread only sends commands (plain data into a lock-free
+// single-producer ring: it never waits). Anything automated (--script, --checks, a
+// soak) and any machine without a device: the mixer is rendered HERE, a fixed
+// 48000 / 60 frames to each fixed step, so it is the same every time with no device at
+// all (a null sink); it may be recorded (--audio-wav).
+//
+// THE MUTE KEY is N (the shell reports presses; `audioToggleMute`).
+
+// (Its imports are browser.cone's: audiomixer, audiodevice, fs.)
+
+// ---- the sink ----
+
+const AU_SILENT = 0u32;       // no sound at all (--no-audio, or no device)
+const AU_DEVICE = 1u32;       // the speakers, rendered on audiodevice's thread
+const AU_OFFLINE = 2u32;      // rendered here, a fixed amount to each step, kept or thrown away
+
+const AU_RATE = 48000u32;
+const AU_VOICES = 32u32;
+const AU_AHEAD_MS = 40u32;
+const AU_CHUNK = 2048usize;   // frames rendered at a time offline
+
+// The mute key: SDL3's scancode for N
+pub const SCANCODE_N = 17u;
+
+// ---- the heap counter (the real-time claim, measured as audiomixer's own test does) ----
+//
+// The heap region every collection allocates from has its allocate and resize replaced by
+// counting wrappers that call the originals; they count only while a mixer render is under
+// way (auInRender), so the game side's allocations (lists grown, the recording) are not
+// counted. Installed by the checks (auCountAllocations), not by a normal run.
+
+// The sound's globals, in one struct so the shell's init makes them with one assignment (the module's init is the only place a
+// global may be given its value)
+struct AudioGlobals {
+  allocs Atomic[u64];           // heap allocations seen during renders
+  inRender Atomic[u64];        // 1 while a render is under way
+  mutePresses Atomic[u64];      // presses of the mute key, told by the shell, read by the view
+  realAlloc &fn(r *MemRegion, bytes usize, align usize) *u8;
+  realResize &fn(r *MemRegion, block *u8, oldBytes usize, newBytes usize, align usize) *u8;
+  forceDevice bool;             // --audio-device: the real device's thread even in an automated run
+  off bool;                     // --no-audio
+  wavPath String;               // --audio-wav FILE: record the offline mix
+  recording bool;
+  startMuted bool;              // --audio-muted
+  view AudioView;               // the view's: touched only from the view actor's turns
+
+  fn make() AudioGlobals {
+    imm heap = heapRegion();
+    new AudioGlobals(Atomic[u64].of(0u64), Atomic[u64].of(0u64), Atomic[u64].of(0u64), heap.allocFn, heap.resizeFn, false, false,
+      String.empty(), false, false, AudioView.silent());
+  }
+}
+
+mut audioG AudioGlobals;
+
+// The mute key's action (the shell binds it beside the clock's)
+struct AudioKeys {
+  mute Action;
+
+  fn bind(ctx &mut Context) AudioKeys {
+    imm mute = ctx.action("audio.mute", BUTTON);
+    ctx.bind(mute, Binding.key(SCANCODE_N));
+    new AudioKeys(mute);
+  }
+}
+
+mut audioKeys AudioKeys;
+
+fn auCountingAlloc(r *MemRegion, bytes usize, align usize) *u8 {
+  if audioG.inRender.load() != 0u64 { audioG.allocs.add(1u64); }
+  imm f = audioG.realAlloc;
+  f(r, bytes, align);
+}
+
+fn auCountingResize(r *MemRegion, block *u8, oldBytes usize, newBytes usize, align usize) *u8 {
+  if audioG.inRender.load() != 0u64 { audioG.allocs.add(1u64); }
+  imm f = audioG.realResize;
+  f(r, block, oldBytes, newBytes, align);
+}
+
+// Start counting the allocations a mixer render makes
+pub fn auCountAllocations() {
+  imm heap = heapRegion();
+  audioG.realAlloc = heap.allocFn;
+  audioG.realResize = heap.resizeFn;
+  heap.allocFn = &auCountingAlloc;
+  heap.resizeFn = &auCountingResize;
+}
+
+// Stop counting, put the heap's own functions back
+pub fn auStopCounting() {
+  imm heap = heapRegion();
+  heap.allocFn = audioG.realAlloc;
+  heap.resizeFn = audioG.realResize;
+}
+
+pub fn auAllocationsCounted() u64 { audioG.allocs.load(); }
+
+// ---- what the shell and the arguments say ----
+
+// Once a frame, from the shell: a press of the mute key is told to the view (which reads it on its own thread)
+pub fn audioKeyFrame(ctx &Context) {
+  if ctx.pressed(audioKeys.mute) { audioG.mutePresses.add(1u64); }
+}
+
+// The mute toggled (the key's effect; the checks use it too)
+pub fn audioToggleMute() { audioG.mutePresses.add(1u64); }
+
+pub fn audioSetOff() { audioG.off = true; }
+pub fn audioSetForceDevice() { audioG.forceDevice = true; }
+// --audio-muted: the device is opened but starts muted (a press of N un-mutes), for trying the device without a sound
+pub fn audioSetStartMuted() { audioG.startMuted = true; }
+pub fn audioSetWavPath(p String) { audioG.wavPath = p; audioG.recording = true; }
+
+// The sink for this run, decided once before the actors start: automated runs render offline (the same every
+// time, no device needed), an interactive one tries the default playback device and is silent if there is none
+pub fn audioOpen(automated bool) {
+  if audioG.off { return; }
+  if automated and !audioG.forceDevice {
+    audioG.view = AudioView.offline(audioG.recording);
+  } else {
+    match audiodevice.Device.start(AU_RATE, AU_VOICES, AU_AHEAD_MS) {
+      case mut s Ok { audioG.view = AudioView.onDevice(s); }
+      case is Error { print <- "No audio device: silent\n"; }
+    }
+  }
+  // (the view has read the mute count already: one more press is the first frame's)
+  if audioG.startMuted { audioG.mutePresses.add(1u64); }
+}
+
+// ---- small numbers ----
+
+fn auAbs(x f32) f32 { libc.fabsf(x); }
+fn auClamp(x f32, lo f32, hi f32) f32 { if x < lo { lo; } elif x > hi { hi; } else { x; }; }
+fn auMin(a f32, b f32) f32 { if a < b { a; } else { b; }; }
+
+// 1 up to 'near' of a range, then a smoothstep to 0 at its end
+fn auRangeGain(d f32, range f32) f32 {
+  imm a = range * 0.6;
+  if d <= a { return 1.; }
+  if d >= range { return 0.; }
+  imm t = (d - a) / (range - a);
+  1. - t * t * (3. - 2. * t);
+}
+
+// ---- the wind's strength ----
+//
+// The weather has no wind speed (its WIND_ constants are the cloud layers' drift and a fixed breeze at the ground), so the
+// strength is the sound's own reading of the numbers the weather does have: a cloud cover that thickens, a rain that is
+// blown, a snow that falls still. clear 0.13, fair 0.25, cloudy 0.34, overcast 0.42, rain 0.87, snow 0.32.
+pub fn windStrength(p &WeatherParams) f32 {
+  auClamp(0.12 + 0.30 * p.cloudLow + 0.45 * p.rain - 0.10 * p.snow, 0., 1.);
+}
+
+// And higher up (the balloon's ride): up to 0.3 more by 120 m over the ground
+pub fn windAtHeight(base f32, aboveGround f32) f32 {
+  auClamp(base + 0.3 * auClamp((aboveGround - 3.) / 120., 0., 1.), 0., 1.);
+}
+
+// ---- surfaces ----
+
+pub const SURF_GRASS = 0u32;      // the lawn, the path, the sand: the soft hiss and crunch
+pub const SURF_STONE = 1u32;      // rocks and edging stones: a short tick that rings
+pub const SURF_WOOD = 2u32;       // the porch and the basket: a hollow knock
+pub const SURF_BRIDGE = 3u32;     // the masonry arch: stone, with a hollow note under it
+
+// The surface a foot comes down on at 'p' (its heel), 'onPlatform' when the being stands on a platform (the balloon's basket)
+pub fn surfaceAt(p Vec3, onPlatform bool) u32 {
+  if onPlatform { return SURF_WOOD; }
+  if auAbs(p.x - BRIDGE_X) <= 1.2 and auAbs(p.z - BRIDGE_Z) <= BRIDGE_END { return SURF_BRIDGE; }
+  imm ground = islandHeight(p.x, p.z);
+  // Raised near the cottage: its porch deck and steps (boards)
+  imm c = placeXZ(COTTAGE);
+  imm cx = p.x - c.x;
+  imm cz = p.z - c.y;
+  if cx * cx + cz * cz < 64. and p.y - ground > 0.15 { return SURF_WOOD; }
+  // A rock or an edging stone under the heel
+  imm items = vegetationLayout();
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    if it.kind == K_ROCK or it.kind == K_EDGING {
+      imm dx = p.x - it.x;
+      imm dz = p.z - it.z;
+      imm reach = it.radius * 0.8 + 0.1;
+      if dx * dx + dz * dz < reach * reach { return SURF_STONE; }
+    }
+    i = i + 1usize;
+  }
+  SURF_GRASS;
+}
+
+// ---- what the view hands the audio each frame ----
+
+// One being as the audio needs it: where it is, its feet, whether it can step
+pub struct AudioBeing {
+  pub index usize;
+  pub position Vec3;
+  pub speed f32;
+  pub steps bool;               // a figure, walking (not limp, not in the air)
+  pub onPlatform bool;
+  pub leftSwinging bool;
+  pub rightSwinging bool;
+  pub leftHeel Vec3;
+  pub rightHeel Vec3;
+  pub fresh bool;               // its gait has just been started over (a set-down): its feet are not compared with the last frame's
+}
+
+pub struct AudioFrame {
+  pub dt f32;                   // seconds the frame's fixed steps took
+  pub now f64;                  // scene time
+  pub eye Vec3;                 // the listener: the player's head
+  pub forward Vec3;             // and the camera's way
+  pub up Vec3;
+  pub wind f32;                 // 0 to 1, before the height's share
+  pub aboveGround f32;          // the listener's height over the land
+  pub beings List[AudioBeing];
+  pub burnerAt List[Vec3];      // where each noted burner part is, in the order AudioView.burnerParts lists them
+
+  pub fn empty() AudioFrame {
+    new AudioFrame(0., 0d, new Vec3(0., 0., 0.), new Vec3(0., 0., -1.), new Vec3(0., 1., 0.), 0.25, 0., List[AudioBeing].empty(),
+      List[Vec3].empty());
+  }
+}
+
+// ---- an emitter: a recipe at a place, with a range and a gain, played only while it can be heard ----
+
+struct Emit {
+  recipe u32;
+  seed u32;
+  bus u32;
+  p0 f32;
+  p1 f32;
+  refDist f32;
+  range f32;                    // beyond this no voice plays
+  rolloff f32;
+  priority i32;
+  attack f32;                   // seconds to rise
+  release f32;                  // seconds to fall
+  id u32;                       // the voice now playing, 0: none
+  last f32;                     // the gain last sent
+  gone bool;                    // not placed: it is heard everywhere (the wind)
+
+  fn make(recipe u32, seed u32, bus u32, p0 f32, p1 f32, refDist f32, range f32, rolloff f32, priority i32, attack f32, release f32) Emit {
+    new Emit(recipe, seed, bus, p0, p1, refDist, range, rolloff, priority, attack, release, 0u32, 0., false);
+  }
+
+  // Bring this emitter to gain 'base' (before the range's taper) at 'pos', the listener at 'at'; 'move': it moves, send its place
+  fn tick(self &mut, c &mut Control, base f32, pos Vec3, vel Vec3, at Vec3, move bool) {
+    imm d = (pos - at).length();
+    imm g = base * auRangeGain(d, range);
+    if g < 0.003 {
+      if id != 0u32 {
+        c.stop(id, release);
+        id = 0u32;
+        last = 0.;
+      }
+      return;
+    }
+    imm att = Attenuation.inverse(refDist, range, rolloff);
+    if id == 0u32 {
+      id = c.playSynthAt(recipe, seed, bus, 0.0001, p0, p1, priority, pos, vel, &att);
+      c.setGain(id, g, attack);
+      last = g;
+      return;
+    }
+    if move { c.setPosition(id, pos, vel); }
+    if auAbs(g - last) > 0.02 * (last + 0.05) {
+      c.setGain(id, g, 0.12);
+      last = g;
+    }
+  }
+}
+
+// One burner the world fires in bursts: its part, and the burst last told (scene time)
+struct Burner {
+  part PartId;
+  start f64;
+  stop f64;
+  voice Emit;
+  lastAt Vec3;
+  hasLast bool;
+}
+
+// What it remembers of a being's feet between frames
+struct FootMemory {
+  known bool;
+  left bool;                    // swinging, last frame
+  right bool;
+}
+
+// ---- the brook's state ----
+
+const NO_STONE = 0xFFFFFFFFusize;
+const STONE_VOICES = 3usize;
+
+// Where the course is closest to a point, and what the water is doing there
+pub struct CourseHit {
+  pos Vec3;                     // (x, the water's level, z)
+  dist f32;                     // metres, on the ground plane
+  speed f32;                    // the water's speed there, m/s
+  s f32;                        // metres from the spring
+}
+
+struct BrookState {
+  course List[BrookPoint];
+  speed List[f32];
+  trickle Emit;
+  rush Emit;
+  stones List[Vec3];            // bed stones: x, z, radius
+  stoneY List[f32];
+  stoneVoice List[Emit];
+  stoneAt List[usize];          // the stone each voice has now
+  bridge Emit;
+  bridgeAt Vec3;
+  cascade Emit;
+  cascadeAt Vec3;
+  near f32;                     // how far the listener was from the course, last frame
+  nearSpeed f32;
+  stonesOn bool;                // the bed stones sound (the checks turn them off to hear what they add)
+
+  fn empty() BrookState {
+    imm none = new Vec3(0., 0., 0.);
+    new BrookState(List[BrookPoint].empty(), List[f32].empty(),
+      Emit.make(SYNTH_WATER, 11u32, BUS_AMBIENCE, 0.2, 0., 2., 70., 1.4, 2i32, 0.3, 0.6),
+      Emit.make(SYNTH_WATER, 12u32, BUS_AMBIENCE, 0.8, 0., 2., 70., 1.4, 2i32, 0.3, 0.6),
+      List[Vec3].empty(), List[f32].empty(), List[Emit].empty(), List[usize].empty(),
+      Emit.make(SYNTH_WATER, 21u32, BUS_AMBIENCE, 0.55, 0., 2.5, 35., 1.2, 2i32, 0.3, 0.6), none,
+      Emit.make(SYNTH_WATER, 22u32, BUS_AMBIENCE, 1.0, 0., 3., 90., 1.0, 2i32, 0.3, 0.6), none, 100., 0., true);
+  }
+}
+
+// ---- the audio of one browser ----
+
+pub struct AudioView {
+  mode u32;
+  control Control;
+  device Option[audiodevice.Started];
+  engine Engine;                // offline: the mixer rendered here (otherwise it is never used)
+  scratch List[f32];
+  owed f64;                     // frames of the steps not yet rendered (the fraction)
+  pub record List[f32];         // the offline mix, interleaved stereo, when recording
+  recording bool;
+  trail List[Vec3];             // the listener at each update, with the seconds it was heard at in its y... (see 'trailT')
+  trailT List[f64];
+  prepared bool;
+  muted bool;
+  muteSeen u64;
+  lis Listener;
+  lisPrev Vec3;
+  lisHas bool;
+  windBreeze u32;
+  windGale u32;
+  windGains Vec2;               // the gains last sent
+  pub windNow f32;              // the strength last used
+  brook BrookState;
+  burners List[Burner];
+  feet List[FootMemory];
+  stepSeed u32;
+  pub stepsPlayed u32;
+  pub stepsOn Array[u32, 4];    // by surface
+  pub frames u64;               // frames of audio rendered here
+  pub peakSeen f32;
+
+  fn assemble(mode u32, control Control, rx Receiver[Cmd], device Option[audiodevice.Started], recording bool) AudioView {
+    imm none = new Vec3(0., 0., 0.);
+    new AudioView(mode, control, device, Engine.make(f32.from(AU_RATE), usize.from(AU_VOICES), rx), List[f32].empty(), 0d, List[f32].empty(),
+      recording, List[Vec3].empty(), List[f64].empty(), false, false, audioG.mutePresses.load(), Listener.make(), none, false, 0u32, 0u32,
+      new Vec2(0., 0.), 0.25, BrookState.empty(), List[Burner].empty(), List[FootMemory].empty(), 1u32, 0u32, [0u32, 0u32, 0u32, 0u32],
+      0u64, 0.);
+  }
+
+  // No sound
+  pub fn silent() AudioView {
+    mut c Control;
+    mut rx Receiver[Cmd];
+    c, rx = commandQueue(8u64);
+    AudioView.assemble(AU_SILENT, c, rx, None[audiodevice.Started], false);
+  }
+
+  // The mixer rendered here, with the control that talks to it
+  pub fn offline(recording bool) AudioView {
+    mut c Control;
+    mut rx Receiver[Cmd];
+    c, rx = commandQueue(1024u64);
+    AudioView.assemble(AU_OFFLINE, c, rx, None[audiodevice.Started], recording);
+  }
+
+  // The speakers: a running device and the control audiodevice made (the Started kept whole; its control is swapped out for ours to use)
+  pub fn onDevice(started audiodevice.Started) AudioView {
+    mut st = started;
+    mut c Control;
+    mut rx Receiver[Cmd];
+    c, rx = commandQueue(8u64);
+    c <=> st.control;
+    AudioView.assemble(AU_DEVICE, c, rx, Some(st), false);
+  }
+
+  pub fn isSilent(self &) bool { mode == AU_SILENT; }
+  pub fn isMuted(self &) bool { muted; }
+  pub fn refused(self &) u32 { control.refused; }
+  pub fn stolen(self &) u32 { engine.mixer.stolen; }
+  pub fn dropped(self &) u32 { engine.mixer.dropped; }
+  pub fn voicesNow(self &) usize { engine.mixer.activeVoices(); }
+  pub fn nearBrook(self &) f32 { brook.near; }
+  pub fn courseSpeedNow(self &) f32 { brook.nearSpeed; }
+
+  // The parts the world has told us burn, in the order their positions are asked for
+  pub fn burnerParts(self &) List[PartId] {
+    mut out = List[PartId].empty();
+    mut i = 0usize;
+    while i < burners.len() { out.push(burners[i].part); i = i + 1usize; }
+    out;
+  }
+
+  // The world told us burner 'part' burns from scene time 'start' to 'stop' (an Effect's first burst, or a Fire's burst)
+  pub fn noteBurst(self &mut, part PartId, start f64, stop f64) {
+    if mode == AU_SILENT { return; }
+    mut i = 0usize;
+    while i < burners.len() {
+      if burners[i].part == part {
+        imm b = *burners[i];
+        burners.set(i, new Burner(part, start, stop, b.voice, b.lastAt, b.hasLast));
+        return;
+      }
+      i = i + 1usize;
+    }
+    burners.push(new Burner(part, start, stop,
+      Emit.make(SYNTH_FIRE, 31u32 + u32.from(burners.len()), BUS_EFFECTS, 0.4, 1.0, 3., 140., 1.0, 3i32, 0.1, 0.5),
+      new Vec3(0., 0., 0.), false));
+  }
+
+  // ---- the course ----
+
+  // The brook's course and its water's speed (the ribbon's: the fall over six metres), its bed stones, and the voices that
+  // are always on; once, after the island is baked
+  fn prepare(self &mut) {
+    prepared = true;
+    brook.course = brookPoints();
+    imm n = brook.course.len();
+    mut i = 0usize;
+    while i < n {
+      imm a = if i >= 3usize { i - 3usize; } else { 0usize; };
+      imm b = if i + 3usize < n { i + 3usize; } else { n - 1usize; };
+      imm run = brook.course[b].s - brook.course[a].s + 0.0001;
+      imm fall = (brook.course[a].w - brook.course[b].w) / run;
+      brook.speed.push(auMin(3., 0.15 + 4.5 * (if fall > 0. { fall; } else { 0.; }).sqrt()));
+      i = i + 1usize;
+    }
+    brook.stones = brookStones();
+    i = 0usize;
+    while i < brook.stones.len() {
+      mut near = 0usize;
+      brookNearest(brook.stones[i].x, brook.stones[i].y, &mut near);
+      brook.stoneY.push(brook.course[near].w + 0.2);
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < STONE_VOICES {
+      brook.stoneVoice.push(Emit.make(SYNTH_WATER, 41u32 + u32.from(i), BUS_AMBIENCE, 0.85, 0., 1.5, 16., 1.2, 2i32, 0.2, 0.5));
+      brook.stoneAt.push(NO_STONE);
+      i = i + 1usize;
+    }
+    brook.bridgeAt = new Vec3(BRIDGE_X, bridgeWater() + 0.3, BRIDGE_Z);
+    // The cascade: the course where its control 22 begins (the middle of the steps)
+    mut k = 0usize;
+    while k + 1usize < n and brook.course[k].ctl < 22usize { k = k + 1usize; }
+    brook.cascadeAt = new Vec3(brook.course[k].x, brook.course[k].w, brook.course[k].z);
+    // The wind: its two voices, always on, silent until the wind's gains are sent
+    windBreeze = control.playSynth(SYNTH_WIND, 1u32, BUS_AMBIENCE, 0.0001, 0.25, 0., 2i32);
+    windGale = control.playSynth(SYNTH_WIND, 2u32, BUS_AMBIENCE, 0.0001, 0.9, 0., 2i32);
+    control.setBusGain(BUS_MASTER, MASTER_GAIN, 0.);
+  }
+
+  // The bed stones sounding or not (a test seam: the checks hear what they add)
+  pub fn setStones(self &mut, on bool) { brook.stonesOn = on; }
+
+  // The bed stones that have a voice playing now
+  pub fn stoneVoicesPlaying(self &) usize {
+    mut n = 0usize;
+    mut v = 0usize;
+    while v < brook.stoneVoice.len() {
+      if brook.stoneVoice[v].id != 0u32 and *brook.stoneAt[v] != NO_STONE { n = n + 1usize; }
+      v = v + 1usize;
+    }
+    n;
+  }
+
+  // The bed stones (x, z, radius)
+  pub fn stonesOfBrook(self &mut) List[Vec3] {
+    if !prepared { self.prepare(); }
+    mut out = List[Vec3].empty();
+    mut i = 0usize;
+    while i < brook.stones.len() { out.push(*brook.stones[i]); i = i + 1usize; }
+    out;
+  }
+
+  // The closest point of the course to (x, z) (for the checks)
+  pub fn nearestCourse(self &mut, x f32, z f32) CourseHit {
+    if !prepared { self.prepare(); }
+    self.closestOnCourse(x, z);
+  }
+
+  // The closest point of the course to (x, z): a projection onto each segment of the polyline, the nearest kept
+  fn closestOnCourse(self &, x f32, z f32) CourseHit {
+    mut best f32 = 1.0e9;
+    mut hit = new CourseHit(new Vec3(x, 0., z), 1.0e9, 0.4, 0.);
+    mut k = 0usize;
+    while k + 1usize < brook.course.len() {
+      imm a = brook.course[k];
+      imm b = brook.course[k + 1usize];
+      imm dx = b.x - a.x;
+      imm dz = b.z - a.z;
+      imm len2 = dx * dx + dz * dz + 0.000001;
+      imm t = auClamp(((x - a.x) * dx + (z - a.z) * dz) / len2, 0., 1.);
+      imm px = a.x + dx * t;
+      imm pz = a.z + dz * t;
+      imm d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+      if d2 < best {
+        best = d2;
+        hit = new CourseHit(new Vec3(px, a.w + (b.w - a.w) * t, pz), 0., brook.speed[k] + (brook.speed[k + 1usize] - brook.speed[k]) * t,
+          a.s + (b.s - a.s) * t);
+      }
+      k = k + 1usize;
+    }
+    hit.dist = best.sqrt();
+    hit;
+  }
+
+  // ---- one frame ----
+
+  // The frame's sound: the listener, the wind, the brook, the burners and the steps, then (offline) the mixer rendered for the
+  // frame's fixed steps
+  pub fn update(self &mut, f &AudioFrame) {
+    if mode == AU_SILENT { return; }
+    if !prepared { self.prepare(); }
+    // The mute key: each press toggles; the master gain follows over 80 ms
+    imm presses = audioG.mutePresses.load();
+    if presses != muteSeen {
+      if (presses - muteSeen) % 2u64 == 1u64 { muted = !muted; }
+      muteSeen = presses;
+      control.setBusGain(BUS_MASTER, if muted { 0.; } else { MASTER_GAIN; }, 0.08);
+    }
+    // The listener
+    mut vel = new Vec3(0., 0., 0.);
+    if lisHas and f.dt > 0. {
+      vel = (f.eye - lisPrev) * (1. / f.dt);
+      if vel.length() > 60. { vel = new Vec3(0., 0., 0.); }
+    }
+    lis.position = f.eye;
+    lis.forward = f.forward;
+    lis.up = f.up;
+    lis.velocity = vel;
+    lisPrev = f.eye;
+    lisHas = true;
+    control.setListener(&lis);
+    trail.push(f.eye);
+    trailT.push(if trailT.len() == 0usize { 0d; } else { *trailT[trailT.len() - 1usize] + f64.from(f.dt); });
+    self.updateWind(f);
+    self.updateBrook(f);
+    self.updateBurners(f);
+    self.updateSteps(f);
+    self.renderFor(f.dt);
+  }
+
+  fn updateWind(self &mut, f &AudioFrame) {
+    imm w = windAtHeight(f.wind, f.aboveGround);
+    windNow = w;
+    // Constant power between the two recipes, and the whole a little louder as it strengthens
+    imm level = 0.55 + 0.45 * w;
+    imm a = w * 1.5707964;
+    imm gb = a.cos() * level;
+    imm gg = a.sin() * level;
+    if auAbs(gb - windGains.x) > 0.01 or auAbs(gg - windGains.y) > 0.01 {
+      control.setGain(windBreeze, gb, 0.3);
+      control.setGain(windGale, gg, 0.3);
+      windGains = new Vec2(gb, gg);
+    }
+  }
+
+  fn updateBrook(self &mut, f &AudioFrame) {
+    if brook.course.len() < 2usize { return; }
+    imm at = f.eye;
+    imm hit = self.closestOnCourse(at.x, at.z);
+    brook.near = hit.dist;
+    brook.nearSpeed = hit.speed;
+    // The water's speed chooses between the trickle and the rush (0.4 m/s in the yard, over 2 m/s in the dingle)
+    imm rush = auClamp((hit.speed - 0.4) / 1.6, 0., 1.) * 1.5707964;
+    imm none = new Vec3(0., 0., 0.);
+    brook.trickle.tick(&mut control, 0.9 * rush.cos(), hit.pos, none, at, true);
+    brook.rush.tick(&mut control, 0.9 * rush.sin(), hit.pos, none, at, true);
+    // The bed stones: the three nearest to the listener keep a voice each (a change of stone only when it is clearly nearer)
+    self.assignStones(at);
+    mut v = 0usize;
+    while v < STONE_VOICES {
+      mut e = *brook.stoneVoice[v];
+      imm which = *brook.stoneAt[v];
+      if which != NO_STONE {
+        imm s = brook.stones[which];
+        e.tick(&mut control, if brook.stonesOn { 0.9; } else { 0.; }, new Vec3(s.x, *brook.stoneY[which], s.y), none, at, false);
+      }
+      brook.stoneVoice.set(v, e);
+      v = v + 1usize;
+    }
+    brook.bridge.tick(&mut control, 0.6, brook.bridgeAt, none, at, false);
+    brook.cascade.tick(&mut control, 0.8, brook.cascadeAt, none, at, false);
+  }
+
+  // The stone voices on the nearest stones to 'at'
+  fn assignStones(self &mut, at Vec3) {
+    mut v = 0usize;
+    while v < STONE_VOICES {
+      // The nearest stone not already held by a voice
+      mut best = NO_STONE;
+      mut bestD f32 = 1.0e9;
+      mut i = 0usize;
+      while i < brook.stones.len() {
+        imm dx = brook.stones[i].x - at.x;
+        imm dz = brook.stones[i].y - at.z;
+        imm d = dx * dx + dz * dz;
+        mut held = false;
+        mut u = 0usize;
+        while u < STONE_VOICES {
+          if *brook.stoneAt[u] == i { held = true; }
+          u = u + 1usize;
+        }
+        if !held and d < bestD { bestD = d; best = i; }
+        i = i + 1usize;
+      }
+      if best != NO_STONE {
+        // The voice takes it if it has none, or its stone is more than 1.5 m further out
+        imm cur = *brook.stoneAt[v];
+        mut take = cur == NO_STONE;
+        if !take {
+          imm cx = brook.stones[cur].x - at.x;
+          imm cz = brook.stones[cur].y - at.z;
+          take = (cx * cx + cz * cz).sqrt() > bestD.sqrt() + 1.5;
+        }
+        if take {
+          // Its voice (if one plays) is stopped, to start again at the new stone
+          mut e = *brook.stoneVoice[v];
+          if e.id != 0u32 { control.stop(e.id, 0.2); e.id = 0u32; e.last = 0.; }
+          brook.stoneVoice.set(v, e);
+          brook.stoneAt.set(v, best);
+        }
+      }
+      v = v + 1usize;
+    }
+  }
+
+  fn updateBurners(self &mut, f &AudioFrame) {
+    mut i = 0usize;
+    while i < burners.len() and i < f.burnerAt.len() {
+      imm b = *burners[i];
+      imm pos = *f.burnerAt[i];
+      imm lit = f.now >= b.start and f.now < b.stop;
+      mut vel = new Vec3(0., 0., 0.);
+      if b.hasLast and f.dt > 0. { vel = (pos - b.lastAt) * (1. / f.dt); }
+      mut e = b.voice;
+      e.tick(&mut control, if lit { 1.5; } else { 0.; }, pos, vel, f.eye, true);
+      burners.set(i, new Burner(b.part, b.start, b.stop, e, pos, true));
+      i = i + 1usize;
+    }
+  }
+
+  // A step for each foot that came down since the last frame
+  fn updateSteps(self &mut, f &AudioFrame) {
+    mut i = 0usize;
+    while i < f.beings.len() {
+      imm b = *f.beings[i];
+      while feet.len() <= b.index { feet.push(new FootMemory(false, false, false)); }
+      imm mem = *feet[b.index];
+      if b.steps and mem.known and !b.fresh {
+        if mem.left and !b.leftSwinging { self.plant(b, b.leftHeel, f.eye); }
+        if mem.right and !b.rightSwinging { self.plant(b, b.rightHeel, f.eye); }
+      }
+      feet.set(b.index, new FootMemory(b.steps and !b.fresh, b.leftSwinging, b.rightSwinging));
+      i = i + 1usize;
+    }
+  }
+
+  // One foot down at 'heel'
+  fn plant(self &mut, b AudioBeing, heel Vec3, at Vec3) {
+    if (heel - at).length() > STEP_RANGE { return; }
+    imm surface = surfaceAt(heel, b.onPlatform);
+    imm weight = auClamp(0.25 + b.speed * 0.15, 0.2, 1.);
+    imm att = Attenuation.inverse(1.5, STEP_RANGE, 1.5);
+    imm none = new Vec3(0., 0., 0.);
+    stepSeed = stepSeed + 1u32;
+    mut material = MATERIAL_GRASS;
+    mut gain f32 = 1.4;
+    if surface == SURF_STONE or surface == SURF_BRIDGE { material = MATERIAL_STONE; gain = 1.1; }
+    elif surface == SURF_WOOD { material = MATERIAL_WOOD; gain = 1.6; }
+    control.playSynthAt(SYNTH_STEP, stepSeed, BUS_EFFECTS, gain, f32.from(material), weight, 1i32, heel, none, &att);
+    if surface == SURF_BRIDGE {
+      // The arch under the road answers with a hollow note: a soft wood-tuned knock, a second voice
+      stepSeed = stepSeed + 1u32;
+      control.playSynthAt(SYNTH_STEP, stepSeed, BUS_EFFECTS, 0.7, f32.from(MATERIAL_WOOD), 1., 1i32, heel, none, &att);
+    }
+    stepsPlayed = stepsPlayed + 1u32;
+    stepsOn[usize.from(surface)] = stepsOn[usize.from(surface)] + 1u32;
+  }
+
+  // ---- the null sink ----
+
+  // The mixer rendered for 'dt' seconds of the fixed steps (offline only): the same frames to the same commands every time
+  fn renderFor(self &mut, dt f32) {
+    if mode != AU_OFFLINE { return; }
+    if scratch.len() == 0usize {
+      mut i = 0usize;
+      while i < AU_CHUNK * 2usize { scratch.push(0.); i = i + 1usize; }
+    }
+    owed = owed + f64.from(dt) * f64.from(AU_RATE);
+    mut n = usize.from(u64.from(libc.floor(owed)));
+    owed = owed - f64.from(n);
+    while n > 0usize {
+      imm chunk = if n > AU_CHUNK { AU_CHUNK; } else { n; };
+      audioG.inRender.store(1u64);
+      engine.render(scratch.viewMut(), chunk);
+      audioG.inRender.store(0u64);
+      mut i = 0usize;
+      while i < chunk * 2usize {
+        imm v = *scratch[i];
+        imm a = auAbs(v);
+        if a > peakSeen { peakSeen = a; }
+        if recording { record.push(v); }
+        i = i + 1usize;
+      }
+      frames = frames + u64.from(chunk);
+      n = n - chunk;
+    }
+  }
+
+  // ---- the end ----
+
+  // The device stopped (the feeder ended, the sounds' owner outliving it), and the offline mix written and described
+  pub fn finish(self &mut) {
+    if mode == AU_SILENT { return; }
+    print <- "Audio: "; print <- (if mode == AU_DEVICE { "the device"; } else { "offline (rendered in step)"; }); print <- ", ";
+    print <- stepsPlayed; print <- " footsteps (grass "; print <- stepsOn[0usize]; print <- ", stone "; print <- stepsOn[1usize];
+    print <- ", wood "; print <- stepsOn[2usize]; print <- ", bridge "; print <- stepsOn[3usize]; print <- "), ";
+    print <- control.refused; print <- " commands refused\n";
+    if mode == AU_DEVICE {
+      mut d Option[audiodevice.Started] = None[audiodevice.Started];
+      d <=> device;
+      match d {
+        case mut s Some {
+          s.control <=> control;
+          s.device.stop(&mut s.control);
+        }
+        case is None[audiodevice.Started] {}
+      }
+      return;
+    }
+    print <- "  "; print <- frames; print <- " frames rendered ("; print <- f32.from(frames) / f32.from(AU_RATE); print <- " s), peak ";
+    print <- peakSeen; print <- ", voices stolen "; print <- engine.mixer.stolen; print <- ", dropped "; print <- engine.mixer.dropped; print <- "\n";
+    if recording and record.len() > 0usize { self.writeAndDescribe(); }
+  }
+
+  // The recording written as a 16-bit stereo WAV, and described by its spectrum in windows of two seconds, with where the
+  // listener stood and how far from the brook
+  fn writeAndDescribe(self &mut) {
+    mut all = new Sound(AU_RATE, 2u32, List[f32].empty());
+    all.samples <=> record;
+    imm text = encodeWav(&all, false);
+    imm p = Path.from(audioG.wavPath.view());
+    match fs.writeFile(&p, text.view()) {
+      case is Ok { print <- "  wrote "; printStr(audioG.wavPath.view()); print <- " ("; print <- text.len(); print <- " bytes)\n"; }
+      case is Error { print <- "  could not write the WAV\n"; }
+    }
+    imm window = usize.from(AU_RATE) * 2usize;
+    imm total = all.samples.len() / 2usize;
+    print <- "  window  at (x, z)          rms dB  centroid Hz  strongest Hz   bass<250  mid<2k  pres<5k  air\n";
+    mut w = 0usize;
+    while w * window + window <= total {
+      // Mono mix of the window's middle 16384 frames, for the spectrum; the whole window's rms
+      mut mono = List[f32].empty();
+      imm mid = w * window + window / 2usize - 8192usize;
+      mut i = 0usize;
+      while i < 16384usize {
+        mono.push(0.5 * (*all.samples[(mid + i) * 2usize] + *all.samples[(mid + i) * 2usize + 1usize]));
+        i = i + 1usize;
+      }
+      mut sum f32 = 0.;
+      i = w * window;
+      while i < w * window + window {
+        sum = sum + *all.samples[i * 2usize] * *all.samples[i * 2usize] + *all.samples[i * 2usize + 1usize] * *all.samples[i * 2usize + 1usize];
+        i = i + 1usize;
+      }
+      imm level = 4.3429448 * libc.logf(sum / f32.from(window * 2usize) + 1.0e-12);
+      imm spec = spectrum(mono.view(), 16384usize);
+      imm secs = f64.from(w * 2usize + 1usize);
+      mut ti = 0usize;
+      while ti + 1usize < trailT.len() and *trailT[ti] < secs { ti = ti + 1usize; }
+      imm pos = *trail[ti];
+      print <- "  "; print <- w * 2usize; print <- "-"; print <- w * 2usize + 2usize; print <- " s   ("; print <- pos.x; print <- ", "; print <- pos.z;
+      print <- ")   "; print <- level; print <- "   "; print <- centroid(&spec, 16384usize, f32.from(AU_RATE)); print <- "   ";
+      print <- dominantFreq(&spec, 16384usize, f32.from(AU_RATE)); print <- "   ";
+      print <- bandFraction(&spec, 16384usize, f32.from(AU_RATE), 0., 250.); print <- "   ";
+      print <- bandFraction(&spec, 16384usize, f32.from(AU_RATE), 250., 2000.); print <- "   ";
+      print <- bandFraction(&spec, 16384usize, f32.from(AU_RATE), 2000., 5000.); print <- "   ";
+      print <- bandFraction(&spec, 16384usize, f32.from(AU_RATE), 5000., 24000.); print <- "\n";
+      w = w + 1usize;
+    }
+  }
+}
+
+const MASTER_GAIN f32 = 1.0;
+const STEP_RANGE f32 = 32.;
+
+// ---- the view's calls ----
+
+// A burner the world fires: noted when its Effect (the first burst) or a Fire (the next) is applied, if the part is the balloon's burner
+pub fn audioNoteEffect(scene &ViewScene, id PartId, start f64, stop f64) {
+  if audioG.view.isSilent() { return; }
+  imm name = scene.nameOf(id);
+  if name.view() == "balloon burner flame" { audioG.view.noteBurst(id, start, stop); }
+}
+
+// A figured being as the audio needs it
+pub fn audioBeingOf(index usize, being &Being) AudioBeing {
+  imm fig = &being.figure;
+  new AudioBeing(index, being.body.position, fig.speed, fig.mode == FIG_WALK and fig.grounded, !fig.on.isNone(),
+    fig.walker.left.swinging, fig.walker.right.swinging, fig.walker.left.heel, fig.walker.right.heel, !fig.walker.started);
+}
+
+// The frame's sound, from the view's state after its beings are posed: the listener is the player's head turned with the camera
+pub fn audioFromView(st &ViewState, steps &List[Step]) {
+  if audioG.view.isSilent() { return; }
+  mut f = AudioFrame.empty();
+  mut k = 0usize;
+  while k < steps.len() { f.dt = f.dt + steps[k].dt; k = k + 1usize; }
+  f.now = st.sceneNow;
+  imm cam = st.cast.eyes();
+  f.eye = cam.origin;
+  if st.own < st.cast.beings.len() { f.eye = st.cast.beings[st.own].eyes().origin; }
+  f.forward = cam.forward();
+  f.up = cam.up();
+  f.wind = windStrength(&st.snapshot.weather.at(st.sceneNow));
+  f.aboveGround = f.eye.y - islandHeight(f.eye.x, f.eye.z);
+  mut b = 0usize;
+  while b < st.cast.beings.len() {
+    imm being = st.cast.beings[b];
+    if !being.gone and being.figure.active { f.beings.push(audioBeingOf(b, being)); }
+    b = b + 1usize;
+  }
+  imm parts = audioG.view.burnerParts();
+  k = 0usize;
+  while k < parts.len() {
+    imm m = st.scene.worldMatrix(*parts[k]);
+    f.burnerAt.push(new Vec3(m.m[12], m.m[13], m.m[14]));
+    k = k + 1usize;
+  }
+  audioG.view.update(&f);
+}
+
+// The end of the run
+pub fn audioFinish() { audioG.view.finish(); }

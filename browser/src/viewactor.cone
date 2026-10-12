@@ -78,11 +78,13 @@ pub struct FrameInput {
   pub resized bool;           // the window changed size: 'width' by 'height' pixels
   pub width u32;
   pub height u32;
+  pub hudHide bool;           // H pressed: the HUD (hud.cone) is hidden or shown
+  pub hudSlots u32;           // bit n: F(n+1) pressed, the hotbar's slot n
 
   // No frame yet
   pub fn none() FrameInput {
     new FrameInput(0u64, List[Step].empty(), Intents.none(), 0., 0., false, false, false, false, false, false, new Vec2(0., 0.),
-      new Vec2(HEADLESS_W, HEADLESS_H), 0., false, 0u32, 0u32);
+      new Vec2(HEADLESS_W, HEADLESS_H), 0., false, 0u32, 0u32, false, 0u32);
   }
 }
 
@@ -222,6 +224,7 @@ pub struct ViewState {
   frameDone bool;             // single player: the simulation said its frame was done
   pub simulateNs u64;         // and how long it took
   pub publishNs u64;
+  pub hud HudView;            // the HUD's: shown or hidden, and the frame time (hud.cone)
 
   pub fn make(birds Birds, lockstep bool) ViewState {
     imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
@@ -231,7 +234,8 @@ pub struct ViewState {
       List[InputSample].empty(), false, still, FOV, String.empty(), List[MaterialId].empty(), lockstep, false, false,
       List[ToView].empty(), List[WorldState].empty(), List[TestView].empty(), 0u64,
       new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
-      List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64);
+      List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64,
+      HudView.make(hudStartsShown(scripted)));
   }
 
   // Reliable messages sent to the simulation, ever
@@ -797,8 +801,8 @@ pub struct ViewState {
           if sh.anchor == 0. { picks.show(sh.id, sh.mesh); }
           toRender = true;
         }
-        case mut ef &mut Effect { toRender = true; }
-        case mut f &mut Fire { toRender = true; }
+        case mut ef &mut Effect { audioNoteEffect(&scene, ef.id, ef.start, ef.stop); toRender = true; }
+        case mut f &mut Fire { audioNoteEffect(&scene, f.id, f.start, f.stop); toRender = true; }
         case mut gl &mut Glow { toRender = true; }
         case mut tn &mut Tint { toRender = true; }
         case mut ls &mut LightSource { toRender = true; }
@@ -1072,6 +1076,7 @@ pub struct ViewState {
     birds.publish(&mut flock);
     snapshot.birds <=> flock;
     snapshot.weather = weather;
+    audioFromView(self, steps);   // the frame's sound (audioview.cone)
     snapshot.fixedView = testFixed;
     snapshot.fov = testFov;
     if testFixed { snapshot.view = testView; }
@@ -1084,7 +1089,33 @@ pub struct ViewState {
     snap <=> snapshot;
     mut requests = List[Request].empty();
     requests <=> forRender;
-    new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, testShot.copy());
+    new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, testShot.copy(),
+      self.hudFrame(input));
+  }
+
+  // What the HUD shows this frame (hud.cone): where the user's being and the others are, the clock, the weather, the frame time
+  fn hudFrame(self &mut, input &FrameInput) HudFrame {
+    if input.hudHide { hud.on = !hud.on; }
+    hud.tick();
+    mut you = new Vec3(0., 0., 0.);
+    mut yaw = 0.;
+    mut others = List[Vec3].empty();
+    imm driven = if own != NO_ROW { own; } else { cast.possessed; };
+    mut i = 0usize;
+    while i < cast.beings.len() {
+      imm b = cast.beings[i];
+      if i == driven {
+        you = b.body.position;
+        yaw = b.body.yaw;
+      } elif !b.gone and b.figure.active {
+        // (a plain walker, with no figure, is nobody to see: the other mannequins are the characters)
+        others.push(b.body.position);
+      }
+      i = i + 1usize;
+    }
+    // (a scripted run's frame time and step are not repeatable: it shows none, and steps by 1/60)
+    new HudFrame(hud.on, f32.from(hourAt(sceneNow)), weather.target, if scripted { 0.; } else { hud.smoothMs; }, !lockstep, rttMs,
+      you, yaw, others, input.hudSlots, if scripted { 0.016666668; } else { hud.stepSeconds(); });
   }
 
   // The user's body, for the shell's report
@@ -1234,6 +1265,7 @@ actor ViewActor {
       }
       else {}
     }
+    audioFinish();
     // The script's walkers are put down by Being.setDown (counted, and the snapshot carries the count), so what the view counts as a
     // correction is a real misprediction: the script lifts one mannequin 6 m on purpose, and nothing in it is out by more than that
     if scripted {

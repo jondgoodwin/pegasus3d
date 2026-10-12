@@ -1,0 +1,362 @@
+// The sound's headless checks (part of 'browser.exe --checks'): no device and no GPU. The mixer is rendered offline
+// (audioview.cone's null sink), so every number below is a measurement of the signal that would go to the speakers.
+//
+//   the surfaces under a foot: grass, stone, the porch's wood, the basket's, the bridge
+//   the wind's strength follows the weather's numbers, and the rendered wind grows with it
+//   the brook is louder at the bridge than far away, and louder over its bed stones
+//   a burner to the right is heard on the right, only while the world's burst lasts
+//   the mute key silences the mix and brings it back
+//   the same frames render the same samples, bit for bit
+//   a walking mannequin's feet come down as often as its stride says, and the bridge's steps are counted as the bridge's
+//   a mixer render allocates nothing (the heap region counted, as audiomixer's own test counts it)
+//   far from everything, almost no voice plays (voices out of range are not run)
+
+// ---- helpers ----
+
+// The mean power in dB of the offline mix from frame 'from' to 'to' (1: the left channel, 2: the right, 0: both)
+fn auLevel(v &AudioView, from usize, to usize, which u32) f32 {
+  mut sum f32 = 0.;
+  mut i = from;
+  while i < to {
+    imm l = *v.record[i * 2usize];
+    imm r = *v.record[i * 2usize + 1usize];
+    if which == 0u32 { sum = sum + l * l + r * r; }
+    elif which == 1u32 { sum = sum + l * l; }
+    else { sum = sum + r * r; }
+    i = i + 1usize;
+  }
+  imm n = f32.from(to - from) * (if which == 0u32 { 2.; } else { 1.; });
+  4.3429448 * libc.logf(sum / n + 1.0e-12);
+}
+
+// The offline mix so far, in frames
+fn auFrames(v &AudioView) usize { v.record.len() / 2usize; }
+
+// A frame for the listener at 'eye' facing -z, with the wind at 'wind'
+fn auFrame(eye Vec3, wind f32, now f64) AudioFrame {
+  mut f = AudioFrame.empty();
+  f.dt = 1. / 60.;
+  f.now = now;
+  f.eye = eye;
+  f.wind = wind;
+  f.aboveGround = 1.7;
+  f;
+}
+
+// 'n' frames of that, the listener standing still
+fn auStand(v &mut AudioView, eye Vec3, wind f32, now f64, n usize) {
+  mut k = 0usize;
+  while k < n {
+    imm f = auFrame(eye, wind, now);
+    v.update(&f);
+    k = k + 1usize;
+  }
+}
+
+// The quiet place: on the hill at the origin, far from the brook (the spring is 130 m off), the cottage and the balloon
+fn auQuiet() Vec3 { new Vec3(0., islandHeight(0., 0.) + 1.7, 0.); }
+
+fn auFresh() AudioView { AudioView.offline(true); }
+
+// ---- the checks ----
+
+fn checkAudio() bool {
+  print <- "The sound:\n";
+  bakeIsland();
+  mut ok = true;
+  ok = checkAudioSurfaces() and ok;
+  ok = checkAudioWind() and ok;
+  ok = checkAudioBrook() and ok;
+  ok = checkAudioBurner() and ok;
+  ok = checkAudioMute() and ok;
+  ok = checkAudioDeterminism() and ok;
+  ok = checkAudioSteps() and ok;
+  ok = checkAudioNoAllocation() and ok;
+  ok;
+}
+
+fn checkAudioSurfaces() bool {
+  // The cottage's porch: its deck is 0.6 m up, 0.3 m right of the door and 0.8 m out from the wall
+  imm c = placeXZ(COTTAGE);
+  imm deckX = c.x + 0.3;
+  imm deckZ = c.y + 0.8;
+  imm deck = new Vec3(deckX, islandHeight(deckX, deckZ) + 0.6, deckZ);
+  mut ok = expect("on the porch's deck a foot lands on wood", surfaceAt(deck, false) == SURF_WOOD);
+  ok = expect("on the basket (a platform) a foot lands on wood", surfaceAt(new Vec3(0., 0., 0.), true) == SURF_WOOD) and ok;
+  ok = expect("on the bridge's crest it lands on the bridge", surfaceAt(new Vec3(BRIDGE_X, 1., BRIDGE_Z), false) == SURF_BRIDGE) and ok;
+  ok = expect("and on its ramp, 3 m from the crest", surfaceAt(new Vec3(BRIDGE_X + 0.4, 1., BRIDGE_Z + 3.), false) == SURF_BRIDGE) and ok;
+  ok = expect("and 4.1 m out, on the lawn, it is grass", surfaceAt(new Vec3(BRIDGE_X, 1., BRIDGE_Z + 4.1), false) == SURF_GRASS) and ok;
+  imm start = new Vec3(BEACH_X, islandHeight(BEACH_X, BEACH_Z), BEACH_Z);
+  ok = expect("on the landing beach it is grass", surfaceAt(start, false) == SURF_GRASS) and ok;
+  // A bed stone and an edging stone: found in the layout, and stood on
+  imm items = vegetationLayout();
+  mut rock = false;
+  mut edging = false;
+  mut i = 0usize;
+  while i < items.len() {
+    imm it = items[i];
+    // (a rock beside the bridge or the cottage is the bridge's or the porch's surface first, so the first rock elsewhere)
+    imm byBridge = auAbs(it.x - BRIDGE_X) < 4. and auAbs(it.z - BRIDGE_Z) < 6.;
+    imm byCottage = (it.x - c.x) * (it.x - c.x) + (it.z - c.y) * (it.z - c.y) < 64.;
+    if it.kind == K_ROCK and !rock and !byBridge and !byCottage {
+      rock = surfaceAt(new Vec3(it.x, it.y, it.z), false) == SURF_STONE;
+    }
+    if it.kind == K_EDGING and !edging and !byBridge and !byCottage { edging = surfaceAt(new Vec3(it.x, it.y, it.z), false) == SURF_STONE; }
+    i = i + 1usize;
+  }
+  ok = expect("a rock of the layout is stone underfoot", rock) and ok;
+  ok = expect("an edging stone is stone underfoot", edging) and ok;
+  ok;
+}
+
+fn checkAudioWind() bool {
+  imm clear = windStrength(&WeatherParams.state(WEATHER_CLEAR));
+  imm fair = windStrength(&WeatherParams.state(WEATHER_FAIR));
+  imm cloudy = windStrength(&WeatherParams.state(WEATHER_CLOUDY));
+  imm overcast = windStrength(&WeatherParams.state(WEATHER_OVERCAST));
+  imm rain = windStrength(&WeatherParams.state(WEATHER_RAIN));
+  imm snow = windStrength(&WeatherParams.state(WEATHER_SNOW));
+  mut ok = expect("the wind's strength rises clear < fair < cloudy < overcast < rain", clear < fair and fair < cloudy and cloudy < overcast and overcast < rain);
+  ok = expect("snow falls stiller than rain", snow < rain) and ok;
+  imm half = WeatherParams.state(WEATHER_FAIR).blend(&WeatherParams.state(WEATHER_RAIN), 0.5);
+  imm mid = windStrength(&half);
+  ok = expect("halfway through a change of weather the strength is halfway (it follows the weather's own crossfade)",
+    mid > fair and mid < rain and nearly(mid, (fair + rain) * 0.5, 0.02)) and ok;
+  ok = expect("it rises with height over the land, and stays within 0 to 1", windAtHeight(0.4, 0.) < windAtHeight(0.4, 100.) and windAtHeight(0.95, 500.) <= 1.) and ok;
+  // The rendered wind, far from everything: the same listener under each weather
+  mut levels = List[f32].empty();
+  mut s = 0u32;
+  while s < 5u32 {
+    mut v = auFresh();
+    imm w = windStrength(&WeatherParams.state(s));
+    auStand(&mut v, auQuiet(), w, 100., 240usize);
+    levels.push(auLevel(&v, auFrames(&v) - 48000usize, auFrames(&v), 0u32));
+    s = s + 1u32;
+  }
+  print <- "    (dB: clear "; print <- *levels[0usize]; print <- ", fair "; print <- *levels[1usize]; print <- ", cloudy "; print <- *levels[2usize];
+  print <- ", overcast "; print <- *levels[3usize]; print <- ", rain "; print <- *levels[4usize]; print <- ")\n";
+  ok = expect("the rendered wind grows louder with the weather, clear to rain",
+    *levels[0usize] < *levels[1usize] and *levels[1usize] < *levels[2usize] and *levels[2usize] < *levels[3usize] and *levels[3usize] < *levels[4usize]) and ok;
+  ok = expect("and rain is at least 9 dB louder than clear", *levels[4usize] - *levels[0usize] > 9.) and ok;
+  ok;
+}
+
+fn checkAudioBrook() bool {
+  mut v = auFresh();
+  imm atBridge = v.nearestCourse(BRIDGE_X, BRIDGE_Z);
+  mut ok = expect("the course passes under the bridge (within 0.6 m of its middle)", atBridge.dist < 0.6);
+  ok = expect("the water there is slow (the yard's 0.4 m/s, under 0.8)", atBridge.speed < 0.8) and ok;
+  imm cascade = v.nearestCourse(brookAtControl(22usize).x, brookAtControl(22usize).z);
+  ok = expect("and fast in the cascade (over 1 m/s)", cascade.speed > 1.) and ok;
+  imm quiet = auQuiet();
+  imm farHit = v.nearestCourse(quiet.x, quiet.z);
+  ok = expect("the quiet place is more than 100 m from the brook", farHit.dist > 100.) and ok;
+  // The same weather, the listener on the bridge's crest and at the quiet place
+  imm crest = new Vec3(BRIDGE_X, islandHeight(BRIDGE_X, BRIDGE_Z) + 0.85 + 1.7, BRIDGE_Z);
+  mut near = auFresh();
+  auStand(&mut near, crest, 0.25, 100., 300usize);
+  imm nearDb = auLevel(&near, auFrames(&near) - 48000usize, auFrames(&near), 0u32);
+  mut far = auFresh();
+  auStand(&mut far, quiet, 0.25, 100., 300usize);
+  imm farDb = auLevel(&far, auFrames(&far) - 48000usize, auFrames(&far), 0u32);
+  print <- "    (fair weather, dB: on the bridge "; print <- nearDb; print <- ", at the quiet place "; print <- farDb; print <- ")\n";
+  ok = expect("the brook adds at least 6 dB on the bridge over the quiet place's wind alone", nearDb - farDb > 6.) and ok;
+  // Along the yard: 30 m from the course against 2 m from it, away from the stones
+  imm yard = new Vec3(BRIDGE_X - 18., islandHeight(BRIDGE_X - 18., BRIDGE_Z) + 1.7, BRIDGE_Z);
+  imm yardHit = near.nearestCourse(yard.x, yard.z);
+  ok = expect("the course runs west from the bridge through the yard (within 1.5 m at 18 m)", yardHit.dist < 1.5) and ok;
+  // The brook is placed along its course, not at the bridge: 25 m west of the bridge, 1.5 m off the water, it is as loud as it is
+  // beside the bridge's crest, and 30 m south of that place (nothing but the wind) it is not
+  imm along = new Vec3(BRIDGE_X - 25., islandHeight(BRIDGE_X - 25., BRIDGE_Z - 1.5) + 1.7, BRIDGE_Z - 1.5);
+  imm alongHit = near.nearestCourse(along.x, along.z);
+  mut va = auFresh();
+  auStand(&mut va, along, 0.25, 100., 300usize);
+  imm alongDb = auLevel(&va, auFrames(&va) - 48000usize, auFrames(&va), 0u32);
+  imm away = new Vec3(along.x, islandHeight(along.x, along.z + 31.5) + 1.7, along.z + 31.5);
+  mut vw = auFresh();
+  auStand(&mut vw, away, 0.25, 100., 300usize);
+  imm awayDb = auLevel(&vw, auFrames(&vw) - 48000usize, auFrames(&vw), 0u32);
+  print <- "    (25 m west of the bridge, "; print <- alongHit.dist; print <- " m from the course: "; print <- alongDb; print <- " dB; 30 m further from it: ";
+  print <- awayDb; print <- " dB)\n";
+  ok = expect("25 m along the yard the brook is still there: 6 dB over the same weather 30 m from it", alongDb - awayDb > 6.) and ok;
+  ok = expect("and within 6 dB of its level on the bridge's crest (the water follows the listener along the course)", nearDb - alongDb < 6.) and ok;
+  // A bed stone: found, and listened to from a metre off it, against a stretch of the course 12 m or more from every stone
+  imm stones = near.stonesOfBrook();
+  ok = expect("the brook has bed stones", stones.len() > 0usize) and ok;
+  if stones.len() > 0usize {
+    imm s0 = *stones[0usize];
+    imm onStone = new Vec3(s0.x + 1., islandHeight(s0.x + 1., s0.y) + 1.7, s0.y);
+    mut vs = auFresh();
+    auStand(&mut vs, onStone, 0.25, 100., 300usize);
+    ok = expect("a bed stone has a voice while the listener stands by it", vs.stoneVoicesPlaying() >= 1usize) and ok;
+    imm stoneDb = auLevel(&vs, auFrames(&vs) - 48000usize, auFrames(&vs), 0u32);
+    // The same place with the bed stones silenced: what they add
+    mut vp = auFresh();
+    vp.setStones(false);
+    auStand(&mut vp, onStone, 0.25, 100., 300usize);
+    imm plainDb = auLevel(&vp, auFrames(&vp) - 48000usize, auFrames(&vp), 0u32);
+    print <- "    (a metre from a bed stone, dB: with the stones "; print <- stoneDb; print <- ", without "; print <- plainDb;
+    print <- "; stone voices "; print <- vs.stoneVoicesPlaying(); print <- " and "; print <- vp.stoneVoicesPlaying(); print <- ")\n";
+    ok = expect("the bed stones make the water louder where they are (by at least 1.5 dB with the others of the course the same)",
+      stoneDb - plainDb > 1.5 and vp.stoneVoicesPlaying() == 0usize) and ok;
+  }
+  ok;
+}
+
+// The course where its control 'ctl' begins (x, water, z)
+fn brookAtControl(ctl usize) Vec3 {
+  imm pts = brookPoints();
+  mut k = 0usize;
+  while k + 1usize < pts.len() and pts[k].ctl < ctl { k = k + 1usize; }
+  new Vec3(pts[k].x, pts[k].w, pts[k].z);
+}
+
+fn checkAudioBurner() bool {
+  mut v = auFresh();
+  imm burner = PartId.none();
+  v.noteBurst(burner, 0d, 3d);
+  imm at = auQuiet();
+  imm right = at + new Vec3(6., 0.5, 0.);
+  // Frames: the listener faces -z, so +x is on its right. Lit at scene time 1 s.
+  mut k = 0usize;
+  while k < 180usize {
+    mut f = auFrame(at, 0.25, 1.);
+    f.burnerAt.push(right);
+    v.update(&f);
+    k = k + 1usize;
+  }
+  imm n = auFrames(&v);
+  imm l = auLevel(&v, n - 24000usize, n, 1u32);
+  imm r = auLevel(&v, n - 24000usize, n, 2u32);
+  print <- "    (the burner 6 m to the right: left "; print <- l; print <- " dB, right "; print <- r; print <- " dB)\n";
+  mut ok = expect("a burner to the right is louder in the right ear (by at least 3 dB)", r - l > 3.);
+  // The burst over: scene time 5 s, past its stop
+  k = 0usize;
+  while k < 240usize {
+    mut f = auFrame(at, 0.25, 5.);
+    f.burnerAt.push(right);
+    v.update(&f);
+    k = k + 1usize;
+  }
+  imm m = auFrames(&v);
+  imm after = auLevel(&v, m - 24000usize, m, 0u32);
+  imm during = auLevel(&v, n - 24000usize, n, 0u32);
+  print <- "    (while it burns "; print <- during; print <- " dB, after the burst "; print <- after; print <- " dB)\n";
+  ok = expect("after the burst's end the burner is silent again (at least 9 dB down, back to the wind alone)", during - after > 9.) and ok;
+  ok = expect("the burner is a voice only while it burns", v.voicesNow() <= 3usize) and ok;
+  ok;
+}
+
+fn checkAudioMute() bool {
+  mut v = auFresh();
+  imm at = auQuiet();
+  auStand(&mut v, at, 0.6, 100., 180usize);
+  imm n0 = auFrames(&v);
+  imm loud = auLevel(&v, n0 - 24000usize, n0, 0u32);
+  audioToggleMute();
+  auStand(&mut v, at, 0.6, 100., 120usize);
+  imm n1 = auFrames(&v);
+  imm muted = auLevel(&v, n1 - 24000usize, n1, 0u32);
+  audioToggleMute();
+  auStand(&mut v, at, 0.6, 100., 120usize);
+  imm n2 = auFrames(&v);
+  imm back = auLevel(&v, n2 - 24000usize, n2, 0u32);
+  print <- "    (dB: "; print <- loud; print <- ", muted "; print <- muted; print <- ", unmuted "; print <- back; print <- ")\n";
+  mut ok = expect("the mute key silences the mix (below -100 dB after its 80 ms fade)", muted < -100.);
+  ok = expect("a second press brings it back to within 1.5 dB", nearly(back, loud, 1.5)) and ok;
+  ok = expect("and after the second press it reports itself unmuted", !v.isMuted()) and ok;
+  ok;
+}
+
+// A scripted walk of frames for the determinism and allocation checks: the listener goes north over the bridge from the lawn,
+// the burner is lit now and then
+fn auWalkFrames(v &mut AudioView, n usize) {
+  mut k = 0usize;
+  while k < n {
+    imm z = 330. - 0.03 * f32.from(k);
+    mut f = auFrame(new Vec3(BRIDGE_X, islandHeight(BRIDGE_X, z) + 1.7, z), 0.3 + 0.0002 * f32.from(k), 10d + f64.from(k) / 60d);
+    f.burnerAt.push(new Vec3(-10., 3., 300.));
+    v.update(&f);
+    k = k + 1usize;
+  }
+}
+
+fn checkAudioDeterminism() bool {
+  mut a = auFresh();
+  a.noteBurst(PartId.none(), 12d, 20d);
+  auWalkFrames(&mut a, 900usize);
+  mut b = auFresh();
+  b.noteBurst(PartId.none(), 12d, 20d);
+  auWalkFrames(&mut b, 900usize);
+  mut same = a.record.len() == b.record.len() and a.record.len() > 0usize;
+  mut i = 0usize;
+  while same and i < a.record.len() {
+    if *a.record[i] != *b.record[i] { same = false; }
+    i = i + 1usize;
+  }
+  mut ok = expect("the same frames render the same samples, bit for bit", same);
+  ok = expect("and the mix is not silent (above -60 dB)", auLevel(&a, 0usize, auFrames(&a), 0u32) > -60.) and ok;
+  ok = expect("48000 / 60 frames of audio to each fixed step (900 steps, 720000 frames)", auFrames(&a) == 720000usize) and ok;
+  ok;
+}
+
+fn checkAudioSteps() bool {
+  // A real mannequin walks the lawn route over the bridge, 360 steps (6 s); the audio is fed the figure each step
+  mut s = Scene.empty();
+  mut c = Cast.empty();
+  imm solids = worldSolids();
+  c.phys.ensureGround();
+  c.phys.setSolids(&solids);
+  imm a = c.add(mannequinBeing(&mut s, "walker", new Vec3(BRIDGE_X, islandHeight(BRIDGE_X, BRIDGE_Z + 8.), BRIDGE_Z + 8.), 1.75, 3u32));
+  c.possess(a);
+  mut v = auFresh();
+  imm walk = new Intents(1., 0., false, false);
+  imm startZ = c.beings[a].body.position.z;
+  mut k = 0;
+  while k < 480 {
+    c.step(walk, 1. / 60.);
+    mut f = auFrame(c.beings[a].eyes().origin, 0.25, 10.);
+    f.beings.push(audioBeingOf(a, c.beings[a]));
+    v.update(&f);
+    k = k + 1;
+  }
+  imm walked = startZ - c.beings[a].body.position.z;
+  imm speed = c.beings[a].figure.speed;
+  imm stride = walkgait.strideLength(1.75, speed);
+  imm expected = walked * 2. / stride;
+  print <- "    (walked "; print <- walked; print <- " m at "; print <- speed; print <- " m/s, stride "; print <- stride; print <- " m: about ";
+  print <- expected; print <- " steps; "; print <- v.stepsPlayed; print <- " played)\n";
+  mut ok = expect("a step is played for each foot that comes down: within 3 of the distance over half the stride",
+    nearly(f32.from(v.stepsPlayed), expected, 3.));
+  ok = expect("the steps on the bridge are the bridge's (7 to 12 of them over its 7.8 m)", v.stepsOn[3usize] >= 7u32 and v.stepsOn[3usize] <= 12u32) and ok;
+  ok = expect("those on the lawn are grass", v.stepsOn[0usize] >= 8u32 and v.stepsOn[1usize] == 0u32 and v.stepsOn[2usize] == 0u32) and ok;
+  ok;
+}
+
+fn checkAudioNoAllocation() bool {
+  mut v = auFresh();
+  v.noteBurst(PartId.none(), 12d, 20d);
+  // Warm: every voice made, every list the game side grows grown
+  auWalkFrames(&mut v, 300usize);
+  auCountAllocations();
+  imm before = auAllocationsCounted();
+  auWalkFrames(&mut v, 900usize);
+  imm after = auAllocationsCounted();
+  // The counter works: an allocation while 'in a render' is seen
+  audioG.inRender.store(1u64);
+  mut probe = List[f32].empty();
+  probe.push(1.);
+  audioG.inRender.store(0u64);
+  imm seen = auAllocationsCounted();
+  auStopCounting();
+  print <- "    (900 steps = 90 s of mixer, "; print <- v.voicesNow(); print <- " voices playing, "; print <- v.stolen(); print <- " stolen, ";
+  print <- v.refused(); print <- " commands refused)\n";
+  mut ok = expect("rendering the mixer allocated nothing in 900 steps (heap allocations counted: 0)", after - before == 0u64);
+  ok = expect("and the counter does see an allocation made inside a render", seen > after) and ok;
+  ok = expect("with more than 4 voices playing, none refused", v.voicesNow() > 4usize and v.refused() == 0u32) and ok;
+  // Out of range: the listener on the hill hears almost nothing, and runs almost nothing
+  mut q = auFresh();
+  auStand(&mut q, auQuiet(), 0.25, 100., 240usize);
+  ok = expect("far from everything only the wind plays (at most 3 voices)", q.voicesNow() <= 3usize) and ok;
+  ok;
+}
