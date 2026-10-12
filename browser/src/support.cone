@@ -34,6 +34,16 @@
 mut supports List[PlatformNow];
 mut feetY f32 = 0.;
 
+// The static solids (parts/platforms.cone: trees, rocks, the house, the
+// porch's deck and steps), set once from the world's own numbers
+mut solids List[Solid];
+// Hand the physics the world's solids (replacing any before)
+pub fn setSolids(list &List[Solid]) {
+  solids.clear();
+  mut i = 0usize;
+  while i < list.len() { solids.push(*list[i]); i = i + 1usize; }
+}
+
 // The platforms as they stand now, from 'scene'
 pub fn setSupports(scene &Scene) { scene.platformsNow(&mut supports); }
 
@@ -71,6 +81,14 @@ fn supportUnder(x f32, z f32, cx f32, cz f32, from f32, on &mut PartId) f32 {
       imm floor = (p.world * new Vec3(there.x, p.shape.floorY, there.z)).y;
       if floor <= from + STEP_UP and floor > top { top = floor; *on = p.id; }
     }
+    i = i + 1usize;
+  }
+  // A solid's top, if a step up at most and the point is over it (nothing
+  // stops a body at a point of its footprint: hitSolids keeps its middle off)
+  i = 0usize;
+  while i < solids.len() {
+    imm so = solids[i];
+    if so.y1 > top and so.y1 <= from + STEP_UP and so.over(x, z) { top = so.y1; *on = PartId.none(); }
     i = i + 1usize;
   }
   top;
@@ -133,7 +151,85 @@ pub fn hitWalls(was Vec3, to Vec3, radius f32, height f32) Vec3 {
   p;
 }
 
-// A wall in the plane x = 'at', from z 'z0' to 'z1' (if there is one): 'b'
+// A capsule of 'radius' and 'height' moving from 'was' to 'to' (its feet's
+// points), stopped by every solid it cannot step onto: a solid whose top is
+// more than a step above the feet, and whose height overlaps the capsule's.
+// Where it ends up: its middle kept 'radius' off the solid's shape (a circle
+// pushed out along the line from its middle, a box from its nearest point;
+// from the side it came from, if it ended inside), so it slides along it.
+pub fn hitSolids(was Vec3, to Vec3, radius f32, height f32) Vec3 {
+  mut x = to.x;
+  mut z = to.z;
+  imm feet = was.y;
+  imm lo = feet + height;
+  imm hi = feet + STEP_UP;
+  imm r2 = radius * radius;
+  mut i = 0usize;
+  while i < solids.len() {
+    imm s = solids[i];
+    if s.y1 > hi and s.y0 < lo {
+      if s.kind == SOLID_CIRCLE {
+        imm reach = s.x1 + radius;
+        imm dx = x - s.x0;
+        imm dz = z - s.z0;
+        imm d2 = dx * dx + dz * dz;
+        if d2 < reach * reach {
+          if d2 > 0.000001 {
+            imm k = reach / d2.sqrt();
+            x = s.x0 + dx * k;
+            z = s.z0 + dz * k;
+          } else {
+            // On its axis: out the way it came, or east
+            imm wx = was.x - s.x0;
+            imm wz = was.z - s.z0;
+            imm wl = (wx * wx + wz * wz).sqrt();
+            if wl > 0.0001 { x = s.x0 + wx / wl * reach; z = s.z0 + wz / wl * reach; }
+            else { x = s.x0 + reach; }
+          }
+        }
+      } else {
+        if x > s.x0 - radius and x < s.x1 + radius and z > s.z0 - radius and z < s.z1 + radius {
+          imm nx = if x < s.x0 { s.x0; } elif x > s.x1 { s.x1; } else { x; };
+          imm nz = if z < s.z0 { s.z0; } elif z > s.z1 { s.z1; } else { z; };
+          imm dx = x - nx;
+          imm dz = z - nz;
+          imm d2 = dx * dx + dz * dz;
+          if d2 > 0.000001 {
+            // Outside the rectangle itself: kept a radius off its nearest point
+            if d2 < r2 {
+              imm k = radius / d2.sqrt();
+              x = nx + dx * k;
+              z = nz + dz * k;
+            }
+          } else {
+            // Its middle is within the rectangle (or on its edge): out by the side it came from
+            if was.x < s.x0 { x = s.x0 - radius; }
+            elif was.x > s.x1 { x = s.x1 + radius; }
+            elif was.z < s.z0 { z = s.z0 - radius; }
+            elif was.z > s.z1 { z = s.z1 + radius; }
+            else {
+              imm toMinX = x - s.x0;
+              imm toMaxX = s.x1 - x;
+              imm toMinZ = z - s.z0;
+              imm toMaxZ = s.z1 - z;
+              imm mx = if toMinX < toMaxX { toMinX; } else { toMaxX; };
+              imm mz = if toMinZ < toMaxZ { toMinZ; } else { toMaxZ; };
+              imm m = if mx < mz { mx; } else { mz; };
+              if m == toMinX { x = s.x0 - radius; }
+              elif m == toMaxX { x = s.x1 + radius; }
+              elif m == toMinZ { z = s.z0 - radius; }
+              else { z = s.z1 + radius; }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1usize;
+  }
+  new Vec3(x, to.y, z);
+}
+
+// A wall in the plane x = 'at', from z 'z0'to 'z1' (if there is one): 'b'
 // kept 'r' on the side 'a' came from, while it is within the wall's reach
 // along z (its ends taken square, 'r' beyond them)
 fn wallAlongX(a Vec3, b Vec3, r f32, at f32, z0 f32, z1 f32, has bool) Vec3 {
