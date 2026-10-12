@@ -189,7 +189,7 @@ float3 rockColor(float3 p, float3 n) {
 // Wet gravel for the brook's bed: rounded pebbles about 0.15 m across, each its own grey or tan, dark in the
 // gaps between them (a cellular pattern)
 float3 gravelColor(float2 xz) {
-    float2 g = xz * 6.5;
+    float2 g = xz * 9.0;
     float2 i = floor(g);
     float2 f = frac(g);
     float best = 2.0;
@@ -206,7 +206,7 @@ float3 gravelColor(float2 xz) {
         }
     }
     float3 stone = lerp(float3(0.040, 0.043, 0.042), float3(0.115, 0.100, 0.075), id);
-    stone *= 0.75 + 0.5 * hash21(floor(xz * 6.5) + 11.0);
+    stone *= 0.75 + 0.5 * hash21(i + 11.0);
     float rim = smoothstep(0.32, 0.62, best);
     return lerp(stone, float3(0.012, 0.012, 0.010), rim);
 }
@@ -285,7 +285,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float mossy = smoothstep(0.35, 0.7, vnoise(xz * 3.1 + 5.0) * 0.6 + vnoise(xz * 11.0) * 0.4);
     float3 mud = lerp(float3(0.060, 0.042, 0.024), float3(0.032, 0.085, 0.022), mossy * 0.8);
     mud *= 0.8 + 0.4 * vnoise(xz * 17.0);
-    float3 damp = albedo * float3(0.50, 0.66, 0.42);
+    float3 damp = albedo * lerp(float3(0.50, 0.66, 0.42), float3(0.55, 0.52, 0.48), saturate(wSand));
     albedo = lerp(albedo, damp, wDamp * 0.85);
     albedo = lerp(albedo, mud, wMud * 0.85);
     albedo = lerp(albedo, gravelColor(xz), wBed);

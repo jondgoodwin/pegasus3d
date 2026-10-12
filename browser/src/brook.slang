@@ -151,12 +151,12 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // The ripples run a little ahead of the water (2.2 times its speed) so that a stream reads as moving
     // from a walker's distance; bigger than a hand's width (0.6 m across, 1.2 m long) and a smaller layer
     float v = speed * (1.0 - 0.5 * across * across) * 2.2;
-    float fadeR = saturate(1.0 - dist / 90.0);
+    float fadeR = saturate(1.0 - dist / 45.0) * (1.0 - 0.6 * smoothstep(params.course.x - 16.0, params.course.x - 2.0, uv.y));
     float2 q1 = float2(uv.x / 0.60, (uv.y - v * t) / 1.2);
     float2 q2 = float2(uv.x / 0.28 + 7.0, (uv.y - 1.7 * v * t) / 0.55);
     float2 r1 = rippleSlope(q1) * float2(1.0 / 0.60, 1.0 / 1.2);
     float2 r2 = rippleSlope(q2) * float2(1.0 / 0.28, 1.0 / 0.55);
-    float amp = 0.060 + 0.030 * saturate(speed);
+    float amp = 0.026 + 0.012 * saturate(speed);
     float2 slope = (r1 * amp + r2 * (amp * 0.45)) * fadeR;
     float3 n = normalize(N - Tu * slope.x - Tv * slope.y);
 
@@ -167,7 +167,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
 
     // The body, and the sky and sun reflected
     float c = saturate(dot(n, V));
-    float F = 0.02 + 0.98 * pow(1.0 - c, 5.0);
+    float F = min(0.02 + 0.98 * pow(1.0 - c, 5.0), 0.65);
     // Deeper (the middle) is darker and more opaque: the bed's pebbles show at the edges
     float3 body = params.body.rgb * lightOn * lerp(1.0, 0.30, mid);
     float3 R = reflect(-V, n);
@@ -179,7 +179,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float3 color = body * (1.0 - F) + skyColor * F;
     // Long streaks of light running with the current, in the faster middle
     float streak = pow(vnoise(float2(uv.x * 7.0 + 3.0, (uv.y - v * t) * 0.8)), 3.0);
-    color += skyLight * (0.9 * streak * mid * fadeR) * (1.0 - F);
+    color += skyLight * (0.45 * streak * mid * fadeR) * (1.0 - F);
     float a = saturate(0.34 + 0.34 * mid + 0.08 * saturate(speed) + 0.6 * F);
 
     // The mouth: in the last metres the water fans out into the sea over the sand in braided rills
