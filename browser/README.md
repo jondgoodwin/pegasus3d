@@ -255,7 +255,7 @@ browser.exe --navpic PREFIX           the villagers' navigation mesh drawn top-d
 `--script` pushes key events into SDL's own queue (never the operating system's), so nothing reaches
 any other window, and a run of a fixed number of frames ignores the real keyboard and mouse (and the
 window losing focus, which would otherwise let go of the script's keys). It starts on the island's landing
-beach and runs 12 m up the path (on the ground, inside the fence, checked), is set down on the lawn
+beach and runs 12 m up the path (on the ground, above the wading limit, checked), is set down on the lawn
 10 m in front of the porch, clicks on the lathed rook on the porch deck and then on the sky, turns, runs a
 few metres, then draws eight close-ups from eyes of its own (the porch's rook and pots, the chimney,
 the ball on the lawn, the balloon from the lawn, the amphora's through a 20 degree lens,
@@ -396,7 +396,7 @@ the world alone. **Tab skips them** (`Being.ai`).
 | shy villager (purple) | keeps away from the player (runs inside 5 m until he is beyond 9 m), goes home when he is not near it | `npcbehave` `evade`, then a route home |
 
 **The navigation mesh** (`navmesh`, after Recast and Detour) is built at start-up in 0.2 to 0.5 s from the baked island
-inside the window x -110 to 90, z 290 to 515: the island's heightfield cells inside the fence and above the wading
+inside the window x -330 to 330, z 150 to 565 (about 2 s, 4520 polygons; it was x -110 to 90, z 290 to 515 in 0.3 s): the island's heightfield cells in it above the wading
 line as triangles (the island's own diagonals), a circle obstacle for each trunk and rock and the balloon's basket, a
 box obstacle for each box solid taller than 2.2 m (the cottage), and for each lower box solid (the porch deck and
 steps, the bridge's crest, ramps and parapets) its top as walkable triangles, level or sloped; a disc every 2 m along the
@@ -607,7 +607,7 @@ turned about the platform's origin and moved with it (so a long ride does not dr
 are placed, so a rider and its floor are drawn together. A body is held up only by the floor: a mannequin
 that walks off the open front falls, at the floor's velocity as well as its own, under the usual gravity
 and hard landings. A fall that empties its health (24 m/s, a 30 m drop) lays it down for 2 s; then it
-gets up whole on the landing beach. The fence holds only a body on or near the ground from inside it: a
+gets up whole on the landing beach. The shoreline holds only a body on or near the ground: a
 rider carried by the basket goes where it goes, and one that falls lands where it falls.
 
 **The ride** (`bakedworld/motions.cone`) is a centripetal Catmull-Rom spline through twelve waypoints,
@@ -798,15 +798,21 @@ The GPU draws it with the same numbers: a fine mesh with a vertex a sample over 
 -64 to 704 (the walkable country and the hill's foot; 307 000 triangles) and a coarse one with a vertex every
 4th sample over the whole grid, with a hole where the fine one is (113 000), the fine mesh's border vertices
 set on the line between the coarse ones, so they meet with no crack. No levels of detail beyond these two;
-the fence keeps you in the fine one. `groundHeight` (`island.cone`) is **triangle-exact**: the quads are split
+the fine one covers the whole island's land (it was x -400 to 400, z -64 to 704, with the hill beyond it drawn on the
+coarse mesh up to 7.6 m off the walker's ground). `groundHeight` (`island.cone`) is **triangle-exact**: the quads are split
 by one rule (`diagonalFlipped`), the index buffers use it, and the query finds the triangle the mesh has
 (`--checks`: 4000 points against the index buffer, within 0.4 mm; plain bilinear would be 0.5 m off).
 
 **The path** is a Catmull-Rom curve from the beach (heading north for its first 22 m) to the cottage's steps,
 205 points a metre apart (`pathCentreline`), its height smoothed along it and pressed into the ground in a
 ribbon (the steepest metre 9 degrees); the distance to it is a second field the ground shader reads.
-**The fence** is a polygon round the beach, the path, the forest and the lawn (`constrain`, called by every
-walk and mannequin step, which slide along it) and a wading limit of 0.6 m. **The forest** (`forestDensity`)
+**There is no fence.** A walker may go anywhere on the island, up the hill and round the coast; the one limit is
+the **shoreline**: `constrain` (called by every walk and mannequin step) refuses ground more than 0.6 m under the sea
+(`WADE_DEPTH`), sliding the step along the shore (by the ground's gradient), and lets a walker already in deeper water
+walk to ground no deeper than its own. The old polygon is the **dressed area** (`insideDressed`): the vegetation's
+layout and the brook's stones are placed only inside it, so the rest of the island is bare grass (the ground shader's
+litter is painted everywhere). The fine mesh covers the whole island (x -640 to 784, z -696 to 704, about a million
+triangles), so the ground a walker stands on is the ground drawn. **The forest** (`forestDensity`)
 is where trees may stand: above the beach, below 85 m, clear of the path and of 34 to 58 m round the lawn.
 
 **The ground** (`src/terrain.slang`) is coloured per fragment from procedural noise: sand by the water (wetter

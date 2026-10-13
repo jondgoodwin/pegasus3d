@@ -806,8 +806,8 @@ fn checkHeightQuery(isl &Island) bool {
   mut seed = 20261007u32;
   mut n = 0;
   while n < 4000 {
-    imm x = -400. + 3. + nextUnit(&mut seed) * 794.;
-    imm z = -64. + 3. + nextUnit(&mut seed) * 762.;
+    imm x = f32.from(FINE_I0) * CELL - HALF + 3. + nextUnit(&mut seed) * (f32.from(FINE_I1 - FINE_I0) * CELL - 6.);
+    imm z = f32.from(FINE_J0) * CELL - HALF + 3. + nextUnit(&mut seed) * (f32.from(FINE_J1 - FINE_J0) * CELL - 6.);
     imm gx = (x + HALF) / CELL;
     imm gz = (z + HALF) / CELL;
     imm i = i32.from(libc.floorf(gx));
@@ -860,35 +860,73 @@ fn checkHeightQuery(isl &Island) bool {
   expect("groundHeight is the drawn triangles' height within 1 mm, at every point", missed == 0 and worst < 0.001);
 }
 
-// A plain walker run at the fence: it never leaves it, slides along its edge
-// and does not wade past knee deep
-fn checkFence(isl &Island) bool {
-  print <- "The island's fence:\n";
+// How far the ground a walker stands on (groundHeight, the fine grid) is from the ground drawn beyond the fine mesh (the coarse
+// mesh's triangles), over random land points outside the fine mesh's window, by the ground's height there: how much a walker's
+// feet would float over or sink into the drawn ground. There should be no land out there.
+fn checkCoarseGround(isl &Island) bool {
+  print <- "The ground a walker stands on against the coarse mesh drawn beyond the fine one:\n";
+  mut worst Array[f32, 3] = [0., 0., 0.];
+  mut sum Array[f32, 3] = [0., 0., 0.];
+  mut count Array[i32, 3] = [0, 0, 0];
+  mut over Array[i32, 3] = [0, 0, 0];
+  mut seed = 20261012u32;
+  mut n = 0;
+  while n < 60000 {
+    imm x = -1000. + nextUnit(&mut seed) * 2000.;
+    imm z = -1000. + nextUnit(&mut seed) * 2000.;
+    imm g = groundHeight(isl, x, z);
+    imm outsideFine = x < f32.from(FINE_I0) * CELL - HALF or x > f32.from(FINE_I1) * CELL - HALF
+      or z < f32.from(FINE_J0) * CELL - HALF or z > f32.from(FINE_J1) * CELL - HALF;
+    if outsideFine and g > 0.5 {
+      imm bin = if g < 10. { 0usize; } elif g < 60. { 1usize; } else { 2usize; };
+      imm c = coarseGroundHeight(isl, x, z);
+      imm err = if c > g { c - g; } else { g - c; };
+      sum[bin] = sum[bin] + err;
+      count[bin] = count[bin] + 1;
+      if err > worst[bin] { worst[bin] = err; }
+      if err > 0.5 { over[bin] = over[bin] + 1; }
+    }
+    n = n + 1;
+  }
+  mut b = 0usize;
+  while b < 3usize {
+    imm name = if b == 0usize { "ground under 10 m"; } elif b == 1usize { "ground 10 to 60 m"; } else { "ground over 60 m"; };
+    print <- "  "; printStr(name); print <- ": "; print <- count[b]; print <- " points, the drawn ground is off by "; print <- sum[b] / f32.from(count[b] + 1);
+    print <- " m on average, "; print <- worst[b]; print <- " m at worst, over 0.5 m at "; print <- over[b]; print <- "\n";
+    b = b + 1usize;
+  }
+  // (measured 12 Oct with the fine mesh x -400 to 400, z -64 to 704: 11 000 land points in 60 000 were beyond it, off by 0.14 m on
+  // average under 10 m high, 0.34 m from 10 to 60 m, 0.78 m over 60 m, and by up to 7.6 m: a walker's feet sank into or floated
+  // over the drawn hill. The fine mesh now covers the whole island, so no land is beyond it)
+  expect("every land point is on the fine mesh: none beyond it (the walker's ground is the drawn ground)",
+    count[0usize] + count[1usize] + count[2usize] == 0);
+}
+
+// A plain walker run at the island's edge: it may go anywhere on the island (no fence), stops at the
+// water's edge, slides along the shore and does not wade past knee deep
+fn checkShoreline(isl &Island) bool {
+  print <- "The island's shoreline (the walker's only limit):\n";
   mut ok = true;
-  // East from the lawn at run speed for 600 m: stops at the fence
+  // East from the lawn at run speed for 1000 m: crosses the lowland and stops at the east coast
   mut w = Walk.make(new Vec3(0., groundHeight(isl, 0., 300.), 300.), -1.5707964);
-  mut escaped = false;
+  mut tooDeep = false;
   mut jump f32 = 0.;
   mut s = 0;
-  while s < 3000 {
+  while s < 5000 {
     imm was = w.position;
     w.step(isl, 1., 0., true, 1. / 60.);
-    if !insideIslandFence(isl, w.position.x, w.position.z) { escaped = true; }
+    if groundHeight(isl, w.position.x, w.position.z) < 0. - WADE_DEPTH - 0.0001 { tooDeep = true; }
     imm d = len2d(w.position.x - was.x, w.position.z - was.z);
     if d > jump { jump = d; }
     s = s + 1;
   }
-  ok = expect("walking east 600 m at 12 m/s, never outside the fence", !escaped) and ok;
-  ok = expect("it stopped at the fence's east edge (x between 150 and 220)", w.position.x > 150. and w.position.x < 220.) and ok;
+  imm eastDepth = groundHeight(isl, w.position.x, w.position.z);
+  print <- "  walking east 1000 m at 12 m/s from the lawn, it stopped at ("; print <- w.position.x; print <- ", "; print <- w.position.z;
+  print <- ") with the ground at "; print <- eastDepth; print <- " m\n";
+  ok = expect("it went past the old fence (x over 250) and never into water deeper than 0.6 m", w.position.x > 250. and !tooDeep) and ok;
+  ok = expect("it stopped at the water's edge (the ground between -0.6 and +0.3 m)", eastDepth >= -0.6 and eastDepth < 0.3) and ok;
   ok = expect("no step longer than 0.2 m (12 m/s in 1/60 s): nothing jumped", jump < 0.2001) and ok;
   ok = expect("the feet on the ground the height query gives", nearly(w.position.y, groundHeight(isl, w.position.x, w.position.z), 0.0001)) and ok;
-  // Against the slanted east edge, pushing east: it slides along it
-  mut v = Walk.make(new Vec3(150., groundHeight(isl, 150., 350.), 350.), -1.5707964);
-  imm z0 = v.position.z;
-  s = 0;
-  while s < 1500 { v.step(isl, 1., 0., true, 1. / 60.); s = s + 1; }
-  ok = expect("pushing east on the slanted east edge, it slides along it (south, at least 3 m)",
-    v.position.z > z0 + 3. and insideIslandFence(isl, v.position.x, v.position.z)) and ok;
   // South from the path's foot into the sea: stops at the water's edge
   mut u = Walk.make(new Vec3(-22., groundHeight(isl, -22., 480.), 480.), 3.1415927);
   s = 0;
@@ -896,39 +934,68 @@ fn checkFence(isl &Island) bool {
   imm depth = groundHeight(isl, u.position.x, u.position.z);
   print <- "  walking south into the sea, it stopped with the ground at "; print <- depth; print <- " m\n";
   ok = expect("it stopped at the water's edge (the ground between -0.6 and +0.3 m)", depth >= -0.6 and depth < 0.3) and ok;
-  // The deepest ground inside the fence, and the wading limit there: a step into
-  // water deeper than 0.6 m is refused
-  mut low f32 = 100.;
-  mut lowX f32 = 0.;
-  mut lowZ f32 = 0.;
-  mut gz = 285.;
-  while gz < 560. {
-    mut gx = -215.;
-    while gx < 205. {
-      if insideIslandFence(isl, gx, gz) {
-        imm hgt = groundHeight(isl, gx, gz);
-        if hgt < low { low = hgt; lowX = gx; lowZ = gz; }
+  // Slanting into the south shore (south-east): it slides along the beach, east
+  mut v = Walk.make(new Vec3(-22., groundHeight(isl, -22., 480.), 480.), 3.1415927 + 0.6);
+  imm x0 = v.position.x;
+  mut slideDeep = false;
+  s = 0;
+  while s < 1500 {
+    v.step(isl, 1., 0., true, 1. / 60.);
+    if groundHeight(isl, v.position.x, v.position.z) < 0. - WADE_DEPTH - 0.0001 { slideDeep = true; }
+    s = s + 1;
+  }
+  print <- "  slanting into the south shore, it slid east "; print <- v.position.x - x0; print <- " m\n";
+  ok = expect("slanting into the shore, it slides along it (east, at least 20 m) and stays out of deep water", v.position.x > x0 + 20. and !slideDeep) and ok;
+  // From a ring of places (the hill's flank, the summit's side, the west lowland, the lawn, the beach) in eight
+  // directions each, 300 m: never in water deeper than 0.6 m, never a jump
+  mut roamDeep = 0;
+  mut roamJump = 0;
+  mut roamMax f32 = 0.;
+  mut place = 0;
+  while place < 5 {
+    imm sx f32 = if place == 0 { -250.; } elif place == 1 { 60.; } elif place == 2 { -300.; } elif place == 3 { 0.; } else { -22.; };
+    imm sz f32 = if place == 0 { 100.; } elif place == 1 { -100.; } elif place == 2 { 330.; } elif place == 3 { 330.; } else { 495.; };
+    mut dir = 0;
+    while dir < 8 {
+      mut r = Walk.make(new Vec3(sx, groundHeight(isl, sx, sz), sz), f32.from(dir) * 0.7853982);
+      mut k = 0;
+      while k < 1500 {
+        imm was = r.position;
+        r.step(isl, 1., 0., true, 1. / 60.);
+        if groundHeight(isl, r.position.x, r.position.z) < 0. - WADE_DEPTH - 0.0001 { roamDeep = roamDeep + 1; }
+        imm d = len2d(r.position.x - was.x, r.position.z - was.z);
+        if d > 0.2001 { roamJump = roamJump + 1; }
+        if d > roamMax { roamMax = d; }
+        k = k + 1;
       }
-      gx = gx + 2.;
+      dir = dir + 1;
     }
-    gz = gz + 2.;
+    place = place + 1;
   }
-  print <- "  the lowest ground inside the fence: "; print <- low; print <- " m at ("; print <- lowX; print <- ", "; print <- lowZ; print <- ")\n";
-  // From a dry point beside the lowest, a step onto it
-  imm from = new Vec3(lowX, 1., lowZ - 3.);
-  imm to = islandConstrain(isl, from, new Vec3(lowX, 1., lowZ));
-  if low < -0.6 {
-    ok = expect("a step into water deeper than 0.6 m is held at the shallows", groundHeight(isl, to.x, to.z) >= -0.6 or (to.x == from.x and to.z == from.z)) and ok;
-  } else {
-    ok = expect("no ground inside the fence is deeper than the wading limit (0.6 m)", low >= -0.6) and ok;
-  }
+  ok = expect("40 runs of 300 m from five places: no step into water deeper than 0.6 m", roamDeep == 0) and ok;
+  ok = expect("and no step longer than 0.2 m", roamJump == 0) and ok;
+  // Set down in the sea (a fall, or a set-down), a walker is not taken deeper, and can walk out
+  imm seaX f32 = -22.;
+  imm seaZ f32 = 560.;
+  imm seaH = groundHeight(isl, seaX, seaZ);
+  mut d1 = Walk.make(new Vec3(seaX, seaH, seaZ), 3.1415927);
+  s = 0;
+  while s < 300 { d1.step(isl, 1., 0., true, 1. / 60.); s = s + 1; }
+  ok = expect("in deep water, walking further out is refused (the ground is no deeper than where it stood)",
+    seaH >= -0.6 or groundHeight(isl, d1.position.x, d1.position.z) >= seaH - 0.0001) and ok;
+  mut d2 = Walk.make(new Vec3(seaX, seaH, seaZ), 0.);
+  s = 0;
+  while s < 1200 { d2.step(isl, 1., 0., true, 1. / 60.); s = s + 1; }
+  print <- "  set down in the sea at ground "; print <- seaH; print <- " m and walking north, it came to "; print <- groundHeight(isl, d2.position.x, d2.position.z); print <- " m\n";
+  ok = expect("in deep water, walking in shallows is allowed: it walks out onto the beach (ground at least -0.6 m)",
+    groundHeight(isl, d2.position.x, d2.position.z) >= -0.6) and ok;
   ok;
 }
 
 fn len2d(x f32, z f32) f32 { (x * x + z * z).sqrt(); }
 
 // The path's centreline: on the ground, never steeper than 12 degrees, from
-// the landing beach to the cottage's steps, inside the fence
+// the landing beach to the cottage's steps, inside the dressed area
 fn checkPath(isl &Island) bool {
   print <- "The island's path:\n";  imm line = pathCentreline(isl);
   mut ok = expect("it has a point about every metre (150 to 250 of them)", line.len() > 150usize and line.len() < 250usize);
@@ -939,7 +1006,7 @@ fn checkPath(isl &Island) bool {
   while k < line.len() {
     imm p = *line[k];
     if !nearly(p.y, groundHeight(isl, p.x, p.z), 0.0001) { onGround = false; }
-    if !insideIslandFence(isl, p.x, p.z) { inside = false; }
+    if !insideDressedArea(isl, p.x, p.z) { inside = false; }
     if k > 0usize {
       imm q = *line[k - 1usize];
       imm run = len2d(p.x - q.x, p.z - q.z);
@@ -949,7 +1016,7 @@ fn checkPath(isl &Island) bool {
     k = k + 1usize;
   }
   ok = expect("every point on the ground", onGround) and ok;
-  ok = expect("every point inside the fence", inside) and ok;
+  ok = expect("every point inside the dressed area", inside) and ok;
   mut lowY f32 = 1000.;
   mut highY f32 = -1000.;
   k = 0usize;
@@ -973,7 +1040,8 @@ fn checkPath(isl &Island) bool {
 
 fn checkIsland(isl &Island) bool {
   mut ok = checkHeightQuery(isl);
-  ok = checkFence(isl) and ok;
+  ok = checkShoreline(isl) and ok;
+  ok = checkCoarseGround(isl) and ok;
   ok = checkPath(isl) and ok;
   ok = checkBrook(isl) and ok;
   ok;
