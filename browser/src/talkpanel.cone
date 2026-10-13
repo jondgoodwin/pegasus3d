@@ -1,0 +1,272 @@
+// The dialogue with a guard of the labyrinth: a modal panel over the picture with the guard's words and a button for each question that
+// may be asked. It is presentational and lives with the HUD (hud.cone), as the "Play with others" panel (requestpanel.cone) does, and
+// takes its input by the same path: SDL's queue -> the shell's PanelRoute.offer -> PanelEvent -> the view -> HudFrame.events ->
+// the render actor's HUD -> TalkPanel.apply -> uilayout's pointer and key events. The one choice it makes goes back by the same path in
+// the other direction: HudModel.takeTalk -> Presented.talk -> the view, which sends the simulation a PLAY_TALK (creatures.cone answers).
+//
+// KEYS. E opens it (PE_TALK) when a guard is within reach (the view says so each frame, HudFrame.talk.near, and render's word to the
+// shell has the bit PANEL_NEAR; with no guard near, E goes to the game as it always did). While it is up it takes every key, text
+// and mouse event; 1 to 4 choose a question as clicking its button does (PE_CHOOSE), E and F9 close it, Escape closes it.
+//
+// WHAT IT SHOWS. The guard's name (by the colour of its kilt), what it says, and four buttons. A visitor may ask one question: once
+// the guard has answered (HudFrame.talk.reply, with a sequence number that rises with each), the buttons go dim and the panel says
+// to choose a door. A visitor that has already asked (HudFrame.talk.asked) is told so at once.
+//
+// NO GLOBALS. The panel's state is the fields of TalkPanel (in the HudModel).
+
+pub const PE_TALK = 8u32;     // E: open the talk panel
+pub const PE_CHOOSE = 9u32;   // code: the question's number, 1 to 4, chosen by its key
+
+// More bits of the word render tells the shell each frame (requestpanel.cone has PANEL_OPEN and PANEL_TEXT)
+pub const PANEL_TALK = 4u32;  // the open panel is the guard's
+pub const PANEL_NEAR = 8u32;  // a guard is near enough to talk to
+
+pub const SCANCODE_E = 8u;
+pub const SCANCODE_1 = 30u;   // 1 to 4 are 30 to 33
+
+// What the view tells the HUD each frame about the guards
+pub struct TalkFrame {
+  pub near u32;               // the guard within reach (CR_GUARD_W or CR_GUARD_E), else CR_NONE
+  pub asked bool;             // this visitor has had its question
+  pub replySeq u32;           // replies this visitor has had (rises by one each)
+  pub reply u32;              // the last one's line code (creatures.cone)
+
+  pub fn none() TalkFrame { new TalkFrame(CR_NONE, false, 0u32, 0u32); }
+}
+
+pub const TALK_W = 400.;
+const TALK_PAD = 18.;
+const TALK_GAP = 8.;
+const TALK_INNER = 364.;
+const TALK_TITLE = 24.;
+const TALK_LINE = 18.;
+const TALK_BUTTON = 36.;
+pub const TALK_H = 392.;      // 2 padding + 11 gaps + title, four lines, four buttons and the close button
+
+// The guard's name as the panel calls it: by the colour of its kilt
+pub fn guardName(g u32) String { if g == CR_GUARD_W { String.from("The guard in blue"); } else { String.from("The guard in red"); }; }
+
+// The controls the scripted run aims at (questions 1 to 4, then Close)
+pub fn talkTarget(which u32, w f32, h f32) Vec2 {
+  imm left = (w - TALK_W) * 0.5 + TALK_PAD;
+  imm top = (h - TALK_H) * 0.5 + TALK_PAD;
+  imm firstY = top + TALK_TITLE + TALK_GAP + 4. * (TALK_LINE + TALK_GAP);
+  if which < 4u32 {
+    return new Vec2(left + TALK_INNER * 0.5, firstY + f32.from(which) * (TALK_BUTTON + TALK_GAP) + TALK_BUTTON * 0.5);
+  }
+  new Vec2(left + TALK_INNER * 0.5, firstY + 4. * (TALK_BUTTON + TALK_GAP) + 16.);
+}
+
+pub struct TalkPanel {
+  scrim usize;
+  dialog usize;
+  title usize;
+  lines List[usize];
+  buttons List[usize];
+  closeButton usize;
+  pub open bool;
+  guard u32;
+  asked bool;
+  seenSeq u32;
+  pub chosen u32;             // (guard * 256 + question) + 1 once a button was pressed, handed on once (takeChoice)
+  pub opens u32;              // for the checks and the scripted run
+  pub choices u32;
+  pub replies u32;
+  pub lastLine String;
+
+  // The panel built into 'ui' (hidden), above the other panels; the request panel's styles must exist (RequestPanel.build first)
+  pub fn build(ui &mut Ui) TalkPanel {
+    imm scrim = uilayout.panel(ui, ui.root, "scrim");
+    ui.setLayout(scrim, uilayout.LK_ANCHOR);
+    ui.setAnchors(scrim, 0., 0., 1., 1.);
+    ui.setOffsets(scrim, 0., 0., 0., 0.);
+    imm dialog = uilayout.panel(ui, scrim, "dialog");
+    ui.setFlex(dialog, uilayout.LK_COLUMN, TALK_GAP);
+    ui.setPadding(dialog, TALK_PAD, TALK_PAD, TALK_PAD, TALK_PAD);
+    ui.setAnchors(dialog, 0.5, 0.5, 0.5, 0.5);
+    ui.setPivot(dialog, 0.5, 0.5);
+    ui.setOffsets(dialog, 0., 0., 0., 0.);
+    ui.setSize(dialog, TALK_W, TALK_H);
+    imm title = uilayout.label(ui, dialog, "The guard");
+    ui.setStyle(title, "ptitle");
+    ui.setSize(title, TALK_INNER, TALK_TITLE);
+    mut lines = List[usize].empty();
+    mut n = 0usize;
+    while n < 4usize {
+      imm l = uilayout.label(ui, dialog, "");
+      ui.setStyle(l, "pwait");
+      ui.setSize(l, TALK_INNER, TALK_LINE);
+      lines.push(l);
+      n = n + 1usize;
+    }
+    mut buttons = List[usize].empty();
+    n = 0usize;
+    while n < 4usize {
+      imm qt = questionText(u32.from(n) + 1u32);
+      imm b = uilayout.button(ui, dialog, qt.view());
+      ui.setStyle(b, "pbutton");
+      ui.setSize(b, TALK_INNER, TALK_BUTTON);
+      buttons.push(b);
+      n = n + 1usize;
+    }
+    imm closeButton = uilayout.button(ui, dialog, "Walk away");
+    ui.setStyle(closeButton, "pclose");
+    ui.setSize(closeButton, TALK_INNER, 32.);
+    ui.setVisible(scrim, false);
+    new TalkPanel(scrim, dialog, title, lines, buttons, closeButton, false, CR_NONE, false, 0u32, 0u32, 0u32, 0u32, 0u32, String.empty());
+  }
+
+  // A sentence broken over the four lines, at word ends, 46 letters or so to a line; 'style' for each
+  fn setWrapped(self &mut, ui &mut Ui, text &str, style &str) {
+    imm s &Array[u8] = text;
+    mut rows = List[String].empty();
+    mut cur = String.empty();
+    mut word = String.empty();
+    mut i = 0usize;
+    while i <= s.len {
+      imm c = if i < s.len { s[i]; } else { 32u8; };
+      if c == 32u8 {
+        if cur.len() + word.len() + 1usize > 46usize and cur.len() > 0usize {
+          rows.push(cur.copy());
+          cur = String.empty();
+        }
+        if cur.len() > 0usize { cur.append(" "); }
+        cur.append(word.view());
+        word = String.empty();
+      } else {
+        word.appendByte(c);
+      }
+      i = i + 1usize;
+    }
+    if cur.len() > 0usize { rows.push(cur.copy()); }
+    lastLine = String.from(text);
+    imm none = String.empty();
+    mut k = 0usize;
+    while k < 4usize {
+      ui.setText(*lines[k], if k < rows.len() { rows[k].view(); } else { none.view(); });
+      ui.setStyle(*lines[k], style);
+      k = k + 1usize;
+    }
+  }
+
+  fn show(self &mut, ui &mut Ui, g u32, hasAsked bool) {
+    open = true;
+    opens = opens + 1u32;
+    guard = g;
+    asked = hasAsked;
+    ui.setVisible(scrim, true);
+    ui.input.modal = scrim;
+    imm name = guardName(g);
+    ui.setText(title, name.view());
+    if hasAsked {
+      self.setWrapped(ui, "You have had your question. Choose a door, traveller.", "pwait");
+    } else {
+      self.setWrapped(ui, "Halt. One of us never lies, and one of us never tells the truth. Ask one question, then choose a door.", "pwait");
+    }
+    mut k = 0usize;
+    while k < 4usize {
+      ui.setEnabled(*buttons[k], !hasAsked);
+      k = k + 1usize;
+    }
+    ui.setFocus(*buttons[0usize]);
+  }
+
+  fn hide(self &mut, ui &mut Ui) {
+    open = false;
+    ui.setFocus(uilayout.NIL);
+    ui.input.modal = uilayout.NIL;
+    ui.setVisible(scrim, false);
+  }
+
+  // Question 'q' (1 to 4) chosen, by its button or its key
+  fn choose(self &mut, ui &mut Ui, q u32) {
+    if !open or asked or guard == CR_NONE or q < 1u32 or q > 4u32 { return; }
+    chosen = guard * 256u32 + q + 1u32;
+    choices = choices + 1u32;
+    asked = true;
+    mut k = 0usize;
+    while k < 4usize {
+      ui.setEnabled(*buttons[k], false);
+      k = k + 1usize;
+    }
+    self.setWrapped(ui, "...", "pwait");
+  }
+
+  // The events of the frame into the Ui; the panel opens on a talk key if a guard is near. True when it was opened by one of them.
+  pub fn apply(self &mut, ui &mut Ui, events &List[PanelEvent], w f32, h f32, talk &TalkFrame) bool {
+    mut opened = false;
+    mut i = 0usize;
+    while i < events.len() {
+      imm ev = events[i];
+      if ev.kind == PE_TALK {
+        if !open and talk.near != CR_NONE {
+          self.show(ui, talk.near, talk.asked);
+          opened = true;
+        }
+      } elif !open {
+        // (events for a panel that is not up are dropped)
+      } elif ev.kind == PE_CLOSE {
+        self.hide(ui);
+      } elif ev.kind == PE_MOVE {
+        uilayout.pointerMove(ui, ev.a * w, ev.b * h);
+      } elif ev.kind == PE_DOWN {
+        uilayout.pointerMove(ui, ev.a * w, ev.b * h);
+        imm taken = uilayout.pointerDown(ui, 1u32);
+      } elif ev.kind == PE_UP {
+        uilayout.pointerMove(ui, ev.a * w, ev.b * h);
+        uilayout.pointerUp(ui, 1u32);
+      } elif ev.kind == PE_KEY {
+        imm taken = uilayout.keyDown(ui, ev.code, ev.mods);
+      } elif ev.kind == PE_CHOOSE {
+        self.choose(ui, ev.code);
+      }
+      i = i + 1usize;
+    }
+    opened;
+  }
+
+  // After the Ui has run on the frame's events: clicks act, and a reply that has come is shown
+  pub fn settle(self &mut, ui &mut Ui, events &List[uilayout.UiEvent], talk &TalkFrame) {
+    mut i = 0usize;
+    while i < events.len() {
+      imm evKind = events[i].kind;
+      imm evNode = events[i].node;
+      if open and evKind == uilayout.UE_CLICK {
+        if evNode == closeButton { self.hide(ui); }
+        else {
+          mut k = 0usize;
+          while k < 4usize {
+            imm b = *buttons[k];
+            if evNode == b { self.choose(ui, u32.from(k) + 1u32); }
+            k = k + 1usize;
+          }
+        }
+      }
+      i = i + 1usize;
+    }
+    if talk.replySeq != seenSeq {
+      seenSeq = talk.replySeq;
+      replies = replies + 1u32;
+      if open {
+        imm said = guardSays(talk.reply);
+        mut text = String.from("The guard says: \"");
+        text.append(said.view());
+        text.append("\"  Now choose a door.");
+        self.setWrapped(ui, text.view(), "pok");
+      }
+    }
+  }
+
+  // What the shell is told (PANEL_OPEN, PANEL_TALK)
+  pub fn bits(self &) u32 { if open { PANEL_OPEN | PANEL_TALK; } else { 0u32; }; }
+
+  // The choice made since the last call ((guard * 256 + question) + 1), or 0
+  pub fn takeChoice(self &mut) u32 {
+    imm c = chosen;
+    chosen = 0u32;
+    c;
+  }
+
+  // For the checks: the nodes' ids (the four question buttons, then Close)
+  pub fn nodeOf(self &, which u32) usize { if which < 4u32 { *buttons[usize.from(which)]; } else { closeButton; }; }
+}

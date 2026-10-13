@@ -64,25 +64,39 @@ def interp(xs, ys, x):
     return tuple(a + (b - a) * t for a, b in zip(ys[i - 1], ys[i]))
 
 
+def walk_flag(args):
+    """The flag that gives client A its script: the portal's walk, the creatures' walk, or the island's"""
+    if args.portal:
+        return '--portal-walk'
+    if args.creatures:
+        return '--creature-walk'
+    return '--autowalk'
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--exe', default=DEFAULT_EXE)
     ap.add_argument('--impair', nargs=3, type=int, metavar=('LOSS', 'LATENCY', 'JITTER'))
     ap.add_argument('--seconds', type=int, default=28, help='how long each client runs')
     ap.add_argument('--tolerance', type=float, default=0.3, help='metres B may differ from the server path')
-    ap.add_argument('--predict-tolerance', type=float, default=0.05, help='metres A\'s final position may differ')
+    ap.add_argument('--predict-tolerance', type=float, default=None, help='metres A\'s final position may differ (0.05; 0.4 with --creatures: the vault)')
     ap.add_argument('--port', type=int, default=7777)
     ap.add_argument('--lab', action='store_true',
                     help='the server sets each joiner down in the labyrinth\'s antechamber (--lab-spawn), 300 m under the island: '
                          'the same checks, and B must see A there')
     ap.add_argument('--portal', action='store_true', help='A runs through the cottage\'s looking-glass into the labyrinth and back (--portal-walk) '
                     'instead of the island walk; the portal is checked, the playground is not')
+    ap.add_argument('--creatures', action='store_true', help='A walks through the labyrinth\'s creatures (--creature-walk): it asks the guard the fellow-question, '
+                    'is set down in the Worm\'s chamber, then in the court where the Minotaur charges a pillar and staggers, and last where it charges A, who '
+                    'jumps and is vaulted over it; B must be told of each and see the Minotaur\'s path (use --seconds 44)')
     ap.add_argument('--connect', metavar='HOST:PORT', help='a server already running on another machine (needs --server-log)')
     ap.add_argument('--server-log', metavar='FILE', help='with --connect: where the remote server\'s --trace log will be')
     ap.add_argument('--reuse', action='store_true', help='with --connect: run no clients; check the logs of a run already made')
     ap.add_argument('--settle', type=int, default=11, help='seconds to wait for a local server to build the world')
     ap.add_argument('--out', default=os.path.join(HERE, '..', '..', 'netcheck-out'))
     args = ap.parse_args()
+    if args.predict_tolerance is None:
+        args.predict_tolerance = 0.4 if args.creatures else 0.05
     exe = os.path.abspath(args.exe)
     os.makedirs(args.out, exist_ok=True)
     remote = bool(args.connect)
@@ -102,7 +116,7 @@ def main():
         try:
             b, f3 = start(common + ['--name', 'netcheck-b'], blog)
             procs.append((b, f3))
-            a, f2 = start(common + ['--name', 'netcheck-a', '--portal-walk' if args.portal else '--autowalk'], alog)
+            a, f2 = start(common + ['--name', 'netcheck-a', walk_flag(args)], alog)
             procs.append((a, f2))
             a.wait(timeout=args.seconds + 60)
             b.wait(timeout=60)
@@ -118,7 +132,7 @@ def main():
         server_cmd = [exe, '--serve', str(args.port), '--loopback', '--run-for', str(args.seconds + 50), '--trace']
         if args.impair:
             server_cmd += ['--impair'] + [str(v) for v in args.impair]
-        if args.lab:
+        if args.lab or args.creatures:
             server_cmd += ['--lab-spawn']
         server, f1 = start(server_cmd, slog)
         procs.append((server, f1))
@@ -136,7 +150,7 @@ def main():
             common = [exe, '--headless', '--connect', f'127.0.0.1:{port}', '--trace', '--run-for', str(args.seconds)]
             b, f3 = start(common + ['--name', 'netcheck-b'], blog)
             procs.append((b, f3))
-            a, f2 = start(common + ['--name', 'netcheck-a', '--portal-walk' if args.portal else '--autowalk'], alog)
+            a, f2 = start(common + ['--name', 'netcheck-a', walk_flag(args)], alog)
             procs.append((a, f2))
             a.wait(timeout=args.seconds + 60)
             b.wait(timeout=60)
@@ -192,6 +206,13 @@ def main():
         big = [e for e in errs if e > 100000]
         check(len(big) <= 1, f'A\'s prediction is out by more than 100 m {len(big)} time(s) (want at most the one set-down)')
         errs = [e for e in errs if e <= 100000]
+    if args.creatures:
+        # The four set-downs of the walk (the server puts A before the guards, in the Worm's chamber, in the court, before the Minotaur: tens of
+        # metres) are not mispredictions; neither is the vault the server carries A through (a scripted arc the client does not predict, and
+        # takes the server's word on at each snapshot), whose difference is a few metres at most while it lasts
+        big = [e for e in errs if e > 8000]
+        check(len(big) <= 8, f'A\'s prediction is out by more than 8 m {len(big)} time(s) (want at most the four set-downs and a few snapshots about them)')
+        errs = [e for e in errs if e <= 8000]
     check(bool(errs), f'A compared its prediction with the server {len(tr)} times')
     if errs:
         print(f'     A: worst difference at a snapshot {max(errs)/1000.0:.3f} m, mean {sum(errs)/len(errs)/1000.0:.4f} m, '
@@ -235,8 +256,10 @@ def main():
     last = None
     # A body that goes through a portal's gate jumps 300 m in one tick (the portal's whole point). B draws it a little late and takes the later
     # snapshot across the jump, so it and the server's path part company for a few ticks either side of it: those are not measured (and said)
+    # (the creatures' walk sets A down at four places of the labyrinth, tens of metres apart: the same, with 10 m for a jump)
+    jump_min = 10.0 if args.creatures else 50.0
     jumps = [ticks[i] for i in range(1, len(ticks))
-             if ((pos[i][0] - pos[i - 1][0]) ** 2 + (pos[i][1] - pos[i - 1][1]) ** 2 + (pos[i][2] - pos[i - 1][2]) ** 2) ** 0.5 > 50.0]
+             if ((pos[i][0] - pos[i - 1][0]) ** 2 + (pos[i][1] - pos[i - 1][1]) ** 2 + (pos[i][2] - pos[i - 1][2]) ** 2) ** 0.5 > jump_min]
     skipped = 0
     for at, qpc, p in tv:
         if qpc < q0 or at < ticks[0] or at > ticks[-1]:
@@ -254,7 +277,7 @@ def main():
         last = p
     check(bool(errs), f'B has {len(errs)} measured samples of A, who moved {moved:.1f} m')
     if jumps:
-        print(f'     A went through a gate {len(jumps)} time(s) (a jump of 50 m or more in the server\'s path); {skipped} of B\'s samples within 8 ticks of one are not measured')
+        print(f'     A went through a gate or was set down {len(jumps)} time(s) (a jump of {jump_min:.0f} m or more in the server\'s path); {skipped} of B\'s samples within 8 ticks of one are not measured')
     if errs:
         errs.sort()
         print(f'     B vs the server path of A: worst {errs[-1]:.3f} m, 95th percentile {errs[int(len(errs)*0.95)]:.3f} m, mean {sum(errs)/len(errs):.3f} m')
@@ -285,7 +308,12 @@ def main():
         verrs = []
         vmoved = 0.0
         vlast = None
+        # (the Minotaur is put back at its place by the creatures' walk, 20 m or so: B draws across it as it draws a gate's jump; not measured)
+        vjumps = [vticks[i] for i in range(1, len(vticks))
+                  if ((vpos[i][0] - vpos[i - 1][0]) ** 2 + (vpos[i][1] - vpos[i - 1][1]) ** 2 + (vpos[i][2] - vpos[i - 1][2]) ** 2) ** 0.5 > 10.0] if args.creatures else []
         for at, qpc, p in vtv:
+            if any(abs(at - j) < 8 for j in vjumps):
+                continue
             if qpc < vq0 or at < vticks[0] or at > vticks[-1]:
                 continue
             sp = interp(vticks, vpos, at)
@@ -316,6 +344,33 @@ def main():
         check(bool(ap_) and int(ap_[-1][1]) == 1 and int(ap_[-1][2]) >= 2, f'A\'s own prediction crossed as the server did ({ap_[-1][2] if ap_ else "no report"} gates)')
         check(bool(bp) and int(bp[-1][1]) == 1 and int(bp[-1][3]) >= 2,
               f'B was told the glass opened and shown the thread ({bp[-1][3] if bp else "no report"} points)')
+        print('PASS' if ok else 'FAIL')
+        return 0 if ok else 1
+
+    # The creatures (--creatures): A asks the east guard the fellow-question (tick 260), is set down in the Worm's chamber (330), in the court where the
+    # Minotaur charges a pillar and staggers (1100) and before the Minotaur, which charges A, who jumps (1700). The server counts what happened; A and
+    # B were each told of it (the CREATURES lines: answers told, charges, staggers, vaults, shoves, the Worm's risings and lines, the roster)
+    if args.creatures:
+        sc = [l.split() for l in S if l.startswith('CREATURES ')]
+        ac = [l.split() for l in A if l.startswith('CREATURES ')]
+        bc = [l.split() for l in B if l.startswith('CREATURES ')]
+        check(bool(sc), 'the server reported the creatures')
+        if sc:
+            said, charges, hits, leaps, shoves, rises, talks = (int(v) for v in sc[-1][1:8])
+            print(f'     the server: {said} answer(s), {charges} charge(s), {hits} stagger(s), {leaps} vault(s), {shoves} shove(s), the Worm rose {rises} time(s) and said {talks} line(s)')
+            check(said == 1, f'the server answered A\'s one question ({said})')
+            check(rises >= 1 and talks >= 2, f'the Worm rose and talked ({rises} rising(s), {talks} line(s))')
+            check(charges >= 2 and hits >= 1, f'the Minotaur charged at the paint and ran into the pillar ({charges} charges, {hits} stagger(s))')
+            check(leaps == 1 and shoves == 0, f'A was vaulted over the Minotaur and not shoved ({leaps} vault(s), {shoves} shove(s))')
+            for who, rows in (('A', ac), ('B', bc)):
+                check(bool(rows), f'{who} reported what it was told of the creatures')
+                if rows:
+                    s2, c2, h2, l2, sh2, r2, t2, roster = (int(v) for v in rows[-1][1:9])
+                    print(f'     {who} was told: {s2} answer(s), {c2} charge(s), {h2} stagger(s), {l2} vault(s), {sh2} shove(s), the Worm rising {r2} time(s) and talking {t2}, a roster of {roster}')
+                    check(s2 == said and r2 == rises and t2 == talks, f'{who} was told every answer ({s2}) and every word of the Worm ({r2} risings, {t2} lines)')
+                    check(c2 == charges and h2 == hits and l2 == leaps and sh2 == shoves,
+                          f'{who} was told of every charge ({c2}), stagger ({h2}), vault ({l2}) and shove ({sh2}) the server made')
+                    check(roster == 3, f'{who} knew the three creatures ({roster})')
         print('PASS' if ok else 'FAIL')
         return 0 if ok else 1
 

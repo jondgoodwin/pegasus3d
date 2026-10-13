@@ -1,0 +1,351 @@
+// The creatures' part of a view (presentation: it only draws and listens, shared-island.md): what the simulation told of them
+// (ToView.Creature, creatures.cone) kept as a view needs it, and drawn: the Worm, whose body is a chain of spheres wriggling as a
+// closed form of the tick since it rose; the stars that circle the Minotaur's head while it is dazed; the words of a guard and the Worm
+// over their heads; and the sounds (a guard's voice, the Worm's squeak, the Minotaur's snort and hooves).
+//
+// The guards and the Minotaur themselves are beings of the cast, drawn as every being is, from the snapshot (creaturelook.cone
+// is how they look). What the simulation says here is only what no snapshot of bodies holds: who is who (CM_ROSTER), what was answered
+// (CM_SAID), and the Worm (it is not a being: CM_WORM, CM_WORM_SAYS). Nothing here is state a second client could disagree about.
+
+// A creature's own part and the extra parts of its look (the cloth, the bronze ...), which the view poses with the same skinning
+pub struct CreatureParts {
+  pub root PartId;
+  pub extras List[PartId];
+}
+
+// A being of the cast that is a creature, and which
+pub struct RosterRow {
+  pub being u32;
+  pub role u32;
+}
+
+// How long a guard's or the Worm's words stay over its head, ticks (6 s), and how far off they can be read, metres
+const SPEECH_TICKS = 360u64;
+pub const SPEECH_RANGE f32 = 18.;
+// The Worm's rise and sink, ticks
+const WORM_RISE_TICKS = 66.;
+const WORM_SINK_TICKS_F = 54.;
+// The Worm's full height, and the length of its mouth moving for a line, ticks
+const WORM_HEIGHT f32 = 1.2;
+const WORM_TALK_TICKS = 150u64;
+
+pub struct CreatureView {
+  pub roster List[RosterRow];
+  pub guardCode List[u32];      // the last line code each guard said (0: none yet), by guard
+  pub guardAt List[u64];        // and the tick it was said
+  pub wormUp bool;
+  pub wormEver bool;            // it has risen at least once
+  pub wormTick u64;             // the tick it rose
+  pub wormDownTick u64;         // and sank
+  pub wormLine u32;             // the last line it said
+  pub wormLineTick u64;         // and when
+  pub replySeq u32;             // answers this client's own question has had, and the last
+  pub reply u32;
+  pub messages u64;             // told, ever
+  pub said u32;                 // answers told (any visitor's)
+  pub wormTalks u32;
+  pub wormRises u32;
+  pub windups u32;              // what the Minotaur did, as told
+  pub charges u32;
+  pub hits u32;
+  pub pullups u32;
+  pub shoves u32;
+  pub leaps u32;
+  pub stands u32;
+  pub lastBull u32;             // the last BE_ event, and the tick it was told
+  pub lastBullAt u64;
+  pub asked bool;               // this client has asked its question
+  pub walkStage u32;            // --creature-walk's client: the set-ups it has asked for
+
+  pub fn make() CreatureView {
+    mut codes = List[u32].empty();
+    codes.push(0u32);
+    codes.push(0u32);
+    mut ats = List[u64].empty();
+    ats.push(0u64);
+    ats.push(0u64);
+    new CreatureView(List[RosterRow].empty(), codes, ats, false, false, 0u64, 0u64, 0u32, 0u64, 0u32, 0u32, 0u64, 0u32, 0u32,
+      0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u64, false, 0u32);
+  }
+
+  // The being that is creature 'role' (a guard 0 or 1, CR_MINOTAUR), or NO_ROW
+  pub fn beingOf(self &, role u32) usize {
+    mut i = 0usize;
+    while i < roster.len() {
+      if roster[i].role == role { return usize.from(roster[i].being); }
+      i = i + 1usize;
+    }
+    NO_ROW;
+  }
+
+  // The role of being 'being' (CR_NONE: it is no creature)
+  pub fn roleOf(self &, being usize) u32 {
+    mut i = 0usize;
+    while i < roster.len() {
+      if usize.from(roster[i].being) == being { return roster[i].role; }
+      i = i + 1usize;
+    }
+    CR_NONE;
+  }
+
+  // One ToView.Creature applied. 'now' is the tick of the newest snapshot, 'own' the being this client drives, 'cast' the beings drawn
+  // (their places, for the sounds)
+  pub fn apply(self &mut, kind u32, a u32, b u32, position Vec3, extra u32, now u64, own usize, cast &Cast, audio &mut AudioView) {
+    messages = messages + 1u64;
+    if kind == CM_ROSTER {
+      mut k = 0usize;
+      while k < roster.len() { if roster[k].being == a { roster.swap(k, roster.len() - 1usize); roster.pop(); } else { k = k + 1usize; } }
+      roster.push(new RosterRow(a, b));
+    } elif kind == CM_SAID {
+      said = said + 1u32;
+      if a < 2u32 {
+        guardCode.set(usize.from(a), extra);
+        guardAt.set(usize.from(a), now);
+        // the guard's voice, from its head: a low man's note, the blue guard's a little higher than the red's
+        imm gb = self.beingOf(a);
+        if gb < cast.beings.len() {
+          imm g = cast.beings[gb];
+          audio.voiceAt(g.body.position + new Vec3(0., 0.9 * g.figure.height, 0.), if a == CR_GUARD_W { 118.; } else { 98.; });
+        }
+      }
+      if usize.from(b) == own {
+        replySeq = replySeq + 1u32;
+        reply = extra;
+        asked = true;
+      }
+    } elif kind == CM_WORM {
+      if a == 1u32 {
+        wormUp = true;
+        wormEver = true;
+        wormTick = now;
+        wormRises = wormRises + 1u32;
+        audio.voiceAt(new Vec3(WORM_X, LAB_Y + 0.6, WORM_Z), 640.);
+      } else {
+        wormUp = false;
+        wormDownTick = now;
+      }
+    } elif kind == CM_WORM_SAYS {
+      wormLine = a;
+      wormLineTick = now;
+      wormTalks = wormTalks + 1u32;
+      audio.voiceAt(new Vec3(WORM_X, LAB_Y + 1.0, WORM_Z - 0.2), 560. + 70. * f32.from(a));
+    } elif kind == CM_BULL {
+      lastBull = a;
+      lastBullAt = now;
+      if a == BE_WINDUP { windups = windups + 1u32; audio.voiceAt(position + new Vec3(0., 1.9, 0.), 52.); }
+      elif a == BE_CHARGE { charges = charges + 1u32; audio.voiceAt(position + new Vec3(0., 1.9, 0.), 44.); }
+      elif a == BE_HIT { hits = hits + 1u32; audio.voiceAt(position + new Vec3(0., 1.6, 0.), 38.); }
+      elif a == BE_PULLUP { pullups = pullups + 1u32; audio.voiceAt(position + new Vec3(0., 1.9, 0.), 58.); }
+      elif a == BE_SHOVE { shoves = shoves + 1u32; audio.voiceAt(position + new Vec3(0., 1.9, 0.), 46.); }
+      elif a == BE_LEAP { leaps = leaps + 1u32; }
+      elif a == BE_STAND { stands = stands + 1u32; audio.voiceAt(position + new Vec3(0., 1.9, 0.), 60.); }
+    }
+  }
+
+  // The beings that are creatures marked so (the zap and the jig do not take them as targets)
+  pub fn mark(self &, cast &mut Cast) {
+    mut i = 0usize;
+    while i < roster.len() {
+      imm b = usize.from(roster[i].being);
+      if b < cast.beings.len() { cast.beings[b].creature = true; }
+      i = i + 1usize;
+    }
+  }
+
+  // What the HUD needs: the guard within reach of the being 'own' (CR_NONE if none), what this client's question has had
+  pub fn talkFrame(self &, cast &Cast, own usize) TalkFrame {
+    mut near = CR_NONE;
+    if own < cast.beings.len() and roster.len() > 0usize {
+      imm me = cast.beings[own].body.position;
+      if underground(me.y) {
+        mut best = TALK_RANGE;
+        mut g = 0u32;
+        while g < 2u32 {
+          imm gb = self.beingOf(g);
+          if gb < cast.beings.len() and !cast.beings[gb].gone {
+            imm gp = cast.beings[gb].body.position;
+            imm dx = me.x - gp.x;
+            imm dz = me.z - gp.z;
+            imm d = libc.sqrtf(dx * dx + dz * dz);
+            if d < best and libc.fabsf(me.y - gp.y) < 1.5 { best = d; near = g; }
+          }
+          g = g + 1u32;
+        }
+      }
+    }
+    new TalkFrame(near, asked, replySeq, reply);
+  }
+
+  // What a creature being says now, over its head (empty: nothing)
+  pub fn speech(self &, being usize, now u64) String {
+    imm role = self.roleOf(being);
+    if role < 2u32 {
+      imm k = usize.from(role);
+      if guardCode[k] != 0u32 and now - guardAt[k] < SPEECH_TICKS {
+        mut s = String.from("Guard: ");
+        imm said = guardSays(*guardCode[k]);
+        s.append(said.view());
+        return s;
+      }
+    }
+    String.empty();
+  }
+
+  // The Worm's words, as a plate over its head when it has just spoken: its place, and the line
+  pub fn wormPlate(self &, now u64, at &mut Vec3, text &mut String) bool {
+    if !wormUp or wormLine == 0u32 or now - wormLineTick >= SPEECH_TICKS { return false; }
+    *at = new Vec3(WORM_X, LAB_Y + WORM_HEIGHT + 0.5, WORM_Z - 0.2);
+    *text = String.from("Worm: ");
+    text.append(wormSays(wormLine).view());
+    true;
+  }
+
+  // The spheres to draw this frame: the Worm if it has risen (or is sinking), and the stars about the Minotaur's head while it is dazed
+  pub fn bits(self &, now u64, cast &Cast, out &mut List[BitDraw]) {
+    out.clear();
+    if wormEver { self.worm(now, out); }
+    // The stars: the Minotaur under FX_STAGGER (the spell the snapshot lists is in force on its figure here: playview.cone), a ring of
+    // them turning about its head
+    imm bull = self.beingOf(CR_MINOTAUR);
+    if bull < cast.beings.len() {
+      imm b = cast.beings[bull];
+      if b.figure.fxKind == FX_STAGGER and b.figure.fxT < STAGGER_SECONDS - 0.5 {
+        imm age = b.figure.fxT;
+        imm head = b.body.position + new Vec3(0., 1.12 * b.figure.height, 0.);
+        mut k = 0usize;
+        while k < 5usize {
+          imm ang = age * 4.2 + 2. * pi * f32.from(k) / 5.;
+          imm at = head + new Vec3(0.52 * libc.cosf(ang), 0.06 * libc.sinf(ang * 2.), 0.52 * libc.sinf(ang));
+          out.push(new BitDraw(Mat4.fromTrs(at, Quat.identity(), new Vec3(0.11, 0.11, 0.11)), new Color(40., 32., 6., 1.), true));
+          k = k + 1usize;
+        }
+      }
+    }
+  }
+
+  // The Worm: ten spheres from a hole in the floor, rising as it comes up, swaying all the while, with a head, two eyes and a mouth
+  fn worm(self &, now u64, out &mut List[BitDraw]) {
+    imm t = f32.from(now) / 60.;
+    mut rise = 1.;
+    if wormUp {
+      imm u = fclamp(f32.from(now - wormTick) / WORM_RISE_TICKS, 0., 1.);
+      // up with a little overshoot
+      rise = 1. + 2.70158 * (u - 1.) * (u - 1.) * (u - 1.) + 1.70158 * (u - 1.) * (u - 1.);
+      if u < 0.001 { rise = 0.; }
+    } else {
+      imm u = fclamp(f32.from(now - wormDownTick) / WORM_SINK_TICKS_F, 0., 1.);
+      rise = 1. - u * u * (3. - 2. * u);
+      if rise <= 0.001 { return; }
+    }
+    imm floor = LAB_Y;
+    // the hole it comes up from: a flat black disc
+    out.push(new BitDraw(Mat4.fromTrs(new Vec3(WORM_X, floor + 0.012, WORM_Z), Quat.identity(), new Vec3(0.42, 0.012, 0.42)), new Color(0.01, 0.008, 0.008, 1.), false));
+    imm n = 11usize;
+    mut head = new Vec3(WORM_X, floor, WORM_Z);
+    mut i = 0usize;
+    while i < n {
+      imm s = f32.from(i) / f32.from(n - 1usize);
+      imm sway = libc.sinf(2. * pi * (0.55 * t - 0.9 * s));
+      imm swayZ = libc.cosf(2. * pi * (0.55 * t - 0.9 * s));
+      // the body leans towards the door (-z) as it rises, wriggling about its line
+      imm p = new Vec3(WORM_X + 0.20 * s * sway * rise, floor + WORM_HEIGHT * rise * s, WORM_Z - 0.24 * s * s * rise + 0.08 * s * swayZ * rise);
+      imm r = (0.115 + 0.012 * s) * (if rise < 0.15 { rise / 0.15; } else { 1.; });
+      imm tint = if i % 2usize == 0usize { new Color(0.06, 0.2, 0.9, 1.); } else { new Color(0.03, 0.11, 0.6, 1.); };
+      out.push(new BitDraw(Mat4.fromTrs(p, Quat.identity(), new Vec3(r, r, r)), tint, false));
+      head = p;
+      i = i + 1usize;
+    }
+    // the head: a bigger sphere, bobbing when it speaks, with eyes that look at the door and a mouth that opens and shuts
+    imm talking = wormLine != 0u32 and now - wormLineTick < WORM_TALK_TICKS;
+    imm bob = if talking { 0.03 * libc.fabsf(libc.sinf(t * 13.)); } else { 0.; };
+    imm hp = head + new Vec3(0., 0.05 + bob, -0.02);
+    out.push(new BitDraw(Mat4.fromTrs(hp, Quat.identity(), new Vec3(0.17, 0.155, 0.17)), new Color(0.1, 0.3, 1., 1.), false));
+    out.push(new BitDraw(Mat4.fromTrs(hp + new Vec3(0.075, 0.05, -0.135), Quat.identity(), new Vec3(0.052, 0.058, 0.04)), new Color(1., 1., 1., 1.), false));
+    out.push(new BitDraw(Mat4.fromTrs(hp + new Vec3(-0.075, 0.05, -0.135), Quat.identity(), new Vec3(0.052, 0.058, 0.04)), new Color(1., 1., 1., 1.), false));
+    out.push(new BitDraw(Mat4.fromTrs(hp + new Vec3(0.078, 0.048, -0.172), Quat.identity(), new Vec3(0.026, 0.03, 0.02)), new Color(0.01, 0.01, 0.015, 1.), false));
+    out.push(new BitDraw(Mat4.fromTrs(hp + new Vec3(-0.072, 0.048, -0.172), Quat.identity(), new Vec3(0.026, 0.03, 0.02)), new Color(0.01, 0.01, 0.015, 1.), false));
+    imm mouth = if talking { 0.012 + 0.03 * libc.fabsf(libc.sinf(t * 13.)); } else { 0.012; };
+    out.push(new BitDraw(Mat4.fromTrs(hp + new Vec3(0., -0.055, -0.14), Quat.identity(), new Vec3(0.06, mouth, 0.03)), new Color(0.35, 0.02, 0.04, 1.), false));
+  }
+}
+
+// The net check's client (--creature-walk): the messages for the simulation at local tick 'tick', or none. At 200 it asks to be set down
+// before the guards; at 260 it asks the east guard the fellow-question; at 330 it is set down in the Worm's chamber; at 1100 in the court,
+// where paint is heard and the Minotaur charges a pillar; at 1700 before the Minotaur, which is roused to charge at it
+pub fn creatureWalkActs(cv &mut CreatureView, tick u64) List[List[u8]] {
+  mut out = List[List[u8]].empty();
+  imm none = new Vec3(0., 0., 0.);
+  imm s = cv.walkStage;
+  if s == 0u32 and tick >= 200u64 {
+    out.push(encodeToSim(ToSim.Play(PLAY_CREATURE_TEST, 1u32, NO_TARGET, none, none)));
+    cv.walkStage = 1u32;
+  } elif s == 1u32 and tick >= 260u64 {
+    out.push(encodeToSim(ToSim.Play(PLAY_TALK, Q_OTHER, CR_GUARD_E, none, none)));
+    cv.walkStage = 2u32;
+  } elif s == 2u32 and tick >= 330u64 {
+    out.push(encodeToSim(ToSim.Play(PLAY_CREATURE_TEST, 2u32, NO_TARGET, none, none)));
+    cv.walkStage = 3u32;
+  } elif s == 3u32 and tick >= 1100u64 {
+    out.push(encodeToSim(ToSim.Play(PLAY_CREATURE_TEST, 3u32, NO_TARGET, none, none)));
+    cv.walkStage = 4u32;
+  } elif s == 4u32 and tick >= 1700u64 {
+    out.push(encodeToSim(ToSim.Play(PLAY_CREATURE_TEST, 4u32, NO_TARGET, none, none)));
+    cv.walkStage = 5u32;
+  }
+  out;
+}
+
+// ... and its jump: from the last set-up on, when the Minotaur it sees coming is between 1.4 and 4 m off, as the player would
+pub fn creatureWalkIntents(cv &CreatureView, cast &Cast, own usize, tick u64) Intents {
+  if cv.walkStage >= 5u32 and own < cast.beings.len() {
+    imm bull = cv.beingOf(CR_MINOTAUR);
+    if bull < cast.beings.len() {
+      imm a = cast.beings[own].body.position;
+      imm b = cast.beings[bull].body.position;
+      imm dx = a.x - b.x;
+      imm dz = a.z - b.z;
+      imm d = libc.sqrtf(dx * dx + dz * dz);
+      if d > 1.4 and d < 4. { return new Intents(0., 0., false, true); }
+    }
+  }
+  Intents.none();
+}
+
+// The spheres as they are drawn: a unit sphere of render's, in a plain lit material for the Worm and an emissive one for the stars, each
+// tinted its colour (render system's, made when first wanted)
+pub struct CreatureDraw {
+  pub sphere MeshHandle;
+  pub lit MaterialHandle;
+  pub glow MaterialHandle;
+  pub made bool;
+  pub drawn usize;             // spheres in the last draw list
+
+  pub fn make() CreatureDraw { new CreatureDraw(MeshHandle.none(), MaterialHandle.none(), MaterialHandle.none(), false, 0usize); }
+
+  pub fn draw(self &mut, renderer &mut Renderer, device &mut Device, list &mut DrawList, bits &List[BitDraw]) {
+    drawn = 0usize;
+    if bits.len() == 0usize { return; }
+    if !made {
+      made = true;
+      imm ball = mesh.Mesh.sphere(1., 16);
+      sphere = renderer.addMesh(device, &ball);
+      mut m = Material.plain(new Color(1., 1., 1., 1.));
+      m.specular = new Color(0.35, 0.35, 0.35, 1.);
+      m.shininess = 48.;
+      lit = renderer.addMaterial(device, &m);
+      mut g = Material.plain(new Color(0.05, 0.05, 0.05, 1.));
+      g.emissive = new Color(1., 1., 1., 1.);
+      glow = renderer.addMaterial(device, &g);
+    }
+    mut i = 0usize;
+    while i < bits.len() {
+      imm b = bits[i];
+      list.addTinted(sphere, if b.glow { glow; } else { lit; }, b.model, b.tint);
+      if b.glow { list.dontCastShadow(); }
+      // (in the labyrinth: its layer, so that a picture of the island leaves them out)
+      if underground(b.model.m[13]) { list.setLayers(list.len() - 1usize, LAB_LAYER); }
+      drawn = drawn + 1usize;
+      i = i + 1usize;
+    }
+  }
+}

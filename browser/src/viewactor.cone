@@ -265,6 +265,8 @@ pub struct ViewState {
   heldTotal u64;              // bytes of upload (estimated) the held back have cost render so far this backlog
   heldFrames u32;             // and the frames it has taken
   heldStartedAt u64;          // when it began (the performance counter)
+  pub creature CreatureView;  // the labyrinth's creatures, as the simulation told them (creatureview.cone)
+  pub creatureParts List[CreatureParts];   // the extra parts of each creature's body, to pose with it
   pub possessedSeen bool = false;   // a server's Possessed has arrived: it has taken this client in (goOnline waits for it)
   pub shotFrame u64 = 0u64;   // the test hook's (--switch-at): the frame the "switch-after" view is saved at
 
@@ -278,7 +280,7 @@ pub struct ViewState {
       new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
       List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64,
       PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, PortalView.make(), playerName, String.empty(), false, List[NameTag].empty(),
-      land, opts, String.empty(), List[Request].empty(), 0u64, 0u32, 0u64);
+      land, opts, String.empty(), List[Request].empty(), 0u64, 0u32, 0u64, CreatureView.make(), List[CreatureParts].empty());
   }
 
   // Reliable messages sent to the simulation, ever
@@ -389,13 +391,19 @@ pub struct ViewState {
       mut au = 0usize;
       while au < autos.len() { net.sendReliable(1u32, copyBytes(autos[au])); au = au + 1usize; }
     }
+    // The creatures test (--creature-walk): the client asks the simulation for each set-up of its walk, and talks to a guard
+    if opts.creatureWalk and joined and ownReady {
+      imm acts = creatureWalkActs(&mut creature, localTick);
+      mut ca = 0usize;
+      while ca < acts.len() { net.sendReliable(1u32, copyBytes(acts[ca])); ca = ca + 1usize; }
+    }
     // The steps: one input a step, numbered; the user's body and the camera follow it at once, and the birds fly on
     mut i = 0usize;
     while i < input.steps.len() {
       imm step = *input.steps[i];
       if joined {
         seq = seq + 1u64;
-        imm sample = new InputSample(seq, input.intents, input.lookKeys);
+        imm sample = new InputSample(seq, if opts.creatureWalk { creatureWalkIntents(&creature, &cast, own, localTick); } else { input.intents; }, input.lookKeys);
         recent.push(sample);
         self.stepOwn(sample, step);
       }
@@ -531,6 +539,9 @@ pub struct ViewState {
           portal.apply(po.kind, po.being, po.position, po.extra);
           // The glass open: the notch in the cottage's wall is cut in this half's physics too
           if po.kind == PM_OPEN { cast.phys.setGlassOpen(po.extra == 1u32); }
+        }
+        case mut cr &mut Creature {
+          creature.apply(cr.kind, cr.a, cr.b, cr.position, cr.extra, lastState.tick, own, &cast, &mut audio);
         }
         case mut bu &mut Burst {
           playBurst(&mut play, bu.kind, bu.being, bu.position, bu.normal, bu.color, bu.tick);
@@ -932,6 +943,10 @@ pub struct ViewState {
     } elif spec.kind == OBJ_MANNEQUIN {
       imm root = door.newPart(spec.name.view());
       spawnMannequin(&mut door, spec.height, spec.color, root);
+    } elif spec.kind == OBJ_CREATURE {
+      imm root = door.newPart(spec.name.view());
+      imm extras = spawnCreature(&mut door, spec.index, spec.height, spec.color, root);
+      creatureParts.push(new CreatureParts(root, extras));
     } elif spec.kind == OBJ_TESTCUBE {
       buildTestCube(&mut door);
     }
@@ -1156,6 +1171,18 @@ pub struct ViewState {
         }
         if b.figure.active and known {
           forRender.push(Request.Bones(b.part, b.figure.skinning()));
+          // A creature's extra parts (its kilt, shield, horns ...) are posed by the same matrices
+          mut cp = 0usize;
+          while cp < creatureParts.len() {
+            if creatureParts[cp].root == b.part {
+              mut e = 0usize;
+              while e < creatureParts[cp].extras.len() {
+                forRender.push(Request.Bones(*creatureParts[cp].extras[e], b.figure.skinning()));
+                e = e + 1usize;
+              }
+            }
+            cp = cp + 1usize;
+          }
         }
       }
       i = i + 1usize;
@@ -1186,6 +1213,8 @@ pub struct ViewState {
     snapshot.weather = weather;
     snapshot.glassOpen = portal.open;
     portal.segments(&cast, &mut snapshot.thread);
+    creature.mark(&mut cast);
+    creature.bits(lastState.tick, &cast, &mut snapshot.bits);
     playSplats(&mut play, &cast, lastState.tick, &mut snapshot.splats);
     audioFromView(self, steps);   // the frame's sound (audioview.cone)
     snapshot.fixedView = testFixed;
@@ -1306,14 +1335,41 @@ pub struct ViewState {
     while t < tags.len() {
       imm being = usize.from(tags[t].being);
       if being != driven and being < cast.beings.len() and !cast.beings[being].gone and cast.beings[being].figure.active {
-        plates.push(new HudTag(cast.beings[being].body.position + new Vec3(0., 0.45 + cast.beings[being].figure.height, 0.), tags[t].name.copy()));
+        // (a guard that has just answered shows its words in place of its name)
+        mut shown = creature.speech(being, lastState.tick);
+        imm said = shown.len() > 0usize;
+        if !said { shown = tags[t].name.copy(); }
+        imm at = cast.beings[being].body.position + new Vec3(0., 0.45 + cast.beings[being].figure.height, 0.);
+        // (words are heard within 18 m, and not through a wall's worth of rooms: a plate for a line spoken further off is its name)
+        imm near = (at - cast.eyes().origin).length() < SPEECH_RANGE;
+        if said and !near { shown = tags[t].name.copy(); }
+        mut tag = new HudTag(at, shown);
+        tag.speech = said and near;
+        plates.push(tag);
       }
       t = t + 1usize;
+    }
+    // ... and the Worm's words over its head
+    {
+      mut wat = new Vec3(0., 0., 0.);
+      mut wtext = String.empty();
+      if creature.wormPlate(lastState.tick, &mut wat, &mut wtext) and (wat - cast.eyes().origin).length() < SPEECH_RANGE {
+        mut tag = new HudTag(wat, wtext);
+        tag.speech = true;
+        plates.push(tag);
+      }
     }
     // (a scripted run's frame time and step are not repeatable: it shows none, and steps by 1/60)
     mut hf = new HudFrame(hud.on, f32.from(hourAt(sceneNow)), weather.target, if opts.scripted { 0.; } else { hud.smoothMs; }, !lockstep, rttMs,
       you, yaw, others, input.hudSlots, if opts.scripted { 0.016666668; } else { hud.stepSeconds(); }, plates, cast.eyes(), FOV,
       copyPanelEvents(&input.panelEvents), input.panelHint and lockstep, String.empty());
+    {
+      imm tf = creature.talkFrame(&cast, driven);
+      hf.talkNear = tf.near;
+      hf.talkAsked = tf.asked;
+      hf.talkSeq = tf.replySeq;
+      hf.talkReply = tf.reply;
+    }
     // A Join that did not get in is told once (to the panel, which shows why)
     if joinFailed.len() > 0usize {
       hf.joinFailed = joinFailed.copy();
@@ -1539,6 +1595,11 @@ actor ViewActor {
     imm shown = await render.draw(order);
     mut p = shown;
     p.snapshot <=> st.snapshot;
+    // The question chosen on a guard's panel: asked of the simulation
+    if p.talk != 0u32 {
+      imm picked = p.talk - 1u32;
+      st.net.sendReliable(1u32, encodeToSim(ToSim.Play(PLAY_TALK, picked % 256u32, picked / 256u32, new Vec3(0., 0., 0.), new Vec3(0., 0., 0.))));
+    }
     mut seen = RenderFacts.empty();
     seen <=> p.facts;
     mut you = st.youBody();
@@ -1596,6 +1657,10 @@ actor ViewActor {
       print <- "FINAL "; print <- st.own; print <- " "; print <- i64.from(libc.floorf(fb.position.x * 1000. + 0.5)); print <- " ";
       print <- i64.from(libc.floorf(fb.position.y * 1000. + 0.5)); print <- " "; print <- i64.from(libc.floorf(fb.position.z * 1000. + 0.5)); print <- "\n";
       playReport(&st.play);
+      // The creatures, as this view was told (the net check compares it with the server's own line)
+      print <- "CREATURES "; print <- st.creature.said; print <- " "; print <- st.creature.charges; print <- " "; print <- st.creature.hits; print <- " ";
+      print <- st.creature.leaps; print <- " "; print <- st.creature.shoves; print <- " "; print <- st.creature.wormRises; print <- " ";
+      print <- st.creature.wormTalks; print <- " "; print <- st.creature.roster.len(); print <- "\n";
       print <- "Scene: "; print <- st.scene.partCount(); print <- " parts live, "; print <- st.worldBuilt; print <- " world objects built here, ";
       print <- st.cast.beings.len(); print <- " beings\n";
       {

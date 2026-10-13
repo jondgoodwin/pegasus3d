@@ -283,6 +283,7 @@ pub struct SimState {
   pub opts RunOptions;        // what the arguments say that this actor acts on (--no-npcs, --trace, --hud-only, --audio-walk)
   pub portal PortalSim;       // the looking-glass, the puppet, Ariadne's threads (portalsim.cone)
   pub portalRunOk bool;       // the scripted run's: the portal's part has held (portalscript.cone)
+  pub creatures CreatureSim;  // the labyrinth's guards, Worm and Minotaur (creatures.cone)
 
   pub fn make(opts RunOptions, birds Birds, serve bool, land Island) SimState {
     imm scripted = opts.scripted;
@@ -293,7 +294,7 @@ pub struct SimState {
       0u64, Weathering.fair(), Weathering.fair(), false, 0u64, ReplayLog.empty(), List[Intents].empty(), List[bool].empty(),
       0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step].empty(), false, 0u64, 0u64, Village.empty(),
       Route.make(), List[f32].empty(), Assembly.make(), Ride.make(), ScriptRun.make(), FallRun.make(), true, true, true, PlaySim.empty(),
-      List[Pending].empty(), List[HangUp].empty(), land, opts, PortalSim.make(), true);
+      List[Pending].empty(), List[HangUp].empty(), land, opts, PortalSim.make(), true, CreatureSim.make());
   }
 
   // The possessed being's body: where the user is (single player)
@@ -388,9 +389,74 @@ pub struct SimState {
     // The villagers live here from the start, in every mode but a scripted run, whose pictures (and checks) of the rest
     // of the world they would otherwise stand in; it makes them at the start of its own part (npcscript.cone)
     if !scripted { self.seedVillage(); }
+    // The labyrinth's creatures likewise: in a scripted run they are made at the start of their own part (creaturescript.cone)
+    if (!scripted or opts.withCreatures) and opts.npcsEnabled { self.seedCreatures(); }
     cast.look(1. / 60.);
     print <- "Scene: "; print <- scene.partCount(); print <- " parts reserved, ";
     print <- scene.waiting(); print <- " requests waiting\n";
+  }
+
+  // A creature of the labyrinth: a mannequin with a look of its own (creaturelook.cone) made, shown, added to the cast, and its
+  // name plate ('tag') given; the index of its being. It is the simulation's (an ai being), no target of the zap and the jig
+  fn addCreatureBeing(self &mut, name &str, tag &str, look u32, at Vec3, yaw f32, height f32, seed u32, color Color) usize {
+    scene.door.beginObject();
+    imm root = scene.newPart(name);
+    imm extras = spawnCreature(&mut scene.door, look, height, color, root);
+    imm spec = new ObjectSpec(OBJ_CREATURE, look, height, color, String.from(name));
+    scene.door.endObject(spec);
+    imm index = cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, List[PartId].empty())));
+    scene.send(Request.BeingAdded(u32.from(index), root, false, height, seed, String.from(tag)));
+    cast.beings[index].ai = true;
+    cast.beings[index].creature = true;
+    index;
+  }
+
+  // The labyrinth's creatures made: the two guards on their plinths in the Hall of Two Doors, the Minotaur in the Bull Court before the
+  // east door, and the lie/truth puzzle drawn (a fixed draw in a scripted run, else from the clock)
+  pub fn seedCreatures(self &mut) {
+    if creatures.on { return; }
+    imm guardSkin = new Color(0.2, 0.07, 0.035, 1.);
+    imm bullSkin = new Color(0.022, 0.012, 0.009, 1.);
+    imm gw = self.addCreatureBeing("guard west", "Guard", CL_GUARD_W, new Vec3(LAB_GUARD_LEFT_X, LAB_Y + 0.22, LAB_GUARD_Z), 0., 1.82, 71u32, guardSkin);
+    imm ge = self.addCreatureBeing("guard east", "Guard", CL_GUARD_E, new Vec3(LAB_GUARD_RIGHT_X, LAB_Y + 0.22, LAB_GUARD_Z), 0., 1.78, 73u32, guardSkin);
+    imm home = bullHome();
+    imm bull = self.addCreatureBeing("minotaur", "Minotaur", CL_MINOTAUR, home, 1.5707964, BULL_HEIGHT, 79u32, bullSkin);
+    creatures.made(gw, ge, bull, if scripted { 128u32; } else { u32.from(sdl.GetPerformanceCounter() & 0xFFFFFFFFu64); });
+    creatures.body.pos = new Vec2(home.x, home.z);
+    creatures.lastPos = new Vec2(home.x, home.z);
+    while given.len() < cast.beings.len() { given.push(Intents.none()); stepIt.push(true); }
+    print <- "The creatures: guards "; print <- gw; print <- " and "; print <- ge; print <- ", the Minotaur "; print <- bull; print <- "; the "; print <- if creatures.liar == 0u32 { "west"; } else { "east"; };
+    print <- " guard lies; their navigation mesh has "; print <- creatures.nav.polygons; print <- " polygons, built in "; print <- f64.from(creatures.nav.buildNs) / 1000000d; print <- " ms\n";
+  }
+
+  // The beings the clients drive (and so what the creatures take as visitors)
+  fn drivenBeings(self &) List[usize] {
+    mut driven = List[usize].empty();
+    mut c = 0usize;
+    while c < clients.len() {
+      driven.push(clients[c].being);
+      c = c + 1usize;
+    }
+    driven;
+  }
+
+  // A client's request to talk to guard 'g' with question 'q' (PLAY_TALK): answered, to every view, if the client's being is near the guard
+  fn talkFor(self &mut, id u32, g u32, q u32) {
+    imm k = self.clientAt(id);
+    if k == NO_ROW { return; }
+    imm who = clients[k].being;
+    if who >= cast.beings.len() { return; }
+    imm line = creatures.talk(who, cast.beings[who].body.position, g, q);
+    print <- "Talk: being "; print <- who; print <- " asked guard "; print <- g; print <- " question "; print <- q; print <- ": ";
+    if line == 0u32 { print <- "not heard\n"; } else { printStr(guardSays(line).view()); print <- "\n"; }
+  }
+
+  // The net check's client (--creature-walk) asks for the next set-up of its walk through the creatures' places (creaturethink.cone)
+  fn creatureTestFor(self &mut, id u32, stage u32) {
+    imm k = self.clientAt(id);
+    if k == NO_ROW { return; }
+    creatureStage(&mut creatures, &mut cast, clients[k].being, stage, tick);
+    print <- "The creature test: client "; print <- id; print <- "'s being set up for stage "; print <- stage; print <- "\n";
   }
 
   // A villager: a mannequin made, shown, added to the cast and given to the village's minds
@@ -474,6 +540,14 @@ pub struct SimState {
     mut ti = 0usize;
     while ti < told.len() {
       net.sendReliable(id, encodePortal(told[ti]));
+      ti = ti + 1usize;
+    }
+    // The creatures: which beings they are, and the Worm if it is up
+    mut seen = List[CreatureInfo].empty();
+    creatures.replay(&mut seen);
+    ti = 0usize;
+    while ti < seen.len() {
+      net.sendReliable(id, encodeCreature(seen[ti]));
       ti = ti + 1usize;
     }
   }
@@ -586,6 +660,9 @@ pub struct SimState {
       mut th = 0usize;
       while th < portal.threads.len() { points = points + portal.threads[th].pts.len(); th = th + 1usize; }
       print <- "PORTAL "; print <- i64.from(portal.open); print <- " "; print <- portal.crossings; print <- " "; print <- points; print <- "\n";
+      // The creatures, for the net check: answers given, charges, staggers, vaults, shoves, the Worm's risings and lines
+      print <- "CREATURES "; print <- creatures.said; print <- " "; print <- creatures.charges; print <- " "; print <- creatures.hits; print <- " ";
+      print <- creatures.leaps; print <- " "; print <- creatures.shoves; print <- " "; print <- creatures.wormRises; print <- " "; print <- creatures.wormTalks; print <- "\n";
     }
     if serve {
       imm b = &mut cast.beings[cb];
@@ -630,7 +707,10 @@ pub struct SimState {
           case mut c &mut Command { commands.push(c.kind); }
           case mut k &mut Click { clicksIn.push(k.part); }
           case mut pl &mut Play {
-            if pl.kind == PLAY_PORTAL_TEST { self.portalTestFor(m.id); } else { play.receive(m.id, pl.kind, pl.spell, pl.target, pl.eye, pl.dir); }
+            if pl.kind == PLAY_PORTAL_TEST { self.portalTestFor(m.id); }
+            elif pl.kind == PLAY_TALK { self.talkFor(m.id, pl.target, pl.spell); }
+            elif pl.kind == PLAY_CREATURE_TEST { self.creatureTestFor(m.id, pl.spell); }
+            else { play.receive(m.id, pl.kind, pl.spell, pl.target, pl.eye, pl.dir); }
           }
           case mut f &mut Frame {
             frameAsked = true;
@@ -717,9 +797,25 @@ pub struct SimState {
       village.step(&land, &cast, &mut given, step.dt);
       // The reflection that walked off down the corridor decides its steps (portalsim.cone)
       portalIntents(&mut portal, &mut cast, &mut given, tick);
+      // The labyrinth's creatures decide theirs (the guards turn to a visitor, the Minotaur patrols and charges); a being in a vault or a
+      // shove is carried along its curve, not stepped
+      {
+        imm driven = self.drivenBeings();
+        creaturesIntents(&mut creatures, &mut cast, &mut given, &mut stepIt, &driven, &mut play, tick, step.dt);
+      }
       // A being under a spell is held: a convulsion or a dance is not steered
       playHold(&mut play, &mut given, tick);
       cast.stepEach(&given, &stepIt, step.dt, self.legacy());
+      {
+        imm driven = self.drivenBeings();
+        creaturesAfter(&mut creatures, &mut cast, &driven, &mut play, tick, step.dt);
+        mut ci = 0usize;
+        while ci < creatures.out.len() {
+          self.tellAll(encodeCreature(creatures.out[ci]));
+          ci = ci + 1usize;
+        }
+        creatures.out.clear();
+      }
       // A backlog of a client's inputs is run off, two a tick
       c = 0usize;
       while !lockstep and c < clients.len() {
@@ -826,6 +922,18 @@ pub struct SimState {
       print <- millimetres(b.body.position.x); print <- " "; print <- millimetres(b.body.position.y); print <- " ";
       print <- millimetres(b.body.position.z); print <- "\n";
       c = c + 1usize;
+    }
+    // and each of the labyrinth's creatures, the same line
+    if creatures.on {
+      c = 0usize;
+      while c < 3usize {
+        imm ci = if c < 2usize { *creatures.guards[c]; } else { creatures.bull; };
+        imm b = cast.beings[ci];
+        print <- "TN "; print <- tick; print <- " "; print <- sdl.GetPerformanceCounter(); print <- " "; print <- ci; print <- " ";
+        print <- millimetres(b.body.position.x); print <- " "; print <- millimetres(b.body.position.y); print <- " ";
+        print <- millimetres(b.body.position.z); print <- "\n";
+        c = c + 1usize;
+      }
     }
   }
 
@@ -1004,7 +1112,7 @@ pub struct SimState {
     mut fov = FOV;
     if fixedView {
       look = viewAt(self, frameNo);
-      fov = if labIn(&opts, frameNo) { labViewFov(&opts, frameNo); } else { viewFov(&asm, frameNo); };
+      fov = if creaturesIn(&opts, frameNo) { creaturesViewFov(&opts, frameNo); } elif labIn(&opts, frameNo) { labViewFov(&opts, frameNo); } else { viewFov(&asm, frameNo); };
     }
     imm test = new TestView(fixedView, look, fov, String.from(shotAt(&opts, &asm, frameNo)));
     mut c = 0usize;
@@ -1161,13 +1269,15 @@ pub struct SimState {
       rendered = seen;
       // (the panel-only run checks the script's first 100 frames and none after: what the later ones check is not run)
       // (nor does the labyrinth-only run, from where its part begins: its own checks are run.labOk)
-      if !(opts.panelOnly and f.frame >= PANEL_FROM) and !(opts.labOnly and f.frame >= labFrom(&opts)) {
+      if !(opts.panelOnly and f.frame >= PANEL_FROM) and !(opts.labOnly and f.frame >= labFrom(&opts))
+        and !(opts.creaturesOnly and f.frame >= creaturesFrom(&opts)) {
         if !checkScript(self, f.frame, &you) {
           if scriptOk { print <- "Script: the checks of frame "; print <- f.frame; print <- " failed\n"; }
           scriptOk = false;
         }
       }
       if opts.labOnly and !run.labOk { scriptOk = false; }
+      if opts.creaturesOnly and !run.creaturesOk { scriptOk = false; }
       driveScene(self, f.frame);
       pushScript(&opts, f.frame + 1u64);
       pushClicks(self, f.frame + 1u64, &you);

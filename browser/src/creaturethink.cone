@@ -1,0 +1,455 @@
+// The creatures' minds, stepped with the beings (creatures.cone has the state and the puzzle's logic; the header there says what the
+// guards, the Worm and the Minotaur do). Two entry points, both the simulation's, called from simactor.cone's step:
+//
+//   creaturesIntents   before the beings are stepped: each creature's intents (the guards turn to face a visitor, the Minotaur patrols,
+//                      winds up and charges), the splats of paint heard, the bull-leap taken, and the beings in a forced move held
+//   creaturesAfter     after they are stepped: what the charge ran into, the shove, the forced moves carried on, the Worm, and the
+//                      visitors who have gone up out of the labyrinth let go of what they had (their question, the bull's respect)
+
+// The distance on the ground plane between two places
+fn crFlat(a Vec3, b Vec3) f32 {
+  imm dx = a.x - b.x;
+  imm dz = a.z - b.z;
+  libc.sqrtf(dx * dx + dz * dz);
+}
+
+// The heading (walk.cone's: 0 faces -z) that faces from (ax, az) to (bx, bz)
+fn headingTo(ax f32, az f32, bx f32, bz f32) f32 { libc.atan2f(0. - (bx - ax), 0. - (bz - az)); }
+
+fn clamp1(x f32) f32 { if x > 1. { 1.; } elif x < -1. { -1.; } else { x; }; }
+
+// A being that is turned to the heading 'want' as its own turn does, quantised as the snapshot carries intents
+fn crTurn(yaw f32, want f32, dt f32) f32 {
+  imm err = wrapPi(want - yaw);
+  if libc.fabsf(err) < 0.03 { return 0.; }
+  quantise(clamp1(err / (TURN_RATE * dt)));
+}
+
+// The Minotaur roused at tick 'tick' by 'target' (a place, or the being 'targetBeing' if not NO_ROW)
+fn bullRouse(c &mut CreatureSim, cast &Cast, target Vec2, targetBeing usize, tick u64) {
+  c.mode = BM_WINDUP;
+  c.modeSince = tick;
+  c.target = target;
+  c.targetBeing = targetBeing;
+  c.havePath = false;
+  c.low = 0u32;
+  c.body.vel = new Vec2(0., 0.);
+  c.winds = c.winds + 1u32;
+  imm p = cast.beings[c.bull].body.position;
+  c.tell(CM_BULL, BE_WINDUP, if targetBeing != NO_ROW { u32.from(targetBeing); } else { CR_NONE; }, p, u32.from(tick & 0xFFFFFFFFu64));
+}
+
+// A route from the Minotaur to a place on the labyrinth's mesh
+fn bullPlan(c &mut CreatureSim, from Vec2, to Vec2) bool {
+  c.path.clear();
+  c.follower.restart();
+  imm ok = labRoute(&mut c.nav, new Vec3(from.x, LAB_Y, from.y), new Vec3(to.x, LAB_Y, to.y), &mut c.path);
+  c.havePath = ok;
+  ok;
+}
+
+// The Minotaur's round: four places before the east door
+fn patrolPlace(k usize) Vec2 {
+  imm i = k % 4usize;
+  if i == 0usize { return new Vec2(35., 388.); }
+  if i == 1usize { return new Vec2(35., 398.); }
+  if i == 2usize { return new Vec2(25., 401.); }
+  new Vec2(25., 386.);
+}
+
+// Where the Minotaur stands at the start (and its first heading, facing west)
+pub fn bullHome() Vec3 { new Vec3(30., LAB_Y, 391.); }
+
+// The patrol's step: dwell, or follow the route to the next place
+fn bullPatrol(c &mut CreatureSim, cast &Cast, pos Vec2, yaw f32, spd f32, dt f32) Intents {
+  c.body.pos = pos;
+  if c.dwell > 0. {
+    c.dwell = c.dwell - dt;
+    c.body.vel = new Vec2(0., 0.);
+    return Intents.none();
+  }
+  if !c.havePath {
+    if !bullPlan(c, pos, patrolPlace(c.patrolK)) {
+      c.patrolK = c.patrolK + 1usize;
+      c.dwell = 1.;
+      return Intents.none();
+    }
+  }
+  imm wasWish = c.body.vel.length();
+  if wasWish > spd + 0.8 { c.body.vel = c.body.vel * ((spd + 0.8) / wasWish); }
+  imm a = c.follower.accel(c.body.pos, c.body.vel, c.path.view(), c.body.maxAccel, c.body.maxSpeed, 0.5, 1.2, 0.6, 2.5);
+  c.body.integrate(a, dt);
+  if c.follower.done {
+    c.havePath = false;
+    c.patrolK = c.patrolK + 1usize;
+    c.dwell = 2.5;
+  }
+  intentsFor(yaw, c.body.vel, dt);
+}
+
+// Whether being 'b' of the cast is somewhere the Minotaur may rouse at: in the labyrinth, standing, in the court
+fn inCourt(p Vec3) bool {
+  underground(p.y) and p.x > COURT_X0 - 1. and p.x < COURT_X1 + 1. and p.z > COURT_Z0 - 1. and p.z < COURT_Z1 + 1.;
+}
+
+// One step of the Minotaur's mind: its intents for this step, written into 'given'
+fn bullThink(c &mut CreatureSim, cast &mut Cast, given &mut List[Intents], driven &List[usize], play &mut PlaySim, tick u64, dt f32) {
+  imm bi = c.bull;
+  if bi == NO_ROW or bi >= cast.beings.len() { return; }
+  imm bb = cast.beings[bi];
+  imm p3 = bb.body.position;
+  imm pos = new Vec2(p3.x, p3.z);
+  imm yaw = bb.body.yaw;
+  imm spd = if bb.figure.grounded { bb.figure.speed; } else { 0.; };
+  // The paint heard: the last splat in the court rouses it (not while it staggers or already charges)
+  if play.splats.len() > 0usize {
+    if c.mode == BM_PATROL or c.mode == BM_RECOVER {
+      mut k = 0usize;
+      while k < play.splats.len() {
+        imm s = *play.splats[k];
+        k = k + 1usize;
+        if !inCourt(s.point) { continue; }
+        if s.onBeing == bi {
+          // paint on the Minotaur itself: it charges the one who threw it
+          if s.caster < cast.beings.len() and !cast.beings[s.caster].gone {
+            imm cp = cast.beings[s.caster].body.position;
+            bullRouse(c, cast, new Vec2(cp.x, cp.z), s.caster, tick);
+          }
+        } else {
+          bullRouse(c, cast, new Vec2(s.point.x, s.point.z), NO_ROW, tick);
+        }
+      }
+    }
+    play.splats.clear();
+  }
+  mut it = Intents.none();
+  if c.mode == BM_PATROL {
+    // A visitor within reach that it has not been outwitted by rouses it
+    if tick >= c.cool {
+      mut d = 0usize;
+      while d < driven.len() and c.mode == BM_PATROL {
+        imm who = *driven[d];
+        d = d + 1usize;
+        if who >= cast.beings.len() or cast.beings[who].gone or !cast.beings[who].figure.active { continue; }
+        imm wp = cast.beings[who].body.position;
+        if c.hasPassed(who) or c.forcedOf(who) or !inCourt(wp) or libc.fabsf(wp.y - p3.y) > 2.5 { continue; }
+        if crFlat(wp, p3) < BULL_NOTICE { bullRouse(c, cast, new Vec2(wp.x, wp.z), who, tick); }
+      }
+    }
+    if c.mode == BM_PATROL { it = bullPatrol(c, cast, pos, yaw, spd, dt); }
+  }
+  if c.mode == BM_WINDUP {
+    // Turning to face the target (a visitor, as it stands), pawing the ground
+    if c.targetBeing != NO_ROW and c.targetBeing < cast.beings.len() {
+      imm tp = cast.beings[c.targetBeing].body.position;
+      c.target = new Vec2(tp.x, tp.z);
+    }
+    imm want = headingTo(pos.x, pos.y, c.target.x, c.target.y);
+    imm err = wrapPi(want - yaw);
+    imm room = libc.fabsf(err);
+    imm more = if BULL_TURN_EXTRA / 60. < room { BULL_TURN_EXTRA / 60.; } else { room; };
+    cast.beings[bi].body.yaw = yaw + (if err > 0. { more; } else { 0. - more; });
+    it = new Intents(0., crTurn(yaw, want, dt), false, false);
+    if room < 0.1 and tick - c.modeSince >= BULL_WINDUP_MIN {
+      c.mode = BM_CHARGE;
+      c.modeSince = tick;
+      c.lastPos = pos;
+      c.low = 0u32;
+      c.charges = c.charges + 1u32;
+      c.tell(CM_BULL, BE_CHARGE, if c.targetBeing != NO_ROW { u32.from(c.targetBeing); } else { CR_NONE; }, p3, u32.from(tick & 0xFFFFFFFFu64));
+    }
+  } elif c.mode == BM_CHARGE {
+    // Straight at the place; a visitor charged at is followed for the first moments only (a bull does not turn on a run)
+    if c.targetBeing != NO_ROW and c.targetBeing < cast.beings.len() and tick - c.modeSince < 36u64 {
+      imm tp = cast.beings[c.targetBeing].body.position;
+      c.target = new Vec2(tp.x, tp.z);
+    }
+    imm want = headingTo(pos.x, pos.y, c.target.x, c.target.y);
+    it = new Intents(1., crTurn(yaw, want, dt), true, false);
+  } elif c.mode == BM_STAGGER {
+    it = Intents.none();
+    if tick >= c.modeSince + BULL_STAGGER_TICKS {
+      c.mode = BM_RECOVER;
+      c.modeSince = tick;
+      c.tell(CM_BULL, BE_STAND, CR_NONE, p3, u32.from(tick & 0xFFFFFFFFu64));
+    }
+  } elif c.mode == BM_RECOVER {
+    it = Intents.none();
+    c.body.vel = new Vec2(0., 0.);
+    if tick >= c.modeSince + BULL_RECOVER_TICKS {
+      c.mode = BM_PATROL;
+      c.modeSince = tick;
+      c.havePath = false;
+      c.dwell = 0.5;
+    }
+  }
+  given.set(bi, it);
+  // The bull-leap: a visitor's jump while the charging Minotaur is just short of them and heading for them
+  if c.mode == BM_CHARGE {
+    mut d = 0usize;
+    while d < driven.len() {
+      imm who = *driven[d];
+      d = d + 1usize;
+      if who >= cast.beings.len() or who >= given.len() or cast.beings[who].gone or !given[who].jump or c.forcedOf(who) { continue; }
+      imm wb = cast.beings[who];
+      if !wb.figure.active or !wb.figure.grounded or !inCourt(wb.body.position) or libc.fabsf(wb.body.position.y - p3.y) > 1. { continue; }
+      imm dist = crFlat(wb.body.position, p3);
+      if dist < LEAP_NEAR or dist > LEAP_FAR { continue; }
+      // heading for them: the Minotaur's way is within 50 degrees of the line to them
+      imm toX = wb.body.position.x - p3.x;
+      imm toZ = wb.body.position.z - p3.z;
+      imm fwdX = 0. - sin(yaw);
+      imm fwdZ = 0. - cos(yaw);
+      if (toX * fwdX + toZ * fwdZ) / dist < 0.64 { continue; }
+      // vaulted: from where they stand over the horns to LEAP_LAND beyond it, along the line from them through it
+      // (the line runs from the visitor through the Minotaur, and on)
+      mut lx = p3.x - toX / dist * LEAP_LAND;
+      mut lz = p3.z - toZ / dist * LEAP_LAND;
+      if lx < COURT_X0 { lx = COURT_X0; }
+      if lx > COURT_X1 { lx = COURT_X1; }
+      if lz < COURT_Z0 { lz = COURT_Z0; }
+      if lz > COURT_Z1 { lz = COURT_Z1; }
+      c.moves.push(new Forced(who, wb.body.position, new Vec3(lx, LAB_Y, lz), tick, LEAP_TICKS, LEAP_APEX, FM_VAULT));
+      c.passed.push(who);
+      c.leaps = c.leaps + 1u32;
+      // the Minotaur runs on past, 6 m on its way, and has been outwitted
+      c.target = new Vec2(p3.x + fwdX * 6., p3.z + fwdZ * 6.);
+      c.targetBeing = NO_ROW;
+      c.tell(CM_BULL, BE_LEAP, u32.from(who), wb.body.position, u32.from(tick & 0xFFFFFFFFu64));
+    }
+  }
+}
+
+// The guards' step: each turns to face a visitor within 7 m, else back to the hall's south
+fn guardsThink(c &mut CreatureSim, cast &Cast, given &mut List[Intents], driven &List[usize], dt f32) {
+  mut g = 0usize;
+  while g < c.guards.len() {
+    imm gi = *c.guards[g];
+    g = g + 1usize;
+    if gi >= cast.beings.len() or gi >= given.len() { continue; }
+    imm gb = cast.beings[gi];
+    imm gp = gb.body.position;
+    mut best = 7.;
+    mut want = 0.;
+    mut d = 0usize;
+    while d < driven.len() {
+      imm who = *driven[d];
+      d = d + 1usize;
+      if who >= cast.beings.len() or cast.beings[who].gone or !cast.beings[who].figure.active { continue; }
+      imm wp = cast.beings[who].body.position;
+      if !underground(wp.y) or libc.fabsf(wp.y - gp.y) > 2. { continue; }
+      imm dist = crFlat(wp, gp);
+      if dist < best { best = dist; want = headingTo(gp.x, gp.z, wp.x, wp.z); }
+    }
+    given.set(gi, new Intents(0., crTurn(gb.body.yaw, want, dt), false, false));
+  }
+}
+
+// The creatures' intents for this step (see the header). 'stepIt' says who steps: a being in a forced move does not (its feet are put
+// where the curve has them)
+pub fn creaturesIntents(c &mut CreatureSim, cast &mut Cast, given &mut List[Intents], stepIt &mut List[bool], driven &List[usize],
+    play &mut PlaySim, tick u64, dt f32) {
+  if !c.on { return; }
+  guardsThink(c, cast, given, driven, dt);
+  bullThink(c, cast, given, driven, play, tick, dt);
+  mut m = 0usize;
+  while m < c.moves.len() {
+    imm who = c.moves[m].being;
+    if who < given.len() { given.set(who, Intents.none()); }
+    if who < stepIt.len() { stepIt.set(who, false); }
+    m = m + 1usize;
+  }
+}
+
+// The forced moves carried on one step: each being's feet put on its curve; a finished one set down on the floor
+fn carryForced(c &mut CreatureSim, cast &mut Cast, tick u64, dt f32) {
+  mut keep = List[Forced].empty();
+  mut m = 0usize;
+  while m < c.moves.len() {
+    imm f = *c.moves[m];
+    m = m + 1usize;
+    if f.being >= cast.beings.len() { continue; }
+    imm b = &mut cast.beings[f.being];
+    if b.gone { continue; }
+    imm s = f32.from(tick + 1u64 - f.start) / f32.from(f.ticks);
+    imm done = s >= 1.;
+    imm u = if done { 1.; } else { s; };
+    imm at = new Vec3(f.from.x + (f.to.x - f.from.x) * u, f.from.y + (f.to.y - f.from.y) * u + 4. * f.apex * u * (1. - u), f.from.z + (f.to.z - f.from.z) * u);
+    b.before = b.body;
+    imm old = b.body.position;
+    b.body.position = at;
+    imm c2 = new Carry(old, at, Mat4.identity());
+    b.figure.carried(&c2, 0.);
+    b.figure.anchored = false;
+    b.figure.ch.teleport(at);
+    b.figure.on = PartId.none();
+    if done {
+      b.figure.grounded = true;
+      b.figure.ch.grounded = true;
+      b.figure.vy = 0.;
+      b.figure.airVx = 0.;
+      b.figure.airVz = 0.;
+      b.figure.speed = 0.;
+    } else {
+      // airborne for the views' gait, with no vertical speed (a fall that fast would make a ragdoll of it)
+      b.figure.grounded = false;
+      b.figure.vy = 0.;
+      b.figure.airVx = (at.x - old.x) / dt;
+      b.figure.airVz = (at.z - old.z) / dt;
+      b.figure.speed = 0.;
+      keep.push(f);
+    }
+  }
+  c.moves <=> keep;
+}
+
+// The Minotaur put back where it starts, calm (a test's set-up: nothing in a game does this)
+pub fn bullReset(c &mut CreatureSim, cast &mut Cast, tick u64) {
+  if c.bull == NO_ROW or c.bull >= cast.beings.len() { return; }
+  cast.beings[c.bull].setDown(bullHome(), 1.5707964);
+  cast.beings[c.bull].figure.setFx(FX_NONE, tick, 0.);
+  c.mode = BM_PATROL;
+  c.modeSince = tick;
+  c.havePath = false;
+  c.dwell = 1.;
+  c.cool = 0u64;
+  c.moves.clear();
+  c.passed.clear();
+  c.body.pos = new Vec2(bullHome().x, bullHome().z);
+  c.body.vel = new Vec2(0., 0.);
+  c.lastPos = c.body.pos;
+}
+
+// The net check's set-ups (PLAY_CREATURE_TEST, 'stage' the walk's step): the visitor 'who' set down at a place of the walk, and what that
+// step needs of the creatures, so that the walk meets each in turn without waiting for a patrol to come round
+//   1  before the guards in the hall, facing them     2  in the Worm's chamber
+//   3  in the court's north-west, the paint heard from a pillar the Minotaur has a clear run to
+//   4  west of the Minotaur, which is roused to charge at it
+pub fn creatureStage(c &mut CreatureSim, cast &mut Cast, who usize, stage u32, tick u64) {
+  if !c.on or who >= cast.beings.len() { return; }
+  if stage == 1u32 {
+    // before the east guard, facing it
+    imm at = new Vec3(4.6, LAB_Y, 335.6);
+    cast.beings[who].setDown(at, headingTo(at.x, at.z, LAB_GUARD_RIGHT_X, LAB_GUARD_Z));
+  } elif stage == 2u32 {
+    cast.beings[who].setDown(new Vec3(LAB_WORM_X, LAB_Y, 345.), 3.1415927);
+  } elif stage == 3u32 {
+    bullReset(c, cast, tick);
+    cast.beings[who].setDown(new Vec3(2., LAB_Y, 379.), 0.);
+    // the pillar at 292.5 degrees on the ring about the court's middle, on its side towards the Minotaur
+    bullRouse(c, cast, new Vec2(17.3, 383.3), NO_ROW, tick);
+  } elif stage == 4u32 {
+    bullReset(c, cast, tick);
+    cast.beings[who].setDown(new Vec3(20., LAB_Y, 391.), 0. - 1.5707964);
+    bullRouse(c, cast, new Vec2(20., 391.), who, tick);
+  }
+}
+
+// Whether being 'b' is where the Worm's chamber is
+fn inWormRoom(p Vec3) bool {
+  underground(p.y) and p.x > WORM_ROOM_X0 and p.x < WORM_ROOM_X1 and p.z > WORM_ROOM_Z0 and p.z < WORM_ROOM_Z1;
+}
+
+// After the beings are stepped (see the header)
+pub fn creaturesAfter(c &mut CreatureSim, cast &mut Cast, driven &List[usize], play &mut PlaySim, tick u64, dt f32) {
+  if !c.on { return; }
+  carryForced(c, cast, tick, dt);
+  // The Minotaur's charge: what it ran into, where it got to, whom it reached
+  if c.bull != NO_ROW and c.bull < cast.beings.len() {
+    imm bi = c.bull;
+    imm p3 = cast.beings[bi].body.position;
+    imm pos = new Vec2(p3.x, p3.z);
+    imm moved = pos.distance(c.lastPos) / dt;
+    c.lastPos = pos;
+    if c.mode == BM_CHARGE {
+      // Held up by something: walking at under a third of the run for four steps, after the first moments of the run
+      if tick - c.modeSince > 30u64 and moved < 1.5 { c.low = c.low + 1u32; } else { c.low = 0u32; }
+      if c.low >= 4u32 {
+        c.hits = c.hits + 1u32;
+        c.mode = BM_STAGGER;
+        c.modeSince = tick;
+        c.cool = tick + BULL_STAGGER_TICKS + BULL_COOL;
+        // The spell in force on it (it crosses in the snapshot with the others): held, and posed by spells.cone
+        mut keep = List[FxState].empty();
+        mut k = 0usize;
+        while k < play.fx.len() { if usize.from(play.fx[k].being) != bi { keep.push(*play.fx[k]); } k = k + 1usize; }
+        keep.push(new FxState(u32.from(bi), FX_STAGGER, tick));
+        play.fx <=> keep;
+        cast.beings[bi].figure.setFx(FX_STAGGER, tick, 0.);
+        c.tell(CM_BULL, BE_HIT, CR_NONE, p3, u32.from(tick & 0xFFFFFFFFu64));
+      } elif pos.distance(c.target) < 0.3 and c.targetBeing == NO_ROW {
+        c.pullups = c.pullups + 1u32;
+        c.mode = BM_RECOVER;
+        c.modeSince = tick;
+        c.cool = tick + BULL_COOL;
+        c.tell(CM_BULL, BE_PULLUP, CR_NONE, p3, u32.from(tick & 0xFFFFFFFFu64));
+      } elif tick - c.modeSince > BULL_CHARGE_MAX {
+        c.mode = BM_RECOVER;
+        c.modeSince = tick;
+        c.cool = tick + BULL_COOL;
+      } else {
+        // Reached a visitor: they are shoved to the court's west side, and it pulls up
+        mut d = 0usize;
+        while d < driven.len() and c.mode == BM_CHARGE {
+          imm who = *driven[d];
+          d = d + 1usize;
+          if who >= cast.beings.len() or cast.beings[who].gone or !cast.beings[who].figure.active or c.hasPassed(who) or c.forcedOf(who) { continue; }
+          imm wp = cast.beings[who].body.position;
+          if !inCourt(wp) or libc.fabsf(wp.y - p3.y) > 1.5 or crFlat(wp, p3) > SHOVE_RADIUS { continue; }
+          mut z = wp.z;
+          if z < 381. { z = 381.; }
+          if z > 425. { z = 425.; }
+          c.moves.push(new Forced(who, wp, new Vec3(SHOVE_X, LAB_Y, z), tick, SHOVE_TICKS, SHOVE_APEX, FM_SHOVE));
+          c.shoves = c.shoves + 1u32;
+          c.mode = BM_RECOVER;
+          c.modeSince = tick;
+          c.cool = tick + BULL_COOL;
+          c.tell(CM_BULL, BE_SHOVE, u32.from(who), wp, u32.from(tick & 0xFFFFFFFFu64));
+        }
+      }
+    }
+  }
+  // The Worm: up when a visitor is in its chamber, saying its lines, down when it has been empty a while
+  mut occupied = false;
+  mut d = 0usize;
+  while d < driven.len() {
+    imm who = *driven[d];
+    d = d + 1usize;
+    if who < cast.beings.len() and !cast.beings[who].gone and cast.beings[who].figure.active and inWormRoom(cast.beings[who].body.position) { occupied = true; }
+  }
+  if occupied {
+    c.wormEmpty = 0u64;
+    if !c.wormUp {
+      c.wormUp = true;
+      c.wormSince = tick;
+      c.wormSaid = 0u32;
+      c.wormRises = c.wormRises + 1u32;
+      c.tell(CM_WORM, 1u32, 0u32, new Vec3(WORM_X, LAB_Y, WORM_Z), u32.from(tick & 0xFFFFFFFFu64));
+    }
+  } else {
+    c.wormEmpty = c.wormEmpty + 1u64;
+    if c.wormUp and c.wormEmpty >= WORM_SINK_TICKS {
+      c.wormUp = false;
+      c.tell(CM_WORM, 0u32, 0u32, new Vec3(WORM_X, LAB_Y, WORM_Z), u32.from(tick & 0xFFFFFFFFu64));
+    }
+  }
+  if c.wormUp and c.wormSaid < WORM_LINES {
+    imm next = c.wormSaid + 1u32;
+    if tick - c.wormSince >= wormLineAt(next) {
+      c.wormSaid = next;
+      c.wormTalks = c.wormTalks + 1u32;
+      c.tell(CM_WORM_SAYS, next, 0u32, new Vec3(WORM_X, LAB_Y, WORM_Z), u32.from(tick & 0xFFFFFFFFu64));
+    }
+  }
+  // Out of the labyrinth, the visitor starts afresh: a question to ask again, the Minotaur's respect to win again
+  mut i = 0usize;
+  while i < c.asked.len() {
+    imm who = *c.asked[i];
+    if who >= cast.beings.len() or !underground(cast.beings[who].body.position.y) { c.asked.swap(i, c.asked.len() - 1usize); c.asked.pop(); } else { i = i + 1usize; }
+  }
+  i = 0usize;
+  while i < c.passed.len() {
+    imm who = *c.passed[i];
+    if who >= cast.beings.len() or !underground(cast.beings[who].body.position.y) { c.passed.swap(i, c.passed.len() - 1usize); c.passed.pop(); } else { i = i + 1usize; }
+  }
+}

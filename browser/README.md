@@ -421,6 +421,43 @@ navmesh alone would never leave the corridor that will not end.)
 `--labyrinth-only --soak N --lab-hold K` holds view K for timing. `--dump-frescos DIR` writes the fresco tiles as BMPs. `--lab-spawn`
 (a server's) sets each joiner down in the antechamber, for `python tools/netcheck.py --lab`.
 
+## The labyrinth's creatures
+
+Two guards, a Worm and the Minotaur (`WI\labyrinth.md`, "creatures: brief"). **Simulation:** `src/creatures.cone` (the state, the puzzle's
+logic, the words), `src/creaturethink.cone` (their minds, stepped with the beings: `creaturesIntents` before, `creaturesAfter` after);
+the guards and the Minotaur are beings of the cast like a villager (their intents decided there, no zap or jig can target them), the
+Worm is not a being. **View:** `src/creatureview.cone` (what the simulation told, the Worm drawn as spheres, the stars about a dazed Minotaur,
+the plates, the sounds), `src/creaturelook.cone` (how they look), `src/talkpanel.cone` (the dialogue). `ToView.Creature` is the one new
+message (roster, a guard's answer, the Worm, what the Minotaur did); `PROTOCOL_VERSION` is 2.
+
+- **The guards** stand on the plinths in the Hall of Two Doors, the blue one by the west door (the Worm's), the red one by the east (the
+  corridor's). One lies and one tells the truth; which, is drawn at random for each run (`CreatureSim.liar`; a scripted run's is fixed:
+  the east one). Walk up (within 4 m), press **E**: a panel opens (`talkpanel.cone`: it takes the keyboard and mouse as the "Play with
+  others" panel does, by the same route, `PanelRoute`; 1 to 4 choose a question as clicking does; E, F9 and Escape close it; E goes on
+  to the game as it did when no guard is near). **One question** to a visitor, kept until it leaves the labyrinth: *Which door leads to
+  the middle?*, *Which door would your fellow name?*, *Do you always tell the truth?*, *Does the door beside you lead there?* The
+  answers are computed by the rule of the guard's kind (`answerCode`); only the second always leads right (both name the west door:
+  take the other). The answer is told to every view (a plate over the guard's head, within 18 m) and is on the asker's panel.
+- **The Worm** is behind the west door. A visitor in its chamber makes it rise (a hole, ten blue spheres swaying, a head with eyes and
+  a mouth that moves when it speaks: a closed form of the tick it rose at); it says four lines in ten seconds, the third that the other
+  way went straight to the middle; it sinks when the chamber has been empty 6 s.
+- **The Minotaur** patrols a round of four places before the east door of the Bull Court on `labnav.cone`'s mesh (npcbehave's path
+  following). Paint (F1) splattered in the court rouses it: it turns to face the splat (a second pawing), runs straight at it, and
+  **a pillar or wall in the way staggers it** for 7 s (`FX_STAGGER`, a spell on the being: spells.cone's pose; it notices nobody; stars
+  circle its head). Paint on the Minotaur makes it charge the one who threw it; a visitor within 14 m that it has not been outwitted by
+  rouses it as well. It never hurts: reached, a visitor is shoved to the court's west side. **The bull-leap:** a jump 1.2 to 4.5 m before
+  it, while it charges at the visitor, vaults the visitor over it (a scripted arc, `Forced`: the feet put on a parabola with a 3 m
+  apex, 78 steps, landing 3 m beyond; the being is not stepped meanwhile) and the Minotaur is then outwitted by that visitor until it
+  goes up out of the labyrinth.
+
+`--checks` (`src/creaturechecks.cone`): the puzzle's logic for both ways round, the guards' answers, the Worm's timeline, and the
+Minotaur's patrol, stagger, shove and bull-leap on the rooms' own solids. `browser.exe --creatures-only --shots DIR` runs the script
+(`src/creaturescript.cone`: talk through the panel by E and a click, both doors, the Worm, the paint and the stagger, the leap, the
+stairs; the full run's last part too); `--with-creatures` makes them in any scripted run (to time the court with them in it).
+`python tools/netcheck.py --creatures --seconds 44` has client A ask a guard, be set down in the Worm's chamber, see the Minotaur
+stagger, and be vaulted over it, while B is told of each (the `CREATURES` lines) and follows the Minotaur's path.
+Cost: simulate +0.03 ms, publish +0.05 ms, render CPU +0.36 ms a frame, +14 draws and 31 000 triangles (RTX; frame p50 13.93 ms either way).
+
 ## Automated runs
 
 ```
@@ -722,6 +759,7 @@ prints "Upload: a burst of ..." when the backlog clears, about 40 frames and 1 t
 | `src/shell.cone` | what the browser puts in every scene: the island's land and sea and the sky, sent as requests |
 | `src/island/island.cone` | the module `island`: the baked heightfield, its path, fence, height query and meshes (below) |
 | `src/terrain.slang`, `src/water.slang`, `src/islandshaders.cone` | the island's two shaders and the custom pipelines made from them |
+| `src/creatures.cone`, `src/creaturethink.cone`, `src/creatureview.cone`, `src/creaturelook.cone`, `src/talkpanel.cone`, `src/creaturescript.cone`, `src/creaturechecks.cone` | the labyrinth's creatures (above): the simulation's state, the puzzle and minds; the view's part; how they look; the guard's dialogue panel; the script's part and the checks |
 | `src/being.cone` | beings and possession: intents, the user's controller, the view rig (first and third person), the Cast |
 | `src/mannequin.cone` | the mannequin: its figure (skeleton, pose, gait, kinematic capsule), its meshes, one a bone, and spawning it |
 | `src/ground.cone` | the ground's height under a point: the island's, the one function everything standing on the ground asks |
