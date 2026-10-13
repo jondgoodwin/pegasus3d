@@ -17,9 +17,10 @@
 param(
   [string]$OutDir   = "C:\src\releases",
   [string]$Compiler = "C:\src\cone-wt-3dweb-compiler\build\x64-release",
-  [string]$Congo    = "C:\src\cone\tools\congo\congo.py",
+  # Congo, the packages and the license files must come from the same Cone commit as the compiler, so they are the snapshot checkout's
+  [string]$Congo    = "C:\src\cone-wt-3dweb-compiler\tools\congo\congo.py",
   [string]$Sdl      = "C:\libs\SDL3-3.4.16\lib\x64",
-  [string]$Cone     = "C:\src\cone",
+  [string]$Cone     = "C:\src\cone-wt-3dweb-compiler",
   [string]$VcRedist = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.42.34433\x64\Microsoft.VC143.CRT",
   [switch]$SkipBuild
 )
