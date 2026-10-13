@@ -27,8 +27,9 @@ KEYS
   F11 fullscreen         Escape quit
 
 MULTIPLAYER
-  Start with:   browser.exe --connect HOST:PORT
-  A server must be running and accept connections from your address.
+  Start with:   browser.exe --connect 40.87.21.70:40000 --name YourName
+  Multiplayer is by approval: the server accepts only players whose IP address has been approved
+  (a request flow is coming). Until then, run without options for the single-player island.
 
 OPTIONS
   --no-audio         no sound
