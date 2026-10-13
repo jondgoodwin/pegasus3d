@@ -13,7 +13,8 @@ TO RUN
 REQUIREMENTS
   - Windows 10 or 11, 64-bit
   - A GPU and current driver with Vulkan 1.3 (NVIDIA, AMD or Intel; update your graphics driver if it does not start)
-  - Memory and disk: @MEASURED@
+  - Memory: about 0.6 GB of RAM in use while running (peak 582 MB measured), plus about 1.2 GB of committed virtual memory
+  - Disk: about 16 MB unpacked (6.4 MB zip)
 
 KEYS
   W / S or Up / Down     walk forward / back          A / D or Left / Right   turn
