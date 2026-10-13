@@ -54,6 +54,12 @@
 // Connected (--connect) the simulation is another process: what has arrived is
 // applied first, then the steps are predicted, and nothing is awaited.
 //
+// GOING ONLINE (goOnline, the panel's Join): single player becomes connected without a restart. The server is dialled while
+// single player runs on; its first words are kept in a second ViewState (`online`); when the server has taken this client in
+// (Possessed) the switch is made at the start of the next frame, where nothing is in flight: render forgets the old world
+// (RenderActor.reset), the in-process simulation stops (SimActor.stop), `online` replaces `st`, and the frame is a connected one.
+// A dial that fails leaves single player as it was.
+//
 //   finish()      the end of the run: the simulation's and the world's lines,
 //                 render's, the script's verdict, and the run's exit code to
 //                 the shell
@@ -107,12 +113,15 @@ pub struct FrameReport {
   pub worldDone bool;         // every object of the world sent
   pub worldSentFrame u64;     // the frame that sent its last; 0 before
   pub refused bool;           // the server would not have this client (its name): the run is over
+  pub join String;            // the panel's Join was pressed this frame: the name to play under (else empty)
   pub panel u32 = 0u32;       // render's word on the "Play with others" panel (requestpanel.cone: PANEL_OPEN, PANEL_TEXT)
+  pub online bool = false;    // the view is connected to a server (from the start, or since a Join)
+  pub dialing bool = false;   // a Join is dialling: the frame's steps are single player's still
 
   // Nothing yet: what the shell holds until a report comes
   pub fn none() FrameReport {
     new FrameReport(0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u, Walk.make(new Vec3(0., 0., 0.), 0.), 0usize, 0usize, 0usize,
-      0usize, false, 0u64, false);
+      0usize, false, 0u64, false, String.empty());
   }
 }
 
@@ -134,6 +143,13 @@ const SNAP_ERROR f32 = 2.;
 const CORRECTION_SECONDS f32 = 0.1;
 // The most steps of predicted state kept to compare, play again, or wait for
 const HISTORY_MAX = 600usize;
+
+// The most GPU upload (bytes, estimated: uploadCost) the requests of one frame may ask of render. A frame's uploads share one
+// staging block that grows by doubling from 64 KB and gives up on its 9th (about 16 MB), so a late joiner, told the whole
+// world in a frame or two, would fail there; the rest waits for the frames after (held), in order.
+const UPLOAD_BUDGET = 4194304u64;
+// A Join that has had no answer from the server after this long (ns) is given up
+const DIAL_LIMIT_NS u64 = 12000000000u64;
 
 // One of the user's steps: the input, and the body predicted after it
 struct Predicted {
@@ -243,6 +259,13 @@ pub struct ViewState {
   tags List[NameTag];         // the names shown above the mannequins of the players
   pub land Island;  // the baked island, shared by every actor (read it with &land)
   pub opts RunOptions;        // what the arguments say that this actor acts on (--script, --trace)
+  pub joinFailed String;      // a Join that did not get in: why, said once in the next HudFrame
+  held List[Request];         // render's requests held back from earlier frames by UPLOAD_BUDGET, oldest first, sent before forRender's
+  heldTotal u64;              // bytes of upload (estimated) the held back have cost render so far this backlog
+  heldFrames u32;             // and the frames it has taken
+  heldStartedAt u64;          // when it began (the performance counter)
+  pub possessedSeen bool = false;   // a server's Possessed has arrived: it has taken this client in (goOnline waits for it)
+  pub shotFrame u64 = 0u64;   // the test hook's (--switch-at): the frame the "switch-after" view is saved at
 
   pub fn make(birds Birds, lockstep bool, audio AudioView, playerName String, land Island, opts RunOptions) ViewState {
     imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
@@ -254,7 +277,7 @@ pub struct ViewState {
       new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
       List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64,
       PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, playerName, String.empty(), false, List[NameTag].empty(),
-      land, opts);
+      land, opts, String.empty(), List[Request].empty(), 0u64, 0u32, 0u64);
   }
 
   // Reliable messages sent to the simulation, ever
@@ -297,6 +320,10 @@ pub struct ViewState {
             refusedWhy = rf.reason.copy();
             refusedNow = true;
             print <- "REFUSED by the server: "; printStr(rf.reason.view()); print <- "\n";
+          }
+          case mut pb &mut Possessed {
+            possessedSeen = true;
+            inbox.push(ToView.Possessed(pb.being));
           }
           else { inbox.push(msg); }
         }
@@ -1140,15 +1167,91 @@ pub struct ViewState {
     if testFixed { snapshot.view = testView; }
   }
 
+  // The requests render takes this frame: those held back before, then this frame's, in order, as many as fit the frame's
+  // upload budget (always at least one); the rest are held for the next frame. In the usual frame there is nothing held and
+  // little to upload, and they all go.
+  fn takeForRender(self &mut, frame u64) List[Request] {
+    mut out = List[Request].empty();
+    if lockstep {
+      // Single player builds its world a few objects a frame (the world actor's steps) and has never outgrown staging
+      out <=> forRender;
+      return out;
+    }
+    if held.len() == 0usize {
+      mut total = 0u64;
+      imm fs = forRender.viewMut();
+      mut k = 0usize;
+      while k < fs.len { total = total + uploadCost(&fs[k]); k = k + 1usize; }
+      if total <= UPLOAD_BUDGET {
+        out <=> forRender;
+        return out;
+      }
+    }
+    // Held first, then this frame's
+    mut all = List[Request].empty();
+    all <=> held;
+    imm fresh = forRender.viewMut();
+    mut f = 0usize;
+    while f < fresh.len {
+      mut r Request = Request.Done;
+      r <=> fresh[f];
+      all.push(r);
+      f = f + 1usize;
+    }
+    forRender.clear();
+    imm items = all.viewMut();
+    mut spent = 0u64;
+    mut i = 0usize;
+    while i < items.len {
+      imm c = uploadCost(&items[i]);
+      if spent > 0u64 and spent + c > UPLOAD_BUDGET { break; }
+      spent = spent + c;
+      mut r Request = Request.Done;
+      r <=> items[i];
+      out.push(r);
+      i = i + 1usize;
+    }
+    mut rest = 0usize;
+    while i < items.len {
+      mut r Request = Request.Done;
+      r <=> items[i];
+      held.push(r);
+      rest = rest + 1usize;
+      i = i + 1usize;
+    }
+    if heldFrames == 0u32 { heldStartedAt = sdl.GetPerformanceCounter(); }
+    heldTotal = heldTotal + spent;
+    heldFrames = heldFrames + 1u32;
+    if rest == 0usize {
+      imm ms = f64.from(sdl.GetPerformanceCounter() - heldStartedAt) / f64.from(sdl.GetPerformanceFrequency()) * 1000d;
+      print <- "Upload: a burst of "; print <- heldTotal / 1048576u64; print <- " MB (estimated) spread over "; print <- heldFrames;
+      print <- " frames, done at frame "; print <- frame; print <- ", "; print <- ms; print <- " ms after it began\n";
+      heldTotal = 0u64;
+      heldFrames = 0u32;
+    }
+    out;
+  }
+
   // What is moved to render for the frame: the snapshot and render's requests,
   // and the name of a scripted view to save
   fn drawOrder(self &mut, input &FrameInput) DrawOrder {
     mut snap = Snapshot.empty();
     snap <=> snapshot;
-    mut requests = List[Request].empty();
-    requests <=> forRender;
-    new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, testShot.copy(),
+    imm requests = self.takeForRender(input.frame);
+    new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, self.shotFor(input.frame),
       self.hudFrame(input));
+  }
+
+  // The view to save at frame 'f': the scripted run's (from the simulation), else the test hook's (--switch-at N): one the frame
+  // before the switch is asked for, one a while after it was made
+  fn shotFor(self &, f u64) String {
+    imm joinShot = panelJoinShotAt(&opts, f);
+    if joinShot.len() > 0usize { return String.from(joinShot); }
+    if opts.switchAt > 0u64 and lockstep and f + 1u64 == opts.switchAt { return String.from("switch-before"); }
+    if shotFrame > 0u64 and f == shotFrame { return String.from("switch-after"); }
+    // (a switch that has not been made 200 frames on, because the dial failed, is shown as it is: single player carrying on)
+    if opts.switchAt > 0u64 and lockstep and f == opts.switchAt + 200u64 { return String.from("switch-after"); }
+    testShot.copy();
   }
 
   // What the HUD shows this frame (hud.cone): where the user's being and the others are, the clock, the weather, the frame time
@@ -1182,9 +1285,15 @@ pub struct ViewState {
       t = t + 1usize;
     }
     // (a scripted run's frame time and step are not repeatable: it shows none, and steps by 1/60)
-    new HudFrame(hud.on, f32.from(hourAt(sceneNow)), weather.target, if opts.scripted { 0.; } else { hud.smoothMs; }, !lockstep, rttMs,
+    mut hf = new HudFrame(hud.on, f32.from(hourAt(sceneNow)), weather.target, if opts.scripted { 0.; } else { hud.smoothMs; }, !lockstep, rttMs,
       you, yaw, others, input.hudSlots, if opts.scripted { 0.016666668; } else { hud.stepSeconds(); }, plates, cast.eyes(), FOV,
-      copyPanelEvents(&input.panelEvents), input.panelHint and lockstep);
+      copyPanelEvents(&input.panelEvents), input.panelHint and lockstep, String.empty());
+    // A Join that did not get in is told once (to the panel, which shows why)
+    if joinFailed.len() > 0usize {
+      hf.joinFailed = joinFailed.copy();
+      joinFailed = String.empty();
+    }
+    hf;
   }
 
   // The user's body, for the shell's report
@@ -1202,6 +1311,13 @@ actor ViewActor {
   ended Sender[i32];           // the shell's: the run's exit code, at the end
   joined Sender[bool];         // the shell's: whether the connection opened
   cur FrameInput;              // the frame being made
+  // Going online (goOnline, below): single player carries on while a server is dialled
+  online Option[ViewState];    // the state of the connected view being made, receiving the server's first messages
+  endpoint Option[Endpoint];   // the dialled link's endpoint (shut when the dial fails, or at the end of the run)
+  attempt u32;                 // the dial in progress (a late event of an earlier one is ignored)
+  dialSince u64;               // when it began, ns (0: none)
+  onlineReady bool;            // the server has taken this client in: the switch is made when the next frame begins
+  switched bool;               // it was made: the first link's late events are ignored, the dialled link's are the view's
 
   // The view made, with the simulation (single player) and render actors named, and the
   // shell's inboxes, and this browser's flock
@@ -1214,12 +1330,15 @@ actor ViewActor {
     imm solids = allSolids(&land);
     state.cast.phys.ensureGround();
     state.cast.phys.setSolids(&solids);
-    *self = new Self(state, sim, render, frames, ended, joined, FrameInput.none());
+    // (the test hook, --switch-at N, on a run that is connected from the start: the same view saved, for comparing with a switch's)
+    if !lockstep and opts.switchAt > 0u64 { state.shotFrame = opts.switchAt + 120u64; }
+    *self =new Self(state, sim, render, frames, ended, joined, FrameInput.none(), None[ViewState], None[Endpoint], 0u32, 0u64, false, false);
   }
 
   // What the connection tells (its handler sends it here): it opened or ended, a message, a value. In single player the
   // simulation's FrameDone, said last, finishes the frame that was begun
   pub async do onNet(self, ev NetEvent) {
+    if switched { return; }   // the first link's (the simulation's in-process pair): it ended with the switch
     st.onEvent(ev);
     if st.joinedNow {
       st.joinedNow = false;
@@ -1236,11 +1355,143 @@ actor ViewActor {
     }
   }
 
+  // ---- going online (the panel's Join) ----
+
+  // Dial the server at 'address' under 'name' while single player carries on. The server's first words are received into a
+  // second, connected state made on the side (ViewState with no lockstep, which sends its Hello when the link opens and keeps
+  // what arrives unapplied). Only when the server has taken this client in (its Possessed, after the replay of the world so far)
+  // is the switch made, at the start of the next frame (frame, above). A dial that gets no answer, or a server that refuses the
+  // name, ends here with a word for the panel (ViewState.joinFailed) and single player has not stopped. Answers whether a dial
+  // was begun.
+  pub async do goOnline(self, address String, name String) bool {
+    if !st.lockstep or switched or dialSince != 0u64 { return false; }
+    if !addressReadable(address.view()) {
+      st.joinFailed = String.from("That server address is not readable.");
+      return false;
+    }
+    print <- "Joining "; printStr(address.view()); print <- " as "; printStr(name.view()); print <- "\n";
+    imm land = st.land.share();
+    mut fresh = ViewState.make(Birds.make(&land), false, AudioView.silent(), name.copy(), land.share(), st.opts);
+    imm solids = worldSolids(&land);
+    fresh.cast.phys.ensureGround();
+    fresh.cast.phys.setSolids(&solids);
+    online = Some[ViewState](fresh);
+    attempt = attempt + 1u32;
+    imm me = selfactor;
+    imm gen = attempt;
+    imm handler = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [me, gen] { me.onOnline(gen, ev); }));
+    imm bound = mustConnect(parseAddress(address.view()), NetConfig.defaults(), handler);
+    endpoint = Some[Endpoint](bound.endpoint);
+    dialSince = sdl.GetTicksNS();
+    true;
+  }
+
+  // What the dialled link tells (attempt 'gen' of it): before the switch it is kept in the state on the side, and decides how the
+  // dial ends; after the switch it is the view's own link, as a --connect view's is
+  pub async do onOnline(self, gen u32, ev NetEvent) {
+    if gen != attempt { return; }
+    if switched {
+      st.onEvent(ev);
+      st.joinedNow = false;
+      st.leftNow = false;
+      return;
+    }
+    mut why = String.empty();
+    mut ready = false;
+    match &mut online {
+      case mut o &mut Some {
+        o.onEvent(ev);
+        o.joinedNow = false;
+        if dialSince == 0u64 {
+          // (the switch is being made: this is only kept)
+        } elif o.refusedNow {
+          why = o.refusedWhy.copy();
+        } elif o.leftNow {
+          why = String.from(if o.joined { "The server closed the connection."; } else { "The server did not answer."; });
+        } elif o.possessedSeen {
+          ready = true;
+        }
+      }
+      else {}
+    }
+    if why.len() > 0usize { self.failDial(why); }
+    elif ready { onlineReady = true; }
+  }
+
+  // A dial that did not get in: the link let go, and the reason left for the panel. Single player never stopped.
+  fn failDial(self, why String) {
+    print <- "Join failed: "; printStr(why.view()); print <- "\n";
+    match &mut online {
+      case mut o &mut Some { if o.net.has(1u32) { o.net.hangUp(1u32); } }
+      else {}
+    }
+    online = None;
+    match &endpoint {
+      case imm e Some { e.shutdown(); }
+      else {}
+    }
+    endpoint = None;
+    dialSince = 0u64;
+    onlineReady = false;
+    st.joinFailed = why;
+  }
+
   // The frame (above). Single player: the user's body predicted, the inputs sent and the simulation asked to take the
   // frame's steps; the rest of the frame waits for its answer. Connected: what has arrived is applied, the steps
   // predicted and the frame completed at once
   pub async do frame(self, input FrameInput) {
     cur = input;
+    // A Join still dialling after too long is given up (the handshake's own limit is 5 s; this is the backstop)
+    if dialSince != 0u64 and !onlineReady and sdl.GetTicksNS() - dialSince > DIAL_LIMIT_NS {
+      self.failDial(String.from("The server did not answer."));
+    }
+    // THE SWITCH, here, at the start of a frame: no frame is in flight (the last was presented and reported before the shell
+    // called this), so the simulation owes the view nothing (no Frame asked, no FrameDone to come). Single player's world
+    // goes, the server's is taken up exactly as a fresh --connect takes it: a late joiner.
+    if onlineReady {
+      onlineReady = false;
+      dialSince = 0u64;   // (from here the link's words decide nothing more: the switch is being made)
+      // Render forgets the old world: a Despawn of every part the view held, its meshes and materials let go
+      mut sweep = List[Request].empty();
+      mut live = List[PartId].empty();
+      st.scene.liveIds(&mut live);
+      if !st.picked.isNone() and st.scene.isLive(st.picked) { sweep.push(Request.Highlight(st.picked, false)); }
+      mut k = 0usize;
+      while k < live.len() {
+        sweep.push(Request.Despawn(*live[k]));
+        k = k + 1usize;
+      }
+      imm forgotten = await render.reset(sweep);
+      // The new state takes over, carrying what is the browser's rather than the world's: the sound, the HUD's toggles and
+      // frame-time smoothing, this browser's flock and the window's size
+      mut next Option[ViewState] = None;
+      next <=> online;
+      match &mut next {
+        case mut n &mut Some {
+          n.audio <=> st.audio;
+          n.birds <=> st.birds;
+          n.hud <=> st.hud;
+          n.view = st.view;
+          if n.opts.switchAt > 0u64 { n.shotFrame = cur.frame + 120u64; }
+          st <=> *n;
+        }
+        else {}
+      }
+      switched = true;
+      st.joinedNow = false;
+      // The in-process simulation is over, quietly (what its connection tells from here is ignored: 'switched'), and so is the
+      // first state's end of that connection
+      match &sim {
+        case imm s Some { imm stopped = await s.stop(); }
+        else {}
+      }
+      sim = None;
+      match &mut next {
+        case mut old &mut Some { old.net.hangUp(1u32); }
+        else {}
+      }
+      print <- "Online: frame "; print <- cur.frame; print <- ", single player's world let go\n";
+    }
     if st.lockstep {
       st.beforeSim(&cur);
       st.net.sendReliable(1u32, encodeToSim(ToSim.Frame(cur.frame, copySteps(&cur.steps))));
@@ -1300,8 +1551,10 @@ actor ViewActor {
     }
     if st.opts.traceOn { print.flush(); }
     mut report = new FrameReport(st.simulateNs, st.publishNs + (t2 - t1), p.renderNs, p.presentNs, p.swapNs, p.acquireNs, p.status,
-      you, waiting, parts, p.rows, p.emitters, worldDone, worldSent, st.refusedNow);
+      you, waiting, parts, p.rows, p.emitters, worldDone, worldSent, st.refusedNow, p.join.copy());
     report.panel = p.panel;
+    report.online = !st.lockstep;
+    report.dialing = dialSince != 0u64;
     frames <- report;
   }
 
@@ -1317,6 +1570,8 @@ actor ViewActor {
       print <- "FINAL "; print <- st.own; print <- " "; print <- i64.from(libc.floorf(fb.position.x * 1000. + 0.5)); print <- " ";
       print <- i64.from(libc.floorf(fb.position.y * 1000. + 0.5)); print <- " "; print <- i64.from(libc.floorf(fb.position.z * 1000. + 0.5)); print <- "\n";
       playReport(&st.play);
+      print <- "Scene: "; print <- st.scene.partCount(); print <- " parts live, "; print <- st.worldBuilt; print <- " world objects built here, ";
+      print <- st.cast.beings.len(); print <- " beings\n";
       if st.net.has(1u32) {
         imm conn = st.net.peer(1u32).conn;
         imm cs = await conn.stats();
@@ -1340,9 +1595,16 @@ actor ViewActor {
       else {}
     }
     st.audio.finish();
+    // A link dialled by a Join: its socket's thread must stop before the actors' runtime does (the shell's own, when the run began
+    // connected, is shut by the shell)
+    match &endpoint {
+      case imm e Some { e.shutdown(); }
+      else {}
+    }
     // The script's walkers are put down by Being.setDown (counted, and the snapshot carries the count), so what the view counts as a
     // correction is a real misprediction: the script lifts one mannequin 6 m on purpose, and nothing in it is out by more than that
-    if st.opts.scripted {
+    // (not after a switch to a server: the script's walkers are the single-player simulation's, which has ended)
+    if st.opts.scripted and !switched {
       imm okSets = st.setDowned >= 1u64 and st.worstSetDown > 100.;
       imm okFix = st.worstError < 6.5;
       print <- "Corrections: the script's set-downs are counted apart ("; print <- st.setDowned; print <- ", farthest "; print <- st.worstSetDown;
@@ -1353,6 +1615,25 @@ actor ViewActor {
     }
     ended <- code;
   }
+}
+
+// About how many bytes render's staging memory takes to upload what request 'r' defines (0 for any other): a mesh's vertex
+// streams and indices, an image or a field's texels with their mip levels
+fn uploadCost(r &Request) u64 {
+  match r {
+    case imm dm DefineMesh { return meshCost(&dm.shape); }
+    case imm ds DefineSkinnedMesh { return meshCost(&ds.shape) + u64.from(ds.skin.joints.len()) * 8u64; }
+    case imm dl DefineMaterial {
+      return u64.from(dl.paint.pixels.len()) * 2u64 + u64.from(dl.maps.normal.pixels.len()) * 2u64
+        + u64.from(dl.maps.orm.pixels.len()) * 2u64 + u64.from(dl.maps.field.values.len() + dl.maps.field2.values.len()) * 6u64 + 256u64;
+    }
+    else {}
+  }
+  0u64;
+}
+
+fn meshCost(m &Mesh) u64 {
+  u64.from(m.positions.len()) * 40u64 + u64.from(m.indices.len()) * 4u64;
 }
 
 // A being's velocity as its snapshot has it, m/s: along its heading at its speed on the ground, as it fell in the air

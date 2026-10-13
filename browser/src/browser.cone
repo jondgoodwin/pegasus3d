@@ -366,6 +366,8 @@ pub struct RunOptions {
   labHold u32 = 0u32;         // --lab-hold N: the labyrinth's view number N held for the rest of the run (timing)
   labSpawn bool = false;      // --lab-spawn (a server's): each joiner is set down in the labyrinth's antechamber, not on the beach (the net check's --lab)
   panelOnly bool = false;     // --panel-only: just the "Play with others" panel's part of the scripted run (panelscript.cone)
+  panelJoin u32 = 0u32;       // --panel-join (1) or --panel-join-refused (2), with --panel-only: after the answer the script clicks Join (panelscript.cone)
+  switchAt u64 = 0u64;       // --switch-at N: a test hook; at frame N the panel's Join is done for the player (the address is PEGASUS_JOIN_ADDRESS)
 
   fn make() RunOptions { new RunOptions(false, false, true, false, 2u32, false, false, false, 0u64, false); }
 }
@@ -523,6 +525,7 @@ fn shellRun(config Config, startup Startup) i32 {
   if opts.scripted { pushScript(&opts, 1u64); }
   imm runStart = sdl.GetTicksNS();
   mut refusedRun = false;
+  mut wentOnline = false;       // the view switched to a server (a Join): its socket's thread needs time to stop, as a --connect run's
   mut panelWatch = PanelWatch.make();   // the panel's scripted run: where the player was (panelscript.cone)
 
   while host.beginFrame() {
@@ -536,7 +539,7 @@ fn shellRun(config Config, startup Startup) i32 {
     // (the panel's scripted run pushes its own keys, text and mouse into SDL's queue, aimed by where the panel's controls are)
     if opts.panelOnly and host.hasWindow() {
       imm px = host.window().size();
-      panelPush(host.frame, viewNow, new Vec2(f32.from(px.w), f32.from(px.h)), panelScale);
+      panelPush(host.frame, viewNow, new Vec2(f32.from(px.w), f32.from(px.h)), panelScale, opts.panelJoin != 0u32);
     }
     while host.nextEvent(&mut e) {
       if host.hasWindow() and host.window().resized {
@@ -597,6 +600,15 @@ fn shellRun(config Config, startup Startup) i32 {
     }
     // Whether the panel is up (the next frame's events go to it or to the game), and SDL's text input with it
     shell.panel.told(report.panel, windowHandle, automated);
+    // The panel's Join (or the test hook's, --switch-at): the view dials the server and single player carries on until the server
+    // has taken this client in. The address goes by message (it is not kept anywhere). The frame is over, so nothing is in flight
+    // when the view's actor takes this.
+    if report.online { wentOnline = true; }
+    if report.join.len() > 0usize and !report.online and !report.dialing {
+      view.goOnline(joinAddress(automated), report.join.copy());
+    } elif opts.switchAt > 0u64 and host.frame == opts.switchAt and !report.online and !report.dialing {
+      view.goOnline(joinAddress(automated), shell.panel.openName.copy());
+    }
     if opts.panelOnly { panelWatch.note(host.frame, report.you.position); }
     if report.refused {
       // The server will not have this client (its name): said already, and the run is over
@@ -636,14 +648,20 @@ fn shellRun(config Config, startup Startup) i32 {
     case is None[i32] {}
   }
   if refusedRun { code = 3i32; }
-  if opts.panelOnly and !panelWatch.verdict() { code = 1i32; }
+  if opts.panelOnly and !panelWatch.verdict(opts.panelJoin != 0u32) { code = 1i32; }
+  if opts.panelJoin != 0u32 {
+    // The Join run's own check: online at the end (the server took this player in), or still single player (it refused the name)
+    imm wantOnline = opts.panelJoin == 1u32;
+    print <- "Panel run: after Join the browser is "; print <- (if wentOnline { "online"; } else { "single player"; });
+    if wentOnline == wantOnline { print <- ": yes\n"; } else { print <- ": NO\n"; code = 1i32; }
+  }
   if watch.soaking() and watch.soakReport() != 0i32 { code = 1i32; }
   // A connection closed before the program ends: its socket's thread must stop before the actors' runtime does
   match &endpointOpt {
     case imm e Some { e.shutdown(); }
     else {}
   }
-  if connected { thread.sleep(Duration.fromMillis(300i64)); }
+  if connected or wentOnline { thread.sleep(Duration.fromMillis(300i64)); }
   imm st = actors.stats();
   print <- "Actors: "; print <- u64.from(st.workers); print <- " workers, "; print <- st.messages; print <- " messages in ";
   print <- st.activations; print <- " turns, "; print <- st.steals; print <- " steals\n";
@@ -745,6 +763,12 @@ fn main(argc i32, argv **u8) i32 {
     } elif libc.strcmp(arg, "--run-for") == 0i32 and a + 1i32 < argc {
       startup.opts.runForSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
+    } elif libc.strcmp(arg, "--switch-at") == 0i32 and a + 1i32 < argc {
+      // A test hook for the panel's Join: at frame N a single-player run goes online, as pressing Join does, to the server
+      // PEGASUS_JOIN_ADDRESS names (else, in this automated run, a port nothing listens on). Views "switch-before" (the frame
+      // before) and "switch-after" (120 frames after the switch) are saved with --shots.
+      startup.opts.switchAt = wholeNumber(*(argv + usize.from(a + 1i32)));
+      a = a + 1i32;
     } elif libc.strcmp(arg, "--hud-only") == 0i32 {
       // Only the HUD's part of the scripted run (hudscript.cone), to look at it quickly: the walk to the cottage, then the HUD
       startup.opts.scripted = true;
@@ -754,6 +778,13 @@ fn main(argc i32, argv **u8) i32 {
       // answer (the live server's, or a stub's: PEGASUS_REQUEST_URL). PEGASUS_PLAY_DIR keeps the token out of the user's folder.
       startup.opts.scripted = true;
       startup.opts.panelOnly = true;
+    } elif libc.strcmp(arg, "--panel-join") == 0i32 or libc.strcmp(arg, "--panel-join-refused") == 0i32 {
+      // The panel's run, then Join: PEGASUS_REQUEST_URL must be a stub that approves and PEGASUS_JOIN_ADDRESS a server on this machine.
+      // --panel-join ends well if the browser is online at the end of the run, --panel-join-refused if it is still single player
+      // (the server refuses this name). A real-time clock: the server is another process.
+      startup.opts.scripted = true;
+      startup.opts.panelOnly = true;
+      startup.opts.panelJoin = if libc.strcmp(arg, "--panel-join") == 0i32 { 1u32; } else { 2u32; };
     } elif libc.strcmp(arg, "--mirror-only") == 0i32 {
       // Only the mirror's part of the scripted run (mirrorscript.cone): the walk to the cottage, then the mirror's windows
       startup.opts.scripted = true;
@@ -795,7 +826,7 @@ fn main(argc i32, argv **u8) i32 {
     return result;
   }
   // A server, and a client that has a window or not, run on the real clock (--headless alone would make it synthetic)
-  if startup.serve.on or startup.connectTo.len() > 0usize { config.synthetic = false; }
+  if startup.serve.on or startup.connectTo.len() > 0usize or startup.opts.switchAt > 0u64 { config.synthetic = false; }
   if startup.connectTo.len() > 0usize {
     if !addressReadable(startup.connectTo.view()) {
       print <- "--connect wants HOST:PORT with HOST a dotted address (a.b.c.d) or localhost, and a port from 1 to 65535: got ";
@@ -816,8 +847,8 @@ fn main(argc i32, argv **u8) i32 {
     config.synthetic = true;
   }
   if startup.opts.panelOnly and config.frames == 0u64 {
-    config.frames = panelScriptEnd();
-    config.synthetic = true;
+    config.frames = panelScriptEnd(startup.opts.panelJoin != 0u32);
+    config.synthetic = startup.opts.panelJoin == 0u32;   // (the Join run is on the real clock: the server is another process)
   }
   if startup.opts.mirrorOnly and config.frames == 0u64 {
     config.frames = mirrorScriptEnd(&startup.opts);

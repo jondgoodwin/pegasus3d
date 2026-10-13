@@ -71,6 +71,7 @@ pub struct Presented {
   pub emitters usize;
   pub shotFailed bool;        // a scripted view could not be written
   pub facts RenderFacts;      // a scripted run's: what it drew
+  pub join String;            // the panel's Join was pressed this frame: the name to play under (else empty)
   pub panel u32 = 0u32;       // the "Play with others" panel after the frame (requestpanel.cone: PANEL_OPEN, PANEL_TEXT)
 }
 
@@ -203,6 +204,7 @@ actor RenderActor {
     mut shotFailed = false;
     mut facts = RenderFacts.empty();
     mut panel = 0u32;
+    mut join = String.empty();
     mut t1 = t0;
     match &mut g {
       case mut some &mut Some {
@@ -212,6 +214,7 @@ actor RenderActor {
         self.apply(some, &mut o.requests);
         self.drawFrame(some, &o.snapshot, o.shot.view(), o.alpha, &o.hud);
         panel = some.hud.panelBits();
+        join = some.hud.takeJoin();
         t1 = sdl.GetTicksNS();
         imm s0 = sdl.GetTicksNS();
         if some.target.ok() {
@@ -238,9 +241,42 @@ actor RenderActor {
     imm t2 = sdl.GetTicksNS();
     mut snap = Snapshot.empty();
     snap <=> o.snapshot;
-    mut presented = new Presented(snap, t1 - t0, t2 - t1, swapNs, acquireNs, status, rows, emitters, shotFailed, facts);
+    mut presented = new Presented(snap, t1 - t0, t2 - t1, swapNs, acquireNs, status, rows, emitters, shotFailed, facts, join);
     presented.panel = panel;
     presented;
+  }
+
+  // The switch from single player to a server (viewactor.cone, goOnline): 'requests' are a Despawn of every part the view
+  // held, applied now (the rows, batches, lights, scene items and effects go by the same code a Despawn always takes); then
+  // every mesh the old world defined is let go (its buffers are destroyed once the GPU has finished with them) and the mesh
+  // and material tables are emptied, so that the server's world is defined into tables with no stale id in them. A material's
+  // GPU resources have no release in render yet, so the old world's materials (and their painted textures) stay allocated.
+  pub async do reset(self, requests List[Request]) bool {
+    mut reqs = requests;
+    mut g Option[Gfx] = None;
+    g <=> gfx;
+    match &mut g {
+      case mut some &mut Some {
+        imm before = some.sys.rows.len();
+        self.apply(some, &mut reqs);
+        // Nothing keyed by an old part's id may be left (a stale id would meet the server's, which are numbered again)
+        print <- "Render reset: "; print <- before; print <- " rows drawn before; after the despawns "; print <- some.sys.rows.len(); print <- " rows, ";
+        print <- some.sys.lamps.len(); print <- " lights, "; print <- some.sys.effects.len(); print <- " effects, "; print <- some.sys.scenery.len();
+        print <- " scene items, "; print <- some.sys.poses.len(); print <- " poses, "; print <- some.sys.skies.len(); print <- " skies; ";
+        print <- some.sys.meshes.len(); print <- " meshes and "; print <- some.sys.materials.len(); print <- " materials let go\n";
+        mut i = 0usize;
+        while i < some.sys.meshes.len() {
+          imm freed = some.renderer.removeMesh(&mut some.device, some.sys.meshes.rows[i].handle);
+          i = i + 1usize;
+        }
+        some.sys.meshes.clear();
+        some.sys.materials.clear();
+        some.sys.batches.clear();
+      }
+      else { self.countUnrendered(&mut reqs); }
+    }
+    gfx = g;
+    true;
   }
 
   // The end of the run (above), printed as the browser always has

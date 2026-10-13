@@ -483,10 +483,7 @@ pub struct SimState {
     mut i = 0usize;
     while i < clients.len() {
       if namesMatch(clients[i].name.view(), name) {
-        mut why = String.from("The name ");
-        why.append(name);
-        why.append(" is already in use: pick another with --name.");
-        return why;
+        return String.from("That name is already taken. Please choose another.");
       }
       i = i + 1usize;
     }
@@ -1179,6 +1176,7 @@ actor SimActor {
   world WorldActor;
   joined Sender[bool];         // the shell's: whether the first client joined
   served Sender[u64];          // the shell's: a server's tick done
+  stopped bool;                // single player went online (the view's goOnline): this simulation is over and answers nothing more
 
   // The scene seeded (the shell's parts and the beings), with the flock the
   // shell made, its world actor named, and the end of the connections
@@ -1186,7 +1184,19 @@ actor SimActor {
       land Island) {
     mut state = SimState.make(opts, birds, serve, land);
     state.seed();
-    *self = new Self(state, world, joined, served);
+    *self = new Self(state, world, joined, served, false);
+  }
+
+  // Single player went online: this simulation is over. Its connections are hung up and what they tell afterwards is ignored
+  // (the clients' leaving is not reported: nothing is ending the run), so that nothing more is said or simulated.
+  pub async do stop(self) bool {
+    stopped = true;
+    mut i = 0usize;
+    while i < st.net.peers.len() {
+      st.net.hangUp(st.net.peers[i].id);
+      i = i + 1usize;
+    }
+    true;
   }
 
   // Single player: this simulation's connection joined to the view's (netmsg's in-process pair)
@@ -1199,6 +1209,7 @@ actor SimActor {
   // What a connection tells (the connections' handler sends it here): a client joined or left, a message, a value.
   // In single player the view's frame arrives as a message after its inputs, and the simulation takes it at once
   pub async do onNet(self, ev NetEvent) {
+    if stopped { return; }
     st.onEvent(ev);
     if st.joinedNow {
       st.joinedNow = false;
@@ -1258,7 +1269,8 @@ actor SimActor {
   // The script's verdict and the exit code, once render has reported 'clean'
   pub async do verdict(self, clean bool) i32 {
     mut code = 0i32;
-    if st.scripted and !st.scriptOk { code = 1i32; }
+    // (the --panel-join run is on the real clock, which the script's step-counted checks do not hold on; it has checks of its own)
+    if st.scripted and !st.scriptOk and st.opts.panelJoin == 0u32 { code = 1i32; }
     if !clean { code = 1i32; }
     if st.scripted { reportScript(st.scriptOk); }
     code;

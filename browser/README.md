@@ -220,8 +220,7 @@ its last part (`src/hudscript.cone`); `browser.exe --hud-only --shots DIR` runs 
 **F9** (or **J**) opens a panel where a player types a name and a line to the island's owner and presses **Request to
 play**; it sends the request `--request-play` sends (`src/requestplay.cone`, see `SERVER.md`), from a thread of its own so
 that no frame waits for the server, and shows the answer in the panel: "Request sent; you'll be able to join once it's
-approved", or, once approved, "You are approved" with the command to restart with (`--connect 40.87.21.70:40000 --name
-NAME`: joining a server is chosen at start-up, when the simulation is made, so joining without a restart is not built).
+approved", or, once approved, "You are approved" and the button reads **Join** (below).
 A first run with no stored token shows a line in the HUD's status panel naming F9. The panel is **modal**: while it is up
 it takes the keyboard and the mouse, so the walk, the camera and the hotbar get none (F9 closes it from anywhere, so does
 Close; Escape is the window's and quits). Free keys were every letter but those in the table above, and F9, F10, F12.
@@ -241,6 +240,31 @@ stub with `PEGASUS_REQUEST_URL=http://127.0.0.1:PORT/play/request` (an automated
 listens on, so no script ever posts to the live server) and keep the token out of your own folder with
 `PEGASUS_PLAY_DIR=SOMEDIR`. Views: `panel-hint`, `panel-open`, `panel-typed`, `panel-answer`, `panel-closed`.
 `--checks` covers the route, the Ui, where the controls are and the off-thread request.
+
+**Join: going online without a restart** (`ViewActor.goOnline`, `src/viewactor.cone`). Pressing Join hands the shell the name
+(`Presented.join` to `FrameReport.join`), which sends `goOnline(address, name)` to the view between two frames. The view
+dials the server (`mustConnect`, the same call `--connect` makes) and **single player keeps running** while it does: the
+server's first words go into a second, connected `ViewState` made on the side (its Hello is sent when the link opens; what
+arrives is kept, not applied). Only when the server has taken this client in, which is its `Possessed` message (the replay of
+the world so far comes before it), is the switch made, **at the start of the next frame**, so that no lockstep Frame or
+FrameDone is in flight (the cut): render is told to Despawn every part the single-player view held and to let go of every
+mesh and material table row (`RenderActor.reset`; the meshes' buffers are destroyed once the GPU is done, a material's GPU
+resources have no release in `render` yet, so the old world's materials stay allocated); the in-process simulation is
+stopped (`SimActor.stop`) and its connection hung up; the side state replaces the view's (carrying the sound, the HUD's
+toggles, the flock and the window's size) and the frame goes on as a connected one. The server is not changed: the switched
+browser is a late joiner (its log is replayed, `Possessed` and the weather follow). A dial that is not answered (5 s, the
+handshake's limit; 12 s backstop) or a server that refuses the name leaves single player untouched, with the reason in the
+panel. The world is built again from the server's `Object` requests, so the switch costs a hitch of the length of a fresh
+`--connect`'s first frames (about 2 s on the RTX 4060). `PEGASUS_JOIN_ADDRESS` makes Join dial a server on this machine
+(an automated run with none dials a port nothing listens on).
+
+Tests: `browser.exe --switch-at N --frames M --shots DIR` (a window; with `PEGASUS_JOIN_ADDRESS=127.0.0.1:PORT` and a
+`browser.exe --serve PORT --loopback` running) does the panel's Join for the player at frame N on the real clock, and saves
+`switch-before`, `switch-after` (120 frames after the switch, 200 after N if there was none) with `--shots`; the same
+flag with `--connect` saves the same view of a fresh connect to compare. `--panel-only --panel-join` (or
+`--panel-join-refused`, with another client already under the name) is the scripted run through the panel: a stub that
+approves on `PEGASUS_REQUEST_URL`, the click on Join, and the result in `panel-joining` and `panel-join-result`; it checks
+the browser ends online (or still single player). `--checks` covers the panel's Join states.
 
 ## The mirror
 
@@ -578,6 +602,14 @@ A's predicted position agrees with the server's at every snapshot, that B's draw
 path within 0.3 m, and prints how far in the past B draws and the bandwidth each client uses.
 `python tools/netcheck.py` is the loopback run, and `python tools/netcheck.py --impair 50 100 20` the same through
 the relay with 5% of packets lost and 100 ms and up to 20 ms more each way.
+
+**A fresh connect and the GPU's staging memory.** A client that connects is told the whole world at once (the replay
+log), about 300 MB of mesh and texture upload, where one frame's uploads can take about 16 MB (gpu's staging block doubles
+from 64 KB and fails on its 9th growth in a frame: "a frame outgrew its staging memory 8 times"). The connected view
+therefore hands render the requests in order up to 4 MB of estimated upload a frame (a request over it goes alone), the
+rest held to the next frames (`UPLOAD_BUDGET`, `takeForRender` in `src/viewactor.cone`; single player is not limited) and
+prints "Upload: a burst of ..." when the backlog clears, about 40 frames and 1 to 2.5 s after the connect.
+`python tools/stagingcheck.py` connects ten times to a local server and checks each ends with no Vulkan failure.
 
 ## How it is put together
 
