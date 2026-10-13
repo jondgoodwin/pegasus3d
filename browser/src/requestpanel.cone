@@ -18,6 +18,11 @@
 // frame, so the Close button, which only the Ui knows was hit, closes the panel for the shell too. Bit 1 of the same word is
 // "a text field has focus": the shell starts SDL's text input then (SDL_StartTextInput) and stops it when the field loses focus.
 //
+// JOIN. Once an answer says "approved" the button reads Join. Pressing it (RequestPanel.press) makes no request: it keeps the name
+// (takeJoin), which render hands the shell in Presented.join, the shell the view (ViewActor.goOnline), and the panel waits. The
+// view's word comes back in the next HudFrames: joinFailed (once: why the dial or the server said no, shown in red, the button on
+// again) or connected (the switch is made: the panel closes). Single player runs under it all the while.
+//
 // KEYS. F9 opens the panel (and closes it, while it is open); J opens it. W A S D, the arrows, Space, Shift, V, Tab, PageUp,
 // PageDown, P, F, T, H, B, N, F1 to F8, Escape and F11 were taken; every other letter and F9, F10 and F12 were free. Escape is the
 // window's: frame's Window ends the run on it before the shell sees it, so Escape does not close the panel (the Close button
@@ -245,6 +250,7 @@ pub fn panelTarget(which u32, w f32, h f32) Vec2 {
 // The panel's phases
 const PH_EDIT = 0u32;
 const PH_SENDING = 1u32;
+const PH_JOINING = 2u32;      // Join pressed: the view is dialling the server (single player carries on until it answers)
 
 // A name as the server takes it: 1 to 24 letters, digits, spaces and . _ -
 fn nameCharOk(c u32) bool {
@@ -295,8 +301,11 @@ pub struct RequestPanel {
   pub open bool;
   phase u32;
   automated bool;
-  pub approved bool;              // an answer said "approved" in this run
+  pub approved bool;              // an answer said "approved" in this run: the button then reads Join
   pending Option[OneshotReceiver[PlayAnswer]];
+  joinName String;                // Join was pressed under this name; handed to the shell once (takeJoin)
+  lateFail String;                // a refusal that came while the panel was closed, said when it opens
+  online bool;                    // the browser is connected to a server (HudFrame.connected)
   // for the checks and the scripted run
   pub requests u32;               // requests made
   pub answers u32;                // answers shown
@@ -401,7 +410,7 @@ pub struct RequestPanel {
     ui.setSize(closeButton, BUTTON_CLOSE_W, ROW_BUTTONS);
     ui.setVisible(scrim, false);
     new RequestPanel(scrim, dialog, nameField, messageField, line0, line1, line2, ask, closeButton, false, PH_EDIT, false, false,
-      None, 0u32, 0u32, ANS_SENT, String.empty());
+      None, String.empty(), String.empty(), false, 0u32, 0u32, ANS_SENT, String.empty());
   }
 
   // The words in the three lines under the fields, in a style ("pwait", "pok" or "perr")
@@ -451,11 +460,30 @@ pub struct RequestPanel {
     ui.input.modal = scrim;
     uilayout.fieldSetText(ui, nameField, name);
     uilayout.fieldSetText(ui, messageField, "");
-    if phase != PH_SENDING {
-      self.setLines(ui, "", "", "", "pwait");
-      ui.setEnabled(ask, true);
+    if phase == PH_EDIT {
+      if online {
+        self.setLines(ui, "You are playing with others.", "", "", "pok");
+        ui.setEnabled(ask, false);
+      } elif lateFail.len() > 0usize {
+        imm why = lateFail.copy();
+        lateFail = String.empty();
+        self.setWrapped(ui, why.view(), "perr");
+        ui.setEnabled(ask, true);
+      } elif approved {
+        self.approvedLines(ui);
+        ui.setEnabled(ask, true);
+      } else {
+        self.setLines(ui, "", "", "", "pwait");
+        ui.setEnabled(ask, true);
+      }
     }
     ui.setFocus(nameField);
+  }
+
+  // The words once an answer has said "approved": the button reads Join from now on
+  fn approvedLines(self &mut, ui &mut Ui) {
+    self.setLines(ui, "You are approved.", "Press Join to play with the others.", "", "pok");
+    ui.setText(ask, "Join");
   }
 
   fn hide(self &mut, ui &mut Ui) {
@@ -510,14 +538,60 @@ pub struct RequestPanel {
     while i < events.len() {
       imm ev = events[i];
       if open {
-        if ev.kind == uilayout.UE_CLICK and ev.node == ask { self.startRequest(ui); }
+        if ev.kind == uilayout.UE_CLICK and ev.node == ask { self.press(ui); }
         elif ev.kind == uilayout.UE_CLICK and ev.node == closeButton { self.hide(ui); }
         elif ev.kind == uilayout.UE_SUBMIT and ev.node == nameField { ui.setFocus(messageField); }
-        elif ev.kind == uilayout.UE_SUBMIT and ev.node == messageField { self.startRequest(ui); }
+        elif ev.kind == uilayout.UE_SUBMIT and ev.node == messageField { self.press(ui); }
       }
       i = i + 1usize;
     }
     self.poll(ui);
+  }
+
+  // The button (or Enter in the message): Join once an answer has said "approved", else the request
+  fn press(self &mut, ui &mut Ui) {
+    if phase != PH_EDIT or online { return; }
+    if approved { self.startJoin(ui); } else { self.startRequest(ui); }
+  }
+
+  // Join: the shell is told (takeJoin) and the view dials the server; single player carries on underneath until the server has
+  // taken this player in (joined() says how it ended)
+  fn startJoin(self &mut, ui &mut Ui) {
+    imm name = String.from(uilayout.fieldText(ui, nameField)).trim();
+    if !validName(name.view()) {
+      self.setLines(ui, "Names use letters, digits, spaces", ". _ - and are up to 24 long.", "", "perr");
+      return;
+    }
+    joinName = name.copy();
+    phase = PH_JOINING;
+    ui.setEnabled(ask, false);
+    self.setLines(ui, "Connecting to the island...", "", "", "pwait");
+  }
+
+  // The name Join was pressed under since the last call (empty: it was not)
+  pub fn takeJoin(self &mut) String {
+    mut out = String.empty();
+    out <=> joinName;
+    out;
+  }
+
+  // How a Join ended, as the view's frame says (hud.cone calls it every frame it runs): 'connected', the switch is done and
+  // the panel closes; 'failed', the server was not reached or would not have this player, and single player carries on
+  pub fn joined(self &mut, ui &mut Ui, connected bool, failed &String) {
+    online = connected;
+    if connected {
+      if phase == PH_JOINING {
+        phase = PH_EDIT;
+        if open { self.hide(ui); }
+      }
+      return;
+    }
+    if failed.len() > 0usize and phase == PH_JOINING {
+      phase = PH_EDIT;
+      ui.setEnabled(ask, true);
+      imm why = failed.copy();
+      if open { self.setWrapped(ui, why.view(), "perr"); } else { lateFail = why.copy(); }
+    }
   }
 
   // The request made: checked, and sent by a thread of its own (the frame does not wait for the server)
@@ -562,13 +636,8 @@ pub struct RequestPanel {
           self.setLines(ui, "Request sent;", "you'll be able to join once it's approved.", "", "pwait");
         } elif a.kind == ANS_APPROVED {
           approved = true;
-          imm name = String.from(uilayout.fieldText(ui, nameField)).trim();
-          mut cmd = String.from("--connect ");
-          cmd.append(JOIN_ADDRESS);
-          cmd.append(" --name ");
-          cmd.append(name.view());
-          self.setLines(ui, if a.note.len() > 0usize and a.note.view() != "Token saved." { "You are approved (the token was not saved)."; } else { "You are approved."; },
-            "To join, restart the browser with:", cmd.view(), "pok");
+          self.approvedLines(ui);
+          if a.note.len() > 0usize and a.note.view() != "Token saved." { ui.setText(line2, "(the token was not saved)"); }
         } else {
           self.setWrapped(ui, a.text.view(), "perr");
         }

@@ -54,9 +54,12 @@ to the machine's name). It sends one HTTPS POST to `https://cone.jondgoodwin.com
 you'll be able to join once it's approved." In the browser, **F9** (or **J**) opens the "Play with others" panel: a name field
 (from `--name`, else the name this machine was approved under, else the machine's), an optional line to the owner, and
 **Request to play**; the same code sends the request, from its own thread, and the panel shows the answer. Once approved it
-shows the command to restart with (`--connect 40.87.21.70:40000 --name NAME`): joining without a restart is not built (the
-simulation is made in-process at start-up for single player, and the view actor is made for one mode; see the browser's
-README, "Play with others"). Tests and scripts: `PEGASUS_REQUEST_URL` (post elsewhere) and `PEGASUS_PLAY_DIR` (keep
+says "You are approved" and its button reads **Join**: pressing it dials the server (`40.87.21.70:40000`, under the panel's name)
+and switches the running browser from single player to connected, with no restart (the browser's README, "Play with others";
+`--connect 40.87.21.70:40000 --name NAME` still starts a browser connected). A server that does not answer, or refuses the
+name, leaves the player in single player with the reason in the panel. The server is not changed: a browser that joined
+this way is a late joiner like any other. Tests and scripts: `PEGASUS_JOIN_ADDRESS` (Join dials this instead; an automated
+run with none dials a port nothing listens on), `PEGASUS_REQUEST_URL` (post elsewhere) and `PEGASUS_PLAY_DIR` (keep
 play-token.txt elsewhere); an automated run never posts to the live server unless `PEGASUS_REQUEST_URL` says so.
 
 ```
