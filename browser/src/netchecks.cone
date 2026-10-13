@@ -122,9 +122,14 @@ fn checkNet() bool {
     PartId.none(), 0.5, 3u32, 250u32, 7.5, 0u32, 0., false, noRots()));
   beings.push(new BeingState(1u32, true, new Vec3(-10.123456, 33.5, 301.987654), -2.5, -1.8, -4.2, 1.1, -0.9, false, new Intents(0., 0., false, true),
     idOf(21u32), 1., 1u32, 2u32, 0., 0u32, 0., false, noRots()));
-  mut w = new WorldState(4294967295u64, 1234.567d, 10u32, 987654u64, beings);
+  mut propList = List[PropState].empty();
+  propList.push(new PropState(0u32, new Vec3(-9.5, 4.6, 342.25), Quat.angleAxis(0.7, new Vec3(0.3, 0.9, 0.1).normalize())));
+  propList.push(new PropState(7u32, new Vec3(-22.001, 5.1234, 300.5), Quat.angleAxis(2.9, new Vec3(1., 0., 0.))));
+  mut fxList = List[FxState].empty();
+  fxList.push(new FxState(1u32, FX_ZAP, 123456u64));
+  mut w = new WorldState(4294967295u64, 1234.567d, 10u32, 987654u64, beings, propList, fxList);
   imm bytes = encodeState(&w);
-  mut back = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+  mut back = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty());
   imm decoded = decodeState(copyBytes(&bytes), &mut back);
   ok = expect("a snapshot decodes", decoded and back.beings.len() == 2usize) and ok;
   if decoded and back.beings.len() == 2usize {
@@ -142,6 +147,35 @@ fn checkNet() bool {
     ok = expect("a whole one comes back to the bit", b.exact and b.position.x == -10.123456 and b.position.y == 33.5 and b.position.z == 301.987654
       and b.yaw == -2.5 and b.speed == -1.8 and b.vy == -4.2 and b.airVx == 1.1 and b.airVz == -0.9 and !b.grounded and b.intents.jump
       and b.platform == idOf(21u32)) and ok;
+    // The playground's props and spells ride in the snapshot
+    ok = expect("two props and a spell in force come back", back.props.len() == 2usize and back.fx.len() == 1usize) and ok;
+    if back.props.len() == 2usize and back.fx.len() == 1usize {
+      imm p0 = back.props[0usize];
+      imm p1 = back.props[1usize];
+      ok = expect("a prop's slot and place to a millimetre", p0.slot == 0u32 and p1.slot == 7u32 and libc.fabsf(p0.position.x + 9.5) <= 0.0006
+        and libc.fabsf(p0.position.y - 4.6) <= 0.0006 and libc.fabsf(p1.position.z - 300.5) <= 0.0006 and libc.fabsf(p1.position.x + 22.001) <= 0.0006) and ok;
+      imm sent = Quat.angleAxis(2.9, new Vec3(1., 0., 0.));
+      imm dot = libc.fabsf(sent.x * p1.rotation.x + sent.y * p1.rotation.y + sent.z * p1.rotation.z + sent.w * p1.rotation.w);
+      ok = expect("a prop's rotation within a fifth of a degree", dot > 0.999998) and ok;
+      ok = expect("a spell's being, kind and the tick it began", back.fx[0usize].being == 1u32 and back.fx[0usize].kind == FX_ZAP
+        and back.fx[0usize].start == 123456u64) and ok;
+    }
+  }
+  // The playground's two messages: an action to the simulation, a burst to the view
+  match decodeToSim(encodeToSim(ToSim.Play(PLAY_SPELL, SPELL_ZAP, 3u32, new Vec3(1., 2., 3.), new Vec3(0., 0.6, -0.8)))) {
+    case imm pl Play {
+      ok = expect("an action comes back whole", pl.kind == PLAY_SPELL and pl.spell == SPELL_ZAP and pl.target == 3u32 and pl.eye.y == 2.
+        and pl.dir.z == -0.8) and ok;
+    }
+    else { ok = expect("an action comes back whole", false) and ok; }
+  }
+  imm burstBytes = encodeBurst(&new BurstInfo(BURST_PAINT, 2u32, new Vec3(0.1, 1.2, -0.3), new Vec3(0., 0., 1.), 3u32, 99999u64));
+  match decodeToView(burstBytes) {
+    case imm bu Burst {
+      ok = expect("a burst comes back whole", bu.kind == BURST_PAINT and bu.being == 2u32 and bu.position.y == 1.2 and bu.normal.z == 1. and bu.color == 3u32
+        and bu.tick == 99999u64) and ok;
+    }
+    else { ok = expect("a burst comes back whole", false) and ok; }
   }
   // Forty beings are a snapshot of what size
   mut many = List[BeingState].empty();
@@ -151,7 +185,7 @@ fn checkNet() bool {
       PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots()));
     k = k + 1u32;
   }
-  mut manyState = new WorldState(1u64, 1d, 1u32, 1u64, many);
+  mut manyState = new WorldState(1u64, 1d, 1u32, 1u64, many, List[PropState].empty(), List[FxState].empty());
   imm big = encodeState(&manyState);
   print <- "  a snapshot of forty beings: "; print <- big.len(); print <- " bytes (the limit "; print <- MAX_LATEST; print <- ")\n";
   ok = expect("a snapshot of forty beings fits a packet", big.len() <= MAX_LATEST) and ok;
@@ -165,8 +199,8 @@ fn checkNet() bool {
   mut rag = List[BeingState].empty();
   rag.push(new BeingState(0u32, false, new Vec3(5., 3., 7.), 0.5, 0., -3., 0., 0., false, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 1u32, 0., true, spun));
   rag.push(new BeingState(1u32, false, new Vec3(6., 0., 8.), 1.5, 0., 0., 0., 0., true, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 2u32, 1.234, false, noRots()));
-  imm ragBytes = encodeState(&new WorldState(5u64, 1d, 1u32, 1u64, rag));
-  mut ragBack = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+  imm ragBytes = encodeState(&new WorldState(5u64, 1d, 1u32, 1u64, rag, List[PropState].empty(), List[FxState].empty()));
+  mut ragBack = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty());
   imm ragOk = decodeState(copyBytes(&ragBytes), &mut ragBack) and ragBack.beings.len() == 2usize;
   mut spinErr = 0.;
   if ragOk and ragBack.beings[0usize].hasRots {
@@ -191,7 +225,7 @@ fn checkNet() bool {
     limp.push(new BeingState(k, false, new Vec3(5., 3., 7.), 0.5, 0., -3., 0., 0., false, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 1u32, 0., true, spun));
     k = k + 1u32;
   }
-  imm limpBytes = encodeState(&new WorldState(5u64, 1d, 1u32, 1u64, limp));
+  imm limpBytes = encodeState(&new WorldState(5u64, 1d, 1u32, 1u64, limp, List[PropState].empty(), List[FxState].empty()));
   print <- "  a snapshot of forty ragdolls: "; print <- limpBytes.len(); print <- " bytes\n";
   ok = expect("a snapshot of forty ragdolls still fits a packet", limpBytes.len() <= MAX_LATEST) and ok;
 
@@ -257,7 +291,7 @@ fn checkNet() bool {
   garbage.push(0u8);
   garbage.push(5u8);
   garbage.push(10u8);
-  mut state = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+  mut state = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty());
   ok = expect("a short or corrupt message is refused", !decodeState(copyBytes(&garbage), &mut state)
     and !decodeInput(copyBytes(&garbage), &mut inputBack)) and ok;
   match decodeToView(copyBytes(&garbage)) {

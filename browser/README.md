@@ -160,7 +160,10 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | T | the weather changes to the next of six states (clear, fair, cloudy, overcast, rain, snow), crossfading over 12 s of scene time |
 | N | mute the sound, or un-mute it (the master gain fades over 80 ms) |
 | H | hide the HUD, or show it again (below) |
-| F1 to F8 | use the hotbar's slots (F1 to F3 hold placeholders that only cool down for 1.5 s; the rest are empty) |
+| B | bowl the ball at the spot the camera looks at (the playground, below) |
+| F1 | throw paint where the camera looks (30 m; trees, rocks, walls and the balloon's basket stop it) |
+| F2 / F3 | zap / make dance the mannequin in front of the camera (the nearest to its middle within 22 m; locked on, and highlighted, for 1.5 s after) |
+| F4 to F8 | hotbar slots with nothing in them yet |
 | F11 | fullscreen |
 | Escape | quit |
 
@@ -415,6 +418,32 @@ other or the player except as the shy one flees: characters pass through one ano
 A step of the four minds takes about 2 to 8 microseconds (measured by `--checks` and the run's last lines); a route
 query a few tenths of a millisecond. `--no-npcs` leaves them out (a scripted run without them is byte-identical in its
 shots to a run before they were added).
+
+## The playground: bowling and three spells
+
+In the balloon's backyard, 26 m west of the basket, ten amphoras (the amphora's mesh at 0.6, 0.89 m tall) stand in a triangle
+at the end of a lane that runs west (`bakedworld/pins.cone`); the lane's head is 11 m east of the apex. The patrolling villager's round
+now ends here (it used to end at the beach), so there is a mannequin to cast at. Everything in it is the simulation's: the view draws only what the
+snapshot and the simulation's bursts say, so every connected player sees it.
+
+- **Bowling (B).** The ball (the scene's own, 1 m across) is made a rigid body at the player's feet and rolled at the spot the camera's ray meets,
+  at 13 m/s with a damping that stops it within about 25 m. The pins are rigid bodies (convex hulls of the amphora's outline, 3 kg each, the ball 25 kg) in
+  the physics world (`props.cone`; layer 16, which mannequins and ragdolls do not see). Live bodies slower than 0.45 m/s for 0.8 s all go to sleep together
+  (the world's own sleep is never satisfied by a ball creeping down a lawn); 5 s after the last body sleeps, every moved prop rises 0.7 m and glides home in
+  1.4 s, and is made again there, asleep. The ball's home is the lane's head. From the first time any prop leaves its home all eleven are in every
+  snapshot (14 bytes each).
+- **Paint (F1).** A ray from the camera through the physics world's ground, solids and platforms and through every mannequin (four spheres each);
+  the nearest is hit. A splat is a box decal (render's) with a ragged-blot texture, tinted one of four colours, kept 20 s and faded over the last 6 s. On a
+  mannequin it is kept in the mannequin's frame (position and heading only: the honest version without a paint layer on the skin, so an arm that swings
+  carries no splat with it). Decals need the image-quality passes, so with `PEGASUS_FX=off` there are none.
+- **Zap (F2).** The target jerks about for a second: twelve bones each given a fresh random rotation twenty times a second, the pelvis thrown about, the whole dying
+  away. A procedural overlay on the gait's pose (`spells.cone`), the same in the simulation and in every view because it is a function of the seconds since
+  the spell began. The "ah!" is audiomixer's new `SYNTH_VOICE` (a glottal pulse train through three vowel formants, 0.35 s; a man's pitch for a tall
+  mannequin, a woman's for a short one), played by each view at the target when the simulation's burst arrives. Nobody has listened to it.
+- **Jig (F3).** The target dances four seconds at two beats a second: bounce, sway, knees up in turn, arms swinging, head nodding.
+- A zapped or dancing mannequin ignores its own intents until the spell ends. The target must be in the open (a ray from the caster's eye to its chest meets no
+  solid) and within 25 m; the simulation decides, the view's targeting (`worldinteract`'s cone-and-cost lock-on) only suggests.
+- The hotbar's first three slots carry icons drawn by hand over them (a splat, a bolt, a dancer).
 
 ## Playing together: one server, two browsers
 

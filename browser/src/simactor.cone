@@ -225,6 +225,7 @@ pub struct SimState {
   pub npcRunOk bool;          // the scripted run's: the villagers' part has held (npcscript.cone)
   pub wxOk bool;              // the scripted run's: the weather's part has held (weatherscript.cone)
   pub fenceRunOk bool;        // the scripted run's: the roaming views' eyes are on walkable ground (fencescript.cone)
+  pub play PlaySim;           // the playground's: the spells in force, the actions received and the bursts to tell (spellsim.cone)
   pub land Island;  // the baked island, shared by every actor (read it with &land)
   pub opts RunOptions;        // what the arguments say that this actor acts on (--no-npcs, --trace, --hud-only, --audio-walk)
 
@@ -236,11 +237,14 @@ pub struct SimState {
       List[Request].empty(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0., List[f32].empty(), List[u32].empty(), List[PartId].empty(),
       0u64, Weathering.fair(), Weathering.fair(), false, 0u64, ReplayLog.empty(), List[Intents].empty(), List[bool].empty(),
       0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step].empty(), false, 0u64, 0u64, Village.empty(),
-      Route.make(), List[f32].empty(), Assembly.make(), Ride.make(), ScriptRun.make(), FallRun.make(), true, true, true, land, opts);
+      Route.make(), List[f32].empty(), Assembly.make(), Ride.make(), ScriptRun.make(), FallRun.make(), true, true, true, PlaySim.empty(), land, opts);
   }
 
   // The possessed being's body: where the user is (single player)
   pub fn youBody(self &) Walk { cast.beings[cast.possessed].body; }
+
+  // The first client's connection number (the scripted run acts as it), or 0
+  pub fn firstClient(self &) u32 { if clients.len() > 0usize { clients[0usize].id; } else { 0u32; }; }
 
   // Whether this half keeps the camera and the birds for the scripted harness: single player and scripted runs
   fn legacy(self &) bool { !serve; }
@@ -284,6 +288,8 @@ pub struct SimState {
     imm solids = worldSolids(&land);
     cast.phys.ensureGround();
     cast.phys.setSolids(&solids);
+    // The playground's pins and ball, asleep at home
+    propsEnsure(&mut cast.phys, &mut cast.props);
     if scripted {
       // The scripted run starts as the plain walker on the landing beach,
       // facing -z up the path's first stretch; its walk is checked there, then
@@ -398,6 +404,12 @@ pub struct SimState {
     print <- "FINAL "; print <- cb; print <- " "; print <- millimetres(fb.body.position.x); print <- " "; print <- millimetres(fb.body.position.y);
     print <- " "; print <- millimetres(fb.body.position.z); print <- " applied "; print <- clients[k].applied; print <- " waited "; print <- clients[k].skipped;
     print <- " extra "; print <- clients[k].extra; print <- "\n";
+    // The playground, for the net check: what was played, and where the ball lay as the client left (millimetres)
+    {
+      imm ball = propPoseOf(&cast.phys, &cast.props, PROP_BALL).pos;
+      print <- "PLAY "; print <- play.bowls; print <- " "; print <- play.paintShots; print <- " "; print <- play.paintOnSurfaces + play.paintOnBeings; print <- " ";
+      print <- millimetres(ball.x); print <- " "; print <- millimetres(ball.y); print <- " "; print <- millimetres(ball.z); print <- "\n";
+    }
     if serve {
       imm b = &mut cast.beings[cb];
       b.gone = true;
@@ -439,6 +451,7 @@ pub struct SimState {
           case mut l &mut Look { looks.push(l.pitch); }
           case mut c &mut Command { commands.push(c.kind); }
           case mut k &mut Click { clicksIn.push(k.part); }
+          case mut pl &mut Play { play.receive(m.id, pl.kind, pl.spell, pl.target, pl.eye, pl.dir); }
           case mut f &mut Frame {
             frameAsked = true;
             frameNo = f.frame;
@@ -522,6 +535,8 @@ pub struct SimState {
         c = c + 1usize;
       }
       village.step(&land, &cast, &mut given, step.dt);
+      // A being under a spell is held: a convulsion or a dance is not steered
+      playHold(&mut play, &mut given, tick);
       cast.stepEach(&given, &stepIt, step.dt, self.legacy());
       // A backlog of a client's inputs is run off, two a tick
       c = 0usize;
@@ -601,6 +616,16 @@ pub struct SimState {
     }
     commands.clear();
     sceneNow = scene.now();
+    // The playground's actions received are played, and what every view is to show of them told
+    if play.pending.len() > 0usize {
+      playApply(&mut play, &mut cast, tick, &clients);
+      mut bi = 0usize;
+      while bi < play.bursts.len() {
+        self.tellAll(encodeBurst(play.bursts[bi]));
+        bi = bi + 1usize;
+      }
+      play.bursts.clear();
+    }
     // Hard landings, mailed to the world
     mut landings = cast.takeLandings();
     mut li = 0usize;
@@ -725,6 +750,9 @@ pub struct SimState {
       }
       i = i + 1usize;
     }
+    // The playground's pins and ball, once any has been moved
+    mut propsNow = List[PropState].empty();
+    propsSnapshot(&cast.phys, &cast.props, &mut propsNow);
     // A scripted close-up looks from where the script says instead, through its lens
     mut fixedView = scripted and hasView(&opts, &asm, frameNo);
     mut look = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
@@ -737,7 +765,8 @@ pub struct SimState {
     mut c = 0usize;
     while c < clients.len() {
       imm cl = clients[c];
-      mut w = new WorldState(tick, scene.now(), u32.from(scene.clock.rate()), cl.applied, copyBeings(&beings));
+      mut w = new WorldState(tick, scene.now(), u32.from(scene.clock.rate()), cl.applied, copyBeings(&beings), copyProps(&propsNow),
+        copyFx(&play.fx));
       // The being the client drives crosses whole: it is compared with the client's own prediction
       mut k = 0usize;
       while k < w.beings.len() {

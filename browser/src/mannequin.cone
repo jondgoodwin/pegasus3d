@@ -115,11 +115,14 @@ pub struct Figure {
   pub modeT f32;                      // seconds in this mode
   pub lieT f32;                       // seconds the ragdoll has been settled
   pub hurtSpeed f32;                  // the landing speed its health has been charged for, this fall
+  pub fxKind u32;                     // a spell in force on it (FX_ZAP, FX_JIG), or FX_NONE (spells.cone)
+  pub fxT f32;                        // seconds since it began
+  pub fxStart u64;                    // and the simulation tick it began at (a view sees a new spell by this)
 
   pub fn none() Figure {
     new Figure(false, 0., bonepose.Skeleton.empty(), bonepose.Pose.empty(), List[Transform3].empty(), walkgait.Walker.make(1., 0u32),
       List[PartId].empty(), List[Mat4].empty(), 0., 0., 0., 0., true, 1., false, 0., 0u32, PartId.none(), new Vec3(0., 0., 0.), 0., 0u32,
-      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32, characterOf(1.), FIG_WALK, -1i32, 0., 0., 0.);
+      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32, characterOf(1.), FIG_WALK, -1i32, 0., 0., 0., FX_NONE, 0., 0u64);
   }
 
   // A standing figure of 'height' metres, with the rigid attachments 'parts'
@@ -136,7 +139,22 @@ pub struct Figure {
     }
     new Figure(true, height, skel, pose, List[Transform3].empty(), walkgait.Walker.make(height, seed), parts, bind,
       0., 0., 0., 0., true, 1., false, 0., 0u32, PartId.none(), new Vec3(0., 0., 0.), 0., 0u32,
-      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32, characterOf(height), FIG_WALK, -1i32, 0., 0., 0.);
+      new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32, characterOf(height), FIG_WALK, -1i32, 0., 0., 0., FX_NONE, 0., 0u64);
+  }
+
+  // A spell of 'kind' (FX_...) begun at simulation tick 'start', 'age' seconds ago (0: now); FX_NONE ends one
+  pub fn setFx(self &mut, kind u32, start u64, age f32) {
+    fxKind = kind;
+    fxStart = start;
+    fxT = age;
+  }
+
+  // One step of the spell in force: its clock on by 'dt', and its pose laid over the gait's; it lapses by itself
+  fn stepFx(self &mut, dt f32) {
+    if fxKind == FX_NONE { return; }
+    fxT = fxT + dt;
+    if fxT > fxSeconds(fxKind) { fxKind = FX_NONE; return; }
+    applyFx(self);
   }
 
   // Posed where the state of a body the figure does not move says it is (a being driven by another process, drawn
@@ -146,6 +164,7 @@ pub struct Figure {
     imm feet = pos.y;
     imm floor = fn(x f32, z f32) f32 { phys.floorAt(x, z, feet); };
     walker.update(&skeleton, &mut pose, &mut models, pos, yaw, if onGround { spd; } else { 0.; }, turnRate, onGround, &floor, dt);
+    self.stepFx(dt);
   }
 
   // A landing at 'impact' m/s that a snapshot told of: the gait takes it as a step of its own would
@@ -183,6 +202,20 @@ pub struct Figure {
   }
 
   pub fn radius(self &) f32 { CAPSULE_RADIUS_OVER_H * height; }
+
+  // The farthest any bone of its last pose is from the model's origin (the feet's ground point), metres: a standing or walking
+  // figure's is under its height; a pose stretched across a teleport is metres more
+  pub fn reach(self &) f32 {
+    mut worst = 0.;
+    mut i = 0usize;
+    while i < models.len() {
+      imm t = (*models[i]).translation;
+      imm d = libc.sqrtf(t.x * t.x + t.y * t.y + t.z * t.z);
+      if d > worst { worst = d; }
+      i = i + 1usize;
+    }
+    worst;
+  }
 
   // The eye, in the figure's model space (the feet's ground point, facing yaw 0)
   pub fn eyeModel(self &) Vec3 {
@@ -278,6 +311,7 @@ pub struct Figure {
     imm floor = fn(x f32, z f32) f32 { phys.floorAt(x, z, feet); };
     walker.update(&skeleton, &mut pose, &mut models, pos, body.yaw, if grounded { speed; } else { 0.; },
       it.turn * TURN_RATE, grounded, &floor, dt);
+    self.stepFx(dt);
     // Falling fast: limp (the simulation's alone; a browser waits for the snapshot to say so)
     if !grounded and vy < 0. - RAGDOLL_FALL_SPEED and phys.authority {
       startRagdoll(phys, self, body);
