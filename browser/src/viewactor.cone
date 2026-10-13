@@ -104,12 +104,19 @@ pub struct FrameReport {
   pub emitters usize;
   pub worldDone bool;         // every object of the world sent
   pub worldSentFrame u64;     // the frame that sent its last; 0 before
+  pub refused bool;           // the server would not have this client (its name): the run is over
 
   // Nothing yet: what the shell holds until a report comes
   pub fn none() FrameReport {
     new FrameReport(0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u, Walk.make(new Vec3(0., 0., 0.), 0.), 0usize, 0usize, 0usize,
-      0usize, false, 0u64);
+      0usize, false, 0u64, false);
   }
+}
+
+// A player's name and the being it is above (a server's clients: BeingAdded says so)
+pub struct NameTag {
+  being u32;
+  name String;
 }
 
 // No being is known to be the user's
@@ -227,10 +234,14 @@ pub struct ViewState {
   pub play PlayView;          // the playground's: the props, the spells' paint and the lock-on (playview.cone)
   pub hud HudView;            // the HUD's: shown or hidden, and the frame time (hud.cone)
   pub audio AudioView;        // the sound: made by the shell (audioOpen), touched only from this actor's turns
+  playerName String;          // the name this client plays under (--name), sent to a server in its Hello
+  refusedWhy String;          // the server's reason, if it would not have this client
+  refusedNow bool;            // it was refused: the run ends
+  tags List[NameTag];         // the names shown above the mannequins of the players
   pub land Island;  // the baked island, shared by every actor (read it with &land)
   pub opts RunOptions;        // what the arguments say that this actor acts on (--script, --trace)
 
-  pub fn make(birds Birds, lockstep bool, audio AudioView, land Island, opts RunOptions) ViewState {
+  pub fn make(birds Birds, lockstep bool, audio AudioView, playerName String, land Island, opts RunOptions) ViewState {
     imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
     new ViewState(ViewScene.empty(), PickSystem.empty(), PartId.none(), new PickHit(PartId.none(), 0., 0u32, 0u64),
       0u64, new Vec2(HEADLESS_W, HEADLESS_H), NetSide.make(), Cast.client(land.share()), List[Puppet].empty(), NO_ROW, NO_BEING, false,
@@ -239,7 +250,8 @@ pub struct ViewState {
       List[ToView].empty(), List[WorldState].empty(), List[TestView].empty(), 0u64,
       new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
       List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64,
-      PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, land, opts);
+      PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, playerName, String.empty(), false, List[NameTag].empty(),
+      land, opts);
   }
 
   // Reliable messages sent to the simulation, ever
@@ -257,6 +269,8 @@ pub struct ViewState {
         net.open(j.id, j.conn);
         joined = true;
         joinedNow = true;
+        // Connected: the server's first word from us is the name we play under
+        if !lockstep { net.sendReliable(j.id, encodeToSim(ToSim.Hello(self.playerName.copy()))); }
       }
       case imm l Left {
         net.close(l.id);
@@ -275,6 +289,11 @@ pub struct ViewState {
             frameTick = fd.tick;
             simulateNs = fd.simulateNs;
             publishNs = fd.publishNs;
+          }
+          case mut rf &mut Refused {
+            refusedWhy = rf.reason.copy();
+            refusedNow = true;
+            print <- "REFUSED by the server: "; printStr(rf.reason.view()); print <- "\n";
           }
           else { inbox.push(msg); }
         }
@@ -808,6 +827,7 @@ pub struct ViewState {
               cast.add(Being.mannequin(ba.part, away, 0., Figure.make(ba.height, ba.seed, List[PartId].empty())));
             }
             puppets.push(new Puppet(List[Sample].empty(), 0u32, 0u32, false, false, away, 0.));
+            if ba.name.len() > 0usize { tags.push(new NameTag(ba.being, ba.name.copy())); }
             self.checkOwn();
           }
         }
@@ -1148,9 +1168,19 @@ pub struct ViewState {
       }
       i = i + 1usize;
     }
+    // The players' names, above their heads (the user's own is not shown to the user)
+    mut plates = List[HudTag].empty();
+    mut t = 0usize;
+    while t < tags.len() {
+      imm being = usize.from(tags[t].being);
+      if being != driven and being < cast.beings.len() and !cast.beings[being].gone and cast.beings[being].figure.active {
+        plates.push(new HudTag(cast.beings[being].body.position + new Vec3(0., 0.45 + cast.beings[being].figure.height, 0.), tags[t].name.copy()));
+      }
+      t = t + 1usize;
+    }
     // (a scripted run's frame time and step are not repeatable: it shows none, and steps by 1/60)
     new HudFrame(hud.on, f32.from(hourAt(sceneNow)), weather.target, if opts.scripted { 0.; } else { hud.smoothMs; }, !lockstep, rttMs,
-      you, yaw, others, input.hudSlots, if opts.scripted { 0.016666668; } else { hud.stepSeconds(); });
+      you, yaw, others, input.hudSlots, if opts.scripted { 0.016666668; } else { hud.stepSeconds(); }, plates, cast.eyes(), FOV);
   }
 
   // The user's body, for the shell's report
@@ -1173,9 +1203,9 @@ actor ViewActor {
   // shell's inboxes, and this browser's flock
   fn init(self &new, sim Option[SimActor], render RenderActor, frames Sender[FrameReport], ended Sender[i32],
       birds Birds, lockstep bool, joined Sender[bool], audioOpts AudioOptions, automated bool, opts RunOptions,
-      land Island) {
+      playerName String, land Island) {
     // The sound's sink, opened here on the constructing (main) thread: the view is this actor's own from then on
-    mut state = ViewState.make(birds, lockstep, audioOpen(&audioOpts, automated), land, opts);
+    mut state = ViewState.make(birds, lockstep, audioOpen(&audioOpts, automated), playerName, land, opts);
     // The physics this browser predicts its own mannequin by: the same ground and solids as the simulation's, its own world
     imm solids = worldSolids(&land);
     state.cast.phys.ensureGround();
@@ -1266,7 +1296,7 @@ actor ViewActor {
     }
     if st.opts.traceOn { print.flush(); }
     frames <- new FrameReport(st.simulateNs, st.publishNs + (t2 - t1), p.renderNs, p.presentNs, p.swapNs, p.acquireNs, p.status,
-      you, waiting, parts, p.rows, p.emitters, worldDone, worldSent);
+      you, waiting, parts, p.rows, p.emitters, worldDone, worldSent, st.refusedNow);
   }
 
   // The end of the run: the simulation's and the world's lines, the link's,
