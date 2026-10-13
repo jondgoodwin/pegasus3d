@@ -160,6 +160,7 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | T | the weather changes to the next of six states (clear, fair, cloudy, overcast, rain, snow), crossfading over 12 s of scene time |
 | N | mute the sound, or un-mute it (the master gain fades over 80 ms) |
 | H | hide the HUD, or show it again (below) |
+| F9 (or J) | open the "Play with others" panel: ask the island's owner to let you join (below); F9 closes it again |
 | B | bowl the ball at the spot the camera looks at (the playground, below) |
 | F1 | throw paint where the camera looks (30 m; trees, rocks, walls and the balloon's basket stop it) |
 | F2 / F3 | zap / make dance the mannequin in front of the camera (the nearest to its middle within 22 m; locked on, and highlighted, for 1.5 s after) |
@@ -202,7 +203,7 @@ widgets), the text is `msdftext`'s signed-distance-field text (sharp at any size
 arcs, lines and the map's image) are one instanced pipeline, `hudshader.slang`. The HUD only presents: the view
 actor hands the render actor, which owns the GPU and draws it, a small record each frame (the clock, the weather,
 the frame time, where the beings are, which F-keys were pressed); no game state is in it. Clicks do not reach it
-yet: they go to the world's picking.
+except while the "Play with others" panel (next section) is up: otherwise they go to the world's picking.
 
 It is laid out in logical units and drawn at the display's scale (`PEGASUS_UI_SCALE=1.5` to force 150 %), with
 the text laid out at the pixel size. The font is Inter (Regular, and SemiBold which no label uses yet), from
@@ -213,6 +214,33 @@ folder; where none can be read it falls back to Segoe UI, or Arial, or Cascadia 
 folder, and draws no text where none can be read. `PEGASUS_HUD=off` starts it hidden (to time the
 picture without it). A scripted run starts with it hidden, so its other views are as they were, and turns it on in
 its last part (`src/hudscript.cone`); `browser.exe --hud-only --shots DIR` runs only that part, for looking at it.
+
+### Play with others (the request panel)
+
+**F9** (or **J**) opens a panel where a player types a name and a line to the island's owner and presses **Request to
+play**; it sends the request `--request-play` sends (`src/requestplay.cone`, see `SERVER.md`), from a thread of its own so
+that no frame waits for the server, and shows the answer in the panel: "Request sent; you'll be able to join once it's
+approved", or, once approved, "You are approved" with the command to restart with (`--connect 40.87.21.70:40000 --name
+NAME`: joining a server is chosen at start-up, when the simulation is made, so joining without a restart is not built).
+A first run with no stored token shows a line in the HUD's status panel naming F9. The panel is **modal**: while it is up
+it takes the keyboard and the mouse, so the walk, the camera and the hotbar get none (F9 closes it from anywhere, so does
+Close; Escape is the window's and quits). Free keys were every letter but those in the table above, and F9, F10, F12.
+
+The event path: the shell (`src/browser.cone`, the main thread, where SDL's events arrive) offers each event to
+`PanelRoute` (`src/requestpanel.cone`), which takes it while the panel is up and makes a `PanelEvent` of it (the mouse as
+fractions of the window); the events ride in `FrameInput`, the view and `HudFrame` to the render actor, which owns the HUD,
+and `RequestPanel.apply` feeds them to `uilayout` (`pointerMove`, `pointerDown`, `pointerUp`, `keyDown`, `textInput`).
+Focus lives in the HUD's `Ui`; the shell holds only a copy of "the panel is up", which render's word comes back in each
+frame's report (bit 0 of `FrameReport.panel`; bit 1, "a text field has focus", starts and stops SDL's text input). It
+adds no global.
+
+`browser.exe --panel-only --name zz-test --shots DIR` (a window; `src/panelscript.cone`) is its scripted run: the first
+100 frames of the script, then F9, a click on each field, text typed through SDL's queue, a click on the button, the
+answer, and F9 again, with W held under the panel (the player must not move) and after it (it must). Point it at a
+stub with `PEGASUS_REQUEST_URL=http://127.0.0.1:PORT/play/request` (an automated run otherwise asks a port nothing
+listens on, so no script ever posts to the live server) and keep the token out of your own folder with
+`PEGASUS_PLAY_DIR=SOMEDIR`. Views: `panel-hint`, `panel-open`, `panel-typed`, `panel-answer`, `panel-closed`.
+`--checks` covers the route, the Ui, where the controls are and the off-thread request.
 
 ## The mirror
 

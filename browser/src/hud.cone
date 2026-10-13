@@ -9,8 +9,9 @@
 //
 // KEYS. H hides and shows the HUD; F1 to F8 use the hotbar's slots. Nothing
 // else is bound to them (walk.cone and browser.cone bind W A S D, the arrows,
-// Space, Shift, V, Tab, PageUp, PageDown, P, F and T; Escape and F11 are the
-// window's).
+// Space, Shift, V, Tab, PageUp, PageDown, P, F, T, B and N; Escape and F11 are the
+// window's). F9 and J open the "Play with others" panel (requestpanel.cone), which takes
+// the keyboard and the mouse while it is up and is the HUD's only input.
 //
 // SCALE. The Ui is laid out in logical units and drawn at 'scale' pixels a unit
 // (the display's scale, 1.5 at 150 %; PEGASUS_UI_SCALE overrides it): the draw
@@ -56,10 +57,12 @@ pub struct HudFrame {
   pub tags List[HudTag];      // the players' names, each at a point in the world (above a head)
   pub eye Pose;               // the camera they are seen from
   pub fov f32;                // and its vertical field of view
+  pub events List[PanelEvent]; // the keys, text and mouse the "Play with others" panel is given this frame (requestpanel.cone)
+  pub hint bool;              // show the one-line hint naming the panel's key
 
   pub fn none() HudFrame {
     new HudFrame(false, 12., WEATHER_FAIR, 0., false, 0i64, new Vec3(0., 0., 0.), 0., List[Vec3].empty(), 0u32, 0.,
-      List[HudTag].empty(), Pose.look(new Vec3(0., 0., 0.), 0., 0.), 1.);
+      List[HudTag].empty(), Pose.look(new Vec3(0., 0., 0.), 0., 0.), 1., List[PanelEvent].empty(), false);
   }
 }
 
@@ -302,6 +305,9 @@ pub struct HudModel {
   bar usize;
   plates List[usize];         // the panels that carry players' names, one label inside each (hidden when unused)
   plateLabels List[usize];
+  placePanel usize;           // the panel under the minimap
+  hintLabel usize;            // the one line naming the "Play with others" key (hidden unless asked for)
+  pub rp RequestPanel;        // the "Play with others" panel (requestpanel.cone), on top of the rest
 
   // A HUD for a target of 'width' by 'height' pixels at 'scale' pixels a logical unit
   pub fn make(width f32, height f32, scale f32) HudModel {
@@ -339,6 +345,8 @@ pub struct HudModel {
     imm timeLabel = uilayout.label(&mut ui, status, "12:00   fair");
     imm frameLabel = uilayout.label(&mut ui, status, "-- ms");
     imm modeLabel = uilayout.label(&mut ui, status, "single player");
+    imm hintLabel = uilayout.label(&mut ui, status, "F9   play with others");
+    ui.setVisible(hintLabel, false);
 
     // The minimap, top right, and where the player is under it
     imm mapFrame = uilayout.minimap(&mut ui, ui.root, 176., MAP_TEX);
@@ -378,8 +386,10 @@ pub struct HudModel {
       plateLabels.push(text);
       pl = pl + 1usize;
     }
+    // The "Play with others" panel last, so that it is on top of everything
+    imm rp = RequestPanel.build(&mut ui);
     new HudModel(ui, font, atlas, scale, uilayout.DrawList.make(), width / scale, height / scale, status, timeLabel, frameLabel,
-      modeLabel, mapFrame, placeLabel, bar, plates, plateLabels);
+      modeLabel, mapFrame, placeLabel, bar, plates, plateLabels, placePanel, hintLabel, rp);
   }
 
   // The HUD brought up to the frame and its draw list made (in logical units; 'scale' makes pixels)
@@ -388,6 +398,12 @@ pub struct HudModel {
       logicalW = width / scale;
       logicalH = height / scale;
       ui.setViewport(logicalW, logicalH);
+    }
+    // The panel's input first: the keys, text and mouse the shell handed over (only while it is up, or to open it)
+    if rp.apply(&mut ui, &f.events, logicalW, logicalH) {
+      // (just opened: laid out now, so that a mouse event later in the same frame finds its controls)
+      ui.setViewport(logicalW, logicalH);
+      relayout(&mut ui, &font, &mut atlas, scale);
     }
     // Keys: F1 to F8 use a slot
     mut n = 0u32;
@@ -399,6 +415,14 @@ pub struct HudModel {
     }
     uilayout.update(&mut ui, f.dt);
     imm events = ui.takeEvents();
+    rp.settle(&mut ui, &events);
+    // The HUD's own parts give way to the panel while it is up (and to H)
+    imm hudShown = f.on and !rp.open;
+    ui.setVisible(status, hudShown);
+    ui.setVisible(mapFrame, hudShown);
+    ui.setVisible(placePanel, hudShown);
+    ui.setVisible(bar, hudShown);
+    ui.setVisible(hintLabel, f.hint and !rp.approved);
     // The words
     ui.setText(timeLabel, hudClock(f.hour, f.weather).view());
     ui.setText(frameLabel, hudFrameText(f.frameMs).view());
@@ -440,12 +464,12 @@ pub struct HudModel {
           }
         }
       }
-      ui.setVisible(*plates[pn], shown);
+      ui.setVisible(*plates[pn], shown and hudShown);
       pn = pn + 1usize;
     }
     relayout(&mut ui, &font, &mut atlas, scale);
     uilayout.drawUi(&ui, &mut list);
-    drawSpellIcons(&ui, bar, &mut list);
+    if hudShown { drawSpellIcons(&ui, bar, &mut list); }
   }
 }
 
@@ -892,6 +916,39 @@ struct HudGpu {
   }
 }
 
+// The pixels a logical unit is drawn at: the window's display scale (1.5 at 150 %), or PEGASUS_UI_SCALE where it is set. The
+// scripted panel run (panelscript.cone) uses the same to aim its mouse.
+pub fn hudUiScale(window usize) f32 {
+  mut scale = 1.;
+  if window != 0usize {
+    imm s = sdl.GetWindowDisplayScale(window as *u8 as *sdl.Window);
+    if s >= 1. { scale = s; }
+  }
+  imm env = libc.getenv("PEGASUS_UI_SCALE");
+  if (env as usize) != 0usize {
+    mut whole = 0.;
+    mut frac = 0.;
+    mut div = 1.;
+    mut seenDot = false;
+    mut k = 0usize;
+    while *(env + k) != 0u8 {
+      imm ch = *(env + k);
+      if ch == '.' { seenDot = true; }
+      elif ch >= '0' and ch <= '9' {
+        if seenDot {
+          div = div * 10.;
+          frac = frac + f32.from(ch - '0') / div;
+        } else {
+          whole = whole * 10. + f32.from(ch - '0');
+        }
+      }
+      k = k + 1usize;
+    }
+    if whole + frac >= 0.5 { scale = whole + frac; }
+  }
+  scale;
+}
+
 pub struct Hud {
   pub model HudModel;
   gpu HudGpu;
@@ -903,33 +960,7 @@ pub struct Hud {
 
   // The HUD for a swapchain of 'format', 'width' by 'height' pixels, at the display's scale (or PEGASUS_UI_SCALE)
   pub fn make(device &mut Device, window usize, format u32, width u32, height u32, isl &Island) Hud {
-    mut scale = 1.;
-    if window != 0usize {
-      imm s = sdl.GetWindowDisplayScale(window as *u8 as *sdl.Window);
-      if s >= 1. { scale = s; }
-    }
-    imm env = libc.getenv("PEGASUS_UI_SCALE");
-    if (env as usize) != 0usize {
-      mut whole = 0.;
-      mut frac = 0.;
-      mut div = 1.;
-      mut seenDot = false;
-      mut k = 0usize;
-      while *(env + k) != 0u8 {
-        imm ch = *(env + k);
-        if ch == '.' { seenDot = true; }
-        elif ch >= '0' and ch <= '9' {
-          if seenDot {
-            div = div * 10.;
-            frac = frac + f32.from(ch - '0') / div;
-          } else {
-            whole = whole * 10. + f32.from(ch - '0');
-          }
-        }
-        k = k + 1usize;
-      }
-      if whole + frac >= 0.5 { scale = whole + frac; }
-    }
+    imm scale = hudUiScale(window);
     imm began = sdl.GetPerformanceCounter();
     mut model = HudModel.make(f32.from(width), f32.from(height), scale);
     // Fields for the printable ASCII now, not in the middle of a frame (3 ms a glyph)
@@ -1001,7 +1032,8 @@ pub struct Hud {
     gpu.drawCalls = 0u32;
     gpu.primitives = 0u32;
     gpu.glyphs = 0u32;
-    if !f.on or !ready { return; }
+    // (hidden with H, it still runs for the panel: while it is up, or to open it)
+    if !ready or (!f.on and !model.rp.open and f.events.len() == 0usize) { return; }
     imm w = f32.from(target.width);
     imm h = f32.from(target.height);
     imm t0 = sdl.GetTicksNS();
@@ -1020,8 +1052,16 @@ pub struct Hud {
     drawn = drawn + 1u64;
   }
 
+  // The panel's word for the shell after a frame (requestpanel.cone: PANEL_OPEN, PANEL_TEXT)
+  pub fn panelBits(self &) u32 { model.rp.bits(&model.ui); }
+
   // What the HUD cost the CPU, once at the end of the run: a line
   pub fn report(self &) {
+    if model.rp.requests > 0u32 {
+      print <- "The panel: "; print <- model.rp.requests; print <- " requests, "; print <- model.rp.answers; print <- " answers; the last: ";
+      print <- (if model.rp.lastKind == ANS_SENT { "sent"; } elif model.rp.lastKind == ANS_APPROVED { "approved"; } else { "error"; });
+      print <- ", \""; printStr(model.rp.lastLine.view()); print <- "\"\n";
+    }
     if drawn == 0u64 { return; }
     print <- "The HUD: "; print <- drawn; print <- " frames drawn; per frame "; print <- f64.from(modelNs) / f64.from(drawn) / 1000d;
     print <- " us in the layout and draw list, "; print <- f64.from(recordNs) / f64.from(drawn) / 1000d; print <- " us recording the passes ("; print <- gpu.primitives;

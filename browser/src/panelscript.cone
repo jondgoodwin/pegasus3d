@@ -1,0 +1,118 @@
+// The "Play with others" panel's part of the scripted run (requestpanel.cone): `browser.exe --panel-only --name zz-test --shots DIR`.
+// Its events go into SDL's own queue, as the rest of the scripted run's do (never the system's), and it needs a window. It runs the
+// first 100 frames of the scripted run (the walk to the cottage, so that there is a picture behind the panel) and then:
+//
+//   frames +0, +1    H: the HUD shown                                             shot "panel-hint" at +8 (the one-line hint)
+//   frames +10, +11  F9: the panel opens                                           shot "panel-open" at +20 (the name is --name's)
+//   frames +22, +23  a click on the name field
+//   frames +26..+33  Backspace, 8 times: the name is cleared
+//   frame  +36       the text "zz-test" typed (a text-input event)
+//   frames +40, +41  a click on the message field
+//   frame  +44       "hello from the check" typed                                  shot "panel-typed" at +50
+//   frames +54, +55  a click on Request to play: the request goes to the server    (PEGASUS_REQUEST_URL, else the address the
+//                    of an automated run: a port on this machine nothing listens on, an error answer)
+//                                                                                  shot "panel-answer" at +100
+//   frames +104, +105 F9: the panel closes                                         shot "panel-closed" at +112
+//
+// The mouse is aimed where the panel puts its controls (panelTarget), in the window's own units: the panel's logical units times the
+// display scale, over the pixels of a window unit. The end of the run says how many requests the panel made and how many were answered.
+//
+// What the run checks beyond its pictures: the panel ends the run with every request answered (the render actor's report).
+
+pub const PANEL_FROM = 100u64;
+pub const PANEL_FRAMES = 120u64;
+
+pub fn panelScriptEnd() u64 { PANEL_FROM + PANEL_FRAMES; }
+
+// The view saved at frame 'f', or an empty name
+pub fn panelShotAt(opts &RunOptions, f u64) &str {
+  if !opts.panelOnly or f < PANEL_FROM or f >= panelScriptEnd() { return ""; }
+  imm k = f - PANEL_FROM;
+  if k == 8u64 { return "panel-hint"; }
+  if k == 20u64 { return "panel-open"; }
+  if k == 50u64 { return "panel-typed"; }
+  if k == 100u64 { return "panel-answer"; }
+  if k == 112u64 { return "panel-closed"; }
+  "";
+}
+
+// A text-input event of the script's: the text is a copy made for it (SDL's queue holds the pointer)
+fn pushText(s &str) {
+  imm b &Array[u8] = s;
+  imm p = libc.malloc(b.len + 1usize) as *u8;
+  mut i = 0usize;
+  while i < b.len {
+    *(p + i) = b[i];
+    i = i + 1usize;
+  }
+  *(p + b.len) = 0u8;
+  mut e = sdl.Event.empty();
+  e.type = sdl.EVENT_TEXT_INPUT;
+  imm t = &mut e as &mut sdl.TextInputEvent;
+  t.windowID = SCRIPT_DEVICE;
+  t.text = p;
+  e.timestamp = 0u64;
+  sdl.PushEvent(&mut e);
+}
+
+// A click's press or release on a control of the panel, for a window of 'view' units and 'pixels' pixels at 'scale' pixels a logical unit
+fn pushPanelButton(which u32, down bool, view Vec2, pixels Vec2, scale f32) {
+  imm at = panelTarget(which, pixels.x / scale, pixels.y / scale);
+  pushButton(at.x * scale * view.x / pixels.x, at.y * scale * view.y / pixels.y, down);
+}
+
+// The panel run's events for frame 'f', pushed by the shell at the start of the frame (so that this frame's input has them)
+pub fn panelPush(f u64, view Vec2, pixels Vec2, scale f32) {
+  if f < PANEL_FROM or f >= panelScriptEnd() { return; }
+  imm k = f - PANEL_FROM;
+  if k == 0u64 { pushKey(SCANCODE_H, true); }
+  if k == 1u64 { pushKey(SCANCODE_H, false); }
+  if k == 10u64 { pushKey(SCANCODE_F9, true); }
+  if k == 11u64 { pushKey(SCANCODE_F9, false); }
+  if k == 22u64 { pushPanelButton(T_NAME_FIELD, true, view, pixels, scale); }
+  if k == 23u64 { pushPanelButton(T_NAME_FIELD, false, view, pixels, scale); }
+  if k >= 26u64 and k < 34u64 {
+    pushKey(42u, true);
+    pushKey(42u, false);
+  }
+  if k == 36u64 { pushText("zz-test"); }
+  if k == 40u64 { pushPanelButton(T_MESSAGE_FIELD, true, view, pixels, scale); }
+  if k == 41u64 { pushPanelButton(T_MESSAGE_FIELD, false, view, pixels, scale); }
+  if k == 44u64 { pushText("hello from the check"); }
+  if k == 54u64 { pushPanelButton(T_ASK_BUTTON, true, view, pixels, scale); }
+  if k == 55u64 { pushPanelButton(T_ASK_BUTTON, false, view, pixels, scale); }
+  // W held while the panel is up must not walk the player; held after it has closed, it must
+  if k == 60u64 { pushKey(sdl.SCANCODE_W, true); }
+  if k == 90u64 { pushKey(sdl.SCANCODE_W, false); }
+  if k == 104u64 { pushKey(SCANCODE_F9, true); }
+  if k == 105u64 { pushKey(SCANCODE_F9, false); }
+  if k == 108u64 { pushKey(sdl.SCANCODE_W, true); }
+  if k == 118u64 { pushKey(sdl.SCANCODE_W, false); }
+}
+
+// Where the player was before W was held under the panel, after it, and at the end (after W held with the panel closed)
+pub struct PanelWatch {
+  before Vec3;
+  under Vec3;
+  after Vec3;
+
+  pub fn make() PanelWatch { new PanelWatch(new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), new Vec3(0., 0., 0.)); }
+
+  // The shell's note of the player's place after frame 'f'
+  pub fn note(self &mut, f u64, at Vec3) {
+    if f == PANEL_FROM + 58u64 { before = at; }
+    if f == PANEL_FROM + 92u64 { under = at; }
+    if f == PANEL_FROM + PANEL_FRAMES - 1u64 { after = at; }
+  }
+
+  // Whether the keys went where they should, said in two lines
+  pub fn verdict(self &) bool {
+    imm held = (under - before).length();
+    imm walked = (after - under).length();
+    imm okHeld = held < 0.001;
+    imm okWalk = walked > 0.05;
+    print <- "Panel run: W held for 30 frames with the panel up moved the player "; print <- held; print <- " m: "; if okHeld { print <- "yes (none)\n"; } else { print <- "NO\n"; }
+    print <- "Panel run: W held after it closed moved the player "; print <- walked; print <- " m: "; if okWalk { print <- "yes (the walk has its keys back)\n"; } else { print <- "NO\n"; }
+    okHeld and okWalk;
+  }
+}
