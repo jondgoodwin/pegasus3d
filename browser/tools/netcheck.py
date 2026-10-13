@@ -74,6 +74,7 @@ def main():
     ap.add_argument('--port', type=int, default=7777)
     ap.add_argument('--connect', metavar='HOST:PORT', help='a server already running on another machine (needs --server-log)')
     ap.add_argument('--server-log', metavar='FILE', help='with --connect: where the remote server\'s --trace log will be')
+    ap.add_argument('--reuse', action='store_true', help='with --connect: run no clients; check the logs of a run already made')
     ap.add_argument('--settle', type=int, default=11, help='seconds to wait for a local server to build the world')
     ap.add_argument('--out', default=os.path.join(HERE, '..', '..', 'netcheck-out'))
     args = ap.parse_args()
@@ -89,7 +90,9 @@ def main():
 
     procs = []
     server = None
-    if remote:
+    if remote and args.reuse:
+        pass    # the clients' logs and the server's are already there: only the checks are run
+    elif remote:
         common = [exe, '--headless', '--connect', args.connect, '--trace', '--run-for', str(args.seconds)]
         try:
             b, f3 = start(common + ['--name', 'netcheck-b'], blog)
@@ -201,7 +204,14 @@ def main():
     ticks, pos = path[a_being]
     # The first 3 s after B first drew anything are not measured: B is building the world (one frame of seconds) and
     # its clock estimate is settling
-    q0 = tv[0][1] + 3 * (freq or 10000000.0) if tv else 0
+    # (B's own clock: when the server is on another machine, its counter's frequency is not B's, so B says its own)
+    cfreq = freq
+    if remote:
+        cfreq = None
+        for l in B:
+            if l.startswith('QPCFREQ'):
+                cfreq = float(l.split()[1])
+    q0 = tv[0][1] + 3 * (cfreq or 10000000.0) if tv else 0
     errs = []
     lags = []
     moved = 0.0
@@ -244,7 +254,7 @@ def main():
                 _, at, qpc, being, x, y, z = l.split()
                 if int(being) == vb:
                     vtv.append((int(at) / 1000.0, int(qpc), (int(x) / 1000.0, int(y) / 1000.0, int(z) / 1000.0)))
-        vq0 = vtv[0][1] + 3 * (freq or 10000000.0) if vtv else 0
+        vq0 = vtv[0][1] + 3 * (cfreq or 10000000.0) if vtv else 0
         verrs = []
         vmoved = 0.0
         vlast = None
