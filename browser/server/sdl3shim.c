@@ -112,6 +112,8 @@ EXPORT bool SDL_SetWindowSize(void *w, int x, int y) { (void)w; (void)x; (void)y
 EXPORT bool SDL_MinimizeWindow(void *w) { (void)w; return unavailable(NOPE); }
 EXPORT bool SDL_RestoreWindow(void *w) { (void)w; return unavailable(NOPE); }
 EXPORT bool SDL_SetWindowFullscreen(void *w, bool f) { (void)w; (void)f; return unavailable(NOPE); }
+EXPORT bool SDL_StartTextInput(void *w) { (void)w; return unavailable(NOPE); }
+EXPORT bool SDL_StopTextInput(void *w) { (void)w; return unavailable(NOPE); }
 EXPORT uint32_t SDL_GetPrimaryDisplay(void) { unavailable(NOPE); return 0; }
 EXPORT bool SDL_GetDisplayBounds(uint32_t d, Rect *r) { (void)d; (void)r; return unavailable(NOPE); }
 EXPORT bool SDL_Vulkan_LoadLibrary(const char *p) { (void)p; return unavailable(NOPE); }
