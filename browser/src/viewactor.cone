@@ -224,6 +224,7 @@ pub struct ViewState {
   frameDone bool;             // single player: the simulation said its frame was done
   pub simulateNs u64;         // and how long it took
   pub publishNs u64;
+  pub play PlayView;          // the playground's: the props, the spells' paint and the lock-on (playview.cone)
   pub hud HudView;            // the HUD's: shown or hidden, and the frame time (hud.cone)
   pub audio AudioView;        // the sound: made by the shell (audioOpen), touched only from this actor's turns
   pub land Island;  // the baked island, shared by every actor (read it with &land)
@@ -236,9 +237,9 @@ pub struct ViewState {
       false, birds, List[Predicted].empty(), new Vec3(0., 0., 0.), 0u64, false, Snapshot.empty(), List[Request].empty(), 0u64,
       List[InputSample].empty(), false, still, FOV, String.empty(), List[MaterialId].empty(), lockstep, false, false,
       List[ToView].empty(), List[WorldState].empty(), List[TestView].empty(), 0u64,
-      new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
+      new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
       List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64,
-      HudView.make(hudStartsShown(opts.scripted)), audio, land, opts);
+      PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, land, opts);
   }
 
   // Reliable messages sent to the simulation, ever
@@ -282,7 +283,7 @@ pub struct ViewState {
         mut data = List[u8].empty();
         data <=> u.data;
         if u32.from(u.stream) == STREAM_STATE {
-          mut w = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+          mut w = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty());
           if decodeState(data, &mut w) { states.push(w); }
         } elif u32.from(u.stream) == STREAM_TEST {
           mut t = new TestView(false, Pose.look(new Vec3(0., 0., 0.), 0., 0.), FOV, String.empty());
@@ -311,6 +312,15 @@ pub struct ViewState {
     if input.weather { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_WEATHER))); }
     if input.swap and lockstep { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_SWAP))); }
     if input.click { self.click(input.pointer); }
+    // The playground's keys (B, F1 to F3): turned into actions for the simulation, and the lock-on kept
+    if input.hudSlots != 0u32 or play.lock.isLocked() {
+      imm acts = playInput(&mut play, input.hudSlots, &cast, own, &snapshot, &scene, f32.from(input.steps.len()) / 60., &mut forRender);
+      mut a = 0usize;
+      while a < acts.len() {
+        net.sendReliable(1u32, copyBytes(acts[a]));
+        a = a + 1usize;
+      }
+    }
     // The steps: one input a step, numbered; the user's body and the camera follow it at once, and the birds fly on
     mut i = 0usize;
     while i < input.steps.len() {
@@ -449,6 +459,7 @@ pub struct ViewState {
         }
         case mut p &mut Possessed { ownWanted = p.being; self.checkOwn(); }
         case mut w &mut Weather { weather = w.weather; }
+        case mut bu &mut Burst { playBurst(&mut play, bu.kind, bu.being, bu.position, bu.normal, bu.color, bu.tick); }
         else {}
       }
       i = i + 1usize;
@@ -475,12 +486,14 @@ pub struct ViewState {
     imm ss = states.viewMut();
     mut s = 0usize;
     while s < ss.len {
-      mut w = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty());
+      mut w = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty());
       w.tick = ss[s].tick;
       w.now = ss[s].now;
       w.rate = ss[s].rate;
       w.appliedInput = ss[s].appliedInput;
       w.beings <=> ss[s].beings;
+      w.props <=> ss[s].props;
+      w.fx <=> ss[s].fx;
       self.takeState(w);
       s = s + 1usize;
     }
@@ -537,6 +550,7 @@ pub struct ViewState {
       }
       k = k + 1usize;
     }
+    playTakeState(&mut play, st.tick, &mut st.props, &st.fx, &mut cast);
     lastState.tick = st.tick;
     lastState.now = st.now;
     lastState.rate = st.rate;
@@ -831,6 +845,7 @@ pub struct ViewState {
       mut partIds = List[PartId].empty();
       mut places = List[Transform3].empty();
       inject(&mut h, &mut door, &mut partIds, &mut places, &mut shared);
+      playNoteObject(&mut play, spec.index, &partIds);
     } elif spec.kind == OBJ_SHELL {
       seedScene(&land, &mut door);
     } elif spec.kind == OBJ_MANNEQUIN {
@@ -1065,6 +1080,34 @@ pub struct ViewState {
   fn publishSnapshot(self &mut, steps &List[Step]) {
     self.poseOthers(steps);
     self.placeBeings();
+    {
+      imm propsAt = self.drawTick(self.nowTick());
+      playPlaceProps(&mut play, &mut scene, propsAt, propsAt > 1.0e17);
+    }
+    {
+      mut bi = 0usize;
+      while bi < cast.beings.len() {
+        if (bi == 3usize and localTick >= 21908u64 and localTick <= 21920u64) or (bi == 1usize and localTick >= 16570u64 and localTick <= 16582u64) {
+          imm fg = &cast.beings[bi].figure;
+          print <- "DBG tick "; print <- localTick; print <- " being "; print <- bi; print <- " steps "; print <- stepSeconds;
+          print <- " pelvisY "; print <- fg.walker.pelvisY; print <- " vy "; print <- fg.walker.pelvisVy;
+          print <- " pos "; print <- cast.beings[bi].body.position.x; print <- ","; print <- cast.beings[bi].body.position.y; print <- ","; print <- cast.beings[bi].body.position.z;
+          print <- " lankle "; print <- fg.walker.left.ankle.y; print <- " rankle "; print <- fg.walker.right.ankle.y;
+          print <- " speed "; print <- fg.walker.speed; print <- " air "; print <- fg.walker.air; print <- " setDowns "; print <- fg.setDowns;
+          print <- " started "; print <- i64.from(fg.walker.started); print <- " grounded "; print <- i64.from(fg.grounded); print <- "\n";
+        }
+        imm rc = cast.beings[bi].figure.reach();
+        if cast.beings[bi].figure.active and rc > 2.2 {
+          imm fg = &cast.beings[bi].figure;
+          print <- "REACH tick "; print <- localTick; print <- " being "; print <- bi; print <- " reach "; print <- rc;
+          print <- " pelvisY "; print <- fg.walker.pelvisY; print <- " vy "; print <- fg.walker.pelvisVy; print <- " started "; print <- i64.from(fg.walker.started);
+          print <- " pos "; print <- cast.beings[bi].body.position.x; print <- ","; print <- cast.beings[bi].body.position.y; print <- ","; print <- cast.beings[bi].body.position.z;
+          print <- " lankle "; print <- fg.walker.left.ankle.x; print <- ","; print <- fg.walker.left.ankle.y; print <- ","; print <- fg.walker.left.ankle.z;
+          print <- " grounded "; print <- i64.from(fg.grounded); print <- " mode "; print <- fg.mode; print <- "\n";
+        }
+        bi = bi + 1usize;
+      }
+    }
     scene.propagate();
     // Scene time: the snapshot's, carried on by the estimate when connected
     mut nowS = lastState.now;
@@ -1079,6 +1122,7 @@ pub struct ViewState {
     birds.publish(&mut flock);
     snapshot.birds <=> flock;
     snapshot.weather = weather;
+    playSplats(&mut play, &cast, lastState.tick, &mut snapshot.splats);
     audioFromView(self, steps);   // the frame's sound (audioview.cone)
     snapshot.fixedView = testFixed;
     snapshot.fov = testFov;

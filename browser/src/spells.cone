@@ -1,0 +1,113 @@
+// The spells' bodies: what a zap and a jig do to a mannequin's pose. A procedural overlay on the pose the gait wrote (walkgait), a pure
+// function of the bones and the seconds since the spell began (Figure.fxT), so the simulation and every view, each stepping its
+// own copy of the figure, draw the same thing, and a view that joins late starts at the right moment.
+//
+// THE ZAP (ZAP_SECONDS): the body jerks about spasmodically. Every bone in a set is turned by a small random rotation, drawn afresh
+// ZAP_RATE times a second (a held value, so it snaps rather than glides) from a hash of the bone and the beat (an integer hash, so it is
+// the same everywhere), its size dying away over the second; the pelvis is thrown sideways and up and down by the same beat. A simple
+// procedural shake on the pose, not a ragdoll joint-drive: the ragdoll's drives are stepped by the physics world and a view only
+// draws what the snapshot says, so a drive would have to cross the wire a body at a time (a limp ragdoll's rotations do; a zap is
+// too short and small to be worth fourteen quaternions a snapshot).
+//
+// THE JIG (JIG_SECONDS): a short dance in place, at two beats a second: the pelvis bounces and sways and twists, the knees come up
+// in turn, the arms swing up and out against each other, the head nods. Eased in and out over a third of a second at each end.
+//
+// Both are laid over the standing pose: the feet are not planted by IK while they last (a dance, a convulsion), which the short
+// lengths hide.
+
+// How long each lasts, seconds
+pub const ZAP_SECONDS f32 = 1.0;
+pub const JIG_SECONDS f32 = 4.0;
+// The zap's new random pose every this many seconds (20 a second)
+const ZAP_BEAT f32 = 0.05;
+
+// How long spell kind 'kind' lasts
+pub fn fxSeconds(kind u32) f32 {
+  if kind == FX_ZAP { return ZAP_SECONDS; }
+  if kind == FX_JIG { return JIG_SECONDS; }
+  0.;
+}
+
+// A hash of two integers to [0, 1) (Wang-style integer mixing, deterministic)
+fn hash01(a u32, b u32) f32 {
+  mut h = a * 747796405u32 + 2891336453u32 + b * 2654435761u32;
+  h = ((h >> ((h >> 28u32) + 4u32)) ^ h) * 277803737u32;
+  h = (h >> 22u32) ^ h;
+  f32.from(h & 0xFFFFu32) / 65536.;
+}
+
+fn easeIn(x f32) f32 {
+  if x <= 0. { return 0.; }
+  if x >= 1. { return 1.; }
+  x * x * (3. - 2. * x);
+}
+
+fn turnBone(pose &mut bonepose.Pose, bone usize, axis Vec3, angle f32) {
+  pose.setRotation(bone, Quat.angleAxis(angle, axis) * pose.rotation(bone));
+}
+
+// The figure's pose with its spell laid over it: the models rebuilt from the bones
+pub fn applyFx(f &mut Figure) {
+  if f.fxKind == FX_NONE or f.models.len() == 0usize { return; }
+  imm t = f.fxT;
+  imm xAxis = new Vec3(1., 0., 0.);
+  imm yAxis = new Vec3(0., 1., 0.);
+  imm zAxis = new Vec3(0., 0., 1.);
+  if f.fxKind == FX_ZAP {
+    if t > ZAP_SECONDS { return; }
+    imm beat = u32.from(libc.floorf(t / ZAP_BEAT));
+    // Full strength for the first tenth, then dying away
+    imm env = if t < 0.1 { 1.; } else { 1. - easeIn((t - 0.1) / (ZAP_SECONDS - 0.1)); };
+    // The bones thrown about, each by its own beat's rotation
+    imm bones Array[usize, 12] = [bonepose.SPINE, bonepose.CHEST, bonepose.NECK, bonepose.HEAD, bonepose.UPPER_ARM_L, bonepose.UPPER_ARM_R,
+      bonepose.FOREARM_L, bonepose.FOREARM_R, bonepose.THIGH_L, bonepose.THIGH_R, bonepose.SHIN_L, bonepose.SHIN_R];
+    mut k = 0usize;
+    while k < 12usize {
+      imm n = u32.from(k);
+      imm ax = hash01(beat * 7u32 + n, 11u32) * 2. - 1.;
+      imm ay = hash01(beat * 7u32 + n, 23u32) * 2. - 1.;
+      imm az = hash01(beat * 7u32 + n, 37u32) * 2. - 1.;
+      imm size = if k < 4usize { 0.35; } elif k < 8usize { 0.9; } else { 0.5; };
+      imm angle = size * env * (hash01(beat * 7u32 + n, 53u32) * 2. - 1.);
+      imm axis = new Vec3(ax + 0.01, ay, az);
+      imm len = libc.sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+      turnBone(&mut f.pose, bones[k], new Vec3(axis.x / len, axis.y / len, axis.z / len), angle);
+      k = k + 1usize;
+    }
+    // The pelvis thrown about
+    imm base = f.pose.locals[bonepose.PELVIS].translation;
+    imm dx = (hash01(beat, 61u32) * 2. - 1.) * 0.06 * env * f.height;
+    imm dy = (hash01(beat, 67u32) * 2. - 1.) * 0.04 * env * f.height;
+    imm dz = (hash01(beat, 71u32) * 2. - 1.) * 0.06 * env * f.height;
+    f.pose.setTranslation(bonepose.PELVIS, new Vec3(base.x + dx, base.y + dy, base.z + dz));
+  } elif f.fxKind == FX_JIG {
+    if t > JIG_SECONDS { return; }
+    imm env = easeIn(t / 0.33) * (1. - easeIn((t - (JIG_SECONDS - 0.33)) / 0.33));
+    imm phase = 2. * pi * 2. * t;
+    imm s = libc.sinf(phase);
+    imm half = libc.sinf(phase * 0.5);
+    imm base = f.pose.locals[bonepose.PELVIS].translation;
+    imm bounce = 0.045 * f.height * libc.fabsf(s) * env;
+    imm sway = 0.04 * f.height * half * env;
+    f.pose.setTranslation(bonepose.PELVIS, new Vec3(base.x + sway, base.y + bounce - 0.02 * f.height * env, base.z));
+    turnBone(&mut f.pose, bonepose.PELVIS, yAxis, 0.32 * half * env);
+    turnBone(&mut f.pose, bonepose.SPINE, yAxis, -0.2 * half * env);
+    turnBone(&mut f.pose, bonepose.CHEST, zAxis, 0.08 * s * env);
+    // The knees come up in turn
+    imm lift = if s > 0. { s; } else { 0.; };
+    imm liftR = if s < 0. { 0. - s; } else { 0.; };
+    turnBone(&mut f.pose, bonepose.THIGH_L, xAxis, -0.9 * lift * env);
+    turnBone(&mut f.pose, bonepose.SHIN_L, xAxis, 1.2 * lift * env);
+    turnBone(&mut f.pose, bonepose.THIGH_R, xAxis, -0.9 * liftR * env);
+    turnBone(&mut f.pose, bonepose.SHIN_R, xAxis, 1.2 * liftR * env);
+    // The arms swing up and out against each other
+    imm armL = 0.5 + 0.5 * libc.sinf(phase + 0.6);
+    imm armR = 0.5 + 0.5 * libc.sinf(phase + 0.6 + pi);
+    turnBone(&mut f.pose, bonepose.UPPER_ARM_L, zAxis, 1.7 * armL * env);
+    turnBone(&mut f.pose, bonepose.UPPER_ARM_R, zAxis, -1.7 * armR * env);
+    turnBone(&mut f.pose, bonepose.FOREARM_L, xAxis, -0.6 * armL * env);
+    turnBone(&mut f.pose, bonepose.FOREARM_R, xAxis, -0.6 * armR * env);
+    turnBone(&mut f.pose, bonepose.HEAD, xAxis, 0.18 * libc.sinf(phase * 2.) * env);
+  }
+  f.skeleton.modelTransforms(&f.pose, &mut f.models);
+}

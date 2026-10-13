@@ -1,0 +1,377 @@
+// The playground's props: the bowling rack's ten pins and the bowling ball, rigid bodies of the simulation's physics world
+// (rigiddynamics), played out by the simulation alone and told to every view in the snapshot (WorldState.props).
+//
+// THE PINS are amphoras (the world's "bowling pins" object, bakedworld.cone: the amphora's mesh at PIN_SCALE, ten parts sharing
+// it), each a dynamic body whose shape is the convex hull of the amphora's outline revolved (a hull of 8 sides at 11 heights);
+// stood in a triangle of four rows, the apex towards the lane's head. THE BALL is the scene's ball (a sphere of BALL_RADIUS):
+// bowled, it is made a dynamic body at the player's feet and rolled at the spot aimed at. Props collide with the ground, the
+// solids and each other, never with a mannequin or a ragdoll (their own layer), as a ball in a game does.
+//
+// A prop is AT HOME, LIVE or GLIDING. At home its body sleeps where the world's part is drawn and the snapshot says nothing of
+// it. Hit, a pin wakes and is live: the world steps it (Phys.stepRagdolls steps the world when any prop is awake). When every
+// live body has been asleep for RESET_DELAY seconds, the live props rise and glide back to their homes (the body is taken out
+// for the glide and made again at home, asleep), so a reset is seen and not a pop. The pins' homes are the rack; the ball's
+// is the head of the lane, at the bowling spot. From the first time a prop leaves its home, every prop is in every snapshot
+// (their places as the physics world has them), so a view that joins later draws them where they are.
+//
+// All of it is the simulation's state and runs from its fixed steps, so a server's clients see the same.
+
+// The props: slot 0 the ball, 1 to PIN_COUNT the pins
+pub const PROP_BALL = 0usize;
+pub const PROP_COUNT = 11usize;
+
+// (The pins' scale, their places and the lane are the world's: bakedworld/pins.cone)
+// Their mass and the ball's (kg); gravity, friction and the rest are the physics world's
+const PIN_MASS f32 = 3.;
+const BALL_MASS f32 = 25.;
+// How fast the ball is bowled (m/s), and the nearest and farthest spot it is aimed at (metres)
+pub const BOWL_SPEED f32 = 13.;
+pub const BOWL_NEAREST f32 = 3.;
+pub const BOWL_FARTHEST f32 = 45.;
+// Seconds every live body is asleep before the reset begins, and how long the glide takes
+pub const RESET_DELAY f32 = 5.;
+const GLIDE_SECONDS f32 = 1.4;
+// A live body slower than this (m/s, plus 0.3 m of its spin a second) for this long is taken to be at rest
+const STILL_SPEED f32 = 0.45;
+const STILL_SECONDS f32 = 0.8;
+// How high a gliding prop rises in the middle of its glide (metres)
+const GLIDE_LIFT f32 = 0.7;
+
+// The props' own layer in the physics world: the ground and the solids see it, the characters and the ragdolls do not
+pub const LAYER_PROP = 16u32;
+const PROP_MASK = 21u32;           // the ground (4), the world's solids (1) and each other (16)
+const NO_PROP_BODY = 0xffffffffu32;
+
+const PM_HOME = 0u32;
+const PM_LIVE = 1u32;
+const PM_GLIDE = 2u32;
+
+// What the snapshot says of a prop
+pub struct PropState {
+  pub slot u32;
+  pub position Vec3;        // the part's origin (a pin's foot, the ball's centre)
+  pub rotation Quat;
+}
+
+// A prop's bookkeeping
+struct Prop {
+  body u32;                 // its body in the physics world, or NO_PROP_BODY while it glides
+  mode u32;
+  home Vec3;                // where it stands at home (the part's origin)
+  homeRot Quat;
+  from Vec3;                // where its glide began
+  fromRot Quat;
+  t f32;                    // seconds into the glide
+  stillT f32;               // seconds its body has been nearly still (see STILL_SPEED)
+}
+
+pub struct Props {
+  pub made bool;
+  props List[Prop];
+  pub moved bool;           // some prop has left its home: every prop is in the snapshot from now on
+  quiet f32;                // seconds every live body has been asleep
+  pub bowls u32;            // balls bowled, counted
+  pub resets u32;           // resets finished, counted
+  ballShape u32;
+  pinShape u32;
+
+  pub fn empty() Props {
+    new Props(false, List[Prop].empty(), false, 0., 0u32, 0u32, 0u32, 0u32);
+  }
+}
+
+// The convex hull of the amphora revolved: (radius, height) of its outline at eleven heights, eight sides round, at PIN_SCALE
+fn pinHull() rigidcollide.Prim {
+  imm rs Array[f32, 11] = [0.13, 0.195, 0.2985, 0.334, 0.3368, 0.3338, 0.2994, 0.19, 0.15, 0.2, 0.21];
+  imm ys Array[f32, 11] = [0.02, 0.2, 0.4, 0.6, 0.71, 0.8, 0.9, 1.0, 1.1, 1.25, 1.36];
+  mut pts = List[Vec3].empty();
+  mut i = 0usize;
+  while i < 11usize {
+    mut k = 0usize;
+    while k < 8usize {
+      imm a = 2. * pi * f32.from(k) / 8.;
+      pts.push(new Vec3(rs[i] * cos(a) * PIN_SCALE, ys[i] * PIN_SCALE, rs[i] * sin(a) * PIN_SCALE));
+      k = k + 1usize;
+    }
+    i = i + 1usize;
+  }
+  pts.push(new Vec3(0., 1.45 * PIN_SCALE, 0.));
+  rigidcollide.convexHull(pts.view());
+}
+
+fn upV() Vec3 { new Vec3(0., 1., 0.); }
+
+// The props made (once): a pin or ball body for each at its home, asleep. The homes are on the island's ground as the world's parts
+// are put there (bakedworld.cone's placeOf), the ball's at the head of the lane
+pub fn propsEnsure(phys &mut Phys, p &mut Props) {
+  if p.made { return; }
+  p.made = true;
+  phys.ensureGround();
+  p.ballShape = phys.w.addShape(rigidcollide.Shape.single(rigidcollide.Prim.sphere(BALL_RADIUS)));
+  p.pinShape = phys.w.addShape(rigidcollide.Shape.single(pinHull()));
+  imm bh = ballHomeSpot();
+  p.props.push(new Prop(NO_PROP_BODY, PM_HOME, new Vec3(bh.x, groundHeight(&phys.island, bh.x, bh.y) + BALL_RADIUS, bh.y), Quat.identity(),
+    new Vec3(0., 0., 0.), Quat.identity(), 0., 0.));
+  mut k = 0usize;
+  while k < PIN_COUNT {
+    imm s = pinSpot(k);
+    imm at = new Vec3(s.x, groundHeight(&phys.island, s.x, s.y), s.y);
+    imm id = makePin(phys, p, at, Quat.identity());
+    p.props.push(new Prop(id, PM_HOME, at, Quat.identity(), at, Quat.identity(), 0., 0.));
+    k = k + 1usize;
+  }
+}
+
+// A pin's body at 'at' turned 'rot', asleep
+fn makePin(phys &mut Phys, p &Props, at Vec3, rot Quat) u32 {
+  mut def = rigiddynamics.BodyDef.dynamicAt(p.pinShape, at);
+  def.rot = rot;
+  def.mass = PIN_MASS;
+  def.layer = LAYER_PROP;
+  def.mask = PROP_MASK;
+  def.material = rigiddynamics.PhysMaterial.wood();
+  def.linearDamping = 0.02;
+  def.angularDamping = 0.1;
+  imm id = phys.w.createBody(def);
+  phys.w.sleep(id);
+  id;
+}
+
+// A pin's centre of mass is not its foot: the body's shape origin is the foot (World.transformOf), which is what the part is placed by
+
+// Whether any prop is awake, or gliding: the physics world is to be stepped, or the glide to go on
+pub fn propsLive(phys &Phys, p &Props) bool {
+  if !p.made { return false; }
+  mut i = 0usize;
+  while i < p.props.len() {
+    imm q = p.props[i];
+    if q.mode == PM_GLIDE { return true; }
+    if q.body != NO_PROP_BODY and !phys.w.isAsleep(q.body) { return true; }
+    i = i + 1usize;
+  }
+  false;
+}
+
+// Whether any prop's body is awake (the physics world's step is wanted)
+pub fn propsAwake(phys &Phys, p &Props) bool {
+  if !p.made { return false; }
+  mut i = 0usize;
+  while i < p.props.len() {
+    imm q = p.props[i];
+    if q.body != NO_PROP_BODY and !phys.w.isAsleep(q.body) { return true; }
+    i = i + 1usize;
+  }
+  false;
+}
+
+fn smooth01p(x f32) f32 {
+  if x <= 0. { return 0.; }
+  if x >= 1. { return 1.; }
+  x * x * (3. - 2. * x);
+}
+
+// One fixed step of the props, after the physics world's step: pins hit are live; when all have been still long enough they
+// glide home, and are made again there
+pub fn propsStep(phys &mut Phys, p &mut Props, dt f32) {
+  if !p.made { return; }
+  mut anyAwake = false;
+  mut anyLive = false;
+  mut i = 0usize;
+  while i < p.props.len() {
+    imm q = &mut p.props[i];
+    if q.mode == PM_HOME and q.body != NO_PROP_BODY and !phys.w.isAsleep(q.body) {
+      q.mode = PM_LIVE;
+      p.moved = true;
+    }
+    if q.mode == PM_LIVE {
+      // A body that creeps (a ball on a slope the lawn does not hold it on; a pin that will not quite settle) is put to sleep once it
+      // has moved less than STILL_SPEED for STILL_SECONDS: the world's own sleep needs it stiller than grass ever lets a ball be
+      if !phys.w.isAsleep(q.body) {
+        imm v = phys.w.linearVelocity(q.body);
+        imm a = phys.w.angularVelocity(q.body);
+        imm quick = libc.sqrtf(v.x * v.x + v.y * v.y + v.z * v.z) + 0.3 * libc.sqrtf(a.x * a.x + a.y * a.y + a.z * a.z);
+        if quick < STILL_SPEED { q.stillT = q.stillT + dt; } else { q.stillT = 0.; }
+      }
+      anyLive = true;
+      if !phys.w.isAsleep(q.body) { anyAwake = true; }
+    }
+    i = i + 1usize;
+  }
+  // Every awake live body still long enough: all go to sleep together (one put to sleep alone is woken again by its awake neighbour)
+  if anyAwake {
+    mut allStill = true;
+    i = 0usize;
+    while i < p.props.len() {
+      imm q = p.props[i];
+      if q.mode == PM_LIVE and !phys.w.isAsleep(q.body) and q.stillT < STILL_SECONDS { allStill = false; }
+      i = i + 1usize;
+    }
+    if allStill {
+      i = 0usize;
+      while i < p.props.len() {
+        imm q = &mut p.props[i];
+        if q.mode == PM_LIVE and !phys.w.isAsleep(q.body) { phys.w.sleep(q.body); q.stillT = 0.; }
+        i = i + 1usize;
+      }
+      anyAwake = false;
+    }
+  }
+  if anyLive {
+    if anyAwake { p.quiet = 0.; } else { p.quiet = p.quiet + dt; }
+    if p.quiet >= RESET_DELAY {
+      // The reset begins: every live prop rises from where it lies
+      p.quiet = 0.;
+      i = 0usize;
+      while i < p.props.len() {
+        imm q = &mut p.props[i];
+        if q.mode == PM_LIVE {
+          imm xf = phys.w.transformOf(q.body);
+          q.from = xf.pos;
+          q.fromRot = xf.rot;
+          phys.w.destroyBody(q.body);
+          q.body = NO_PROP_BODY;
+          q.mode = PM_GLIDE;
+          q.t = 0.;
+        }
+        i = i + 1usize;
+      }
+    }
+  } else {
+    p.quiet = 0.;
+  }
+  // The glides
+  i = 0usize;
+  while i < p.props.len() {
+    imm q = &mut p.props[i];
+    if q.mode == PM_GLIDE {
+      q.t = q.t + dt;
+      if q.t >= GLIDE_SECONDS {
+        q.mode = PM_HOME;
+        if i == PROP_BALL {
+          // The ball waits at the head of the lane: a body, asleep
+          mut def = rigiddynamics.BodyDef.dynamicAt(p.ballShape, q.home);
+          def.mass = BALL_MASS;
+          def.layer = LAYER_PROP;
+          def.mask = PROP_MASK;
+          def.material = rigiddynamics.PhysMaterial.wood();
+          imm id = phys.w.createBody(def);
+          phys.w.sleep(id);
+          q.body = id;
+        } else {
+          q.body = makePin(phys, p, q.home, q.homeRot);
+        }
+        // Every prop home: the reset is done
+        mut allHome = true;
+        mut j = 0usize;
+        while j < p.props.len() { if p.props[j].mode != PM_HOME { allHome = false; } j = j + 1usize; }
+        if allHome { p.resets = p.resets + 1u32; }
+      }
+    }
+    i = i + 1usize;
+  }
+}
+
+// Bowl the ball: from a point 1 m ahead of the feet 'feet' towards the spot 'aim', as a dynamic body that rolls. A ball already
+// rolling or gliding is taken back and bowled again
+pub fn propsBowl(phys &mut Phys, p &mut Props, feet Vec3, aim Vec3) {
+  propsEnsure(phys, p);
+  imm q = &mut p.props[PROP_BALL];
+  if q.body != NO_PROP_BODY { phys.w.destroyBody(q.body); }
+  mut d = new Vec3(aim.x - feet.x, 0., aim.z - feet.z);
+  imm len = libc.sqrtf(d.x * d.x + d.z * d.z);
+  if len < 0.001 { d = laneDir(); } else { d = new Vec3(d.x / len, 0., d.z / len); }
+  imm sx = feet.x + d.x * 1.0;
+  imm sz = feet.z + d.z * 1.0;
+  imm start = new Vec3(sx, groundHeight(&phys.island, sx, sz) + BALL_RADIUS + 0.05, sz);
+  mut def = rigiddynamics.BodyDef.dynamicAt(p.ballShape, start);
+  def.mass = BALL_MASS;
+  def.layer = LAYER_PROP;
+  def.mask = PROP_MASK;
+  def.material = rigiddynamics.PhysMaterial.wood();
+  // Grass is not a bowling lane: the ball slows as it rolls (a damping of 0.35 a second), so it comes to rest within about 25 m
+  def.linearDamping = 0.35;
+  def.angularDamping = 0.35;
+  def.bullet = true;
+  def.linVel = d * BOWL_SPEED;
+  // Rolling without slipping: spin = up x v / r
+  def.angVel = upV().cross(d * BOWL_SPEED) * (1. / BALL_RADIUS);
+  q.body = phys.w.createBody(def);
+  q.mode = PM_LIVE;
+  q.t = 0.;
+  p.moved = true;
+  p.quiet = 0.;
+  p.bowls = p.bowls + 1u32;
+}
+
+// A prop's place now, for the snapshot
+fn propPose(phys &Phys, q &Prop) rigidcollide.Rigid {
+  if q.mode == PM_LIVE { return phys.w.transformOf(q.body); }
+  if q.mode == PM_GLIDE {
+    imm s = smooth01p(q.t / GLIDE_SECONDS);
+    imm lift = GLIDE_LIFT * libc.sinf(pi * s);
+    new rigidcollide.Rigid(new Vec3(q.from.x + (q.home.x - q.from.x) * s, q.from.y + (q.home.y - q.from.y) * s + lift,
+      q.from.z + (q.home.z - q.from.z) * s), q.fromRot.slerp(q.homeRot, s));
+  } else {
+    if q.body != NO_PROP_BODY { return phys.w.transformOf(q.body); }
+    new rigidcollide.Rigid(q.home, q.homeRot);
+  }
+}
+
+// The props for the snapshot: none until one has left its home, then all
+pub fn propsSnapshot(phys &Phys, p &Props, out &mut List[PropState]) {
+  if !p.made or !p.moved { return; }
+  mut i = 0usize;
+  while i < p.props.len() {
+    imm xf = propPose(phys, p.props[i]);
+    out.push(new PropState(u32.from(i), xf.pos, xf.rot));
+    i = i + 1usize;
+  }
+}
+
+// Whether any prop is gliding home
+pub fn propsGliding(p &Props) bool {
+  mut i = 0usize;
+  while i < p.props.len() { if p.props[i].mode == PM_GLIDE { return true; } i = i + 1usize; }
+  false;
+}
+
+// Whether every prop is at home (asleep, or not yet made)
+pub fn propsAllHome(p &Props) bool {
+  mut i = 0usize;
+  while i < p.props.len() { if p.props[i].mode != PM_HOME { return false; } i = i + 1usize; }
+  true;
+}
+
+// Prop 'slot''s place now, and its speed (zero but for a live body), and its home
+pub fn propPoseOf(phys &Phys, p &Props, slot usize) rigidcollide.Rigid { propPose(phys, p.props[slot]); }
+pub fn propHomeOf(p &Props, slot usize) Vec3 { p.props[slot].home; }
+pub fn propAwakeOf(phys &Phys, p &Props, slot usize) bool {
+  imm q = p.props[slot];
+  q.body != NO_PROP_BODY and !phys.w.isAsleep(q.body);
+}
+pub fn propSpeedOf(phys &Phys, p &Props, slot usize) f32 {
+  imm q = p.props[slot];
+  if q.mode != PM_LIVE { return 0.; }
+  imm v = phys.w.linearVelocity(q.body);
+  libc.sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+// How far the farthest pin has moved from its home, metres (for the checks), and how many have fallen over (their foot-to-head axis
+// more than 45 degrees from up)
+pub fn pinsDisturbed(phys &Phys, p &Props, fallen &mut u32) f32 {
+  mut far = 0.;
+  *fallen = 0u32;
+  if !p.made { return 0.; }
+  mut i = 1usize;
+  while i < p.props.len() {
+    imm q = p.props[i];
+    imm xf = propPose(phys, q);
+    imm d = xf.pos - q.home;
+    imm l = libc.sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+    if l > far { far = l; }
+    imm axis = xf.rot * upV();
+    if axis.y < 0.7071 { *fallen = *fallen + 1u32; }
+    i = i + 1usize;
+  }
+  far;
+}

@@ -33,7 +33,9 @@ const TOSIM_CLICK = 1u32;
 const TOSIM_COMMAND = 2u32;
 const TOSIM_LOOK = 3u32;
 const TOSIM_FRAME = 4u32;
+const TOSIM_PLAY = 5u32;
 const TOVIEW_FRAMEDONE = 4u32;
+const TOVIEW_BURST = 5u32;
 const TOVIEW_REQUESTS = 1u32;
 const TOVIEW_POSSESSED = 2u32;
 const TOVIEW_WEATHER = 3u32;
@@ -337,6 +339,14 @@ pub fn encodeToSim(msg ToSim) List[u8] {
       w8(&mut out, TOSIM_LOOK);
       wF32(&mut out, l.pitch);
     }
+    case imm p Play {
+      w8(&mut out, TOSIM_PLAY);
+      w8(&mut out, p.kind);
+      w8(&mut out, p.spell);
+      w32(&mut out, p.target);
+      wVec3(&mut out, p.eye);
+      wVec3(&mut out, p.dir);
+    }
     case imm f Frame {
       w8(&mut out, TOSIM_FRAME);
       w64(&mut out, f.frame);
@@ -370,6 +380,13 @@ pub fn decodeToSim(bytes List[u8]) ToSim {
   } elif tag == TOSIM_LOOK {
     imm pitch = r.rF32();
     if r.ok { out = ToSim.Look(pitch); }
+  } elif tag == TOSIM_PLAY {
+    imm kind = r.r8();
+    imm spell = r.r8();
+    imm target = r.r32();
+    imm eye = r.rVec3();
+    imm dir = r.rVec3();
+    if r.ok { out = ToSim.Play(kind, spell, target, eye, dir); }
   } elif tag == TOSIM_FRAME {
     imm frame = r.r64();
     imm n = usize.from(r.r8());
@@ -683,6 +700,18 @@ pub fn encodeFrameDone(tick u64, simulateNs u64, publishNs u64) List[u8] {
   out;
 }
 
+pub fn encodeBurst(b &BurstInfo) List[u8] {
+  mut out = List[u8].empty();
+  w8(&mut out, TOVIEW_BURST);
+  w8(&mut out, b.kind);
+  w32(&mut out, b.being);
+  wVec3(&mut out, b.position);
+  wVec3(&mut out, b.normal);
+  w8(&mut out, b.color);
+  w64(&mut out, b.tick);
+  out;
+}
+
 pub fn encodeWeather(w &Weathering) List[u8] {
   mut out = List[u8].empty();
   w8(&mut out, TOVIEW_WEATHER);
@@ -756,6 +785,14 @@ pub fn decodeToView(bytes List[u8]) ToView {
     imm simulateNs = r.r64();
     imm publishNs = r.r64();
     if r.ok { return ToView.FrameDone(tick, simulateNs, publishNs); }
+  } elif tag == TOVIEW_BURST {
+    imm kind = r.r8();
+    imm being = r.r32();
+    imm position = r.rVec3();
+    imm normal = r.rVec3();
+    imm color = r.r8();
+    imm tick = r.r64();
+    if r.ok { return ToView.Burst(kind, being, position, normal, color, tick); }
   }
   ToView.Nothing;
 }
@@ -770,11 +807,35 @@ pub fn encodeState(w &WorldState) List[u8] {
   w8(&mut out, w.rate);
   w32(&mut out, u32.from(w.appliedInput & 0xFFFFFFFFu64));
   w8(&mut out, u32.from(w.beings.len()));
+  // The props and spells after the beings take their room first
+  imm tail = 2usize + 14usize * w.props.len() + 9usize * w.fx.len();
   mut i = 0usize;
   while i < w.beings.len() {
     // A ragdoll's rotations go in while the beings still to come keep room for the least a being takes
-    imm fits = out.len() + 32usize + RAG_BYTES + 30usize * (w.beings.len() - i - 1usize) + 16usize <= MAX_LATEST;
+    imm fits = out.len() + 32usize + RAG_BYTES + 30usize * (w.beings.len() - i - 1usize) + 16usize + tail <= MAX_LATEST;
     wBeing(&mut out, w.beings[i], fits);
+    i = i + 1usize;
+  }
+  // The playground's props: slot, place in millimetres, rotation
+  w8(&mut out, u32.from(w.props.len()));
+  i = 0usize;
+  while i < w.props.len() {
+    imm p = w.props[i];
+    w8(&mut out, p.slot);
+    wMillimetres(&mut out, p.position.x, POS_ORIGIN_XZ);
+    wMillimetres(&mut out, p.position.y, POS_ORIGIN_Y);
+    wMillimetres(&mut out, p.position.z, POS_ORIGIN_XZ);
+    wQuat(&mut out, p.rotation);
+    i = i + 1usize;
+  }
+  // The spells in force: the being, the kind and the tick it began
+  w8(&mut out, u32.from(w.fx.len()));
+  i = 0usize;
+  while i < w.fx.len() {
+    imm f = w.fx[i];
+    w8(&mut out, f.being);
+    w8(&mut out, f.kind);
+    w32(&mut out, u32.from(f.start & 0xFFFFFFFFu64));
     i = i + 1usize;
   }
   out;
@@ -940,12 +1001,37 @@ pub fn decodeState(bytes List[u8], out &mut WorldState) bool {
     beings.push(rBeing(&mut r));
     i = i + 1usize;
   }
+  // The props, then the spells in force
+  imm np = usize.from(r.r8());
+  mut props = List[PropState].empty();
+  i = 0usize;
+  while i < np and r.ok {
+    imm slot = r.r8();
+    imm x = r.rMillimetres(POS_ORIGIN_XZ);
+    imm y = r.rMillimetres(POS_ORIGIN_Y);
+    imm z = r.rMillimetres(POS_ORIGIN_XZ);
+    imm q = rQuat(&mut r);
+    props.push(new PropState(slot, new Vec3(x, y, z), q));
+    i = i + 1usize;
+  }
+  imm nf = usize.from(r.r8());
+  mut fx = List[FxState].empty();
+  i = 0usize;
+  while i < nf and r.ok {
+    imm being = r.r8();
+    imm kind = r.r8();
+    imm start = u64.from(r.r32());
+    fx.push(new FxState(being, kind, start));
+    i = i + 1usize;
+  }
   if !r.ok { return false; }
   out.tick = tick;
   out.now = now;
   out.rate = rate;
   out.appliedInput = applied;
   out.beings <=> beings;
+  out.props <=> props;
+  out.fx <=> fx;
   true;
 }
 
