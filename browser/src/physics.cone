@@ -51,12 +51,16 @@ pub struct Phys {
   solidList List[Solid];              // the numbers the solid bodies were made from, and the platforms as last synced,
   platsNow List[PlatformNow];         // for the gait's foot query (floorAt)
   pub island Island;                  // the ground this world stands on (its own owner of the shared island); an empty one is a flat floor
+  pub portals Portals;                // the gates a being crosses by (portal.cone), and whether the looking-glass is open
+  houseAt usize;                      // the cottage's main block among the solids, if there is one: the wall the looking-glass is in
+  notched bool;                       // the glass is open and its notch is cut in that wall
+  glassBodies List[u32];              // the three boxes the wall is in while it is notched
 
   pub fn make(authority bool, island Island) Phys {
     mut w = rigiddynamics.World.make();
     ragdollrig.tuneWorld(&mut w);
     new Phys(w, authority, false, NO_BODY, List[u32].empty(), List[PlatBody].empty(), List[RigSlot].empty(), 0u64,
-      List[Solid].empty(), List[PlatformNow].empty(), island);
+      List[Solid].empty(), List[PlatformNow].empty(), island, Portals.none(), NO_ROW, false, List[u32].empty());
   }
 
   // The ground made (once): the island's heights, or a flat floor if the island is not baked
@@ -64,6 +68,11 @@ pub struct Phys {
     if groundMade { return; }
     groundMade = true;
     mut heights = heightGrid(&island);
+    // (the gates are made for the ground at the cottage, once there is one; the glass keeps its state)
+    imm wasOpen = portals.open;
+    portals = Portals.make(if heights.len() > 0usize { groundHeight(&island, COTTAGE_X, COTTAGE_Z); } else { 0.; },
+      if heights.len() > 0usize { groundHeight(&island, SPRING_X, SPRING_Z); } else { 0.; });
+    portals.open = wasOpen;
     if heights.len() > 0usize {
       imm prim = rigidcollide.Prim.heightfield(heights, u32.from(N), u32.from(N), CELL, CELL, new Vec3(0. - HALF, 0., 0. - HALF));
       imm shape = w.addShape(rigidcollide.Shape.single(prim));
@@ -80,6 +89,7 @@ pub struct Phys {
 
   // The static solids replaced by 'list': a cylinder for a circle, a box, or a hull for a sloped top
   pub fn setSolids(self &mut, list &List[Solid]) {
+    if notched { self.closeNotch(); }
     mut i = 0usize;
     while i < solidBodies.len() { imm id = *solidBodies[i]; w.destroyBody(id); i = i + 1usize; }
     solidBodies.clear();
@@ -118,6 +128,69 @@ pub struct Phys {
       }
       i = i + 1usize;
     }
+    // The cottage's main block, the wall the looking-glass is in (portal.cone); if the glass is open already, notched
+    houseAt = NO_ROW;
+    notched = false;
+    glassBodies.clear();
+    i = 0usize;
+    while i < solidList.len() and houseAt == NO_ROW {
+      imm s = solidList[i];
+      if s.kind == SOLID_BOX and s.axis == 0u32 and libc.fabsf(s.z0 - (GLASS_Z + 0.034)) < 0.01 and s.x0 < GLASS_X - NOTCH_HALF
+        and s.x1 > GLASS_X + NOTCH_HALF and s.y1 - s.y0 > 6. {
+        houseAt = i;
+      }
+      i = i + 1usize;
+    }
+    if portals.open { self.cutNotch(); }
+  }
+
+  // More solids, boxes (the labyrinth's rooms: portal stub, rooms), added to those set; their tops are walkable as any box's
+  pub fn addSolids(self &mut, list &List[Solid]) {
+    mut i = 0usize;
+    while i < list.len() {
+      imm s = *list[i];
+      solidList.push(s);
+      solidBodies.push(self.boxBody(s.x0, s.z0, s.x1, s.z1, s.y0, s.y1));
+      i = i + 1usize;
+    }
+  }
+
+  // A static box body over x0..x1, z0..z1, y0..y1
+  fn boxBody(self &mut, x0 f32, z0 f32, x1 f32, z1 f32, y0 f32, y1 f32) u32 {
+    imm half = new Vec3((x1 - x0) * 0.5, atLeast((y1 - y0) * 0.5, 0.01), (z1 - z0) * 0.5);
+    imm shape = w.addShape(rigidcollide.Shape.single(rigidcollide.Prim.box(half)));
+    mut def = rigiddynamics.BodyDef.staticAt(shape, new Vec3((x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5));
+    def.layer = LAYER_WORLD;
+    w.createBody(def);
+  }
+
+  // The looking-glass opened or closed: its gates work, and the cottage's back wall has a notch where the pane is (so that a body
+  // can reach the pane and be moved through it), or is whole again
+  pub fn setGlassOpen(self &mut, open bool) {
+    portals.open = open;
+    if open == notched or houseAt == NO_ROW { return; }
+    if open { self.cutNotch(); } else { self.closeNotch(); }
+  }
+
+  fn cutNotch(self &mut) {
+    if houseAt == NO_ROW or notched { return; }
+    imm s = solidList[houseAt];
+    w.destroyBody(*solidBodies[houseAt]);
+    glassBodies.clear();
+    glassBodies.push(self.boxBody(s.x0, s.z0, GLASS_X - NOTCH_HALF, s.z1, s.y0, s.y1));
+    glassBodies.push(self.boxBody(GLASS_X + NOTCH_HALF, s.z0, s.x1, s.z1, s.y0, s.y1));
+    glassBodies.push(self.boxBody(GLASS_X - NOTCH_HALF, s.z0 + NOTCH_DEPTH, GLASS_X + NOTCH_HALF, s.z1, s.y0, s.y1));
+    notched = true;
+  }
+
+  fn closeNotch(self &mut) {
+    if houseAt == NO_ROW or !notched { return; }
+    mut i = 0usize;
+    while i < glassBodies.len() { imm id = *glassBodies[i]; w.destroyBody(id); i = i + 1usize; }
+    glassBodies.clear();
+    imm s = solidList[houseAt];
+    solidBodies.set(houseAt, self.boxBody(s.x0, s.z0, s.x1, s.z1, s.y0, s.y1));
+    notched = false;
   }
 
   // ---- platforms ----
@@ -220,8 +293,8 @@ pub struct Phys {
   // world; so it reads the numbers the bodies were made from (the solids, the platforms as last synced),
   // not the World, and the ground as the island draws it (the feet meet the picture).
   pub fn floorAt(self &, x f32, z f32, from f32) f32 {
-    // (feet under the island's ground, in the labyrinth: the island's ground is overhead, not underfoot)
-    mut top = if from > LAB_TOP { groundHeight(&island, x, z); } else { LAB_VOID; };
+    // (under the island the ground is 300 m overhead and only the labyrinth's own floors, and the void under them)
+    mut top = if underground(from) { LAB_VOID; } else { groundHeight(&island, x, z); };
     imm reach = from + STEP_UP;
     mut i = 0usize;
     while i < platsNow.len() {

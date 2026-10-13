@@ -75,6 +75,8 @@ def main():
     ap.add_argument('--lab', action='store_true',
                     help='the server sets each joiner down in the labyrinth\'s antechamber (--lab-spawn), 300 m under the island: '
                          'the same checks, and B must see A there')
+    ap.add_argument('--portal', action='store_true', help='A runs through the cottage\'s looking-glass into the labyrinth and back (--portal-walk) '
+                    'instead of the island walk; the portal is checked, the playground is not')
     ap.add_argument('--connect', metavar='HOST:PORT', help='a server already running on another machine (needs --server-log)')
     ap.add_argument('--server-log', metavar='FILE', help='with --connect: where the remote server\'s --trace log will be')
     ap.add_argument('--reuse', action='store_true', help='with --connect: run no clients; check the logs of a run already made')
@@ -100,7 +102,7 @@ def main():
         try:
             b, f3 = start(common + ['--name', 'netcheck-b'], blog)
             procs.append((b, f3))
-            a, f2 = start(common + ['--name', 'netcheck-a', '--autowalk'], alog)
+            a, f2 = start(common + ['--name', 'netcheck-a', '--portal-walk' if args.portal else '--autowalk'], alog)
             procs.append((a, f2))
             a.wait(timeout=args.seconds + 60)
             b.wait(timeout=60)
@@ -134,7 +136,7 @@ def main():
             common = [exe, '--headless', '--connect', f'127.0.0.1:{port}', '--trace', '--run-for', str(args.seconds)]
             b, f3 = start(common + ['--name', 'netcheck-b'], blog)
             procs.append((b, f3))
-            a, f2 = start(common + ['--name', 'netcheck-a', '--autowalk'], alog)
+            a, f2 = start(common + ['--name', 'netcheck-a', '--portal-walk' if args.portal else '--autowalk'], alog)
             procs.append((a, f2))
             a.wait(timeout=args.seconds + 60)
             b.wait(timeout=60)
@@ -184,6 +186,12 @@ def main():
     tr = [l.split() for l in A if l.startswith('TR ') and int(l.split()[1]) >= 120]
     errs = [int(t[3]) for t in tr]
     wrong = sum(1 for t in tr if t[4] == '1')
+    if args.portal:
+        # The one set-down (the server puts A before the glass: 170 m or so from where it was) is not a misprediction; a crossing the
+        # prediction did not make with the server would be, by 300 m
+        big = [e for e in errs if e > 100000]
+        check(len(big) <= 1, f'A\'s prediction is out by more than 100 m {len(big)} time(s) (want at most the one set-down)')
+        errs = [e for e in errs if e <= 100000]
     check(bool(errs), f'A compared its prediction with the server {len(tr)} times')
     if errs:
         print(f'     A: worst difference at a snapshot {max(errs)/1000.0:.3f} m, mean {sum(errs)/len(errs)/1000.0:.4f} m, '
@@ -225,8 +233,16 @@ def main():
     lags = []
     moved = 0.0
     last = None
+    # A body that goes through a portal's gate jumps 300 m in one tick (the portal's whole point). B draws it a little late and takes the later
+    # snapshot across the jump, so it and the server's path part company for a few ticks either side of it: those are not measured (and said)
+    jumps = [ticks[i] for i in range(1, len(ticks))
+             if ((pos[i][0] - pos[i - 1][0]) ** 2 + (pos[i][1] - pos[i - 1][1]) ** 2 + (pos[i][2] - pos[i - 1][2]) ** 2) ** 0.5 > 50.0]
+    skipped = 0
     for at, qpc, p in tv:
         if qpc < q0 or at < ticks[0] or at > ticks[-1]:
+            continue
+        if any(abs(at - j) < 8 for j in jumps):
+            skipped += 1
             continue
         sp = interp(ticks, pos, at)
         errs.append(((p[0] - sp[0]) ** 2 + (p[1] - sp[1]) ** 2 + (p[2] - sp[2]) ** 2) ** 0.5)
@@ -237,6 +253,8 @@ def main():
             moved += ((p[0] - last[0]) ** 2 + (p[2] - last[2]) ** 2) ** 0.5
         last = p
     check(bool(errs), f'B has {len(errs)} measured samples of A, who moved {moved:.1f} m')
+    if jumps:
+        print(f'     A went through a gate {len(jumps)} time(s) (a jump of 50 m or more in the server\'s path); {skipped} of B\'s samples within 8 ticks of one are not measured')
     if errs:
         errs.sort()
         print(f'     B vs the server path of A: worst {errs[-1]:.3f} m, 95th percentile {errs[int(len(errs)*0.95)]:.3f} m, mean {sum(errs)/len(errs):.3f} m')
@@ -283,6 +301,23 @@ def main():
             check(verrs[-1] <= args.tolerance, f'B follows villager {vb}\'s server path within {args.tolerance} m')
         else:
             check(False, f'B drew villager {vb}')
+
+    # The portal (--portal): A asks at tick 200 to be put before the cottage's glass, which is opened for it; it runs through, into the room, turns,
+    # and runs back out. The server counts the gates gone through; A's own prediction counted the same (and agreed, above: the TR lines); B was
+    # told the glass opened and saw the thread laid
+    if args.portal:
+        sp = [l.split() for l in S if l.startswith('PORTAL ')]
+        ap_ = [l.split() for l in A if l.startswith('PORTAL ')]
+        bp = [l.split() for l in B if l.startswith('PORTAL ')]
+        check(bool(sp) and int(sp[-1][1]) == 1, 'the server opened the glass')
+        if sp:
+            check(int(sp[-1][2]) >= 2, f'the server counted {sp[-1][2]} gates gone through (want at least 2: in and out)')
+            check(int(sp[-1][3]) >= 2, f'the server laid {sp[-1][3]} thread points (want at least E and the end)')
+        check(bool(ap_) and int(ap_[-1][1]) == 1 and int(ap_[-1][2]) >= 2, f'A\'s own prediction crossed as the server did ({ap_[-1][2] if ap_ else "no report"} gates)')
+        check(bool(bp) and int(bp[-1][1]) == 1 and int(bp[-1][3]) >= 2,
+              f'B was told the glass opened and shown the thread ({bp[-1][3] if bp else "no report"} points)')
+        print('PASS' if ok else 'FAIL')
+        return 0 if ok else 1
 
     # The playground (props.cone, spellsim.cone): A bowls at tick 600 and throws paint at 900; the server played both, and B saw the ball
     # where the server has it and was told of the paint

@@ -58,6 +58,10 @@ pub struct Being {
   pub respawned bool;         // its last step got it up again on the landing beach
   pub gone bool;              // its client left: it is not stepped or published
   pub ai bool;                // a villager (npcs.cone) decides its intents: the user does not possess it
+  pub crossed bool = false;   // its last step took it through a gate (portal.cone) ...
+  pub crossShift Vec3 = new Vec3(0., 0., 0.);   // ... and moved it by this
+  pub crossGate u32 = NO_GATE;                  // ... which gate (portal.cone's GATE_...)
+  pub crossings u32 = 0u32;   // gates gone through, counted
 
   pub fn make(part PartId, body Walk) Being { new Being(part, body, body, Intents.none(), Figure.none(), false, false, false); }
 
@@ -72,20 +76,46 @@ pub struct Being {
     intents = given;
     before = body;
     respawned = false;
+    crossed = false;
     if figure.active {
       // (A fall that empties its health is a ragdoll's: it lies, then is set down on the landing beach, ragdoll.cone)
       figure.step(phys, &mut body, if figure.health <= 0. { Intents.none(); } else { given; }, dt);
       // Held by the island's wading limit, the shoreline (it slides along it),
       // but only on or near the ground (walking, or a jump): a body a platform
       // carries is not stopped by it, and one that falls from high up lands
-      // where it falls, in the water or not (and walks out from there)
-      if figure.on.isNone() and body.position.y > LAB_TOP and body.position.y - groundHeight(&phys.island, body.position.x, body.position.z) < SHORE_REACH {
+      // where it falls, in the water or not (and walks out from there). (Not under the island: the labyrinth has no shore.)
+      if figure.on.isNone() and !underground(body.position.y)
+        and body.position.y - groundHeight(&phys.island, body.position.x, body.position.z) < SHORE_REACH {
         body.position = islandConstrain(&phys.island, before.position, body.position);
       }
       body.eyeHeight = figure.eyeModel().y;
+      self.throughGate(phys);
     } else {
       body.step(&phys.island, intents.ahead, intents.turn, intents.run, dt);
     }
+  }
+
+  // After a step: if the eye went through a gate (portal.cone) the being is moved by the gate's shift, its gait's planted feet and the
+  // drawn place with it (so that nothing is drawn across the move), and the step is noted for the camera ('crossed')
+  fn throughGate(self &mut, phys &mut Phys) {
+    if phys.portals.gates.len() == 0usize { return; }
+    // The eye is the figure's eye socket (the first-person camera's place: a little ahead of the body's middle), so the camera and the
+    // crossing agree
+    imm eye = figure.eyeModel();
+    imm g = phys.portals.crossing(before.position + Quat.angleAxis(before.yaw, new Vec3(0., 1., 0.)) * eye,
+      body.position + Quat.angleAxis(body.yaw, new Vec3(0., 1., 0.)) * eye, body.yaw);
+    if g == NO_GATE { return; }
+    imm shift = phys.portals.gates[usize.from(g)].shift;
+    imm c = new Carry(body.position, body.position + shift, Mat4.identity());
+    body.position = body.position + shift;
+    before = body;
+    figure.carried(&c, 0.);
+    figure.anchored = false;
+    figure.ch.teleport(body.position);
+    crossed = true;
+    crossShift = shift;
+    crossGate = g;
+    crossings = crossings + 1u32;
   }
 
   // After the physics world's step (the simulation's alone): a limp or getting-up figure's pose from the ragdoll,
@@ -217,7 +247,8 @@ pub struct ViewRig {
         imm fx = 0. - sin(yaw);
         imm fz = 0. - cos(yaw);
         mut want = new Vec3(chest.x - fx * THIRD_BEHIND, chest.y + THIRD_ABOVE, chest.z - fz * THIRD_BEHIND);
-        imm floor = if want.y > LAB_TOP { groundHeight(isl, want.x, want.z) + 0.35; } else { LAB_Y + 0.35; };
+        // (pulled up out of the ground; under the island the ground is 300 m overhead and the labyrinth's floor is the level)
+        imm floor = if underground(chest.y) { LAB_Y + 0.35; } else { groundHeight(isl, want.x, want.z) + 0.35; };
         if want.y < floor { want = new Vec3(want.x, floor, want.z); }
         cam = if fresh { want; } else { cam + (want - cam) * k; };
         imm d = chest - cam;
@@ -232,6 +263,14 @@ pub struct ViewRig {
     now = target;
     fresh = false;
   }
+}
+
+// The view rig carried through the gate that being 'b' just went through (portal.cone): its poses and its smoothed place moved by
+// the gate's shift, as a platform carries it (a translation: no turn), so the camera goes through with the body and nothing is
+// drawn across the move
+fn carryRigThrough(rig &mut ViewRig, b &Being) {
+  imm c = new Carry(b.body.position - b.crossShift, b.body.position, Mat4.identity());
+  rig.carried(&c, 0.);
 }
 
 fn clampPitch(p f32) f32 {
@@ -300,6 +339,7 @@ pub struct Cast {
     while i < beings.len() {
       imm b = &mut beings[i];
       b.step(&mut phys, if i == possessed { user; } else { Intents.none(); }, dt);
+      if b.crossed and i == possessed { carryRigThrough(&mut rig, b); }
       if b.figure.active and b.figure.landed and b.figure.landSpeed >= HARD_LANDING_SPEED {
         landings.push(new Landing(b.part, b.figure.landSpeed, b.figure.damageOf(b.figure.landSpeed)));
       }
@@ -349,6 +389,7 @@ pub struct Cast {
       imm b = &mut beings[i];
       if !b.gone and *stepIt[i] {
         b.step(&mut phys, *given[i], dt);
+        if b.crossed and i == possessed { carryRigThrough(&mut rig, b); }
         if b.figure.active and b.figure.landed and b.figure.landSpeed >= HARD_LANDING_SPEED {
           landings.push(new Landing(b.part, b.figure.landSpeed, b.figure.damageOf(b.figure.landSpeed)));
         }

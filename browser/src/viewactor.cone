@@ -253,6 +253,7 @@ pub struct ViewState {
   pub play PlayView;          // the playground's: the props, the spells' paint and the lock-on (playview.cone)
   pub hud HudView;            // the HUD's: shown or hidden, and the frame time (hud.cone)
   pub audio AudioView;        // the sound: made by the shell (audioOpen), touched only from this actor's turns
+  pub portal PortalView;      // the looking-glass's state and Ariadne's threads, as the simulation told them (portalview.cone)
   playerName String;          // the name this client plays under (--name), sent to a server in its Hello
   refusedWhy String;          // the server's reason, if it would not have this client
   refusedNow bool;            // it was refused: the run ends
@@ -276,7 +277,7 @@ pub struct ViewState {
       List[ToView].empty(), List[WorldState].empty(), List[TestView].empty(), 0u64,
       new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
       List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64,
-      PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, playerName, String.empty(), false, List[NameTag].empty(),
+      PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, PortalView.make(), playerName, String.empty(), false, List[NameTag].empty(),
       land, opts, String.empty(), List[Request].empty(), 0u64, 0u32, 0u64);
   }
 
@@ -377,6 +378,11 @@ pub struct ViewState {
         net.sendReliable(1u32, copyBytes(acts[a]));
         a = a + 1usize;
       }
+    }
+    // The portal test (--portal-walk): at tick 200 the client asks the simulation to put it before the glass, which is opened
+    if opts.portalWalk and joined and ownReady and !portal.asked and localTick >= 200u64 {
+      portal.asked = true;
+      net.sendReliable(1u32, encodeToSim(ToSim.Play(PLAY_PORTAL_TEST, 0u32, NO_TARGET, new Vec3(0., 0., 0.), new Vec3(0., 0., 0.))));
     }
     if opts.autoWalk and joined and ownReady {
       imm autos = playAuto(&mut play, localTick, &cast, own);
@@ -521,6 +527,11 @@ pub struct ViewState {
         }
         case mut p &mut Possessed { ownWanted = p.being; self.checkOwn(); }
         case mut w &mut Weather { weather = w.weather; }
+        case mut po &mut Portal {
+          portal.apply(po.kind, po.being, po.position, po.extra);
+          // The glass open: the notch in the cottage's wall is cut in this half's physics too
+          if po.kind == PM_OPEN { cast.phys.setGlassOpen(po.extra == 1u32); }
+        }
         case mut bu &mut Burst {
           playBurst(&mut play, bu.kind, bu.being, bu.position, bu.normal, bu.color, bu.tick);
           // The zap's "ah!", at the being's chest
@@ -961,6 +972,8 @@ pub struct ViewState {
     imm a = p.samples[i].state;
     imm c = p.samples[i + 1usize].state;
     if c.mode != FIG_WALK { return c; }
+    // Through a gate (portal.cone) between the two: the later one, not a smear across 300 m
+    if (c.position - a.position).length() > 40. { return c; }
     imm ta = f64.from(p.samples[i].tick);
     imm tc = f64.from(p.samples[i + 1usize].tick);
     mut t = 0.;
@@ -1092,6 +1105,8 @@ pub struct ViewState {
   fn poseOne(self &mut, b usize, s BeingState, dt f32) {
     imm being = &mut cast.beings[b];
     imm p = &mut puppets[b];
+    // Moved far since the last (through a gate: portal.cone): its gait starts afresh there, as a set-down's does
+    imm jumped = p.placed and (s.position - being.body.position).length() > 40.;
     being.body.position = s.position;
     being.body.yaw = s.yaw;
     being.intents = s.intents;
@@ -1100,6 +1115,7 @@ pub struct ViewState {
       return;
     }
     if being.figure.active {
+      if jumped { being.figure.setDown(&mut being.body, s.position, s.yaw); }
       if p.respawns != s.respawns {
         p.respawns = s.respawns;
         being.figure.setDown(&mut being.body, s.position, s.yaw);
@@ -1168,6 +1184,8 @@ pub struct ViewState {
     birds.publish(&mut flock);
     snapshot.birds <=> flock;
     snapshot.weather = weather;
+    snapshot.glassOpen = portal.open;
+    portal.segments(&cast, &mut snapshot.thread);
     playSplats(&mut play, &cast, lastState.tick, &mut snapshot.splats);
     audioFromView(self, steps);   // the frame's sound (audioview.cone)
     snapshot.fixedView = testFixed;
@@ -1580,6 +1598,12 @@ actor ViewActor {
       playReport(&st.play);
       print <- "Scene: "; print <- st.scene.partCount(); print <- " parts live, "; print <- st.worldBuilt; print <- " world objects built here, ";
       print <- st.cast.beings.len(); print <- " beings\n";
+      {
+        mut points = 0usize;
+        mut th = 0usize;
+        while th < st.portal.threads.len() { points = points + st.portal.threads[th].pts.len(); th = th + 1usize; }
+        print <- "PORTAL "; print <- i64.from(st.portal.open); print <- " "; print <- st.cast.beings[st.own].crossings; print <- " "; print <- points; print <- "\n";
+      }
       if st.net.has(1u32) {
         imm conn = st.net.peer(1u32).conn;
         imm cs = await conn.stats();

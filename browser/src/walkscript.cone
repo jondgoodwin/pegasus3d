@@ -1,0 +1,273 @@
+// The walk: the whole labyrinth in one go (the end of portalscript.cone's part of the scripted run, from PK_WALK).
+//
+// The wooden mannequin (being 1) is set down on the lawn 7 m before the cottage's looking-glass (open since the part's first minutes),
+// facing it, and walked by keys through SDL's queue, first person, in these phases (st.run.walkPhase):
+//
+//   glass       run at the glass and through it: the island, then the pane close up (walk-island, walk-glass)
+//   entrance    on down the entrance corridor, through E's doorway, into the antechamber (walk-corridor, walk-antechamber)
+//   corridor    the labyrinth's nav mesh route (labnav.cone) through the hall (walk-hall) to the foot of the corridor that will not end
+//   forward     forward in it, facing forward, until the gate sends it back (walk-corridor-in, walk-loop-before)
+//   turn        turned about where it stands (walk-loop-after: the first picture after being sent back), to face the hall
+//   backward    walked backwards, facing the hall, through the gate and out of the corridor into the court (walk-backwards,
+//               walk-court-door: it sees the corridor it has left)
+//   stairs      the nav mesh's route from the court to the top of the staircase (walk-court, walk-stairs)
+//   exit        turned to face the doorway, then walked at it: the top landing, the doorway (walk-top, walk-exit-door); through it,
+//               it comes out at the brook's spring on the island (walk-spring); its thread is let go; a last look (walk-spring-look)
+//
+// Checked: it crosses the glass once, is sent back by the loop at least once and goes through it backwards at least once, reaches the
+// top landing within 2 m and 11.2 m up having never been under the floors, has laid a thread, comes out of the exit (once) on the island at the
+// spring's ground within 8 m of the spring, and its thread is then empty. The keys are pushed from here, from where the mannequin is.
+
+pub const WALK_FRAMES = 4800u64;
+
+const WP_GLASS = 0u32;
+const WP_ENTRANCE = 1u32;
+const WP_CORRIDOR = 2u32;
+const WP_FORWARD = 3u32;
+const WP_TURN = 4u32;
+const WP_BACKWARD = 5u32;
+const WP_STAIRS = 6u32;
+const WP_EXIT = 7u32;
+const WP_OUT = 8u32;
+const WP_DONE = 9u32;
+
+imm WALK_NAMES Array[&str, 16] = ["walk-island", "walk-glass", "walk-corridor", "walk-antechamber", "walk-hall", "walk-corridor-in",
+  "walk-loop-before", "walk-loop-after", "walk-backwards", "walk-court-door", "walk-court", "walk-stairs", "walk-top",
+  "walk-exit-door", "walk-spring", "walk-spring-look"];
+
+// The picture of the walk's frame 'f' (the assembly's shot slot is used for them)
+pub fn walkShotAt(asm &Assembly, f u64) &str {
+  if f == asm.shotFrame and asm.shotFrame > 0u64 and asm.shotId < 16u32 { return WALK_NAMES[usize.from(asm.shotId)]; }
+  "";
+}
+
+// A picture of the next frame from the walker's eyes, and the phase's next step
+fn walkPic(st &mut SimState, f u64, id u32) {
+  takePicture(&mut st.asm, f + 1u64, id);
+  st.run.walkSub = st.run.walkSub + 1u32;
+}
+
+fn walkTo(st &mut SimState, f u64, phase u32, what &str) {
+  st.run.walkPhase = phase;
+  st.run.walkAt = f;
+  st.run.walkSub = 0u32;
+  print <- "  walk, frame "; print <- f; print <- ": "; print <- what; print <- "\n";
+}
+
+fn walkWrong(st &mut SimState, what &str) {
+  print <- "  "; print <- what; print <- " WRONG\n";
+  st.portalRunOk = false;
+}
+
+// The route from 'from' to 'to' on the labyrinth's nav mesh, into the script's route
+fn walkPlan(st &mut SimState, f u64, from Vec3, to Vec3) bool {
+  mut nav = buildLabNav();
+  mut pts = List[Vec2].empty();
+  imm found = labRoute(&mut nav, from, to, &mut pts);
+  st.route.clear();
+  if found {
+    mut i = 0usize;
+    while i < pts.len() { imm p = *pts[i]; st.route.add(p.x, p.y); i = i + 1usize; }
+    print <- "  walk, route: "; print <- pts.len(); print <- " corners, "; print <- st.route.length(); print <- " m\n";
+  } else {
+    walkWrong(st, "walk: NO route");
+  }
+  st.route.frames = f;
+  found;
+}
+
+// Release every key the walk holds
+fn walkRelease(st &mut SimState) {
+  holdAhead(&mut st.asm, false, false);
+  holdTurn(&mut st.asm, 0.);
+  if st.run.walkBack {
+    st.run.walkBack = false;
+    pushKey(sdl.SCANCODE_S, false);
+    pushKey(sdl.SCANCODE_LSHIFT, false);
+  }
+}
+
+// The walk's scene requests: its start ('kk' is the frame in the walk), and its time limit
+pub fn walkDrive(st &mut SimState, f u64, kk u64) {
+  if kk == 0u64 {
+    st.cast.possess(1usize);
+    st.scene.clock.ns = u64.from(nanosOf(MIRROR_NOON));
+    st.weather.setNow(WEATHER_FAIR);
+    imm at = new Vec3(GLASS_X, groundHeight(&st.land, GLASS_X, GLASS_Z - 7.), GLASS_Z - 7.);
+    st.cast.beings[1usize].setDown(at, 3.1415927);
+    st.run.walkPhase = WP_GLASS;
+    st.run.walkAt = f;
+    st.run.walkSub = 0u32;
+    st.run.walkMark = st.portal.crossings;
+    st.run.walkMinY = 1.0e9;
+    st.run.walkBack = false;
+    print <- "The walk: the mannequin set down on the lawn 7 m before the open glass, facing it ("; print <- at.x; print <- ", "; print <- at.y; print <- ", ";
+    print <- at.z; print <- ")\n";
+  }
+  if kk == WALK_FRAMES - 20u64 and st.run.walkPhase != WP_DONE {
+    walkRelease(st);
+    walkWrong(st, "the walk did NOT reach the spring in time");
+    st.run.walkPhase = WP_DONE;
+  }
+}
+
+// The walk's keys for frame 'f' (called with the script's clicks), from where the mannequin 'w' is
+pub fn walkClicks(st &mut SimState, f u64, w &Walk) {
+  if !portalIn(&st.opts, f) or st.opts.mirrorHold > 0u32 { return; }
+  imm wf = labWalkStart(&st.opts);
+  if f < wf + 6u64 or st.run.walkPhase >= WP_DONE { return; }
+  imm p = w.position;
+  imm ph = st.run.walkPhase;
+  imm sub = st.run.walkSub;
+  imm since = f - st.run.walkAt;
+  if underground(p.y) and p.y < st.run.walkMinY { st.run.walkMinY = p.y; }
+  if (f - wf) % 300u64 == 0u64 {
+    print <- "  walk, frame "; print <- f - wf; print <- " (phase "; print <- ph; print <- "): at ("; print <- p.x; print <- ", "; print <- p.y; print <- ", ";
+    print <- p.z; print <- ") yaw "; print <- w.yaw; print <- " crossings "; print <- st.portal.crossings; print <- ", loops "; print <- st.portal.loops;
+    print <- ", escapes "; print <- st.portal.escapes; print <- ", exits "; print <- st.portal.exits; print <- "\n";
+  }
+  if ph == WP_GLASS {
+    holdAhead(&mut st.asm, true, true);
+    if sub == 0u32 and since >= 2u64 { walkPic(st, f, 0u32); }
+    elif sub == 1u32 and p.z > GLASS_Z - 2.4 { walkPic(st, f, 1u32); }
+    if st.portal.crossings > st.run.walkMark {
+      st.run.walkMark = st.portal.crossings;
+      walkTo(st, f, WP_ENTRANCE, "through the glass");
+    }
+    return;
+  }
+  if ph == WP_ENTRANCE {
+    holdAhead(&mut st.asm, true, true);
+    if sub == 0u32 and since >= 8u64 { walkPic(st, f, 2u32); }
+    elif sub == 1u32 and p.z > E_Z + 4. {
+      walkPic(st, f, 3u32);
+      imm target = new Vec3(LOOP_X, LAB_FLOOR, LOOP_Z0 + 1.);
+      if walkPlan(st, f, new Vec3(p.x, LAB_FLOOR, p.z), target) { walkTo(st, f, WP_CORRIDOR, "through E into the antechamber; on by the nav mesh"); }
+      else { walkRelease(st); st.run.walkPhase = WP_DONE; }
+    }
+    return;
+  }
+  if ph == WP_CORRIDOR {
+    imm reached = st.route.follow(&mut st.asm, w, 2.5);
+    imm arrived = flatDist(p.x, p.z, LOOP_X, LOOP_Z0 + 1.) < 1.0;
+    holdAhead(&mut st.asm, !arrived and !reached and st.route.go, st.route.fast);
+    if sub == 0u32 and p.z > 326. { walkPic(st, f, 4u32); }
+    if arrived or reached {
+      holdAhead(&mut st.asm, false, false);
+      holdTurn(&mut st.asm, 0.);
+      st.run.walkMark2 = st.portal.loops;
+      walkTo(st, f, WP_FORWARD, "at the foot of the corridor; forward");
+    }
+    return;
+  }
+  if ph == WP_FORWARD {
+    // Facing along the corridor (+z) and running at it
+    imm err = yawError(w, LOOP_X, LOOP_Z1);
+    holdTurn(&mut st.asm, err);
+    holdAhead(&mut st.asm, absF(err) < 0.3, true);
+    if sub == 0u32 and p.z > LOOP_Z0 + 5. { walkPic(st, f, 5u32); }
+    elif sub == 1u32 and p.z > LOOP_GATE_Z - 1.8 { walkPic(st, f, 6u32); }
+    if st.portal.loops > st.run.walkMark2 {
+      holdAhead(&mut st.asm, false, false);
+      holdTurn(&mut st.asm, 0.);
+      print <- "  walk: sent back by the gate (the corridor's loops "; print <- st.portal.loops; print <- ")\n";
+      st.run.walkMark3 = st.portal.escapes;
+      walkTo(st, f, WP_TURN, "sent back; turning about");
+    }
+    return;
+  }
+  if ph == WP_TURN {
+    if sub == 0u32 and since >= 6u64 { walkPic(st, f, 7u32); }
+    // To face the hall (-z)
+    imm err = yawError(w, LOOP_X, LOOP_Z0 - 20.);
+    holdTurn(&mut st.asm, err);
+    if absF(err) < 0.04 {
+      holdTurn(&mut st.asm, 0.);
+      // Backwards, running: S and Shift
+      st.run.walkBack = true;
+      pushKey(sdl.SCANCODE_LSHIFT, true);
+      pushKey(sdl.SCANCODE_S, true);
+      walkTo(st, f, WP_BACKWARD, "facing the hall; backwards");
+    }
+    return;
+  }
+  if ph == WP_BACKWARD {
+    if sub == 0u32 and p.z > LOOP_GATE_Z + 3. { walkPic(st, f, 8u32); }
+    elif sub == 1u32 and p.z > LOOP_Z1 + 3.5 {
+      walkPic(st, f, 9u32);
+      walkRelease(st);
+      print <- "  walk: backwards through the gate (escapes "; print <- st.portal.escapes; print <- ", from "; print <- st.run.walkMark3; print <- ")\n";
+      if st.portal.escapes <= st.run.walkMark3 { walkWrong(st, "walk: it did not go through the gate backwards"); }
+      imm top = new Vec3(LAB_STAIR_TOP_X, LAB_Y + LAB_EXIT_UP, LAB_STAIR_TOP_Z);
+      if walkPlan(st, f, new Vec3(p.x, LAB_FLOOR, p.z), top) { walkTo(st, f, WP_STAIRS, "out of the corridor into the court; on to the staircase"); }
+      else { st.run.walkPhase = WP_DONE; }
+    }
+    return;
+  }
+  if ph == WP_STAIRS {
+    imm end = new Vec3(LAB_STAIR_TOP_X, LAB_Y + LAB_EXIT_UP, LAB_STAIR_TOP_Z);
+    imm arrived = flatDist(p.x, p.z, end.x, end.z) < 1.2 and p.y > end.y - 0.5;
+    imm reached = st.route.follow(&mut st.asm, w, 2.5);
+    holdAhead(&mut st.asm, !arrived and !reached and st.route.go, st.route.fast);
+    imm along = *st.route.along[st.route.at];
+    if sub == 0u32 and along >= 0.3 * st.route.length() { walkPic(st, f, 10u32); }
+    elif sub == 1u32 and along >= 0.7 * st.route.length() { walkPic(st, f, 11u32); }
+    if arrived or reached {
+      walkRelease(st);
+      print <- "  walk: at the top landing ("; print <- p.x; print <- ", "; print <- p.y - LAB_Y; print <- " m up, "; print <- p.z; print <- "), "; print <- flatDist(p.x, p.z, end.x, end.z);
+      print <- " m from its place; the lowest it went "; print <- st.run.walkMinY - LAB_Y; print <- " m above the antechamber's floor\n";
+      if flatDist(p.x, p.z, end.x, end.z) > 2. or p.y < end.y - 0.6 or p.y > end.y + 0.6 or st.run.walkMinY < LAB_Y - 0.3 {
+        walkWrong(st, "walk: the staircase's top");
+      }
+      imm n = walkThreadLength(st);
+      print <- "  walk: its thread has "; print <- n; print <- " points\n";
+      if n < 6usize { walkWrong(st, "walk: the thread (want 6 points or more)"); }
+      st.run.walkMark3 = st.portal.exits;
+      walkTo(st, f, WP_EXIT, "at the top; to the doorway");
+    }
+    return;
+  }
+  if ph == WP_EXIT {
+    // Facing the doorway (+z), then walking at it
+    imm err = yawError(w, EXIT_X, EXIT_Z + 10.);
+    holdTurn(&mut st.asm, err);
+    holdAhead(&mut st.asm, absF(err) < 0.12 and since > 20u64, false);
+    if sub == 0u32 and since >= 3u64 { walkPic(st, f, 12u32); }
+    elif sub == 1u32 and underground(p.y) and p.z > EXIT_Z - 2.2 { walkPic(st, f, 13u32); }
+    if st.portal.exits > st.run.walkMark3 {
+      holdTurn(&mut st.asm, 0.);
+      walkTo(st, f, WP_OUT, "through the doorway");
+    }
+    return;
+  }
+  if ph == WP_OUT {
+    // A few steps on, on the island
+    holdAhead(&mut st.asm, since < 18u64, false);
+    if sub == 0u32 and since >= 10u64 { walkPic(st, f, 14u32); }
+    if since >= 45u64 {
+      walkRelease(st);
+      walkPic(st, f, 15u32);
+      imm ground = groundHeight(&st.land, p.x, p.z);
+      imm toSpring = flatDist(p.x, p.z, SPRING_X, SPRING_Z);
+      print <- "Frame "; print <- f; print <- ", the walk ended on the island at ("; print <- p.x; print <- ", "; print <- p.y; print <- ", "; print <- p.z; print <- "), ";
+      print <- toSpring; print <- " m from the spring, the ground there "; print <- ground; print <- ", facing "; print <- w.yaw; print <- "; exits "; print <- st.portal.exits;
+      print <- ", its thread "; print <- walkThreadLength(st); print <- " points\n";
+      if underground(p.y) or toSpring > 8. or absF(p.y - ground) > 0.3 { walkWrong(st, "walk: not at the spring"); }
+      if st.portal.exits != 1u64 { walkWrong(st, "walk: the exit was not taken once"); }
+      if walkThreadLength(st) != 0usize { walkWrong(st, "walk: the thread was not let go at the exit"); }
+      if st.portal.loops < 1u64 { walkWrong(st, "walk: the corridor never sent it back"); }
+      st.run.walkPhase = WP_DONE;
+    }
+    return;
+  }
+}
+
+// The points of the mannequin's (being 1's) thread
+fn walkThreadLength(st &SimState) usize {
+  mut i = 0usize;
+  while i < st.portal.threads.len() {
+    if st.portal.threads[i].being == 1u32 { return st.portal.threads[i].pts.len(); }
+    i = i + 1usize;
+  }
+  0usize;
+}

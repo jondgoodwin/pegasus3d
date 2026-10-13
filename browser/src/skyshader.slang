@@ -117,8 +117,14 @@ float highDensity(float2 uv, float cover, float time) {
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target {
     // The direction this pixel looks in
+    // (the pixel's ray through the far plane's point. A camera with an oblique near plane (a portal's picture, viewsurface.cone) has
+    // a far "plane" that tilts, and for a ray that never meets it in front of the eye the point is behind the eye: the direction
+    // would be reversed, the sky below the horizon, a flat grey. There the point where the ray crosses the clip plane, depth 0, is used)
     float4 farPoint = mul(frame.inverseViewProjection, float4(input.ndc, 1.0, 1.0));
-    float3 dir = normalize(farPoint.xyz / farPoint.w - frame.cameraPosition.xyz);
+    float4 nearPoint = mul(frame.inverseViewProjection, float4(input.ndc, 0.0, 1.0));
+    float3 farDir = farPoint.xyz / farPoint.w - frame.cameraPosition.xyz;
+    float3 nearDir = nearPoint.xyz / nearPoint.w - frame.cameraPosition.xyz;
+    float3 dir = normalize(farPoint.w > 0.0 ? farDir : nearDir);
     float pixel = length(fwidth(dir));
     DaySkyParams sky = params.sky;
     float time = params.clouds.z;

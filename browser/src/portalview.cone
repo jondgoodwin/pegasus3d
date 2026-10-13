@@ -1,0 +1,137 @@
+// The portal's part of a view (presentation: it only draws and listens, shared-island.md): the glass's state as the simulation told it,
+// and Ariadne's threads kept as the simulation laid them (ToView.Portal, portalsim.cone), drawn as thin glowing bars on the floor.
+//
+// The glass's state reaches three places: the view's physics world (its notch in the cottage's wall, so that a body predicted here goes
+// through the pane as the simulation's does), the render system (a glass surface is a portal: viewsurface.cone, by the snapshot's
+// 'glassOpen') and the snapshot's thread segments. A thread's last stretch runs on from its last point to the being it belongs to, drawn
+// where the being is drawn, while it holds the thread.
+
+// The colour of a being's thread, by its number: its own (red first), in nits (the labyrinth's exposure is a lit room's)
+const THREAD_NITS f32 = 25.;
+// How high the thread lies above the floor, and its half thickness, metres
+const THREAD_LIFT f32 = 0.035;
+const THREAD_HALF f32 = 0.018;
+
+fn threadColor(being u32) Color {
+  imm k = being % 6u32;
+  if k == 0u32 { return new Color(1., 0.06, 0.04, 1.); }
+  if k == 1u32 { return new Color(0.12, 0.5, 1., 1.); }
+  if k == 2u32 { return new Color(0.15, 1., 0.25, 1.); }
+  if k == 3u32 { return new Color(1., 0.8, 0.1, 1.); }
+  if k == 4u32 { return new Color(0.8, 0.2, 1., 1.); }
+  new Color(0.1, 1., 0.9, 1.);
+}
+
+// One being's thread as a view has it
+pub struct ThreadView {
+  pub being u32;
+  pub pts List[Vec3];
+  pub attached bool;
+  pub hue u32;                 // its colour, as the simulation numbered it
+}
+
+pub struct PortalView {
+  pub open bool;
+  pub threads List[ThreadView];
+  pub messages u64;            // told, ever
+  pub asked bool;              // the net check's client has asked for the glass (--portal-walk)
+
+  pub fn make() PortalView { new PortalView(false, List[ThreadView].empty(), 0u64, false); }
+
+  fn threadOf(self &mut, being u32) usize {
+    mut i = 0usize;
+    while i < threads.len() {
+      if threads[i].being == being { return i; }
+      i = i + 1usize;
+    }
+    threads.push(new ThreadView(being, List[Vec3].empty(), false, 0u32));
+    threads.len() - 1usize;
+  }
+
+  // One ToView.Portal applied
+  pub fn apply(self &mut, kind u32, being u32, position Vec3, extra u32) {
+    messages = messages + 1u64;
+    if kind == PM_OPEN {
+      open = extra == 1u32;
+      return;
+    }
+    imm k = self.threadOf(being);
+    imm th = &mut threads[k];
+    if kind == PM_THREAD_ADD {
+      th.pts.push(position);
+      th.hue = extra;
+    } elif kind == PM_THREAD_TRUNC {
+      imm keep = usize.from(extra);
+      while th.pts.len() > keep { th.pts.pop(); }
+    } elif kind == PM_THREAD_ATTACH {
+      th.attached = extra == 1u32;
+    }
+  }
+
+  // Every thread as the segments to draw, into 'out' (cleared first): its points joined, and, while it is held, its last stretch on to
+  // its being's place
+  pub fn segments(self &, cast &Cast, out &mut List[ThreadSeg]) {
+    out.clear();
+    imm up = new Vec3(0., THREAD_LIFT, 0.);
+    mut k = 0usize;
+    while k < threads.len() {
+      imm being = threads[k].being;
+      imm tint = threadColor(threads[k].hue);
+      imm glow = new Color(tint.red * THREAD_NITS, tint.green * THREAD_NITS, tint.blue * THREAD_NITS, 1.);
+      mut i = 1usize;
+      while i < threads[k].pts.len() {
+        out.push(new ThreadSeg(threads[k].pts[i - 1usize] + up, threads[k].pts[i] + up, glow));
+        i = i + 1usize;
+      }
+      if threads[k].attached and threads[k].pts.len() > 0usize and usize.from(being) < cast.beings.len() {
+        imm b = cast.beings[usize.from(being)];
+        imm last = threads[k].pts[threads[k].pts.len() - 1usize];
+        imm at = b.body.position;
+        // (not across a gate's move)
+        if (at - last).length() < 6. { out.push(new ThreadSeg(last + up, at + up, glow)); }
+      }
+      k = k + 1usize;
+    }
+  }
+}
+
+// The thread as it is drawn: a unit cube of render's, in a white emissive material, a bar to a segment, tinted its colour (render
+// system's, made when first wanted)
+pub struct ThreadDraw {
+  pub barMesh MeshHandle;
+  pub barMaterial MaterialHandle;
+  pub made bool;
+  pub drawn usize;             // bars in the last draw list
+
+  pub fn make() ThreadDraw { new ThreadDraw(MeshHandle.none(), MaterialHandle.none(), false, 0usize); }
+
+  // The bars for 'segs' added to the draw list 'list'
+  pub fn draw(self &mut, renderer &mut Renderer, device &mut Device, list &mut DrawList, segs &List[ThreadSeg]) {
+    drawn = 0usize;
+    if segs.len() == 0usize { return; }
+    if !made {
+      made = true;
+      imm cube = mesh.Mesh.cube(1.);
+      barMesh = renderer.addMesh(device, &cube);
+      mut m = Material.plain(new Color(0.05, 0.05, 0.05, 1.));
+      m.emissive = new Color(1., 1., 1., 1.);
+      barMaterial = renderer.addMaterial(device, &m);
+    }
+    mut i = 0usize;
+    while i < segs.len() {
+      imm s = segs[i];
+      imm d = s.b - s.a;
+      imm len = d.length();
+      if len > 0.001 {
+        imm axis = if libc.fabsf(d.y) > 0.95 * len { new Vec3(1., 0., 0.); } else { new Vec3(0., 1., 0.); };
+        imm place = Mat4.targetTo((s.a + s.b) * 0.5, s.b, axis);
+        imm model = place * Mat4.fromTrs(new Vec3(0., 0., 0.), Quat.identity(), new Vec3(THREAD_HALF, THREAD_HALF, len * 0.5 + THREAD_HALF));
+        list.addTinted(barMesh, barMaterial, model, s.tint);
+        list.dontCastShadow();
+        if underground(s.a.y) { list.setLayers(list.len() - 1usize, LAB_LAYER); }
+        drawn = drawn + 1usize;
+      }
+      i = i + 1usize;
+    }
+  }
+}

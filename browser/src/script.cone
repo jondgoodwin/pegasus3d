@@ -93,6 +93,7 @@ fn lookFrom(eye Vec3, target Vec3) Pose {
 // Whether frame 'f' is drawn from a close-up's eye
 pub fn hasView(opts &RunOptions, asm &Assembly, f u64) bool {
   if labIn(opts, f) { return labHasView(opts, f); }
+  if portalIn(opts, f) { return portalHasView(opts, f); }
   if mirrorIn(opts, f) { return mirrorHasView(opts, f); }
   if f >= PLAY_FROM { return playHasView(f); }
   if f >= FENCE_FROM { return fenceHasView(f); }
@@ -109,6 +110,7 @@ pub fn hasView(opts &RunOptions, asm &Assembly, f u64) bool {
 // snapshot)
 pub fn viewAt(st &mut SimState, f u64) Pose {
   if labIn(&st.opts, f) { return labView(st, f); }
+  if portalIn(&st.opts, f) { return portalView(st, f); }
   if mirrorIn(&st.opts, f) { return mirrorView(st, f); }
   if f >= PLAY_FROM { return playView(st, f); }
   if f >= FENCE_FROM { return fenceView(&st.land, f); }
@@ -215,10 +217,12 @@ fn pushKey(scancode u32, down bool) {
 
 // The script's events for frame 'f'
 pub fn pushScript(opts &RunOptions, f u64) {
+  // The portal's keys (portalscript.cone), late in the run (or from frame 300 in the portal-only run)
+  portalPush(opts, f);
   // (the mirror-only run keeps the first walk's keys, and none of the later ones: the mannequin is not to be walked away)
-  if (opts.mirrorOnly or opts.labOnly) and f >= 300u64 { return; }
-  // (and the full run's keys are none after the labyrinth's part begins: it works the mannequin's keys itself)
-  if !opts.labOnly and opts.scripted and f >= labFrom(opts) { return; }
+  if (opts.mirrorOnly or opts.labOnly or opts.portalOnly) and f >= 300u64 { return; }
+  // (and the full run's keys are none after the portal's part begins: it works the mannequin's keys itself)
+  if !opts.labOnly and !opts.portalOnly and opts.scripted and f >= portalFrom(opts) { return; }
   // (the panel-only run keeps the first 100 frames' and none after: the panel's own keys and mouse (panelscript.cone) are pushed by the shell)
   if opts.panelOnly and f >= PANEL_FROM { return; }
   // The beach walk: Shift and W for 60 steps (12 m/s: 12 m) up the path's first stretch
@@ -287,8 +291,14 @@ pub struct ScriptRun {
   pub mirrorOk bool = true;   // the mirror's part (mirrorscript.cone) has held so far
   pub mirrorMark u64 = 0u64;  // the mirror pictures drawn when its window began
   pub labOk bool = true;      // the labyrinth's part (labscript.cone) has held so far
-  pub labDone bool = false;   // its walk has ended
-  pub labMinY f32 = 1.0e9;    // the lowest the walker went
+  pub walkPhase u32 = 0u32;   // the walk (walkscript.cone, the end of the portal's part): the phase it is in,
+  pub walkAt u64 = 0u64;      // the frame the phase began,
+  pub walkSub u32 = 0u32;     // the step of the phase (the pictures taken in it),
+  pub walkMark u64 = 0u64;    // counts the portals had when it began a phase (crossings, loops, escapes or exits),
+  pub walkMark2 u64 = 0u64;
+  pub walkMark3 u64 = 0u64;
+  pub walkMinY f32 = 1.0e9;   // the lowest the walker went in the labyrinth
+  pub walkBack bool = false;  // and whether it holds S (walking backwards)
 
   pub fn make() ScriptRun { new ScriptRun(new Vec2(0., 0.), new Vec3(0., 0., 0.), PartId.none(), 0u64, 0u64, 0u64, 0d, 0d); }
 }
@@ -308,7 +318,7 @@ fn partPoint(scene &Scene, id PartId, up f32) Vec3 {
 // The script's clicks for frame 'f': pressed then let go two frames later
 pub fn pushClicks(st &mut SimState, f u64, w &Walk) {
   if st.opts.panelOnly and f >= PANEL_FROM { return; }
-  labClicks(st, f, w);
+  walkClicks(st, f, w);
   if st.opts.labOnly and f >= labFrom(&st.opts) { return; }
   if f == 120u64 {
     // The lathed rook on the porch deck, 0.28 m up its 0.56
@@ -388,6 +398,9 @@ pub fn driveScene(st &mut SimState, f u64) {
   labDrive(st, f);
   // (the labyrinth-only run does nothing else from its first frame on)
   if st.opts.labOnly and f >= labFrom(&st.opts) { return; }
+  portalDrive(st, f);
+  // (the portal-only run has no other part after frame 300)
+  if st.opts.portalOnly and f >= 300u64 { return; }
   mirrorDrive(st, f);
   playDrive(st, f);
   fenceDrive(st, f);
@@ -435,6 +448,7 @@ pub fn shotAt(opts &RunOptions, asm &Assembly, f u64) &str {
   if panelShot.len() > 0usize { return panelShot; }
   if opts.panelOnly and f >= PANEL_FROM { return ""; }
   if labIn(opts, f) { return labShotAt(opts, asm, f); }
+  if portalIn(opts, f) { return portalShotAt(opts, asm, f); }
   if mirrorIn(opts, f) { return mirrorShotAt(opts, f); }
   if f >= PLAY_FROM { return playShotAt(f); }
   if f >= FENCE_FROM { return fenceShotAt(f); }
@@ -730,8 +744,9 @@ fn checkSharing(st &mut SimState) bool {
   print <- " the island's 3 meshes (land fine and coarse, the sea) have 2 materials;";
   print <- " plus the vegetation's surplus (its 36 meshes have 13 materials); plus the bridge's 1 (its 5 meshes have 4 materials; the cascade's steps and the brook's water have one each);";
   print <- " and each mannequin is "; print <- FIGURE_MESHES;
-  print <- " meshes in one material), "; print <- scene.resourceCount(); print <- " defined\n";
-  if scene.door.meshes != scene.door.materials + 10u64 + vegetationMeshSurplus(&st.land) + 1u64 + u64.from(SCRIPT_FIGURES) * (FIGURE_MESHES - 1u64)
+  print <- " meshes in one material; the labyrinth's meshes have a material each, and its three panes (one pane mesh) have three: two fewer), "; print <- scene.resourceCount(); print <- " defined\n";
+  // (10 - 1: the bridge's one more, and the labyrinth's panes' two fewer)
+  if scene.door.meshes != scene.door.materials + 9u64 + vegetationMeshSurplus(&st.land) + u64.from(SCRIPT_FIGURES) * (FIGURE_MESHES - 1u64)
     or u64.from(scene.resourceCount()) != scene.door.meshes + scene.door.materials {
     ok = false;
   }
@@ -826,6 +841,8 @@ fn checkMannequinRun(st &mut SimState, f u64) bool {
 
 // What the script's events must have done by the end of frame 'f'
 pub fn checkScript(st &mut SimState, f u64, w &Walk) bool {
+  // (the portal-only run has no other part after frame 300)
+  if st.opts.portalOnly and f >= 300u64 { return checkPortalRun(st); }
   mut ok = checkMannequinRun(st, f);
   imm scene = &st.scene;
   if f == 2u64 {
@@ -894,6 +911,7 @@ pub fn checkScript(st &mut SimState, f u64, w &Walk) bool {
   ok = checkNpcRun(st) and ok;
   ok = st.run.mirrorOk and ok;
   ok = st.run.labOk and ok;
+  ok = checkPortalRun(st) and ok;
   ok = checkFenceRun(st) and ok;
   ok = checkPlayRun(st) and ok;
   ok;

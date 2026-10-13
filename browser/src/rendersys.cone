@@ -30,6 +30,8 @@
 // A mesh resource uploaded
 pub struct MeshRow {
   pub handle MeshHandle;
+  pub midY f32 = 0.;          // the height of the middle of its bounds in its own frame: which world an item of it is in (the labyrinth's meshes are
+                              // modelled where they stand, under the island, and placed at the origin or at their floor)
 }
 
 // A material resource made
@@ -207,7 +209,8 @@ pub struct RenderSystem {
   prevBones List[Mat4];
   nextBones List[Mat4];
   pub scenery Table[SceneRow];   // the parts that are scene items, keyed by part (Cull)
-  pub surfaces ViewSurfaces;     // the mirrors (viewsurface.cone)
+  pub surfaces ViewSurfaces;     // the mirrors and portals (viewsurface.cone)
+  pub threads ThreadDraw;        // Ariadne's threads (portalview.cone)
   pub sceneEye Vec3 = new Vec3(0., 0., 0.);   // the eye at the last 'syncScene': a jump of it is a cut, with no fade
   pub sceneNow f64 = 0d;    // the snapshot time of the last 'syncScene', for the fades' step
   pub sceneMade u64 = 0u64;   // scene items made, ever
@@ -228,7 +231,7 @@ pub struct RenderSystem {
       List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
       List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty(), List[EmitterHandle].empty(),
       Table[LampRow].empty(), Table[u32].empty(), MotionList.empty(), Table[PrevRow].empty(), List[Mat4].empty(),
-      List[Mat4].empty(), Table[SceneRow].empty(), ViewSurfaces.make());
+      List[Mat4].empty(), Table[SceneRow].empty(), ViewSurfaces.make(), ThreadDraw.make());
     sys.cullMode = cullMode;
     sys;
   }
@@ -274,13 +277,19 @@ pub struct RenderSystem {
   // Apply a DefineMesh: upload it
   pub fn defineMesh(self &mut, renderer &mut Renderer, device &mut Device, id MeshId, m &Mesh) {
     imm handle = renderer.addMesh(device, m);
-    meshes.put(id.id, new MeshRow(handle));
+    imm b = m.bounds();
+    mut row = new MeshRow(handle);
+    row.midY = (b.min.y + b.max.y) * 0.5;
+    meshes.put(id.id, row);
   }
 
   // Apply a DefineSkinnedMesh: upload it with its skin
   pub fn defineSkinnedMesh(self &mut, renderer &mut Renderer, device &mut Device, id MeshId, m &Mesh, skin &Skin) {
     imm handle = renderer.addSkinnedMesh(device, m, skin);
-    meshes.put(id.id, new MeshRow(handle));
+    imm b = m.bounds();
+    mut row = new MeshRow(handle);
+    row.midY = (b.min.y + b.max.y) * 0.5;
+    meshes.put(id.id, row);
   }
 
   // Apply a Bones: part 'id' posed by 'bones' from now on (its run in
@@ -346,16 +355,17 @@ pub struct RenderSystem {
   // scene drawn again from another camera, which the render actor draws each frame the surface is seen
   fn defineSurface(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look) {
     imm tint = new Color(surface.params[0usize], surface.params[1usize], surface.params[2usize], 1.);
-    imm mh = surfaces.define(renderer, device, id, u32.from(surface.params[3usize]), tint);
+    imm link = new Vec3(surface.params[4usize], surface.params[5usize], surface.params[6usize]);
+    imm mh = surfaces.define(renderer, device, id, u32.from(surface.params[3usize]), tint, link, u32.from(surface.params[7usize]));
     mut row = new MaterialRow(mh, Material.plain(surface.color), false, PbrMaterial.standard(surface.color, 0., 1.),
       MaterialHandle.none());
     row.surface = true;
     materials.put(id.id, row);
   }
 
-  // The surfaces' pictures the size of the frame (before 'build', which hands their materials to the draw list)
-  pub fn fitSurfaces(self &mut, renderer &mut Renderer, device &mut Device, width u32, height u32) {
-    if !surfaces.fit(renderer, device, width, height) { return; }
+  // The surfaces' pictures sized to what they show of the frame (before 'build', which hands their materials to the draw list)
+  pub fn fitSurfaces(self &mut, renderer &mut Renderer, device &mut Device, camera &Camera, width u32, height u32) {
+    if !surfaces.plan(renderer, device, camera, width, height) { return; }
     mut i = 0usize;
     while i < surfaces.rows.len() {
       imm mrow = materials.find(*surfaces.rows.ids[i]);
@@ -636,6 +646,9 @@ pub struct RenderSystem {
               renderer.setSceneLod(h, &chain);
             }
             if sr.rangeMax > 0. { renderer.setSceneRange(h, 0., sr.rangeMax, sr.margin); }
+            // What is in the labyrinth is on its layer, as a listed item is (build): a picture of the labyrinth draws these alone
+            // and one of the island those alone
+            if underground((model * new Vec3(0., meshes.rows[meshes.find(r.mesh.id)].midY, 0.)).y) { renderer.setSceneLayers(h, LAB_LAYER); }
             if quiet.len() > 0usize and quiet.find(id) != NO_ROW { renderer.setSceneCastsShadow(h, false); }
             sr.handle = h;
             sr.model = model;
@@ -852,7 +865,9 @@ pub struct RenderSystem {
 
   // The frame's draw list, batch by batch, from the snapshot's world
   // matrices, for a viewer whose eye is at 'eye'
-  pub fn build(self &mut, snap &Snapshot, eye Vec3) {
+  // 'skipIsland': under the island, with no picture of it wanted: what is on the island is left out (not even handed to the GPU to clip)
+  // 'skipLab': on the island, with no picture of the labyrinth wanted: what is in the labyrinth is left out
+  pub fn build(self &mut, snap &Snapshot, eye Vec3, skipIsland bool, skipLab bool) {
     list.clear();
     mut drawnNow = 0usize;
     mut skinnedNow = 0usize;
@@ -862,6 +877,7 @@ pub struct RenderSystem {
       imm batch = batches[b];
       if batch.members.len() > 0usize {
         imm meshH = meshes.rows[meshes.find(batch.mesh.id)].handle;
+        imm midY = meshes.rows[meshes.find(batch.mesh.id)].midY;
         imm mat = *materials.rows[materials.find(batch.material.id)];
         mut k = 0usize;
         while k < batch.members.len() {
@@ -874,6 +890,15 @@ pub struct RenderSystem {
             imm sx = libc.floorf(eye.x / r.anchor) * r.anchor;
             imm sz = libc.floorf(eye.z / r.anchor) * r.anchor;
             model = Mat4.fromTranslation(new Vec3(sx, 0., sz)) * model;
+          }
+          // Which world it is in: the height of the middle of its mesh's bounds, where it is placed (the labyrinth's are placed at the
+          // origin or at a floor, modelled where they stand)
+          imm below = underground((model * new Vec3(0., midY, 0.)).y);
+          if (skipIsland and !below) or (skipLab and below) {
+            // (left out: its bones are not in this frame's, so what it was is kept as a place alone, and compared as such when it is drawn again)
+            prevRows.put(id, new PrevRow(model, 0u32, 0u32));
+            k = k + 1usize;
+            continue;
           }
           imm material = if r.highlighted { mat.lit; } else { mat.handle; };
           imm posed = poses.find(id);
@@ -916,6 +941,8 @@ pub struct RenderSystem {
             }
           }
           prevRows.put(id, new PrevRow(model, nowFirst, nowCount));
+          // What is in the labyrinth is on a layer of its own, so that a picture of the island does not draw it nor one of the labyrinth the island
+          if below { list.setLayers(list.len() - 1usize, LAB_LAYER); }
           // A view surface is on its own layer (not in its own picture), casts no shadow, and is told its place
           if mat.surface {
             list.setLayers(list.len() - 1usize, SURFACE_LAYER);

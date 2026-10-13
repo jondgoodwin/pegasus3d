@@ -274,23 +274,103 @@ surface** (`src/viewsurface.cone`): a surface that shows the scene drawn again f
 steps and only the first is the mirror's: which camera (`cameraThrough`: the viewer's camera reflected about the surface's
 plane, with an oblique near plane so nothing behind the wall is drawn: render's `Camera.reflectedAbout`), draw the scene
 again from it into the surface's own texture (render's `RenderView`, drawn before the frame in its own submission, on
-the layers the surface is not on), and show the picture (render's `ViewMaterials`). A portal would add a kind to
-`cameraThrough`. A surface is a part whose look names `SHADER_MIRROR`; the part's world matrix places it (its mesh is
-mesh's plane, its normal the matrix's +y), so the simulation places it like any part and the view only draws what it shows.
-The picture is drawn only while the surface is in front of the eye and in the frustum, at the frame's size (remade when the
-window changes). Temporal AA: the picture is jittered with the frame's own sequence (opposite in x, the picture being
-mirrored), so a still mirror is anti-aliased; while the camera moves, the history is reprojected by the wall's motion and
-the picture's edges soften (render treats a custom pipeline as static). Not in the reflection: the particles (the burner's
-flame, smoke, rain), and the froxel fog (a pass over the main frame's depth). Shadows are right (the picture is drawn with
-its own cascades; the cottage's shadow edge falls in the pane where it should). `--mirror-only --shots DIR` runs the
-mirror's part of the script (`src/mirrorscript.cone`); `--mirror-only --soak N --mirror-hold 1|2` holds the eyes on the
-mirror or turned away, for timing; `PEGASUS_MIRROR_TIMING=1` times each picture on the GPU. `--checks` works the
-geometry out by hand (`src/mirrorchecks.cone`: the plane, the facing, the reflected eye, that points in front of the mirror
-are drawn where the mirror shows them, the frustum test, the pane's size).
+the layers the surface is not on), and show the picture (the browser's own pipeline, `src/surfaceview.slang`, which reads it
+at the fragment's own place on the frame). A portal is a second kind (below). A surface is a part whose look names
+`SHADER_MIRROR`; the part's world matrix places it (its mesh is mesh's plane, its normal the matrix's +y), so the simulation
+places it like any part and the view only draws what it shows.
+**The picture is cut to the surface's window**: the rectangle its four corners make on the frame (and a margin), drawn by a
+camera whose field of view is narrowed to it (the middle shifted by the camera's jitter) into a texture of just the window's
+size (a power of two a side, so it is remade seldom, at the frame's sharpness times `PEGASUS_MIRROR_SCALE`, 100 by default,
+60 on an integrated GPU). So the second pass culls, shadows and fills only what the surface can show. It is drawn only while
+the surface is in front of the eye and in the frustum. Temporal AA: the picture is jittered with the frame's own sequence
+(opposite in x for a mirror, the picture being mirrored, the same way for a portal), so a still mirror is anti-aliased;
+while the camera moves, the history is reprojected by the wall's motion and the picture's edges soften (render treats a
+custom pipeline as static). A surface is not cut away by the near plane (its vertex shader clamps the depth there), so an
+eye about to go through a portal's pane does not see the pane vanish. Not in the picture: the particles (the burner's flame,
+smoke, rain: they need the picture's texture, which render keeps private: `TextureSlot.texture` is not `pub`; a
+`RenderView.texture(renderer)` accessor in render would do), the froxel fog (a pass over the main frame's depth), and shared
+shadows (the picture's cascades are fitted to its own camera: render's `renderTo` does it, with no way to hand it the main
+frame's). Shadows are right (the cottage's shadow edge falls in the pane where it should).
+`--mirror-only --shots DIR` runs the mirror's part of the script (`src/mirrorscript.cone`); `--mirror-only --soak N
+--mirror-hold 1|2` holds the eyes on the mirror or turned away, for timing; `PEGASUS_MIRROR_TIMING=1` times each picture on the
+GPU, `PEGASUS_MIRROR_WINDOW=0` draws it the frame's whole view (the old way), `PEGASUS_MIRROR_SHADOWD=N` limits the sun's shadow
+reach in a picture to N metres and `PEGASUS_MIRROR_CASCADES=N` its cascades (2 saves about 0.7 ms of CPU and 0.3 ms of GPU, and the
+reflected lawn's shadows differ a little from the frame's; neither is the default), `PEGASUS_MIRROR_SCALE=N` the picture's size
+(percent), `PEGASUS_MIRROR_LOD=N` biases the levels of detail (percent), `PEGASUS_NO_PICTURES=1` draws no
+picture at all. `--checks` works the geometry out by hand (`src/mirrorchecks.cone`: the plane, the facing, the reflected eye,
+that points in front of the mirror are drawn where the mirror shows them, the frustum test, the pane's size; and
+`src/portalchecks.cone`: the same for a portal's camera and a window: a point is where the surface reads it).
 
-Cost (RTX 4060, soak, mirror in sight against turned away): frame p50 20.8 ms against 13.9 (vsync-bound; render phase
-9 against 4.8 ms), the picture 3.6 ms on the GPU and 4 ms of CPU recording (76 draws, 0.9 M triangles). Intel UHD 770: 67 ms
-against 55 ms (the picture 51 ms on the GPU in the timed run, which waits idle after it).
+Cost (RTX 4060 laptop, a soak of 1200 to 1500 frames, the surface in sight against turned away; the machine was shared with the
+other lanes' browsers, so the frame times are noisy and are the best of several runs; the structural numbers are not):
+- GPU time of a picture, mirror in sight (`PEGASUS_MIRROR_TIMING=1`, mean of 300): RTX 3.38 ms before, 1.73 ms now (window crop;
+  scale 1.0 here, 0.6 on integrated), 1.05 ms at half size, 5.1 ms with the crop off (`PEGASUS_MIRROR_WINDOW=0`). Intel UHD
+  (`GPU_POWER_PREFERENCE=low-power`): 59.9 ms before, 12.2 ms now (the 0.6 scale and the crop together).
+- CPU of a picture on RTX: 3.17 ms, of which about half is the sun's three shadow cascades (2 cascades: 2.46 ms, 1: 2.15 ms).
+- Frame p50 with the mirror in sight, RTX: 8.79 ms (7.7 to 8.1 with fewer cascades). The frame is CPU bound there; the largest
+  remaining part is that every picture redraws the island's terrain and sea (about 2.2 M triangles, not culled).
+
+## The looking-glass and the labyrinth
+
+The mirror turns into the way in to the labyrinth under the island (`WI\labyrinth.md`). A being that stands still before the
+glass for 3 s, facing it, within 5.5 m, opens it (`src/portalsim.cone`): the glass stops copying it. Its reflection, a
+mannequin of its height and colour, stands where the reflection stood, facing the glass, then turns and walks off down a
+corridor to E, the entry point (0, -300, 300), and is gone at E. The glass is a portal from then on, for everyone, for good.
+A being that goes through it comes out at the corridor's mouth (0, -300, 291), and one that goes back through the mouth's pane
+(a portal in the other direction) comes out in front of the cottage's back wall.
+
+**The method.** Render to texture, not the stencil: the render package has no stencil in its passes and its `RenderView` is the
+mirror's own path; the recursion is one deep by construction (a surface is on a layer no picture draws). The portal's camera is
+the viewer's moved by the pane's link, a translation (the exit's place less the pane's), with the exit's plane as the near plane
+(Lengyel's oblique clip, as the mirror's); a translation, not a rotation, because both panes face along z. The glass is a
+`SURFACE_GLASS` (`src/parts/portal.cone`): a mirror until the view is told it has opened. The two panes' looks carry the link and
+the world they show (the labyrinth from the island, the island from the labyrinth).
+
+**Crossing** is decided where the bodies are stepped (`Being.throughGate`, `src/being.cone`), by the eye socket's move across a
+gate's plane inside its opening; the gates (`Portals`) are the same in the simulation and in a view's prediction, so both cross
+at the same step and nothing is corrected (netcheck: 0.000 m). The being, its planted feet, its drawn place and the view rig
+(the camera, first or third person) are moved together, so nothing is drawn across the move: shots `portal-seam-N` are seven
+frames round the crossing (the mean difference between neighbours is 1 to 3 grey levels). The cottage's back wall has no hole,
+so while the glass is open its solid is notched (`Phys.setGlassOpen`: the wall is three boxes) where the pane is.
+
+**Where things are** (`src/parts/portal.cone`): the labyrinth is in the same scene, its floor at y = -300; below y = -150 a camera
+sees 120 m, lit by the labyrinth's own lamps alone (no sun, sky, fog, weather, cascades; `labAmbient()` at `LAB_EV` 6), with the island's draw items
+left out of the draw list unless a picture of it is wanted (and the labyrinth's out of the island's unless a picture of it is):
+what is in the labyrinth is on its own layer, chosen by the height of the middle of an item's mesh bounds where it is placed. The
+rooms must keep a part's origin or its mesh's middle under y = -150. There is one test of "under the island", `underground(y)`
+(`UNDER_Y` = -150), for the light and exposure, the layer, the ground a body stands on, the camera's floor, the navigation mesh
+and the ragdoll's lost line; and one light and exposure, the rooms lane's (`labAmbient()`, `LAB_EV` 6), which a portal's picture
+of the labyrinth uses too (`PictureEnv.under`), as the picture of the island seen from below uses the island's sun.
+
+**The entrance** is where the rooms meet the portal: the cottage's glass lands a being at the mouth of a corridor (x -1.5 to 1.5,
+z 285 to 299, 2.5 high, in `labrooms.cone`), and a 1 m doorway at E in the antechamber's south wall (z 299 to 300) leads on.
+
+**The corridor that will not end** (the rooms' corridor between the hall and the court, x 6.4 to 9.6, z 342 to 372, `LOOP_*`): a
+gate across it at z 359.5 is an invisible portal joined to its own start: a being that goes through it facing forward (its heading
+the way it moves) is moved back 12 m, two bays (a column pair and a hanging lamp every 6 m, so every bay is alike); one that goes
+through walking backwards (facing back, moving on) goes through to the court. The picture past the gate is a portal's (the same
+corridor 12 m back), so the move cannot be seen, and a being sees its own back far ahead.
+
+**The exit**: the doorway at the staircase's top (x 67, z 430.5, its sill 11.2 m up, 4 m wide) is a window onto the island at the
+brook's spring (34, 128), and a gate: a being that walks through it comes out at the spring, moved by a translation, so it faces
++z, 28 degrees off the rill's first run. It is one way: the spring has no pane and no gate. The exit lets go of the being's
+Ariadne's thread (cleared whole, told to every view), so a return through the looking-glass begins a thread afresh at E.
+
+**Ariadne's thread** (`src/portalsim.cone`, drawn by `src/portalview.cone`) starts at E for every being that goes there: a
+polyline of its feet's places, a point a metre, straight runs merged, laid as it walks, in its own colour (the first red). It
+keeps what it laid when the being goes out, and is reeled in as it walks back along it. It is simulation state: the points
+cross as `ToView.Portal` messages (reliable) and a view that joins is told them again.
+
+Runs: `browser.exe --portal-only --shots DIR` is the portal's part of the script (`src/portalscript.cone`, after the mirror's in
+the full run: the mirror, the glass opening, the reflection walking off, a run through the glass into the room and back out,
+the thread, the corridor that will not end forwards and backwards, with shots on each side; then the walk, `src/walkscript.cone`:
+the whole labyrinth in first person from the lawn to the spring, `walk-*` shots); `--portal-only --soak N --mirror-hold
+1|2|3` holds the eyes on the open glass, away from it, or in the corridor under the island, to time them. `python tools/netcheck.py
+--portal` has client A ask to be put before the glass, run through it into the room and back while B watches. `--checks`:
+`src/portalchecks.cone` (the gates, the camera and window, a body through the wall and the floors, the loop, the thread).
+
+Cost of the open glass: a picture of the labyrinth is 0.06 ms on the GPU (5 draws, 8 k triangles), against the mirror's 1.7 ms, so
+looking into the labyrinth costs little. Seen from the labyrinth, the island's picture costs what the mirror's does.
 
 ## The labyrinth
 
@@ -333,7 +413,8 @@ by a column and a parapet, climbing the stair, the mesh's coverage of every room
 chamber, the corridor, the court, the throne room and the staircase's top.
 
 `browser.exe --labyrinth-only --shots DIR` runs `labscript.cone` alone (30 views from fixed eyes, the island's light changed under
-two of them, then the mannequin walked from E to the staircase's top on the navmesh's route); it is the full run's last part too.
+two of them); it is the full run's last part too. (The walk through the rooms is the portal part's, `walkscript.cone`: a walk on the
+navmesh alone would never leave the corridor that will not end.)
 `--labyrinth-only --soak N --lab-hold K` holds view K for timing. `--dump-frescos DIR` writes the fresco tiles as BMPs. `--lab-spawn`
 (a server's) sets each joiner down in the antechamber, for `python tools/netcheck.py --lab`.
 
@@ -631,6 +712,8 @@ prints "Upload: a burst of ..." when the backlog clears, about 40 frames and 1 t
 | `src/fogshader.slang` | the fog's depth slabs (compiled and embedded in `skyrig.cone` by `tools/shaders/shaders.py`) |
 | `src/weatherscript.cone` | the scripted run's last part: the sky 60 s apart, the cottage in each weather, the T key |
 | `src/rendersys.cone` | the render system: owns the meshes and materials defined, how parts are drawn (in batches by mesh and material), their effects (particles) and the sky, and turns them, with the snapshot, into render's draw list (render draws each batch as one instanced draw); a physical material is render's physically based one; a shaded one, a custom pipeline |
+| `src/viewsurface.cone`, `src/surfaceview.slang` | view surfaces (a mirror, a portal): which camera, the picture cut to the surface's window, the pipeline that reads it (above) |
+| `src/parts/portal.cone`, `src/portalsim.cone`, `src/portalview.cone`, `src/portalscript.cone`, `src/portalchecks.cone`, `src/walkscript.cone` | the looking-glass portal: where the labyrinth is and the gates (shared by both halves), the simulation's part (the glass opening, the reflection, the thread), the view's (the thread drawn), the script's part and its walk to the spring, and the checks (above) |
 | `src/look.cone` | the look: light in physical units (the sun in lux, the sky and glows in nits), the exposure from the sun's height (EV 15 at noon), AgX tone mapping and bloom through render's Post |
 | `src/shaders.cone` | the browser's own shaders, which a shaded Look names: the heightfield (`heightfield.slang`), a pool of light (`lightpool.slang`, see-through) and a lit room behind a window (`interior.slang`); after editing a `.slang`, run Cone's `tools/shaders/shaders.py src` to compile and embed it |
 | `src/shell.cone` | what the browser puts in every scene: the island's land and sea and the sky, sent as requests |

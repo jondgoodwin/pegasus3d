@@ -281,6 +281,8 @@ pub struct SimState {
   hangUps List[HangUp];       // connections refused, to be ended once the refusal has been sent
   pub land Island;  // the baked island, shared by every actor (read it with &land)
   pub opts RunOptions;        // what the arguments say that this actor acts on (--no-npcs, --trace, --hud-only, --audio-walk)
+  pub portal PortalSim;       // the looking-glass, the puppet, Ariadne's threads (portalsim.cone)
+  pub portalRunOk bool;       // the scripted run's: the portal's part has held (portalscript.cone)
 
   pub fn make(opts RunOptions, birds Birds, serve bool, land Island) SimState {
     imm scripted = opts.scripted;
@@ -291,7 +293,7 @@ pub struct SimState {
       0u64, Weathering.fair(), Weathering.fair(), false, 0u64, ReplayLog.empty(), List[Intents].empty(), List[bool].empty(),
       0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step].empty(), false, 0u64, 0u64, Village.empty(),
       Route.make(), List[f32].empty(), Assembly.make(), Ride.make(), ScriptRun.make(), FallRun.make(), true, true, true, PlaySim.empty(),
-      List[Pending].empty(), List[HangUp].empty(), land, opts);
+      List[Pending].empty(), List[HangUp].empty(), land, opts, PortalSim.make(), true);
   }
 
   // The possessed being's body: where the user is (single player)
@@ -356,6 +358,8 @@ pub struct SimState {
     cast.phys.setSolids(&solids);
     // The playground's pins and ball, asleep at home
     propsEnsure(&mut cast.phys, &mut cast.props);
+    // (a scripted run opens the glass at its portal part: the mirror's part stands still before it, and must not open it)
+    if scripted { portal.auto = false; }
     if scripted {
       // The scripted run starts as the plain walker on the landing beach,
       // facing -z up the path's first stretch; its walk is checked there, then
@@ -464,6 +468,14 @@ pub struct SimState {
     net.sendReliable(id, encodePossessed(u32.from(being)));
     net.sendReliable(id, encodeWeather(&weather));
     weatherSent = weather;
+    // The looking-glass and the threads as they stand
+    mut told = List[PortalInfo].empty();
+    portal.replay(&mut told);
+    mut ti = 0usize;
+    while ti < told.len() {
+      net.sendReliable(id, encodePortal(told[ti]));
+      ti = ti + 1usize;
+    }
   }
 
   fn pendingAt(self &, id u32) usize {
@@ -569,6 +581,11 @@ pub struct SimState {
       imm ball = propPoseOf(&cast.phys, &cast.props, PROP_BALL).pos;
       print <- "PLAY "; print <- play.bowls; print <- " "; print <- play.paintShots; print <- " "; print <- play.paintOnSurfaces + play.paintOnBeings; print <- " ";
       print <- millimetres(ball.x); print <- " "; print <- millimetres(ball.y); print <- " "; print <- millimetres(ball.z); print <- "\n";
+      // The portal, for the net check: whether the glass is open, the gates gone through, the points of every thread
+      mut points = 0usize;
+      mut th = 0usize;
+      while th < portal.threads.len() { points = points + portal.threads[th].pts.len(); th = th + 1usize; }
+      print <- "PORTAL "; print <- i64.from(portal.open); print <- " "; print <- portal.crossings; print <- " "; print <- points; print <- "\n";
     }
     if serve {
       imm b = &mut cast.beings[cb];
@@ -612,7 +629,9 @@ pub struct SimState {
           case mut h &mut Hello { self.hello(m.id, h.name.view(), h.version); }
           case mut c &mut Command { commands.push(c.kind); }
           case mut k &mut Click { clicksIn.push(k.part); }
-          case mut pl &mut Play { play.receive(m.id, pl.kind, pl.spell, pl.target, pl.eye, pl.dir); }
+          case mut pl &mut Play {
+            if pl.kind == PLAY_PORTAL_TEST { self.portalTestFor(m.id); } else { play.receive(m.id, pl.kind, pl.spell, pl.target, pl.eye, pl.dir); }
+          }
           case mut f &mut Frame {
             frameAsked = true;
             frameNo = f.frame;
@@ -696,6 +715,8 @@ pub struct SimState {
         c = c + 1usize;
       }
       village.step(&land, &cast, &mut given, step.dt);
+      // The reflection that walked off down the corridor decides its steps (portalsim.cone)
+      portalIntents(&mut portal, &mut cast, &mut given, tick);
       // A being under a spell is held: a convulsion or a dance is not steered
       playHold(&mut play, &mut given, tick);
       cast.stepEach(&given, &stepIt, step.dt, self.legacy());
@@ -716,12 +737,74 @@ pub struct SimState {
         c = c + 1usize;
       }
       if self.legacy() { birds.step(&land, step.dt * f32.from(scene.clock.rate())); }
+      self.portalAfterStep();
       scene.advanceClock(step.ns);
       tick = tick + 1u64;
       if serve { self.tidyConnections(); }
       if opts.traceOn { self.traceTick(); }
       i = i + 1usize;
     }
+  }
+
+  // The portal's part of a step (portalsim.cone): the gates gone through counted, the glass opened by a being that stood before it, the
+  // reflection made as a puppet if it opened, the threads laid; and what every view is to be told, told
+  fn portalAfterStep(self &mut) {
+    mut driven = List[usize].empty();
+    mut c = 0usize;
+    while c < clients.len() {
+      driven.push(clients[c].being);
+      c = c + 1usize;
+    }
+    imm ground = groundHeight(&land, COTTAGE_X, COTTAGE_Z);
+    portalAfter(&mut portal, &mut cast, &driven, ground, tick);
+    if portal.spawnFrom != NO_ROW { self.makePuppet(); }
+    if portal.puppetDone { self.removePuppet(); }
+    mut i = 0usize;
+    while i < portal.out.len() {
+      self.tellAll(encodePortal(portal.out[i]));
+      i = i + 1usize;
+    }
+    portal.out.clear();
+  }
+
+  // The puppet: a mannequin of the height and colour of the being that opened the glass, where its reflection stood, facing as it
+  // did; a being of the cast whose intents the portal decides
+  fn makePuppet(self &mut) {
+    imm h = cast.beings[portal.spawnFrom].figure.height;
+    imm color = if h < 1.7 { clayColor(); } else { woodColor(); };
+    imm idx = self.addMannequin("reflection", portal.spawnAt, portal.spawnYaw, h, 91u32, color);
+    cast.beings[idx].ai = true;
+    while given.len() < cast.beings.len() { given.push(Intents.none()); stepIt.push(true); }
+    portal.puppetMade(idx);
+    print <- "The portal: the looking-glass opened at tick "; print <- tick; print <- "; its reflection (being "; print <- idx;
+    print <- ") walks off down the corridor\n";
+  }
+
+  // The net check's client (--portal-walk) asks to be put down 3 m before the cottage's glass, facing it, with the glass open: its being is
+  // set down there (as a script's hook would), and the glass opened for it (the reflection walks off), so that it can run through and every
+  // view sees it cross
+  fn portalTestFor(self &mut, id u32) {
+    imm k = self.clientAt(id);
+    if k == NO_ROW { return; }
+    imm idx = clients[k].being;
+    imm ground = groundHeight(&land, COTTAGE_X, COTTAGE_Z);
+    imm at = new Vec3(GLASS_X, groundHeight(&land, GLASS_X, GLASS_Z - 3.), GLASS_Z - 3.);
+    cast.beings[idx].setDown(at, 3.1415927);
+    portal.openFor(&mut cast, idx, ground, tick);
+    print <- "The portal test: client "; print <- id; print <- "'s being "; print <- idx; print <- " set down 3 m before the glass, which is open\n";
+  }
+
+  // The reflection reached E (the antechamber's door) and is gone: its being and part taken out of the world, as a client's is
+  fn removePuppet(self &mut) {
+    imm idx = portal.puppet;
+    portal.puppetDone = false;
+    portal.puppet = NO_ROW;
+    if idx >= cast.beings.len() { return; }
+    imm b = &mut cast.beings[idx];
+    b.gone = true;
+    scene.forget(b.part);
+    scene.send(Request.Despawn(b.part));
+    print <- "The portal: the reflection reached E and is gone (tick "; print <- tick; print <- ")\n";
   }
 
   // What a test reads: each client's being where this tick left it, with the wall clock (the performance counter)
@@ -1069,6 +1152,7 @@ pub struct SimState {
     lastPick = f.lastPick;
     clicks = f.clicks;
     view = f.view;
+    if (f.shotFailed or f.late) and scriptOk { print <- "Script: frame "; print <- f.frame; print <- ", a shot failed or the state was late\n"; }
     if f.shotFailed or f.late { scriptOk = false; }
     imm you = self.youBody();
     if scripted {
@@ -1078,7 +1162,10 @@ pub struct SimState {
       // (the panel-only run checks the script's first 100 frames and none after: what the later ones check is not run)
       // (nor does the labyrinth-only run, from where its part begins: its own checks are run.labOk)
       if !(opts.panelOnly and f.frame >= PANEL_FROM) and !(opts.labOnly and f.frame >= labFrom(&opts)) {
-        if !checkScript(self, f.frame, &you) { scriptOk = false; }
+        if !checkScript(self, f.frame, &you) {
+          if scriptOk { print <- "Script: the checks of frame "; print <- f.frame; print <- " failed\n"; }
+          scriptOk = false;
+        }
       }
       if opts.labOnly and !run.labOk { scriptOk = false; }
       driveScene(self, f.frame);
