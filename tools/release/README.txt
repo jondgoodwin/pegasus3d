@@ -28,8 +28,9 @@ KEYS
 
 MULTIPLAYER
   Start with:   browser.exe --connect 40.87.21.70:40000 --name YourName
-  Multiplayer is by approval: the server accepts only players whose IP address has been approved
-  (a request flow is coming). Until then, run without options for the single-player island.
+  Multiplayer is by approval: the server accepts only players whose IP address has been approved.
+  To ask to be let in:   browser.exe --request-play --name YourName --message "a line about you"
+  (it sends one request over HTTPS and prints what happened; then wait to be approved). Otherwise, run without options for the single-player island.
 
 OPTIONS
   --no-audio         no sound

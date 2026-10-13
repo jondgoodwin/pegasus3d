@@ -21,6 +21,8 @@ param(
   [string]$Congo    = "C:\src\cone-wt-3dweb-compiler\tools\congo\congo.py",
   [string]$Sdl      = "C:\libs\SDL3-3.4.16\lib\x64",
   [string]$Cone     = "C:\src\cone-wt-3dweb-compiler",
+  # OpenSSL 3.5.9 binaries as fetched by Cone's tools\deps\fetch.py (libssl-3.dll, libcrypto-3.dll, LICENSE.txt)
+  [string]$OpenSsl  = "C:\src\cone\deps\openssl",
   [string]$VcRedist = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Redist\MSVC\14.42.34433\x64\Microsoft.VC143.CRT",
   [switch]$SkipBuild
 )
@@ -35,7 +37,7 @@ if ($dirty) { Write-Warning "The working tree has uncommitted changes; the zip's
 $hash = (git -C $repo rev-parse --short=8 HEAD).Trim()
 
 if (-not $SkipBuild) {
-  $env:LIB      = "$Sdl;$env:LIB"
+  $env:LIB      = "$Sdl;$OpenSsl;$env:LIB"
   $env:CONEC    = Join-Path $Compiler "conec.exe"
   $env:CONESTD  = Join-Path $Compiler "conestd.lib"
   Push-Location $browser
@@ -49,6 +51,9 @@ $files = @(
   @{ src = "$rel\sdfmesh.spv";                         dst = "sdfmesh.spv" },
   @{ src = "$Sdl\SDL3.dll";                            dst = "SDL3.dll" },
   @{ src = "$VcRedist\vcruntime140.dll";               dst = "vcruntime140.dll" },
+  @{ src = "$OpenSsl\libssl-3.dll";                    dst = "libssl-3.dll" },
+  @{ src = "$OpenSsl\libcrypto-3.dll";                 dst = "libcrypto-3.dll" },
+  @{ src = "$OpenSsl\LICENSE.txt";                     dst = "licenses\OpenSSL-LICENSE-Apache-2.0.txt" },
   @{ src = "$browser\fonts\Inter-Regular.ttf";         dst = "fonts\Inter-Regular.ttf" },
   @{ src = "$browser\fonts\Inter-SemiBold.ttf";        dst = "fonts\Inter-SemiBold.ttf" },
   @{ src = "$tpl\README.txt";                          dst = "README.txt" },
