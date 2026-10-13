@@ -72,6 +72,9 @@ def main():
     ap.add_argument('--tolerance', type=float, default=0.3, help='metres B may differ from the server path')
     ap.add_argument('--predict-tolerance', type=float, default=0.05, help='metres A\'s final position may differ')
     ap.add_argument('--port', type=int, default=7777)
+    ap.add_argument('--lab', action='store_true',
+                    help='the server sets each joiner down in the labyrinth\'s antechamber (--lab-spawn), 300 m under the island: '
+                         'the same checks, and B must see A there')
     ap.add_argument('--connect', metavar='HOST:PORT', help='a server already running on another machine (needs --server-log)')
     ap.add_argument('--server-log', metavar='FILE', help='with --connect: where the remote server\'s --trace log will be')
     ap.add_argument('--reuse', action='store_true', help='with --connect: run no clients; check the logs of a run already made')
@@ -113,6 +116,8 @@ def main():
         server_cmd = [exe, '--serve', str(args.port), '--loopback', '--run-for', str(args.seconds + 50), '--trace']
         if args.impair:
             server_cmd += ['--impair'] + [str(v) for v in args.impair]
+        if args.lab:
+            server_cmd += ['--lab-spawn']
         server, f1 = start(server_cmd, slog)
         procs.append((server, f1))
         try:
@@ -201,6 +206,10 @@ def main():
             if int(being) == a_being:
                 tv.append((int(at) / 1000.0, int(qpc), (int(x) / 1000.0, int(y) / 1000.0, int(z) / 1000.0)))
     check(len(tv) > 600, f'B drew A {len(tv)} times')
+    if args.lab and tv:
+        ys = sorted(p[1] for _, _, p in tv)
+        check(ys[0] < -299.0 and ys[-1] < -298.0 and ys[len(ys) // 2] < -299.0,
+              f'B drew A in the labyrinth: heights {ys[0]:.2f} to {ys[-1]:.2f} m, median {ys[len(ys) // 2]:.2f} (want about -300)')
     ticks, pos = path[a_being]
     # The first 3 s after B first drew anything are not measured: B is building the world (one frame of seconds) and
     # its clock estimate is settling

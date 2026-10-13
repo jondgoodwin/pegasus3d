@@ -40,7 +40,11 @@ struct Gfx {
   pub surface Surface;
   pub instance Instance;
   pub camera Camera;
+  pub sunShadows bool;        // the tier's sun shadows are on (they are switched off underground: bakedworld/labyrinth.cone)
 }
+
+// The labyrinth's auto-exposure trim (stops): its rooms are dim, and the auto-exposure must not lift them to a middle grey
+const LAB_TRIM_EV f32 = -1.;
 
 // What the scene actor moves to render each frame
 pub struct DrawOrder {
@@ -342,18 +346,28 @@ actor RenderActor {
     if !g.target.ok() { return; }
     imm pose = snapshot.eye(alpha);
     mut sky = g.sys.currentSky();
+    // UNDERGROUND (the labyrinth, 300 m under the island: bakedworld/labyrinth.cone): the island's day is not its light. The frame's
+    // light is the labyrinth's (no sun, a dim warm ambient, a fixed exposure), with no sky, birds, fog, rain, sun shadows or
+    // image-based light; the rooms are lit by their own lamps
+    imm underground = pose.origin.y < LAB_TOP;
     // Once the world has sent a sky, the day's: the sun, moon and ambient from
     // the day clock (skyrig.cone), and the exposure from the sun's height
-    imm dayLit = g.sys.skies.len() > 0usize and rig.made;
+    imm dayLit = g.sys.skies.len() > 0usize and rig.made and !underground;
     // The weather at this moment of scene time: a closed form, so a paused
     // clock holds it and a scrubbed one finds it (parts/weather.cone)
-    imm weather = snapshot.weather.at(snapshot.now);
+    mut weather = snapshot.weather.at(snapshot.now);
+    if underground { weather.rain = 0.; weather.snow = 0.; weather.fog = 0.; weather.ev = 0.; }
     rig.setWeather(weather);
     if dayLit {
       rig.setHour(f32.from(snapshot.hour));
       sky = rig.look();
       g.renderer.environmentStrength = rig.environmentStrength();
     }
+    if underground {
+      sky = new SkyLook(new Color(0., 0., 0., 1.), new Vec3(0., 1., 0.), new Color(0., 0., 0., 1.), labAmbient());
+      g.renderer.environmentStrength = 0.;
+    }
+    g.renderer.shadow.settings.enabled = g.sunShadows and !underground;
     g.camera.origin = pose.origin;
     g.camera.orientation = pose.orientation;
     // A scripted close-up may look through a longer lens
@@ -363,7 +377,8 @@ actor RenderActor {
     g.renderer.time = f32.from(snapshot.now);
     imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
     // (under a dull sky the exposure opens up by the weather's stops)
-    g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()) * rig.exposureScale(); } else { exposureFor(&sky); };
+    g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()) * rig.exposureScale(); }
+      elif underground { exposureFromEv100(LAB_EV); } else { exposureFor(&sky); };
     // Smoke is lit by the sky: white radiance under the ambient light and the
     // sun's (or the moon's) share on a surface turned to it, times the exposure
     imm sunUp = sky.sunDirection.normalize().y;
@@ -421,7 +436,7 @@ actor RenderActor {
       // The passes' settings this frame: the tier's, the exposure's trim from the day clock, and the fog from
       // the weather (the froxel fog is made only while there is some: switching it makes its textures)
       mut fxs = fxBase(g.fxTier);
-      fxs.exposure.compensationEv = autoExposureTrim(rig.sunSine(), weather.ev);
+      fxs.exposure.compensationEv = if underground { LAB_TRIM_EV; } else { autoExposureTrim(rig.sunSine(), weather.ev); };
       fxs.exposure.minEv = AUTO_EXPOSURE_MIN;
       fxs.exposure.maxEv = AUTO_EXPOSURE_MAX;
       if weather.fog > FOG_THIN {
@@ -596,8 +611,9 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, cullMode u32,
     imm splatTex = renderer.addTexture(&mut device, &splatImage());
     splatMaterial = fx.addDecalMaterial(&mut device, &renderer, splatTex, TextureHandle.none(), TextureHandle.none());
   }
+  imm sunShadows = renderer.shadow.settings.enabled;
   Some[Gfx](new Gfx(Buffer.none(), String.empty(), target, post, fx, fxTier, fxMeter, splatMaterial, new Vec3(0., 0., 0.),
-    new Vec3(0., 0., -1.), false, hud, sys, renderer, swapchain, device, adapter, surface, instance, camera));
+    new Vec3(0., 0., -1.), false, hud, sys, renderer, swapchain, device, adapter, surface, instance, camera, sunShadows));
 }
 
 // Image quality by the GPU's tier: 2 high on a discrete GPU (temporal AA, auto-exposure, ambient occlusion),

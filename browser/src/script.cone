@@ -92,6 +92,7 @@ fn lookFrom(eye Vec3, target Vec3) Pose {
 
 // Whether frame 'f' is drawn from a close-up's eye
 pub fn hasView(opts &RunOptions, asm &Assembly, f u64) bool {
+  if labIn(opts, f) { return labHasView(opts, f); }
   if mirrorIn(opts, f) { return mirrorHasView(opts, f); }
   if f >= PLAY_FROM { return playHasView(f); }
   if f >= FENCE_FROM { return fenceHasView(f); }
@@ -107,6 +108,7 @@ pub fn hasView(opts &RunOptions, asm &Assembly, f u64) bool {
 // The close-up's eye for frame 'f' (the scene actor puts it in the frame's
 // snapshot)
 pub fn viewAt(st &mut SimState, f u64) Pose {
+  if labIn(&st.opts, f) { return labView(st, f); }
   if mirrorIn(&st.opts, f) { return mirrorView(st, f); }
   if f >= PLAY_FROM { return playView(st, f); }
   if f >= FENCE_FROM { return fenceView(&st.land, f); }
@@ -214,7 +216,9 @@ fn pushKey(scancode u32, down bool) {
 // The script's events for frame 'f'
 pub fn pushScript(opts &RunOptions, f u64) {
   // (the mirror-only run keeps the first walk's keys, and none of the later ones: the mannequin is not to be walked away)
-  if opts.mirrorOnly and f >= 300u64 { return; }
+  if (opts.mirrorOnly or opts.labOnly) and f >= 300u64 { return; }
+  // (and the full run's keys are none after the labyrinth's part begins: it works the mannequin's keys itself)
+  if !opts.labOnly and opts.scripted and f >= labFrom(opts) { return; }
   // (the panel-only run keeps the first 100 frames' and none after: the panel's own keys and mouse (panelscript.cone) are pushed by the shell)
   if opts.panelOnly and f >= PANEL_FROM { return; }
   // The beach walk: Shift and W for 60 steps (12 m/s: 12 m) up the path's first stretch
@@ -282,6 +286,9 @@ pub struct ScriptRun {
   pub fastFrom f64;           // and when it was run fast
   pub mirrorOk bool = true;   // the mirror's part (mirrorscript.cone) has held so far
   pub mirrorMark u64 = 0u64;  // the mirror pictures drawn when its window began
+  pub labOk bool = true;      // the labyrinth's part (labscript.cone) has held so far
+  pub labDone bool = false;   // its walk has ended
+  pub labMinY f32 = 1.0e9;    // the lowest the walker went
 
   pub fn make() ScriptRun { new ScriptRun(new Vec2(0., 0.), new Vec3(0., 0., 0.), PartId.none(), 0u64, 0u64, 0u64, 0d, 0d); }
 }
@@ -301,6 +308,8 @@ fn partPoint(scene &Scene, id PartId, up f32) Vec3 {
 // The script's clicks for frame 'f': pressed then let go two frames later
 pub fn pushClicks(st &mut SimState, f u64, w &Walk) {
   if st.opts.panelOnly and f >= PANEL_FROM { return; }
+  labClicks(st, f, w);
+  if st.opts.labOnly and f >= labFrom(&st.opts) { return; }
   if f == 120u64 {
     // The lathed rook on the porch deck, 0.28 m up its 0.56
     st.run.clickAt = seen(st.view, w, partPoint(&st.scene, st.world.partOf(LATHED_ROOK, 0usize), 0.28));
@@ -376,6 +385,9 @@ pub fn buildTestCube(door &mut Door) PartId {
 
 // The script's scene requests, sent after frame 'f' is presented
 pub fn driveScene(st &mut SimState, f u64) {
+  labDrive(st, f);
+  // (the labyrinth-only run does nothing else from its first frame on)
+  if st.opts.labOnly and f >= labFrom(&st.opts) { return; }
   mirrorDrive(st, f);
   playDrive(st, f);
   fenceDrive(st, f);
@@ -422,6 +434,7 @@ pub fn shotAt(opts &RunOptions, asm &Assembly, f u64) &str {
   imm panelShot = panelShotAt(opts, f);
   if panelShot.len() > 0usize { return panelShot; }
   if opts.panelOnly and f >= PANEL_FROM { return ""; }
+  if labIn(opts, f) { return labShotAt(opts, asm, f); }
   if mirrorIn(opts, f) { return mirrorShotAt(opts, f); }
   if f >= PLAY_FROM { return playShotAt(f); }
   if f >= FENCE_FROM { return fenceShotAt(f); }
@@ -532,7 +545,7 @@ fn checkSmoke(st &mut SimState) bool {
 // the vegetation's (layout.cone's items: each tree two parts, the rest one); the brook's water (one part)
 // and the cascade's stone lips (one part), and the stone bridge's five (its body, its underside, a parapet
 // each side and the dressed stone)
-fn worldParts(isl &Island) usize { 147usize + 2usize + BRIDGE_PARTS + PIN_COUNT + vegetationParts(isl); }
+fn worldParts(isl &Island) usize { 147usize + 2usize + BRIDGE_PARTS + PIN_COUNT + labPartCount() + vegetationParts(isl); }
 
 fn nearBox(name &str, b Aabb3, lo Vec3, hi Vec3) bool {
   mut ok = near(name, b.max.y, hi.y, 0.001);
@@ -616,8 +629,9 @@ fn checkCottage(st &mut SimState) bool {
   }
   if rendered.gpu {
     // Every light a part sent is a light in render's set: the lanterns' two each and the windows' five
-    print <- "  lights in render: "; print <- rendered.lightCount(); print <- " (want "; print <- LANTERN_LIGHTS + COTTAGE_LIGHTS; print <- ")\n";
-    if rendered.lightCount() != LANTERN_LIGHTS + COTTAGE_LIGHTS { ok = false; }
+    // (and the labyrinth's: its braziers', its hanging lamps' and its light wells' spot lights)
+    print <- "  lights in render: "; print <- rendered.lightCount(); print <- " (want "; print <- LANTERN_LIGHTS + COTTAGE_LIGHTS + labLightCount(); print <- ")\n";
+    if rendered.lightCount() != LANTERN_LIGHTS + COTTAGE_LIGHTS + labLightCount() { ok = false; }
     // A path lantern's stake and cap in the one metal, its glass and bulb in the world's two others, shared with the wall lanterns
     imm stake = rendered.materialOf(world.partOf(LANTERNS, 0usize));
     imm glass = rendered.materialOf(world.partOf(LANTERNS, 1usize));
@@ -879,6 +893,7 @@ pub fn checkScript(st &mut SimState, f u64, w &Walk) bool {
   ok = checkFallRun(st) and ok;
   ok = checkNpcRun(st) and ok;
   ok = st.run.mirrorOk and ok;
+  ok = st.run.labOk and ok;
   ok = checkFenceRun(st) and ok;
   ok = checkPlayRun(st) and ok;
   ok;

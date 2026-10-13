@@ -268,6 +268,51 @@ Cost (RTX 4060, soak, mirror in sight against turned away): frame p50 20.8 ms ag
 9 against 4.8 ms), the picture 3.6 ms on the GPU and 4 ms of CPU recording (76 draws, 0.9 M triangles). Intel UHD 770: 67 ms
 against 55 ms (the picture 51 ms on the GPU in the timed run, which waits idle after it).
 
+## The labyrinth
+
+Far under the island (the antechamber's floor at y = -300, in x -46..76, z 299..434) lie Minoan rooms, the first underworld: the
+way in will be the mirror's portal at **E = (0, -300, 300)** on the antechamber's south wall, facing +z; the way out the doorway at
+the top of the Grand Staircase (`LAB_EXIT_X/Z/UP`, `bakedworld/labrooms.cone`). Nothing else leads there yet (the portal and the
+creatures are other lanes'). It is the object `labyrinth` of the baked-in world (the last, number 19): 50 parts (19 materials' meshes
+and 31 lights), 49 700 triangles, and 238 solids from the same call that makes its meshes (`labgeo.cone`'s kit: a box, a wall with
+doorways, a lathed column, a flight of treads, a band, a panel, a light well, a brazier).
+
+| room | where | what |
+| --- | --- | --- |
+| antechamber | x -10..10, z 300..320, 5.5 high | four red columns, a light well, two dolphin panels, Akrotiri's rosette band, two braziers at E |
+| hall of two doors | x -14..14, z 321..341 | lily panels, a guard's plinth by each door (`LAB_GUARD_LEFT_X/RIGHT_X`, `LAB_GUARD_Z`); the left door (x -8) opens on the Worm's chamber (x -14..-2, z 342..358, a dead end), the right (x +8) on the corridor |
+| corridor | x 6.4..9.6, z 342..372, 3.4 high | a pair of columns every 6 m (its pattern's period, so a loop joined end to start shows no seam), a hanging lamp every 10 m; its far end is the court's wall (door at x = 8) |
+| bull court | x -20..40, z 373..433, 12 high | a colonnade of 5.6 m columns, eight square pillars on a ring of 21 m about (10, 403), a light well, 30 m of open floor; a door west (z 403, the throne room) and east (z 392, the stair) |
+| throne room | x -45..-21, z 391..415, 7 high | red walls, four griffin panels, a wavy band, a gypsum throne with three cloth banners against the west wall, benches, a basin |
+| grand staircase | x 41..75, z 380..430, 16 high | a flight east (35 treads of 0.6 by 0.16 m, 5.6 m up), a landing, a flight south (the same again), a top landing at y = -288.8 with a doorway at x = 67 in the south wall, and an alcove behind it where the exit portal will stand |
+
+**Frescoes** (`bakedworld/labpaint.cone`) are textures baked at start-up: surfacepatterns' `PatternField` (a height, colour, roughness and
+cavity for each texel) filled by functions of the texel's place that draw signed distances in metres, in flat colours with dark
+outlines, and turned by the package into colour, normal and ORM maps. Nothing is a photograph. Every room has a band near its ceiling:
+Akrotiri's rosette band (four blue rosettes in each interlocking lozenge of two raised white wavy ribbons, on red, under a blue and
+black dentil strip). Also: the Knossos rosette chain (the doorways' jambs), running spirals, the throne room's wavy band, the
+dolphins, the griffins and the lilies. The blue monkeys are not done.
+
+**Light.** The island's sun, sky, fog, rain and shadows do not reach it: when the eye is under `LAB_TOP` (-150) `renderactor.cone` swaps
+the frame's light for the labyrinth's (no sun, a dim warm ambient of 40 nits, a fixed exposure `LAB_EV` 6, no sky, birds, fog, rain,
+sun shadows or image-based light, a fixed auto-exposure trim). The rooms are lit by their own lights: warm point lights in the
+braziers and hanging lamps, and a cool spot light down each light well with a bright plate at the top of the shaft (daylight from
+nowhere). Every part has a visibility range of 250 m, so it is culled from the island's camera and costs the island nothing.
+
+**Under the island's ground.** Everything that asked the island for the ground under (x, z) is told, below `LAB_TOP`, that the
+labyrinth's floors are the ground: the gait's feet (`Phys.floorAt`), the wading limit, the third-person camera's floor, the ragdoll's
+"lost" depth. Net: a being's height crosses the wire from -512 m (`POS_ORIGIN_Y`; it was -256 and would have clamped).
+
+**Navigation** (`labnav.cone`): a navmesh of its own from the plan's level tops, with the columns, braziers and pillars as
+obstacles; `labRoute` asks for a route in 3-D. **`--checks`** (`labchecks.cone`) covers the doorways, a walker on the floors, stopped
+by a column and a parapet, climbing the stair, the mesh's coverage of every room, and routes from E to each guard's plinth, the Worm's
+chamber, the corridor, the court, the throne room and the staircase's top.
+
+`browser.exe --labyrinth-only --shots DIR` runs `labscript.cone` alone (30 views from fixed eyes, the island's light changed under
+two of them, then the mannequin walked from E to the staircase's top on the navmesh's route); it is the full run's last part too.
+`--labyrinth-only --soak N --lab-hold K` holds view K for timing. `--dump-frescos DIR` writes the fresco tiles as BMPs. `--lab-spawn`
+(a server's) sets each joiner down in the antechamber, for `python tools/netcheck.py --lab`.
+
 ## Automated runs
 
 ```
