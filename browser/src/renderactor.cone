@@ -358,22 +358,38 @@ actor RenderActor {
     g.camera.orientation = pose.orientation;
     // A scripted close-up may look through a longer lens
     g.camera.fov = snapshot.fov;
-    g.camera.background = sky.color;
+    // Under the island (the labyrinth, portal.cone) the sun, the sky, the fog and the island's terrain are not there: the camera
+    // sees 120 m, the light is the lamps' alone and a dim ambient, the exposure a lit room's
+    imm under = underground(pose.origin.y);
+    g.camera.far = if under { UNDER_FAR; } else { DAY_FAR; };
+    g.camera.background = if under { new Color(0., 0., 0., 1.); } else { sky.color; };
     // The shaders' clock: the scene's time (the sea's waves, the swash), stopped when it is
     g.renderer.time = f32.from(snapshot.now);
-    imm light = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
+    imm dayLight = Light.directional(new Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
     // (under a dull sky the exposure opens up by the weather's stops)
-    g.renderer.exposure = if dayLit { exposureForElevation(rig.sunSine()) * rig.exposureScale(); } else { exposureFor(&sky); };
+    imm dayExposure = if dayLit { exposureForElevation(rig.sunSine()) * rig.exposureScale(); } else { exposureFor(&sky); };
+    imm dayEnvironment = g.renderer.environmentStrength;
+    imm underLight = Light.directional(new Vec3(0., -1., 0.), new Color(0., 0., 0., 1.), underAmbient());
+    imm underExposure = exposureFromEv100(UNDER_EV - EXPOSURE_COMPENSATION);
+    imm light = if under { underLight; } else { dayLight; };
+    g.renderer.exposure = if under { underExposure; } else { dayExposure; };
+    if under { g.renderer.environmentStrength = 0.; }
+    g.sys.surfaces.open = snapshot.glassOpen;
     // Smoke is lit by the sky: white radiance under the ambient light and the
     // sun's (or the moon's) share on a surface turned to it, times the exposure
     imm sunUp = sky.sunDirection.normalize().y;
     imm sunShare = if sunUp > 0. { sunUp; } else { 0.; };
     g.sys.smokeLight = g.renderer.exposure * (luma(sky.ambient) + luma(sky.sunColor) * sunShare * 0.3183);
     g.sys.syncScene(&mut g.renderer, snapshot, pose.origin);
-    g.sys.fitSurfaces(&mut g.renderer, &mut g.device, g.target.texture.width, g.target.texture.height);
-    g.sys.build(snapshot, pose.origin);
+    g.sys.fitSurfaces(&mut g.renderer, &mut g.device, &g.camera, g.target.texture.width, g.target.texture.height);
+    // (under the island, the island is left out unless a picture of it is wanted: the corridor's mouth shows it)
+    imm islandOut = under and !g.sys.surfaces.dayWanted;
+    // (and on the island the labyrinth is left out unless a picture of it is wanted: the glass is open and seen)
+    imm labOut = !under and !g.sys.surfaces.labWanted;
+    g.sys.build(snapshot, pose.origin, islandOut, labOut);
+    g.sys.threads.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, &snapshot.thread);
     g.sys.aimLights(&mut g.renderer, snapshot);
-    if dayLit {
+    if dayLit and !islandOut {
       rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds);
       // The fog after the sky: depth slabs over what lies beyond them (with image quality on, the froxel
       // fog of ImageFx does it, from the same weather)
@@ -396,12 +412,19 @@ actor RenderActor {
         jitterX = 2. * jx / f32.from(g.target.texture.width);
         jitterY = -2. * jy / f32.from(g.target.texture.height);
       }
-      drawSurfaceViews(&mut g.sys.surfaces, &mut g.renderer, &mut g.device, &g.camera, &light, &g.sys.list,
+      // The worlds a picture can show: the viewer's own (a mirror's), the island's day, and the labyrinth
+      imm env = new PictureEnv(new PictureWorld(light, g.renderer.exposure, !under, g.camera.far, g.renderer.environmentStrength, if under { LAB_LAYER; } else { 1u32; }),
+        new PictureWorld(dayLight, dayExposure, true, DAY_FAR, dayEnvironment, 1u32),
+        new PictureWorld(underLight, underExposure, false, UNDER_FAR, 0., LAB_LAYER));
+      drawSurfaceViews(&mut g.sys.surfaces, &mut g.renderer, &mut g.device, &g.camera, &env, &g.sys.list,
         jitterX, jitterY, g.target.texture.width, g.target.texture.height);
     } else {
       g.sys.surfaces.pictures = 0u32;
     }
     mut encoder = g.device.createCommandEncoder();
+    // (Under the island the sun is not there: no cascades are drawn for it)
+    imm shadowsOn = g.renderer.shadow.settings.enabled;
+    if under { g.renderer.shadow.settings.enabled = false; }
     // Into the HDR frame (the size of the target), then bloomed and
     // tone-mapped into the target
     g.post.resize(&mut g.device, g.target.texture.width, g.target.texture.height);
@@ -411,7 +434,7 @@ actor RenderActor {
       g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
       renderCallTicks = renderCallTicks + (sdl.GetPerformanceCounter() - callFrom);
       renderCalls = renderCalls + 1u64;
-      if g.sys.hasEffects() {
+      if g.sys.hasEffects() and !under {
         g.sys.aimEffects(&mut g.device, snapshot);
         g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
         g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
@@ -421,10 +444,10 @@ actor RenderActor {
       // The passes' settings this frame: the tier's, the exposure's trim from the day clock, and the fog from
       // the weather (the froxel fog is made only while there is some: switching it makes its textures)
       mut fxs = fxBase(g.fxTier);
-      fxs.exposure.compensationEv = autoExposureTrim(rig.sunSine(), weather.ev);
+      fxs.exposure.compensationEv = if under { UNDER_TRIM; } else { autoExposureTrim(rig.sunSine(), weather.ev); };
       fxs.exposure.minEv = AUTO_EXPOSURE_MIN;
       fxs.exposure.maxEv = AUTO_EXPOSURE_MAX;
-      if weather.fog > FOG_THIN {
+      if weather.fog > FOG_THIN and !under {
         fxs.fog.enabled = true;
         fxs.fog.density = weather.fog;
         fxs.fog.anisotropy = 0.3;
@@ -462,13 +485,14 @@ actor RenderActor {
       renderCallTicks = renderCallTicks + (sdl.GetPerformanceCounter() - callFrom);
       renderCalls = renderCalls + 1u64;
       // The particles, into the frame before the passes that resolve it, through the camera the scene was drawn with
-      if g.sys.hasEffects() {
+      if g.sys.hasEffects() and !under {
         g.sys.aimEffects(&mut g.device, snapshot);
         g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
         g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.fx.depth, &g.fx.sceneCamera);
       }
       g.fx.renderFinish(&mut g.device, &mut encoder, &mut g.renderer, &mut g.post, &g.sys.list, &g.target.texture);
     }
+    g.renderer.shadow.settings.enabled = shadowsOn;
 
     // The overlay, over the finished picture (after tone mapping)
     g.hud.draw(&mut g.device, &mut encoder, &g.target.texture, hud);
@@ -571,6 +595,7 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, cullMode u32,
   // (off, low, medium, high) override them, to measure what each costs.
   setShadowTiers(&mut renderer, &mut device, adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, cullMode);
+  sys.surfaces.tier(adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   imm fxTier = fxTierFor(adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   mut fx = ImageFx.create(&mut device, &renderer, &mut post);
   imm fxStart = fxBase(fxTier);

@@ -1,0 +1,283 @@
+// The portal's headless checks (part of 'browser.exe --checks'): portal.cone's gates, the camera of a picture through a portal and its window
+// (viewsurface.cone), a body walked through the cottage's wall, the glass and the labyrinth's floors (physics.cone, being.cone), the
+// corridor that will not end, and Ariadne's thread (portalsim.cone). No GPU.
+//
+// The numbers: the cottage's ground 0 (flat); the glass in the back wall at z = 323.966, the middle of its width x = -14.5, its opening 0.55 to
+// 2.25 m up and 1 m across; the corridor's mouth at z = 291, the glass's link (14.5, -300, -32.966).
+
+// The cottage standing on flat ground at its place, its solids and the labyrinth's
+fn portalWorld(c &mut Cast) {
+  mut list = List[Solid].empty();
+  cottageSolids(new Vec3(COTTAGE_X, 0., COTTAGE_Z), &mut list);
+  c.phys.ensureGround();
+  c.phys.setSolids(&list);
+  c.phys.addSolids(&stubSolids());
+}
+
+// The pane's model matrix: the middle 'at', half sizes 0.5 and 0.85, facing -z (the cottage's glass) or +z (the corridor's mouth)
+fn portalPaneModel(at Vec3, faceBack bool) Mat4 {
+  Mat4.fromTrs(at, Quat.angleAxis(if faceBack { 1.5707963; } else { 0. - 1.5707963; }, new Vec3(1., 0., 0.)), new Vec3(0.5, 1., 0.85));
+}
+
+// Where a point 'p' is on a camera's picture, in clip space (x right, y up)
+fn portalClip(camera &Camera, aspect f32, p Vec3) Vec2 {
+  imm vp = camera.projectionMatrix(aspect) * camera.viewMatrix();
+  imm c = clipOf(&vp, p);
+  new Vec2(c.x / c.w, c.y / c.w);
+}
+
+pub fn checkPortal() bool {
+  print <- "The portal (portal.cone, viewsurface.cone, being.cone):\n";
+  mut ok = true;
+  // ---- the gates ----
+  imm p = Portals.make(0.);
+  mut open = Portals.make(0.);
+  open.open = true;
+  imm eyeY = 1.6;
+  ok = expect("a gate is found: an eye going +z through the glass's plane inside its opening, with the glass open",
+    open.crossing(new Vec3(-14.5, eyeY, 323.9), new Vec3(-14.5, eyeY, 324.0), 3.1415927) == 0u32) and ok;
+  ok = expect("not with the glass shut", p.crossing(new Vec3(-14.5, eyeY, 323.9), new Vec3(-14.5, eyeY, 324.0), 3.1415927) == NO_GATE) and ok;
+  ok = expect("not beside the pane, over it or under it",
+    open.crossing(new Vec3(-13.8, eyeY, 323.9), new Vec3(-13.8, eyeY, 324.0), 3.1415927) == NO_GATE
+    and open.crossing(new Vec3(-14.5, 2.4, 323.9), new Vec3(-14.5, 2.4, 324.0), 3.1415927) == NO_GATE
+    and open.crossing(new Vec3(-14.5, 0.3, 323.9), new Vec3(-14.5, 0.3, 324.0), 3.1415927) == NO_GATE) and ok;
+  ok = expect("not coming the other way (-z), which is the mouth's way",
+    open.crossing(new Vec3(-14.5, eyeY, 324.0), new Vec3(-14.5, eyeY, 323.9), 0.) == NO_GATE) and ok;
+  ok = expect("the mouth's gate takes an eye going -z through z = 291, inside its opening",
+    open.crossing(new Vec3(0., LAB_FLOOR + eyeY, 291.1), new Vec3(0., LAB_FLOOR + eyeY, 290.9), 0.) == 1u32) and ok;
+  imm shiftA = open.gates[0usize].shift;
+  imm shiftB = open.gates[1usize].shift;
+  ok = expect("the two gates' shifts undo each other, and the glass's takes its pane's middle to the mouth's (14.5, -300, -32.966)",
+    nearly(shiftA.x + shiftB.x, 0., 0.0001) and nearly(shiftA.y + shiftB.y, 0., 0.0001) and nearly(shiftA.z + shiftB.z, 0., 0.0001)
+    and nearly(shiftA.x, 14.5, 0.0001) and nearly(shiftA.y, -300., 0.0001) and nearly(shiftA.z, MOUTH_Z - GLASS_Z, 0.0001)) and ok;
+  ok = expect("the loop's gate sends a being moving forward as it faces (heading pi faces +z) back by LOOP_BACK",
+    open.crossing(new Vec3(LOOP_X, LAB_FLOOR + eyeY, LOOP_GATE_Z - 0.05), new Vec3(LOOP_X, LAB_FLOOR + eyeY, LOOP_GATE_Z + 0.05), 3.1415927) == 2u32
+    and nearly(open.gates[2usize].shift.z, 0. - LOOP_BACK, 0.0001)) and ok;
+  ok = expect("and lets one moving backwards (facing -z, going +z) through",
+    open.crossing(new Vec3(LOOP_X, LAB_FLOOR + eyeY, LOOP_GATE_Z - 0.05), new Vec3(LOOP_X, LAB_FLOOR + eyeY, LOOP_GATE_Z + 0.05), 0.) == NO_GATE) and ok;
+  ok = expect("the loop works with the glass shut", p.crossing(new Vec3(LOOP_X, LAB_FLOOR + eyeY, LOOP_GATE_Z - 0.05),
+    new Vec3(LOOP_X, LAB_FLOOR + eyeY, LOOP_GATE_Z + 0.05), 3.1415927) == 2u32) and ok;
+
+  // ---- the camera of a picture through a portal ----
+  imm glass = portalPaneModel(new Vec3(-14.5, 1.4, GLASS_Z), false);
+  imm link = glassToMouth(0.);
+  mut main = Camera.make();
+  main.fov = 1.0471976;
+  main.near = 0.1;
+  main.far = 500.;
+  main.lookAt(new Vec3(-14.2, 1.7, 319.), new Vec3(-14.5, 1.4, GLASS_Z), new Vec3(0., 1., 0.));
+  imm other = cameraThroughPortal(&glass, link, &main);
+  ok = expect("the picture is drawn by the eye moved by the link", nearly(other.position().x, -14.2 + 14.5, 0.0001)
+    and nearly(other.position().y, 1.7 - 300., 0.0001) and nearly(other.position().z, 319. + MOUTH_Z - GLASS_Z, 0.0001)
+    and !other.reflected and other.clipped) and ok;
+  // The exit plane: through the corridor's mouth, the corridor on its positive side
+  imm clip = other.clip;
+  imm inCorridor = new Vec3(0., LAB_FLOOR + 1.4, 293.);
+  imm behind = new Vec3(0., LAB_FLOOR + 1.4, 289.);
+  ok = expect("with the exit's plane its near plane: the corridor is on its positive side, what is behind the mouth on its negative",
+    clip.x * inCorridor.x + clip.y * inCorridor.y + clip.z * inCorridor.z + clip.w > 0.
+    and clip.x * behind.x + clip.y * behind.y + clip.z * behind.z + clip.w < 0.
+    and nearly(clip.x, 0., 0.0001) and nearly(clip.z, 1., 0.0001)) and ok;
+  // The same point as the picture puts it: a point P beyond the exit is seen at the screen place of the point P - link in front of the
+  // pane, through the pane; the picture's camera sees P at that place
+  imm aspect = 16. / 9.;
+  imm pFar = new Vec3(0.2, LAB_FLOOR + 1.1, 296.);
+  imm seenAs = pFar - link;
+  imm eye = main.position();
+  imm t = (GLASS_Z - eye.z) / (seenAs.z - eye.z);
+  imm hit = eye + (seenAs - eye) * t;
+  imm onFrame = portalClip(&main, aspect, hit);
+  imm inPicture = portalClip(&other, aspect, pFar);
+  ok = expect("a point beyond the exit is drawn by the picture where the main camera sees it through the pane (clip space)",
+    nearly(onFrame.x, inPicture.x, 0.002) and nearly(onFrame.y, inPicture.y, 0.002)) and ok;
+  // The window: the pane's screen rectangle, and the picture cut to it puts the point where the surface reads it
+  imm vp = main.projectionMatrix(aspect) * main.viewMatrix();
+  imm win = windowOf(&vp, &glass);
+  ok = expect("the pane's window on the frame holds its corners and is smaller than the frame",
+    win.z < 1. and win.w < 1. and win.z > 0.05 and portalWindowHolds(&vp, &glass, win)) and ok;
+  mut cut = other;
+  fitWindow(&mut cut, main.fov, win, true, 0., 0.);
+  // (the picture's aspect is the window's: its width over its height in pixels, here 1920 x 1080's share of the frame)
+  imm texAspect = (win.z * 1920.) / (win.w * 1080.);
+  imm cutClip = portalClip(&cut, texAspect, pFar);
+  imm want = new Vec2((onFrame.x - win.x) / win.z, (onFrame.y - win.y) / win.w);
+  ok = expect("cut to the window, the point is at the window's own clip space: ((x, y) less the window's middle) over its half sizes",
+    nearly(cutClip.x, want.x, 0.003) and nearly(cutClip.y, want.y, 0.003)) and ok;
+  // A mirror's, the other way round in x (it is drawn mirrored left to right)
+  imm mirror = portalPaneModel(new Vec3(-14.5, 1.4, GLASS_Z), false);
+  imm mirrored = cameraThrough(&mirror, SURFACE_MIRROR, &main);
+  mut mcut = mirrored;
+  fitWindow(&mut mcut, main.fov, win, false, 0., 0.);
+  imm pFront = new Vec3(-14.3, 1.1, 321.5);
+  imm hitM = main.position() + (new Vec3(pFront.x, pFront.y, 2. * GLASS_Z - pFront.z) - main.position())
+    * ((GLASS_Z - main.position().z) / (2. * GLASS_Z - pFront.z - main.position().z));
+  imm mainM = portalClip(&main, aspect, hitM);
+  imm mCut = portalClip(&mcut, texAspect, pFront);
+  ok = expect("and a mirror's, mirrored: the picture's x is the window's, negated",
+    nearly(mCut.x, 0. - (mainM.x - win.x) / win.z, 0.003) and nearly(mCut.y, (mainM.y - win.y) / win.w, 0.003)) and ok;
+
+  ok = checkPortalBodies() and ok;
+  ok = checkPortalThread() and ok;
+  ok;
+}
+
+// Whether the four corners of the pane (the model's -1..1 in x and z) are inside the window of 'win' on the frame (with the margin's room)
+fn portalWindowHolds(vp &Mat4, model &Mat4, win Vec4) bool {
+  mut c = 0u32;
+  while c < 4u32 {
+    imm sx = if (c & 1u32) == 0u32 { -1.; } else { 1.; };
+    imm sz = if (c & 2u32) == 0u32 { -1.; } else { 1.; };
+    imm world = clipOf(model, new Vec3(sx, 0., sz));
+    imm q = clipOf(vp, new Vec3(world.x, world.y, world.z));
+    imm nx = q.x / q.w;
+    imm ny = q.y / q.w;
+    if nx < win.x - win.z or nx > win.x + win.z or ny < win.y - win.w or ny > win.y + win.w { return false; }
+    c = c + 1u32;
+  }
+  true;
+}
+
+// A mannequin walked at the cottage's back wall at the pane: stopped by the wall with the glass shut, through it when it is open, and on
+// through the labyrinth's floors and back
+fn checkPortalBodies() bool {
+  print <- "  The glass, the wall and the labyrinth's floors:\n";
+  mut ok = true;
+  mut s = Scene.empty();
+  mut c = Cast.empty(Island.empty());
+  portalWorld(&mut c);
+  imm w = c.add(mannequinBeing(&mut s, "walker", new Vec3(GLASS_X, 0., GLASS_Z - 3.), 1.75, 9u32));
+  c.possess(w);
+  c.beings[w].setDown(new Vec3(GLASS_X, 0., GLASS_Z - 3.), 3.1415927);
+  imm go = new Intents(1., 0., false, false);
+  imm radius = c.beings[w].figure.radius();
+  // Shut: the wall stops it
+  walkFor(&mut c, 4., go);
+  imm shut = c.beings[w].body.position;
+  ok = expect("with the glass shut the cottage's back wall stops it, its radius off the wall (z 324), on the island",
+    nearly(shut.z, 324. - radius, 0.02) and !underground(shut.y) and c.beings[w].crossings == 0u32) and ok;
+  // Open: the wall is notched where the pane is, and it goes through
+  c.phys.setGlassOpen(true);
+  c.beings[w].setDown(new Vec3(GLASS_X, 0., GLASS_Z - 3.), 3.1415927);
+  c.beings[w].before = c.beings[w].body;
+  mut crossedAt = 0;
+  mut shiftSeen = new Vec3(0., 0., 0.);
+  mut k = 0;
+  while k < 240 {
+    c.step(go, 1. / 60.);
+    if c.beings[w].crossed and crossedAt == 0 { crossedAt = k + 1; shiftSeen = c.beings[w].crossShift; }
+    k = k + 1;
+  }
+  imm through = c.beings[w].body.position;
+  print <- "  (4 s of walking: through at step "; print <- crossedAt; print <- ", now at ("; print <- through.x; print <- ", "; print <- through.y; print <- ", ";
+  print <- through.z; print <- "), moved by ("; print <- shiftSeen.x; print <- ", "; print <- shiftSeen.y; print <- ", "; print <- shiftSeen.z; print <- "))\n";
+  ok = expect("with it open it goes through the glass once, by the gate's shift, and is in the labyrinth on its floor, walking on down the corridor",
+    c.beings[w].crossings == 1u32 and crossedAt > 0 and nearly(shiftSeen.x, 14.5, 0.001) and underground(through.y)
+    and nearly(through.y, LAB_FLOOR, 0.03) and through.z > MOUTH_Z + 1. and nearly(through.x, 0., 0.01)) and ok;
+  // The camera follows: the view rig is carried with the body, not left behind (single steps: Cast.step carries it)
+  ok = expect("and the view rig went with it (its eye is under the island too)", underground(c.eyes().origin.y) and underground(c.eyesBefore().origin.y)) and ok;
+  // The feet find the labyrinth's floor, not the island's ground 300 m up
+  imm floor = c.phys.floorAt(0., 300., LAB_FLOOR);
+  ok = expect("the feet's floor query under the island finds the labyrinth's floor (the island's ground is not offered)", nearly(floor, LAB_FLOOR, 0.01)) and ok;
+  ok = expect("and the gait is not stretched towards the ground above (its farthest bone from the feet is under 2 m)", c.beings[w].figure.reach() < 2.) and ok;
+  // On to the room, and back out: turn round, walk to the mouth
+  walkFor(&mut c, 4., go);
+  imm inRoom = c.beings[w].body.position;
+  ok = expect("it walks on into the room (E at z 300, the room to 313) and stands on the floor", inRoom.z > E_Z + 1. and inRoom.z < 312.5 and nearly(inRoom.y, LAB_FLOOR, 0.03)) and ok;
+  c.beings[w].setDown(new Vec3(E_X, LAB_FLOOR, MOUTH_Z + 3.), 0.);
+  c.beings[w].before = c.beings[w].body;
+  mut back = false;
+  k = 0;
+  while k < 240 {
+    c.step(go, 1. / 60.);
+    if c.beings[w].crossed { back = true; }
+    k = k + 1;
+  }
+  imm out = c.beings[w].body.position;
+  ok = expect("run at the mouth from 3 m in, facing it, it goes through and is on the island at the glass, facing away from the wall, walking on",
+    back and !underground(out.y) and out.z < GLASS_Z - 1. and nearly(out.x, GLASS_X, 0.05) and nearly(out.y, 0., 0.03) and c.beings[w].crossings == 2u32) and ok;
+  // Shut again: the notch is filled
+  c.phys.setGlassOpen(false);
+  c.beings[w].setDown(new Vec3(GLASS_X, 0., GLASS_Z - 3.), 3.1415927);
+  c.beings[w].before = c.beings[w].body;
+  walkFor(&mut c, 4., go);
+  ok = expect("with the glass shut again the wall is whole", nearly(c.beings[w].body.position.z, 324. - radius, 0.02) and !underground(c.beings[w].body.position.y)) and ok;
+
+  // The corridor that will not end: forward it sends back, backwards it lets through
+  c.phys.setGlassOpen(true);
+  imm loops0 = c.beings[w].crossings;
+  c.beings[w].setDown(new Vec3(LOOP_X, LAB_FLOOR, LOOP_GATE_Z - 3.), 3.1415927);
+  c.beings[w].before = c.beings[w].body;
+  walkFor(&mut c, 2., go);
+  imm forward = c.beings[w].body.position;
+  ok = expect("walked forward through the loop's gate it is sent back 12 m: it is before the gate again, 12 m on from where it would be",
+    c.beings[w].crossings == loops0 + 1u32 and forward.z < LOOP_GATE_Z and nearly(forward.x, LOOP_X, 0.01)) and ok;
+  imm back2 = new Intents(-1., 0., false, false);
+  c.beings[w].setDown(new Vec3(LOOP_X, LAB_FLOOR, LOOP_GATE_Z - 3.), 0.);
+  c.beings[w].before = c.beings[w].body;
+  walkFor(&mut c, 3., back2);
+  imm backward = c.beings[w].body.position;
+  ok = expect("walked backwards (facing back, going on) it goes through the gate, and on beyond it, to the corridor's end",
+    c.beings[w].crossings == loops0 + 1u32 and backward.z > LOOP_GATE_Z + 1.) and ok;
+  ok;
+}
+
+// Ariadne's thread laid by a being along a path
+fn checkPortalThread() bool {
+  print <- "  Ariadne's thread:\n";
+  mut ok = true;
+  mut p = PortalSim.make();
+  // A being walks from E along +z 6 m (a point a metre, the run merged), turns and goes 4 m along +x
+  mut z = 0.;
+  while z <= 6.01 {
+    p.threadStep(0u32, new Vec3(E_X, LAB_FLOOR, E_Z + z));
+    z = z + 0.25;
+  }
+  imm straight = p.threads[0usize].pts.len();
+  mut x = 0.;
+  while x <= 4.01 {
+    p.threadStep(0u32, new Vec3(E_X + x, LAB_FLOOR, E_Z + 6.));
+    x = x + 0.25;
+  }
+  imm bent = p.threads[0usize].pts.len();
+  ok = expect("a straight walk from E lays two points (E and the being's end: the run is merged), a turn of a corner adds one",
+    straight == 2usize and bent == 3usize and nearly(p.threads[0usize].pts[0usize].z, E_Z, 0.001) and p.threads[0usize].attached) and ok;
+  // Back along the way: the thread is reeled in to where the being is
+  mut back = 4.;
+  while back >= 0. {
+    p.threadStep(0u32, new Vec3(E_X + back, LAB_FLOOR, E_Z + 6.));
+    back = back - 0.25;
+  }
+  imm after = p.threads[0usize].pts.len();
+  ok = expect("walked back to the corner the thread is cut back to it (the corner's point and the ones before it)", after <= 3usize
+    and nearly(p.threads[0usize].pts[after - 1usize].x, E_X, 1.) ) and ok;
+  // A being that goes out (above the labyrinth) lets go of it, and takes it up again where it stands on it
+  p.threadStep(0u32, new Vec3(E_X, 4., E_Z));
+  ok = expect("a being that goes up to the island lets go of its thread (the thread stays)", !p.threads[0usize].attached and p.threads[0usize].pts.len() == after) and ok;
+  p.threadStep(0u32, new Vec3(E_X + 0.3, LAB_FLOOR, E_Z + 0.3));
+  ok = expect("and takes it up again on coming back to a place on it", p.threads[0usize].attached) and ok;
+  // The messages the views are told replay the thread
+  mut told = List[PortalInfo].empty();
+  p.replay(&mut told);
+  mut adds = 0u32;
+  mut attached = false;
+  mut i = 0usize;
+  while i < told.len() {
+    if told[i].kind == PM_THREAD_ADD { adds = adds + 1u32; }
+    if told[i].kind == PM_THREAD_ATTACH { attached = true; }
+    i = i + 1usize;
+  }
+  ok = expect("a view that joins is told every point again, and that it is held", u32.from(p.threads[0usize].pts.len()) == adds and attached) and ok;
+  // A second being's thread is its own colour (the first red)
+  p.threadStep(5u32, new Vec3(E_X, LAB_FLOOR, E_Z));
+  ok = expect("a second being's thread has a hue of its own", p.threads.len() == 2usize and p.threads[0usize].hue == 0u32 and p.threads[1usize].hue == 1u32) and ok;
+  // The message round trip
+  imm bytes = encodePortal(&new PortalInfo(PM_THREAD_ADD, 3u32, new Vec3(1.5, -299.9, 301.25), 2u32));
+  match decodeToView(bytes) {
+    case imm pm Portal {
+      ok = expect("a portal message encodes to bytes and decodes to what it was", pm.kind == PM_THREAD_ADD and pm.being == 3u32 and pm.extra == 2u32
+        and nearly(pm.position.y, -299.9, 0.0001) and nearly(pm.position.z, 301.25, 0.0001)) and ok;
+    }
+    else { ok = expect("a portal message encodes to bytes and decodes to what it was", false) and ok; }
+  }
+  ok;
+}

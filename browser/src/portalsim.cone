@@ -1,0 +1,332 @@
+// The portal's part of the simulation (the truth; a view only draws and listens, shared-island.md): the looking-glass opening, the
+// reflection that walks away down the corridor, Ariadne's thread, and the counts the checks read. State that a connected view must
+// see crosses as ToView.Portal messages (simview.cone), and as the beings' snapshots (the puppet is a being like any).
+//
+// THE OPENING. A being stands still in front of the cottage's glass, facing it, for STILL_TICKS (3 s): the glass opens. Method: the
+// surface switches from the mirror kind to a portal (the view, from the glass's state: viewsurface.cone), onto the corridor behind
+// the labyrinth's mouth; at the same instant a PUPPET, a mannequin of the being's height and colour, is made where the being's
+// reflection stands (the being's place reflected in the pane and moved by the portal's link, so the picture does not change at the
+// switch but for what it is made of), facing the glass, as the reflection does. It waits a moment, turns round, and walks off down the
+// corridor to E. It is a being of the cast like a villager (its intents are decided here), so every view has it.
+//
+// ARIADNE'S THREAD starts at E for every being that goes there: a polyline of its feet's places, a point a metre, near-straight runs
+// merged, laid as it walks. It keeps what it laid when the being goes out (so the way back shows), and a being that comes back to
+// a place on it takes it up from there: the thread is cut back to that point (it is reeled in as the being walks home, and a being
+// that is sent back along the corridor that will not end finds its thread cut back with it). Each being has its own, in its own colour.
+
+// How long a being must stand still before the glass, ticks (3 s), and where: 0.6 to 5.5 m before it, within 2.5 m of its middle,
+// facing it (the heading's forward component towards the glass above 0.7)
+const STILL_TICKS = 180u64;
+const STILL_NEAR f32 = 0.6;
+const STILL_FAR f32 = 5.5;
+const STILL_SIDE f32 = 2.5;
+
+// The puppet stands facing the glass this long (ticks) before it turns and walks, and stops this short of E
+const PUPPET_WAIT = 75u64;
+const PUPPET_STOP f32 = 1.2;
+// ... and turns this much faster than a figure's own turn does, radians a second
+const PUPPET_TURN_EXTRA f32 = 2.;
+
+// The thread: a point each THREAD_STEP metres, a being on an earlier point (within THREAD_RETRACE) cuts the thread back to it, one that
+// comes in takes the thread up where it is within THREAD_ATTACH of it
+const THREAD_STEP f32 = 1.0;
+const THREAD_RETRACE f32 = 0.7;
+const THREAD_ATTACH f32 = 1.2;
+// A being within this of the last stretch of its thread, and short of its end, is reeling it in
+const THREAD_REEL_SIDE f32 = 0.5;
+// A run is merged when its bend is under this (the cosine of the angle between the two stretches: above it, straight on)
+const THREAD_STRAIGHT f32 = 0.995;
+
+// One being's thread
+pub struct Thread {
+  pub being u32;
+  pub pts List[Vec3];
+  pub attached bool;           // the being is laying it (or reeling it in): it runs on to the being
+  pub hue u32;                 // its colour: the first thread laid is red, the next blue ... (portalview.cone)
+}
+
+pub struct PortalSim {
+  pub auto bool;               // a being that stands still before the glass opens it (off in a scripted run until its portal part: the mirror's stands still)
+  pub open bool;
+  still u64;                   // ticks a being has stood still before the glass
+  stillBeing usize;
+  pub openedAt u64;            // the tick it opened
+  pub puppet usize;            // the being that is the reflection gone away, or NO_ROW
+  pub spawnFrom usize;         // a puppet to be made (the simulation does it: it makes beings): from this being, NO_ROW if none
+  pub spawnAt Vec3;
+  pub spawnYaw f32;
+  pub threads List[Thread];
+  pub out List[PortalInfo];    // to tell every view
+  pub crossings u64;           // gates gone through, by any being
+  pub loops u64;               // sent back by the corridor that will not end
+  pub escapes u64;             // gone through it backwards
+  pub mark u64;                // a count a script keeps (portalscript.cone)
+  pub puppetDone bool;         // the reflection has walked to E: it is to go (the simulation does it: it despawns beings)
+
+  pub fn make() PortalSim {
+    new PortalSim(true, false, 0u64, NO_ROW, 0u64, NO_ROW, NO_ROW, new Vec3(0., 0., 0.), 0., List[Thread].empty(), List[PortalInfo].empty(),
+      0u64, 0u64, 0u64, 0u64, false);
+  }
+
+  fn tell(self &mut, kind u32, being u32, position Vec3, extra u32) {
+    out.push(new PortalInfo(kind, being, position, extra));
+  }
+
+  fn threadOf(self &mut, being u32) usize {
+    mut i = 0usize;
+    while i < threads.len() {
+      if threads[i].being == being { return i; }
+      i = i + 1usize;
+    }
+    threads.push(new Thread(being, List[Vec3].empty(), false, u32.from(threads.len())));
+    threads.len() - 1usize;
+  }
+
+  // Cut being 'being''s thread back to its first 'keep' points
+  fn cut(self &mut, k usize, keep usize) {
+    imm being = threads[k].being;
+    if keep >= threads[k].pts.len() { return; }
+    {
+      imm th = &mut threads[k];
+      while th.pts.len() > keep { th.pts.pop(); }
+    }
+    self.tell(PM_THREAD_TRUNC, being, new Vec3(0., 0., 0.), u32.from(keep));
+  }
+
+  fn lay(self &mut, k usize, at Vec3) {
+    imm being = threads[k].being;
+    {
+      imm th = &mut threads[k];
+      th.pts.push(at);
+    }
+    self.tell(PM_THREAD_ADD, being, at, threads[k].hue);
+  }
+
+  // The thread is held (or let go): told
+  fn attach(self &mut, k usize, on bool) {
+    imm being = threads[k].being;
+    if threads[k].attached == on { return; }
+    {
+      imm th = &mut threads[k];
+      th.attached = on;
+    }
+    self.tell(PM_THREAD_ATTACH, being, new Vec3(0., 0., 0.), if on { 1u32; } else { 0u32; });
+  }
+
+  // The nearest of thread 'k''s points to 'at', among the first 'upto', if within 'within' (flat; the heights are the floor's): its index, or NO_ROW
+  fn nearest(self &, k usize, at Vec3, upto usize, within f32) usize {
+    mut best = NO_ROW;
+    mut bestD = within * within;
+    mut i = 0usize;
+    while i < upto and i < threads[k].pts.len() {
+      imm q = threads[k].pts[i];
+      imm dx = q.x - at.x;
+      imm dz = q.z - at.z;
+      imm d = dx * dx + dz * dz;
+      if d <= bestD and libc.fabsf(q.y - at.y) < 1.5 { bestD = d; best = i; }
+      i = i + 1usize;
+    }
+    best;
+  }
+
+  // A being on the last stretch of thread 'k' (within THREAD_REEL_SIDE of it) a metre or more short of its end has walked back along it: the
+  // thread is shortened to where it is (to the stretch's start if it is within half a metre of that, dropping the end: the stretch before is
+  // the last then). True if it was.
+  fn reel(self &mut, k usize, at Vec3) bool {
+    imm m = threads[k].pts.len();
+    if m < 2usize { return false; }
+    imm a = *threads[k].pts[m - 2usize];
+    imm b = *threads[k].pts[m - 1usize];
+    imm dx = b.x - a.x;
+    imm dz = b.z - a.z;
+    imm len = libc.sqrtf(dx * dx + dz * dz);
+    if len < 0.01 { return false; }
+    imm t = ((at.x - a.x) * dx + (at.z - a.z) * dz) / (len * len);
+    if t < 0. or t > 1. { return false; }
+    imm fx = a.x + dx * t;
+    imm fz = a.z + dz * t;
+    imm px = at.x - fx;
+    imm pz = at.z - fz;
+    if px * px + pz * pz > THREAD_REEL_SIDE * THREAD_REEL_SIDE or libc.fabsf(at.y - b.y) > 1.5 { return false; }
+    imm along = t * len;
+    if along > len - THREAD_STEP * 0.9 { return false; }
+    self.cut(k, m - 1usize);
+    if along >= 0.6 { self.lay(k, new Vec3(fx, at.y, fz)); }
+    true;
+  }
+
+  // Being 'being' (its feet at 'at') on its thread
+  pub fn threadStep(self &mut, being u32, at Vec3) {
+    imm k = self.threadOf(being);
+    if underground(at.y) {
+      if !threads[k].attached {
+        // Just in: it takes the thread up where it stands on it, or begins one at E
+        imm near = self.nearest(k, at, threads[k].pts.len(), THREAD_ATTACH);
+        if near != NO_ROW {
+          self.cut(k, near + 1usize);
+          self.attach(k, true);
+        } elif threads[k].pts.len() == 0usize {
+          imm dx = at.x - E_X;
+          imm dz = at.z - E_Z;
+          if dx * dx + dz * dz < THREAD_ATTACH * THREAD_ATTACH {
+            self.lay(k, new Vec3(E_X, at.y, E_Z));
+            self.attach(k, true);
+          }
+        }
+      } else {
+        // Walking back along the last stretch of its own thread: the thread is reeled in to where it is
+        if self.reel(k, at) { return; }
+        // On an earlier point of its own thread (not the last two): the thread is reeled in to it
+        imm n = threads[k].pts.len();
+        if n >= 3usize {
+          imm near = self.nearest(k, at, n - 2usize, THREAD_RETRACE);
+          if near != NO_ROW { self.cut(k, near + 1usize); }
+        }
+        // Laid on: a point a metre on, the run merged with the one before if straight
+        imm m = threads[k].pts.len();
+        if m > 0usize {
+          imm last = *threads[k].pts[m - 1usize];
+          imm dx = at.x - last.x;
+          imm dz = at.z - last.z;
+          if dx * dx + dz * dz >= THREAD_STEP * THREAD_STEP {
+            if m >= 2usize {
+              imm before = *threads[k].pts[m - 2usize];
+              imm ax = last.x - before.x;
+              imm az = last.z - before.z;
+              imm la = libc.sqrtf(ax * ax + az * az);
+              imm lb = libc.sqrtf(dx * dx + dz * dz);
+              if la > 0.001 and lb > 0.001 and (ax * dx + az * dz) / (la * lb) > THREAD_STRAIGHT {
+                self.cut(k, m - 1usize);
+              }
+            }
+            self.lay(k, at);
+          }
+        }
+      }
+    } else {
+      self.attach(k, false);
+    }
+  }
+
+  // Everything a view that has just joined is to be told again: the glass if it is open, and every thread
+  pub fn replay(self &, dest &mut List[PortalInfo]) {
+    if open { dest.push(new PortalInfo(PM_OPEN, 0u32, new Vec3(0., 0., 0.), 1u32)); }
+    mut k = 0usize;
+    while k < threads.len() {
+      mut i = 0usize;
+      while i < threads[k].pts.len() {
+        dest.push(new PortalInfo(PM_THREAD_ADD, threads[k].being, *threads[k].pts[i], threads[k].hue));
+        i = i + 1usize;
+      }
+      if threads[k].attached { dest.push(new PortalInfo(PM_THREAD_ATTACH, threads[k].being, new Vec3(0., 0., 0.), 1u32)); }
+      k = k + 1usize;
+    }
+  }
+
+  // The glass opens, for being 'idx' standing at 'at' facing 'yaw': the puppet is to be made where its reflection stands
+  pub fn openFor(self &mut, cast &mut Cast, idx usize, ground f32, tick u64) {
+    if open { return; }
+    open = true;
+    openedAt = tick;
+    cast.phys.setGlassOpen(true);
+    imm b = cast.beings[idx];
+    imm link = glassToMouth(ground);
+    // The reflection: the place reflected in the pane's plane, moved by the link, kept in the corridor
+    mut x = b.body.position.x + link.x;
+    if x < E_X - 0.3 { x = E_X - 0.3; }
+    if x > E_X + 0.3 { x = E_X + 0.3; }
+    mut z = 2. * GLASS_Z - b.body.position.z + link.z;
+    if z < MOUTH_Z + 0.9 { z = MOUTH_Z + 0.9; }
+    spawnFrom = idx;
+    spawnAt = new Vec3(x, LAB_FLOOR, z);
+    spawnYaw = pi - b.body.yaw;
+    self.tell(PM_OPEN, 0u32, new Vec3(0., 0., 0.), 1u32);
+  }
+
+  // The puppet is made: being 'idx'
+  pub fn puppetMade(self &mut, idx usize) {
+    puppet = idx;
+    spawnFrom = NO_ROW;
+  }
+}
+
+// What the puppet means to do this step: it stands facing the glass for a moment, turns about, and walks to E (the simulation's, before the
+// beings are stepped)
+pub fn portalIntents(p &mut PortalSim, cast &mut Cast, given &mut List[Intents], tick u64) {
+  if p.puppet == NO_ROW or p.puppet >= cast.beings.len() or p.puppet >= given.len() { return; }
+  imm b = cast.beings[p.puppet];
+  mut it = Intents.none();
+  if tick - p.openedAt >= PUPPET_WAIT {
+    imm d = wrapPi(pi - b.body.yaw);
+    if libc.fabsf(d) > 0.08 {
+      it.turn = if d > 0. { 1.; } else { -1.; };
+      // (a figure's own turn is a quarter turn in 1.5 s: the reflection turns about in a second, its body turned on a little more)
+      imm room = libc.fabsf(d);
+      imm more = if PUPPET_TURN_EXTRA / 60. < room { PUPPET_TURN_EXTRA / 60.; } else { room; };
+      cast.beings[p.puppet].body.yaw = b.body.yaw + (if d > 0. { more; } else { 0. - more; });
+    } elif b.body.position.z < E_Z - PUPPET_STOP {
+      it.ahead = 1.;
+    } else {
+      p.puppetDone = true;
+    }
+  }
+  given.set(p.puppet, it);
+}
+
+// After the beings are stepped: the gates they went through counted, a being that has stood before the glass long enough opens it, and
+// the threads laid. 'driven' are the beings the clients drive; 'ground' the cottage's ground
+pub fn portalAfter(p &mut PortalSim, cast &mut Cast, driven &List[usize], ground f32, tick u64) {
+  mut i = 0usize;
+  while i < cast.beings.len() {
+    imm b = cast.beings[i];
+    if b.crossed {
+      p.crossings = p.crossings + 1u64;
+      if b.crossShift.z == 0. - LOOP_BACK and b.crossShift.x == 0. { p.loops = p.loops + 1u64; }
+    } elif !b.gone and b.figure.active and underground(b.body.position.y) and b.before.position.z < LOOP_GATE_Z
+      and b.body.position.z >= LOOP_GATE_Z and libc.fabsf(b.body.position.x - LOOP_X) < LOOP_HALF {
+      // Through the loop's gate backwards (a being facing forward would have been sent back)
+      p.escapes = p.escapes + 1u64;
+    }
+    i = i + 1usize;
+  }
+  // Standing still before the glass
+  if !p.open and p.auto {
+    mut found = false;
+    mut d = 0usize;
+    while d < driven.len() and !found {
+      imm idx = *driven[d];
+      if idx < cast.beings.len() {
+        imm b = cast.beings[idx];
+        if b.figure.active and !b.gone {
+          imm pos = b.body.position;
+          imm fz = 0. - cos(b.body.yaw);
+          imm inZone = pos.z < GLASS_Z - STILL_NEAR and pos.z > GLASS_Z - STILL_FAR and libc.fabsf(pos.x - GLASS_X) < STILL_SIDE and fz > 0.7
+            and !underground(pos.y);
+          imm still = libc.fabsf(b.figure.speed) < 0.05 and b.figure.grounded and b.intents.ahead == 0.;
+          if inZone and still {
+            found = true;
+            if p.stillBeing == idx { p.still = p.still + 1u64; } else { p.stillBeing = idx; p.still = 1u64; }
+          }
+        }
+      }
+      d = d + 1usize;
+    }
+    if !found {
+      p.still = 0u64;
+      p.stillBeing = NO_ROW;
+    }
+    if found and p.still >= STILL_TICKS {
+      imm who = p.stillBeing;
+      p.openFor(cast, who, ground, tick);
+    }
+  }
+  // The threads
+  mut d = 0usize;
+  while d < driven.len() {
+    imm idx = *driven[d];
+    if idx < cast.beings.len() and !cast.beings[idx].gone and cast.beings[idx].figure.active {
+      p.threadStep(u32.from(idx), cast.beings[idx].body.position);
+    }
+    d = d + 1usize;
+  }
+}

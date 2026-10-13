@@ -92,6 +92,7 @@ fn lookFrom(eye Vec3, target Vec3) Pose {
 
 // Whether frame 'f' is drawn from a close-up's eye
 pub fn hasView(opts &RunOptions, asm &Assembly, f u64) bool {
+  if portalIn(opts, f) { return portalHasView(opts, f); }
   if mirrorIn(opts, f) { return mirrorHasView(opts, f); }
   if f >= PLAY_FROM { return playHasView(f); }
   if f >= FENCE_FROM { return fenceHasView(f); }
@@ -107,6 +108,7 @@ pub fn hasView(opts &RunOptions, asm &Assembly, f u64) bool {
 // The close-up's eye for frame 'f' (the scene actor puts it in the frame's
 // snapshot)
 pub fn viewAt(st &mut SimState, f u64) Pose {
+  if portalIn(&st.opts, f) { return portalView(st, f); }
   if mirrorIn(&st.opts, f) { return mirrorView(st, f); }
   if f >= PLAY_FROM { return playView(st, f); }
   if f >= FENCE_FROM { return fenceView(&st.land, f); }
@@ -213,8 +215,10 @@ fn pushKey(scancode u32, down bool) {
 
 // The script's events for frame 'f'
 pub fn pushScript(opts &RunOptions, f u64) {
+  // The portal's keys (portalscript.cone), late in the run (or from frame 300 in the portal-only run)
+  portalPush(opts, f);
   // (the mirror-only run keeps the first walk's keys, and none of the later ones: the mannequin is not to be walked away)
-  if opts.mirrorOnly and f >= 300u64 { return; }
+  if (opts.mirrorOnly or opts.portalOnly) and f >= 300u64 { return; }
   // (the panel-only run keeps the first 100 frames' and none after: the panel's own keys and mouse (panelscript.cone) are pushed by the shell)
   if opts.panelOnly and f >= PANEL_FROM { return; }
   // The beach walk: Shift and W for 60 steps (12 m/s: 12 m) up the path's first stretch
@@ -376,6 +380,9 @@ pub fn buildTestCube(door &mut Door) PartId {
 
 // The script's scene requests, sent after frame 'f' is presented
 pub fn driveScene(st &mut SimState, f u64) {
+  portalDrive(st, f);
+  // (the portal-only run has no other part after frame 300)
+  if st.opts.portalOnly and f >= 300u64 { return; }
   mirrorDrive(st, f);
   playDrive(st, f);
   fenceDrive(st, f);
@@ -422,6 +429,7 @@ pub fn shotAt(opts &RunOptions, asm &Assembly, f u64) &str {
   imm panelShot = panelShotAt(opts, f);
   if panelShot.len() > 0usize { return panelShot; }
   if opts.panelOnly and f >= PANEL_FROM { return ""; }
+  if portalIn(opts, f) { return portalShotAt(opts, f); }
   if mirrorIn(opts, f) { return mirrorShotAt(opts, f); }
   if f >= PLAY_FROM { return playShotAt(f); }
   if f >= FENCE_FROM { return fenceShotAt(f); }
@@ -532,7 +540,7 @@ fn checkSmoke(st &mut SimState) bool {
 // the vegetation's (layout.cone's items: each tree two parts, the rest one); the brook's water (one part)
 // and the cascade's stone lips (one part), and the stone bridge's five (its body, its underside, a parapet
 // each side and the dressed stone)
-fn worldParts(isl &Island) usize { 147usize + 2usize + BRIDGE_PARTS + PIN_COUNT + vegetationParts(isl); }
+fn worldParts(isl &Island) usize { 147usize + 2usize + BRIDGE_PARTS + PIN_COUNT + PORTAL_STUB_PARTS + vegetationParts(isl); }
 
 fn nearBox(name &str, b Aabb3, lo Vec3, hi Vec3) bool {
   mut ok = near(name, b.max.y, hi.y, 0.001);
@@ -616,8 +624,9 @@ fn checkCottage(st &mut SimState) bool {
   }
   if rendered.gpu {
     // Every light a part sent is a light in render's set: the lanterns' two each and the windows' five
-    print <- "  lights in render: "; print <- rendered.lightCount(); print <- " (want "; print <- LANTERN_LIGHTS + COTTAGE_LIGHTS; print <- ")\n";
-    if rendered.lightCount() != LANTERN_LIGHTS + COTTAGE_LIGHTS { ok = false; }
+    // (and the labyrinth's placeholder lamps: portalstub.cone's)
+    print <- "  lights in render: "; print <- rendered.lightCount(); print <- " (want "; print <- LANTERN_LIGHTS + COTTAGE_LIGHTS + PORTAL_STUB_LAMPS; print <- ")\n";
+    if rendered.lightCount() != LANTERN_LIGHTS + COTTAGE_LIGHTS + PORTAL_STUB_LAMPS { ok = false; }
     // A path lantern's stake and cap in the one metal, its glass and bulb in the world's two others, shared with the wall lanterns
     imm stake = rendered.materialOf(world.partOf(LANTERNS, 0usize));
     imm glass = rendered.materialOf(world.partOf(LANTERNS, 1usize));
@@ -716,8 +725,9 @@ fn checkSharing(st &mut SimState) bool {
   print <- " the island's 3 meshes (land fine and coarse, the sea) have 2 materials;";
   print <- " plus the vegetation's surplus (its 36 meshes have 13 materials); plus the bridge's 1 (its 5 meshes have 4 materials; the cascade's steps and the brook's water have one each);";
   print <- " and each mannequin is "; print <- FIGURE_MESHES;
-  print <- " meshes in one material), "; print <- scene.resourceCount(); print <- " defined\n";
-  if scene.door.meshes != scene.door.materials + 10u64 + vegetationMeshSurplus(&st.land) + 1u64 + u64.from(SCRIPT_FIGURES) * (FIGURE_MESHES - 1u64)
+  print <- " meshes in one material; the labyrinth stub's 5 meshes have 6 materials: one pane mesh serves its two panes), "; print <- scene.resourceCount(); print <- " defined\n";
+  // (+ 1 - 1: the bridge's one more, and the stub's one fewer)
+  if scene.door.meshes != scene.door.materials + 10u64 + vegetationMeshSurplus(&st.land) + u64.from(SCRIPT_FIGURES) * (FIGURE_MESHES - 1u64)
     or u64.from(scene.resourceCount()) != scene.door.meshes + scene.door.materials {
     ok = false;
   }
@@ -812,6 +822,8 @@ fn checkMannequinRun(st &mut SimState, f u64) bool {
 
 // What the script's events must have done by the end of frame 'f'
 pub fn checkScript(st &mut SimState, f u64, w &Walk) bool {
+  // (the portal-only run has no other part after frame 300)
+  if st.opts.portalOnly and f >= 300u64 { return checkPortalRun(st); }
   mut ok = checkMannequinRun(st, f);
   imm scene = &st.scene;
   if f == 2u64 {
@@ -879,6 +891,7 @@ pub fn checkScript(st &mut SimState, f u64, w &Walk) bool {
   ok = checkFallRun(st) and ok;
   ok = checkNpcRun(st) and ok;
   ok = st.run.mirrorOk and ok;
+  ok = checkPortalRun(st) and ok;
   ok = checkFenceRun(st) and ok;
   ok = checkPlayRun(st) and ok;
   ok;
