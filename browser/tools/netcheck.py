@@ -233,6 +233,26 @@ def main():
         else:
             check(False, f'B drew villager {vb}')
 
+    # The playground (props.cone, spellsim.cone): A bowls at tick 600 and throws paint at 900; the server played both, and B saw the ball
+    # where the server has it and was told of the paint
+    sp = [l.split() for l in S if l.startswith('PLAY ')]
+    bp = [l.split() for l in B if l.startswith('PLAY ')]
+    ap_ = [l.split() for l in A if l.startswith('PLAY ')]
+    check(bool(sp) and int(sp[0][1]) == 1 and int(sp[0][2]) == 1, 'the server played A\'s one bowl and one paintball')
+    if sp and bp:
+        props, bursts = int(bp[-1][1]), int(bp[-1][2])
+        bx, by, bz = (int(v) / 1000.0 for v in bp[-1][4:7])
+        sx, sy, sz = (int(v) / 1000.0 for v in sp[0][4:7])
+        d = ((bx - sx) ** 2 + (by - sy) ** 2 + (bz - sz) ** 2) ** 0.5
+        check(props == 11, f'B has all 11 props once the ball has moved ({props})')
+        check(d <= 0.05, f'B has the ball at ({bx:.3f}, {bz:.3f}), {d:.3f} m from the server\'s ({sx:.3f}, {sz:.3f})')
+        if int(sp[0][3]) > 0:
+            check(bursts >= 1, f'B was told of the paint ({bursts} burst(s); the server had {sp[0][3]} splat(s))')
+    else:
+        check(False, 'the server and B both reported the playground')
+    if ap_:
+        check(int(ap_[-1][1]) == 11, f'A has all 11 props too ({ap_[-1][1]})')
+
     # Bandwidth
     secs = args.seconds
     for line in S:
