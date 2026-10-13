@@ -558,6 +558,14 @@ path within 0.3 m, and prints how far in the past B draws and the bandwidth each
 `python tools/netcheck.py` is the loopback run, and `python tools/netcheck.py --impair 50 100 20` the same through
 the relay with 5% of packets lost and 100 ms and up to 20 ms more each way.
 
+**A fresh connect and the GPU's staging memory.** A client that connects is told the whole world at once (the replay
+log), about 300 MB of mesh and texture upload, where one frame's uploads can take about 16 MB (gpu's staging block doubles
+from 64 KB and fails on its 9th growth in a frame: "a frame outgrew its staging memory 8 times"). The connected view
+therefore hands render the requests in order up to 4 MB of estimated upload a frame (a request over it goes alone), the
+rest held to the next frames (`UPLOAD_BUDGET`, `takeForRender` in `src/viewactor.cone`; single player is not limited) and
+prints "Upload: a burst of ..." when the backlog clears, about 40 frames and 1 to 2.5 s after the connect.
+`python tools/stagingcheck.py` connects ten times to a local server and checks each ends with no Vulkan failure.
+
 ## How it is put together
 
 | File | What it is |
