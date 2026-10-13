@@ -83,12 +83,14 @@ pub struct RenderFacts {
   drawn Table[DrawnFact];
   emitting Table[u32];        // the particles it drew at the last frame
   lighting Table[u32];        // the parts that are lights
+  pub pictures u64 = 0u64;    // the frames that drew a view surface's picture (a mirror's), ever
 
   pub fn empty() RenderFacts { new RenderFacts(false, Table[DrawnFact].empty(), Table[u32].empty(), Table[u32].empty()); }
 
   // The render system's tables now, into 'dest' (its lists reused)
   fn take(sys &RenderSystem, dest &mut RenderFacts) {
     dest.gpu = true;
+    dest.pictures = sys.surfaces.frames;
     dest.drawn.clear();
     dest.emitting.clear();
     dest.lighting.clear();
@@ -198,6 +200,8 @@ actor RenderActor {
     match &mut g {
       case mut some &mut Some {
         if o.resized { some.swapchain.resize(o.width, o.height); }
+        some.sys.surfaces.width = some.target.texture.width;
+        some.sys.surfaces.height = some.target.texture.height;
         self.apply(some, &mut o.requests);
         self.drawFrame(some, &o.snapshot, o.shot.view(), o.alpha, &o.hud);
         t1 = sdl.GetTicksNS();
@@ -247,6 +251,15 @@ actor RenderActor {
         if renderCalls > 0u64 {
           print <- "Render call: "; print <- f64.from(renderCallTicks) / f64.from(sdl.GetPerformanceFrequency()) * 1000d / f64.from(renderCalls);
           print <- " ms CPU a frame, mean of "; print <- renderCalls; print <- " frames\n";
+        }
+        if some.sys.surfaces.frames > 0u64 {
+          print <- "View surfaces: "; print <- some.sys.surfaces.frames; print <- " frames drew a picture, "; print <- f64.from(some.sys.surfaces.ticks) /
+            f64.from(sdl.GetPerformanceFrequency()) * 1000d / f64.from(some.sys.surfaces.frames); print <- " ms CPU a frame recording them\n";
+        }
+        if some.sys.surfaces.gpuPictures > 0u64 {
+          print <- "View surfaces: "; print <- some.sys.surfaces.gpuNs / f64.from(some.sys.surfaces.gpuPictures) / 1000000d;
+          print <- " ms on the GPU a picture, mean of "; print <- some.sys.surfaces.gpuPictures; print <- "; the last picture "; print <- u64.from(some.sys.surfaces.lastCalls);
+          print <- " draws, "; print <- some.sys.surfaces.lastTriangles; print <- " triangles\n";
         }
       }
       else {}
@@ -348,6 +361,7 @@ actor RenderActor {
     imm sunShare = if sunUp > 0. { sunUp; } else { 0.; };
     g.sys.smokeLight = g.renderer.exposure * (luma(sky.ambient) + luma(sky.sunColor) * sunShare * 0.3183);
     g.sys.syncScene(&mut g.renderer, snapshot, pose.origin);
+    g.sys.fitSurfaces(&mut g.renderer, &mut g.device, g.target.texture.width, g.target.texture.height);
     g.sys.build(snapshot, pose.origin);
     g.sys.aimLights(&mut g.renderer, snapshot);
     if dayLit {
@@ -358,6 +372,25 @@ actor RenderActor {
         imm aspect = f32.from(g.target.texture.width) / f32.from(g.target.texture.height);
         rig.drawFog(&mut g.sys.list, pose.origin, pose.orientation, snapshot.fov, aspect, g.renderer.exposure);
       }
+    }
+    // The pictures of the view surfaces (mirrors) in sight, drawn before the frame's own pass, each in a submission
+    // of its own (viewsurface.cone)
+    if g.sys.surfaces.anySeen() {
+      // (the jitter temporal AA is about to move this frame by, so the pictures are of its sequence: see drawSurfaceViews)
+      mut jitterX = 0.;
+      mut jitterY = 0.;
+      if g.fxTier != 0u32 and g.fx.settings.aa == AA_TAA {
+        mut jx = 0.;
+        mut jy = 0.;
+        imm taa = &g.fx.settings.taa;
+        jitterOf(g.fx.frameNumber, if taa.samples < 2u32 { 2u32; } else { taa.samples; }, taa.jitterScale, &mut jx, &mut jy);
+        jitterX = 2. * jx / f32.from(g.target.texture.width);
+        jitterY = -2. * jy / f32.from(g.target.texture.height);
+      }
+      drawSurfaceViews(&mut g.sys.surfaces, &mut g.renderer, &mut g.device, &g.camera, &light, &g.sys.list,
+        jitterX, jitterY, g.target.texture.width, g.target.texture.height);
+    } else {
+      g.sys.surfaces.pictures = 0u32;
     }
     mut encoder = g.device.createCommandEncoder();
     // Into the HDR frame (the size of the target), then bloomed and

@@ -41,6 +41,7 @@ pub struct MaterialRow {
   pub lit MaterialHandle;     // the highlighted material, made the first time it is asked for
   pub shaded bool = false;    // drawn by a shader of the browser's own: 'params' its parameters
   pub params Array[f32, 8] = [0., 0., 0., 0., 0., 0., 0., 0.];
+  pub surface bool = false;   // a view surface (viewsurface.cone): its item is on the surface layer, its picture drawn before the frame
 }
 
 // What one part is drawn as
@@ -206,6 +207,7 @@ pub struct RenderSystem {
   prevBones List[Mat4];
   nextBones List[Mat4];
   pub scenery Table[SceneRow];   // the parts that are scene items, keyed by part (Cull)
+  pub surfaces ViewSurfaces;     // the mirrors (viewsurface.cone)
   pub sceneEye Vec3 = new Vec3(0., 0., 0.);   // the eye at the last 'syncScene': a jump of it is a cut, with no fade
   pub sceneNow f64 = 0d;    // the snapshot time of the last 'syncScene', for the fades' step
   pub sceneMade u64 = 0u64;   // scene items made, ever
@@ -226,7 +228,7 @@ pub struct RenderSystem {
       List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
       List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty(), List[EmitterHandle].empty(),
       Table[LampRow].empty(), Table[u32].empty(), MotionList.empty(), Table[PrevRow].empty(), List[Mat4].empty(),
-      List[Mat4].empty(), Table[SceneRow].empty());
+      List[Mat4].empty(), Table[SceneRow].empty(), ViewSurfaces.make());
     sys.cullMode = cullMode;
     sys;
   }
@@ -304,6 +306,10 @@ pub struct RenderSystem {
   // Apply a DefineMaterial: make its material, Blinn-Phong or physical
   pub fn defineMaterial(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look,
       paint &Image, maps &mut Maps) {
+    if surface.shader == SHADER_MIRROR {
+      self.defineSurface(renderer, device, id, surface);
+      return;
+    }
     if surface.shader != SHADER_STANDARD {
       self.defineShaded(renderer, device, id, surface, paint, maps);
       return;
@@ -334,6 +340,28 @@ pub struct RenderSystem {
     imm mh = renderer.addMaterial(device, &material);
     materials.put(id.id, new MaterialRow(mh, material, false, PbrMaterial.standard(surface.color, 0., 1.),
       MaterialHandle.none()));
+  }
+
+  // A view surface's material (viewsurface.cone): the look's params are its tint (rgb) and its kind; it shows the
+  // scene drawn again from another camera, which the render actor draws each frame the surface is seen
+  fn defineSurface(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, surface &Look) {
+    imm tint = new Color(surface.params[0usize], surface.params[1usize], surface.params[2usize], 1.);
+    imm mh = surfaces.define(renderer, device, id, u32.from(surface.params[3usize]), tint);
+    mut row = new MaterialRow(mh, Material.plain(surface.color), false, PbrMaterial.standard(surface.color, 0., 1.),
+      MaterialHandle.none());
+    row.surface = true;
+    materials.put(id.id, row);
+  }
+
+  // The surfaces' pictures the size of the frame (before 'build', which hands their materials to the draw list)
+  pub fn fitSurfaces(self &mut, renderer &mut Renderer, device &mut Device, width u32, height u32) {
+    if !surfaces.fit(renderer, device, width, height) { return; }
+    mut i = 0usize;
+    while i < surfaces.rows.len() {
+      imm mrow = materials.find(*surfaces.rows.ids[i]);
+      if mrow != NO_ROW { materials.rows[mrow].handle = surfaces.materialOf(i); }
+      i = i + 1usize;
+    }
   }
 
   // A shaded look's material: drawn by the browser's shader it names
@@ -888,6 +916,14 @@ pub struct RenderSystem {
             }
           }
           prevRows.put(id, new PrevRow(model, nowFirst, nowCount));
+          // A view surface is on its own layer (not in its own picture), casts no shadow, and is told its place
+          if mat.surface {
+            list.setLayers(list.len() - 1usize, SURFACE_LAYER);
+            list.dontCastShadow();
+            surfaces.note(batch.material, model);
+            // (Temporal AA reprojects the pane by the wall's motion, not by the motion of what it shows: render treats a custom
+            // pipeline's item as static and has no way to say otherwise, so a moving camera softens the picture's edges)
+          }
           if quiet.len() > 0usize and quiet.find(id) != NO_ROW { list.dontCastShadow(); }
           drawnNow = drawnNow + 1usize;
           k = k + 1usize;

@@ -1,0 +1,241 @@
+// View surfaces: a surface in the world that shows the scene drawn again from another camera.
+//
+// A MIRROR is the first kind, and the only one so far; a PORTAL, a security-camera screen or a window onto
+// another place would be the same piece with a different camera. The piece is three steps, and only the
+// first differs between kinds:
+//
+//   1. WHICH CAMERA. 'cameraFor' says, from the viewer's camera and the surface's place in the world, the
+//      camera whose picture the surface shows. For a mirror it is the viewer's camera reflected about the
+//      surface's plane (render's Camera.reflectedAbout: the eye reflected, nothing behind the plane drawn).
+//      A portal would give the camera moved through the doorway to the paired surface's place; nothing else
+//      changes.
+//   2. DRAW THE SCENE AGAIN from that camera into the surface's own texture (render's RenderView, a view of
+//      the same draw list on the layers the surface is not on, so a mirror is left out of its own
+//      reflection).
+//   3. SHOW THE PICTURE on the surface (render's ViewMaterials: a custom pipeline that reads the picture at
+//      the fragment's own screen position).
+//
+// A surface is a part whose look names SHADER_MIRROR (parts.cone): the look's params are its tint (rgb) and
+// its kind (the fourth number), the part's mesh is mesh's plane (-1 to 1 in x and z, facing +y, so +y is the
+// surface's normal), and where it is is the part's world matrix. So the simulation places it like any part
+// (the cottage's wall carries the mirror), and the view only draws what it shows.
+//
+// The picture is drawn only for a surface that is in front of the viewer's eye (the plane's front side) and
+// whose quad is in the viewer's frustum; a surface nobody sees costs nothing. It is a view of the frame's size,
+// remade when the window's size changes.
+//
+// The layer: the surface's own draw item is on layer 2 and the picture's view draws layer 1 only (render's
+// RenderView.layerMask), so the surface is not in its own reflection.
+
+// The kinds of surface (the look's fourth parameter)
+pub const SURFACE_MIRROR = 0u32;
+
+// The layer bit a surface's item is on; everything else is on layer 1 (render's default)
+pub const SURFACE_LAYER = 2u32;
+
+// One surface
+pub struct SurfaceRow {
+  pub kind u32;
+  pub tint Color;
+  pub view RenderView;          // its picture
+  pub shows MaterialHandle;     // the material showing the picture
+  pub model Mat4;               // the world matrix of its item in this frame's draw list
+  pub seen bool = false;        // there is one
+  pub drawn u64 = 0u64;         // pictures drawn, ever
+}
+
+// The surfaces of the world, by their look's material
+pub struct ViewSurfaces {
+  materials ViewMaterials;
+  ready bool;
+  pub rows Table[SurfaceRow];
+  pub pictures u32 = 0u32;      // pictures drawn at the last frame
+  pub ticks u64 = 0u64;         // the CPU time recording them (performance counter ticks), over the frames that drew any
+  pub frames u64 = 0u64;        // and how many such frames
+  pub width u32 = 16u32;        // the frame's size, set by the render actor before it applies requests: the size of a picture made now
+  pub height u32 = 16u32;
+  // PEGASUS_MIRROR_TIMING=1: each picture is timed on the GPU (timestamps round its pass), the device waited idle after it, which
+  // slows the frame: for measuring a picture's cost, not for playing
+  pub timing bool = false;
+  pub gpuNs f64 = 0d;           // the GPU time of the pictures timed
+  pub gpuPictures u64 = 0u64;
+  pub lodBias f32 = 1.;
+  pub lastCalls u32 = 0u32;     // the draws and triangles of the last picture
+  pub lastTriangles u64 = 0u64;
+
+  pub fn make() ViewSurfaces {
+    mut s = new ViewSurfaces(new ViewMaterials(PipelineHandle.none(), PipelineHandle.none()), false, Table[SurfaceRow].empty());
+    imm e = libc.getenv("PEGASUS_MIRROR_TIMING");
+    if (e as usize) != 0usize { s.timing = libc.strcmp(cstr.fromPtr(e), "1") == 0i32; }
+    imm l = libc.getenv("PEGASUS_MIRROR_LOD");
+    if (l as usize) != 0usize { s.lodBias = f32.from(u32.from(wholeNumber(l))) / 100.; }
+    s;
+  }
+
+  // Material 'id' is a surface of 'kind', tinted 'tint': its picture the size of the frame as it is now (made at that
+  // size, so that nothing made here is destroyed again before the device has used it: 'fit' remakes it only when the
+  // window changes). The material that shows it.
+  pub fn define(self &mut, renderer &mut Renderer, device &mut Device, id MaterialId, kind u32, tint Color) MaterialHandle {
+    if !ready {
+      materials = ViewMaterials.create(renderer, device);
+      ready = true;
+    }
+    mut view = RenderView.create(renderer, device, width, height);
+    view.layerMask = 1u32;
+    view.lodBias = lodBias;
+    if timing { view.enableTiming(device); }
+    imm shows =materials.mirrorMaterial(renderer, device, view.color, tint);
+    rows.put(id.id, new SurfaceRow(kind, tint, view, shows, Mat4.identity()));
+    shows;
+  }
+
+  pub fn isSurface(self &, id MaterialId) bool { rows.find(id.id) != NO_ROW; }
+
+  // Item of surface 'id' is in this frame's draw list, placed by 'model'
+  pub fn note(self &mut, id MaterialId, model Mat4) {
+    imm r = rows.find(id.id);
+    if r == NO_ROW { return; }
+    imm row = &mut rows.rows[r];
+    row.seen = true;
+    row.model = model;
+  }
+
+  // Every surface's picture the size of the frame, 'width' by 'height'; true if any was remade (its material
+  // is then another: see 'materialOf')
+  pub fn fit(self &mut, renderer &mut Renderer, device &mut Device, width u32, height u32) bool {
+    mut changed = false;
+    mut i = 0usize;
+    while i < rows.len() {
+      imm row = &mut rows.rows[i];
+      if row.view.width != width or row.view.height != height {
+        // (the picture being let go may be in use by the frame before)
+        device.waitIdle();
+        mut view = RenderView.create(renderer, device, width, height);
+        view.layerMask = 1u32;
+        view.lodBias = lodBias;
+        if timing { view.enableTiming(device); }
+        row.shows = materials.mirrorMaterial(renderer, device, view.color, row.tint);
+        row.view = view;
+        changed = true;
+      }
+      i = i + 1usize;
+    }
+    changed;
+  }
+
+  // The material showing surface number 'i''s picture
+  pub fn materialOf(self &, i usize) MaterialHandle { rows.rows[i].shows; }
+
+  pub fn anySeen(self &) bool {
+    mut i = 0usize;
+    while i < rows.len() {
+      if rows.rows[i].seen { return true; }
+      i = i + 1usize;
+    }
+    false;
+  }
+}
+
+// ---- Step 1: which camera ----
+
+// The plane of a surface placed by 'model': through its place, facing its +y (the plane mesh's front), turned
+// to face 'eye': (n, d) with n.p + d = 0 on the plane and the eye on the positive side
+fn surfacePlane(model &Mat4, eye Vec3) Vec4 {
+  imm point = new Vec3(model.m[12], model.m[13], model.m[14]);
+  imm normal = new Vec3(model.m[4], model.m[5], model.m[6]);
+  mirrorPlane(point, normal, eye);
+}
+
+// Whether the surface placed by 'model' faces 'eye' (its back is never seen: the item is culled)
+fn facesEye(model &Mat4, eye Vec3) bool {
+  imm point = new Vec3(model.m[12], model.m[13], model.m[14]);
+  imm normal = new Vec3(model.m[4], model.m[5], model.m[6]).normalize();
+  normal.dot(eye - point) > 0.;
+}
+
+// The camera whose picture a surface of 'kind' placed by 'model' shows, for a viewer seeing it through 'camera'
+pub fn cameraThrough(model &Mat4, kind u32, camera &Camera) Camera {
+  // (a portal would be another kind here)
+  camera.reflectedAbout(surfacePlane(model, camera.position()));
+}
+
+// The camera whose picture surface 'row' shows
+pub fn cameraFor(row &SurfaceRow, camera &Camera) Camera { cameraThrough(&row.model, row.kind, camera); }
+
+// ---- Seen or not ----
+
+fn clipOf(m &Mat4, p Vec3) Vec4 {
+  new Vec4(m.m[0] * p.x + m.m[4] * p.y + m.m[8] * p.z + m.m[12], m.m[1] * p.x + m.m[5] * p.y + m.m[9] * p.z + m.m[13],
+    m.m[2] * p.x + m.m[6] * p.y + m.m[10] * p.z + m.m[14], m.m[3] * p.x + m.m[7] * p.y + m.m[11] * p.z + m.m[15]);
+}
+
+// Whether any part of the surface's quad (-1 to 1 in x and z of its frame) is inside the frustum of the
+// viewer matrix 'viewProjection' (conservative: false only if all four corners lie past one plane)
+fn inFrustum(viewProjection &Mat4, model &Mat4) bool {
+  mut all = 0xffu32;
+  mut c = 0u32;
+  while c < 4u32 {
+    imm sx = if (c & 1u32) == 0u32 { -1.; } else { 1.; };
+    imm sz = if (c & 2u32) == 0u32 { -1.; } else { 1.; };
+    imm world = clipOf(model, new Vec3(sx, 0., sz));
+    imm p = clipOf(viewProjection, new Vec3(world.x, world.y, world.z));
+    mut code = 0u32;
+    if p.x < 0. - p.w { code = code | 1u32; }
+    if p.x > p.w { code = code | 2u32; }
+    if p.y < 0. - p.w { code = code | 4u32; }
+    if p.y > p.w { code = code | 8u32; }
+    if p.z < 0. { code = code | 16u32; }
+    if p.z > p.w { code = code | 32u32; }
+    all = all & code;
+    c = c + 1u32;
+  }
+  all == 0u32;
+}
+
+// ---- Step 2: draw the scene again ----
+
+// Draw the picture of every surface seen this frame, from the camera 'cameraFor' gives, of 'list' (the frame's
+// draw list, the sky and birds in it) lit by 'light'. Before the frame's own pass. How many pictures were drawn.
+// (Not drawn into a picture: the particles, which render's pass does not draw: the burner's flame, the chimney's smoke and the
+// rain are missing from a reflection. ParticleRenderer.render wants the picture's Texture, which render keeps private.)
+//
+// 'jitterX' and 'jitterY' are the sub-pixel shift (clip space) that temporal AA is about to move the frame by. The pane reads the
+// picture at the pixel it is drawn at, and that pixel is shifted by the frame's jitter, so for the pane's samples to be of
+// the sequence the history averages, the picture is shifted the opposite way in x (the picture is mirrored left to right)
+// and the same way in y.
+pub fn drawSurfaceViews(surfaces &mut ViewSurfaces, renderer &mut Renderer, device &mut Device, camera &Camera,
+    light &Light, list &DrawList, jitterX f32, jitterY f32, width u32, height u32) u32 {
+  mut drawn = 0u32;
+  imm from = sdl.GetPerformanceCounter();
+  imm eye = camera.position();
+  imm aspect = f32.from(width) / f32.from(height);
+  imm viewProjection = camera.projectionMatrix(aspect) * camera.viewMatrix();
+  mut i = 0usize;
+  while i < surfaces.rows.len() {
+    imm row = &mut surfaces.rows.rows[i];
+    imm seen = row.seen;
+    row.seen = false;
+    if seen and facesEye(&row.model, eye) and inFrustum(&viewProjection, &row.model) {
+      mut other = cameraFor(row, camera);
+      other.jitterX = 0. - jitterX;
+      other.jitterY = jitterY;
+      row.view.render(renderer, device, &other, light, list, DEFAULT_MAX_NEST);
+      if surfaces.timing {
+        device.waitIdle();
+        surfaces.gpuNs = surfaces.gpuNs + row.view.gpuNanoseconds(device);
+        surfaces.gpuPictures = surfaces.gpuPictures + 1u64;
+      }
+      row.drawn = row.drawn + 1u64;
+      surfaces.lastCalls = row.view.drawCalls;
+      surfaces.lastTriangles = row.view.triangles;
+      drawn = drawn + 1u32;
+    }
+    i = i + 1usize;
+  }
+  surfaces.pictures = drawn;
+  if drawn > 0u32 {
+    surfaces.ticks = surfaces.ticks + (sdl.GetPerformanceCounter() - from);
+    surfaces.frames = surfaces.frames + 1u64;
+  }
+  drawn;
+}

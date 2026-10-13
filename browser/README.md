@@ -211,6 +211,32 @@ folder, and draws no text where none can be read. `PEGASUS_HUD=off` starts it hi
 picture without it). A scripted run starts with it hidden, so its other views are as they were, and turns it on in
 its last part (`src/hudscript.cone`); `browser.exe --hud-only --shots DIR` runs only that part, for looking at it.
 
+## The mirror
+
+A framed mirror hangs on the cottage's back wall, towards the chimney's end (1.0 m wide, 1.7 m tall, 0.55 m up: a
+standing figure shows head to foot, the sky and the balloon behind the viewer show above it). It is the first **view
+surface** (`src/viewsurface.cone`): a surface that shows the scene drawn again from another camera. The piece is three
+steps and only the first is the mirror's: which camera (`cameraThrough`: the viewer's camera reflected about the surface's
+plane, with an oblique near plane so nothing behind the wall is drawn: render's `Camera.reflectedAbout`), draw the scene
+again from it into the surface's own texture (render's `RenderView`, drawn before the frame in its own submission, on
+the layers the surface is not on), and show the picture (render's `ViewMaterials`). A portal would add a kind to
+`cameraThrough`. A surface is a part whose look names `SHADER_MIRROR`; the part's world matrix places it (its mesh is
+mesh's plane, its normal the matrix's +y), so the simulation places it like any part and the view only draws what it shows.
+The picture is drawn only while the surface is in front of the eye and in the frustum, at the frame's size (remade when the
+window changes). Temporal AA: the picture is jittered with the frame's own sequence (opposite in x, the picture being
+mirrored), so a still mirror is anti-aliased; while the camera moves, the history is reprojected by the wall's motion and
+the picture's edges soften (render treats a custom pipeline as static). Not in the reflection: the particles (the burner's
+flame, smoke, rain), and the froxel fog (a pass over the main frame's depth). Shadows are right (the picture is drawn with
+its own cascades; the cottage's shadow edge falls in the pane where it should). `--mirror-only --shots DIR` runs the
+mirror's part of the script (`src/mirrorscript.cone`); `--mirror-only --soak N --mirror-hold 1|2` holds the eyes on the
+mirror or turned away, for timing; `PEGASUS_MIRROR_TIMING=1` times each picture on the GPU. `--checks` works the
+geometry out by hand (`src/mirrorchecks.cone`: the plane, the facing, the reflected eye, that points in front of the mirror
+are drawn where the mirror shows them, the frustum test, the pane's size).
+
+Cost (RTX 4060, soak, mirror in sight against turned away): frame p50 20.8 ms against 13.9 (vsync-bound; render phase
+9 against 4.8 ms), the picture 3.6 ms on the GPU and 4 ms of CPU recording (76 draws, 0.9 M triangles). Intel UHD 770: 67 ms
+against 55 ms (the picture 51 ms on the GPU in the timed run, which waits idle after it).
+
 ## Automated runs
 
 ```
