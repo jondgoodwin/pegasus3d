@@ -15,7 +15,14 @@ Runs `browser.exe --serve`, then two `browser.exe --headless --connect` processe
   * the bandwidth the server used for each client, and the client's own count of the wire
 
 Usage: netcheck.py [--exe PATH] [--impair LOSS_PER_1000 LATENCY_MS JITTER_MS] [--seconds N] [--tolerance M]
+                   [--connect HOST:PORT --server-log FILE]
 Exit code 0 if every check holds.
+
+AGAINST A SERVER ON ANOTHER MACHINE (--connect HOST:PORT --server-log FILE): the script starts no server. Start one
+there yourself with `--serve PORT --trace --run-for N` (see SERVER.md) and let it build the world; run this script;
+the server ends by its --run-for and the script waits for its log at FILE (copy it there, e.g. with scp). The two
+clients run here. The check that needs the server's and the clients' clocks to be one clock (how far in the past B
+draws) is skipped.
 """
 import argparse, os, re, subprocess, sys, time, threading
 
@@ -65,45 +72,73 @@ def main():
     ap.add_argument('--tolerance', type=float, default=0.3, help='metres B may differ from the server path')
     ap.add_argument('--predict-tolerance', type=float, default=0.05, help='metres A\'s final position may differ')
     ap.add_argument('--port', type=int, default=7777)
+    ap.add_argument('--connect', metavar='HOST:PORT', help='a server already running on another machine (needs --server-log)')
+    ap.add_argument('--server-log', metavar='FILE', help='with --connect: where the remote server\'s --trace log will be')
+    ap.add_argument('--reuse', action='store_true', help='with --connect: run no clients; check the logs of a run already made')
+    ap.add_argument('--settle', type=int, default=11, help='seconds to wait for a local server to build the world')
     ap.add_argument('--out', default=os.path.join(HERE, '..', '..', 'netcheck-out'))
     args = ap.parse_args()
     exe = os.path.abspath(args.exe)
     os.makedirs(args.out, exist_ok=True)
-    tag = 'impaired' if args.impair else 'loopback'
-    slog = os.path.join(args.out, f'{tag}-server.log')
+    remote = bool(args.connect)
+    if remote and not args.server_log:
+        print('FAIL: --connect needs --server-log'); return 2
+    tag = 'remote' if remote else ('impaired' if args.impair else 'loopback')
+    slog = args.server_log if remote else os.path.join(args.out, f'{tag}-server.log')
     alog = os.path.join(args.out, f'{tag}-clientA.log')
     blog = os.path.join(args.out, f'{tag}-clientB.log')
 
-    server_cmd = [exe, '--serve', str(args.port), '--loopback', '--run-for', str(args.seconds + 50), '--trace']
-    if args.impair:
-        server_cmd += ['--impair'] + [str(v) for v in args.impair]
     procs = []
-    server, f1 = start(server_cmd, slog)
-    procs.append((server, f1))
-    try:
-        if not wait_for(slog, r'Serving on UDP port', 60):
-            print('FAIL: the server did not start'); return 1
-        port = args.port
+    server = None
+    if remote and args.reuse:
+        pass    # the clients' logs and the server's are already there: only the checks are run
+    elif remote:
+        common = [exe, '--headless', '--connect', args.connect, '--trace', '--run-for', str(args.seconds)]
+        try:
+            b, f3 = start(common + ['--name', 'netcheck-b'], blog)
+            procs.append((b, f3))
+            a, f2 = start(common + ['--name', 'netcheck-a', '--autowalk'], alog)
+            procs.append((a, f2))
+            a.wait(timeout=args.seconds + 60)
+            b.wait(timeout=60)
+        finally:
+            for p, f in procs:
+                if p.poll() is None:
+                    p.kill()
+                f.close()
+        print(f'clients ended; waiting up to 300 s for the server log at {slog} to hold the end of the run')
+        if not wait_for(slog, r'Server: \d+ ticks', 300):
+            print('FAIL: the server log is missing or has not ended'); return 1
+    else:
+        server_cmd = [exe, '--serve', str(args.port), '--loopback', '--run-for', str(args.seconds + 50), '--trace']
         if args.impair:
-            m = wait_for(slog, r'Relay: port (\d+)', 10)
-            if not m:
-                print('FAIL: the relay did not start'); return 1
-            port = int(m.group(1))
-        # Let the server build the world before the clients ask for it
-        time.sleep(11)
-        common = [exe, '--headless', '--connect', f'127.0.0.1:{port}', '--trace', '--run-for', str(args.seconds)]
-        b, f3 = start(common, blog)
-        procs.append((b, f3))
-        a, f2 = start(common + ['--autowalk'], alog)
-        procs.append((a, f2))
-        a.wait(timeout=args.seconds + 60)
-        b.wait(timeout=60)
-        server.wait(timeout=args.seconds + 60)
-    finally:
-        for p, f in procs:
-            if p.poll() is None:
-                p.kill()
-            f.close()
+            server_cmd += ['--impair'] + [str(v) for v in args.impair]
+        server, f1 = start(server_cmd, slog)
+        procs.append((server, f1))
+        try:
+            if not wait_for(slog, r'Serving on UDP port', 60):
+                print('FAIL: the server did not start'); return 1
+            port = args.port
+            if args.impair:
+                m = wait_for(slog, r'Relay: port (\d+)', 10)
+                if not m:
+                    print('FAIL: the relay did not start'); return 1
+                port = int(m.group(1))
+            # Let the server build the world before the clients ask for it
+            time.sleep(args.settle)
+            common = [exe, '--headless', '--connect', f'127.0.0.1:{port}', '--trace', '--run-for', str(args.seconds)]
+            b, f3 = start(common + ['--name', 'netcheck-b'], blog)
+            procs.append((b, f3))
+            a, f2 = start(common + ['--name', 'netcheck-a', '--autowalk'], alog)
+            procs.append((a, f2))
+            a.wait(timeout=args.seconds + 60)
+            b.wait(timeout=60)
+            server.wait(timeout=args.seconds + 60)
+        finally:
+            for p, f in procs:
+                if p.poll() is None:
+                    p.kill()
+                f.close()
 
     ok = True
     def check(cond, text):
@@ -169,7 +204,14 @@ def main():
     ticks, pos = path[a_being]
     # The first 3 s after B first drew anything are not measured: B is building the world (one frame of seconds) and
     # its clock estimate is settling
-    q0 = tv[0][1] + 3 * (freq or 10000000.0) if tv else 0
+    # (B's own clock: when the server is on another machine, its counter's frequency is not B's, so B says its own)
+    cfreq = freq
+    if remote:
+        cfreq = None
+        for l in B:
+            if l.startswith('QPCFREQ'):
+                cfreq = float(l.split()[1])
+    q0 = tv[0][1] + 3 * (cfreq or 10000000.0) if tv else 0
     errs = []
     lags = []
     moved = 0.0
@@ -179,7 +221,7 @@ def main():
             continue
         sp = interp(ticks, pos, at)
         errs.append(((p[0] - sp[0]) ** 2 + (p[1] - sp[1]) ** 2 + (p[2] - sp[2]) ** 2) ** 0.5)
-        if freq and wall[0] and wall[0][0] <= qpc <= wall[0][-1]:
+        if not remote and freq and wall[0] and wall[0][0] <= qpc <= wall[0][-1]:
             tick_now = interp(wall[0], wall[1], qpc)[0]
             lags.append(tick_now - at)
         if last is not None:
@@ -212,7 +254,7 @@ def main():
                 _, at, qpc, being, x, y, z = l.split()
                 if int(being) == vb:
                     vtv.append((int(at) / 1000.0, int(qpc), (int(x) / 1000.0, int(y) / 1000.0, int(z) / 1000.0)))
-        vq0 = vtv[0][1] + 3 * (freq or 10000000.0) if vtv else 0
+        vq0 = vtv[0][1] + 3 * (cfreq or 10000000.0) if vtv else 0
         verrs = []
         vmoved = 0.0
         vlast = None

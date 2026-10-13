@@ -95,6 +95,56 @@ pub struct Advance {
 // How many input samples may wait for a being before the server runs two a tick
 const BACKLOG = 4usize;
 
+// Players' names: how long, how many at once, how long a connection may stay nameless (10 s of ticks), and how long after
+// a refusal the connection is ended (half a second: the refusal has to reach the client first)
+const MAX_NAME = 24usize;
+const MAX_PLAYERS = 8usize;
+const NAME_WAIT_TICKS = 600u64;
+const HANGUP_TICKS = 30u64;
+
+// A server's connection that has not said its name yet, and since when (the tick)
+struct Pending {
+  id u32;
+  since u64;
+}
+
+// A refused connection, and the tick at which it is ended
+struct HangUp {
+  id u32;
+  at u64;
+}
+
+// Whether a name is made only of ASCII letters, digits, spaces and . _ - and has something in it besides spaces
+fn nameIsPlain(name &str) bool {
+  imm b &Array[u8] = name;
+  mut visible = false;
+  mut i = 0usize;
+  while i < b.len {
+    imm c = b[i];
+    imm letter = (c >= 65u8 and c <= 90u8) or (c >= 97u8 and c <= 122u8);
+    imm digit = c >= 48u8 and c <= 57u8;
+    if !(letter or digit or c == 32u8 or c == 46u8 or c == 95u8 or c == 45u8) { return false; }
+    if c != 32u8 { visible = true; }
+    i = i + 1usize;
+  }
+  visible;
+}
+
+fn lowerAscii(c u8) u8 { if c >= 65u8 and c <= 90u8 { c + 32u8; } else { c; }; }
+
+// Two names the same, ignoring case ("Jon" and "jon" are one player)
+fn namesMatch(a &str, b &str) bool {
+  imm x &Array[u8] = a;
+  imm y &Array[u8] = b;
+  if x.len != y.len { return false; }
+  mut i = 0usize;
+  while i < x.len {
+    if lowerAscii(x[i]) != lowerAscii(y[i]) { return false; }
+    i = i + 1usize;
+  }
+  true;
+}
+
 // A connected client, as the simulation keeps it
 pub struct Client {
   pub id u32;                 // the connection's: a server numbers its clients from 1
@@ -108,9 +158,10 @@ pub struct Client {
   pub skipped u64;            // steps a being waited for its input
   pub extra u64;              // steps run off a backlog
   pub told usize;             // the being it was last told is its own
+  pub name String;            // the name it plays under (a server's clients; empty in single player)
 
   pub fn make(id u32, being usize) Client {
-    new Client(id, being, List[InputSample].empty(), 1u64, 0u64, Intents.none(), 0., 0u64, 0u64, 0u64, being);
+    new Client(id, being, List[InputSample].empty(), 1u64, 0u64, Intents.none(), 0., 0u64, 0u64, 0u64, being, String.empty());
   }
 
   // Samples received, kept if newer than any before
@@ -226,6 +277,8 @@ pub struct SimState {
   pub wxOk bool;              // the scripted run's: the weather's part has held (weatherscript.cone)
   pub fenceRunOk bool;        // the scripted run's: the roaming views' eyes are on walkable ground (fencescript.cone)
   pub play PlaySim;           // the playground's: the spells in force, the actions received and the bursts to tell (spellsim.cone)
+  pending List[Pending];      // a server's connections that have not yet said their name
+  hangUps List[HangUp];       // connections refused, to be ended once the refusal has been sent
   pub land Island;  // the baked island, shared by every actor (read it with &land)
   pub opts RunOptions;        // what the arguments say that this actor acts on (--no-npcs, --trace, --hud-only, --audio-walk)
 
@@ -237,7 +290,8 @@ pub struct SimState {
       List[Request].empty(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0., List[f32].empty(), List[u32].empty(), List[PartId].empty(),
       0u64, Weathering.fair(), Weathering.fair(), false, 0u64, ReplayLog.empty(), List[Intents].empty(), List[bool].empty(),
       0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step].empty(), false, 0u64, 0u64, Village.empty(),
-      Route.make(), List[f32].empty(), Assembly.make(), Ride.make(), ScriptRun.make(), FallRun.make(), true, true, true, PlaySim.empty(), land, opts);
+      Route.make(), List[f32].empty(), Assembly.make(), Ride.make(), ScriptRun.make(), FallRun.make(), true, true, true, PlaySim.empty(),
+      List[Pending].empty(), List[HangUp].empty(), land, opts);
   }
 
   // The possessed being's body: where the user is (single player)
@@ -252,18 +306,24 @@ pub struct SimState {
   // A mannequin of 'height' metres made, shown and added to the cast standing
   // at 'at' facing 'yaw': the index of its being
   fn addMannequin(self &mut, name &str, at Vec3, yaw f32, height f32, seed u32, color Color) usize {
+    self.addNamedMannequin(name, "", at, yaw, height, seed, color);
+  }
+
+  // The same, for a player: 'player' is the name shown above it ("" for every other mannequin)
+  fn addNamedMannequin(self &mut, name &str, player &str, at Vec3, yaw f32, height f32, seed u32, color Color) usize {
     scene.door.beginObject();
     imm root = scene.newPart(name);
     imm parts = spawnMannequin(&mut scene.door, height, color, root);
     imm spec = new ObjectSpec(OBJ_MANNEQUIN, u32.from(cast.beings.len()), height, color, String.from(name));
     scene.door.endObject(spec);
     imm index = cast.add(Being.mannequin(root, at, yaw, Figure.make(height, seed, parts)));
-    scene.send(Request.BeingAdded(u32.from(index), root, false, height, seed));
+    scene.send(Request.BeingAdded(u32.from(index), root, false, height, seed, String.from(player)));
     index;
   }
 
-  // A mannequin for a client that joined: the k-th, set down on the landing beach and given its own height and colour
-  fn addClientMannequin(self &mut, k u32) usize {
+  // A mannequin for a client that joined: the k-th, set down on the landing beach and given its own height and colour,
+  // and the name it plays under
+  fn addClientMannequin(self &mut, k u32, player &str) usize {
     imm heights Array[f32, 6] = [1.75, 1.62, 1.82, 1.68, 1.78, 1.58];
     imm which = usize.from(k % 6u32);
     mut color = woodColor();
@@ -274,7 +334,7 @@ pub struct SimState {
     elif which == 5usize { color = new Color(0.30, 0.08, 0.30, 1.); }
     imm x = BEACH_X + f32.from(i32.from(k % 4u32) - 1i32) * 1.5;
     imm z = BEACH_Z - 1.5 * f32.from(k / 4u32);
-    self.addMannequin(clientName(k), standing(&land, x, z), 0., heights[which], 3u32 + 8u32 * k, color);
+    self.addNamedMannequin(clientName(k), player, standing(&land, x, z), 0., heights[which], 3u32 + 8u32 * k, color);
   }
 
   // The scene before the first frame: the shell's land, sea and sky, and the
@@ -299,7 +359,7 @@ pub struct SimState {
       imm youPart = scene.newPart("you");
       imm youAt = cast.add(Being.make(youPart, Walk.make(new Vec3(BEACH_X, islandHeight(&land, BEACH_X, BEACH_Z),
         BEACH_Z), 0.)));
-      scene.send(Request.BeingAdded(u32.from(youAt), youPart, true, 0., 0u32));
+      scene.send(Request.BeingAdded(u32.from(youAt), youPart, true, 0., 0u32, String.empty()));
       cast.possess(youAt);
       self.addMannequin("mannequin", standing(&land, START_X + 5., START_Z), 0., 1.75, 3u32, woodColor());
       self.addMannequin("second mannequin", standing(&land, START_X + 3.5, START_Z - 3.), 2.356, 1.62, 11u32, clayColor());
@@ -368,27 +428,123 @@ pub struct SimState {
 
   // A client has joined: it is told what has been sent so far and which being is its own. Single player's one client
   // takes the being the user possesses; any other gets a mannequin made for it
+  // A server's client is not given a being until it has said its name (ToSim.Hello): it waits in 'pending'.
   fn clientJoined(self &mut, id u32, conn Connection) {
     net.open(id, conn);
     if self.clientAt(id) != NO_ROW { return; }
+    if serve {
+      if self.pendingAt(id) == NO_ROW { pending.push(new Pending(id, tick)); }
+      print <- "Connection "; print <- id; print <- " opened; waiting for its name\n";
+      return;
+    }
+    self.admit(id, "");
+  }
+
+  // A client given its being (a server's: once its name has been accepted) and told the world so far
+  fn admit(self &mut, id u32, name &str) {
     mut being = cast.possessed;
     if serve or clients.len() > 0usize {
-      being = self.addClientMannequin(clientBeings);
+      being = self.addClientMannequin(clientBeings, name);
       clientBeings = clientBeings + 1u32;
     }
-    clients.push(Client.make(id, being));
+    mut client = Client.make(id, being);
+    client.name = String.from(name);
+    clients.push(client);
     joinedNow = true;
-    print <- "Client "; print <- id; print <- " joined: being "; print <- being; print <- "\n";
+    print <- "Client "; print <- id; print <- " joined: being "; print <- being;
+    if name.len() > 0usize { print <- ", named "; printStr(name); }
+    print <- "\n";
     self.sendLog(id);
     net.sendReliable(id, encodePossessed(u32.from(being)));
     net.sendReliable(id, encodeWeather(&weather));
     weatherSent = weather;
   }
 
+  fn pendingAt(self &, id u32) usize {
+    mut i = 0usize;
+    while i < pending.len() {
+      if pending[i].id == id { return i; }
+      i = i + 1usize;
+    }
+    NO_ROW;
+  }
+
+  // What is wrong with a name offered, in words for the user; "" if nothing is
+  fn nameProblem(self &, name &str) String {
+    if name.len() == 0usize { return String.from("A name is needed."); }
+    if name.len() > MAX_NAME { return String.from("That name is too long (24 letters at most)."); }
+    if !nameIsPlain(name) { return String.from("A name may hold letters, digits, spaces and . _ - only."); }
+    mut i = 0usize;
+    while i < clients.len() {
+      if namesMatch(clients[i].name.view(), name) {
+        mut why = String.from("The name ");
+        why.append(name);
+        why.append(" is already in use: pick another with --name.");
+        return why;
+      }
+      i = i + 1usize;
+    }
+    if clients.len() >= MAX_PLAYERS { return String.from("The server is full."); }
+    String.empty();
+  }
+
+  // A server's client says its name: given a being, or refused
+  fn hello(self &mut, id u32, name &str) {
+    if !serve or self.clientAt(id) != NO_ROW { return; }
+    imm k = self.pendingAt(id);
+    if k == NO_ROW { return; }
+    pending.swap(k, pending.len() - 1usize);
+    pending.pop();
+    imm why = self.nameProblem(name);
+    if why.len() == 0usize {
+      self.admit(id, name);
+    } else {
+      self.refuse(id, why.view());
+    }
+  }
+
+  // A connection the server will not have: told why, and ended a little later (the message has to get there first)
+  fn refuse(self &mut, id u32, why &str) {
+    print <- "Connection "; print <- id; print <- " refused: "; printStr(why); print <- "\n";
+    net.sendReliable(id, encodeRefused(why));
+    hangUps.push(new HangUp(id, tick + HANGUP_TICKS));
+  }
+
+  // Once a tick: the refused connections whose message has had time to arrive are ended, and a connection that has not said
+  // its name in time is refused
+  fn tidyConnections(self &mut) {
+    mut i = 0usize;
+    while i < hangUps.len() {
+      if tick >= hangUps[i].at {
+        net.hangUp(hangUps[i].id);
+        hangUps.swap(i, hangUps.len() - 1usize);
+        hangUps.pop();
+      } else {
+        i = i + 1usize;
+      }
+    }
+    i = 0usize;
+    while i < pending.len() {
+      if tick - pending[i].since > NAME_WAIT_TICKS {
+        imm id = pending[i].id;
+        pending.swap(i, pending.len() - 1usize);
+        pending.pop();
+        self.refuse(id, "No name was given (this server needs a client that sends one).");
+      } else {
+        i = i + 1usize;
+      }
+    }
+  }
+
   // A client has gone: its being is taken out of the world
   fn clientLeft(self &mut, id u32) {
     imm k = self.clientAt(id);
     if k == NO_ROW {
+      imm p = self.pendingAt(id);
+      if p != NO_ROW {
+        pending.swap(p, pending.len() - 1usize);
+        pending.pop();
+      }
       net.close(id);
       return;
     }
@@ -449,6 +605,7 @@ pub struct SimState {
         mut msg = decodeToSim(data);
         match &mut msg {
           case mut l &mut Look { looks.push(l.pitch); }
+          case mut h &mut Hello { self.hello(m.id, h.name.view()); }
           case mut c &mut Command { commands.push(c.kind); }
           case mut k &mut Click { clicksIn.push(k.part); }
           case mut pl &mut Play { play.receive(m.id, pl.kind, pl.spell, pl.target, pl.eye, pl.dir); }
@@ -557,6 +714,7 @@ pub struct SimState {
       if self.legacy() { birds.step(&land, step.dt * f32.from(scene.clock.rate())); }
       scene.advanceClock(step.ns);
       tick = tick + 1u64;
+      if serve { self.tidyConnections(); }
       if opts.traceOn { self.traceTick(); }
       i = i + 1usize;
     }

@@ -53,11 +53,25 @@ pub struct HudFrame {
   pub others List[Vec3];      // the other beings
   pub keys u32;               // bit n: F(n+1) was pressed this frame
   pub dt f32;
+  pub tags List[HudTag];      // the players' names, each at a point in the world (above a head)
+  pub eye Pose;               // the camera they are seen from
+  pub fov f32;                // and its vertical field of view
 
   pub fn none() HudFrame {
-    new HudFrame(false, 12., WEATHER_FAIR, 0., false, 0i64, new Vec3(0., 0., 0.), 0., List[Vec3].empty(), 0u32, 0.);
+    new HudFrame(false, 12., WEATHER_FAIR, 0., false, 0i64, new Vec3(0., 0., 0.), 0., List[Vec3].empty(), 0u32, 0.,
+      List[HudTag].empty(), Pose.look(new Vec3(0., 0., 0.), 0., 0.), 1.);
   }
 }
+
+// A name to put over the point 'at' of the world
+pub struct HudTag {
+  pub at Vec3;
+  pub name String;
+}
+
+// How many names the HUD can show at once (a server holds at most MAX_PLAYERS), and how far away one is still read
+const PLATES = 8usize;
+const PLATE_RANGE = 80.;
 
 // Whether the HUD starts shown: not in a scripted run (hudscript.cone turns it on), and not with PEGASUS_HUD=off
 // (to time the picture without it)
@@ -286,6 +300,8 @@ pub struct HudModel {
   mapFrame usize;
   placeLabel usize;
   bar usize;
+  plates List[usize];         // the panels that carry players' names, one label inside each (hidden when unused)
+  plateLabels List[usize];
 
   // A HUD for a target of 'width' by 'height' pixels at 'scale' pixels a logical unit
   pub fn make(width f32, height f32, scale f32) HudModel {
@@ -347,8 +363,23 @@ pub struct HudModel {
     uilayout.hotbarBind(&mut ui, uilayout.hotbarSlot(&ui, bar, 0u32), uilayout.BK_SPELL, 1u32, 0u32, 0xf0b43cffu32, 1.5);
     uilayout.hotbarBind(&mut ui, uilayout.hotbarSlot(&ui, bar, 1u32), uilayout.BK_SPELL, 2u32, 0u32, 0x46c8beffu32, 1.5);
     uilayout.hotbarBind(&mut ui, uilayout.hotbarSlot(&ui, bar, 2u32), uilayout.BK_SPELL, 3u32, 0u32, 0xa078e6ffu32, 1.5);
+    // The players' name plates: a small glass panel each, put over a mannequin's head when there is one to name
+    mut plates = List[usize].empty();
+    mut plateLabels = List[usize].empty();
+    mut pl = 0usize;
+    while pl < PLATES {
+      imm panel = uilayout.panel(&mut ui, ui.root, "hud");
+      ui.setPadding(panel, 6., 2., 6., 2.);
+      ui.setAnchors(panel, 0., 0., 0., 0.);
+      ui.setPivot(panel, 0.5, 1.);
+      imm text = uilayout.label(&mut ui, panel, "name");
+      ui.setVisible(panel, false);
+      plates.push(panel);
+      plateLabels.push(text);
+      pl = pl + 1usize;
+    }
     new HudModel(ui, font, atlas, scale, uilayout.DrawList.make(), width / scale, height / scale, status, timeLabel, frameLabel,
-      modeLabel, mapFrame, placeLabel, bar);
+      modeLabel, mapFrame, placeLabel, bar, plates, plateLabels);
   }
 
   // The HUD brought up to the frame and its draw list made (in logical units; 'scale' makes pixels)
@@ -393,6 +424,25 @@ pub struct HudModel {
     imm tick = uilayout.minimapAddMarker(&mut ui, mapFrame, (f.you.x - sin(f.yaw) * ahead + HALF) / (2. * HALF),
       (f.you.z - cos(f.yaw) * ahead + HALF) / (2. * HALF), 0xffd84affu32, 4.);
     imm me = uilayout.minimapAddMarker(&mut ui, mapFrame, u, v, 0xffffffffu32, 9.);
+    // The players' names over their heads (in front of the camera and within PLATE_RANGE; not hidden behind anything)
+    mut pn = 0usize;
+    while pn < PLATES {
+      mut shown = false;
+      if pn < f.tags.len() {
+        imm seen = f.eye.orientation.inverse() * (f.tags[pn].at - f.eye.origin);
+        if seen.z < 0. - 0.3 and seen.length() < PLATE_RANGE {
+          imm px = placeOnView(f.eye, f.fov, f.tags[pn].at, width, height);
+          if px.x > 0. and px.x < width and px.y > 0. and px.y < height {
+            imm shownName = f.tags[pn].name.copy();   // (a copy: setText may change the Ui's own strings)
+            ui.setText(*plateLabels[pn], shownName.view());
+            ui.setOffsets(*plates[pn], px.x / scale, px.y / scale, 0., 0.);
+            shown = true;
+          }
+        }
+      }
+      ui.setVisible(*plates[pn], shown);
+      pn = pn + 1usize;
+    }
     relayout(&mut ui, &font, &mut atlas, scale);
     uilayout.drawUi(&ui, &mut list);
     drawSpellIcons(&ui, bar, &mut list);

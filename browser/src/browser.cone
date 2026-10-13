@@ -312,10 +312,33 @@ struct Startup {
   serve ServeOptions;
   watch Watch;                // --watch and --soak (watch.cone)
   startedAt u64;              // the performance counter when main began
+  playerName String;          // --name NAME: the name this client plays under on a server (default: the machine's name)
 
   fn make(startedAt u64) Startup {
-    new Startup(String.empty(), String.empty(), AudioOptions.make(), RunOptions.make(), ServeOptions.make(), Watch.make(), startedAt);
+    new Startup(String.empty(), String.empty(), AudioOptions.make(), RunOptions.make(), ServeOptions.make(), Watch.make(), startedAt,
+      String.empty());
   }
+}
+
+// The name a client plays under when --name does not say: this machine's (Windows' COMPUTERNAME, else HOSTNAME), cut and
+// cleaned to what a server accepts (letters, digits, spaces and . _ -; 24 at most), or "player"
+fn defaultPlayerName() String {
+  mut raw = libc.getenv("COMPUTERNAME");
+  if (raw as usize) == 0usize { raw = libc.getenv("HOSTNAME"); }
+  mut name = String.empty();
+  if (raw as usize) != 0usize {
+    imm text = String.fromCStr(raw);
+    imm b &Array[u8] = text.view();
+    mut i = 0usize;
+    while i < b.len and name.len() < 24usize {
+      imm c = b[i];
+      imm ok = (c >= 65u8 and c <= 90u8) or (c >= 97u8 and c <= 122u8) or (c >= 48u8 and c <= 57u8) or c == 46u8 or c == 95u8 or c == 45u8;
+      name.appendByte(if ok { c; } else { 45u8; });
+      i = i + 1usize;
+    }
+  }
+  if name.len() == 0usize { return String.from("player"); }
+  name;
 }
 
 // What the arguments say that the actors and the shell act on. Made by main; the actors that read it keep a copy in their state.
@@ -443,7 +466,8 @@ fn shellRun(config Config, startup Startup) i32 {
     simOpt2 = Some[SimActor](sim);
     joinsToWait = 2;
   }
-  imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx, startup.audio.copy(), automated, opts, land.share());
+  imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx, startup.audio.copy(), automated, opts,
+    startup.playerName.copy(), land.share());
   imm viewHandler = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [view] { view.onNet(ev); }));
   if connected {
     imm addr = parseAddress(startup.connectTo.view());
@@ -475,6 +499,7 @@ fn shellRun(config Config, startup Startup) i32 {
   }
   if opts.scripted { pushScript(&opts, 1u64); }
   imm runStart = sdl.GetTicksNS();
+  mut refusedRun = false;
 
   while host.beginFrame() {
     if opts.runForSeconds > 0u64 and sdl.GetTicksNS() - runStart > opts.runForSeconds * 1000000000u64 { break; }
@@ -528,6 +553,11 @@ fn shellRun(config Config, startup Startup) i32 {
       case imm r Some { report = r; }
       case is None[FrameReport] { break; }
     }
+    if report.refused {
+      // The server will not have this client (its name): said already, and the run is over
+      refusedRun = true;
+      break;
+    }
     host.stats.phase(PHASE_SIMULATE).add(report.simulateNs, host.frame);
     host.stats.phase(PHASE_PUBLISH).add(report.publishNs, host.frame);
     host.stats.phase(PHASE_RENDER).add(report.renderNs, host.frame);
@@ -560,6 +590,7 @@ fn shellRun(config Config, startup Startup) i32 {
     case imm c Some { code = c; }
     case is None[i32] {}
   }
+  if refusedRun { code = 3i32; }
   if watch.soaking() and watch.soakReport() != 0i32 { code = 1i32; }
   // A connection closed before the program ends: its socket's thread must stop before the actors' runtime does
   match &endpointOpt {
@@ -648,6 +679,10 @@ fn main(argc i32, argv **u8) i32 {
     } elif libc.strcmp(arg, "--connect") == 0i32 and a + 1i32 < argc {
       startup.connectTo = String.fromCStr(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
+    } elif libc.strcmp(arg, "--name") == 0i32 and a + 1i32 < argc {
+      // The name this client plays under on a server (shown above its mannequin to the others)
+      startup.playerName = String.fromCStr(*(argv + usize.from(a + 1i32)));
+      a = a + 1i32;
     } elif libc.strcmp(arg, "--run-for") == 0i32 and a + 1i32 < argc {
       startup.opts.runForSeconds = wholeNumber(*(argv + usize.from(a + 1i32)));
       a = a + 1i32;
@@ -681,6 +716,15 @@ fn main(argc i32, argv **u8) i32 {
   }
   // A server, and a client that has a window or not, run on the real clock (--headless alone would make it synthetic)
   if startup.serve.on or startup.connectTo.len() > 0usize { config.synthetic = false; }
+  if startup.connectTo.len() > 0usize {
+    if !addressReadable(startup.connectTo.view()) {
+      print <- "--connect wants HOST:PORT with HOST a dotted address (a.b.c.d) or localhost, and a port from 1 to 65535: got ";
+      printStr(startup.connectTo.view()); print <- "\n";
+      finalAll();
+      return 2i32;
+    }
+    if startup.playerName.len() == 0usize { startup.playerName = defaultPlayerName(); }
+  }
   if startup.serve.on {
     config.headless = true;
     imm served = serveRun(config, &startup);

@@ -489,9 +489,10 @@ A client that leaves takes its mannequin with it.
 
 **Across machines.** The server binds UDP on all its addresses, so another machine can connect to its
 address and port, *but the port must be opened on the server's host* (a firewall rule, and on a cloud VM its
-security group): nothing in this program opens one, and none has been opened. Until that is done, play is on
-one machine (127.0.0.1). There is no encryption or login (netmsg's handshake proves only that a client can
-receive at the address it gives).
+security group): nothing in this program opens one. A server runs on the VM (`SERVER.md`: building it for Linux,
+deploying, the log, connecting), with its port open to listed addresses only. There is no encryption or login
+(netmsg's handshake proves only that a client can receive at the address it gives); a client says a name
+(`--name`, default the machine's), shown over its mannequin to the others, and the server refuses one already in use.
 
 Options: `--run-for S` stops a run after S seconds of real time; `--headless` with `--connect` runs a client with no window or
 GPU; `--impair LOSS LATENCY JITTER` (with `--serve`) puts netmsg's lossy relay in front of the server and
