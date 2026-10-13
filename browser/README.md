@@ -166,7 +166,7 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | F2 / F3 | zap / make dance the mannequin in front of the camera (the nearest to its middle within 22 m; locked on, and highlighted, for 1.5 s after) |
 | F4 to F8 | hotbar slots with nothing in them yet |
 | F11 | fullscreen |
-| Escape | quit |
+| Escape | closes the "Play with others" panel while it is up, otherwise quit |
 
 ## Sound
 
@@ -223,7 +223,8 @@ that no frame waits for the server, and shows the answer in the panel: "Request 
 approved", or, once approved, "You are approved" and the button reads **Join** (below).
 A first run with no stored token shows a line in the HUD's status panel naming F9. The panel is **modal**: while it is up
 it takes the keyboard and the mouse, so the walk, the camera and the hotbar get none (F9 closes it from anywhere, so does
-Close; Escape is the window's and quits). Free keys were every letter but those in the table above, and F9, F10, F12.
+Close, and Escape; the browser sets frame's `Config.escapeQuits` to false and the shell decides: with the panel up Escape closes
+it, otherwise it quits as before). Free keys were every letter but those in the table above, and F9, F10, F12.
 
 The event path: the shell (`src/browser.cone`, the main thread, where SDL's events arrive) offers each event to
 `PanelRoute` (`src/requestpanel.cone`), which takes it while the panel is up and makes a `PanelEvent` of it (the mouse as
