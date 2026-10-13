@@ -288,9 +288,10 @@ the surface is in front of the eye and in the frustum. Temporal AA: the picture 
 (opposite in x for a mirror, the picture being mirrored, the same way for a portal), so a still mirror is anti-aliased;
 while the camera moves, the history is reprojected by the wall's motion and the picture's edges soften (render treats a
 custom pipeline as static). A surface is not cut away by the near plane (its vertex shader clamps the depth there), so an
-eye about to go through a portal's pane does not see the pane vanish. Not in the picture: the particles (the burner's flame,
-smoke, rain: they need the picture's texture, which render keeps private: `TextureSlot.texture` is not `pub`; a
-`RenderView.texture(renderer)` accessor in render would do), the froxel fog (a pass over the main frame's depth), and shared
+eye about to go through a portal's pane does not see the pane vanish. The particles (the burner's flame, the chimney's
+smoke, rain) are drawn into each picture after it, through the picture's own camera, over `RenderView.texture(renderer)` and against
+the view's depth (`drawSurfaceViews`; the effects and the weather are aimed before it, once a frame); a picture of the labyrinth has
+none. Not in the picture: the froxel fog (a pass over the main frame's depth), and shared
 shadows (the picture's cascades are fitted to its own camera: render's `renderTo` does it, with no way to hand it the main
 frame's). Shadows are right (the cottage's shadow edge falls in the pane where it should).
 `--mirror-only --shots DIR` runs the mirror's part of the script (`src/mirrorscript.cone`); `--mirror-only --soak N
