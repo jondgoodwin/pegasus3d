@@ -249,8 +249,9 @@ server's first words go into a second, connected `ViewState` made on the side (i
 arrives is kept, not applied). Only when the server has taken this client in, which is its `Possessed` message (the replay of
 the world so far comes before it), is the switch made, **at the start of the next frame**, so that no lockstep Frame or
 FrameDone is in flight (the cut): render is told to Despawn every part the single-player view held and to let go of every
-mesh and material table row (`RenderActor.reset`; the meshes' buffers are destroyed once the GPU is done, a material's GPU
-resources have no release in `render` yet, so the old world's materials stay allocated); the in-process simulation is
+mesh and material table row (`RenderActor.reset`; the meshes' buffers, the materials with the textures they were made with,
+and the view surfaces' pictures are given back to `render`, which destroys them once the GPU is done with the frames that may
+have used them); the in-process simulation is
 stopped (`SimActor.stop`) and its connection hung up; the side state replaces the view's (carrying the sound, the HUD's
 toggles, the flock and the window's size) and the frame goes on as a connected one. The server is not changed: the switched
 browser is a late joiner (its log is replayed, `Possessed` and the weather follow). A dial that is not answered (5 s, the
