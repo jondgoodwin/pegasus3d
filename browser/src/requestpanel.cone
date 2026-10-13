@@ -1,0 +1,595 @@
+// The "Play with others" panel: a modal dialog over the picture where a player types a name and a line to the island's
+// owner and asks to be let in (requestplay.cone sends the request). It is presentational and lives with the HUD (hud.cone):
+// its widgets are nodes of the HUD's Ui, drawn by the HUD's renderer.
+//
+// THE EVENT PATH (the only input the HUD has):
+//
+//   SDL's queue -> the shell (browser.cone, the main thread: SDL wants the window's events there)
+//     -> PanelRoute.offer: while the panel is closed it takes only the opening key (F9 or J) and every other event goes to the
+//        walk, camera and hotbar as it always did. While the panel is open it takes every key, text and mouse event for itself,
+//        so the walk, camera and hotbar receive none (a window's own events, focus lost, a resize, still go through), and
+//        turns each into a PanelEvent, the mouse's places as fractions of the window (so that the display's scale does not matter)
+//     -> FrameInput.panelEvents -> the view (viewactor.cone) -> HudFrame.events -> the render actor, which owns the HUD
+//     -> RequestPanel.apply: each PanelEvent into uilayout's pointerMove, pointerDown, pointerUp, keyDown and textInput.
+//
+// WHERE FOCUS LIVES. In the HUD's Ui (ui.input.focus, which field or button has it) and nowhere else. The shell keeps only a
+// copy of "the panel is open" (PanelRoute.open) so that it knows where to send the next frame's events; render's word on it
+// comes back in the frame's report (bit 0 of Presented.panel and FrameReport.panel), and the shell takes it from there each
+// frame, so the Close button, which only the Ui knows was hit, closes the panel for the shell too. Bit 1 of the same word is
+// "a text field has focus": the shell starts SDL's text input then (SDL_StartTextInput) and stops it when the field loses focus.
+//
+// KEYS. F9 opens the panel (and closes it, while it is open); J opens it. W A S D, the arrows, Space, Shift, V, Tab, PageUp,
+// PageDown, P, F, T, H, B, N, F1 to F8, Escape and F11 were taken; every other letter and F9, F10 and F12 were free. Escape is the
+// window's: frame's Window ends the run on it before the shell sees it, so Escape does not close the panel (the Close button
+// and F9 do).
+//
+// NO GLOBALS. The panel's state is the fields of RequestPanel (in the HudModel) and of PanelRoute (in the shell's ShellInput).
+
+// ---- the shell's side ----
+
+pub const SCANCODE_J = 13u;
+pub const SCANCODE_F9 = 66u;
+
+// What the shell tells the panel (a PanelEvent's 'kind')
+pub const PE_OPEN = 1u32;     // text: the name to start with; code: bit 0 a token is stored, bit 1 an automated run
+pub const PE_CLOSE = 2u32;
+pub const PE_MOVE = 3u32;     // a, b: the pointer, 0 to 1 across and down the window
+pub const PE_DOWN = 4u32;     // a, b: where; the left button
+pub const PE_UP = 5u32;
+pub const PE_KEY = 6u32;      // code: a uilayout KEY_..., mods: uilayout's MOD_...
+pub const PE_TEXT = 7u32;     // code: one code point typed
+
+pub struct PanelEvent {
+  pub kind u32;
+  pub a f32;
+  pub b f32;
+  pub code u32;
+  pub mods u32;
+  pub text String;
+
+  pub fn of(kind u32, a f32, b f32, code u32, mods u32) PanelEvent {
+    new PanelEvent(kind, a, b, code, mods, String.empty());
+  }
+}
+
+// Bits of the word render tells the shell each frame
+pub const PANEL_OPEN = 1u32;
+pub const PANEL_TEXT = 2u32;
+
+// SDL's text input, which the sdl package does not bind yet
+extern {
+  fn @c("SDL_StartTextInput") startTextInput(window *sdl.Window) bool;
+  fn @c("SDL_StopTextInput") stopTextInput(window *sdl.Window) bool;
+}
+
+// What offer did with an event
+pub const OFFER_PASS = 0u32;      // not the panel's: the game's
+pub const OFFER_TAKEN = 1u32;
+pub const OFFER_OPENED = 2u32;    // the panel's, and it has just opened: the keys held are to be let go
+
+// The uilayout key code of a scancode, or 0 for one the panel does not use
+fn uiKeyOf(scancode u32) u32 {
+  if scancode == 42u32 { return uilayout.KEY_BACKSPACE; }
+  if scancode == 40u32 or scancode == 88u32 { return uilayout.KEY_ENTER; }
+  if scancode == 43u32 { return uilayout.KEY_TAB; }
+  if scancode == 44u32 { return uilayout.KEY_SPACE; }
+  if scancode == 76u32 { return uilayout.KEY_DELETE; }
+  if scancode == 80u32 { return uilayout.KEY_LEFT; }
+  if scancode == 79u32 { return uilayout.KEY_RIGHT; }
+  if scancode == 82u32 { return uilayout.KEY_UP; }
+  if scancode == 81u32 { return uilayout.KEY_DOWN; }
+  if scancode == 74u32 { return uilayout.KEY_HOME; }
+  if scancode == 77u32 { return uilayout.KEY_END; }
+  if scancode == 4u32 { return uilayout.KEY_A; }
+  if scancode == 6u32 { return uilayout.KEY_C; }
+  if scancode == 25u32 { return uilayout.KEY_V; }
+  if scancode == 27u32 { return uilayout.KEY_X; }
+  0u32;
+}
+
+// uilayout's modifier bits from SDL's
+fn uiModsOf(keymod u16) u32 {
+  mut m = 0u32;
+  if (keymod & sdl.KMOD_SHIFT) != 0u16 { m = m | uilayout.MOD_SHIFT; }
+  if (keymod & sdl.KMOD_CTRL) != 0u16 { m = m | uilayout.MOD_CTRL; }
+  if (keymod & sdl.KMOD_ALT) != 0u16 { m = m | uilayout.MOD_ALT; }
+  m;
+}
+
+// The code points of the UTF-8 text at 'p' (ending in a zero), each as a PE_TEXT
+fn pushTextEvents(events &mut List[PanelEvent], p *u8) {
+  if (p as usize) == 0usize { return; }
+  mut i = 0usize;
+  while *(p + i) != 0u8 {
+    imm c = u32.from(*(p + i));
+    mut cp = c;
+    mut more = 0usize;
+    if c >= 0xF0u32 { cp = c & 0x07u32; more = 3usize; }
+    elif c >= 0xE0u32 { cp = c & 0x0Fu32; more = 2usize; }
+    elif c >= 0xC0u32 { cp = c & 0x1Fu32; more = 1usize; }
+    i = i + 1usize;
+    mut m = 0usize;
+    while m < more and *(p + i) != 0u8 {
+      cp = (cp << 6u32) | (u32.from(*(p + i)) & 0x3Fu32);
+      i = i + 1usize;
+      m = m + 1usize;
+    }
+    events.push(PanelEvent.of(PE_TEXT, 0., 0., cp, 0u32));
+  }
+}
+
+// The shell's half: which events the panel takes, and what it makes of them. The main thread's alone.
+pub struct PanelRoute {
+  pub open bool;                // the panel is up (render's word, kept)
+  pub textOn bool;              // SDL's text input is on
+  pub events List[PanelEvent];  // this frame's, for the view
+  pub openName String;          // the name the panel starts with
+  pub openCode u32;             // PE_OPEN's code
+
+  pub fn make(name String, hasToken bool, automated bool) PanelRoute {
+    new PanelRoute(false, false, List[PanelEvent].empty(), name, (if hasToken { 1u32; } else { 0u32; }) | (if automated { 2u32; } else { 0u32; }));
+  }
+
+  // Event 'e' offered, in a window of 'viewW' by 'viewH' of its own units. OFFER_PASS: it is not the panel's.
+  pub fn offer(self &mut, e &sdl.Event, viewW f32, viewH f32) u32 {
+    imm t = e.type;
+    if !open {
+      if t == sdl.EVENT_KEY_DOWN {
+        imm k = e as &sdl.KeyboardEvent;
+        if !k.repeat and (k.scancode == SCANCODE_F9 or k.scancode == SCANCODE_J) {
+          open = true;
+          mut ev = PanelEvent.of(PE_OPEN, 0., 0., openCode, 0u32);
+          ev.text = openName.copy();
+          events.push(ev);
+          return OFFER_OPENED;
+        }
+      }
+      return OFFER_PASS;
+    }
+    if t == sdl.EVENT_KEY_DOWN {
+      imm k = e as &sdl.KeyboardEvent;
+      if k.scancode == SCANCODE_F9 {
+        if !k.repeat { events.push(PanelEvent.of(PE_CLOSE, 0., 0., 0u32, 0u32)); }
+        return OFFER_TAKEN;
+      }
+      imm code = uiKeyOf(k.scancode);
+      if code != 0u32 { events.push(PanelEvent.of(PE_KEY, 0., 0., code, uiModsOf(k.keymod))); }
+      return OFFER_TAKEN;
+    }
+    if t == sdl.EVENT_KEY_UP { return OFFER_TAKEN; }
+    if t == sdl.EVENT_TEXT_INPUT {
+      pushTextEvents(&mut events, (e as &sdl.TextInputEvent).text);
+      return OFFER_TAKEN;
+    }
+    if viewW > 0. and viewH > 0. {
+      if t == sdl.EVENT_MOUSE_MOTION {
+        imm m = e as &sdl.MouseMotionEvent;
+        events.push(PanelEvent.of(PE_MOVE, m.x / viewW, m.y / viewH, 0u32, 0u32));
+        return OFFER_TAKEN;
+      }
+      if t == sdl.EVENT_MOUSE_BUTTON_DOWN or t == sdl.EVENT_MOUSE_BUTTON_UP {
+        imm b = e as &sdl.MouseButtonEvent;
+        if b.button == sdl.BUTTON_LEFT {
+          events.push(PanelEvent.of(if t == sdl.EVENT_MOUSE_BUTTON_DOWN { PE_DOWN; } else { PE_UP; }, b.x / viewW, b.y / viewH, 0u32, 0u32));
+        }
+        return OFFER_TAKEN;
+      }
+    }
+    if t == sdl.EVENT_MOUSE_MOTION or t == sdl.EVENT_MOUSE_BUTTON_DOWN or t == sdl.EVENT_MOUSE_BUTTON_UP or t == sdl.EVENT_MOUSE_WHEEL {
+      return OFFER_TAKEN;
+    }
+    OFFER_PASS;
+  }
+
+  // The frame's events, handed over (the list starts again empty)
+  pub fn take(self &mut) List[PanelEvent] {
+    mut out = List[PanelEvent].empty();
+    out <=> events;
+    out;
+  }
+
+  // Render's word on the panel after a frame: open or not, and whether a text field has focus. SDL's text input follows
+  // the second (not in an automated run: the script pushes its own text, and a real keyboard must not add to it)
+  pub fn told(self &mut, bits u32, window usize, automated bool) {
+    open = (bits & PANEL_OPEN) != 0u32;
+    imm want = (bits & PANEL_TEXT) != 0u32 and open;
+    if want != textOn {
+      textOn = want;
+      if window != 0usize and !automated {
+        if want { startTextInput(window as *u8 as *sdl.Window); } else { stopTextInput(window as *u8 as *sdl.Window); }
+      }
+    }
+  }
+}
+
+// ---- the panel in the HUD's Ui ----
+
+// The dialog's size and rows, in logical units: every row has a size of its own, so that where each control is can be told
+// without laying anything out (the scripted run clicks on them; hudchecks.cone checks the numbers against the real layout)
+pub const DIALOG_W = 380.;
+const DIALOG_PAD = 18.;
+const DIALOG_GAP = 8.;
+const INNER_W = 344.;
+const ROW_TITLE = 22.;
+const ROW_SUB = 18.;
+const ROW_LABEL = 18.;
+const ROW_FIELD = 34.;
+const ROW_LINE = 18.;
+const ROW_BUTTONS = 36.;
+const BUTTON_ASK_W = 200.;
+const BUTTON_CLOSE_W = 100.;
+const BUTTON_GAP = 12.;
+pub const DIALOG_H = 342.;      // 2 padding + 9 gaps + the rows' heights
+
+// The controls the scripted run aims at
+pub const T_NAME_FIELD = 0u32;
+pub const T_MESSAGE_FIELD = 1u32;
+pub const T_ASK_BUTTON = 2u32;
+pub const T_CLOSE_BUTTON = 3u32;
+
+// The middle of a control, in logical units, for a viewport of 'w' by 'h' logical units
+pub fn panelTarget(which u32, w f32, h f32) Vec2 {
+  imm left = (w - DIALOG_W) * 0.5 + DIALOG_PAD;
+  imm top = (h - DIALOG_H) * 0.5 + DIALOG_PAD;
+  imm step = DIALOG_GAP;
+  // The rows above the one asked for: title, sub, name label, (name field), message label, (message field), 3 lines, buttons
+  imm nameY = top + ROW_TITLE + step + ROW_SUB + step + ROW_LABEL + step;
+  imm messageY = nameY + ROW_FIELD + step + ROW_LABEL + step;
+  imm buttonsY = messageY + ROW_FIELD + step + 3. * ROW_LINE + 3. * step;
+  if which == T_NAME_FIELD { return new Vec2(left + INNER_W * 0.5, nameY + ROW_FIELD * 0.5); }
+  if which == T_MESSAGE_FIELD { return new Vec2(left + INNER_W * 0.5, messageY + ROW_FIELD * 0.5); }
+  if which == T_ASK_BUTTON { return new Vec2(left + BUTTON_ASK_W * 0.5, buttonsY + ROW_BUTTONS * 0.5); }
+  new Vec2(left + BUTTON_ASK_W + BUTTON_GAP + BUTTON_CLOSE_W * 0.5, buttonsY + ROW_BUTTONS * 0.5);
+}
+
+// The panel's phases
+const PH_EDIT = 0u32;
+const PH_SENDING = 1u32;
+
+// A name as the server takes it: 1 to 24 letters, digits, spaces and . _ -
+fn nameCharOk(c u32) bool {
+  (c >= 65u32 and c <= 90u32) or (c >= 97u32 and c <= 122u32) or (c >= 48u32 and c <= 57u32) or c == 32u32 or c == 46u32 or c == 95u32 or c == 45u32;
+}
+
+pub fn validName(s &str) bool {
+  imm b &Array[u8] = s;
+  if b.len == 0usize or b.len > 24usize { return false; }
+  mut i = 0usize;
+  while i < b.len {
+    if !nameCharOk(u32.from(b[i])) { return false; }
+    i = i + 1usize;
+  }
+  true;
+}
+
+// What the thread that asks is given: the name and the message, and where to put the answer
+struct PlayJob is Sendable {
+  name String;
+  message String;
+  url String;
+  tx OneshotSender[PlayAnswer];
+}
+
+fn askJob(job PlayJob) i32 {
+  mut j = job;
+  imm answer = askToPlay(j.name.view(), j.message.view(), j.url.view());
+  j.tx.send(answer);
+  0i32;
+}
+
+// The address a request goes to when the panel asks: the user's (default or PEGASUS_REQUEST_URL) in a person's run; in an
+// automated run, unless a test says otherwise through PEGASUS_REQUEST_URL, a port on this machine that nothing listens on,
+// so that no scripted run ever posts to the live server
+const AUTOMATED_URL = "http://127.0.0.1:9/play/request";
+
+pub struct RequestPanel {
+  pub scrim usize;
+  dialog usize;
+  nameField usize;
+  messageField usize;
+  line0 usize;
+  line1 usize;
+  line2 usize;
+  ask usize;
+  closeButton usize;
+  pub open bool;
+  phase u32;
+  automated bool;
+  pub approved bool;              // an answer said "approved" in this run
+  pending Option[OneshotReceiver[PlayAnswer]];
+  // for the checks and the scripted run
+  pub requests u32;               // requests made
+  pub answers u32;                // answers shown
+  pub lastKind u32;               // the last answer's kind
+  pub lastLine String;            // and its first line
+
+  // The panel built into 'ui' (hidden), on top of everything else in it
+  pub fn build(ui &mut Ui) RequestPanel {
+    imm panelStyle = ui.theme.find("panel");
+    imm labelStyle = ui.theme.find("label");
+    imm buttonStyle = ui.theme.find("button");
+    imm fieldStyle = ui.theme.find("textfield");
+    imm scrimS = ui.theme.style("scrim", panelStyle);
+    ui.theme.setColor(scrimS, uilayout.P_BG, 0u32, rgbaOf(0u32, 0u32, 0u32, 150u32));
+    ui.theme.setNum(scrimS, uilayout.P_BORDER_W, 0u32, 0.);
+    ui.theme.setNum(scrimS, uilayout.P_RADIUS, 0u32, 0.);
+    ui.theme.setNum(scrimS, uilayout.P_PAD, 0u32, 0.);
+    imm dialogS = ui.theme.style("dialog", panelStyle);
+    ui.theme.setColor(dialogS, uilayout.P_BG, 0u32, rgbaOf(14u32, 20u32, 30u32, 238u32));
+    ui.theme.setColor(dialogS, uilayout.P_BORDER, 0u32, rgbaOf(150u32, 162u32, 184u32, 190u32));
+    ui.theme.setNum(dialogS, uilayout.P_BORDER_W, 0u32, 1.);
+    ui.theme.setNum(dialogS, uilayout.P_RADIUS, 0u32, 10.);
+    imm titleS = ui.theme.style("ptitle", labelStyle);
+    ui.theme.setNum(titleS, uilayout.P_FONT_SIZE, 0u32, 19.);
+    imm subS = ui.theme.style("psub", labelStyle);
+    ui.theme.setNum(subS, uilayout.P_FONT_SIZE, 0u32, 13.);
+    ui.theme.setColor(subS, uilayout.P_FG, 0u32, rgbaOf(168u32, 178u32, 194u32, 255u32));
+    imm waitS = ui.theme.style("pwait", labelStyle);
+    ui.theme.setColor(waitS, uilayout.P_FG, 0u32, rgbaOf(222u32, 226u32, 234u32, 255u32));
+    imm okS = ui.theme.style("pok", labelStyle);
+    ui.theme.setColor(okS, uilayout.P_FG, 0u32, rgbaOf(128u32, 224u32, 160u32, 255u32));
+    imm errS = ui.theme.style("perr", labelStyle);
+    ui.theme.setColor(errS, uilayout.P_FG, 0u32, rgbaOf(255u32, 140u32, 120u32, 255u32));
+    imm fieldS = ui.theme.style("pfield", fieldStyle);
+    ui.theme.setColor(fieldS, uilayout.P_BG, 0u32, rgbaOf(8u32, 11u32, 17u32, 255u32));
+    ui.theme.setColor(fieldS, uilayout.P_BORDER, 0u32, rgbaOf(110u32, 122u32, 144u32, 255u32));
+    ui.theme.setNum(fieldS, uilayout.P_PAD, 0u32, 8.);
+    ui.theme.setNum(fieldS, uilayout.P_FONT_SIZE, 0u32, 15.);
+    ui.theme.setNum(fieldS, uilayout.P_RADIUS, 0u32, 5.);
+    imm buttonS = ui.theme.style("pbutton", buttonStyle);
+    ui.theme.setColor(buttonS, uilayout.P_BG, 0u32, rgbaOf(52u32, 70u32, 104u32, 255u32));
+    ui.theme.setColor(buttonS, uilayout.P_BG, uilayout.ST_HOVER, rgbaOf(70u32, 94u32, 140u32, 255u32));
+    ui.theme.setColor(buttonS, uilayout.P_BG, uilayout.ST_PRESSED, rgbaOf(40u32, 54u32, 82u32, 255u32));
+    ui.theme.setColor(buttonS, uilayout.P_BG, uilayout.ST_PRESSED | uilayout.ST_HOVER, rgbaOf(40u32, 54u32, 82u32, 255u32));
+    ui.theme.setColor(buttonS, uilayout.P_BG, uilayout.ST_DISABLED, rgbaOf(36u32, 40u32, 50u32, 255u32));
+    ui.theme.setColor(buttonS, uilayout.P_BORDER, 0u32, rgbaOf(130u32, 146u32, 178u32, 255u32));
+    ui.theme.setNum(buttonS, uilayout.P_FONT_SIZE, 0u32, 15.);
+    ui.theme.setNum(buttonS, uilayout.P_RADIUS, 0u32, 6.);
+    imm closeS = ui.theme.style("pclose", buttonS);
+    ui.theme.setColor(closeS, uilayout.P_BG, 0u32, rgbaOf(40u32, 44u32, 54u32, 255u32));
+    ui.theme.setColor(closeS, uilayout.P_BG, uilayout.ST_HOVER, rgbaOf(58u32, 64u32, 78u32, 255u32));
+
+    imm scrim = uilayout.panel(ui, ui.root, "scrim");
+    ui.setLayout(scrim, uilayout.LK_ANCHOR);
+    ui.setAnchors(scrim, 0., 0., 1., 1.);
+    ui.setOffsets(scrim, 0., 0., 0., 0.);
+    imm dialog = uilayout.panel(ui, scrim, "dialog");
+    ui.setFlex(dialog, uilayout.LK_COLUMN, DIALOG_GAP);
+    ui.setPadding(dialog, DIALOG_PAD, DIALOG_PAD, DIALOG_PAD, DIALOG_PAD);
+    ui.setAnchors(dialog, 0.5, 0.5, 0.5, 0.5);
+    ui.setPivot(dialog, 0.5, 0.5);
+    ui.setOffsets(dialog, 0., 0., 0., 0.);
+    ui.setSize(dialog, DIALOG_W, DIALOG_H);
+    imm title = uilayout.label(ui, dialog, "Play with others");
+    ui.setStyle(title, "ptitle");
+    ui.setSize(title, INNER_W, ROW_TITLE);
+    imm sub = uilayout.label(ui, dialog, "The island's owner approves each request.");
+    ui.setStyle(sub, "psub");
+    ui.setSize(sub, INNER_W, ROW_SUB);
+    imm nameLabel = uilayout.label(ui, dialog, "Your name");
+    ui.setStyle(nameLabel, "psub");
+    ui.setSize(nameLabel, INNER_W, ROW_LABEL);
+    imm nameField = uilayout.textField(ui, dialog, "");
+    ui.setStyle(nameField, "pfield");
+    ui.setSize(nameField, INNER_W, ROW_FIELD);
+    ui.fields[ui.nodes[nameField].data].maxLen = 24usize;
+    imm messageLabel = uilayout.label(ui, dialog, "A line to the owner (optional)");
+    ui.setStyle(messageLabel, "psub");
+    ui.setSize(messageLabel, INNER_W, ROW_LABEL);
+    imm messageField = uilayout.textField(ui, dialog, "");
+    ui.setStyle(messageField, "pfield");
+    ui.setSize(messageField, INNER_W, ROW_FIELD);
+    ui.fields[ui.nodes[messageField].data].maxLen = 120usize;
+    uilayout.fieldPlaceholder(ui, messageField, "say who you are");
+    imm line0 = uilayout.label(ui, dialog, "");
+    ui.setStyle(line0, "pwait");
+    ui.setSize(line0, INNER_W, ROW_LINE);
+    imm line1 = uilayout.label(ui, dialog, "");
+    ui.setStyle(line1, "pwait");
+    ui.setSize(line1, INNER_W, ROW_LINE);
+    imm line2 = uilayout.label(ui, dialog, "");
+    ui.setStyle(line2, "pwait");
+    ui.setSize(line2, INNER_W, ROW_LINE);
+    imm row = uilayout.panel(ui, dialog, "label");
+    ui.setFlex(row, uilayout.LK_ROW, BUTTON_GAP);
+    ui.setSize(row, INNER_W, ROW_BUTTONS);
+    imm ask = uilayout.button(ui, row, "Request to play");
+    ui.setStyle(ask, "pbutton");
+    ui.setSize(ask, BUTTON_ASK_W, ROW_BUTTONS);
+    imm closeButton = uilayout.button(ui, row, "Close");
+    ui.setStyle(closeButton, "pclose");
+    ui.setSize(closeButton, BUTTON_CLOSE_W, ROW_BUTTONS);
+    ui.setVisible(scrim, false);
+    new RequestPanel(scrim, dialog, nameField, messageField, line0, line1, line2, ask, closeButton, false, PH_EDIT, false, false,
+      None, 0u32, 0u32, ANS_SENT, String.empty());
+  }
+
+  // The words in the three lines under the fields, in a style ("pwait", "pok" or "perr")
+  fn setLines(self &mut, ui &mut Ui, a &str, b &str, c &str, style &str) {
+    ui.setText(line0, a);
+    ui.setText(line1, b);
+    ui.setText(line2, c);
+    ui.setStyle(line0, style);
+    ui.setStyle(line1, style);
+    ui.setStyle(line2, style);
+  }
+
+  // A sentence broken over the lines, at word ends, 44 letters or so to a line
+  fn setWrapped(self &mut, ui &mut Ui, text &str, style &str) {
+    imm s &Array[u8] = text;
+    mut lines = List[String].empty();
+    mut cur = String.empty();
+    mut word = String.empty();
+    mut i = 0usize;
+    while i <= s.len {
+      imm c = if i < s.len { s[i]; } else { 32u8; };
+      if c == 32u8 {
+        if cur.len() + word.len() + 1usize > 44usize and cur.len() > 0usize {
+          lines.push(cur.copy());
+          cur = String.empty();
+        }
+        if cur.len() > 0usize { cur.append(" "); }
+        cur.append(word.view());
+        word = String.empty();
+      } else {
+        word.appendByte(c);
+      }
+      i = i + 1usize;
+    }
+    if cur.len() > 0usize { lines.push(cur.copy()); }
+    imm none = String.empty();
+    self.setLines(ui, if lines.len() > 0usize { lines[0].view(); } else { none.view(); },
+      if lines.len() > 1usize { lines[1].view(); } else { none.view(); },
+      if lines.len() > 2usize { lines[2].view(); } else { none.view(); }, style);
+  }
+
+  // The panel shown, with 'name' in the name field and the message empty. A request still out is kept as it was.
+  fn show(self &mut, ui &mut Ui, name &str, code u32) {
+    open = true;
+    automated = (code & 2u32) != 0u32;
+    ui.setVisible(scrim, true);
+    ui.input.modal = scrim;
+    uilayout.fieldSetText(ui, nameField, name);
+    uilayout.fieldSetText(ui, messageField, "");
+    if phase != PH_SENDING {
+      self.setLines(ui, "", "", "", "pwait");
+      ui.setEnabled(ask, true);
+    }
+    ui.setFocus(nameField);
+  }
+
+  fn hide(self &mut, ui &mut Ui) {
+    open = false;
+    ui.setFocus(uilayout.NIL);
+    ui.input.modal = uilayout.NIL;
+    ui.setVisible(scrim, false);
+  }
+
+  // The events of the frame into the Ui. True when the panel was opened by one of them.
+  pub fn apply(self &mut, ui &mut Ui, events &List[PanelEvent], w f32, h f32) bool {
+    mut opened = false;
+    mut i = 0usize;
+    while i < events.len() {
+      imm ev = events[i];
+      if ev.kind == PE_OPEN {
+        imm name = ev.text.copy();   // (a copy: showing the panel sets strings in the Ui)
+        self.show(ui, name.view(), ev.code);
+        opened = true;
+      } elif !open {
+        // (events for a panel that is not up are dropped)
+      } elif ev.kind == PE_CLOSE {
+        self.hide(ui);
+      } elif ev.kind == PE_MOVE {
+        uilayout.pointerMove(ui, ev.a * w, ev.b * h);
+      } elif ev.kind == PE_DOWN {
+        uilayout.pointerMove(ui, ev.a * w, ev.b * h);
+        imm taken = uilayout.pointerDown(ui, 1u32);
+      } elif ev.kind == PE_UP {
+        uilayout.pointerMove(ui, ev.a * w, ev.b * h);
+        uilayout.pointerUp(ui, 1u32);
+      } elif ev.kind == PE_KEY {
+        imm taken = uilayout.keyDown(ui, ev.code, ev.mods);
+      } elif ev.kind == PE_TEXT {
+        // Typed text goes to a field: a name only the letters a name has, a message any printable character
+        imm focus = ui.input.focus;
+        if focus == nameField and nameCharOk(ev.code) {
+          imm taken = uilayout.textInput(ui, ev.code);
+        } elif focus == messageField and ev.code >= 32u32 and ev.code != 127u32 {
+          imm taken = uilayout.textInput(ui, ev.code);
+        }
+      }
+      i = i + 1usize;
+    }
+    opened;
+  }
+
+  // After the Ui has run on the frame's events ('events' are the Ui's): clicks and Enter act, and an answer that has come
+  // is shown
+  pub fn settle(self &mut, ui &mut Ui, events &List[uilayout.UiEvent]) {
+    mut i = 0usize;
+    while i < events.len() {
+      imm ev = events[i];
+      if open {
+        if ev.kind == uilayout.UE_CLICK and ev.node == ask { self.startRequest(ui); }
+        elif ev.kind == uilayout.UE_CLICK and ev.node == closeButton { self.hide(ui); }
+        elif ev.kind == uilayout.UE_SUBMIT and ev.node == nameField { ui.setFocus(messageField); }
+        elif ev.kind == uilayout.UE_SUBMIT and ev.node == messageField { self.startRequest(ui); }
+      }
+      i = i + 1usize;
+    }
+    self.poll(ui);
+  }
+
+  // The request made: checked, and sent by a thread of its own (the frame does not wait for the server)
+  fn startRequest(self &mut, ui &mut Ui) {
+    if phase == PH_SENDING { return; }
+    imm name = String.from(uilayout.fieldText(ui, nameField)).trim();
+    imm message = String.from(uilayout.fieldText(ui, messageField)).trim();
+    if !validName(name.view()) {
+      self.setLines(ui, "Names use letters, digits, spaces", ". _ - and are up to 24 long.", "", "perr");
+      return;
+    }
+    mut tx OneshotSender[PlayAnswer];
+    mut rx OneshotReceiver[PlayAnswer];
+    tx, rx = Oneshot[PlayAnswer].make();
+    mut url = String.empty();
+    if automated and (libc.getenv("PEGASUS_REQUEST_URL") as usize) == 0usize { url = String.from(AUTOMATED_URL); }
+    mut t = thread.start(new PlayJob(name.copy(), message.copy(), url, tx), &askJob);
+    t.detach();
+    pending = Some[OneshotReceiver[PlayAnswer]](rx);
+    phase = PH_SENDING;
+    requests = requests + 1u32;
+    ui.setEnabled(ask, false);
+    self.setLines(ui, "Sending...", "", "", "pwait");
+  }
+
+  // The thread's answer, if it has come, on the screen
+  fn poll(self &mut, ui &mut Ui) {
+    mut got Option[PlayAnswer] = None;
+    match &mut pending {
+      case mut some &mut Some { got = some.tryRecv(); }
+      else {}
+    }
+    match got {
+      case imm a Some {
+        pending = None;
+        phase = PH_EDIT;
+        ui.setEnabled(ask, true);
+        answers = answers + 1u32;
+        lastKind = a.kind;
+        lastLine = a.text.copy();
+        if a.kind == ANS_SENT {
+          self.setLines(ui, "Request sent;", "you'll be able to join once it's approved.", "", "pwait");
+        } elif a.kind == ANS_APPROVED {
+          approved = true;
+          imm name = String.from(uilayout.fieldText(ui, nameField)).trim();
+          mut cmd = String.from("--connect ");
+          cmd.append(JOIN_ADDRESS);
+          cmd.append(" --name ");
+          cmd.append(name.view());
+          self.setLines(ui, if a.note.len() > 0usize and a.note.view() != "Token saved." { "You are approved (the token was not saved)."; } else { "You are approved."; },
+            "To join, restart the browser with:", cmd.view(), "pok");
+        } else {
+          self.setWrapped(ui, a.text.view(), "perr");
+        }
+      }
+      else {}
+    }
+  }
+
+  // What the shell is told (PANEL_OPEN, PANEL_TEXT)
+  pub fn bits(self &, ui &Ui) u32 {
+    if !open { return 0u32; }
+    mut b = PANEL_OPEN;
+    if ui.input.focus == nameField or ui.input.focus == messageField { b = b | PANEL_TEXT; }
+    b;
+  }
+
+  // For the checks: the nodes' ids
+  pub fn nodeOf(self &, which u32) usize {
+    if which == T_NAME_FIELD { return nameField; }
+    if which == T_MESSAGE_FIELD { return messageField; }
+    if which == T_ASK_BUTTON { return ask; }
+    closeButton;
+  }
+}

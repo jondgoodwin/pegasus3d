@@ -1,6 +1,8 @@
-// Request to play: asking the island's owner to let this machine join. `browser --request-play [--name NAME] [--message TEXT]`
-// sends one HTTPS POST to https://cone.jondgoodwin.com/play/request (name, an optional one-line message, and the token
-// this machine was given when it was approved, if any), prints the answer and ends. See SERVER.md.
+// Request to play: asking the island's owner to let this machine join. Two ways in, one piece of code:
+//   `browser --request-play [--name NAME] [--message TEXT]` asks, prints the answer and ends, and
+//   the "Play with others" panel in the browser (requestpanel.cone, key F9 or J) asks from a thread of its own.
+// Either sends one HTTPS POST to https://cone.jondgoodwin.com/play/request (name, an optional one-line message, and the token
+// this machine was given when it was approved, if any). See SERVER.md.
 //
 //   The body is text/plain, at most 1 KB: line 1 the name, line 2 the message, line 3 the token (empty: none).
 //   The answer is text: "sent" (waiting for approval), "approved", or "approved" and a line "token HEX" (the first request
@@ -9,12 +11,45 @@
 //   A request with no token is never approved by itself: the owner approves it by hand.
 //
 // Method: httpclient's fetchWhole (one fetch, the loop driven until it ends), the OS's own certificate check (tls).
+//
+// For tests only, two environment variables: PEGASUS_REQUEST_URL (another address to post to: a stub on this machine) and
+// PEGASUS_PLAY_DIR (another folder for play-token.txt, so that a test never touches the user's own token).
 
 const REQUEST_URL = "https://cone.jondgoodwin.com/play/request";
+
+// The island server's address, as `--connect` takes it (a dotted address and the game's UDP port)
+pub const JOIN_ADDRESS = "40.87.21.70:40000";
+
+// How an ask ended
+pub const ANS_SENT = 0u32;          // waiting for the owner's approval
+pub const ANS_APPROVED = 1u32;
+pub const ANS_ERROR = 2u32;
+
+// The answer to one request, ready to show: 'text' is the line to tell the user, 'note' what happened to a token (or empty)
+pub struct PlayAnswer is Sendable {
+  pub kind u32;
+  pub text String;
+  pub note String;
+}
+
+// The address to post to
+fn requestUrl() String {
+  imm raw = libc.getenv("PEGASUS_REQUEST_URL");
+  if (raw as usize) != 0usize {
+    imm own = String.fromCStr(raw);
+    if own.len() > 0usize { return own; }
+  }
+  String.from(REQUEST_URL);
+}
 
 // The folder the token lives in: %LOCALAPPDATA%\pegasus3d on Windows, else ~/.local/share/pegasus3d. Empty: none to be had.
 fn tokenFolder() Path {
   mut base = String.empty();
+  imm own = libc.getenv("PEGASUS_PLAY_DIR");
+  if (own as usize) != 0usize {
+    imm dir = String.fromCStr(own);
+    if dir.len() > 0usize { return Path.from(dir.view()); }
+  }
   mut raw = libc.getenv("LOCALAPPDATA");
   if (raw as usize) != 0usize {
     base = String.fromCStr(raw);
@@ -27,6 +62,21 @@ fn tokenFolder() Path {
   }
   if base.len() == 0usize { return Path.from(""); }
   Path.from(base.view()).join("pegasus3d");
+}
+
+// The name stored with the token (the name this machine was approved under), or an empty string
+pub fn storedName() String {
+  imm dir = tokenFolder();
+  if dir.isEmpty() { return String.empty(); }
+  imm file = dir.join("play-token.txt");
+  match fs.readFile(&file) {
+    case imm text Ok {
+      imm lines = text.split(10u8);
+      if lines.len() >= 2usize { return lines[0].trim(); }
+    }
+    else {}
+  }
+  String.empty();
 }
 
 // The token stored for 'name' (letters' case ignored), or an empty string
@@ -42,6 +92,12 @@ fn storedToken(name &str) String {
     else {}
   }
   String.empty();
+}
+
+// Whether a token is stored for any name (this machine has been approved at some time)
+pub fn hasStoredToken() bool {
+  imm name = storedName();
+  name.len() > 0usize and storedToken(name.view()).len() > 0usize;
 }
 
 // Whether the text starts with 'prefix'
@@ -86,49 +142,57 @@ fn oneLine(s &str) String {
   out.trim();
 }
 
-// Sends the request and prints what happened; the process's exit code (0: the answer was sent or approved)
-fn requestPlay(name &str, message &str) i32 {
+fn failed(text String) PlayAnswer { new PlayAnswer(ANS_ERROR, text, String.empty()); }
+
+// Sends the request and answers what happened. It waits for the server (a second or two, a long time when the server does
+// not answer): never call it from a frame, but from a thread of its own, or from the command line.
+pub fn askToPlay(name &str, message &str, address &str) PlayAnswer {
   imm token = storedToken(name);
   mut body = String.from(name);
   body.append("\n");
   body.append(oneLine(message).view());
   body.append("\n");
   body.append(token.view());
-  mut req = httpclient.Request.make("POST", REQUEST_URL);
+  imm url = if address.len() > 0usize { String.from(address); } else { requestUrl(); };
+  mut req = httpclient.Request.make("POST", url.view());
   req.body = body;
   mut lp = Loop.mustMake();
   mut client = httpclient.Client.make(httpclient.Config.make(), iobuf.Pool.make());
   mut resp = client.fetchWhole(&mut lp, req, 2048usize);
   client.abortAll(&mut lp);
   if !resp.isOk() {
-    print <- "Could not reach the server: "; print <- resp.failure.message().view(); print <- "\n";
-    return 1i32;
+    mut t = String.from("Could not reach the server: ");
+    t.append(resp.failure.message().view());
+    return failed(t);
   }
   imm status = u32.from(resp.status);
   imm answer = resp.body.split(10u8);
-  if status == 429u32 {
-    print <- "Too many requests from this address; try again in a minute.\n";
-    return 1i32;
-  }
+  if status == 429u32 { return failed(String.from("Too many requests from this address; try again in a minute.")); }
   if status != 200u32 {
-    print <- "The server said "; print <- status; print <- "\n";
-    return 1i32;
+    mut t = String.from("The server said ");
+    t.appendUInt(u64.from(status));
+    return failed(t);
   }
   mut approved = false;
+  mut note = String.empty();
   mut i = 0usize;
   while i < answer.len() {
     imm line = answer[i].trim();
     if hasPrefix(&line, "approved") { approved = true; }
     if hasPrefix(&line, "token ") {
       imm t = line.sub(6usize, line.len());
-      if saveToken(name, t.view()) { print <- "Token saved.\n"; } else { print <- "Could not save the token.\n"; }
+      note = String.from(if saveToken(name, t.view()) { "Token saved."; } else { "Could not save the token."; });
     }
     i = i + 1usize;
   }
-  if approved {
-    print <- "You are approved. You can join now.\n";
-  } else {
-    print <- "Request sent; you'll be able to join once it's approved.\n";
-  }
-  0i32;
+  if approved { return new PlayAnswer(ANS_APPROVED, String.from("You are approved. You can join now."), note); }
+  new PlayAnswer(ANS_SENT, String.from("Request sent; you'll be able to join once it's approved."), note);
+}
+
+// Sends the request and prints what happened; the process's exit code (0: the answer was sent or approved)
+fn requestPlay(name &str, message &str) i32 {
+  imm a = askToPlay(name, message, "");
+  if a.note.len() > 0usize { print <- a.note.view(); print <- "\n"; }
+  print <- a.text.view(); print <- "\n";
+  if a.kind == ANS_ERROR { 1i32; } else { 0i32; };
 }

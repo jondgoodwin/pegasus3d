@@ -51,8 +51,13 @@ world in about 9 s of one core; idle it uses about 3% of a core.
 
 A friend runs `browser.exe --request-play --name Ann --message "hi, it's Ann"` (`--message` is optional; `--name` defaults
 to the machine's name). It sends one HTTPS POST to `https://cone.jondgoodwin.com/play/request` and prints "Request sent;
-you'll be able to join once it's approved." (This is a command-line flag for now; the in-browser screen with a name field and
-a button is not built: the browser has no text-input or mouse path in its UI yet.)
+you'll be able to join once it's approved." In the browser, **F9** (or **J**) opens the "Play with others" panel: a name field
+(from `--name`, else the name this machine was approved under, else the machine's), an optional line to the owner, and
+**Request to play**; the same code sends the request, from its own thread, and the panel shows the answer. Once approved it
+shows the command to restart with (`--connect 40.87.21.70:40000 --name NAME`): joining without a restart is not built (the
+simulation is made in-process at start-up for single player, and the view actor is made for one mode; see the browser's
+README, "Play with others"). Tests and scripts: `PEGASUS_REQUEST_URL` (post elsewhere) and `PEGASUS_PLAY_DIR` (keep
+play-token.txt elsewhere); an automated run never posts to the live server unless `PEGASUS_REQUEST_URL` says so.
 
 ```
 friend: browser --request-play  ->  nginx /play/request (1 KB, 6 a minute per address, 3 burst)  ->  pegasus-request on 127.0.0.1:8098
