@@ -4,8 +4,10 @@
 // its middle near the origin. Inlets and peninsulas round its coast rise to
 // a hill 150 m high; a sheltered lowland on the south shore, in a cove, holds
 // the cottage; you land on the cove's beach and a path leads inland to it.
-// The hill behind the cottage is out of bounds: a fence (a polygon) keeps a
-// walker on the beach, the path, the forest and the cottage's lawn.
+// A walker may go anywhere on it and stops at the water's edge (constrain,
+// below: ground more than WADE_DEPTH under the sea is not walked into). The
+// vegetation is laid out only inside the 'dressed area', a polygon over the
+// beach, the path, the forest and the cottage's lawn; the rest is bare ground.
 //
 // ONE FIELD. The land is a single grid of heights, N x N samples CELL
 // metres apart, covering WORLD metres. The GPU draws it (terrain.slang, from
@@ -306,23 +308,34 @@ fn heightIn(heights &List[f32], x f32, z f32) f32 {
   d + (1. - fx) * (c - d) + (1. - fz) * (b - d);
 }
 
-// The point of the fence's edge nearest (x, z), and how far it is
-fn nearestOnFenceIn(fence &List[Vec2], x f32, z f32, onEdge &mut Vec2) f32 {
-  mut best f32 = 1000000.;
-  mut k = 0usize;
-  while k < fence.len() {
-    imm a = *fence[k];
-    imm b = *fence[if k + 1usize == fence.len() { 0usize; } else { k + 1usize; }];
-    imm abx = b.x - a.x;
-    imm abz = b.y - a.y;
-    imm t = clamp01(((x - a.x) * abx + (z - a.y) * abz) / (abx * abx + abz * abz));
-    imm px = a.x + abx * t;
-    imm pz = a.y + abz * t;
-    imm d = len2(x - px, z - pz);
-    if d < best { best = d; *onEdge = new Vec2(px, pz); }
-    k = k + 1usize;
+// The height of the triangle of the COARSE mesh (a vertex every COARSE_STRIDE samples, quads split by the same rule on the
+// vertices' sample indices divided by the stride) over (x, z): what is drawn beyond the fine mesh
+fn coarseHeightIn(heights &List[f32], x f32, z f32) f32 {
+  if heights.len() == 0usize { return 0.; }
+  imm gx = (x + HALF) / (CELL * f32.from(COARSE_STRIDE));
+  imm gz = (z + HALF) / (CELL * f32.from(COARSE_STRIDE));
+  imm cells = f32.from((N - 1) / COARSE_STRIDE);
+  if gx < 0. or gz < 0. or gx >= cells or gz >= cells { return -30.; }
+  imm ci = i32.from(libc.floorf(gx));
+  imm cj = i32.from(libc.floorf(gz));
+  imm fx = gx - f32.from(ci);
+  imm fz = gz - f32.from(cj);
+  imm a = sampleIn(heights, ci * COARSE_STRIDE, cj * COARSE_STRIDE);
+  imm b = sampleIn(heights, (ci + 1) * COARSE_STRIDE, cj * COARSE_STRIDE);
+  imm c = sampleIn(heights, ci * COARSE_STRIDE, (cj + 1) * COARSE_STRIDE);
+  imm d = sampleIn(heights, (ci + 1) * COARSE_STRIDE, (cj + 1) * COARSE_STRIDE);
+  if !diagonalFlipped(ci, cj) {
+    if fx >= fz { return a + fx * (b - a) + fz * (d - b); }
+    return a + fx * (d - c) + fz * (c - a);
   }
-  best;
+  if fx + fz <= 1. { return a + fx * (b - a) + fz * (c - a); }
+  d + (1. - fx) * (c - d) + (1. - fz) * (b - d);
+}
+
+// The height of the coarse mesh's triangle over (x, z), against groundHeight: how far the drawn ground beyond the fine mesh is from
+// the ground a walker stands on (--checks measures it)
+pub fn coarseGroundHeight(isl &Island, x f32, z f32) f32 {
+  coarseHeightIn(&*isl.heights, x, z);
 }
 
 // The island as the bake builds it: plain lists, filled in by the bake's steps, each reading what the steps before it made
@@ -330,7 +343,7 @@ struct Baking {
   heights List[f32];
   pathDistance List[f32];     // metres to the path's centre, capped
   centre List[Vec3];          // the path's centreline, a point every metre, on the ground
-  fence List[Vec2];
+  dressed List[Vec2];         // the dressed area's polygon
   brook List[BrookPoint];
   brookDistance List[f32];    // metres to the course, capped at BROOK_NEAR
 
@@ -355,7 +368,7 @@ pub struct Item {
   pub radius f32;             // the footprint it keeps others off by, metres
 }
 
-// The baked island, which every query reads: the land's heights and the distance grids, the path's centreline, the fence, the
+// The baked island, which every query reads: the land's heights and the distance grids, the path's centreline, the dressed area, the
 // brook's course and the vegetation's layout. Made once by bake() (the layout is added right after it, by bakedworld's
 // 'layOutVegetation') and never changed; each list is a shared read-only owner, so a copy ('share') is a handful of counts and
 // every actor, and the physics world, holds one.
@@ -363,13 +376,13 @@ pub struct Island {
   heights Arc[imm, List[f32]];
   pathDistance Arc[imm, List[f32]];
   centre Arc[imm, List[Vec3]];
-  fence Arc[imm, List[Vec2]];
+  dressed Arc[imm, List[Vec2]];
   brook Arc[imm, List[BrookPoint]];
   brookDistance Arc[imm, List[f32]];
   vegetation Arc[imm, List[Item]];   // the vegetation's layout: empty until laid out, and when the vegetation is left out
   pub vegetationOff bool;     // the vegetation is left out (--no-vegetation): its layout is empty; every caller of it has an island
 
-  // An island with nothing in it: not baked (the ground is 0 m, there is no fence)
+  // An island with nothing in it: not baked (the ground is 0 m, there is no dressed area)
   pub fn empty() Island { Island.of(Baking.empty()); }
 
   fn of(b Baking) Island {
@@ -377,31 +390,31 @@ pub struct Island {
     mut heights = List[f32].empty();
     mut pathDistance = List[f32].empty();
     mut centre = List[Vec3].empty();
-    mut fence = List[Vec2].empty();
+    mut dressed = List[Vec2].empty();
     mut brook = List[BrookPoint].empty();
     mut brookDistance = List[f32].empty();
     heights <=> src.heights;
     pathDistance <=> src.pathDistance;
     centre <=> src.centre;
-    fence <=> src.fence;
+    dressed <=> src.dressed;
     brook <=> src.brook;
     brookDistance <=> src.brookDistance;
     new Island(new Arc[imm, List[f32]](heights), new Arc[imm, List[f32]](pathDistance), new Arc[imm, List[Vec3]](centre),
-      new Arc[imm, List[Vec2]](fence), new Arc[imm, List[BrookPoint]](brook), new Arc[imm, List[f32]](brookDistance),
+      new Arc[imm, List[Vec2]](dressed), new Arc[imm, List[BrookPoint]](brook), new Arc[imm, List[f32]](brookDistance),
       new Arc[imm, List[Item]](List[Item].empty()), false);
   }
 
   // Another owner of the same island (what each actor, and the physics world, keeps)
-  pub fn share(self &) Island { new Island(heights, pathDistance, centre, fence, brook, brookDistance, vegetation, vegetationOff); }
+  pub fn share(self &) Island { new Island(heights, pathDistance, centre, dressed, brook, brookDistance, vegetation, vegetationOff); }
 
   // The same island with the vegetation switched on or off
   pub fn withVegetation(self &, on bool) Island {
-    new Island(heights, pathDistance, centre, fence, brook, brookDistance, vegetation, !on);
+    new Island(heights, pathDistance, centre, dressed, brook, brookDistance, vegetation, !on);
   }
 
   // The same island with the vegetation's layout in it (made once, after the bake)
   pub fn withLayout(self &, items List[Item]) Island {
-    new Island(heights, pathDistance, centre, fence, brook, brookDistance, new Arc[imm, List[Item]](items), vegetationOff);
+    new Island(heights, pathDistance, centre, dressed, brook, brookDistance, new Arc[imm, List[Item]](items), vegetationOff);
   }
 
   // The vegetation's layout, a copy of the list the island holds
@@ -415,10 +428,9 @@ pub struct Island {
 
   fn sample(self &, i i32, j i32) f32 { sampleIn(&*heights, i, j); }
   fn heightAt(self &, x f32, z f32) f32 { heightIn(&*heights, x, z); }
-  fn nearestOnFence(self &, x f32, z f32, onEdge &mut Vec2) f32 { nearestOnFenceIn(&*fence, x, z, onEdge); }
 
-  // Whether (x, z) is inside the fence
-  fn inside(self &, x f32, z f32) bool { polygonContains(fence.view(), new Vec2(x, z)); }
+  // Whether (x, z) is inside the dressed area
+  fn inside(self &, x f32, z f32) bool { polygonContains(dressed.view(), new Vec2(x, z)); }
 }
 
 // Whether the quad (i, j) of the mesh is split along its other diagonal,
@@ -688,64 +700,74 @@ pub fn pathDistanceAt(isl &Island, x f32, z f32) f32 {
   mixf(mixf(a, b, fx), mixf(c, d, fx), fz);
 }
 
-// ---- The fence ----
+// ---- The dressed area ----
 
-// The walkable area's boundary, corners in order (x, z): the beach, the
+// The area the island is dressed in, corners in order (x, z): the beach, the
 // forest to the east and west of the path, the cottage's lawn and the balloon's
-// field behind it. The hill beyond is out of bounds.
-imm FENCE_CORNERS Array[f32, 22] = [
+// field behind it. The vegetation's layout, the brook's bed stones and the like
+// are placed inside it only. It is not a boundary: a walker may go anywhere.
+imm DRESSED_CORNERS Array[f32, 22] = [
   -190., 285.,   175., 285.,   200., 430.,   175., 540.,   120., 552.,   60., 525.,
   0., 507.,   -60., 505.,   -120., 512.,   -200., 545.,   -215., 420.];
 
-pub fn fencePolygon(isl &Island) List[Vec2] {
-  mut out = List[Vec2].withCapacity(isl.fence.len());
-  mut k = 0usize;
-  while k < isl.fence.len() { out.push(*isl.fence[k]); k = k + 1usize; }
-  out;
-}
-
-fn buildFence(isl &mut Baking) {
-  isl.fence = List[Vec2].empty();
+fn buildDressedArea(isl &mut Baking) {
+  isl.dressed = List[Vec2].empty();
   mut k = 0usize;
   while k < 11usize {
-    isl.fence.push(new Vec2(FENCE_CORNERS[k * 2usize], FENCE_CORNERS[k * 2usize + 1usize]));
+    isl.dressed.push(new Vec2(DRESSED_CORNERS[k * 2usize], DRESSED_CORNERS[k * 2usize + 1usize]));
     k = k + 1usize;
   }
 }
 
-// Whether (x, z) is inside the fence
-pub fn insideFence(isl &Island, x f32, z f32) bool {
+// Whether (x, z) is inside the dressed area
+pub fn insideDressed(isl &Island, x f32, z f32) bool {
   isl.inside(x, z);
 }
 
-// The deepest water a walker may wade into (metres below the sea's level)
+// ---- The shoreline ----
+
+// The deepest water a walker may wade into (metres below the sea's level): the
+// shoreline stop. It is the whole of the island's edge: a walker goes anywhere
+// on the island, up the hill or round the coast, and stops where the ground
+// falls more than this below the sea (knee deep); the grid's own edge is 30 m
+// down, so it is stopped there too.
 pub const WADE_DEPTH f32 = 0.6;
 
-// Where a walker who was at 'from' and means to go to 'to' ends up: 'to',
-// if that is inside the fence and on ground it can stand on; else the
-// fence's nearest edge point (a walker pressing on the fence slides along
-// it); and shallow water only knee deep, never farther (the same, along the
-// axis that is clear). Positions are on the ground plane (x, z); y is kept.
+// Where a walker who was at 'from' and means to go to 'to' ends up: 'to', if
+// that ground is no deeper than WADE_DEPTH; else the step with its seaward part
+// taken off, so the walker slides along the shore (the seaward direction is
+// the ground's steepest descent where it meant to go, from the height grid's
+// central differences over 2 m); else the move along only one axis, if one of
+// those is clear; else where it stands. A walker already deeper than the limit
+// (it fell in, or was set down in the sea) may go to ground no deeper than its
+// own, so it can walk out. Positions are on the ground plane (x, z); y is kept.
 pub fn constrain(isl &Island, from Vec3, to Vec3) Vec3 {
   if isl.heights.len() == 0usize { return to; }   // not baked
+  imm limit = minf(0. - WADE_DEPTH, isl.heightAt(from.x, from.z));
   mut p = to;
-  if !isl.inside(p.x, p.z) {
-    mut edge = new Vec2(from.x, from.z);
-    imm d = isl.nearestOnFence(p.x, p.z, &mut edge);
-    // A hair inside: from where it meant to go to the edge's nearest point is
-    // the way in, square to the edge
-    imm inx = edge.x - p.x;
-    imm inz = edge.y - p.z;
-    imm il = len2(inx, inz);
-    p = if il > 0.0001 and d > 0. {
-      new Vec3(edge.x + inx / il * 0.02, p.y, edge.y + inz / il * 0.02);
-    } else { new Vec3(from.x, p.y, from.z); };
-    if !isl.inside(p.x, p.z) { p = new Vec3(from.x, p.y, from.z); }
-  }
-  if isl.heightAt(p.x, p.z) < 0. - WADE_DEPTH {
-    if isl.heightAt(p.x, from.z) >= 0. - WADE_DEPTH { p = new Vec3(p.x, p.y, from.z); }
-    elif isl.heightAt(from.x, p.z) >= 0. - WADE_DEPTH { p = new Vec3(from.x, p.y, p.z); }
-    else { p = new Vec3(from.x, p.y, from.z); }
+  if isl.heightAt(p.x, p.z) < limit {
+    // The way down at the target: minus the gradient
+    imm gx = (isl.heightAt(p.x + 1., p.z) - isl.heightAt(p.x - 1., p.z)) * 0.5;
+    imm gz = (isl.heightAt(p.x, p.z + 1.) - isl.heightAt(p.x, p.z - 1.)) * 0.5;
+    imm gl = len2(gx, gz);
+    mut slid = false;
+    if gl > 0.0001 {
+      imm dx = 0. - gx / gl;
+      imm dz = 0. - gz / gl;
+      imm sx = p.x - from.x;
+      imm sz = p.z - from.z;
+      imm seaward = sx * dx + sz * dz;
+      if seaward > 0. {
+        imm qx = p.x - dx * seaward;
+        imm qz = p.z - dz * seaward;
+        if isl.heightAt(qx, qz) >= limit { p = new Vec3(qx, p.y, qz); slid = true; }
+      }
+    }
+    if !slid {
+      if isl.heightAt(p.x, from.z) >= limit { p = new Vec3(p.x, p.y, from.z); }
+      elif isl.heightAt(from.x, p.z) >= limit { p = new Vec3(from.x, p.y, p.z); }
+      else { p = new Vec3(from.x, p.y, from.z); }
+    }
   }
   p;
 }
@@ -813,7 +835,7 @@ pub fn pathGrid(isl &Island) List[f32] {
 pub fn bake() Island {
   mut isl = Baking.empty();
   bakeGrid(&mut isl);
-  buildFence(&mut isl);
+  buildDressedArea(&mut isl);
   carvePath(&mut isl);
   carveBrook(&mut isl);
   Island.of(isl);
@@ -979,7 +1001,7 @@ pub fn writePreview(file &str) bool {
     }
     j = j - 1;
   }
-  // The path in red-brown, the fence in white, the cottage a yellow dot
+  // The path in red-brown, the dressed area in white, the cottage a yellow dot
   mut m = 0usize;
   while m < isl.centre.len() {
     markPixel(&mut px, isl.centre[m].x, isl.centre[m].z, 200u8, 80u8, 40u8, 1);
@@ -992,9 +1014,9 @@ pub fn writePreview(file &str) bool {
     m = m + 1usize;
   }
   m = 0usize;
-  while m < isl.fence.len() {
-    imm a = *isl.fence[m];
-    imm b = *isl.fence[if m + 1usize == isl.fence.len() { 0usize; } else { m + 1usize; }];
+  while m < isl.dressed.len() {
+    imm a = *isl.dressed[m];
+    imm b = *isl.dressed[if m + 1usize == isl.dressed.len() { 0usize; } else { m + 1usize; }];
     mut t f32 = 0.;
     while t < 1. {
       markPixel(&mut px, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, 255u8, 255u8, 255u8, 0);
