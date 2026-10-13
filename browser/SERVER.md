@@ -6,6 +6,14 @@ systemd service `pegasus3d-server` on **UDP 40000**, as user `ubuntu`. There is 
 server refuses one already in use (case ignored), one with anything but letters, digits, spaces and `. _ -`, one over 24
 letters, and a ninth player. Nothing is encrypted.
 
+**Protocol version.** `PROTOCOL_VERSION` (netcodec.cone) must be bumped whenever the wire format changes (a message's
+fields, an encoding's range or origin such as `POS_ORIGIN_Y`, a new message). A client sends it after its name in `Hello`; a
+server sends its own after the being in `Possessed`. A build from before versions existed sends none and reads as version 0.
+A server refuses a client whose version differs ("Your browser is out of date. Please download the latest from
+cone.jondgoodwin.com." for an older client, "The server is being updated. Please try again shortly." for a newer one); a
+client refuses a server whose `Possessed` carries a different version, with the same two messages. Deploy the server and
+publish the browser together.
+
 ## Where things are on the VM
 
 | What | Where |

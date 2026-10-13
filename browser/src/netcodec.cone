@@ -24,6 +24,11 @@ pub const MAX_LATEST = 1171usize;
 const REQUESTS_BYTES = 1100usize;
 
 // Where each coordinate's millimetres count from (metres), and how many millimetres make a metre
+// The wire-format version. Bump it whenever anything on the wire changes (see SERVER.md). A client sends it after its name in
+// ToSim.Hello; a server sends its own after the being in ToView.Possessed. A build from before versions existed sends neither
+// (it is read as version 0).
+pub const PROTOCOL_VERSION = 1u32;
+
 pub const POS_ORIGIN_XZ f32 = -2048.;
 pub const POS_ORIGIN_Y f32 = -512.;    // (was -256: the labyrinth's floor at -300 would have been clamped to -256 for every other player)
 const POS_MAX = 16777215.;
@@ -344,6 +349,7 @@ pub fn encodeToSim(msg ToSim) List[u8] {
     case imm h Hello {
       w8(&mut out, TOSIM_HELLO);
       wStr(&mut out, h.name.view());
+      w8(&mut out, h.version);
     }
     case imm p Play {
       w8(&mut out, TOSIM_PLAY);
@@ -388,7 +394,9 @@ pub fn decodeToSim(bytes List[u8]) ToSim {
     if r.ok { out = ToSim.Look(pitch); }
   } elif tag == TOSIM_HELLO {
     imm name = r.rStr();
-    if r.ok { out = ToSim.Hello(name); }
+    // (an older client's Hello ends after the name: version 0)
+    imm version = if r.ok and r.left() > 0usize { r.r8(); } else { 0u32; };
+    if r.ok { out = ToSim.Hello(name, version); }
   } elif tag == TOSIM_PLAY {
     imm kind = r.r8();
     imm spell = r.r8();
@@ -695,6 +703,12 @@ pub fn packRequests(items &List[List[u8]], from usize, out &mut List[u8]) usize 
   i;
 }
 
+// What a refusal for mismatched versions says to the user
+pub fn versionRefusal(client u32, server u32) String {
+  if client < server { String.from("Your browser is out of date. Please download the latest from cone.jondgoodwin.com."); }
+  else { String.from("The server is being updated. Please try again shortly."); }
+}
+
 pub fn encodeRefused(reason &str) List[u8] {
   mut out = List[u8].empty();
   w8(&mut out, TOVIEW_REFUSED);
@@ -706,6 +720,7 @@ pub fn encodePossessed(being u32) List[u8] {
   mut out = List[u8].empty();
   w8(&mut out, TOVIEW_POSSESSED);
   wVar(&mut out, being);
+  w8(&mut out, PROTOCOL_VERSION);
   out;
 }
 
@@ -791,7 +806,9 @@ pub fn decodeToView(bytes List[u8]) ToView {
     if r.ok { return ToView.Requests(batch); }
   } elif tag == TOVIEW_POSSESSED {
     imm being = r.rVar();
-    if r.ok { return ToView.Possessed(being); }
+    // (an older server's Possessed ends after the being: version 0)
+    imm version = if r.ok and r.left() > 0usize { r.r8(); } else { 0u32; };
+    if r.ok { return ToView.Possessed(being, version); }
   } elif tag == TOVIEW_REFUSED {
     imm reason = r.rStr();
     if r.ok { return ToView.Refused(reason); }
