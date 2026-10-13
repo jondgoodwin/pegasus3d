@@ -47,10 +47,51 @@ journalctl -u pegasus3d-server --since today
 It restarts on failure after 5 s, runs at nice 5 and may not pass 1.5 GB (it uses about 100 MB). Starting it builds the
 world in about 9 s of one core; idle it uses about 3% of a core.
 
+## Request to play (a friend asks, the owner approves)
+
+A friend runs `browser.exe --request-play --name Ann --message "hi, it's Ann"` (`--message` is optional; `--name` defaults
+to the machine's name). It sends one HTTPS POST to `https://cone.jondgoodwin.com/play/request` and prints "Request sent;
+you'll be able to join once it's approved." (This is a command-line flag for now; the in-browser screen with a name field and
+a button is not built: the browser has no text-input or mouse path in its UI yet.)
+
+```
+friend: browser --request-play  ->  nginx /play/request (1 KB, 6 a minute per address, 3 burst)  ->  pegasus-request on 127.0.0.1:8098
+        -> one line in /var/lib/pegasus-requests/requests.log (UTC time, source IP, name, message), nothing else happens
+owner:  sudo play-approve Ann [IP]   -> ufw allow from IP to UDP 40000 (comment "pegasus3d player Ann"), a random token issued
+friend: browser --request-play again (from the approved address) -> "approved" and the token, kept in
+        %LOCALAPPDATA%\pegasus3d\play-token.txt (else ~/.local/share/pegasus3d/), once only
+later:  a request that carries the token from a NEW address -> that player's rule moves (new added, old deleted)
+owner:  sudo play-revoke Ann         -> the rule and the token are gone
+```
+
+- **On the VM:** `sudo play-approve` with no name shows the last 10 requests. If one name asked from several addresses, say
+  which: `sudo play-approve Ann 198.51.100.4` (a stranger can type a friend's name, so the owner chooses the address). Only a
+  public IPv4 address is accepted. `sudo ufw status numbered` shows the rules, one per player, each with the player's name.
+- **No token, no approval.** A typed name is not an identity: a request without a valid token never changes a firewall rule;
+  it is a line in the list for the owner to read. A wrong token is logged as `[bad token]` and refused (403).
+- **Where things are:** list `/var/lib/pegasus-requests/requests.log` (tab separated), approved players
+  `/var/lib/pegasus-requests/players.tsv` (name, SHA-256 of the token, IP, UTC time; the token itself is not kept after it is
+  handed over), pending hand-overs `claims/`. Code in `/usr/local/lib/pegasus/` (`request.py` the endpoint, `players.py` the
+  root half), commands in `/usr/local/sbin/` (`play-approve`, `play-revoke`, `pegasus-move-ip`). Sources in `browser/server/request/`.
+- **Endpoint:** a Python 3 standard-library server, systemd `pegasus-request`, as the system user `pegreq` (no shell, no
+  login). nginx: the zone `playreq` and `location = /play/request` in `/etc/nginx/conf.d/cone.conf` (an exact match; the
+  playground's `/play/` routes are untouched; backup `~/cone.conf.bak-2026-10-13-prerequest`). `sudo nginx -t` before a reload.
+- **Root, narrowly:** `/etc/sudoers.d/pegasus-request` holds one line, `pegreq ALL=(root) NOPASSWD: /usr/local/sbin/pegasus-move-ip ""`.
+  The empty `""` means no arguments at all. The helper reads `name ip token` from stdin, checks the name and the IPv4 address
+  by pattern, checks the token against the stored hash itself, and calls ufw with an argument list (no shell). It can only
+  move a player's own rule, never add a first one.
+- **Firewalls:** this adds nothing to the Azure NSG. Until the NSG's `allow-pegasus3d-udp` source is widened from the owner's
+  address, an approved friend's packets still stop at Azure; widening it is the owner's step (ufw is then the gate: default deny, no rule for
+  UDP 40000 from anywhere except the approved addresses).
+- **IPv6:** the game socket is IPv4; a request from an IPv6 address is refused with a message.
+- **Client cost:** `--request-play` uses Cone's `httpclient` and `tls`, which link OpenSSL: `libssl-3.dll` and `libcrypto-3.dll`
+  (7.3 MB) now sit beside `browser.exe`, and the zip must carry them. Build with OpenSSL's DLLs on `LIB`
+  (`C:\src\cone\deps\openssl`).
+
 ## Connecting
 
 The port is open only to the addresses in the Azure rule `allow-pegasus3d-udp` and the VM's ufw. **Adding a player means
-adding their address to both** (the owner's decision each time). From an allowed address:
+adding their address to both** (the owner's decision each time; `play-approve` does the ufw half). From an allowed address:
 
 ```
 browser.exe --connect 40.87.21.70:40000 --name Jon
