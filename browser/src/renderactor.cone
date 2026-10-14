@@ -497,12 +497,19 @@ actor RenderActor {
         jitterX = 2. * jx / f32.from(g.target.texture.width);
         jitterY = -2. * jy / f32.from(g.target.texture.height);
       }
+      // The air a picture shows (render's RenderView.fog, Cone #613): the island's weather, whatever world the viewer is in (a
+      // portal's picture of the island seen from the labyrinth is fogged); the labyrinth has none
+      imm dayFog = pictureFog(g.fxTier, weather.fog);
+      imm noFog = pictureFog(g.fxTier, 0.);
+      // Has the camera cut? (the same test as the frame's own history, below)
+      imm pictureCut = cameraCut(g, pose.origin, pose.orientation * new Vec3(0., 0., -1.));
       // The worlds a picture can show: the viewer's own (a mirror's), the island's day, and the labyrinth
-      imm env = new PictureEnv(new PictureWorld(light, g.renderer.exposure, !under, g.camera.far, g.renderer.environmentStrength, if under { LAB_LAYER; } else { 1u32; }),
-        new PictureWorld(dayLight, dayExposure, true, DAY_FAR, dayEnvironment, 1u32),
-        new PictureWorld(underLight, if under { underExposure; } else { underSeenExposure; }, false, UNDER_FAR, 0., LAB_LAYER));
+      imm env = new PictureEnv(new PictureWorld(light, g.renderer.exposure, !under, g.camera.far, g.renderer.environmentStrength, if under { LAB_LAYER; } else { 1u32; },
+          if under { noFog; } else { dayFog; }),
+        new PictureWorld(dayLight, dayExposure, true, DAY_FAR, dayEnvironment, 1u32, dayFog),
+        new PictureWorld(underLight, if under { underExposure; } else { underSeenExposure; }, false, UNDER_FAR, 0., LAB_LAYER, noFog));
       drawSurfaceViews(&mut g.sys.surfaces, &mut g.renderer, &mut g.device, &g.camera, &env, &g.sys.list,
-        &mut g.sys.particles, effectsOn, jitterX, jitterY, g.target.texture.width, g.target.texture.height);
+        &mut g.sys.particles, effectsOn, pictureCut, jitterX, jitterY, g.target.texture.width, g.target.texture.height);
     } else {
       g.sys.surfaces.pictures = 0u32;
     }
@@ -538,12 +545,7 @@ actor RenderActor {
       g.fx.configure(&fxs);
       // A cut (a teleport or a snap round) has no history to reproject
       imm forward = pose.orientation * new Vec3(0., 0., -1.);
-      if g.haveLast {
-        imm moved = (pose.origin - g.lastEye).length();
-        if moved > 3. or forward.dot(g.lastForward) < 0.9 { g.fx.cutHistory(); }
-      } else {
-        g.fx.cutHistory();
-      }
+      if cameraCut(g, pose.origin, forward) { g.fx.cutHistory(); }
       g.lastEye = pose.origin;
       g.lastForward = forward;
       g.haveLast = true;
@@ -678,6 +680,9 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, cullMode u32,
   mut sys = RenderSystem.make(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, cullMode);
   sys.surfaces.tier(adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   imm fxTier = fxTierFor(adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
+  // The pictures carry the froxel fog while image quality is on (set before any picture is made: its volumes are made with it)
+  sys.surfaces.fogOn = fxTier > 0u32 and sys.surfaces.fogAllowed;
+  sys.surfaces.fogBase = pictureFog(fxTier, 0.);
   mut fx = ImageFx.create(&mut device, &renderer, &mut post);
   imm fxStart = fxBase(fxTier);
   fx.configure(&fxStart);
@@ -731,6 +736,24 @@ fn fxBase(tier u32) FxSettings {
   s.fog.maxDistance = FOG_REACH;
   s.exposure.enabled = true;
   s;
+}
+
+// The froxel fog of a picture, for the weather's extinction 'density': the tier's grid, reaching the horizon, drawn while there is some
+fn pictureFog(tier u32, density f32) FogSettings {
+  mut f = if tier == 1u32 { FogSettings.low(); } else { FogSettings.high(); };
+  f.maxDistance = FOG_REACH;
+  f.anisotropy = 0.3;
+  f.density = density;
+  f.enabled = density > FOG_THIN;
+  f;
+}
+
+// Has the camera cut since the last frame (a teleport, a snap round)? Then there is no history to reproject: the frame's, and
+// the pictures' fog volumes
+fn cameraCut(g &Gfx, eye Vec3, forward Vec3) bool {
+  if !g.haveLast { return true; }
+  imm moved = (eye - g.lastEye).length();
+  moved > 3. or forward.dot(g.lastForward) < 0.9;
 }
 
 // The farthest the froxel fog reaches, metres: the slabs' (skyrig.cone's FOG_FAR)
