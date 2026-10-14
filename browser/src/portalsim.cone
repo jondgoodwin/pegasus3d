@@ -21,6 +21,11 @@ const STILL_NEAR f32 = 0.6;
 const STILL_FAR f32 = 5.5;
 const STILL_SIDE f32 = 2.5;
 
+// The glass closes after this many ticks (10 s) with nobody near, and "near" is within these metres (see portalAfter)
+const GLASS_CLOSE_TICKS = 600u64;
+const GLASS_KEEP_NEAR f32 = 15.;
+const GLASS_KEEP_UNDER f32 = 30.;
+
 // The puppet stands facing the glass this long (ticks) before it turns and walks, and stops this short of E
 const PUPPET_WAIT = 75u64;
 const PUPPET_STOP f32 = 1.2;
@@ -63,6 +68,9 @@ pub struct PortalSim {
   pub exits u64;               // gone out by the staircase to the spring
   pub mark u64;                // a count a script keeps (portalscript.cone)
   pub puppetDone bool;         // the reflection has walked to E: it is to go (the simulation does it: it despawns beings)
+  pub closes bool = true;      // the open glass closes when nobody has been near for GLASS_CLOSE_TICKS (off in a scripted run: its shots lean on it open)
+  pub lonely u64 = 0u64;       // ticks the open glass has had nobody near
+  pub shut u64 = 0u64;         // times it has closed
 
   pub fn make() PortalSim {
     new PortalSim(true, false, 0u64, NO_ROW, 0u64, NO_ROW, NO_ROW, new Vec3(0., 0., 0.), 0., List[Thread].empty(), List[PortalInfo].empty(),
@@ -251,6 +259,25 @@ pub struct PortalSim {
     self.tell(PM_OPEN, 0u32, new Vec3(0., 0., 0.), 1u32);
   }
 
+  // The glass opened again with no one to open it (a script putting back what it closed): no reflection is made
+  pub fn reopen(self &mut, cast &mut Cast) {
+    if open { return; }
+    open = true;
+    lonely = 0u64;
+    cast.phys.setGlassOpen(true);
+    self.tell(PM_OPEN, 0u32, new Vec3(0., 0., 0.), 1u32);
+  }
+
+  // The glass closes: a mirror again (the cottage's wall whole, the views told)
+  pub fn closeGlass(self &mut, cast &mut Cast) {
+    if !open { return; }
+    open = false;
+    lonely = 0u64;
+    shut = shut + 1u64;
+    cast.phys.setGlassOpen(false);
+    self.tell(PM_OPEN, 0u32, new Vec3(0., 0., 0.), 0u32);
+  }
+
   // The puppet is made: being 'idx'
   pub fn puppetMade(self &mut, idx usize) {
     puppet = idx;
@@ -333,6 +360,31 @@ pub fn portalAfter(p &mut PortalSim, cast &mut Cast, driven &List[usize], ground
       imm who = p.stillBeing;
       p.openFor(cast, who, ground, tick);
     }
+  }
+  // Closing: the open glass shuts once nobody has been near it for GLASS_CLOSE_TICKS (10 s). "Near" is a driven being (a player's) on the
+  // island within GLASS_KEEP_NEAR (15 m) of the pane, or under the island within GLASS_KEEP_UNDER (30 m) of E (the antechamber and the
+  // hall: where the way back is), or the reflection still walking off. Reopening is the same standing still as ever.
+  if p.open and p.closes {
+    mut near = p.puppet != NO_ROW;
+    mut n = 0usize;
+    while n < driven.len() {
+      imm idx = *driven[n];
+      if idx < cast.beings.len() and !cast.beings[idx].gone and cast.beings[idx].figure.active {
+        imm pos = cast.beings[idx].body.position;
+        if underground(pos.y) {
+          imm dx = pos.x - E_X;
+          imm dz = pos.z - E_Z;
+          if dx * dx + dz * dz < GLASS_KEEP_UNDER * GLASS_KEEP_UNDER { near = true; }
+        } else {
+          imm dx = pos.x - GLASS_X;
+          imm dz = pos.z - GLASS_Z;
+          if dx * dx + dz * dz < GLASS_KEEP_NEAR * GLASS_KEEP_NEAR { near = true; }
+        }
+      }
+      n = n + 1usize;
+    }
+    if near { p.lonely = 0u64; } else { p.lonely = p.lonely + 1u64; }
+    if p.lonely >= GLASS_CLOSE_TICKS { p.closeGlass(cast); }
   }
   // The threads
   mut d = 0usize;

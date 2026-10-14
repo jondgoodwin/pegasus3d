@@ -76,17 +76,56 @@ pub struct HudTag {
   pub at Vec3;
   pub name String;
   pub speech bool = false;    // words someone is saying (a guard's answer, the Worm's line): shown even with the HUD hidden
+  pub clear bool = true;      // a line from the eye to the point meets nothing (the view casts a ray through the physics world's statics); a plate
+                              // with no clear line fades out, and back in when there is one
 }
+
+// How fast a plate fades, in and out: 1 / seconds (about 0.17 s from clear to gone)
+const PLATE_FADE_RATE = 6.;
+
+// The labyrinth's plan on the minimap, below ground: a fixed window on the rooms (a 140 m square about the middle of the plan: x -55..85,
+// z 296.5..436.5), as the walkable rectangles the navigation mesh is made from (labPlan().tops), the floors darker and the upper levels lighter
+const PLAN_CX = 15.;
+const PLAN_CZ = 366.5;
+const PLAN_SPAN = 140.;
 
 // How many names the HUD can show at once (a server holds at most MAX_PLAYERS), and how far away one is still read
 const PLATES = 8usize;
 const PLATE_RANGE = 80.;
 
+fn freshPlateFades() List[f32] {
+  mut l = List[f32].empty();
+  mut i = 0usize;
+  while i < PLATES { l.push(0. - 1.); i = i + 1usize; }
+  l;
+}
+
+// 'c' with its alpha scaled by 'k'
+fn fadedColor(c u32, k f32) u32 {
+  imm a = f32.from(c & 255u32) * k;
+  (c & 0xffffff00u32) | u32.from(fclamp(a + 0.5, 0., 255.));
+}
+
+// The commands of the node 'a' or 'b' in 'list' faded by 'k' (a plate's panel and its label)
+fn fadeNodes(list &mut uilayout.DrawList, a usize, b usize, k f32) {
+  mut i = 0usize;
+  while i < list.cmds.len() {
+    imm c = list.cmds[i];
+    if c.node == u32.from(a) or c.node == u32.from(b) {
+      mut d = *c;
+      d.color = fadedColor(d.color, k);
+      list.cmds.set(i, d);
+    }
+    i = i + 1usize;
+  }
+}
+
 // Whether the HUD starts shown: not in a scripted run (hudscript.cone turns it on), and not with PEGASUS_HUD=off
 // (to time the picture without it)
 pub fn hudStartsShown(scripted bool) bool {
-  if scripted { return false; }
   imm env = libc.getenv("PEGASUS_HUD");
+  // (PEGASUS_HUD=on shows it in a scripted run too, to look at it in the other parts of the run: the minimap below ground in the walk)
+  if scripted { return (env as usize) != 0usize and libc.strcmp(cstr.fromPtr(env), "on") == 0i32; }
   if (env as usize) != 0usize { return libc.strcmp(cstr.fromPtr(env), "off") != 0i32; }
   true;
 }
@@ -316,6 +355,9 @@ pub struct HudModel {
   pub rp RequestPanel;        // the "Play with others" panel (requestpanel.cone), on top of the rest
   pub tp TalkPanel;           // the dialogue with a guard (talkpanel.cone), likewise
   talkNear bool;              // a guard was within reach at the last frame (render's word to the shell, PANEL_NEAR)
+  plateFade List[f32];        // each plate's opacity now, 0 to 1 (eased towards its tag's clear line)
+  planTops List[Vec4];        // the labyrinth's walkable rectangles (x0, z0, x1, z1) ...
+  planY List[f32];            // ... and the height of each
 
   // A HUD for a target of 'width' by 'height' pixels at 'scale' pixels a logical unit
   pub fn make(width f32, height f32, scale f32) HudModel {
@@ -397,8 +439,14 @@ pub struct HudModel {
     // The "Play with others" panel last, so that it is on top of everything
     imm rp = RequestPanel.build(&mut ui);
     imm tp = TalkPanel.build(&mut ui);
+    // (the labyrinth's plan for the minimap below ground; the same call the navigation mesh is made from)
+    mut plan = labPlan();
+    mut tops = List[Vec4].empty();
+    mut topY = List[f32].empty();
+    tops <=> plan.tops;
+    topY <=> plan.topY;
     new HudModel(ui, font, atlas, scale, uilayout.DrawList.make(), width / scale, height / scale, status, timeLabel, frameLabel,
-      modeLabel, mapFrame, placeLabel, bar, plates, plateLabels, placePanel, hintLabel, rp, tp, false);
+      modeLabel, mapFrame, placeLabel, bar, plates, plateLabels, placePanel, hintLabel, rp, tp, false, freshPlateFades(), tops, topY);
   }
 
   // The HUD brought up to the frame and its draw list made (in logical units; 'scale' makes pixels)
@@ -445,31 +493,47 @@ pub struct HudModel {
     ui.setText(timeLabel, hudClock(f.hour, f.weather).view());
     ui.setText(frameLabel, hudFrameText(f.frameMs).view());
     ui.setText(modeLabel, hudMode(f.connected, f.rttMs).view());
-    mut place = String.from("x ");
+    // Below the island (the one test, underground()) the coordinates are the labyrinth's own, and the map is its plan
+    imm below = underground(f.you.y);
+    mut place = String.from(if below { "below ground   x "; } else { "x "; });
     place.appendInt(i64.from(libc.floorf(f.you.x + 0.5)));
     place.append("   z ");
     place.appendInt(i64.from(libc.floorf(f.you.z + 0.5)));
     ui.setText(placeLabel, place.view());
-    // The map: the window round the player, and the beings on it
-    imm u = (f.you.x + HALF) / (2. * HALF);
-    imm v = (f.you.z + HALF) / (2. * HALF);
-    uilayout.minimapSetView(&mut ui, mapFrame, u, v, 6.);
+    // The map: the window round the player, and the beings on it. Below ground the frame shows the labyrinth's plan, fixed (the whole
+    // plan fits), in the plan's own units (u, v from the window's corner); the island's picture is not drawn then (tex 0), the plan is
+    // spliced in after the frame
+    uilayout.minimapSetTexture(&mut ui, mapFrame, if below { 0u32; } else { MAP_TEX; });
+    imm span = if below { PLAN_SPAN; } else { 2. * HALF; };
+    imm ox = if below { PLAN_CX - PLAN_SPAN * 0.5; } else { 0. - HALF; };
+    imm oz = if below { PLAN_CZ - PLAN_SPAN * 0.5; } else { 0. - HALF; };
+    imm u = (f.you.x - ox) / span;
+    imm v = (f.you.z - oz) / span;
+    if below { uilayout.minimapSetView(&mut ui, mapFrame, 0.5, 0.5, 1.); }
+    else { uilayout.minimapSetView(&mut ui, mapFrame, u, v, 6.); }
     uilayout.minimapClearMarkers(&mut ui, mapFrame);
     mut o = 0usize;
     while o < f.others.len() {
       imm at = f.others[o];
-      imm marker = uilayout.minimapAddMarker(&mut ui, mapFrame, (at.x + HALF) / (2. * HALF), (at.z + HALF) / (2. * HALF), 0xe8503cffu32, 8.);
+      imm marker = uilayout.minimapAddMarker(&mut ui, mapFrame, (at.x - ox) / span, (at.z - oz) / span, 0xe8503cffu32, 8.);
       o = o + 1usize;
     }
     // (a small tick ahead of the player shows the heading: walk.cone's forward is (-sin yaw, -cos yaw))
-    imm ahead = 16.;
-    imm tick = uilayout.minimapAddMarker(&mut ui, mapFrame, (f.you.x - sin(f.yaw) * ahead + HALF) / (2. * HALF),
-      (f.you.z - cos(f.yaw) * ahead + HALF) / (2. * HALF), 0xffd84affu32, 4.);
+    imm ahead = if below { 5.; } else { 16.; };
+    imm tick = uilayout.minimapAddMarker(&mut ui, mapFrame, (f.you.x - sin(f.yaw) * ahead - ox) / span,
+      (f.you.z - cos(f.yaw) * ahead - oz) / span, 0xffd84affu32, 4.);
     imm me = uilayout.minimapAddMarker(&mut ui, mapFrame, u, v, 0xffffffffu32, 9.);
     // The players' names over their heads (in front of the camera and within PLATE_RANGE; not hidden behind anything)
     mut pn = 0usize;
     while pn < PLATES {
       mut shown = false;
+      // (a plate's opacity eases to 1 with a clear line from the eye to its point, and to 0 without one: a fade, not a pop)
+      imm wantFade f32 = if pn < f.tags.len() and f.tags[pn].clear { 1.; } else { 0.; };
+      imm stepFade = PLATE_FADE_RATE * f.dt;
+      // (a plate that was unused begins at its target: it appears clear or not at all; only a plate that is on goes through the fade)
+      imm nowFade = if *plateFade[pn] < 0. { wantFade; } else { *plateFade[pn]; };
+      if pn >= f.tags.len() { plateFade.set(pn, 0. - 1.); }
+      else { plateFade.set(pn, if wantFade > nowFade { fmin(nowFade + stepFade, wantFade); } else { fmax(nowFade - stepFade, wantFade); }); }
       if pn < f.tags.len() {
         imm seen = f.eye.orientation.inverse() * (f.tags[pn].at - f.eye.origin);
         if seen.z < 0. - 0.3 and seen.length() < PLATE_RANGE {
@@ -482,12 +546,59 @@ pub struct HudModel {
           }
         }
       }
-      ui.setVisible(*plates[pn], shown and !tp.open and !rp.open and (hudShown or (pn < f.tags.len() and f.tags[pn].speech)));
+      ui.setVisible(*plates[pn], shown and *plateFade[pn] > 0.003 and !tp.open and !rp.open and (hudShown or (pn < f.tags.len() and f.tags[pn].speech)));
       pn = pn + 1usize;
     }
     relayout(&mut ui, &font, &mut atlas, scale);
     uilayout.drawUi(&ui, &mut list);
+    pn = 0usize;
+    while pn < PLATES {
+      if *plateFade[pn] < 0.999 { fadeNodes(&mut list, *plates[pn], *plateLabels[pn], *plateFade[pn]); }
+      pn = pn + 1usize;
+    }
+    if below { self.splicePlan(); }
     if hudShown { drawSpellIcons(&ui, bar, &mut list); }
+  }
+
+  // The labyrinth's plan, drawn inside the minimap frame's clip, over its backing and under its markers: each walkable rectangle of the
+  // plan (labPlan().tops) in a tone by its height, the higher levels lighter, so that the staircase's flights and landings read over the
+  // court they climb out of
+  fn splicePlan(self &mut) {
+    imm n = ui.nodes[mapFrame];
+    mut plan = uilayout.DrawList.make();
+    imm ox = PLAN_CX - PLAN_SPAN * 0.5;
+    imm oz = PLAN_CZ - PLAN_SPAN * 0.5;
+    imm tones = [0xa89a7effu32, 0xbfae8affu32, 0xd2c09affu32, 0xe4d2aaffu32, 0xf2e4c0ffu32];
+    mut band = 0usize;
+    while band < 5usize {
+      mut k = 0usize;
+      while k < planTops.len() {
+        imm r = *planTops[k];
+        imm up = *planY[k] - LAB_Y;
+        imm b = if up < 0.6 { 0usize; } elif up < 4. { 1usize; } elif up < 8. { 2usize; } elif up < 12. { 3usize; } else { 4usize; };
+        if b == band {
+          imm x0 = n.gx + (r.x - ox) / PLAN_SPAN * n.w;
+          imm y0 = n.gy + (r.y - oz) / PLAN_SPAN * n.h;
+          imm x1 = n.gx + (r.z - ox) / PLAN_SPAN * n.w;
+          imm y1 = n.gy + (r.w - oz) / PLAN_SPAN * n.h;
+          plan.rect(x0, y0, fmax(x1 - x0, 0.6), fmax(y1 - y0, 0.6), tones[band], 0., mapFrame);
+        }
+        k = k + 1usize;
+      }
+      band = band + 1usize;
+    }
+    mut out = List[uilayout.DrawCmd].empty();
+    mut i = 0usize;
+    while i < list.cmds.len() {
+      out.push(*list.cmds[i]);
+      // (the frame's clip is the push with the frame's own rectangle)
+      if list.cmds[i].kind == uilayout.DC_CLIP_PUSH and list.cmds[i].x == n.gx and list.cmds[i].y == n.gy and list.cmds[i].w == n.w {
+        mut p = 0usize;
+        while p < plan.cmds.len() { out.push(*plan.cmds[p]); p = p + 1usize; }
+      }
+      i = i + 1usize;
+    }
+    list.cmds = out;
   }
 }
 

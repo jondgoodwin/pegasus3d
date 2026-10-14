@@ -212,6 +212,11 @@ pub fn windAtHeight(base f32, aboveGround f32) f32 {
   auClamp(base + 0.3 * auClamp((aboveGround - 3.) / 120., 0., 1.), 0., 1.);
 }
 
+// The labyrinth's room tone, its gain at full shelter, and the shelter's time constant (the wind falls by 1 - 1/e = 63 % in this long, 98 % in
+// four times as long)
+const ROOM_TONE_GAIN f32 = 0.35;
+const SHELTER_SECONDS f32 = 0.8;
+
 // ---- surfaces ----
 
 pub const SURF_GRASS = 0u32;      // the lawn, the path, the sand: the soft hiss and crunch
@@ -419,13 +424,16 @@ pub struct AudioView {
   pub stepsOn Array[u32, 4];    // by surface
   pub frames u64;               // frames of audio rendered here
   pub peakSeen f32;
+  pub shelter f32;              // 0 in the open, 1 under the island, eased (SHELTER_SECONDS): the wind and the brook fade out by it, the room tone in
+  roomTone u32;                 // the labyrinth's room tone voice (the wind recipe at its calmest), silent in the open
+  roomGain f32;                 // the gain last sent to it
 
   fn assemble(mode u32, control Control, rx Receiver[Cmd], device Option[audiodevice.Started], recording bool, wavPath String) AudioView {
     imm none = new Vec3(0., 0., 0.);
     new AudioView(mode, control, device, Engine.make(f32.from(AU_RATE), usize.from(AU_VOICES), rx), List[f32].empty(), 0d, List[f32].empty(),
       recording, wavPath, List[Vec3].empty(), List[f64].empty(), false, false, audioCounts.mutePresses.load(), Listener.make(), none, false, 0u32, 0u32,
       new Vec2(0., 0.), 0.25, BrookState.empty(), List[Burner].empty(), List[FootMemory].empty(), 1u32, 0u32, [0u32, 0u32, 0u32, 0u32],
-      0u64, 0.);
+      0u64, 0., 0., 0u32, 0.);
   }
 
   // No sound
@@ -614,6 +622,7 @@ pub struct AudioView {
     control.setListener(&lis);
     trail.push(f.eye);
     trailT.push(if trailT.len() == 0usize { 0d; } else { *trailT[trailT.len() - 1usize] + f64.from(f.dt); });
+    self.updateShelter(f);
     self.updateWind(f);
     self.updateBrook(f);
     self.updateBurners(f);
@@ -621,11 +630,37 @@ pub struct AudioView {
     self.renderFor(f.dt);
   }
 
+  // Under the island (the one test, underground()) the weather is shut out: 'shelter' eases to 1 (time constant 0.8 s: a fade, not a cut,
+  // for the way back up through the glass), and the room tone rises with it
+  fn updateShelter(self &mut, f &AudioFrame) {
+    imm target f32 = if underground(f.eye.y) { 1.; } else { 0.; };
+    imm k = auClamp(f.dt / SHELTER_SECONDS, 0., 1.);
+    shelter = shelter + (target - shelter) * k;
+    if auAbs(target - shelter) < 0.002 { shelter = target; }
+    // The room tone: the wind recipe at its calmest strength, a low even hush (a closed stone room's air), made when the shelter begins
+    // and let go when it has ended, so that the open air runs no voice for it
+    if shelter > 0. and roomTone == 0u32 {
+      roomTone = control.playSynth(SYNTH_WIND, 3u32, BUS_AMBIENCE, 0.0001, 0.02, 0., 2i32);
+      roomGain = 0.;
+    }
+    if roomTone != 0u32 {
+      imm g = ROOM_TONE_GAIN * shelter;
+      if shelter == 0. {
+        control.stop(roomTone, 0.3);
+        roomTone = 0u32;
+        roomGain = 0.;
+      } elif auAbs(g - roomGain) > 0.01 * ROOM_TONE_GAIN {
+        control.setGain(roomTone, g, 0.2);
+        roomGain = g;
+      }
+    }
+  }
+
   fn updateWind(self &mut, f &AudioFrame) {
     imm w = windAtHeight(f.wind, f.aboveGround);
-    windNow = w;
-    // Constant power between the two recipes, and the whole a little louder as it strengthens
-    imm level = 0.55 + 0.45 * w;
+    windNow = w * (1. - shelter);
+    // Constant power between the two recipes, and the whole a little louder as it strengthens; faded out by the shelter
+    imm level = (0.55 + 0.45 * w) * (1. - shelter);
     imm a = w * 1.5707964;
     imm gb = a.cos() * level;
     imm gg = a.sin() * level;
@@ -645,8 +680,9 @@ pub struct AudioView {
     // The water's speed chooses between the trickle and the rush (0.4 m/s in the yard, over 2 m/s in the dingle)
     imm rush = auClamp((hit.speed - 0.4) / 1.6, 0., 1.) * 1.5707964;
     imm none = new Vec3(0., 0., 0.);
-    brook.trickle.tick(&mut control, 0.9 * rush.cos(), hit.pos, none, at, true);
-    brook.rush.tick(&mut control, 0.9 * rush.sin(), hit.pos, none, at, true);
+    imm open = 1. - shelter;
+    brook.trickle.tick(&mut control, 0.9 * open * rush.cos(), hit.pos, none, at, true);
+    brook.rush.tick(&mut control, 0.9 * open * rush.sin(), hit.pos, none, at, true);
     // The bed stones: the three nearest to the listener keep a voice each (a change of stone only when it is clearly nearer)
     self.assignStones(at);
     mut v = 0usize;
@@ -655,13 +691,13 @@ pub struct AudioView {
       imm which = *brook.stoneAt[v];
       if which != NO_STONE {
         imm s = brook.stones[which];
-        e.tick(&mut control, if brook.stonesOn { 0.9; } else { 0.; }, new Vec3(s.x, *brook.stoneY[which], s.y), none, at, false);
+        e.tick(&mut control, if brook.stonesOn { 0.9 * open; } else { 0.; }, new Vec3(s.x, *brook.stoneY[which], s.y), none, at, false);
       }
       brook.stoneVoice.set(v, e);
       v = v + 1usize;
     }
-    brook.bridge.tick(&mut control, 0.6, brook.bridgeAt, none, at, false);
-    brook.cascade.tick(&mut control, 0.8, brook.cascadeAt, none, at, false);
+    brook.bridge.tick(&mut control, 0.6 * open, brook.bridgeAt, none, at, false);
+    brook.cascade.tick(&mut control, 0.8 * open, brook.cascadeAt, none, at, false);
   }
 
   // The stone voices on the nearest stones to 'at'

@@ -78,7 +78,7 @@ def main():
     ap.add_argument('--exe', default=DEFAULT_EXE)
     ap.add_argument('--impair', nargs=3, type=int, metavar=('LOSS', 'LATENCY', 'JITTER'))
     ap.add_argument('--seconds', type=int, default=28, help='how long each client runs')
-    ap.add_argument('--tolerance', type=float, default=0.3, help='metres B may differ from the server path')
+    ap.add_argument('--tolerance', type=float, default=None, help='metres B may differ from the server path (0.3; 0.5 with --impair)')
     ap.add_argument('--predict-tolerance', type=float, default=None, help='metres A\'s final position may differ (0.05; 0.4 with --creatures: the vault)')
     ap.add_argument('--port', type=int, default=7777)
     ap.add_argument('--lab', action='store_true',
@@ -97,6 +97,11 @@ def main():
     args = ap.parse_args()
     if args.predict_tolerance is None:
         args.predict_tolerance = 0.4 if args.creatures else 0.05
+    if args.tolerance is None:
+        # Through the impairing relay a being that starts walking after a stand is drawn from a snapshot older than the loss and the
+        # jitter allow it to be told of (the draw cannot know it has started): the error is its speed times the gap, 0.18 to 0.45 m over
+        # twelve measured runs (14 Oct), so 0.5 there; 0.3 on the clean link
+        args.tolerance = 0.5 if args.impair else 0.3
     exe = os.path.abspath(args.exe)
     os.makedirs(args.out, exist_ok=True)
     remote = bool(args.connect)
@@ -386,7 +391,16 @@ def main():
         sx, sy, sz = (int(v) / 1000.0 for v in sp[0][4:7])
         d = ((bx - sx) ** 2 + (by - sy) ** 2 + (bz - sz) ** 2) ** 0.5
         check(props == 11, f'B has all 11 props once the ball has moved ({props})')
-        check(d <= 0.05, f'B has the ball at ({bx:.3f}, {bz:.3f}), {d:.3f} m from the server\'s ({sx:.3f}, {sz:.3f})')
+        # The server prints where the ball lay as each client leaves, B prints it as it leaves itself, a little later. Compared only when the
+        # ball was at rest (the server's samples agree): through the impairing relay the bowl can come late, and the ball is then still rolling
+        # (it rolls tens of metres down the slope) at all of them, so a difference is the time between the samples, not a disagreement
+        # (measured 14 Oct, base and branch alike: the server's two samples 5 to 10 m apart, B's later sample elsewhere on the same roll)
+        lastS = sp[-1]
+        steady = len(sp) < 2 or sum((int(a) - int(b)) ** 2 for a, b in zip(sp[0][4:7], lastS[4:7])) ** 0.5 / 1000.0 <= 0.05
+        if steady:
+            check(d <= 0.05, f'B has the ball at ({bx:.3f}, {bz:.3f}), {d:.3f} m from the server\'s ({sx:.3f}, {sz:.3f})')
+        else:
+            print(f'     (the ball was still rolling when the clients left: the server had it at ({sx:.3f}, {sz:.3f}), then ({int(lastS[4])/1000.0:.3f}, {int(lastS[6])/1000.0:.3f}); B\'s ({bx:.3f}, {bz:.3f}) is a later sample of the same roll: not compared)')
         if int(sp[0][3]) > 0:
             check(bursts >= 1, f'B was told of the paint ({bursts} burst(s); the server had {sp[0][3]} splat(s))')
     else:
