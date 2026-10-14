@@ -976,7 +976,16 @@ pub struct ViewState {
       // Beyond the newest snapshot (late, or the clock estimate a little ahead): on at its velocity, for a while
       mut ahead = tick - f64.from(p.samples[n - 1usize].tick);
       if ahead > 6. { ahead = 6.; }
-      imm v = velocityOf(&last);
+      mut v = velocityOf(&last);
+      if n >= 2usize {
+        // (held to what it was seen to do between the last two snapshots: heldToObserved)
+        imm before = p.samples[n - 2usize];
+        imm gap = f64.from(p.samples[n - 1usize].tick) - f64.from(before.tick);
+        if gap > 0. {
+          imm seen = (last.position - before.state.position).length() / f32.from(gap / TICKS_PER_SECOND);
+          v = heldToObserved(v, seen);
+        }
+      }
       return new BeingState(last.being, false, last.position + v * f32.from(ahead / TICKS_PER_SECOND), last.yaw, last.speed, last.vy,
         last.airVx, last.airVz, last.grounded, last.intents, last.platform, last.health, last.respawns, last.landings, last.landSpeed,
         FIG_WALK, 0., false, noRots());
@@ -998,8 +1007,9 @@ pub struct ViewState {
     // The path between two snapshots: a cubic through both places with the velocities they carry (so that a
     // being that is speeding up or slowing down is not cut short across a gap of lost snapshots)
     imm span = f32.from((tc - ta) / TICKS_PER_SECOND);
-    imm va = velocityOf(&a);
-    imm vc = velocityOf(&c);
+    imm meanSpeed = (c.position - a.position).length() / (if span > 0.0001 { span; } else { 0.0001; });
+    imm va = heldToObserved(velocityOf(&a), meanSpeed);
+    imm vc = heldToObserved(velocityOf(&c), meanSpeed);
     imm t2 = t * t;
     imm t3 = t2 * t;
     imm h00 = 2. * t3 - 3. * t2 + 1.;
@@ -1309,6 +1319,12 @@ pub struct ViewState {
     testShot.copy();
   }
 
+  // Whether a name plate's line, from the eye 'from' to the plate's point 'to', is clear (physics.cone's lineClear, through this view's own
+  // physics world); hud.cone fades a plate whose line is blocked
+  fn lineClear(self &mut, from Vec3, to Vec3) bool {
+    cast.phys.lineClear(from, to);
+  }
+
   // What the HUD shows this frame (hud.cone): where the user's being and the others are, the clock, the weather, the frame time
   fn hudFrame(self &mut, input &FrameInput) HudFrame {
     if input.hudHide { hud.on = !hud.on; }
@@ -1345,6 +1361,7 @@ pub struct ViewState {
         if said and !near { shown = tags[t].name.copy(); }
         mut tag = new HudTag(at, shown);
         tag.speech = said and near;
+        tag.clear = self.lineClear(cast.eyes().origin, at);
         plates.push(tag);
       }
       t = t + 1usize;
@@ -1356,6 +1373,7 @@ pub struct ViewState {
       if creature.wormPlate(lastState.tick, &mut wat, &mut wtext) and (wat - cast.eyes().origin).length() < SPEECH_RANGE {
         mut tag = new HudTag(wat, wtext);
         tag.speech = true;
+        tag.clear = self.lineClear(cast.eyes().origin, wat);
         plates.push(tag);
       }
     }
@@ -1737,6 +1755,17 @@ fn meshCost(m &Mesh) u64 {
 fn velocityOf(s &BeingState) Vec3 {
   if s.grounded { return new Vec3(0. - libc.sinf(s.yaw) * s.speed, 0., 0. - libc.cosf(s.yaw) * s.speed); }
   new Vec3(s.airVx, s.vy, s.airVz);
+}
+
+// The velocity a snapshot states, held to what the being was seen to do: a being pushing against a wall states its walking speed and
+// moves not at all, and a path through two snapshots (or on beyond the newest) that took the stated velocity at its word would swing
+// past the wall and back (the 0.45 m that failed netcheck --lab --impair: the antechamber's wall, A still walking at it). So the
+// tangent's length is held to twice the mean speed observed (the chord over the time between the snapshots) and a little; for a being
+// that moves as it says (steady, speeding up or slowing down) nothing changes.
+fn heldToObserved(v Vec3, observed f32) Vec3 {
+  imm cap = 2. * observed + 0.05;
+  imm len = v.length();
+  if len <= cap { v; } else { v * (cap / len); };
 }
 
 // A copy of the panel's events of a frame
