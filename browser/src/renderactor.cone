@@ -49,7 +49,36 @@ struct Gfx {
   pub shotH u32;
   pub shotBgra bool;
   pub shotPng bool;
+  pub skyScale f32 = 1.;      // how bright the environment's sky is baked (fitEnvironmentSky), the share of rendersys.cone's daylight
 }
+
+// The environment's sky is one fixed daylight (rendersys.cone's environmentSky), which the day dims by the renderer's
+// 'environmentStrength' where the image-based light reads the cubes made from it. Ray-traced glass also reads that sky directly, for
+// a ray that leaves a ball or a pane into the air, and the strength does not reach it: left alone, a glass ball at night would
+// refract a noon sky. So the sky is baked as bright as the hour's strength says, in steps of 6% (the cubes are made again only when a
+// step is crossed: a few passes, a few times in a dusk), and the strength that is left (a few percent either side of 1) is the
+// ratio, so what the image-based light gives is the strength exactly as before. Zero (underground) keeps the sky as it was.
+// Answers the strength to give the renderer.
+fn fitEnvironmentSky(g &mut Gfx, strength f32) f32 {
+  if strength < 0.0001 { return strength; }
+  imm scale = libc.expf(libc.floorf(libc.logf(strength) / 0.06 + 0.5) * 0.06);
+  if !(scale > g.skyScale * 0.9999 and scale < g.skyScale * 1.0001) {
+    mut s = environmentSky();
+    s.sunColor = scaled(s.sunColor, scale);
+    s.zenith = scaled(s.zenith, scale);
+    s.horizon = scaled(s.horizon, scale);
+    s.glow = scaled(s.glow, scale);
+    s.ground = scaled(s.ground, scale);
+    s.line = scaled(s.line, scale);
+    s.cloud = scaled(s.cloud, scale);
+    g.renderer.setSky(&mut g.device, &s);
+    g.renderer.drawSky = false;       // (setSky turns render's own sky pass on; the browser's is its own)
+    g.skyScale = scale;
+  }
+  strength / g.skyScale;
+}
+
+fn scaled(c Color, k f32) Color { new Color(c.red * k, c.green * k, c.blue * k, c.alpha); }
 
 // The labyrinth's auto-exposure trim (stops): its rooms are dim, and the auto-exposure must not lift them to a middle grey
 const LAB_TRIM_EV f32 = -1.;
@@ -460,7 +489,7 @@ actor RenderActor {
     if dayLit {
       rig.setHour(f32.from(snapshot.hour));
       sky = rig.look();
-      g.renderer.environmentStrength = rig.environmentStrength();
+      g.renderer.environmentStrength = fitEnvironmentSky(g, rig.environmentStrength());
     }
     g.renderer.shadow.settings.enabled = g.sunShadows;
     g.camera.origin = pose.origin;
@@ -750,6 +779,14 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, cullMode u32,
   // The scene is drawn into a half-float frame, which the Post blooms and
   // tone-maps into the swapchain's texture (lookPost says how)
   mut renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  // Glass by rays where the card has ray queries (the RTX), else the raster glass over the captured frame (the Intel): chosen by
+  // the device's capability, the same material description either way. PEGASUS_RT=off keeps the raster glass on a card that
+  // has rays, to compare the two
+  mut rayWanted = true;
+  imm rtEnv = libc.getenv("PEGASUS_RT");
+  if (rtEnv as usize) != 0usize { rayWanted = libc.strcmp(cstr.fromPtr(rtEnv), "off") != 0i32; }
+  imm rayTraced = renderer.setRayTracing(&mut device, rayWanted);
+  print <- "Glass: "; print <- if rayTraced { "ray-traced"; } elif device.rayTracing { "raster (PEGASUS_RT=off)"; } else { "raster (no ray tracing on this device)"; }; print <- "\n";
   mut post = Post.create(&mut device, swapchain.format, width, height);
   lookPost(&mut post);
   // The depth kept after the scene's pass, for the particles' pass to test against
