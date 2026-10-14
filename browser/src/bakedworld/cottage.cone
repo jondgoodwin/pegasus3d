@@ -101,7 +101,7 @@ pub const COTTAGE_STACK = 15usize;
 pub const COTTAGE_LANTERNS = 18usize;   // two wall lanterns, four parts each (bracket, glass, bulb, cap)
 pub const COTTAGE_ROOMS = 26usize;      // the rooms behind the windows; then the two wall lanterns' base plates
 pub const COTTAGE_MIRROR = 29usize;     // the mirror's frame; its pane (a view surface) 30
-pub const COTTAGE_PARTS = 31usize;      // (and after them the chimney's smoke, then the lights: COTTAGE_LIGHTS)
+pub const COTTAGE_PARTS = 33usize;      // (the garden's plinth and glass globe 31 and 32; and after them the chimney's smoke, then the lights: COTTAGE_LIGHTS)
 pub const COTTAGE_LIGHTS = 9usize;      // each wall lantern's two (its light and its interior light), then the five windows' spot lights
 pub const LANTERN_PLATES = 48usize;     // after twelve path lanterns of four parts each (stake, glass, bulb, cap), their base plates
 pub const LANTERN_PARTS = 60usize;
@@ -770,11 +770,28 @@ fn ctLanternMaterials(h &mut Hydrated) Array[usize, 5] {
 
 // ---- Glass, rooms and pools of light (lights.cone glows them) ----
 
-// The window glass: physically based, so it reflects the sky at a glancing
-// angle, and see-through, a faint grey-green tint over the room behind it
+// The window glass: real glass (Look.clearGlass), a 6 mm slab of float glass, index 1.5, nearly colourless with the faint
+// green of its iron (the light that goes through 10 cm of it keeps 0.86, 0.93 and 0.88: a 6 mm pane keeps almost all). Where
+// the card has ray tracing the rays go through it (Snell and Fresnel, the sky and the lawn in its reflections, the lantern's
+// light on it); elsewhere it refracts the frame drawn so far and reflects the screen. The same description either way.
+const CT_PANE_T f32 = 0.006;
 fn ctWindowGlass(h &mut Hydrated) usize {
-  imm look = Look.physicallyBased(srgb(214., 226., 220.), 0.06, 0.).translucent(0.1);
+  imm look = Look.clearGlass(new Color(1., 1., 1., 1.), 1.5, CT_PANE_T, new Color(0.86, 0.93, 0.88, 1.), 0.1);
   h.addMaterial(look, Image.empty(), Maps.none(), 0u32);
+}
+
+// The panes as slabs: a closed box of thickness CT_PANE_T about each pane's plane (the quads 'pane' holds, six corners
+// each, from the lower left a to the upper right c), which a ray can enter and leave
+fn ctPaneSlabs(pane &mesh.Mesh) mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  mut q = 0usize;
+  while q + 5usize < pane.positions.len() {
+    imm a = *pane.positions[q];
+    imm c = *pane.positions[q + 2usize];
+    ctBox(&mut m, a.x, c.x, a.y, c.y, a.z - CT_PANE_T * 0.5, a.z + CT_PANE_T * 0.5);
+    q = q + 6usize;
+  }
+  m;
 }
 
 // The rooms seen through the windows (SHADER_INTERIOR): a warm beige by day,
@@ -1038,6 +1055,23 @@ fn ctMirrorParts(h &mut Hydrated, root usize, ground f32) {
   h.noShadow(glass);
 }
 
+// The garden's globe: a ball of sapphire glass (glassware.cone) on a stone plinth on the lawn at the porch's left front, in the
+// cottage's frame (the lanterns' light and the dusk sky and the cottage's lit windows turned over in it)
+const CT_GLOBE_X f32 = -3.6;
+const CT_GLOBE_Z f32 = 2.7;
+const CT_GLOBE_H f32 = 0.72;          // the plinth's top
+const CT_GLOBE_R f32 = 0.2;
+
+// The plinth, its foot sunk 15 cm so it stands on the lawn wherever the ground is a little off the plan
+fn ctGardenPlinth() mesh.Mesh {
+  mut pts = List[Vec2].empty();
+  pts.push(pt(0.001, -0.15)); pts.push(pt(0.3, -0.15)); pts.push(pt(0.3, 0.1)); pts.push(pt(0.22, 0.16)); pts.push(pt(0.2, 0.3));
+  pts.push(pt(0.2, CT_GLOBE_H - 0.12)); pts.push(pt(0.26, CT_GLOBE_H - 0.06)); pts.push(pt(0.26, CT_GLOBE_H)); pts.push(pt(0.001, CT_GLOBE_H));
+  mut m = mesh.Mesh.empty();
+  lgLathe(&mut m, &pts, 24, CT_GLOBE_X, 0., CT_GLOBE_Z, 1.);
+  m;
+}
+
 // The cottage's parts into 'h', its root at 'at' (the world's frame): COTTAGE_PARTS of them
 fn hydrateCottage(h &mut Hydrated, at Transform3) {
   imm mats = ctMaterials(h);
@@ -1061,9 +1095,9 @@ fn hydrateCottage(h &mut Hydrated, at Transform3) {
   imm glass = ctWindowGlass(h);
   mut rooms = ctRooms(&pane);
   rooms.append(&ctRooms(&doorPane));
-  ctPart(h, "window panes", pane, glass, root);
+  ctPart(h, "window panes", ctPaneSlabs(&pane), glass, root);
   ctPart(h, "door", leaf, mats.door, root);
-  ctPart(h, "door panes", doorPane, glass, root);
+  ctPart(h, "door panes", ctPaneSlabs(&doorPane), glass, root);
   // The porch: the deck, and under it the skirt, the posts, the roof, the steps
   imm porch = ctPart(h, "porch", ctDeck(), mats.deck, root);
   ctPart(h, "porch skirt", ctSkirt(), mats.door, porch);
@@ -1089,6 +1123,12 @@ fn hydrateCottage(h &mut Hydrated, at Transform3) {
   ctLanternPlatePart(h, rightLantern, plate, lm, inside);
   // The mirror on the back wall: its frame and its pane (the last two parts)
   ctMirrorParts(h, root, at.translation.y);
+  // The garden's globe: a stone plinth at the porch's left front and a sapphire glass ball on it (the two parts after the mirror's)
+  imm plinthMat = h.addMaterial(Look.physicallyBased(srgb(170., 164., 150.), 0.85, 0.), Image.empty(), Maps.none(), 0u32);
+  ctPart(h, "garden plinth", ctGardenPlinth(), plinthMat, root);
+  imm globeMat = h.addMaterial(gwSapphire(), Image.empty(), Maps.none(), 0u32);
+  imm globe = h.part("garden globe", h.addMesh(gwBall(CT_GLOBE_R)), globeMat, root, ctAt(CT_GLOBE_X, CT_GLOBE_H + CT_GLOBE_R, CT_GLOBE_Z));
+  h.noShadow(globe);
   // And, after the parts and the chimney's smoke, the lights (lights.cone sets their candela): each wall
   // lantern's two, then the windows' five
   ctLanternLights(h, leftLantern, ctBulbAt(s, inside));
@@ -1208,4 +1248,9 @@ pub fn cottageSolids(at Vec3, out &mut List[Solid]) {
   out.push(Solid.box(at.x + CT_STEP_X0, at.z + CT_PORCH_D, at.x + CT_STEP_X1, at.z + CT_PORCH_D + CT_STEP_D, below, at.y + CT_STEP_TOP));
   out.push(Solid.box(at.x + CT_STEP_X0, at.z + CT_PORCH_D + CT_STEP_D, at.x + CT_STEP_X1, at.z + CT_PORCH_D + CT_STEP_D * 2.,
     below, at.y + CT_STEP_TOP * 0.5));
+}
+
+// The garden's plinth (the glass globe's): a round solid, apart from the cottage's six
+pub fn cottageGardenSolids(at Vec3, out &mut List[Solid]) {
+  out.push(Solid.circle(at.x + CT_GLOBE_X, at.z + CT_GLOBE_Z, 0.28, at.y - 6., at.y + CT_GLOBE_H));
 }
