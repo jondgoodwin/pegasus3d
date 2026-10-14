@@ -174,7 +174,8 @@ static const float3 ROCK_B = float3(0.23, 0.20, 0.16);
 static const float3 EARTH = float3(0.24, 0.15, 0.085);
 static const float PATH_HALF = 0.9;
 
-float3 rockColor(float3 p, float3 n) {
+// fp: the metres a pixel covers; the grain fades to its mean as it shrinks toward a pixel (no hex moire from afar)
+float3 rockColor(float3 p, float3 n, float fp) {
     // Three planes of noise blended by the normal (a triplanar of procedural
     // textures): strata across the vertical ones
     float3 w = pow(abs(n), float3(4.0, 4.0, 4.0));
@@ -183,7 +184,11 @@ float3 rockColor(float3 p, float3 n) {
     float cy = fbm4(p.xz * 0.9) * w.y;
     float cz = fbm4(p.xy * 0.9) * w.z;
     float rough = cx + cy + cz;
-    float strata = 0.5 + 0.5 * sin(p.y * 3.1 + fbm4(p.xz * 0.25) * 6.0);
+    rough = lerp(rough, 0.5, smoothstep(0.12, 0.6, fp * 0.9));
+    float strataW = 1.0 - smoothstep(0.3, 1.2, fp * 3.1);
+    // Coarse strata too (every 14 m up the face), which a far view still resolves
+    float coarse = 0.5 + 0.5 * sin(p.y * 0.45 + fbm4(p.xz * 0.02) * 9.0);
+    float strata = lerp(coarse, 0.5 + 0.5 * sin(p.y * 3.1 + fbm4(p.xz * 0.25) * 6.0), strataW);
     float t = saturate(rough * 0.9 + strata * 0.35 - 0.15);
     return lerp(ROCK_A, ROCK_B, t);
 }
@@ -266,51 +271,95 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float dist = length(frame.cameraPosition.xyz - p);
     float near = saturate(1.0 - dist / 80.0);
 
+    float fp = length(float2(length(ddx(xz)), length(ddy(xz))));    // the metres a pixel covers
     float macro = fbm4(xz * 0.018);
+    // The far field's variation, from the maps and the field alone (the same at any distance): a slope-sized
+    // noise (300 m) and a hill-sized one (100 m) say where it is lush and where dry; the ground's own
+    // curvature over 6 m says where it hollows (gullies, hollows: damp, dark, mossy) and where it is a rib
+    float big = fbm4(xz * 0.0035 + 71.0);
+    float mid = fbm4(xz * 0.011 + 13.0);
+    float grove = mask.a;
+    float ce = 9.0;
+    float curv = (fieldHeight(xz + float2(ce, 0.0)) + fieldHeight(xz - float2(ce, 0.0)) + fieldHeight(xz + float2(0.0, ce)) + fieldHeight(xz - float2(0.0, ce)) - 4.0 * h) / (ce * ce);
+    float cavity = saturate(curv * 16.0);
+    float rib = saturate(0.0 - curv * 16.0);
+    float moist = saturate(1.1 - h / 85.0 + (big - 0.5) * 1.2 + (mid - 0.5) * 0.5 + cavity * 0.25);
+
     float sandBreak = (fbm4(xz * 0.07) - 0.5) * 1.4;
     float wSand = smoothstep(2.7, 1.3, h + sandBreak);
-    float rockBreak = (fbm4(xz * 0.05 + 4.0) - 0.5) * 0.12;
-    float wRock = smoothstep(0.86, 0.74, n.y + rockBreak);
-    float wLitter = litter * 0.72 * (1.0 - wSand) * (1.0 - wRock);
+    float rockBreak = (fbm4(xz * 0.05 + 4.0) - 0.5) * 0.16 + (mid - 0.5) * 0.06 - rib * 0.05 + cavity * 0.02;
+    float alt = smoothstep(80.0, 140.0, h);
+    float wRock = smoothstep(0.84, 0.72, n.y + rockBreak - alt * 0.05);
+    // Scree: loose stone skirting the rock, grass coming through it
+    float wScree = smoothstep(0.90, 0.82, n.y + rockBreak * 0.7 - alt * 0.03) * (1.0 - wRock) * smoothstep(25.0, 60.0, h) * 0.8;
+    float wLitter = max(litter * 0.72, grove * 0.85) * (1.0 - wSand) * (1.0 - wRock);
     float wGrass = (1.0 - wSand) * (1.0 - wRock) * (1.0 - wLitter);
     wSand *= (1.0 - wRock);
 
-    // Sand: ripples across it and grain, darker where the swash wets it
+    // Sand: ripples across it and grain, darker where the swash wets it (a warm brown, not a grey)
     float swash = 0.30 + 0.20 * sin(6.2831853 * t / 7.0 + 6.0 * vnoise(xz * 0.15));
     float wet = smoothstep(swash + 0.30, swash - 0.05, h);
     float grain = vnoise(xz * 38.0) * 0.5 + vnoise(xz * 9.0) * 0.5;
     float ripple = vnoise(float2(xz.x * 2.0 + vnoise(xz * 0.5) * 6.0, xz.y * 0.35));
     float3 sand = SAND * (0.82 + 0.22 * ripple + 0.2 * (grain - 0.5) * near + 0.15 * (macro - 0.5));
-    sand *= lerp(1.0, 0.55, wet);
+    // The dry upper beach is paler and warmer; the wet is a deeper, redder brown
+    sand = lerp(sand, sand * float3(1.22, 1.14, 1.0), smoothstep(0.9, 2.4, h) * 0.8);
+    sand *= lerp(float3(1.0, 1.0, 1.0), float3(0.58, 0.49, 0.40), wet);
+    // The high-tide wrack line: a dark, broken band of weed and shell grit where the swash tops out
+    float wrackAt = swash + 0.42 + (vnoise(xz * 0.9) - 0.5) * 0.35;
+    float wrack = exp(-pow((h - wrackAt) / 0.035, 2.0)) * smoothstep(0.35, 0.7, vnoise(xz * 6.0 + 2.0) * 0.6 + vnoise(xz * 1.7) * 0.4);
+    sand = lerp(sand, float3(0.09, 0.07, 0.04) * (0.6 + 0.8 * vnoise(xz * 23.0)), wrack * 0.55);
+    sand += step(0.955, vnoise(xz * 47.0)) * 0.10 * near * (1.0 - wet);    // shell grit
 
-    // Grass: two greens by the large patches, fine blades, a few dry stalks
+    // Grass: dry gold, meadow green and lush deep green by how moist the ground is, fine blades, a few dry stalks
     float blades = vnoise(xz * 22.0) * 0.6 + vnoise(xz * 63.0) * 0.4;
     // Patches of lusher and drier grass at two scales (about 50 m and 8 m)
     float mottle = fbm4(xz * 0.13 + 31.0);
     float3 grass = lerp(GRASS_A, GRASS_B, smoothstep(0.3, 0.7, macro * 0.6 + mottle * 0.4));
+    grass = lerp(float3(0.25, 0.215, 0.07) * (0.8 + 0.4 * mottle), grass, smoothstep(0.22, 0.52, moist));
+    grass = lerp(grass, float3(0.045, 0.14, 0.03) * (0.8 + 0.4 * mottle), smoothstep(0.62, 0.95, moist) * 0.5);
     grass *= 0.85 + 0.3 * mottle;
     grass *= 0.72 + 0.55 * lerp(0.5, blades, near);
-    // Higher up the grass is thinner and darker
+    // Higher up the grass is thinner, darker and browner
     grass *= lerp(1.0, 0.62, smoothstep(20.0, 120.0, h));
+    grass = lerp(grass, float3(0.21, 0.185, 0.10) * (0.7 + 0.5 * mottle), smoothstep(70.0, 140.0, h) * 0.38);
     grass = lerp(grass, grass * float3(1.5, 1.2, 0.6), step(0.93, vnoise(xz * 7.0)) * 0.6);
+    // Dune grass between the beach and the lawn: sparse, straw-coloured, sand showing through in flecks
+    float wDune = smoothstep(1.7, 2.7, h + sandBreak * 0.8) * (1.0 - smoothstep(2.7, 3.5, h + sandBreak * 0.6));
+    float tuft = smoothstep(0.45, 0.7, vnoise(xz * 3.3) * 0.6 + vnoise(xz * 11.0) * 0.4);
+    grass = lerp(grass, lerp(SAND * float3(0.9, 0.9, 0.8), float3(0.30, 0.29, 0.10) * (0.8 + 0.4 * mottle), tuft), wDune * 0.6);
 
     // Forest litter: soil with leaves lying on it, in clumps
     float leafMask = smoothstep(0.58, 0.70, vnoise(xz * 17.0 + 3.3) * 0.6 + vnoise(xz * 5.1) * 0.4);
     float3 litterCol = lerp(SOIL * (0.7 + 0.6 * vnoise(xz * 11.0)), LEAF * (0.6 + 0.8 * vnoise(xz * 29.0)), leafMask * near);
     // Undergrowth: grass comes through the leaf mould, more in the distance
     litterCol = lerp(litterCol, grass * 0.55, 0.3 + 0.4 * (1.0 - near));
+    // Under a grove: the needle floor's dark green-brown, in mottles (seen from afar the crowns' shade)
+    float3 groveCol = lerp(float3(0.022, 0.040, 0.016), float3(0.040, 0.050, 0.020), mottle) * (0.7 + 0.6 * vnoise(xz * 2.1));
+    litterCol = lerp(litterCol, groveCol, saturate(grove * 1.6) * (1.0 - 0.55 * near));
 
-    float3 rock = rockColor(p, n);
+    float3 rock = rockColor(p, n, fp);
+    // Large patches of cool grey and warm tan, lichen and moss on the lower rock and in the hollows
+    rock *= lerp(float3(0.88, 0.94, 1.02), float3(1.16, 1.02, 0.84), smoothstep(0.3, 0.7, big * 0.6 + mid * 0.5));
+    rock = lerp(rock, rock * float3(0.62, 0.95, 0.48), saturate((1.0 - smoothstep(40.0, 115.0, h)) * 0.55 * smoothstep(0.35, 0.7, vnoise(xz * 0.4)) + cavity * 0.5));
+    // Scree: the rock's own tone, broken, with grass in tufts through it
+    float speck = smoothstep(0.42, 0.62, vnoise(xz * 2.7) * 0.6 + vnoise(xz * 9.0) * 0.4);
+    float3 scree = lerp(rock * 1.12, grass * 0.8, speck * 0.7);
 
-    // The path: packed earth, pebbles, an uneven edge
+    // The path: packed earth, pebbles, an uneven edge; from afar its width is at least a pixel's or two,
+    // so it stays a line on the hillside rather than flickering out
     float edge = pathD + (fbm4(xz * 1.6) - 0.5) * 0.5;
-    float wPath = smoothstep(PATH_HALF + 0.35, PATH_HALF - 0.2, edge);
+    float halfW = max(PATH_HALF, fp * 1.2);
+    float wPath = smoothstep(halfW + 0.35, halfW - 0.2, edge);
     float pebble = smoothstep(0.78, 0.86, vnoise(xz * 26.0 + 9.0));
     float3 earth = EARTH * (0.8 + 0.4 * vnoise(xz * 14.0)) + pebble * 0.07 * near;
     // The edge's shoulder: a little darker where the verge meets it
     earth *= 1.0 - 0.25 * smoothstep(PATH_HALF + 0.9, PATH_HALF, edge) * (1.0 - wPath);
 
     float3 albedo = sand * wSand + grass * wGrass + litterCol * wLitter + rock * wRock;
+    albedo = lerp(albedo, scree, wScree);
+    // The hollows are shaded in the colour too (the cavity of the surface the lighting does not know about)
+    albedo *= 1.0 - 0.18 * cavity * (1.0 - wSand);
     albedo = lerp(albedo, earth, wPath);
 
     // The brook's margin (the mask's blue: metres to the course over 8, smoothed across the 2 m grid):
@@ -320,7 +369,6 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float wMud = smoothstep(2.5, 1.5, bd);
     float wBed = smoothstep(1.55, 0.95, bd);
     float mossy = smoothstep(0.35, 0.7, vnoise(xz * 3.1 + 5.0) * 0.6 + vnoise(xz * 11.0) * 0.4);
-    float fp = length(float2(length(ddx(xz)), length(ddy(xz))));
     float farB = smoothstep(20.0, 80.0, dist);
     float sandW = saturate(wSand);
     // Mud and moss at the water's edge (greener far off); on the beach, sand darkened with wet instead
@@ -347,10 +395,20 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // How much of the sun arrives (render's cascaded shadow maps: the trees, the cottage and the hill
     // shade the ground); the derivatives it takes need every pixel of a quad to call it
     float visible = sunVisibility(p, n, frame.lightDirection.xyz, input.position.xy);
-    float diffuse = max(dot(nn, frame.lightDirection.xyz), 0.0) * visible;
+    // A little wrap (0.35): at a low sun the sky's scattered light round it still reaches ground that faces
+    // it only obliquely, so a sunset beach is lit warm, not by the cold ambient alone
+    float diffuse = saturate((dot(nn, frame.lightDirection.xyz) + 0.35) / 1.35) * visible;
     // Ambient: more from above than from the side
     float3 amb = frame.ambient.rgb * (0.65 + 0.35 * nn.y);
     float3 color = albedo * (amb + frame.lightColor.rgb * (diffuse / RENDER_PI));
+    // Wet sand is glossy: it mirrors the sky at a glancing angle (a pink and violet sheen at dusk) and the
+    // low sun in a broad glint
+    float3 vEye = normalize(frame.cameraPosition.xyz - p);
+    float gloss = wet * wSand * (1.0 - wBed) * (1.0 - wPath);
+    float fres = pow(1.0 - saturate(dot(nn, vEye)), 4.0);
+    float3 rr = reflect(-vEye, nn);
+    color += gloss * ((0.03 + 0.55 * fres) * frame.ambient.rgb * 1.6
+        + frame.lightColor.rgb * (pow(max(dot(rr, frame.lightDirection.xyz), 0.0), 40.0) * 0.25 * visible / RENDER_PI));
     // The point and spot lights of the fragment's cluster (render's locallights.slang): the lanterns'
     // and the windows', in the ground's own colour, diffuse only
     if (lightParams.grid.w > 0.5) {

@@ -171,19 +171,23 @@ float2 rippleSlope(float2 p) {
     return float2(x, z) / (2.0 * e);
 }
 
-float foamTexture(float2 p) {
-    // Cells of foam: the nearer of a few jittered points, as a soft web
-    float2 i = floor(p);
-    float2 f = frac(p);
-    float best = 1.0;
-    for (int y = -1; y <= 1; y++) {
-        for (int x = -1; x <= 1; x++) {
-            float2 o = float2(float(x), float(y));
-            float2 j = float2(hash21(i + o), hash21(i + o + 7.7));
-            best = min(best, length(o + j - f));
-        }
+float fbm3(float2 p) {
+    float s = 0.0;
+    float a = 0.5;
+    for (int o = 0; o < 3; o++) {
+        s += a * vnoise(p);
+        p = p * 2.03 + float2(17.1, 9.2);
+        a *= 0.5;
     }
-    return smoothstep(0.55, 0.15, best);
+    return s * 1.14;
+}
+
+// Lace: the thin ridges of a warped noise, as foam's torn net (not cells, which read as discs)
+float foamLace(float2 p) {
+    float2 w = float2(vnoise(p * 0.7 + 3.1), vnoise(p * 0.7 + 8.7)) - 0.5;
+    float a = 1.0 - abs(2.0 * vnoise(p + w * 2.2) - 1.0);
+    float b = 1.0 - abs(2.0 * vnoise(p * 2.3 + w * 3.0 + 5.0) - 1.0);
+    return saturate(a * 0.65 + b * 0.35);
 }
 
 [shader("fragment")]
@@ -222,11 +226,17 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
 
     // The bed's own colour: sand near the shore, darker in the deep
     float3 bedAlbedo = lerp(float3(0.55, 0.43, 0.25), float3(0.12, 0.10, 0.07), smoothstep(0.5, 8.0, depth));
+    // Weed and dark rock in patches on the shelf, pale sand bars between them
+    float weed = smoothstep(0.52, 0.72, fbm3(seen * 0.045 + 5.0)) * smoothstep(1.2, 3.0, depth) * (1.0 - smoothstep(9.0, 16.0, depth));
+    bedAlbedo = lerp(bedAlbedo, float3(0.05, 0.075, 0.035), weed * 0.85);
+    bedAlbedo *= 0.85 + 0.3 * vnoise(seen * 0.6);
     float3 bed = bedAlbedo * lightOn * exp(-depth * 0.25);
     // Beer-Lambert: red goes first, in clear water
     float3 sigma = float3(0.85, 0.24, 0.14);
     float3 T = exp(-depth * sigma);
-    float3 body = float3(0.005, 0.055, 0.070) * lightOn;
+    // The open water's body colour drifts over the sea in wide patches (bluer, greener, darker)
+    float patch = fbm3(xz * 0.0025 + 40.0);
+    float3 body = lerp(float3(0.004, 0.040, 0.085), float3(0.007, 0.075, 0.068), patch) * (0.8 + 0.4 * fbm3(xz * 0.011 + 9.0)) * lightOn;
     float3 water = bed * T + body * (1.0 - T);
 
     // Reflection: Schlick's Fresnel, the sky's colour towards the reflected direction and the sun's glint
@@ -241,17 +251,38 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // about twice that overhead
     float3 skyColor = skyLight * 2.0;
     float glint = pow(max(dot(R, L), 0.0), 1500.0) * 400.0;
-    float3 reflected = skyColor + frame.lightColor.rgb * (glint / RENDER_PI);
+    // A broader sheen round the sun's glint, and streaks of wind-roughened water, long along the wind
+    float sheen = pow(max(dot(R, L), 0.0), 60.0) * 0.5;
+    float2 wd = waveDir(0);
+    float streak = vnoise(float2(dot(xz, wd) * 0.008, dot(xz, float2(-wd.y, wd.x)) * 0.05) + t * 0.01);
+    float3 reflected = skyColor * (0.88 + 0.24 * streak) + frame.lightColor.rgb * ((glint + sheen) / RENDER_PI);
     float3 color = water * (1.0 - F) + reflected * F;
 
-    // Foam: along the waterline in a band that comes and goes with the swash,
-    // and a few whitecaps on the biggest crests
-    float thr = 0.28 + 0.16 * sin(6.2831853 * t / 6.5 + 5.0 * vnoise(xz * 0.2));
-    float cells = foamTexture(xz * 1.6 + float2(t * 0.03, 0.0));
-    float foam = smoothstep(thr, 0.0, depth) * smoothstep(0.35, 0.7, cells * 0.7 + vnoise(xz * 3.0) * 0.5);
-    foam += smoothstep(0.03, 0.0, depth);
-    foam = saturate(foam) * (1.0 - smoothstep(120.0, 400.0, dist));
-    float3 foamColor = float3(0.85, 0.85, 0.85) * lightOn;
+    // Surf: lines of foam rolling in to the beach, each a wave breaking (a sharp front and a lace trailing
+    // behind it), parallel to the shore (the distance to it taken from the depth over the bed's slope) with
+    // gaps along every line; then the swash's lace on the sand's edge. Far out the sea has a few whitecaps.
+    float eg = params.grid.z;
+    float2 slope = float2(fieldHeight(xz + float2(eg, 0.0)) - fieldHeight(xz - float2(eg, 0.0)),
+                          fieldHeight(xz + float2(0.0, eg)) - fieldHeight(xz - float2(0.0, eg))) / (2.0 * eg);
+    float ds = depth0 / max(length(slope), 0.025);          // metres to the shore across the bed
+    float spacing = 8.5;
+    float phase = ds / spacing + t / 9.0;
+    float wid = floor(phase);
+    float saw = phase - wid;
+    float front = smoothstep(0.0, 0.05, saw) * pow(1.0 - smoothstep(0.04, 0.6, saw), 1.6);
+    float gate = smoothstep(0.30, 0.62, vnoise(xz * 0.09 + wid * 7.3));
+    float lace = foamLace(xz * 1.1 + float2(t * 0.05, wid * 3.7));
+    float strength = smoothstep(55.0, 4.0, ds) * (0.55 + 0.45 * hash21(float2(wid, 3.0)));
+    float breakers = front * gate * smoothstep(0.36, 0.5, lace + front * 0.3) * strength * 1.25;
+    breakers *= smoothstep(0.1, 0.5, depth0);               // none on the sand itself
+    // The swash: a wash of lace that climbs and falls on the beach, with a bright rim at the water's edge
+    float thr = 0.34 + 0.20 * sin(6.2831853 * t / 6.5 + 5.0 * vnoise(xz * 0.2));
+    float swashLace = smoothstep(thr, 0.0, depth0) * smoothstep(0.38, 0.7, foamLace(xz * 2.2 + float2(0.0, t * 0.04)));
+    float rim = smoothstep(0.05, 0.0, depth0) * 0.9;
+    float cap = smoothstep(0.17, 0.30, disp.y) * smoothstep(0.5, 0.75, vnoise(xz * 0.7 + t * 0.03)) * smoothstep(2.0, 8.0, depth0) * 0.55;
+    float foam = saturate(breakers + swashLace * 0.9 + rim + cap * foamLace(xz * 0.9));
+    foam *= 1.0 - smoothstep(180.0, 520.0, dist);
+    float3 foamColor = float3(0.95, 0.95, 0.94) * lightOn * 1.15;
     color = lerp(color, foamColor, foam);
 
     return float4(color * frame.exposure.x, 1.0);
