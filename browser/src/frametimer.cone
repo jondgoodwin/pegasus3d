@@ -1,0 +1,169 @@
+// Where the frame goes, by stage. Two timers, each off unless asked for by an environment variable; presentation only (the
+// view's), nothing here is the simulation's.
+//
+//   PEGASUS_CPU_TIMING=1   the render actor's CPU time by stage: applying the requests, placing the scene, building the draw list,
+//                          the sky and the lights, the pictures of the view surfaces, the renderer's own call, the overlay and
+//                          the submit, and presenting. A stamp costs ~30 ns, so a run with it on is the normal frame.
+//   PEGASUS_GPU_TIMING=1   the main frame's GPU time by stage, from timestamps written into its command buffer: 0 at its start, 1 after
+//                          the scene (shadows, the lit pass, occlusion, temporal AA's inputs), 2 after the passes that resolve it
+//                          (temporal AA, bloom, tone mapping), 3 after the overlay. The device is waited idle after each submit so
+//                          the results can be read, which serialises the CPU and the GPU: the frame time of that run is NOT the
+//                          normal frame time; what it prints is the GPU's, stage by stage. (A picture of a view surface is
+//                          timed apart: PEGASUS_MIRROR_TIMING=1.)
+
+const FT_BUCKET_NS = 10000u64;       // 10 us a bucket
+const FT_BUCKETS = 5000usize;        // up to 50 ms; longer lands in the last
+pub const FT_CPU_STAGES = 10usize;
+pub const FT_GPU_STAGES = 3usize;
+
+// A histogram of times, for a median and a 95th percentile without keeping every sample
+pub struct TimeHist {
+  counts List[u32];
+  n u64;
+  sum f64;
+
+  pub fn make() TimeHist {
+    mut h = new TimeHist(List[u32].empty(), 0u64, 0d);
+    h.counts.resize(FT_BUCKETS, 0u32);
+    h;
+  }
+
+  pub fn add(self &mut, ns u64) {
+    mut b = usize.from(ns / FT_BUCKET_NS);
+    if b >= FT_BUCKETS { b = FT_BUCKETS - 1usize; }
+    counts[b] = *counts[b] + 1u32;
+    n = n + 1u64;
+    sum = sum + f64.from(ns);
+  }
+
+  // Milliseconds
+  pub fn percentile(self &, p f64) f64 {
+    imm want = u64.from(f64.from(n) * p);
+    mut seen = 0u64;
+    mut b = 0usize;
+    while b < FT_BUCKETS {
+      seen = seen + u64.from(*counts[b]);
+      if seen > want { return f64.from(u64.from(b) * FT_BUCKET_NS) / 1000000d; }
+      b = b + 1usize;
+    }
+    f64.from(FT_BUCKETS) * f64.from(FT_BUCKET_NS) / 1000000d;
+  }
+
+  pub fn mean(self &) f64 { if n == 0u64 { 0d; } else { sum / f64.from(n) / 1000000d; }; }
+}
+
+pub struct FrameTimer {
+  cpuOn bool;
+  cpu List[TimeHist];
+  last u64;                          // the performance counter at the last stamp
+  gpuOn bool;
+  queries QuerySet;
+  resolved Buffer;
+  readback Buffer;
+  gpu List[TimeHist];                // the three stages, then the whole
+  seen u64;
+
+  pub fn off() FrameTimer {
+    new FrameTimer(false, List[TimeHist].empty(), 0u64, false, QuerySet.none(), Buffer.none(), Buffer.none(), List[TimeHist].empty(), 0u64);
+  }
+
+  pub fn make(device &mut Device) FrameTimer {
+    mut t = FrameTimer.off();
+    imm c = libc.getenv("PEGASUS_CPU_TIMING");
+    if (c as usize) != 0usize and libc.strcmp(cstr.fromPtr(c), "1") == 0i32 {
+      t.cpuOn = true;
+      mut i = 0usize;
+      while i < FT_CPU_STAGES { t.cpu.push(TimeHist.make()); i = i + 1usize; }
+    }
+    imm e = libc.getenv("PEGASUS_GPU_TIMING");
+    if (e as usize) != 0usize and libc.strcmp(cstr.fromPtr(e), "1") == 0i32 and device.timestampPeriod > 0. {
+      t.queries = device.createQuerySet(QUERY_TYPE_TIMESTAMP, 4u32);
+      t.resolved = device.createBuffer(256u64, BUFFER_USAGE_QUERY_RESOLVE | BUFFER_USAGE_COPY_SRC);
+      t.readback = device.createBuffer(32u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+      t.gpuOn = t.queries.isValid();
+      if t.gpuOn {
+        mut i = 0usize;
+        while i < FT_GPU_STAGES + 1usize { t.gpu.push(TimeHist.make()); i = i + 1usize; }
+      }
+    }
+    t;
+  }
+
+  // ---- CPU ----
+
+  // The start of a frame's stages
+  pub fn begin(self &mut) {
+    if cpuOn { last = sdl.GetPerformanceCounter(); }
+  }
+
+  // The time since the last stamp (or 'begin') belongs to stage 'stage'. The first frames, which build pipelines, are left out.
+  pub fn mark(self &mut, stage usize) {
+    if !cpuOn { return; }
+    imm now = sdl.GetPerformanceCounter();
+    if seen >= 200u64 {
+      cpu[stage].add((now - last) * 1000000000u64 / sdl.GetPerformanceFrequency());
+    }
+    last = now;
+  }
+
+  // The frame is over: counts it
+  pub fn frameDone(self &mut) {
+    if cpuOn or gpuOn { seen = seen + 1u64; }
+  }
+
+  // ---- GPU ----
+
+  pub fn stamp(self &mut, encoder &mut CommandEncoder, index u32) {
+    if gpuOn { encoder.writeTimestamp(&queries, index); }
+  }
+
+  // After the frame's last stamp, before the submit
+  pub fn resolve(self &mut, encoder &mut CommandEncoder) {
+    if !gpuOn { return; }
+    encoder.resolveQuerySet(&queries, 0u32, 4u32, &resolved, 0u64);
+    encoder.copyBufferToBuffer(&resolved, 0u64, &readback, 0u64, 32u64);
+  }
+
+  // After the submit: wait, read, and count
+  pub fn collect(self &mut, device &mut Device) {
+    if !gpuOn { return; }
+    device.waitIdle();
+    if seen < 200u64 { return; }
+    imm t = readback.mappedRange() as *u64;
+    imm period = f64.from(device.timestampPeriod);
+    mut s = 0usize;
+    while s < FT_GPU_STAGES + 1usize {
+      imm a = if s == FT_GPU_STAGES { 0usize; } else { s; };
+      imm b = if s == FT_GPU_STAGES { FT_GPU_STAGES; } else { s + 1usize; };
+      gpu[s].add(u64.from(f64.from(*(t + b) - *(t + a)) * period));
+      s = s + 1usize;
+    }
+  }
+
+  fn line(label &str, h &TimeHist) {
+    print <- "  "; print <- label; print <- h.percentile(0.5); print <- " / "; print <- h.percentile(0.95); print <- " / "; print <- h.mean(); print <- "\n";
+  }
+
+  pub fn report(self &) {
+    if cpuOn and cpu[0usize].n > 0u64 {
+      print <- "CPU time of the render actor by stage, ms (p50 / p95 / mean) over "; print <- cpu[0usize].n; print <- " frames:\n";
+      FrameTimer.line("requests applied:                ", cpu[0usize]);
+      FrameTimer.line("scene placed, surfaces planned:  ", cpu[1usize]);
+      FrameTimer.line("draw list built:                 ", cpu[2usize]);
+      FrameTimer.line("threads, creatures, lights:      ", cpu[3usize]);
+      FrameTimer.line("sky, birds, fog slabs:           ", cpu[4usize]);
+      FrameTimer.line("effects and weather aimed:       ", cpu[5usize]);
+      FrameTimer.line("view surfaces' pictures:         ", cpu[6usize]);
+      FrameTimer.line("render call (shadows, passes):   ", cpu[7usize]);
+      FrameTimer.line("overlay, shot, submit:           ", cpu[8usize]);
+      FrameTimer.line("present and acquire:             ", cpu[9usize]);
+    }
+    if gpuOn and gpu[0usize].n > 0u64 {
+      print <- "GPU time of the main frame by stage, ms (p50 / p95 / mean) over "; print <- gpu[0usize].n; print <- " frames (device idled each frame):\n";
+      FrameTimer.line("scene, shadows to the lit pass:  ", gpu[0usize]);
+      FrameTimer.line("resolve (TAA, bloom, tone):      ", gpu[1usize]);
+      FrameTimer.line("overlay:                         ", gpu[2usize]);
+      FrameTimer.line("main frame, all:                 ", gpu[3usize]);
+    }
+  }
+}

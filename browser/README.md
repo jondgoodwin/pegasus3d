@@ -1196,3 +1196,15 @@ more courses of the same bond from the ground to the eave, on the right eave wal
 ridge. The twelve path lanterns and the two wall lanterns are one family, square in plan like a solar path light (post
 or bracket, glass, bulb, and the head: bronze frame with arched tracery, flared hipped roof and solar panel), the
 glass and the bulb each its own part, in three materials the world shares.
+
+## Where the frame and the start-up go (14 Oct)
+
+- **The validation layer.** Where the Vulkan SDK is installed the gpu package loads Khronos validation with synchronization checks, ~12 ms of CPU a frame
+  (render's recording 14.6 ms with it, 1.9 ms without). It is now on only in the scripted runs (`--script`, `--checks`, `--mirror-only`... whose
+  verdict says "validation messages: 0") or with `PEGASUS_VALIDATION=1`; `PEGASUS_VALIDATION=0` turns it off even there (`validationPolicy`, renderactor.cone).
+- **Timers.** `PEGASUS_CPU_TIMING=1` prints the render actor's CPU time by stage, `PEGASUS_GPU_TIMING=1` the main frame's GPU time by stage (it idles the
+  device each frame, so the frame time of that run is not the normal one). `frametimer.cone`.
+- **The bake cache** (`bakedworld/bakecache.cone`). A baked texture set is kept in `%LOCALAPPDATA%\pegasus3d\bakecache` (`$XDG_CACHE_HOME` or `~/.cache`
+  elsewhere), keyed by the executable's size and last-written time, the bake's name, tile size and seed, and `PEGASUS_BAKE_SALT`. `PEGASUS_BAKE_CACHE=DIR`
+  moves it, `=off` turns it off. `--checks` proves a stored set loads back identical and that other inputs, a damaged file and a truncated one do not.
+- **Pictures too small** (under 10 px a side, half-size) are given no new picture (`PICTURE_SKIP_PIXELS`, viewsurface.cone).
