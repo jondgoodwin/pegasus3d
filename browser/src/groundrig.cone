@@ -1,0 +1,616 @@
+// The island's ground cover: Cone's groundcover package (rule-driven grass, flowers, ferns, moss, needles, cones and twigs, placed and
+// drawn on the GPU into render's HDR frame after the opaque scene) set over the island's own ground.
+//
+// THE GROUND MAPS. The package's rules read eight signals over a square raster; this file fills them from the island's: height (the
+// baked grid, one texel a grid sample, so the cover stands on the drawn triangles' own heights), slope, the distance to the path's
+// edge (from its centreline), to water (the brook's course and the sea's edge: the beach rises about 1 m in 11, so the shore's
+// distance is read off the height), moisture (from that, drier on slopes, in patches), sun exposure (the ground's facing the sun, dimmed
+// under crowns), canopy (a crown disc under every tree the layout stands), and the distance to the nearest object (trunks, rocks, the
+// cottage's footprint, the bridge's ends). It covers the fine mesh's land, 1424 m a side at 2 m a texel (23 MB of r32float on the GPU).
+//
+// THE COVER TYPES are DATA (coverTypes, below), twelve of them: the rules, not code, say where each grows (windows on the signals,
+// patch noise, interactions) and how it looks. Grass and flowers are drawn as geometry by the package's own shaders; the ferns, cones and
+// twigs are meshes. 'tier' thins and shortens them for an integrated GPU: fewer tufts a square metre and a nearer range (the rings of
+// coarser cells farther out are the package's own level of detail).
+//
+//   lawn         short fine grass wherever there is room: not on sand, steep ground, the path or under thick crowns; it feathers out at the
+//                path's edge and round stones
+//   meadow       taller grass in patches, away from the path, the cottage and the trees, with straw-coloured dry patches
+//   tussock      tall tufts in the damp: by the brook and the low ground
+//   marram       pale beach grass on the dunes, the strip between the wet sand and the lowland (the same rule on every shore)
+//   daisies, buttercups, vetch   wildflowers in drifts on the open ground
+//   ferns        under the crowns and in the shade by water
+//   moss         flat dark-green patches on the damp ground in the shade
+//   needles      thin brown needles and a few fallen leaves under the crowns
+//   cones, twigs fallen cones and short branches under the crowns, thickest under the old trees
+//
+// GALLERY AND CHECKS run the same frame, so a shot has the cover. PEGASUS_COVER=off leaves it out (to time what it costs).
+
+// The raster: it starts one metre off the grid's sample at x = -640, z = -696 so that texel centres are the grid's samples
+const COVER_ORIGIN_X f32 = -641.;
+const COVER_ORIGIN_Z f32 = -697.;
+const COVER_SIZE f32 = 1424.;
+const COVER_RES u32 = 712u32;
+
+fn crgb(r f32, g f32, b f32) Color { new Color(r, g, b, 1.); }
+
+// How far a crown reaches from its trunk, metres, and how dense its shade is at the middle
+fn crownOf(it &Item, reach &mut f32, density &mut f32) {
+  *density = 0.92;
+  if it.kind == K_PINE {
+    *reach = (0.9 + 0.2 * coniferHeightOf(it.variant)) * it.scale;
+  } elif it.kind == K_MAPLE {
+    *reach = 4.4 * it.scale;
+    *density = 0.7;
+  } elif it.kind == K_SPECIMEN {
+    *reach = 5.6 * it.scale;
+    *density = 0.75;
+  } else {
+    *reach = 0.;
+  }
+}
+
+// The ground maps of the island's land and what stands on it
+fn coverMaps(isl &Island) groundcover.GroundMaps {
+  mut maps = groundcover.GroundMaps.create(COVER_ORIGIN_X, COVER_ORIGIN_Z, COVER_SIZE, COVER_RES);
+  // heights, and the sea's edge: the shore's distance from the height (11 m of beach to a metre of height), zero at and under the water
+  mut j = 0u32;
+  while j < COVER_RES {
+    mut i = 0u32;
+    while i < COVER_RES {
+      imm h = islandHeight(isl, maps.worldX(i), maps.worldZ(j));
+      maps.set(groundcover.SIGNAL_HEIGHT, i, j, h);
+      imm sea = if h <= 0. { 0.; } else { h * 11.; };
+      maps.set(groundcover.SIGNAL_WATER, i, j, if sea > groundcover.FAR { groundcover.FAR; } else { sea; });
+      i = i + 1u32;
+    }
+    j = j + 1u32;
+  }
+  maps.deriveSlope();
+  // the path's edge, and the brook's
+  imm centre = pathCentreline(isl);
+  mut line = List[Vec2].withCapacity(centre.len());
+  mut k = 0usize;
+  while k < centre.len() { line.push(new Vec2(centre[k].x, centre[k].z)); k = k + 1usize; }
+  maps.addPolylineDistance(groundcover.SIGNAL_PATH, &line, 0.9);
+  imm course = brookPoints(isl);
+  mut water = List[Vec2].withCapacity(course.len());
+  k = 0usize;
+  while k < course.len() { water.push(new Vec2(course[k].x, course[k].z)); k = k + 1usize; }
+  maps.addPolylineDistance(groundcover.SIGNAL_WATER, &water, 1.2);
+  // the crowns and what is on the ground
+  imm items = vegetationLayout(isl);
+  k = 0usize;
+  while k < items.len() {
+    imm it = items[k];
+    mut reach f32 = 0.;
+    mut density f32 = 0.;
+    crownOf(it,&mut reach, &mut density);
+    if reach > 0. {
+      maps.addCrown(it.x, it.z, reach, density);
+      maps.addObject(it.x, it.z, 0.3 * it.scale);
+    } elif it.kind == K_ROCK {
+      maps.addObject(it.x, it.z, it.radius);
+    }
+    k = k + 1usize;
+  }
+  // the cottage's footprint, and the bridge's ends
+  imm bx0 = -21.5;
+  mut bx = bx0;
+  while bx <= -12.6 {
+    mut bz = 323.8;
+    while bz <= 332.4 {
+      maps.addObject(bx, bz, 1.2);
+      bz = bz + 1.6;
+    }
+    bx = bx + 1.6;
+  }
+  maps.addObject(BRIDGE_X, BRIDGE_Z - 3.4, 1.4);
+  maps.addObject(BRIDGE_X, BRIDGE_Z + 3.4, 1.4);
+  // moisture: from the water, a little drier on slopes, patchy
+  maps.deriveMoisture(0.22, 11., 0.3);
+  // exposure: the ground's facing the sun (high in the south-west), dimmed under crowns
+  imm toSun = new Vec3(-0.42, 0.76, 0.5).normalize();
+  imm flat = toSun.y;
+  j = 0u32;
+  while j < COVER_RES {
+    mut i = 0u32;
+    while i < COVER_RES {
+      imm x = maps.worldX(i);
+      imm z = maps.worldZ(j);
+      imm m = maps.at(groundcover.SIGNAL_MOISTURE, i, j) + 0.34 * (groundcover.fbm2(x / 28., z / 28., 21u32) - 0.5);
+      maps.set(groundcover.SIGNAL_MOISTURE, i, j, groundcover.fclamp(m, 0., 1.));
+      imm n = maps.normalAt(x, z);
+      maps.set(groundcover.SIGNAL_EXPOSURE, i, j, groundcover.fclamp((n.x * toSun.x + n.y * toSun.y + n.z * toSun.z) / flat, 0., 1.));
+      i = i + 1u32;
+    }
+    j = j + 1u32;
+  }
+  maps.shadeByCanopy(0.6);
+  // the far field the distant tufts take their colour from: the lawn's green, darker under crowns, sandy low down
+  maps.farField.reserve(usize.from(COVER_RES) * usize.from(COVER_RES) * 4usize);
+  j = 0u32;
+  while j < COVER_RES {
+    mut i = 0u32;
+    while i < COVER_RES {
+      imm h = maps.at(groundcover.SIGNAL_HEIGHT, i, j);
+      imm canopy = maps.at(groundcover.SIGNAL_CANOPY, i, j);
+      imm sand = 1. - groundcover.smoothstep(2.2, 3.0, h);
+      imm dim = 1. - 0.5 * canopy;
+      imm r = (0.10 + (0.5 - 0.10) * sand) * dim;
+      imm g = (0.21 + (0.4 - 0.21) * sand) * dim;
+      imm b = (0.035 + (0.22 - 0.035) * sand) * dim;
+      maps.farField.push(u8.from(i32.from(groundcover.linearToSrgb(r) * 255. + 0.5)));
+      maps.farField.push(u8.from(i32.from(groundcover.linearToSrgb(g) * 255. + 0.5)));
+      maps.farField.push(u8.from(i32.from(groundcover.linearToSrgb(b) * 255. + 0.5)));
+      maps.farField.push(255u8);
+      i = i + 1u32;
+    }
+    j = j + 1u32;
+  }
+  maps;
+}
+
+// ---- The meshes (cones and twigs) ----
+
+// A tube along +x on the ground, tapering, with a bellying profile: 'belly' 0 is a straight taper, 1 a fat middle (a cone's)
+fn lathe(length f32, radius f32, bend f32, belly f32, sides i32, steps i32) mesh.Mesh {
+  mut m = mesh.Mesh.empty();
+  mut s = 0;
+  while s <= steps {
+    imm t = f32.from(s) / f32.from(steps);
+    imm cx = t * length;
+    imm cy = radius * 0.9 + bend * libc.sinf(3.14159265 * t) * 0.25;
+    imm cz = bend * libc.sinf(3.14159265 * t) * 0.5;
+    imm taper = (1. - belly) * (1. - 0.75 * t) + belly * libc.sqrtf(libc.sinf(3.14159265 * (0.08 + 0.84 * t)));
+    imm r = radius * taper;
+    mut k = 0;
+    while k < sides {
+      imm a = 6.2831853 * f32.from(k) / f32.from(sides);
+      m.positions.push(new Vec3(cx, cy + r * libc.cosf(a), cz + r * libc.sinf(a)));
+      m.uvs.push(new Vec2(f32.from(k) / f32.from(sides), t));
+      k = k + 1;
+    }
+    s = s + 1;
+  }
+  mut i = 0;
+  while i < steps {
+    mut k = 0;
+    while k < sides {
+      imm a = u32.from(i * sides + k);
+      imm b = u32.from(i * sides + (k + 1) % sides);
+      imm c = u32.from((i + 1) * sides + k);
+      imm d = u32.from((i + 1) * sides + (k + 1) % sides);
+      m.indices.push(a); m.indices.push(b); m.indices.push(c);
+      m.indices.push(b); m.indices.push(d); m.indices.push(c);
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  m.computeSmoothNormals();
+  m;
+}
+
+// ---- The cover types ----
+
+// Twelve types, objects first (the rest give way to them); 'k' scales the density, 'reach' the ranges (1 on a discrete GPU, less on an
+// integrated one), and the meshes are the cover renderer's indices
+fn coverTypes(k f32, reach f32, fern i32, cone i32, twig i32) List[groundcover.CoverType] {
+  mut types = List[groundcover.CoverType].empty();
+
+  // 0: ferns, in the shade and the damp
+  mut ferns = groundcover.CoverType.meshKind("ferns");
+  ferns.seed = 41u32;
+  ferns.density = 0.09 * k;
+  ferns.perCluster = 3u32;
+  ferns.clusterRadius = 1.2;
+  ferns.cellFactor = 0.6;
+  ferns.canopy = groundcover.Window.atLeast(0.3, 0.3);
+  ferns.moisture = groundcover.Window.atLeast(0.25, 0.15);
+  ferns.slope = groundcover.Window.atMost(35., 10.);
+  ferns.path = groundcover.Window.rising(0.5, 1.4);
+  ferns.water = groundcover.Window.rising(0.6, 1.4);
+  ferns.object = groundcover.Window.atLeast(0.6, 0.4);
+  ferns.sizeMin = 0.7;
+  ferns.sizeMax = 1.3;
+  ferns.widthMin = 0.8;
+  ferns.widthMax = 1.3;
+  ferns.lean = 0.08;
+  ferns.wind = 0.5;
+  ferns.baseColor = crgb(0.03, 0.10, 0.025);
+  ferns.tipColor = crgb(0.11, 0.30, 0.06);
+  ferns.altColor = crgb(0.18, 0.33, 0.07);
+  ferns.variation = 0.5;
+  ferns.translucency = 0.6;
+  ferns.meshes = [fern, fern, fern];
+  ferns.range = 50. * reach;
+  ferns.fadeStart = 36. * reach;
+  ferns.maxInstances = 6000u32;
+  types.push(ferns);
+
+  // 1: fallen cones, thickest where the shade is
+  mut cones = groundcover.CoverType.meshKind("cones");
+  cones.seed = 42u32;
+  cones.density = 0.07 * k;
+  cones.perCluster = 2u32;
+  cones.clusterRadius = 0.7;
+  cones.canopy = groundcover.Window.atLeast(0.5, 0.3);
+  cones.path = groundcover.Window.rising(0.4, 1.1);
+  cones.slope = groundcover.Window.atMost(40., 10.);
+  cones.object = groundcover.Window.atLeast(0.3, 0.3);
+  cones.sizeMin = 0.8;
+  cones.sizeMax = 1.5;
+  cones.widthMin = 1.;
+  cones.widthMax = 1.2;
+  cones.lean = 0.;
+  cones.sink = 0.2;
+  cones.wind = 0.;
+  cones.baseColor = crgb(0.045, 0.027, 0.014);
+  cones.tipColor = crgb(0.12, 0.072, 0.034);
+  cones.altColor = crgb(0.2, 0.12, 0.05);
+  cones.variation = 0.5;
+  cones.albedoNoise = 0.4;
+  cones.meshes = [cone, cone, cone];
+  cones.range = 24. * reach;
+  cones.fadeStart = 16. * reach;
+  cones.maxInstances = 5000u32;
+  types.push(cones);
+
+  // 2: twigs and fallen branches
+  mut twigs = groundcover.CoverType.meshKind("twigs");
+  twigs.seed = 43u32;
+  twigs.density = 0.012 * k;
+  twigs.canopy = groundcover.Window.atLeast(0.4, 0.3);
+  twigs.path = groundcover.Window.rising(0.4, 1.1);
+  twigs.slope = groundcover.Window.atMost(40., 10.);
+  twigs.object = groundcover.Window.atLeast(0.3, 0.3);
+  twigs.sizeMin = 0.7;
+  twigs.sizeMax = 1.6;
+  twigs.widthMin = 0.8;
+  twigs.widthMax = 1.3;
+  twigs.lean = 0.;
+  twigs.sink = 0.1;
+  twigs.wind = 0.;
+  twigs.baseColor = crgb(0.05, 0.035, 0.022);
+  twigs.tipColor = crgb(0.1, 0.07, 0.04);
+  twigs.altColor = crgb(0.17, 0.14, 0.11);
+  twigs.variation = 0.4;
+  twigs.albedoNoise = 0.35;
+  twigs.meshes = [twig, twig, twig];
+  twigs.range = 30. * reach;
+  twigs.fadeStart = 20. * reach;
+  twigs.maxInstances = 3000u32;
+  types.push(twigs);
+
+  // 3: the lawn: short fine grass wherever there is room
+  mut lawn = groundcover.CoverType.grass("lawn");
+  lawn.seed = 21u32;
+  lawn.density = 60. * k;
+  lawn.cellFactor = 0.5;
+  lawn.height = groundcover.Window.atLeast(2.9, 0.6);
+  lawn.slope = groundcover.Window.atMost(40., 10.);
+  lawn.canopy = groundcover.Window.atMost(0.55, 0.4);
+  lawn.exposure = groundcover.Window.atLeast(0.1, 0.3);
+  lawn.path = groundcover.Window.rising(0.0, 0.7);
+  lawn.water = groundcover.Window.rising(0.15, 0.9);
+  lawn.object = groundcover.Window.rising(0.0, 0.35);
+  lawn.patchScale = 9.;
+  lawn.patchThreshold = 0.3;
+  lawn.patchSoftness = 0.25;
+  lawn.patchFloor = 0.55;
+  lawn.sizeMin = 0.09;
+  lawn.sizeMax = 0.2;
+  lawn.sizeNoise = 0.4;
+  lawn.widthMin = 0.008;
+  lawn.widthMax = 0.012;
+  lawn.lean = 0.3;
+  lawn.bend = 0.55;
+  lawn.bladesPerTuft = 8u32;
+  lawn.baseColor = crgb(0.035, 0.1, 0.015);
+  lawn.tipColor = crgb(0.1, 0.23, 0.04);
+  lawn.altColor = crgb(0.22, 0.25, 0.05);
+  lawn.variation = 0.4;
+  lawn.dryColor = crgb(0.3, 0.26, 0.09);
+  lawn.dryAmount = 0.3;
+  lawn.translucency = 0.6;
+  lawn.wind = 0.8;
+  lawn.rings = 3u32;
+  lawn.ringEnd = [7. * reach, 20. * reach, 50. * reach];
+  lawn.ringStep = 1.9;
+  lawn.range = 50. * reach;
+  lawn.fadeStart = 36. * reach;
+  lawn.maxInstances = 70000u32;
+  lawn.farWeight = 0.9;
+  lawn.avoid(0u32, groundcover.NEAR, 0.8, 0.7);
+  types.push(lawn);
+
+  // 4: the meadow: taller grass in patches, away from the path, the cottage and the trees
+  mut meadow = groundcover.CoverType.grass("meadow");
+  meadow.seed = 22u32;
+  meadow.density = 14. * k;
+  meadow.cellFactor = 0.5;
+  meadow.height = groundcover.Window.atLeast(3.2, 0.6);
+  meadow.slope = groundcover.Window.atMost(36., 10.);
+  meadow.canopy = groundcover.Window.atMost(0.3, 0.3);
+  meadow.exposure = groundcover.Window.atLeast(0.15, 0.3);
+  meadow.path = groundcover.Window.rising(2., 5.);
+  meadow.water = groundcover.Window.rising(0.5, 1.5);
+  meadow.object = groundcover.Window.atLeast(5., 3.);
+  meadow.patchScale = 19.;
+  meadow.patchThreshold = 0.56;
+  meadow.patchSoftness = 0.15;
+  meadow.patchFloor = 0.;
+  meadow.sizeMin = 0.26;
+  meadow.sizeMax = 0.52;
+  meadow.sizeNoise = 0.35;
+  meadow.widthMin = 0.012;
+  meadow.widthMax = 0.019;
+  meadow.lean = 0.4;
+  meadow.bend = 0.65;
+  meadow.bladesPerTuft = 10u32;
+  meadow.baseColor = crgb(0.03, 0.09, 0.012);
+  meadow.tipColor = crgb(0.12, 0.26, 0.04);
+  meadow.altColor = crgb(0.26, 0.26, 0.06);
+  meadow.variation = 0.5;
+  meadow.dryColor = crgb(0.34, 0.28, 0.09);
+  meadow.dryAmount = 0.3;
+  meadow.translucency = 0.6;
+  meadow.wind = 1.;
+  meadow.rings = 3u32;
+  meadow.ringEnd = [9. * reach, 26. * reach, 60. * reach];
+  meadow.ringStep = 1.9;
+  meadow.range = 60. * reach;
+  meadow.fadeStart = 44. * reach;
+  meadow.maxInstances = 30000u32;
+  meadow.farWeight = 0.5;
+  meadow.avoid(0u32, groundcover.NEAR, 1.2, 0.8);
+  types.push(meadow);
+
+  // 5: tussocks in the damp
+  mut tussock = groundcover.CoverType.grass("tussock");
+  tussock.seed = 23u32;
+  tussock.density = 2.5 * k;
+  tussock.cellFactor = 0.5;
+  tussock.height = groundcover.Window.atLeast(2.8, 0.5);
+  tussock.moisture = groundcover.Window.atLeast(0.55, 0.2);
+  tussock.slope = groundcover.Window.atMost(30., 8.);
+  tussock.canopy = groundcover.Window.atMost(0.5, 0.3);
+  tussock.water = groundcover.Window.rising(0.4, 1.2);
+  tussock.path = groundcover.Window.rising(0.6, 1.5);
+  tussock.object = groundcover.Window.atLeast(0.8, 0.5);
+  tussock.patchScale = 9.;
+  tussock.patchThreshold = 0.4;
+  tussock.patchFloor = 0.3;
+  tussock.sizeMin = 0.55;
+  tussock.sizeMax = 0.95;
+  tussock.widthMin = 0.015;
+  tussock.widthMax = 0.022;
+  tussock.lean = 0.5;
+  tussock.bend = 0.9;
+  tussock.bladesPerTuft = 14u32;
+  tussock.baseColor = crgb(0.04, 0.1, 0.02);
+  tussock.tipColor = crgb(0.18, 0.33, 0.07);
+  tussock.altColor = crgb(0.38, 0.36, 0.1);
+  tussock.variation = 0.5;
+  tussock.rings = 2u32;
+  tussock.ringEnd = [14. * reach, 45. * reach, 45. * reach];
+  tussock.range = 45. * reach;
+  tussock.fadeStart = 32. * reach;
+  tussock.maxInstances = 10000u32;
+  tussock.avoid(0u32, groundcover.NEAR, 1., 0.8);
+  types.push(tussock);
+
+  // 6: beach grass (marram) on the dunes: the strip above the wet sand and below the lowland, on every shore
+  mut marram = groundcover.CoverType.grass("marram");
+  marram.seed = 24u32;
+  marram.density = 3.2 * k;
+  marram.cellFactor = 0.5;
+  marram.height = groundcover.Window.between(1.7, 3.3, 0.6);
+  marram.slope = groundcover.Window.atMost(32., 10.);
+  marram.path = groundcover.Window.rising(0.5, 1.4);
+  marram.object = groundcover.Window.atLeast(0.5, 0.4);
+  marram.patchScale = 7.;
+  marram.patchThreshold = 0.48;
+  marram.patchSoftness = 0.18;
+  marram.patchFloor = 0.05;
+  marram.sizeMin = 0.45;
+  marram.sizeMax = 0.9;
+  marram.widthMin = 0.01;
+  marram.widthMax = 0.016;
+  marram.lean = 0.55;
+  marram.bend = 0.85;
+  marram.bladesPerTuft = 14u32;
+  marram.baseColor = crgb(0.11, 0.13, 0.04);
+  marram.tipColor = crgb(0.42, 0.4, 0.17);
+  marram.altColor = crgb(0.28, 0.38, 0.1);
+  marram.variation = 0.5;
+  marram.dryColor = crgb(0.5, 0.42, 0.2);
+  marram.dryAmount = 0.35;
+  marram.translucency = 0.7;
+  marram.wind = 1.3;
+  marram.rings = 2u32;
+  marram.ringEnd = [16. * reach, 55. * reach, 55. * reach];
+  marram.range = 55. * reach;
+  marram.fadeStart = 40. * reach;
+  marram.maxInstances = 14000u32;
+  marram.farWeight = 0.35;
+  types.push(marram);
+
+  // 7, 8, 9: wildflowers in drifts on the open ground
+  mut daisies = groundcover.CoverType.flowerKind("daisies");
+  daisies.seed = 31u32;
+  daisies.density = 0.5 * k;
+  daisies.perCluster = 8u32;
+  daisies.clusterRadius = 1.1;
+  daisies.patchScale = 11.;
+  daisies.patchThreshold = 0.55;
+  daisies.patchSoftness = 0.1;
+  daisies.height = groundcover.Window.atLeast(3.2, 0.6);
+  daisies.slope = groundcover.Window.atMost(25., 8.);
+  daisies.canopy = groundcover.Window.atMost(0.15, 0.2);
+  daisies.moisture = groundcover.Window.atLeast(0.25, 0.2);
+  daisies.path = groundcover.Window.rising(0.5, 1.2);
+  daisies.water = groundcover.Window.rising(0.5, 1.3);
+  daisies.object = groundcover.Window.atLeast(1.4, 0.8);
+  daisies.sizeMin = 0.22;
+  daisies.sizeMax = 0.4;
+  daisies.widthMin = 0.026;
+  daisies.widthMax = 0.04;
+  daisies.flower = crgb(0.95, 0.95, 0.9);
+  daisies.flowerCenter = crgb(0.9, 0.62, 0.05);
+  daisies.altColor = crgb(0.95, 0.75, 0.8);
+  daisies.variation = 0.25;
+  daisies.petals = 12u32;
+  daisies.range = 42. * reach;
+  daisies.fadeStart = 30. * reach;
+  daisies.maxInstances = 12000u32;
+  types.push(daisies);
+
+  mut buttercups = groundcover.CoverType.flowerKind("buttercups");
+  buttercups.seed = 32u32;
+  buttercups.density = 0.45 * k;
+  buttercups.perCluster = 9u32;
+  buttercups.clusterRadius = 1.3;
+  buttercups.patchScale = 13.;
+  buttercups.patchThreshold = 0.58;
+  buttercups.patchSoftness = 0.1;
+  buttercups.height = groundcover.Window.atLeast(3.2, 0.6);
+  buttercups.slope = groundcover.Window.atMost(25., 8.);
+  buttercups.canopy = groundcover.Window.atMost(0.15, 0.2);
+  buttercups.moisture = groundcover.Window.atLeast(0.4, 0.15);
+  buttercups.path = groundcover.Window.rising(0.5, 1.2);
+  buttercups.water = groundcover.Window.rising(0.5, 1.3);
+  buttercups.object = groundcover.Window.atLeast(1.4, 0.8);
+  buttercups.sizeMin = 0.25;
+  buttercups.sizeMax = 0.45;
+  buttercups.widthMin = 0.022;
+  buttercups.widthMax = 0.032;
+  buttercups.flower = crgb(1., 0.72, 0.03);
+  buttercups.flowerCenter = crgb(0.85, 0.5, 0.02);
+  buttercups.altColor = crgb(1., 0.85, 0.2);
+  buttercups.variation = 0.3;
+  buttercups.petals = 5u32;
+  buttercups.range = 42. * reach;
+  buttercups.fadeStart = 30. * reach;
+  buttercups.maxInstances = 12000u32;
+  types.push(buttercups);
+
+  mut vetch = groundcover.CoverType.flowerKind("vetch");
+  vetch.seed = 33u32;
+  vetch.density = 0.3 * k;
+  vetch.perCluster = 6u32;
+  vetch.clusterRadius = 0.9;
+  vetch.patchScale = 8.;
+  vetch.patchThreshold = 0.6;
+  vetch.patchSoftness = 0.1;
+  vetch.height = groundcover.Window.atLeast(3.2, 0.6);
+  vetch.slope = groundcover.Window.atMost(30., 8.);
+  vetch.canopy = groundcover.Window.atMost(0.3, 0.3);
+  vetch.path = groundcover.Window.rising(0.5, 1.2);
+  vetch.water = groundcover.Window.rising(0.5, 1.3);
+  vetch.object = groundcover.Window.atLeast(1.4, 0.8);
+  vetch.sizeMin = 0.3;
+  vetch.sizeMax = 0.55;
+  vetch.widthMin = 0.02;
+  vetch.widthMax = 0.03;
+  vetch.flower = crgb(0.38, 0.16, 0.62);
+  vetch.flowerCenter = crgb(0.9, 0.85, 0.5);
+  vetch.altColor = crgb(0.6, 0.3, 0.75);
+  vetch.variation = 0.5;
+  vetch.petals = 5u32;
+  vetch.range = 42. * reach;
+  vetch.fadeStart = 30. * reach;
+  vetch.maxInstances = 9000u32;
+  types.push(vetch);
+
+  // 10: moss on the damp, shaded ground
+  mut moss = groundcover.CoverType.patchKind("moss");
+  moss.seed = 52u32;
+  moss.density = 0.3 * k;
+  moss.canopy = groundcover.Window.atLeast(0.3, 0.3);
+  moss.moisture = groundcover.Window.atLeast(0.3, 0.2);
+  moss.path = groundcover.Window.rising(0.2, 0.8);
+  moss.sizeMin = 0.015;
+  moss.sizeMax = 0.03;
+  moss.widthMin = 0.3;
+  moss.widthMax = 0.9;
+  moss.patchScale = 6.;
+  moss.patchThreshold = 0.45;
+  moss.patchFloor = 0.2;
+  moss.baseColor = crgb(0.012, 0.05, 0.008);
+  moss.tipColor = crgb(0.035, 0.11, 0.02);
+  moss.range = 35. * reach;
+  moss.fadeStart = 24. * reach;
+  moss.farWeight = 0.5;
+  moss.maxInstances = 10000u32;
+  types.push(moss);
+
+  // 11: needles under the crowns (thin, brown, a few fallen leaves among them)
+  mut needles = groundcover.CoverType.litterKind("needles");
+  needles.seed = 61u32;
+  needles.density = 80. * k;
+  needles.canopy = groundcover.Window.atLeast(0.35, 0.3);
+  needles.slope = groundcover.Window.atMost(45., 10.);
+  needles.path = groundcover.Window.rising(0.1, 0.7);
+  needles.patchScale = 3.;
+  needles.patchThreshold = 0.35;
+  needles.patchFloor = 0.35;
+  needles.sizeMin = 0.07;
+  needles.sizeMax = 0.13;
+  needles.widthMin = 0.004;
+  needles.widthMax = 0.008;
+  needles.lean = 0.2;
+  needles.baseColor = crgb(0.13, 0.07, 0.028);
+  needles.tipColor = crgb(0.13, 0.07, 0.028);
+  needles.altColor = crgb(0.34, 0.15, 0.04);
+  needles.variation = 0.55;
+  needles.dryColor = crgb(0.28, 0.2, 0.08);
+  needles.translucency = 0.2;
+  needles.range = 18. * reach;
+  needles.fadeStart = 12. * reach;
+  needles.farWeight = 0.6;
+  needles.maxInstances = 50000u32;
+  types.push(needles);
+  types;
+}
+
+// The cover renderer, built over the island (a renderer that is not 'built' draws nothing). 'integrated': the GPU is an integrated
+// one, and the cover is thinner and nearer. PEGASUS_COVER=off makes none.
+fn makeCover(device &mut Device, isl &Island, integrated bool) groundcover.CoverRenderer {
+  mut cover = groundcover.CoverRenderer.create(device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  imm e = libc.getenv("PEGASUS_COVER");
+  if (e as usize) != 0usize {
+    if libc.strcmp(cstr.fromPtr(e), "off") == 0i32 { return cover; }
+  }
+  if !cover.isValid() { return cover; }
+  imm t0 = sdl.GetPerformanceCounter();
+  imm maps = coverMaps(isl);
+  imm t1 = sdl.GetPerformanceCounter();
+  mut p = new leafrosette.FernParams();
+  p.seed = 3u32;
+  imm fernMesh = leafrosette.fernMesh(&p);
+  mut coneMesh = lathe(0.07, 0.017, 0., 1., 6, 5);
+  mut twigMesh = lathe(0.5, 0.011, 0.05, 0., 5, 6);
+  imm fern = cover.addMesh(&fernMesh);
+  imm cone = cover.addMesh(&coneMesh);
+  imm twig = cover.addMesh(&twigMesh);
+  // (PEGASUS_COVER=full makes the discrete tier on an integrated GPU, to measure what the thinner tier saves)
+  mut thin = integrated;
+  if (e as usize) != 0usize {
+    if libc.strcmp(cstr.fromPtr(e), "full") == 0i32 { thin = false; }
+  }
+  imm k = if thin { 0.4; } else { 1.; };
+  imm reach = if thin { 0.62; } else { 1.; };
+  imm types = coverTypes(k, reach, fern, cone, twig);
+  if !cover.build(device, &types, &maps) {
+    print <- "The ground cover could not be built\n";
+    return cover;
+  }
+  imm t2 = sdl.GetPerformanceCounter();
+  imm freq = f64.from(sdl.GetPerformanceFrequency());
+  print <- "Ground cover: maps "; print <- f64.from(t1 - t0) * 1000. / freq; print <- " ms, built "; print <- f64.from(t2 - t1) * 1000. / freq; print <- " ms; ";
+  print <- u64.from(types.len()); print <- " types, "; print <- u64.from(cover.batchCount); print <- " batches";
+  if integrated { print <- " (integrated tier)"; }
+  print <- "\n";
+  cover;
+}
