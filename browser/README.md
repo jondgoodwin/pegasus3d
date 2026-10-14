@@ -291,11 +291,15 @@ custom pipeline as static). A surface is not cut away by the near plane (its ver
 eye about to go through a portal's pane does not see the pane vanish. The particles (the burner's flame, the chimney's
 smoke, rain) are drawn into each picture after it, through the picture's own camera, over `RenderView.texture(renderer)` and against
 the view's depth (`drawSurfaceViews`; the effects and the weather are aimed before it, once a frame); a picture of the labyrinth has
-none. Not in the picture: the froxel fog (a pass over the main frame's depth), and shared
+none. The froxel fog is in the picture while image quality is on: each picture's view has its own fog passes and volume
+(`RenderView.enableFog`, called where the view is made; `view.fog` is set each frame in `drawSurfaceViews` from the weather: the island's air
+for a mirror on the island and for any picture of the island, none for the labyrinth's; `cutFog` on a camera cut and for a picture
+not drawn the frame before). Not in the picture: shared
 shadows (the picture's cascades are fitted to its own camera: render's `renderTo` does it, with no way to hand it the main
 frame's). Shadows are right (the cottage's shadow edge falls in the pane where it should).
 `--mirror-only --shots DIR` runs the mirror's part of the script (`src/mirrorscript.cone`); `--mirror-only --soak N
---mirror-hold 1|2` holds the eyes on the mirror or turned away, for timing; `PEGASUS_MIRROR_TIMING=1` times each picture on the
+--mirror-hold 1|2` holds the eyes on the mirror or turned away, for timing (`--hold-weather 4` puts the held view in rain, which has the
+thickest fog; `PEGASUS_NO_PICTURE_FOG=1` leaves the pictures unfogged, to see what their fog costs); `PEGASUS_MIRROR_TIMING=1` times each picture on the
 GPU, `PEGASUS_MIRROR_WINDOW=0` draws it the frame's whole view (the old way), `PEGASUS_MIRROR_SHADOWD=N` limits the sun's shadow
 reach in a picture to N metres and `PEGASUS_MIRROR_CASCADES=N` its cascades (2 saves about 0.7 ms of CPU and 0.3 ms of GPU, and the
 reflected lawn's shadows differ a little from the frame's; neither is the default), `PEGASUS_MIRROR_SCALE=N` the picture's size

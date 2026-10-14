@@ -79,6 +79,7 @@ pub struct PictureWorld {
   pub far f32;
   pub environment f32;          // how strongly the sky lights the physically based parts
   pub layers u32;               // the layers of the draw list it is made of (the island's, or the labyrinth's: portal.cone's LAB_LAYER)
+  pub fog FogSettings;          // the air it shows: the weather's froxel fog (enabled while there is some) for a picture of the island, none for the labyrinth's
 }
 
 // The worlds the frame's pictures can show: the viewer's own (a mirror), the island's day, and the labyrinth
@@ -118,6 +119,9 @@ pub struct ViewSurfaces {
   pub cascades u32 = 0u32;      // how many cascades of the sun's shadows a picture draws (PEGASUS_MIRROR_CASCADES, 1 to 4; 0: the frame's)
   pub off bool = false;         // PEGASUS_NO_PICTURES=1: no picture is drawn (a surface shows what it last held): to see what the pictures cost the frame
   envScale bool = false;        // the environment said the picture's sharpness: not the tier's to set
+  pub fogAllowed bool = true;   // PEGASUS_NO_PICTURE_FOG=1: the pictures are left unfogged, to see what their fog costs
+  pub fogOn bool = false;       // the pictures carry the froxel fog (the frame has image quality on: renderactor's 'fxTier' above 0)
+  pub fogBase FogSettings = new FogSettings();   // the grid and reach a picture's fog is made for (the tier's): a picture keeps its grid, or its volume is remade
 
   // The pictures by the GPU's tier: on an integrated GPU (fill-bound) sharper than 0.6 of the frame's is not worth the fill; unless the
   // environment said otherwise
@@ -140,6 +144,8 @@ pub struct ViewSurfaces {
     if (cs as usize) != 0usize { s.cascades = u32.from(wholeNumber(cs)); }
     imm np = libc.getenv("PEGASUS_NO_PICTURES");
     if (np as usize) != 0usize { s.off = libc.strcmp(cstr.fromPtr(np), "1") == 0i32; }
+    imm nf = libc.getenv("PEGASUS_NO_PICTURE_FOG");
+    if (nf as usize) != 0usize { s.fogAllowed = libc.strcmp(cstr.fromPtr(nf), "1") != 0i32; }
     imm wn = libc.getenv("PEGASUS_MIRROR_WINDOW");
     if (wn as usize) != 0usize { s.windowed = libc.strcmp(cstr.fromPtr(wn), "0") != 0i32; }
     s;
@@ -157,6 +163,13 @@ pub struct ViewSurfaces {
     view.layerMask = 1u32;
     view.lodBias = lodBias;
     if timing { view.enableTiming(device); }
+    // The froxel fog of the frame, over the picture (render's RenderView.enableFog, Cone #613): the picture's own volume, the size of
+    // the picture; drawn while 'fog.enabled', which 'drawSurfaceViews' sets from the world the picture shows. (It stalls the device once.)
+    if fogOn {
+      view.fog = *(&self.fogBase);
+      view.fog.enabled = false;
+      view.enableFog(renderer, device);
+    }
     view;
   }
 
@@ -389,7 +402,7 @@ pub fn fitWindow(other &mut Camera, fov f32, win Vec4, portal bool, jitterX f32,
 // the sequence the history averages, the picture is shifted the opposite way in x (a mirror's picture is mirrored left to right)
 // or the same way (a portal's), and the same way in y.
 pub fn drawSurfaceViews(surfaces &mut ViewSurfaces, renderer &mut Renderer, device &mut Device, camera &Camera,
-    env &PictureEnv, list &DrawList, particles &mut ParticleRenderer, effects bool, jitterX f32, jitterY f32, width u32, height u32) u32 {
+    env &PictureEnv, list &DrawList, particles &mut ParticleRenderer, effects bool, cut bool, jitterX f32, jitterY f32, width u32, height u32) u32 {
   mut drawn = 0u32;
   mut texels = 0u64;
   if surfaces.off { return 0u32; }
@@ -428,6 +441,10 @@ pub fn drawSurfaceViews(surfaces &mut ViewSurfaces, renderer &mut Renderer, devi
       if surfaces.cascades > 0u32 and surfaces.cascades < cascadesWas { renderer.shadow.settings.cascades = surfaces.cascades; }
       renderer.shadow.settings.enabled = shadowsWere and world.shadows;
       row.view.layerMask = world.layers;
+      // (a view whose fog passes were not made draws none, whatever this says)
+      row.view.fog = *(&world.fog);
+      // A camera that has cut (a teleport, a snap round) has no last picture's volume to blend in
+      if cut { row.view.cutFog(); }
       row.view.render(renderer, device, &other, &world.light, list, DEFAULT_MAX_NEST);
       if effects and !(portal and row.dest == DEST_UNDER) {
         mut enc = device.createCommandEncoder();
@@ -449,6 +466,9 @@ pub fn drawSurfaceViews(surfaces &mut ViewSurfaces, renderer &mut Renderer, devi
       surfaces.lastTriangles = row.view.triangles;
       texels = texels + u64.from(row.view.width) * u64.from(row.view.height);
       drawn = drawn + 1u32;
+    } else {
+      // (not drawn this frame: its last picture's fog volume is stale by the time it is next drawn)
+      row.view.cutFog();
     }
     i = i + 1usize;
   }
