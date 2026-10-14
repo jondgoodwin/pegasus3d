@@ -185,5 +185,14 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     color = lerp(color, lowColor, lowAlpha);
     // The horizon haze, over all of it
     color = lerp(color, hazeC, hazeMix);
+    // Below the horizon the sky is drawn only where no geometry is: past the sea's end (the far plane, 6 km,
+    // is a fraction of the way to the true horizon when the eye is high). The analytic sky is a flat grey there;
+    // carry on the colour the distant sea has there: its body and the sky it mirrors at that glancing angle (water.slang's)
+    float cosV = saturate(0.0 - dir.y);
+    float seaF = 0.02 + 0.98 * pow(1.0 - cosV, 5.0);
+    float3 seaLight = frame.ambient.rgb + frame.lightColor.rgb * (max(frame.lightDirection.y, 0.0) / 3.14159265);
+    float3 seaFar = float3(0.0055, 0.050, 0.075) * seaLight * (1.0 - seaF) + frame.ambient.rgb * 2.0 * seaF;
+    seaFar = lerp(seaFar, color, params.weatherB.x * 0.5);
+    color = lerp(color, seaFar, smoothstep(0.0, -0.004, dir.y));
     return float4(min(color * frame.exposure.x, 200.0), 1.0);
 }
