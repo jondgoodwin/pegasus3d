@@ -160,6 +160,7 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | T | the weather changes to the next of six states (clear, fair, cloudy, overcast, rain, snow), crossfading over 12 s of scene time |
 | N | mute the sound, or un-mute it (the master gain fades over 80 ms) |
 | H | hide the HUD, or show it again (below) |
+| G | print the camera, the hour and the weather to the terminal as a gallery shot-list section (under Automated runs: Gallery shots) |
 | F9 (or J) | open the "Play with others" panel: ask the island's owner to let you join (below); F9 closes it again |
 | B | bowl the ball at the spot the camera looks at (the playground, below) |
 | F1 | throw paint where the camera looks (30 m; trees, rocks, walls and the balloon's basket stop it) |
@@ -475,7 +476,51 @@ browser.exe --frames 600              600 frames on frame's synthetic clock
 browser.exe --soak 12000              12000 frames, checking nothing grows (below)
 browser.exe --watch 300               300 s in real time, a line a second and a key probe (below)
 browser.exe --navpic PREFIX           the villagers' navigation mesh drawn top-down as PREFIX-region.bmp, -cottage.bmp and -bridge.bmp
+browser.exe --gallery LIST [--shots DIR]   stills from a shot list: any camera, hour, weather and size, as PNGs (next section)
 ```
+
+### Gallery shots: `--gallery LIST`
+
+`browser.exe --gallery gallery.shots.toml` takes the stills a shot list names, one run for the lot, in the scripted run's harness (a
+synthetic clock, so the same list always gives the same pictures; the validation layer is on and the run ends `Script: OK`, `validation
+messages: 0`) but with none of its walk (`src/gallery.cone`). Each shot is drawn **off screen** at its own size, whatever the window is
+(the window is only the device's surface: a 4K shot on a 1080p laptop is fine), with no HUD and no name plates, and written as a PNG to
+`DIR/NAME.png`; `DIR` is `--shots DIR`, else the list's own folder. A shot is given 150 frames to settle first (the world has arrived,
+the temporal anti-aliasing has converged, the auto-exposure has adapted, the level-of-detail fades are done, the smoke and clouds are
+closed forms of the hour). The mannequins that stand on the lawn in a scripted run are taken away; there are no villagers. A run of
+eight shots at 2560x1440 (one at 3840x2160) takes about 45 s on the RTX 4060. A fault in the list is said with its line and the run
+does not start (exit 2).
+
+The list is TOML-like (a section per shot, `key = value`, `#` comments; the numbers are decimals, which the toml package does not read,
+so it has a reader of its own):
+
+```
+[defaults]                 # optional; what every shot after it starts from (any key but a camera's)
+size = 2560x1440           # pixels, 64 to 7680 by 4320 (default 1440x810)
+fov = 55                   # vertical, degrees (default 60)
+time = 12                  # the day clock: an hour, 0 to 24, or 17:54 (default 12); 7 sunrise, 17.2 sunset, 17.9 dusk, 23 night
+weather = fair             # clear, fair, cloudy, overcast, rain, snow (default fair)
+settle = 150               # frames to settle before the picture (default 150; the world's first 300 frames are not counted)
+
+[cottage-dusk]             # the name: letters, digits, - _ . ; the file is cottage-dusk.png
+pos-agl = -25, 1.5, 352    # the eye: x, height above the ground at that x z, z   (or  pos = x, y, z  with y the world's height)
+target-agl = -14, 4.5, 330 # a point to look at, the same two ways (target = x, y, z) ...
+                           # ... or  yaw = 20  and  pitch = 3  (degrees; yaw 0 faces -z, positive turns left, pitch positive up)
+time = 17.7
+day = 0                    # optional: which repeat of the day (the clouds differ from one to the next; the same time and day always match)
+```
+
+The world is in metres, x east, y up, z south: the cottage's front wall stands at (-16, 330) facing +z, the beach and its path at z 500,
+the brook's bridge at (-7, 314.4), the mirror in the cottage's north wall at (-14.5, 324). The labyrinth is 300 m under the island
+(its floor is y = -300, x -46 to 76, z 299 to 434); an eye there is lit as the labyrinth is, whatever the hour. Each shot sets the day
+clock and the weather outright (a settled state, no fade), so the shots are independent of their order. A sample list that gives the
+eight demonstration shots (the cottage at dusk, at night and in rain, the island from above in 4K, the brook's bridge, the shoreline
+at sunset, the mirror, a labyrinth room) is `tools/gallery.shots.toml`.
+
+**Finding poses.** In a normal window press **G**: the camera as it is, the hour and the weather are printed to the terminal as a
+shot-list section (`[camera-1]`, `pos`, `target` 30 m ahead, `fov`, `time`, `weather`, `size`); paste it into the list and rename it. It
+is the view's own eyes (first or third person), so walk or take the balloon to where the picture is, and press G. To compose by
+numbers, run a draft list at `size = 960x540` with `settle = 45` (about 10 s a dozen shots) and look at the PNGs.
 
 `--script` pushes key events into SDL's own queue (never the operating system's), so nothing reaches
 any other window, and a run of a fixed number of frames ignores the real keyboard and mouse (and the

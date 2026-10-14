@@ -114,6 +114,7 @@ import audiomixer use Control, Engine, Cmd, Listener, Attenuation, commandQueue,
   BUS_MASTER, BUS_EFFECTS, BUS_AMBIENCE, MATERIAL_GRASS, MATERIAL_WOOD, MATERIAL_STONE, Sound, encodeWav, spectrum, bandFraction,
   centroid, dominantFreq;
 import audiodevice;
+import imagedecode use PngWrite, encodePngSamples;   // the gallery's pictures are PNGs (gallery.cone)
 
 // The submodules: the scene's parts, ids, tables and requests (parts/), whose
 // names the browser folds in, and the baked-in world (bakedworld/), a sister
@@ -160,6 +161,7 @@ const START_Z f32 = 8. + WORLD_DZ;
 // SDL3's scancodes for P and F (the sdl package binds only some letters)
 const SCANCODE_B = 5u;
 const SCANCODE_F = 9u;
+const SCANCODE_G = 10u;
 const SCANCODE_P = 19u;
 const SCANCODE_T = 23u;
 
@@ -194,6 +196,7 @@ struct HudActions {
   pub s6 Action;
   pub s7 Action;
   pub bowl Action;            // B: bowl the ball (props.cone); it rides in 'hudSlots' as bit 8
+  pub cam Action;             // G: print the camera as a shot-list section (gallery.cone); it has its own flag in the frame's input
 
   fn slot(ctx &mut Context, n u32) Action {
     imm a = ctx.action("hud.slot", BUTTON);
@@ -214,7 +217,9 @@ struct HudActions {
     imm a7 = HudActions.slot(ctx, 7u32);
     imm bowl = ctx.action("play.bowl", BUTTON);
     ctx.bind(bowl, Binding.key(SCANCODE_B));
-    new HudActions(hide, a0, a1, a2, a3, a4, a5, a6, a7, bowl);
+    imm cam = ctx.action("gallery.camera", BUTTON);
+    ctx.bind(cam, Binding.key(SCANCODE_G));
+    new HudActions(hide, a0, a1, a2, a3, a4, a5, a6, a7, bowl, cam);
   }
 
   // The slots pressed this frame, as bits
@@ -321,10 +326,11 @@ struct Startup {
   watch Watch;                // --watch and --soak (watch.cone)
   startedAt u64;              // the performance counter when main began
   playerName String;          // --name NAME: the name this client plays under on a server (default: the machine's name)
+  gallery GalleryPlan;        // --gallery FILE: the shots to take (gallery.cone)
 
   fn make(startedAt u64) Startup {
     new Startup(String.empty(), String.empty(), AudioOptions.make(), RunOptions.make(), ServeOptions.make(), Watch.make(), startedAt,
-      String.empty());
+      String.empty(), GalleryPlan.none());
   }
 }
 
@@ -375,6 +381,7 @@ pub struct RunOptions {
   panelOnly bool = false;     // --panel-only: just the "Play with others" panel's part of the scripted run (panelscript.cone)
   panelJoin u32 = 0u32;       // --panel-join (1) or --panel-join-refused (2), with --panel-only: after the answer the script clicks Join (panelscript.cone)
   switchAt u64 = 0u64;       // --switch-at N: a test hook; at frame N the panel's Join is done for the player (the address is PEGASUS_JOIN_ADDRESS)
+  gallery bool = false;       // --gallery FILE: the shot list's stills (gallery.cone), in the scripted run's harness but none of its walk
 
   fn make() RunOptions { new RunOptions(false, false, true, false, 2u32, false, false, false, 0u64, false); }
 }
@@ -493,7 +500,7 @@ fn shellRun(config Config, startup Startup) i32 {
     mut servedTx Sender[u64];
     mut servedRx Receiver[u64];
     servedTx, servedRx = Channel[u64].make();
-    imm sim = new SimActor(opts, birds, world, false, joinedTx.clone(), servedTx, land.share());
+    imm sim = new SimActor(opts, birds, world, false, joinedTx.clone(), servedTx, land.share(), startup.gallery.copy());
     simOpt = Some[SimActor](sim);
     simOpt2 = Some[SimActor](sim);
     joinsToWait = 2;
@@ -529,7 +536,7 @@ fn shellRun(config Config, startup Startup) i32 {
     print <- "The connection could not be opened\n";
     return 1i32;
   }
-  if opts.scripted { pushScript(&opts, 1u64); }
+  if opts.scripted and !opts.gallery { pushScript(&opts, 1u64); }
   imm runStart = sdl.GetTicksNS();
   mut refusedRun = false;
   mut wentOnline = false;       // the view switched to a server (a Join): its socket's thread needs time to stop, as a --connect run's
@@ -605,7 +612,7 @@ fn shellRun(config Config, startup Startup) i32 {
       shell.ctx.pressed(shell.user.actions.view), shell.ctx.pressed(shell.user.actions.swap),
       (shell.state.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u, new Vec2(shell.state.pointer.x, shell.state.pointer.y),
       viewNow, alpha, resized, width, height, shell.ctx.pressed(shell.hudKeys.hide), shell.hudKeys.pressedSlots(&shell.ctx),
-      shell.panel.take(), panelHint);
+      shell.panel.take(), panelHint, shell.ctx.pressed(shell.hudKeys.cam));
     view.frame(input);
 
     // The frame comes back presented, with each actor's phases
@@ -696,6 +703,7 @@ fn main(argc i32, argv **u8) i32 {
   mut a = 1i32;
   mut requestPlayAsked = false;       // --request-play: ask to be let in (requestplay.cone), and nothing else
   mut requestMessage = String.empty();
+  mut galleryFile = String.empty();   // --gallery FILE
   while a < argc {
     imm arg = cstr.fromPtr(*(argv + usize.from(a)));     // argv's strings each end in a NUL
     if libc.strcmp(arg, "--request-play") == 0i32 {
@@ -728,6 +736,10 @@ fn main(argc i32, argv **u8) i32 {
       return if ok { 0i32; } else { 1i32; };
     } elif libc.strcmp(arg, "--script") == 0i32 {
       startup.opts.scripted = true;
+    } elif libc.strcmp(arg, "--gallery") == 0i32 and a + 1i32 < argc {
+      // Stills from a shot list (gallery.cone): each at its camera, hour, weather and size, saved as PNGs in --shots DIR (default: the list's folder)
+      galleryFile = String.fromCStr(*(argv + usize.from(a + 1i32)));
+      a = a + 1i32;
     } elif libc.strcmp(arg, "--no-sky") == 0i32 {
       startup.opts.skyOff = true;
     } elif libc.strcmp(arg, "--audio-walk") == 0i32 and a + 1i32 < argc {
@@ -856,6 +868,40 @@ fn main(argc i32, argv **u8) i32 {
     }
     a = a + 1i32;
   }
+  if galleryFile.len() > 0usize {
+    mut found = false;
+    match fs.readFile(&Path.from(galleryFile.view())) {
+      case imm text Ok {
+        found = true;
+        startup.gallery = readGallery(text.view());
+      }
+      else {}
+    }
+    if !found {
+      print <- "gallery: cannot read the shot list "; printStr(galleryFile.view()); print <- "\n";
+      finalAll();
+      return 2i32;
+    }
+    if !startup.gallery.ok {
+      finalAll();
+      return 2i32;
+    }
+    startup.opts.scripted = true;
+    startup.opts.gallery = true;
+    config.frames = galleryEnd(&startup.gallery);
+    config.synthetic = true;
+    // The pictures go beside the list unless --shots says
+    if startup.shotsDir.len() == 0usize {
+      imm gv = galleryFile.view();
+      mut slash = gv.len;
+      mut g = 0usize;
+      while g < gv.len { if gv[g] == '/' or gv[g] == '\\' { slash = g; } g = g + 1usize; }
+      startup.shotsDir = if slash < gv.len { galleryFile.sub(0usize, slash); } else { String.from("."); };
+    }
+    imm made = fs.makeDirAll(&Path.from(startup.shotsDir.view()));
+    print <- "Gallery: "; print <- startup.gallery.shots.len(); print <- " shots, "; print <- config.frames; print <- " frames, into ";
+    printStr(startup.shotsDir.view()); print <- "\n";
+  }
   if requestPlayAsked {
     if startup.playerName.len() == 0usize { startup.playerName = defaultPlayerName(); }
     imm result = requestPlay(startup.playerName.view(), requestMessage.view());
@@ -904,7 +950,7 @@ fn main(argc i32, argv **u8) i32 {
     config.synthetic = true;
   }
   if startup.opts.scripted and !startup.opts.hudOnly and !startup.opts.mirrorOnly and !startup.opts.panelOnly and !startup.opts.labOnly
-    and !startup.opts.portalOnly and !startup.opts.creaturesOnly {
+    and !startup.opts.portalOnly and !startup.opts.creaturesOnly and !startup.opts.gallery {
     if config.frames == 0u64 {
       config.frames = SCRIPT_FRAMES;
       config.synthetic = true;

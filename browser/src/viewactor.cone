@@ -88,11 +88,12 @@ pub struct FrameInput {
   pub hudSlots u32;           // bit n: F(n+1) pressed, the hotbar's slot n
   pub panelEvents List[PanelEvent]; // the "Play with others" panel's keys, text and mouse (requestpanel.cone), taken from the walk's
   pub panelHint bool;         // the HUD says which key opens that panel
+  pub camNote bool;           // G pressed: the camera is printed as a shot-list section (gallery.cone)
 
   // No frame yet
   pub fn none() FrameInput {
     new FrameInput(0u64, List[Step].empty(), Intents.none(), 0., 0., false, false, false, false, false, false, new Vec2(0., 0.),
-      new Vec2(HEADLESS_W, HEADLESS_H), 0., false, 0u32, 0u32, false, 0u32, List[PanelEvent].empty(), false);
+      new Vec2(HEADLESS_W, HEADLESS_H), 0., false, 0u32, 0u32, false, 0u32, List[PanelEvent].empty(), false, false);
   }
 }
 
@@ -269,6 +270,9 @@ pub struct ViewState {
   pub creatureParts List[CreatureParts];   // the extra parts of each creature's body, to pose with it
   pub possessedSeen bool = false;   // a server's Possessed has arrived: it has taken this client in (goOnline waits for it)
   pub shotFrame u64 = 0u64;   // the test hook's (--switch-at): the frame the "switch-after" view is saved at
+  pub testW u32 = 0u32;       // a gallery run's: the size the frame is drawn at (0: the window's)
+  pub testH u32 = 0u32;
+  notes u32 = 0u32;           // the camera sections G has printed
 
   pub fn make(birds Birds, lockstep bool, audio AudioView, playerName String, land Island, opts RunOptions) ViewState {
     imm still = Pose.look(new Vec3(0., 0., 0.), 0., 0.);
@@ -599,6 +603,8 @@ pub struct ViewState {
       testView = ts[t].view;
       testFov = ts[t].fov;
       testShot = ts[t].shot.copy();
+      testW = ts[t].width;
+      testH = ts[t].height;
       t = t + 1usize;
     }
     testIn.clear();
@@ -1303,8 +1309,12 @@ pub struct ViewState {
     mut snap = Snapshot.empty();
     snap <=> snapshot;
     imm requests = self.takeForRender(input.frame);
-    new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, self.shotFor(input.frame),
+    mut order = new DrawOrder(snap, requests, input.alpha, input.frame, input.resized, input.width, input.height, self.shotFor(input.frame),
       self.hudFrame(input));
+    // (a gallery run draws off screen, at the size its shot says)
+    order.capW = testW;
+    order.capH = testH;
+    order;
   }
 
   // The view to save at frame 'f': the scripted run's (from the simulation), else the test hook's (--switch-at N): one the frame
@@ -1325,9 +1335,25 @@ pub struct ViewState {
     cast.phys.lineClear(from, to);
   }
 
+  // G: the camera as it is, printed as a section of a shot list (gallery.cone), to paste into one: the eye, a point 30 m ahead of it to
+  // look at, the lens, the hour and the weather (the size is the list's to say)
+  fn noteCamera(self &mut) {
+    imm eye = cast.eyes();
+    imm ahead = eye.origin + eye.forward() * 30.;
+    notes = notes + 1u32;
+    print <- "[camera-"; print <- notes; print <- "]\n";
+    print <- "pos = "; print <- round2(eye.origin.x); print <- ", "; print <- round2(eye.origin.y); print <- ", "; print <- round2(eye.origin.z); print <- "\n";
+    print <- "target = "; print <- round2(ahead.x); print <- ", "; print <- round2(ahead.y); print <- ", "; print <- round2(ahead.z); print <- "\n";
+    print <- "fov = "; print <- round2(FOV * 57.29578); print <- "\n";
+    print <- "time = "; print <- round2(f32.from(hourAt(sceneNow))); print <- "\n";
+    print <- "weather = "; printStr(weatherName(weather.target)); print <- "\n";
+    print <- "size = 2560x1440\n";
+  }
+
   // What the HUD shows this frame (hud.cone): where the user's being and the others are, the clock, the weather, the frame time
   fn hudFrame(self &mut, input &FrameInput) HudFrame {
     if input.hudHide { hud.on = !hud.on; }
+    if input.camNote { self.noteCamera(); }
     hud.tick();
     mut you = new Vec3(0., 0., 0.);
     mut yaw = 0.;
@@ -1720,7 +1746,8 @@ actor ViewActor {
     // correction is a real misprediction: the script lifts one mannequin 6 m on purpose, and nothing in it is out by more than that
     // (not after a switch to a server: the script's walkers are the single-player simulation's, which has ended)
     if st.opts.scripted and !switched {
-      imm okSets = st.setDowned >= 1u64 and st.worstSetDown > 100.;
+      // (a gallery run sets nobody down)
+      imm okSets = st.opts.gallery or (st.setDowned >= 1u64 and st.worstSetDown > 100.);
       imm okFix = st.worstError < 6.5;
       print <- "Corrections: the script's set-downs are counted apart ("; print <- st.setDowned; print <- ", farthest "; print <- st.worstSetDown;
       print <- " m): "; if okSets { print <- "yes\n"; } else { print <- "NO\n"; }
