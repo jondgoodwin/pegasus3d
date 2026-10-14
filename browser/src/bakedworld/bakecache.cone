@@ -1,0 +1,422 @@
+// The bake cache: a texture set baked once is kept on disk, and the next start loads it instead of baking it again.
+//
+// WHAT IS KEPT. The three maps the world's materials use from a baked pbrmaterial.TextureSet: the base colour, the normal
+// and the occlusion-roughness-metallic map (their width, height, channels and bytes). The set's other maps (height, wear and
+// grime masks) are never read by the world, so a loaded set holds them empty.
+//
+// THE KEY. A file is named for the bake and a hash of what it was made from: the PROGRAM (the running executable's size and the
+// time it was last written, which change with every build, so a changed bake function, kernel, package or constant is a
+// different program), the bake's NAME, its INPUTS (the tile's size in texels and its seed), the cache's format number, and
+// PEGASUS_BAKE_SALT if set. A bake whose key is not in the folder runs and is stored; one whose key is there is read back.
+// (The program is the executable, not the bake function's source: a bake's inputs that are code are only known to the build.
+// The cost is that every build re-bakes once; the benefit is that a stale texture can never be loaded.)
+//
+// WHERE. A user cache folder, not the executable's: the installed program may sit where its user cannot write, and two
+// builds of the program (a worktree's and master's) must not trip over each other. PEGASUS_BAKE_CACHE=DIR picks the
+// folder, PEGASUS_BAKE_CACHE=off turns the cache off (every start bakes, as before). Otherwise it is
+// %LOCALAPPDATA%\pegasus3d\bakecache on Windows and $XDG_CACHE_HOME (or ~/.cache)/pegasus3d/bakecache elsewhere.
+// A file of another program's, a day old or more, is deleted when something is stored.
+//
+// SAFE. A file is written under a temporary name and renamed into place, so a reader never meets half of one; the reader
+// checks the magic, the format, the key, the exact length and a checksum of the payload, and a file that fails any of them is
+// ignored (and rebaked and replaced). Nothing is ever read back that was made by another program or other inputs.
+// Nothing here is kept in a global; the log of what was loaded and what was baked is the hydrated object's (BakeLog).
+
+const BC_MAGIC = 0x4b423350u32;       // "P3BK"
+const BC_FORMAT = 1u32;
+const BC_FNV_OFFSET = 14695981039346656037u64;
+const BC_FNV_PRIME = 1099511628211u64;
+const BC_MAX_BYTES = 268435456usize;  // no map of a set is bigger than 256 MB
+const BC_STALE_SECONDS = 86400i64;
+
+extern {
+  fn @c("SDL_GetBasePath") bcBasePath() *u8;
+}
+
+// What the hydrated object's bakes did: sets loaded from the cache and sets baked (and stored), with their time, milliseconds
+pub struct BakeLog {
+  pub loaded u32 = 0u32;
+  pub baked u32 = 0u32;
+  pub loadMs f64 = 0d;
+  pub bakeMs f64 = 0d;
+}
+
+fn bcMixByte(h u64, b u8) u64 { (h ^ u64.from(b)) * BC_FNV_PRIME; }
+
+fn bcMixU64(h u64, x u64) u64 {
+  mut r = h;
+  mut k = 0u32;
+  while k < 8u32 {
+    r = bcMixByte(r, u8.from((x >> (k * 8u32)) & 0xFFu64));
+    k = k + 1u32;
+  }
+  r;
+}
+
+fn bcMixText(h u64, s &str) u64 {
+  imm b &Array[u8] = s;
+  mut r = h;
+  mut i = 0usize;
+  while i < b.len {
+    r = bcMixByte(r, b[i]);
+    i = i + 1usize;
+  }
+  bcMixByte(r, 0u8);
+}
+
+fn bcHex(x u64) String {
+  mut out = String.empty();
+  mut k = 16i32;
+  while k > 0i32 {
+    k = k - 1i32;
+    imm d = u8.from((x >> (u64.from(k) * 4u64)) & 0xFu64);
+    out.appendByte(if d < 10u8 { '0' + d; } else { 'a' + (d - 10u8); });
+  }
+  out;
+}
+
+// The checksum of 'n' bytes at 'p': a word at a time (the payload is tens of megabytes)
+fn bcSum(p *u8, n usize) u64 {
+  mut h = BC_FNV_OFFSET;
+  imm words = n / 8usize;
+  imm w = p as *u64;
+  mut i = 0usize;
+  while i < words {
+    h = ((h ^ *(w + i)) * BC_FNV_PRIME) ^ (h >> 29u64);
+    i = i + 1usize;
+  }
+  mut j = words * 8usize;
+  while j < n {
+    h = bcMixByte(h, *(p + j));
+    j = j + 1usize;
+  }
+  h;
+}
+
+// The running program's identity: the executable's size and last-written second, mixed. 0: it could not be found (no caching).
+fn bcProgramStamp() u64 {
+  imm base = bcBasePath();
+  if (base as usize) == 0usize { return 0u64; }
+  imm dir = BPath.from(String.fromCStr(base).view());
+  mut stamp = 0u64;
+  mut which = 0u32;
+  while which < 2u32 and stamp == 0u64 {
+    imm file = dir.join(if which == 0u32 { "browser.exe"; } else { "browser"; });
+    match fs.stat(&file) {
+      case imm info Ok {
+        if info.isFile {
+          stamp = bcMixU64(bcMixU64(BC_FNV_OFFSET, u64.from(info.size)), u64.from(info.modified.unixSeconds()));
+        }
+      }
+      else {}
+    }
+    which = which + 1u32;
+  }
+  stamp;
+}
+
+// The cache's folder; empty: no cache
+fn bcFolder() BPath {
+  imm own = libc.getenv("PEGASUS_BAKE_CACHE");
+  if (own as usize) != 0usize {
+    if libc.strcmp(cstr.fromPtr(own), "off") == 0i32 or libc.strcmp(cstr.fromPtr(own), "") == 0i32 { return BPath.from(""); }
+    return BPath.from(String.fromCStr(own).view());
+  }
+  imm appData = libc.getenv("LOCALAPPDATA");
+  if (appData as usize) != 0usize { return BPath.from(String.fromCStr(appData).view()).join("pegasus3d").join("bakecache"); }
+  imm xdg = libc.getenv("XDG_CACHE_HOME");
+  if (xdg as usize) != 0usize { return BPath.from(String.fromCStr(xdg).view()).join("pegasus3d").join("bakecache"); }
+  imm home = libc.getenv("HOME");
+  if (home as usize) != 0usize { return BPath.from(String.fromCStr(home).view()).join(".cache").join("pegasus3d").join("bakecache"); }
+  BPath.from("");
+}
+
+// One bake's place in the cache: valid if there is a cache and a program to key it by
+pub struct BakeKey {
+  pub valid bool;
+  pub hash u64;                // of the program and the inputs
+  pub stamp String;            // the program's part of the file name
+  pub dir BPath;
+  pub file BPath;
+
+  pub fn none() BakeKey { new BakeKey(false, 0u64, String.empty(), BPath.from(""), BPath.from("")); }
+
+  // The key of the bake 'name' (letters, digits and dashes) of a tile 'size' texels a side from 'seed', in the cache folder
+  pub fn make(name &str, size i32, seed u32) BakeKey {
+    BakeKey.inFolder(bcFolder(), name, size, seed);
+  }
+
+  // The same, in the folder 'dir' (the cache's checks use a folder of their own)
+  pub fn inFolder(dir BPath, name &str, size i32, seed u32) BakeKey {
+    if dir.isEmpty() { return BakeKey.none(); }
+    imm program = bcProgramStamp();
+    if program == 0u64 { return BakeKey.none(); }
+    mut h = bcMixU64(BC_FNV_OFFSET, program);
+    h = bcMixU64(h, u64.from(BC_FORMAT));
+    h = bcMixText(h, name);
+    h = bcMixU64(h, u64.from(u32.from(size)));
+    h = bcMixU64(h, u64.from(seed));
+    imm salt = libc.getenv("PEGASUS_BAKE_SALT");
+    if (salt as usize) != 0usize { h = bcMixText(h, String.fromCStr(salt).view()); }
+    mut stamp = bcHex(program);
+    mut fileName = String.from(name);
+    fileName.append("-");
+    fileName.append(stamp.view());
+    fileName.append("-");
+    fileName.append(bcHex(h).view());
+    fileName.append(".bake");
+    imm file = dir.join(fileName.view());
+    new BakeKey(true, h, stamp, dir, file);
+  }
+}
+
+// ---- The file ----
+
+fn bcPutU32(out &mut List[u8], x u32) {
+  mut k = 0u32;
+  while k < 4u32 { out.push(u8.from((x >> (k * 8u32)) & 0xFFu32)); k = k + 1u32; }
+}
+
+fn bcPutU64(out &mut List[u8], x u64) {
+  mut k = 0u32;
+  while k < 8u32 { out.push(u8.from((x >> (u64.from(k) * 8u64)) & 0xFFu64)); k = k + 1u32; }
+}
+
+// 'n' bytes from 'src' at the end of 'out'
+fn bcPutBytes(out &mut List[u8], src *u8, n usize) {
+  imm at = out.len();
+  out.resize(at + n, 0u8);
+  if n > 0usize { libc.memcpy((out.viewMut() as *u8) + at, src, n); }
+}
+
+fn bcPutMap(out &mut List[u8], m &pbrmaterial.TexelMap) {
+  bcPutU32(out, u32.from(m.width));
+  bcPutU32(out, u32.from(m.height));
+  bcPutU32(out, u32.from(m.channels));
+  bcPutU64(out, u64.from(m.pixels.len()));
+  bcPutBytes(out, m.pixels.view() as *u8, m.pixels.len());
+}
+
+fn bcGetU32(b &Array[u8], at usize) u32 {
+  u32.from(b[at]) | (u32.from(b[at + 1usize]) << 8u32) | (u32.from(b[at + 2usize]) << 16u32) | (u32.from(b[at + 3usize]) << 24u32);
+}
+
+fn bcGetU64(b &Array[u8], at usize) u64 {
+  u64.from(bcGetU32(b, at)) | (u64.from(bcGetU32(b, at + 4usize)) << 32u64);
+}
+
+// A set with nothing in it
+pub fn bcEmptySet() pbrmaterial.TextureSet {
+  new pbrmaterial.TextureSet(0, pbrmaterial.TexelMap.withCapacity(0, 0, 0), pbrmaterial.TexelMap.withCapacity(0, 0, 0),
+    pbrmaterial.TexelMap.withCapacity(0, 0, 0), pbrmaterial.TexelMap.withCapacity(0, 0, 0), pbrmaterial.TexelMap.withCapacity(0, 0, 0),
+    pbrmaterial.TexelMap.withCapacity(0, 0, 0), pbrmaterial.ScalarMap.zeros(0));
+}
+
+// Read the map at 'at' of 'b' into 'm', and move 'at' past it; false if it does not fit the file
+fn bcGetMap(b &Array[u8], at &mut usize, m &mut pbrmaterial.TexelMap) bool {
+  if *at + 20usize > b.len { return false; }
+  imm w = i32.from(bcGetU32(b, *at));
+  imm h = i32.from(bcGetU32(b, *at + 4usize));
+  imm c = i32.from(bcGetU32(b, *at + 8usize));
+  imm n = bcGetU64(b, *at + 12usize);
+  *at = *at + 20usize;
+  if w < 0i32 or h < 0i32 or c < 0i32 or n > u64.from(BC_MAX_BYTES) { return false; }
+  if n != u64.from(w) * u64.from(h) * u64.from(c) { return false; }
+  if *at + usize.from(n) > b.len { return false; }
+  mut px = List[u8].withCapacity(usize.from(n));
+  px.resize(usize.from(n), 0u8);
+  if n > 0u64 { libc.memcpy(px.viewMut() as *u8, (b as *u8) + *at, usize.from(n)); }
+  *at = *at + usize.from(n);
+  m.width = w;
+  m.height = h;
+  m.channels = c;
+  m.pixels <=> px;
+  true;
+}
+
+// The cached set under 'key' read into 'set'; false (and 'set' as it was) if there is none, or the file is not exactly what
+// this key wrote
+pub fn bcLoad(key &BakeKey, set &mut pbrmaterial.TextureSet) bool {
+  if !key.valid { return false; }
+  match fs.readFile(&key.file) {
+    case imm text Ok {
+      imm b &Array[u8] = text.view();
+      if b.len < 40usize { return false; }
+      if bcGetU32(b, 0usize) != BC_MAGIC or bcGetU32(b, 4usize) != BC_FORMAT or bcGetU64(b, 8usize) != key.hash { return false; }
+      imm size = i32.from(bcGetU32(b, 16usize));
+      imm payload = bcGetU64(b, 20usize);
+      imm sum = bcGetU64(b, 28usize);
+      if payload != u64.from(b.len - 36usize) { return false; }
+      if bcSum((b as *u8) + 36usize, b.len - 36usize) != sum { return false; }
+      mut at = 36usize;
+      mut base = pbrmaterial.TexelMap.withCapacity(0, 0, 0);
+      mut normal = pbrmaterial.TexelMap.withCapacity(0, 0, 0);
+      mut orm = pbrmaterial.TexelMap.withCapacity(0, 0, 0);
+      if !bcGetMap(b, &mut at, &mut base) or !bcGetMap(b, &mut at, &mut normal) or !bcGetMap(b, &mut at, &mut orm) { return false; }
+      if at != b.len { return false; }
+      set.size = size;
+      set.baseColor <=> base;
+      set.normal <=> normal;
+      set.orm <=> orm;
+      return true;
+    }
+    else {}
+  }
+  false;
+}
+
+// Delete what another program left here a day ago or more (the cache would grow with every build)
+fn bcPrune(key &BakeKey) {
+  match fs.readDir(&key.dir) {
+    case imm entries Ok {
+      imm now = time.Timestamp.now().unixSeconds();
+      mut i = 0usize;
+      while i < entries.len() {
+        imm e = entries[i];
+        i = i + 1usize;
+        if !e.isFile { continue; }
+        imm name = e.name.view();
+        imm isOurs = name.contains(key.stamp.view());
+        if isOurs { continue; }
+        match fs.stat(&e.path) {
+          case imm info Ok {
+            if now - info.modified.unixSeconds() > BC_STALE_SECONDS { match fs.removeFile(&e.path) { else {} } }
+          }
+          else {}
+        }
+      }
+    }
+    else {}
+  }
+}
+
+// Keep 'set' under 'key'. A failure (no room, no rights) is silent: the bake simply is not cached.
+pub fn bcStore(key &BakeKey, set &pbrmaterial.TextureSet) {
+  if !key.valid { return; }
+  match fs.makeDirAll(&key.dir) { else {} }
+  mut out = List[u8].empty();
+  bcPutU32(&mut out, BC_MAGIC);
+  bcPutU32(&mut out, BC_FORMAT);
+  bcPutU64(&mut out, key.hash);
+  bcPutU32(&mut out, u32.from(set.size));
+  bcPutU64(&mut out, 0u64);       // the payload's length, below
+  bcPutU64(&mut out, 0u64);       // and its checksum
+  bcPutMap(&mut out, &set.baseColor);
+  bcPutMap(&mut out, &set.normal);
+  bcPutMap(&mut out, &set.orm);
+  imm payload = out.len() - 36usize;
+  imm sum = bcSum((out.view() as *u8) + 36usize, payload);
+  // (the two fields in place)
+  mut k = 0u32;
+  while k < 8u32 {
+    out.set(20usize + usize.from(k), u8.from((u64.from(payload) >> (u64.from(k) * 8u64)) & 0xFFu64));
+    out.set(28usize + usize.from(k), u8.from((sum >> (u64.from(k) * 8u64)) & 0xFFu64));
+    k = k + 1u32;
+  }
+  mut tmpName = String.from(key.file.name());
+  tmpName.append(".tmp");
+  tmpName.append(bcHex(sdl.GetPerformanceCounter()).view());
+  imm tmp = key.dir.join(tmpName.view());
+  mut written = false;
+  match fs.writeFile(&tmp, out.view()) {
+    case is Ok { written = true; }
+    else {}
+  }
+  if written {
+    mut renamed = false;
+    match fs.rename(&tmp, &key.file) {
+      case is Ok { renamed = true; }
+      else {}
+    }
+    if !renamed {
+      // (a file already there, which Windows will not rename over: a damaged one that was just read and refused, or a racing
+      // process's; it goes, and ours takes its place)
+      match fs.removeFile(&key.file) { else {} }
+      match fs.rename(&tmp, &key.file) {
+        case is Ok { renamed = true; }
+        else {}
+      }
+    }
+    if !renamed { match fs.removeFile(&tmp) { else {} } }
+  }
+  bcPrune(key);
+}
+
+// ---- The call ----
+
+// The texture set 'name' of a tile 'size' texels a side from 'seed': loaded from the cache if it is there, else made by 'bake'
+// and kept. 'log' counts which, and the time each took.
+pub fn bakeSet[F fn() pbrmaterial.TextureSet](log &mut BakeLog, name &str, size i32, seed u32, bake &F) pbrmaterial.TextureSet {
+  imm hz = f64.from(sdl.GetPerformanceFrequency()) / 1000d;
+  imm t0 = sdl.GetPerformanceCounter();
+  imm key = BakeKey.make(name, size, seed);
+  mut set = bcEmptySet();
+  if bcLoad(&key, &mut set) {
+    log.loaded = log.loaded + 1u32;
+    log.loadMs = log.loadMs + f64.from(sdl.GetPerformanceCounter() - t0) / hz;
+    return set;
+  }
+  set = bake();
+  bcStore(&key, &set);
+  log.baked = log.baked + 1u32;
+  log.bakeMs = log.bakeMs + f64.from(sdl.GetPerformanceCounter() - t0) / hz;
+  set;
+}
+
+// ---- The checks (browser.exe --checks) ----
+
+fn bcCheckSet(seed u32) pbrmaterial.TextureSet {
+  mut p = surfacepatterns.PlankParams.siding(64, seed);
+  surfacepatterns.bakePlanks(&p);
+}
+
+fn bcSame(a &pbrmaterial.TextureSet, b &pbrmaterial.TextureSet) bool {
+  a.size == b.size and pbrmaterial.mapHash(&a.baseColor) == pbrmaterial.mapHash(&b.baseColor)
+    and pbrmaterial.mapHash(&a.normal) == pbrmaterial.mapHash(&b.normal) and pbrmaterial.mapHash(&a.orm) == pbrmaterial.mapHash(&b.orm);
+}
+
+// A stored set loads back byte for byte; other inputs, a damaged file and a truncated one load nothing; a damaged file is replaced
+pub fn checkBakeCache() bool {
+  imm base = bcFolder();
+  if base.isEmpty() { print <- "Bake cache: off (PEGASUS_BAKE_CACHE=off), not checked\n"; return true; }
+  imm dir = base.join("check");
+  imm a = BakeKey.inFolder(dir.copy(), "check-planks", 64, 1u32);
+  imm b = BakeKey.inFolder(dir.copy(), "check-planks", 64, 2u32);
+  if !a.valid { print <- "Bake cache: no program stamp, not checked\n"; return true; }
+  match fs.removeFile(&a.file) { else {} }
+  match fs.removeFile(&b.file) { else {} }
+  mut ok = true;
+  mut got = bcEmptySet();
+  if bcLoad(&a, &mut got) { print <- "Bake cache: NOT OK, a set loaded before it was stored\n"; ok = false; }
+  imm fresh = bcCheckSet(1u32);
+  bcStore(&a, &fresh);
+  mut back = bcEmptySet();
+  if !bcLoad(&a, &mut back) or !bcSame(&fresh, &back) { print <- "Bake cache: NOT OK, a stored set did not load back identical\n"; ok = false; }
+  mut other = bcEmptySet();
+  if bcLoad(&b, &mut other) { print <- "Bake cache: NOT OK, other inputs (seed 2) loaded seed 1's set\n"; ok = false; }
+  // A damaged file (one byte changed) and a truncated one load nothing
+  match fs.readFile(&a.file) {
+    case imm text Ok {
+      imm bytes &Array[u8] = text.view();
+      mut copy = List[u8].empty();
+      mut i = 0usize;
+      while i < bytes.len { copy.push(bytes[i]); i = i + 1usize; }
+      imm mid = copy.len() / 2usize;
+      copy.set(mid, *copy[mid] ^ 0x55u8);
+      match fs.writeFile(&a.file, copy.view()) { else {} }
+      mut dmg = bcEmptySet();
+      if bcLoad(&a, &mut dmg) { print <- "Bake cache: NOT OK, a damaged file loaded\n"; ok = false; }
+      copy.truncate(copy.len() / 2usize);
+      match fs.writeFile(&a.file, copy.view()) { else {} }
+      if bcLoad(&a, &mut dmg) { print <- "Bake cache: NOT OK, a truncated file loaded\n"; ok = false; }
+    }
+    else { print <- "Bake cache: NOT OK, the stored file could not be read\n"; ok = false; }
+  }
+  // ... and storing again replaces it
+  bcStore(&a, &fresh);
+  mut again = bcEmptySet();
+  if !bcLoad(&a, &mut again) or !bcSame(&fresh, &again) { print <- "Bake cache: NOT OK, a damaged file was not replaced\n"; ok = false; }
+  match fs.removeFile(&a.file) { else {} }
+  if ok { print <- "Bake cache: a stored set loads back identical; other inputs, a damaged file and a truncated one do not load; a damaged file is replaced: OK\n"; }
+  ok;
+}

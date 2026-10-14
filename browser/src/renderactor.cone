@@ -32,6 +32,7 @@ struct Gfx {
   pub lastForward Vec3;
   pub haveLast bool;
   pub hud Hud;                // the overlay (hud.cone), drawn last; before the device, which ends after what was made on it
+  pub timer FrameTimer;       // PEGASUS_CPU_TIMING / PEGASUS_GPU_TIMING: the frame's time by stage (frametimer.cone); before the device, too
   pub sys RenderSystem;
   pub renderer Renderer;
   pub swapchain SwapChain;
@@ -179,6 +180,7 @@ actor RenderActor {
     mut made Option[Gfx] = None;
     mut ok = true;
     if window != 0usize {
+      validationPolicy(scripted);
       made = makeGfx(window as *u8 as *sdl.Window, width, height, skyOff, opts.cullMode, &mut rig, &land);
       ok = false;
       match &mut made {
@@ -210,10 +212,12 @@ actor RenderActor {
     mut t1 = t0;
     match &mut g {
       case mut some &mut Some {
+        some.timer.begin();
         if o.resized { some.swapchain.resize(o.width, o.height); }
         some.sys.surfaces.width = some.target.texture.width;
         some.sys.surfaces.height = some.target.texture.height;
         self.apply(some, &mut o.requests);
+        some.timer.mark(0usize);
         self.drawFrame(some, &o.snapshot, o.shot.view(), o.alpha, &o.hud);
         panel = some.hud.panelBits();
         join = some.hud.takeJoin();
@@ -230,6 +234,8 @@ actor RenderActor {
         imm a0 = sdl.GetTicksNS();
         some.target = some.swapchain.getCurrentTexture(&mut some.device);
         acquireNs = sdl.GetTicksNS() - a0;
+        some.timer.mark(9usize);
+        some.timer.frameDone();
         status = some.target.status;
         rows = some.sys.rows.len();
         emitters = some.sys.particles.emitterCount();
@@ -321,6 +327,7 @@ actor RenderActor {
     match &mut g {
       case mut some &mut Some {
         some.device.waitIdle();
+        some.timer.report();
         some.hud.report();
         // (a run that asked to play, as the panel's scripted run does: every request must have been answered)
         if some.hud.model.rp.answers != some.hud.model.rp.requests { panelClean = false; }
@@ -460,14 +467,17 @@ actor RenderActor {
     g.sys.smokeLight = g.renderer.exposure * (luma(sky.ambient) + luma(sky.sunColor) * sunShare * 0.3183);
     g.sys.syncScene(&mut g.renderer, snapshot, pose.origin);
     g.sys.fitSurfaces(&mut g.renderer, &mut g.device, &g.camera, g.target.texture.width, g.target.texture.height);
+    g.timer.mark(1usize);
     // (under the island, the island is left out unless a picture of it is wanted: the corridor's mouth shows it)
     imm islandOut = under and !g.sys.surfaces.dayWanted;
     // (and on the island the labyrinth is left out unless a picture of it is wanted: the glass is open and seen)
     imm labOut = !under and !g.sys.surfaces.labWanted;
     g.sys.build(snapshot, pose.origin, islandOut, labOut);
+    g.timer.mark(2usize);
     g.sys.threads.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, &snapshot.thread);
     g.sys.creatures.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, &snapshot.bits);
     g.sys.aimLights(&mut g.renderer, snapshot);
+    g.timer.mark(3usize);
     if dayLit and !islandOut {
       rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds);
       // The fog after the sky: depth slabs over what lies beyond them (with image quality on, the froxel
@@ -480,11 +490,13 @@ actor RenderActor {
     // The pictures of the view surfaces (mirrors) in sight, drawn before the frame's own pass, each in a submission
     // of its own (viewsurface.cone)
     // (The effects and the weather are aimed first, for the pictures' particles as well as the frame's own: viewsurface.cone)
+    g.timer.mark(4usize);
     imm effectsOn = g.sys.hasEffects() and !under;
     if effectsOn {
       g.sys.aimEffects(&mut g.device, snapshot);
       g.sys.aimWeather(&mut g.device, snapshot, pose.origin, &weather);
     }
+    g.timer.mark(5usize);
     if g.sys.surfaces.anySeen() {
       // (the jitter temporal AA is about to move this frame by, so the pictures are of its sequence: see drawSurfaceViews)
       mut jitterX = 0.;
@@ -506,7 +518,9 @@ actor RenderActor {
     } else {
       g.sys.surfaces.pictures = 0u32;
     }
+    g.timer.mark(6usize);
     mut encoder = g.device.createCommandEncoder();
+    g.timer.stamp(&mut encoder, 0u32);
     // (Under the island the sun is not there: no cascades are drawn for it)
     imm shadowsOn = g.renderer.shadow.settings.enabled;
     if under { g.renderer.shadow.settings.enabled = false; }
@@ -522,6 +536,7 @@ actor RenderActor {
       if effectsOn {
         g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera);
       }
+      g.timer.stamp(&mut encoder, 1u32);
       g.post.apply(&mut encoder, &g.target.texture);
     } else {
       // The passes' settings this frame: the tier's, the exposure's trim from the day clock, and the fog from
@@ -571,12 +586,17 @@ actor RenderActor {
       if effectsOn {
         g.sys.particles.render(&mut g.device, &mut encoder, &g.post.hdr, &g.fx.depth, &g.fx.sceneCamera);
       }
+      g.timer.stamp(&mut encoder, 1u32);
       g.fx.renderFinish(&mut g.device, &mut encoder, &mut g.renderer, &mut g.post, &g.sys.list, &g.target.texture);
     }
     g.renderer.shadow.settings.enabled = shadowsOn;
+    g.timer.mark(7usize);
 
     // The overlay, over the finished picture (after tone mapping)
+    g.timer.stamp(&mut encoder, 2u32);
     g.hud.draw(&mut g.device, &mut encoder, &g.target.texture, hud);
+    g.timer.stamp(&mut encoder, 3u32);
+    g.timer.resolve(&mut encoder);
 
     // A scripted view to save: copied now, written once presented
     if shotsDir.len() > 0usize and shot.len > 0usize {
@@ -597,6 +617,8 @@ actor RenderActor {
       encoder.copyBufferToBuffer(&g.post.exposureBuffer, 0u64, &meter, 0u64, 16u64);
     }
     g.device.queue.submit(encoder.finish());
+    g.timer.collect(&mut g.device);
+    g.timer.mark(8usize);
     if shot.len > 0usize {
       // What this view cost to draw, for comparing the culling's modes (--cull N): draw calls and triangles, then
       // the scene's items: in it, past the frustum, put to draw (a cross-fade is two), dropped by range, level switches
@@ -633,6 +655,25 @@ actor RenderActor {
     g.readback = Buffer.none();
     written;
   }
+}
+
+// THE VALIDATION LAYER. Where the Vulkan SDK is installed, Cone's gpu package turns on the Khronos validation layer with its
+// synchronization checks, and they cost ~12 ms of CPU a frame here (render's recording 14.6 ms with the layer, 1.9 ms without;
+// the frame 21 ms against 6 ms: measured 13 Oct on the RTX, same build, same run, only the layer differing). That, not the
+// image quality, is what took the frame from 6.4 to 11.8 ms on 12 Oct. So the layer is on only where its verdict is wanted:
+// in the scripted runs, which end by saying "validation messages: 0" (the tests), or when PEGASUS_VALIDATION=1; PEGASUS_VALIDATION=0
+// turns it off even there. Otherwise the loader is told to leave it out (VK_LOADER_LAYERS_DISABLE) before the instance is made,
+// unless the environment already set that variable itself.
+fn validationPolicy(scripted bool) {
+  imm e = libc.getenv("PEGASUS_VALIDATION");
+  mut forcedOn = false;
+  mut forcedOff = false;
+  if (e as usize) != 0usize {
+    forcedOn = libc.strcmp(cstr.fromPtr(e), "1") == 0i32;
+    forcedOff = libc.strcmp(cstr.fromPtr(e), "0") == 0i32;
+  }
+  if forcedOn or (scripted and !forcedOff) { return; }
+  imm result = posix.setenv("VK_LOADER_LAYERS_DISABLE", "VK_LAYER_KHRONOS_validation", 0i32);
 }
 
 // The GPU side for 'window', 'width' by 'height': the instance, the surface,
@@ -703,8 +744,9 @@ fn makeGfx(window *sdl.Window, width u32, height u32, skyOff bool, cullMode u32,
     splatMaterial = fx.addDecalMaterial(&mut device, &renderer, splatTex, TextureHandle.none(), TextureHandle.none());
   }
   imm sunShadows = renderer.shadow.settings.enabled;
+  imm timer = FrameTimer.make(&mut device);
   Some[Gfx](new Gfx(Buffer.none(), String.empty(), target, post, fx, fxTier, fxMeter, splatMaterial, new Vec3(0., 0., 0.),
-    new Vec3(0., 0., -1.), false, hud, sys, renderer, swapchain, device, adapter, surface, instance, camera, sunShadows));
+    new Vec3(0., 0., -1.), false, hud, timer, sys, renderer, swapchain, device, adapter, surface, instance, camera, sunShadows));
 }
 
 // Image quality by the GPU's tier: 2 high on a discrete GPU (temporal AA, auto-exposure, ambient occlusion),
