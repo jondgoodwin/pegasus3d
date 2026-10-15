@@ -20,9 +20,10 @@ byte for a sitting or hailing being. The server also needs the people's files, o
 
 | What | Where |
 | --- | --- |
-| Cone compiler (Cone master `5da803c6`, shared libLLVM link, so it needs 104 MB to link, not 854) | `~/pegasus/cone/build/x64-release/conec`, with `libconestd.a` beside it; its `CMakeLists.txt` has the one change (`target_link_libraries(conec LLVM m)`; the original is `CMakeLists.txt.orig`). Not the playground's: that is `~/play/` and its container. |
+| Cone compiler (Cone master `25b21647` since 15 Oct 2026; earlier ones kept as `~/pegasus/cone-<hash>`; shared libLLVM link, so it needs 104 MB to link, not 854) | `~/pegasus/cone/build/x64-release/conec`, with `libconestd.a` beside it; its `CMakeLists.txt` has the one change (`target_link_libraries(conec LLVM m)`; the original is `CMakeLists.txt.orig`). Not the playground's: that is `~/play/` and its container. |
 | Server source, as sent by `deploy.sh` | `~/pegasus/src/browser` |
-| Program and its libSDL3 stand-in | `~/pegasus/bin/pegasus-server`, `~/pegasus/bin/libSDL3.so` |
+| Program and its libSDL3 stand-in | `~/pegasus/bin/pegasus-server`, `~/pegasus/bin/libSDL3.so` (the previous ones as `.bak-<pegasus3d hash>`) |
+| The people's files | `~/pegasus/bin/people/` (nine `.people` files from `browser.exe --bake-people`, the same as the zip's `people` folder) |
 | The unit | `/etc/systemd/system/pegasus3d-server.service` (a copy is `server/pegasus3d-server.service`) |
 
 ## Building the server for Linux
