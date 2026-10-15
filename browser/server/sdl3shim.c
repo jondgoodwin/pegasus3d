@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <time.h>
 #include <stddef.h>
+#include <unistd.h>
 
 #define EXPORT __attribute__((visibility("default")))
 #define EVENT_QUIT 0x100u
@@ -60,6 +61,20 @@ EXPORT uint64_t SDL_GetTicksNS(void) {
   return nowNs() - startNs;
 }
 EXPORT uint64_t SDL_GetPerformanceCounter(void) { return nowNs(); }
+
+/* ---- the program's folder, as real SDL gives it (with a trailing '/'): the bake cache stamps itself with the program ---- */
+EXPORT const char *SDL_GetBasePath(void) {
+  static char path[4096] = "";
+  if (path[0] == 0) {
+    ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1);
+    if (n <= 0) { path[0] = 0; unavailable("no program path"); return NULL; }
+    path[n] = 0;
+    char *slash = strrchr(path, '/');
+    if (slash == NULL) { path[0] = 0; return NULL; }
+    slash[1] = 0;
+  }
+  return path;
+}
 EXPORT uint64_t SDL_GetPerformanceFrequency(void) { return 1000000000ull; }
 EXPORT void SDL_Delay(uint32_t ms) {
   struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L };
