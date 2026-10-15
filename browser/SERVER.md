@@ -12,7 +12,9 @@ server sends its own after the being in `Possessed`. A build from before version
 A server refuses a client whose version differs ("Your browser is out of date. Please download the latest from
 cone.jondgoodwin.com." for an older client, "The server is being updated. Please try again shortly." for a newer one); a
 client refuses a server whose `Possessed` carries a different version, with the same two messages. Deploy the server and
-publish the browser together.
+publish the browser together. Version 3 (people): `BeingAdded`'s person, the object kind `OBJ_PERSON`, the input's sit and hail bits, a pose
+byte for a sitting or hailing being. The server also needs the people's files, or makes them on its first start (about 50 s): run
+`browser.exe --bake-people DIR` and put the result in a folder `people` beside the server's executable, as the browser's zip carries it.
 
 ## Where things are on the VM
 

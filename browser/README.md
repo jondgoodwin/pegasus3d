@@ -40,6 +40,46 @@ The build also compiles the browser's `gpu/` folder (the starship's distance fie
 GPU, into `build\release\browser.spv`, beside `sdfmesh.spv`; the program reads both at run time. The
 first run after a driver's shader cache is cleared makes the kernels in about 4 s; after that, 0.4 s.
 
+## The people
+
+Everyone on the island is a person of Cone's `humanbody` package (game-quality bodies from ANSUR II measures, a face that moves, fitted
+clothes), which replaced the wooden mannequin everywhere: you are the main avatar (1.807 m, in his black cape); the other player's
+stand-in on the beach is the average woman; the four villagers are the average man (the round), the petite woman (the gardener), the tall
+slim man (the follower) and the athletic woman (the shy one); the clients of a server are the avatar, the tall slim man, the athletic woman,
+the stocky older man, the petite woman and the average man in turn; the labyrinth's guards are bare-chested variants of two of the men in
+their kilts, belts, helmets, spears and shields (`creaturelook.cone`'s `spawnGuardPerson`). The Minotaur and the Worm are still the old
+mannequin's body with their pieces. `PEGASUS_NO_PEOPLE=1` starts without people and the wooden mannequins stand in their places (for timing
+the one against the other, and the before pictures).
+
+- **Made once, kept in files** (`src/personasset.cone`). humanbody builds each sex's base mesh and its 29 blends in about 16 s, so a
+  person is made once and stored as a `.people` file (the body and skin weights, 50 face targets, eyes, ears, teeth, tongue and mouth, the
+  clothes as pieces, the cape settled as a static drape, a 1024x1024 skin albedo and roughness, the 22-bone skeleton with the person's own
+  hips and shoulders, the face rig's spec; about 10 MB each, nine files). Looked for in `PEGASUS_PEOPLE_CACHE`, a folder `people` beside
+  the executable (what a zip carries), then `%LOCALAPPDATA%\pegasus3d\people`; made here when missing (the first start of a machine that
+  has none: about 50 s, then 0.1 s), keyed by the file's name (format, humanbody revision, the person's number and name: bump
+  `PEOPLE_REVISION` when humanbody changes), not by the program. `browser.exe --bake-people DIR` makes them all into DIR.
+- **In the scene** (`src/personview.cone`). A person is the being's own part (the body: a *morphed* skinned mesh, `Request.DefineMorphed`,
+  drawn by render's subsurface skin material with the painted albedo) and parts under it for the eyes (clear coat), ears, teeth, tongue,
+  mouth and each piece of clothing and the cape, all posed by the one list of skinning matrices. The face is render's morph pre-pass,
+  recorded into the frame's encoder (`Request.Morph` carries the weights). The simulation and every view build the object themselves from
+  an `OBJ_PERSON` request (the person's number), so no mesh crosses the wire.
+- **Walking, jumping, falling, spells** are as they were, on the person's own skeleton: `walkgait` with the person's real hips
+  (`Walker.hipSpan`), the capsule scaled to the person's height, the ragdoll made of the first 19 bones (the face's three are at rest in
+  it), the zap and the jig laid on the pose, the paint on its four spheres, the bull-leap over the Minotaur.
+- **A face** (view only): facerig's blink, idle and gaze for a person within 40 m of the eye; a hail smiles. Beyond 38 m the five small
+  face parts are not drawn.
+- **Sit and hail.** **S** sits on the nearest free seat within 2.8 m (and no more than a step up) or, seated, stands up; **H** hails (right
+  arm up and waving for 3 s, the head turned, a smile; near a labyrinth guard it also opens the dialogue, as E did). Sitting walks the
+  being to the place a thigh's length before the seat, turns it to the seat's way and sits it down by humanbody's sit-to-stand
+  (`Figure.steered`, `stepSit`); a jump or S again on the way gives it up. A **seat is data on a part** (`Request.Seat`: the sit point, the
+  facing, the surface's height above the floor the feet stand on, how it rocks): the porch's rocking chair (a part of the porch object; it
+  rocks about the deck with its sitter, 0.09 rad every 3.2 s of scene time, the view's `rockSeats`), the labyrinth's throne (the feet on
+  its plinth) and the east parapet of the bridge (a perch on the coping). The HUD names the key worth pressing (`S sit`, `S stand up`,
+  `H hail`) under the clock.
+- **On the wire.** `PROTOCOL_VERSION` 3: `BeingAdded` carries the person, the input's flags carry S and H, and a snapshot's being carries,
+  only while it is sitting or hailing, a pose byte (with the seat and how far the sit is, a byte each, and the hail's age): a being doing
+  neither costs nothing more.
+
 ## The mannequin
 
 You start as an artist's wooden mannequin, 1.75 m tall, seen from behind and above (V for its eyes),
@@ -146,7 +186,8 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | Key | Does |
 | --- | --- |
 | W or Up | walk forward (the mannequin 1.8 m/s; the plain walker of a scripted run 3 m/s) |
-| S or Down | walk back |
+| Down | walk back |
+| **S** | **sit** on the nearest free seat in reach (2.8 m; the porch's rocking chair, the labyrinth's throne, the bridge's east parapet), or **stand up** again; S or a jump on the way gives the seat up |
 | A or Left | turn left (a quarter turn in 1.5 s) |
 | D or Right | turn right |
 | Shift (held) | run (the mannequin 4.5 m/s; the plain walker four times as fast) |
@@ -159,7 +200,8 @@ part's colour and glow multiplied). A `Look` is see-through with `.translucent(a
 | F | run scene time ten times as fast, or back to normal (for testing the day: dusk comes 50 s after the start instead of 12.5 min) |
 | T | the weather changes to the next of six states (clear, fair, cloudy, overcast, rain, snow), crossfading over 12 s of scene time |
 | N | mute the sound, or un-mute it (the master gain fades over 80 ms) |
-| H | hide the HUD, or show it again (below) |
+| **H** | **hail**, the EverQuest way: wave (3 s) and smile; with a labyrinth guard within reach it also opens the dialogue (E did before) |
+| **U** | hide the HUD, or show it again (below; H hid it before) |
 | G | print the camera, the hour and the weather to the terminal as a gallery shot-list section (under Automated runs: Gallery shots) |
 | F9 (or J) | open the "Play with others" panel: ask the island's owner to let you join (below); F9 closes it again |
 | B | bowl the ball at the spot the camera looks at (the playground, below) |
@@ -457,7 +499,7 @@ message (roster, a guard's answer, the Worm, what the Minotaur did); `PROTOCOL_V
 
 `--checks` (`src/creaturechecks.cone`): the puzzle's logic for both ways round, the guards' answers, the Worm's timeline, and the
 Minotaur's patrol, stagger, shove and bull-leap on the rooms' own solids. `browser.exe --creatures-only --shots DIR` runs the script
-(`src/creaturescript.cone`: talk through the panel by E and a click, both doors, the Worm, the paint and the stagger, the leap, the
+(`src/creaturescript.cone`: talk through the panel by H and a click, both doors, the Worm, the paint and the stagger, the leap, the
 stairs; the full run's last part too); `--with-creatures` makes them in any scripted run (to time the court with them in it).
 `python tools/netcheck.py --creatures --seconds 44` has client A ask a guard, be set down in the Worm's chamber, see the Minotaur
 stagger, and be vaulted over it, while B is told of each (the `CREATURES` lines) and follows the Minotaur's path.
@@ -810,7 +852,8 @@ prints "Upload: a burst of ..." when the backlog clears, about 40 frames and 1 t
 | `src/terrain.slang`, `src/water.slang`, `src/islandshaders.cone` | the island's two shaders and the custom pipelines made from them |
 | `src/creatures.cone`, `src/creaturethink.cone`, `src/creatureview.cone`, `src/creaturelook.cone`, `src/talkpanel.cone`, `src/creaturescript.cone`, `src/creaturechecks.cone` | the labyrinth's creatures (above): the simulation's state, the puzzle and minds; the view's part; how they look; the guard's dialogue panel; the script's part and the checks |
 | `src/being.cone` | beings and possession: intents, the user's controller, the view rig (first and third person), the Cast |
-| `src/mannequin.cone` | the mannequin: its figure (skeleton, pose, gait, kinematic capsule), its meshes, one a bone, and spawning it |
+| `src/mannequin.cone` | the figure of a being (skeleton, pose, gait, kinematic capsule, sitting, hailing) and the wooden mannequin's meshes (still the Minotaur's and the Worm's body) |
+| `src/personasset.cone`, `src/personview.cone`, `src/peoplechecks.cone` | the people: made once from humanbody and kept in files, put in the scene and animated by a view, and their checks (above) |
 | `src/ground.cone` | the ground's height under a point: the island's, the one function everything standing on the ground asks |
 | `src/walk.cone` | a walker's body on the ground, and the user's key bindings |
 | `src/script.cone` | the scripted run, its close-ups and its checks |
