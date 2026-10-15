@@ -49,7 +49,8 @@ fn checkNet() bool {
   ok = requestRoundTrips("Glow", Request.Glow(new MaterialId(idOf(11u32)), new Color(2800., 1100., 260., 1.))) and ok;
   ok = requestRoundTrips("Tint", Request.Tint(idOf(12u32), new Color(1.45, 1.45, 1.45, 1.))) and ok;
   ok = requestRoundTrips("Platform", Request.Platform(idOf(13u32), PlatformShape.make(0.1, new Vec2(-0.5, -0.4), new Vec2(0.5, 0.4), 0.8, 11u32))) and ok;
-  ok = requestRoundTrips("BeingAdded", Request.BeingAdded(3u32, idOf(14u32), false, 1.62, 11u32, String.from("Jon"))) and ok;
+  ok = requestRoundTrips("BeingAdded", Request.BeingAdded(3u32, idOf(14u32), false, 1.62, 11u32, String.from("Jon"), 4u32)) and ok;
+  ok = requestRoundTrips("BeingAdded (a mannequin)", Request.BeingAdded(3u32, idOf(14u32), false, 1.62, 11u32, String.from("Jon"), NO_PERSON)) and ok;
   ok = requestRoundTrips("LightSource", Request.LightSource(idOf(15u32), LightLook.spot(new Vec3(0., 1., 0.), new Vec3(0., -1., 0.),
     new Color(1., 0.5, 0.2, 1.), 40., 12., 0.3, 0.5))) and ok;
   ok = requestRoundTrips("CastsShadow", Request.CastsShadow(idOf(16u32), false)) and ok;
@@ -176,6 +177,65 @@ fn checkNet() bool {
         and bu.tick == 99999u64) and ok;
     }
     else { ok = expect("a burst comes back whole", false) and ok; }
+  }
+  // A person sitting down on a seat, one standing up and one hailing cross with one pose byte more (and the seat and how far the sit
+  // is), and a being doing none of it nothing more
+  {
+    mut posedBeings = List[BeingState].empty();
+    mut sitting = new BeingState(0u32, false, new Vec3(-17.85, 0.6, 331.2), 3.1415927, 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots());
+    sitting.seat = 3u32;
+    sitting.sitT = 0.6;
+    sitting.sitDown = true;
+    posedBeings.push(sitting);
+    mut rising = new BeingState(1u32, false, new Vec3(-5., 3., 300.), 1.5, 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots());
+    rising.seat = 1u32;
+    rising.sitT = 0.25;
+    rising.sitDown = false;
+    posedBeings.push(rising);
+    mut hailer = new BeingState(2u32, false, new Vec3(-20., 4., 340.), 0.5, 1.8, 0., 0., 0., true, new Intents(1., 0., false, false), PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots());
+    hailer.hail = 1.2;
+    posedBeings.push(hailer);
+    posedBeings.push(new BeingState(3u32, false, new Vec3(-20., 4., 345.), 0.5, 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots()));
+    mut posedState = new WorldState(7u64, 1d, 1u32, 1u64, posedBeings, List[PropState].empty(), List[FxState].empty());
+    imm posedBytes = encodeState(&posedState);
+    mut posedBack = new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty());
+    imm posedOk = decodeState(copyBytes(&posedBytes), &mut posedBack) and posedBack.beings.len() == 4usize;
+    ok = expect("a snapshot with a sitter, a person standing up, a hailer and a walker decodes", posedOk) and ok;
+    if posedOk {
+      imm s0 = posedBack.beings[0usize];
+      imm s1 = posedBack.beings[1usize];
+      imm s2 = posedBack.beings[2usize];
+      imm s3 = posedBack.beings[3usize];
+      ok = expect("the sitter's seat, how far it has sat down, and that it is sitting down", s0.seat == 3u32 and libc.fabsf(s0.sitT - 0.6) < 0.005 and s0.sitDown and s0.hail < 0. and s0.mode == FIG_WALK) and ok;
+      ok = expect("the one standing up: its seat, how far, and that it is getting up", s1.seat == 1u32 and libc.fabsf(s1.sitT - 0.25) < 0.005 and !s1.sitDown) and ok;
+      ok = expect("the hailer: when it began, to a fiftieth of a second, and no seat", libc.fabsf(s2.hail - 1.2) < 0.02 and s2.seat == 0u32) and ok;
+      ok = expect("a walker has neither (and no byte of it)", s3.seat == 0u32 and s3.hail < 0.) and ok;
+    }
+    // (the walker's bytes are what they were: a person doing neither costs nothing)
+    mut plain = List[BeingState].empty();
+    plain.push(*posedBack.beings[3usize]);
+    mut plainState = new WorldState(7u64, 1d, 1u32, 1u64, plain, List[PropState].empty(), List[FxState].empty());
+    mut sittingOnly = List[BeingState].empty();
+    sittingOnly.push(*posedBack.beings[0usize]);
+    mut sittingState = new WorldState(7u64, 1d, 1u32, 1u64, sittingOnly, List[PropState].empty(), List[FxState].empty());
+    print <- "  a being: "; print <- encodeState(&plainState).len(); print <- " bytes of a snapshot; sitting: "; print <- encodeState(&sittingState).len(); print <- "\n";
+    ok = expect("sitting costs a pose byte, the seat and the progress (three bytes) and a person standing or walking nothing",
+      encodeState(&sittingState).len() == encodeState(&plainState).len() + 3usize) and ok;
+  }
+  // The input's sit and hail bits
+  {
+    mut samples = List[InputSample].empty();
+    mut it = new Intents(0.5, -1., true, false);
+    it.sit = true;
+    samples.push(new InputSample(10u64, it, 0.25));
+    mut it2 = new Intents(0., 0., false, false);
+    it2.hail = true;
+    samples.push(new InputSample(11u64, it2, 0.));
+    imm bytes2 = encodeInput(&samples);
+    mut back2 = List[InputSample].empty();
+    imm okIn = decodeInput(copyBytes(&bytes2), &mut back2) and back2.len() == 2usize;
+    ok = expect("an input batch carries the S and H keys: sit and hail", okIn and back2[0usize].intents.sit and !back2[0usize].intents.hail
+      and back2[1usize].intents.hail and !back2[1usize].intents.sit and back2[0usize].intents.run) and ok;
   }
   // Forty beings are a snapshot of what size
   mut many = List[BeingState].empty();

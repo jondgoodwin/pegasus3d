@@ -28,7 +28,9 @@ const REQUESTS_BYTES = 1100usize;
 // ToSim.Hello; a server sends its own after the being in ToView.Possessed. A build from before versions existed sends neither
 // (it is read as version 0).
 // (2: ToView.Creature, the labyrinth's creatures; PLAY_TALK and PLAY_CREATURE_TEST in ToSim.Play; the object kind OBJ_CREATURE; FX_STAGGER)
-pub const PROTOCOL_VERSION = 2u32;
+// (3: people: BeingAdded's person and the object kind OBJ_PERSON; the input's sit and hail bits; a byte a being in the snapshot, and its
+// seat and sit, its hail, when there are some)
+pub const PROTOCOL_VERSION = 3u32;
 
 pub const POS_ORIGIN_XZ f32 = -2048.;
 pub const POS_ORIGIN_Y f32 = -512.;    // (was -256: the labyrinth's floor at -300 would have been clamped to -256 for every other player)
@@ -438,7 +440,8 @@ pub fn encodeInput(samples &List[InputSample]) List[u8] {
     imm s = *samples[i];
     wUnit(&mut out, s.intents.ahead);
     wUnit(&mut out, s.intents.turn);
-    w8(&mut out, (if s.intents.run { 1u32; } else { 0u32; }) | (if s.intents.jump { 2u32; } else { 0u32; }));
+    w8(&mut out, (if s.intents.run { 1u32; } else { 0u32; }) | (if s.intents.jump { 2u32; } else { 0u32; })
+      | (if s.intents.sit { 4u32; } else { 0u32; }) | (if s.intents.hail { 8u32; } else { 0u32; }));
     wUnit(&mut out, s.lookKeys);
     i = i + 1usize;
   }
@@ -458,8 +461,10 @@ pub fn decodeInput(bytes List[u8], samples &mut List[InputSample]) bool {
     imm turn = r.rUnit();
     imm flags = r.r8();
     imm look = r.rUnit();
-    found.push(new InputSample(first + u64.from(u32.from(i)), new Intents(ahead, turn, (flags & 1u32) != 0u32,
-      (flags & 2u32) != 0u32), look));
+    mut it = new Intents(ahead, turn, (flags & 1u32) != 0u32, (flags & 2u32) != 0u32);
+    it.sit = (flags & 4u32) != 0u32;
+    it.hail = (flags & 8u32) != 0u32;
+    found.push(new InputSample(first + u64.from(u32.from(i)), it, look));
     i = i + 1usize;
   }
   if !r.ok { return false; }
@@ -586,6 +591,7 @@ pub fn encodeRequest(q &Request, out &mut List[u8]) bool {
       wF32(out, b.height);
       w32(out, b.seed);
       wStr(out, b.name.view());
+      wVar(out, if b.person == NO_PERSON { 0u32; } else { b.person + 1u32; });   // (0: a mannequin; else the cast's number plus one)
     }
     else { return false; }
   }
@@ -674,7 +680,8 @@ pub fn decodeRequest(r &mut Rd, out &mut List[Request]) bool {
     imm height = r.rF32();
     imm seed = r.r32();
     imm name = r.rStr();
-    if r.ok { out.push(Request.BeingAdded(being, part, plain != 0u32, height, seed, name)); }
+    imm personPlus = r.rVar();
+    if r.ok { out.push(Request.BeingAdded(being, part, plain != 0u32, height, seed, name, if personPlus == 0u32 { NO_PERSON; } else { personPlus - 1u32; })); }
   } else {
     r.ok = false;
   }
@@ -968,10 +975,13 @@ fn wBeing(out &mut List[u8], b &BeingState, rotsFit bool) {
   wVar(out, b.being);
   imm hasPlatform = !b.platform.isNone();
   imm sendRots = b.mode == FIG_RAG and b.hasRots and rotsFit;
+  // A person sitting or hailing (the one that is not limp or getting up) has a pose byte after what the rest says: the two mode
+  // bits both set (32 and 64), which no being has otherwise, say so; a being doing neither is not a byte the larger
+  imm posed = b.mode == FIG_WALK and (b.seat > 0u32 or b.hail >= 0.);
   w8(out, (if b.exact { 1u32; } else { 0u32; }) | (if b.grounded { 2u32; } else { 0u32; })
     | (if b.intents.run { 4u32; } else { 0u32; }) | (if b.intents.jump { 8u32; } else { 0u32; })
     | (if hasPlatform { 16u32; } else { 0u32; }) | (if b.mode == FIG_RAG { 32u32; } else { 0u32; })
-    | (if b.mode == FIG_GETUP { 64u32; } else { 0u32; }) | (if sendRots { 128u32; } else { 0u32; }));
+    | (if b.mode == FIG_GETUP { 64u32; } else { 0u32; }) | (if posed { 96u32; } else { 0u32; }) | (if sendRots { 128u32; } else { 0u32; }));
   wUnit(out, b.intents.ahead);
   wUnit(out, b.intents.turn);
   if b.exact {
@@ -1001,6 +1011,18 @@ fn wBeing(out &mut List[u8], b &BeingState, rotsFit bool) {
     while k < RAG_BODIES { wQuat(out, b.rots[k]); k = k + 1usize; }
   }
   if b.mode == FIG_GETUP { w16(out, u32.from(clampInt(rounded(b.modeT * 1000.), 0, 65535))); }
+  // What a person is doing besides walking, one byte: sitting (bit 0, then the seat and how far the sit is, a byte each), sitting down
+  // rather than getting up (bit 1), hailing (bit 2, then the seconds since it began in fiftieths)
+  if posed {
+    imm sitting = b.seat > 0u32;
+    imm hailing = b.hail >= 0.;
+    w8(out, (if sitting { 1u32; } else { 0u32; }) | (if b.sitDown { 2u32; } else { 0u32; }) | (if hailing { 4u32; } else { 0u32; }));
+    if sitting {
+      w8(out, if b.seat > 256u32 { 255u32; } else { b.seat - 1u32; });
+      w8(out, u32.from(clampInt(rounded(b.sitT * 255.), 0, 255)));
+    }
+    if hailing { w8(out, u32.from(clampInt(rounded(b.hail * 50.), 0, 255))); }
+  }
 }
 
 // The heading in 16 bits: its turns, 0 to 65535 of a whole one
@@ -1055,11 +1077,29 @@ fn rBeing(r &mut Rd) BeingState {
   }
   mut mode = FIG_WALK;
   mut modeT = 0.;
-  if (flags & 32u32) != 0u32 { mode = FIG_RAG; }
-  if (flags & 64u32) != 0u32 { mode = FIG_GETUP; modeT = f32.from(r.r16()) / 1000.; }
-  new BeingState(being, exact, position, yaw, speed, vy, airVx, airVz, (flags & 2u32) != 0u32,
+  imm posed = (flags & 96u32) == 96u32;
+  if !posed and (flags & 32u32) != 0u32 { mode = FIG_RAG; }
+  if !posed and (flags & 64u32) != 0u32 { mode = FIG_GETUP; modeT = f32.from(r.r16()) / 1000.; }
+  // What a person is doing besides walking (both mode bits set): sitting (which seat, how far the sit is) and hailing (how long since
+  // it began)
+  mut pose = 0u32;
+  if posed { pose = r.r8(); }
+  mut seat = 0u32;
+  mut sitT = 0.;
+  mut hail = -1.;
+  if (pose & 1u32) != 0u32 {
+    seat = r.r8() + 1u32;
+    sitT = f32.from(r.r8()) / 255.;
+  }
+  if (pose & 4u32) != 0u32 { hail = f32.from(r.r8()) / 50.; }
+  mut bs = new BeingState(being, exact, position, yaw, speed, vy, airVx, airVz, (flags & 2u32) != 0u32,
     new Intents(ahead, turn, (flags & 4u32) != 0u32, (flags & 8u32) != 0u32), platform, health, respawns, landings, landSpeed,
     mode, modeT, hasRots, rots);
+  bs.seat = seat;
+  bs.sitT = sitT;
+  bs.sitDown = (pose & 2u32) != 0u32;
+  bs.hail = hail;
+  bs;
 }
 
 // A snapshot decoded into 'out' (whose beings are added to); false if malformed

@@ -268,6 +268,10 @@ pub struct ViewState {
   heldStartedAt u64;          // when it began (the performance counter)
   pub creature CreatureView;  // the labyrinth's creatures, as the simulation told them (creatureview.cone)
   pub creatureParts List[CreatureParts];   // the extra parts of each creature's body, to pose with it
+  pub people People;          // humanbody's people, shared with the simulation (personasset.cone)
+  pub personParts List[PersonParts];   // each person's body, extra parts and face mesh, to pose with it
+  pub looks List[PersonLook];          // and its face as this view animates it
+  pub rockAmp List[f32];               // how far each seat of the world is rocking, 0 to 1: 1 with a sitter seated, eased in and out
   pub possessedSeen bool = false;   // a server's Possessed has arrived: it has taken this client in (goOnline waits for it)
   pub shotFrame u64 = 0u64;   // the test hook's (--switch-at): the frame the "switch-after" view is saved at
   pub testW u32 = 0u32;       // a gallery run's: the size the frame is drawn at (0: the window's)
@@ -284,7 +288,8 @@ pub struct ViewState {
       new WorldState(0u64, 0d, 1u32, 0u64, List[BeingState].empty(), List[PropState].empty(), List[FxState].empty()), false, Weathering.fair(), List[PlatformMove].empty(), List[PlatformNow].empty(), 0.,
       List[Intents].empty(), List[bool].empty(), 0u64, 0d, false, 0i64, 1u32, 0d, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2d, false, false, false, 0u64, 0u64,
       PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, PortalView.make(), playerName, String.empty(), false, List[NameTag].empty(),
-      land, opts, String.empty(), List[Request].empty(), 0u64, 0u32, 0u64, CreatureView.make(), List[CreatureParts].empty());
+      land, opts, String.empty(), List[Request].empty(), 0u64, 0u32, 0u64, CreatureView.make(), List[CreatureParts].empty(),
+      People.empty(), List[PersonParts].empty(), List[PersonLook].empty(), List[f32].empty());
   }
 
   // Reliable messages sent to the simulation, ever
@@ -889,6 +894,10 @@ pub struct ViewState {
             imm away = new Vec3(0., 0. - 5000., 0.);
             if ba.plain {
               cast.add(Being.make(ba.part, Walk.make(away, 0.)));
+            } elif ba.person != NO_PERSON and people.has() {
+              imm everyone = people.share();
+              cast.add(Being.mannequin(ba.part, away, 0., Figure.makePerson(everyone.at(usize.from(ba.person) % everyone.count()), ba.seed,
+                List[PartId].empty())));
             } else {
               cast.add(Being.mannequin(ba.part, away, 0., Figure.make(ba.height, ba.seed, List[PartId].empty())));
             }
@@ -908,6 +917,13 @@ pub struct ViewState {
           picks.shape(ds.mesh, &ds.shape);
           toRender = true;
         }
+        case mut dd &mut DefineMorphed {
+          // Picked as modelled; drawn morphed and posed
+          picks.shape(dd.mesh, &dd.shape);
+          toRender = true;
+        }
+        case mut mw &mut Morph { toRender = true; }
+        case mut sa &mut Seat { cast.phys.addSeat(sa.id, sa.point, sa.yaw, sa.height, sa.rock, sa.period, sa.rest); }
         case mut bn &mut Bones { toRender = true; }
         case mut dl &mut DefineMaterial { toRender = true; }
         case mut sh &mut Show {
@@ -949,10 +965,30 @@ pub struct ViewState {
     } elif spec.kind == OBJ_MANNEQUIN {
       imm root = door.newPart(spec.name.view());
       spawnMannequin(&mut door, spec.height, spec.color, root);
+    } elif spec.kind == OBJ_PERSON {
+      imm root = door.newPart(spec.name.view());
+      imm everyone = people.share();
+      if everyone.has() {
+        imm asset = everyone.at(usize.from(spec.index) % everyone.count());
+        imm spawned = spawnPerson(&mut door, asset, root);
+        looks.push(personLook(asset, root, spawned.face, u32.from(looks.len()) + 1u32));
+        personParts.push(spawned);
+      }
     } elif spec.kind == OBJ_CREATURE {
       imm root = door.newPart(spec.name.view());
-      imm extras = spawnCreature(&mut door, spec.index, spec.height, spec.color, root);
-      creatureParts.push(new CreatureParts(root, extras));
+      imm everyone = people.share();
+      imm guard = spec.index == CL_GUARD_W or spec.index == CL_GUARD_E;
+      imm which = if spec.index == CL_GUARD_W { PERSON_GUARD_W; } else { PERSON_GUARD_E; };
+      if guard and everyone.count() > which {
+        // (a guard is a person in the guard's kit: the simulation made it so)
+        imm asset = everyone.at(which);
+        imm spawned = spawnGuardPerson(&mut door, spec.index, asset, root);
+        looks.push(personLook(asset, root, spawned.face, u32.from(looks.len()) + 1u32));
+        personParts.push(spawned);
+      } else {
+        imm extras = spawnCreature(&mut door, spec.index, spec.height, spec.color, root);
+        creatureParts.push(new CreatureParts(root, extras));
+      }
     } elif spec.kind == OBJ_TESTCUBE {
       buildTestCube(&mut door);
     }
@@ -976,8 +1012,8 @@ pub struct ViewState {
   fn stateAt(self &, p &Puppet, tick f64) BeingState {
     imm n = p.samples.len();
     imm last = p.samples[n - 1usize].state;
-    // Limp or getting up: the newest the simulation said (its pose is not blended)
-    if last.mode != FIG_WALK { return last; }
+    // Limp or getting up, or sitting: the newest the simulation said (its pose is not blended)
+    if last.mode != FIG_WALK or last.seat > 0u32 { return last; }
     if tick >= f64.from(p.samples[n - 1usize].tick) {
       // Beyond the newest snapshot (late, or the clock estimate a little ahead): on at its velocity, for a while
       mut ahead = tick - f64.from(p.samples[n - 1usize].tick);
@@ -992,16 +1028,18 @@ pub struct ViewState {
           v = heldToObserved(v, seen);
         }
       }
-      return new BeingState(last.being, false, last.position + v * f32.from(ahead / TICKS_PER_SECOND), last.yaw, last.speed, last.vy,
+      mut onward = new BeingState(last.being, false, last.position + v * f32.from(ahead / TICKS_PER_SECOND), last.yaw, last.speed, last.vy,
         last.airVx, last.airVz, last.grounded, last.intents, last.platform, last.health, last.respawns, last.landings, last.landSpeed,
         FIG_WALK, 0., false, noRots());
+      onward.hail = last.hail;
+      return onward;
     }
     if n == 1usize { return last; }
     mut i = n - 2usize;
     while i > 0usize and f64.from(p.samples[i].tick) > tick { i = i - 1usize; }
     imm a = p.samples[i].state;
     imm c = p.samples[i + 1usize].state;
-    if c.mode != FIG_WALK { return c; }
+    if c.mode != FIG_WALK or c.seat > 0u32 or a.seat > 0u32 { return c; }
     // Through a gate (portal.cone) between the two: the later one, not a smear across 300 m
     if (c.position - a.position).length() > 40. { return c; }
     imm ta = f64.from(p.samples[i].tick);
@@ -1024,8 +1062,10 @@ pub struct ViewState {
     imm h11 = t3 - t2;
     imm pos = a.position * h00 + va * (span * h10) + c.position * h01 + vc * (span * h11);
     imm yaw = a.yaw + wrapPi(c.yaw - a.yaw) * t;
-    new BeingState(a.being, false, pos, yaw, a.speed + (c.speed - a.speed) * t, a.vy + (c.vy - a.vy) * t, a.airVx, a.airVz,
+    mut mixed = new BeingState(a.being, false, pos, yaw, a.speed + (c.speed - a.speed) * t, a.vy + (c.vy - a.vy) * t, a.airVx, a.airVz,
       a.grounded, a.intents, a.platform, a.health, a.respawns, a.landings, a.landSpeed, FIG_WALK, 0., false, noRots());
+    mixed.hail = c.hail;
+    mixed;
   }
 
   // Every being but the one the user drives posed for each of this frame's steps, from the snapshots
@@ -1083,11 +1123,28 @@ pub struct ViewState {
           puppets[b].started = true;
           cast.beings[b].before = cast.beings[b].body;
           cast.beings[b].intents = s.intents;
+        } elif cast.beings[b].figure.active and s.seat > 0u32 {
+          // Sitting, or standing up from a seat: posed as the simulation says (it needs no stepping)
+          puppets[b].started = true;
+          cast.beings[b].body.position = s.position;
+          cast.beings[b].body.yaw = s.yaw;
+          cast.beings[b].before = cast.beings[b].body;
+          cast.beings[b].intents = s.intents;
+          cast.beings[b].figure.hailT = s.hail;
+          cast.beings[b].figure.poseSeated(&mut cast.phys, i32.from(s.seat) - 1i32, s.sitT, s.sitDown, 0.);
         } elif !puppets[b].started {
           // The first snapshot of it: it stands as the snapshot says
           puppets[b].started = true;
           self.setBodyTo(b, s);
         } else {
+          if cast.beings[b].figure.active and cast.beings[b].figure.seat >= 0i32 {
+            // Stood up from a seat: it walks on from where it stands
+            cast.beings[b].figure.poseSeated(&mut cast.phys, -1i32, 0., true, 0.);
+            self.setBodyTo(b, s);
+          }
+          // (a hail the snapshot says: begun when it was not, ended when it is over)
+          if s.hail >= 0. and cast.beings[b].figure.hailT < 0. { cast.beings[b].figure.hailT = s.hail; }
+          if s.hail < 0. { cast.beings[b].figure.hailT = -1.; }
           mut k = 0usize;
           while k < steps.len() {
             cast.beings[b].step(&mut cast.phys, s.intents, steps[k].dt);
@@ -1145,7 +1202,22 @@ pub struct ViewState {
       being.before = being.body;
       return;
     }
+    if being.figure.active and s.seat > 0u32 {
+      // Sitting (or standing up from a seat): posed as the simulation says
+      being.figure.hailT = s.hail;
+      being.figure.poseSeated(&mut cast.phys, i32.from(s.seat) - 1i32, s.sitT, s.sitDown, dt);
+      being.before = being.body;
+      return;
+    }
+    if being.figure.active and being.figure.seat >= 0i32 {
+      // Stood up from a seat: the gait begins afresh where it stands
+      being.figure.poseSeated(&mut cast.phys, -1i32, 0., true, dt);
+      being.figure.setDown(&mut being.body, s.position, s.yaw);
+    }
     if being.figure.active {
+      // Hailing (the snapshot says when it began; the figure's own clock carries it on)
+      if s.hail >= 0. and being.figure.hailT < 0. { being.figure.hailT = s.hail; }
+      if s.hail < 0. { being.figure.hailT = -1.; }
       if jumped { being.figure.setDown(&mut being.body, s.position, s.yaw); }
       if p.respawns != s.respawns {
         p.respawns = s.respawns;
@@ -1168,7 +1240,9 @@ pub struct ViewState {
 
   // Each being's part placed where its body is, when it has moved, and each mannequin posed by the skinning matrices
   // of its gait
-  fn placeBeings(self &mut) {
+  fn placeBeings(self &mut, steps &List[Step]) {
+    imm faceDt = f32.from(steps.len()) / 60.;
+    self.rockSeats(faceDt);
     mut i = 0usize;
     while i < cast.beings.len() {
       imm b = cast.beings[i];
@@ -1179,21 +1253,43 @@ pub struct ViewState {
         mut at = b.body.position;
         if drawn { at = at + corr; }
         if !known { at = new Vec3(0., 0. - 5000., 0.); }
-        if !p.placed or p.placedAt.x != at.x or p.placedAt.y != at.y or p.placedAt.z != at.z or p.placedYaw != b.body.yaw {
+        // A sitter on a rocker rocks with its seat (about the floor under it): placed afresh each frame it does
+        imm rocking = b.figure.active and b.figure.mode == FIG_SIT and b.figure.seat >= 0i32 and known and self.seatRocks(usize.from(u32.from(b.figure.seat)));
+        if rocking {
+          // (its remembered place is not where it is: the frame after it stops, it is put upright again)
+          p.placed = true;
+          p.placedAt = new Vec3(0., 1.0e9, 0.);
+          p.placedYaw = b.body.yaw;
+          scene.applyPlace(b.part, self.rockTilt(usize.from(u32.from(b.figure.seat))) * bodyPlacement(at, b.body.yaw));
+        } elif !p.placed or p.placedAt.x != at.x or p.placedAt.y != at.y or p.placedAt.z != at.z or p.placedYaw != b.body.yaw {
           p.placed = known;
           p.placedAt = at;
           p.placedYaw = b.body.yaw;
           scene.applyPlace(b.part, bodyPlacement(at, b.body.yaw));
         }
         if b.figure.active and known {
-          forRender.push(Request.Bones(b.part, b.figure.skinning()));
-          // A creature's extra parts (its kilt, shield, horns ...) are posed by the same matrices
+          // A person's face first (its jaw and eyes lie on the pose before the matrices are made)
+          if b.figure.person != NO_PERSON { self.faceStep(i, faceDt); }
+          imm mats = cast.beings[i].figure.skinning();
+          forRender.push(Request.Bones(b.part, copyMats(&mats)));
+          // A creature's or a person's extra parts (kilt, shield, horns, the eyes, the clothes ...) are posed by the same matrices
           mut cp = 0usize;
           while cp < creatureParts.len() {
             if creatureParts[cp].root == b.part {
               mut e = 0usize;
               while e < creatureParts[cp].extras.len() {
-                forRender.push(Request.Bones(*creatureParts[cp].extras[e], b.figure.skinning()));
+                forRender.push(Request.Bones(*creatureParts[cp].extras[e], copyMats(&mats)));
+                e = e + 1usize;
+              }
+            }
+            cp = cp + 1usize;
+          }
+          cp = 0usize;
+          while cp < personParts.len() {
+            if personParts[cp].root == b.part {
+              mut e = 0usize;
+              while e < personParts[cp].extras.len() {
+                forRender.push(Request.Bones(*personParts[cp].extras[e], copyMats(&mats)));
                 e = e + 1usize;
               }
             }
@@ -1205,10 +1301,80 @@ pub struct ViewState {
     }
   }
 
+  // Whether seat 'i' of the world rocks (a rocking chair)
+  fn seatRocks(self &, i usize) bool { i < cast.phys.seats.len() and cast.phys.seats[i].seat.rock > 0.; }
+
+  // How far each seat is rocking, brought on by 'dt' seconds: a seat that rocks is rocked by a sitter seated on it (eased in over
+  // about a second and out over two), and its part is put where the rocking has it (about the floor under the seat), each frame it
+  // moves and once more when it has stopped
+  fn rockSeats(self &mut, dt f32) {
+    imm n = cast.phys.seats.len();
+    while rockAmp.len() < n { rockAmp.push(0.); }
+    mut s = 0usize;
+    while s < n {
+      if cast.phys.seats[s].seat.rock > 0. {
+        mut target = 0.;
+        mut b = 0usize;
+        while b < cast.beings.len() {
+          imm f = &cast.beings[b].figure;
+          if !cast.beings[b].gone and f.active and f.seat == i32.from(s) and f.mode == FIG_SIT and f.sitT > 0.7 { target = 1.; }
+          b = b + 1usize;
+        }
+        imm amp = *rockAmp[s];
+        imm rate = if target > amp { 1.; } else { 0.5; };
+        mut next = amp + (target - amp) * (1. - libc.expf(0. - rate * dt));
+        if target == 0. and next < 0.004 { next = 0.; }
+        if next > 0. or amp > 0. {
+          rockAmp.set(s, next);
+          scene.applyPlace(cast.phys.seats[s].part, self.rockTilt(s) * cast.phys.seats[s].rest);
+        }
+      }
+      s = s + 1usize;
+    }
+  }
+
+  // The turn of seat 'i' rocking: about the floor under its sit point, across the sitter's way, 'rock' radians each way every
+  // 'period' seconds of scene time (the same for every browser, so that the chair and its sitter agree)
+  fn rockTilt(self &, i usize) Transform3 {
+    imm sp = cast.phys.seats[i];
+    imm amp = if i < rockAmp.len() { *rockAmp[i]; } else { 0.; };
+    imm theta = amp * sp.seat.rock * libc.sinf(6.2831855 * f32.from(sceneNow) / sp.seat.period);
+    imm across = new Vec3(libc.cosf(sp.seat.yaw), 0., 0. - libc.sinf(sp.seat.yaw));
+    imm q = Quat.angleAxis(theta, across);
+    imm pivot = new Vec3(sp.seat.point.x, sp.seat.point.y - sp.seat.height, sp.seat.point.z);
+    new Transform3(pivot - q.rotate(pivot), q, new Vec3(1., 1., 1.));
+  }
+
+  // A person's face stepped by 'dt' seconds and laid on its figure's pose (the jaw and the eyes), its target weights sent to its body
+  // as a Morph; a face far from the eye is left as it was (not seen)
+  fn faceStep(self &mut, i usize, dt f32) {
+    imm part = cast.beings[i].part;
+    mut near = true;
+    if own < cast.beings.len() and i != own {
+      near = (cast.beings[own].body.position - cast.beings[i].body.position).length() < FACE_RANGE;
+    }
+    mut k = 0usize;
+    while k < looks.len() {
+      if looks[k].root == part {
+        imm lk = &mut looks[k];
+        lk.seen = near;
+        if near {
+          // A hail smiles (the face eases into it over a third of a second, and out again)
+          lk.rig.express(facerig.EXPR_HAPPINESS, if cast.beings[i].figure.hailT >= 0. { 0.85; } else { 0.; }, 0.35);
+          lk.rig.update(dt, &mut lk.frame);
+        }
+        cast.beings[i].figure.applyFace(&lk.bones, &lk.frame, &lk.spec);
+        if near { forRender.push(Request.Morph(lk.face, copyF32s(&lk.frame.weights))); }
+        return;
+      }
+      k = k + 1usize;
+    }
+  }
+
   // The frame's snapshot for drawing: the beings placed, the world matrices, the camera, the birds and the weather
   fn publishSnapshot(self &mut, steps &List[Step]) {
     self.poseOthers(steps);
-    self.placeBeings();
+    self.placeBeings(steps);
     {
       imm propsAt = self.drawTick(self.nowTick());
       playPlaceProps(&mut play, &mut scene, propsAt, propsAt > 1.0e17);
@@ -1449,9 +1615,10 @@ actor ViewActor {
   // shell's inboxes, and this browser's flock
   fn init(self &new, sim Option[SimActor], render RenderActor, frames Sender[FrameReport], ended Sender[i32],
       birds Birds, lockstep bool, joined Sender[bool], audioOpts AudioOptions, automated bool, opts RunOptions,
-      playerName String, land Island) {
+      playerName String, land Island, people People) {
     // The sound's sink, opened here on the constructing (main) thread: the view is this actor's own from then on
     mut state = ViewState.make(birds, lockstep, audioOpen(&audioOpts, automated), playerName, land, opts);
+    state.people = people;
     // The physics this browser predicts its own mannequin by: the same ground and solids as the simulation's, its own world
     imm solids = allSolids(&land);
     state.cast.phys.ensureGround();
@@ -1498,6 +1665,7 @@ actor ViewActor {
     print <- "Joining "; printStr(address.view()); print <- " as "; printStr(name.view()); print <- "\n";
     imm land = st.land.share();
     mut fresh = ViewState.make(Birds.make(&land), false, AudioView.silent(), name.copy(), land.share(), st.opts);
+    fresh.people = st.people.share();
     imm solids = worldSolids(&land);
     fresh.cast.phys.ensureGround();
     fresh.cast.phys.setSolids(&solids);
@@ -1765,6 +1933,9 @@ fn uploadCost(r &Request) u64 {
   match r {
     case imm dm DefineMesh { return meshCost(&dm.shape); }
     case imm ds DefineSkinnedMesh { return meshCost(&ds.shape) + u64.from(ds.skin.joints.len()) * 8u64; }
+    case imm dd DefineMorphed {
+      return meshCost(&dd.shape) + u64.from(dd.skin.joints.len()) * 8u64 + u64.from(dd.targets.entryCount()) * 24u64;
+    }
     case imm dl DefineMaterial {
       return u64.from(dl.paint.pixels.len()) * 2u64 + u64.from(dl.maps.normal.pixels.len()) * 2u64
         + u64.from(dl.maps.orm.pixels.len()) * 2u64 + u64.from(dl.maps.field.values.len() + dl.maps.field2.values.len()) * 6u64 + 256u64;

@@ -76,6 +76,9 @@ import pool use *;
 import geomath use *;
 import bonepose;
 import walkgait;
+import humanbody;                   // the people (personasset.cone, personview.cone)
+import facerig;
+import xpbdsoftbody;
 import rigidcollide;
 import rigiddynamics;
 import ragdollrig;
@@ -186,7 +189,7 @@ struct ClockActions {
   }
 }
 
-// The HUD's keys (hud.cone): H hides and shows it, F1 to F8 use the hotbar's eight slots
+// The HUD's keys (hud.cone): U hides and shows it (H hails: walk.cone), F1 to F8 use the hotbar's eight slots
 struct HudActions {
   pub hide Action;
   pub s0 Action;
@@ -208,7 +211,7 @@ struct HudActions {
 
   pub fn bind(ctx &mut Context) HudActions {
     imm hide = ctx.action("hud.hide", BUTTON);
-    ctx.bind(hide, Binding.key(SCANCODE_H));
+    ctx.bind(hide, Binding.key(SCANCODE_U));
     imm a0 = HudActions.slot(ctx, 0u32);
     imm a1 = HudActions.slot(ctx, 1u32);
     imm a2 = HudActions.slot(ctx, 2u32);
@@ -285,10 +288,11 @@ struct ShellInput {
   user UserController;        // the user's: the actions into the possessed being's intents
   clockKeys ClockActions;     // the pause and x10 keys
   audioKeys AudioKeys;        // N: mute
-  hudKeys HudActions;         // the HUD's: H and F1 to F8
+  hudKeys HudActions;         // the HUD's: U and F1 to F8
   ctxFrame u64;               // the frame whose actions are in 'ctx'
   inputFrame u64;             // the frame whose events are in 'state'
   panel PanelRoute;           // the "Play with others" panel (requestpanel.cone): while it is up it takes the keyboard and the mouse
+  hailHold u32 = 0u32;        // frames the being is still to be told to hail, after H opened a guard's dialogue (the panel took the key)
 
   fn make(panelName String, hasToken bool, automated bool) ShellInput {
     mut ctx = Context.empty();
@@ -329,10 +333,11 @@ struct Startup {
   startedAt u64;              // the performance counter when main began
   playerName String;          // --name NAME: the name this client plays under on a server (default: the machine's name)
   gallery GalleryPlan;        // --gallery FILE: the shots to take (gallery.cone)
+  people People;              // humanbody's people, read from their files or made (personasset.cone)
 
   fn make(startedAt u64) Startup {
     new Startup(String.empty(), String.empty(), AudioOptions.make(), RunOptions.make(), ServeOptions.make(), Watch.make(), startedAt,
-      String.empty(), GalleryPlan.none());
+      String.empty(), GalleryPlan.none(), People.empty());
   }
 }
 
@@ -502,13 +507,13 @@ fn shellRun(config Config, startup Startup) i32 {
     mut servedTx Sender[u64];
     mut servedRx Receiver[u64];
     servedTx, servedRx = Channel[u64].make();
-    imm sim = new SimActor(opts, birds, world, false, joinedTx.clone(), servedTx, land.share(), startup.gallery.copy());
+    imm sim = new SimActor(opts, birds, world, false, joinedTx.clone(), servedTx, land.share(), startup.gallery.copy(), startup.people.share());
     simOpt = Some[SimActor](sim);
     simOpt2 = Some[SimActor](sim);
     joinsToWait = 2;
   }
   imm view = new ViewActor(simOpt, render, framesTx, endTx, viewBirds, !connected, joinedTx, startup.audio.copy(), automated, opts,
-    startup.playerName.copy(), land.share());
+    startup.playerName.copy(), land.share(), startup.people.share());
   imm viewHandler = eventHandler(new So[fn(ev NetEvent) + Sendable](fn(ev NetEvent) [view] { view.onNet(ev); }));
   if connected {
     imm addr = parseAddress(startup.connectTo.view());
@@ -581,6 +586,11 @@ fn shellRun(config Config, startup Startup) i32 {
           mut lost = sdl.Event.empty();
           lost.type = sdl.EVENT_WINDOW_FOCUS_LOST;
           shell.state.handle(&lost);
+          // (H opened a guard's dialogue: the being hails as well; the key was the panel's)
+          if shell.panel.hailAsked {
+            shell.panel.hailAsked = false;
+            shell.hailHold = 4u32;
+          }
         } elif offered == OFFER_PASS {
           shell.state.handle(&e);
         }
@@ -608,7 +618,11 @@ fn shellRun(config Config, startup Startup) i32 {
       height = u32.from(s.h);
     }
     if opts.audioWalk { audioWalkKeys(host.frame); }
-    imm intentsNow = if opts.audioWalk { audioWalkIntents(firstStep); } elif opts.portalWalk { portalWalkIntents(firstStep); } elif opts.autoWalk { autoIntents(firstStep); } else { shell.user.intents(&shell.ctx); };
+    mut intentsNow = if opts.audioWalk { audioWalkIntents(firstStep); } elif opts.portalWalk { portalWalkIntents(firstStep); } elif opts.autoWalk { autoIntents(firstStep); } else { shell.user.intents(&shell.ctx); };
+    if shell.hailHold > 0u32 {
+      intentsNow.hail = true;
+      shell.hailHold = shell.hailHold - 1u32;
+    }
     imm input = new FrameInput(host.frame, steps, intentsNow, shell.user.lookKeys(&shell.ctx), shell.user.lookDrag(&shell.ctx),
       shell.ctx.pressed(shell.clockKeys.pause), shell.ctx.pressed(shell.clockKeys.fast), shell.ctx.pressed(shell.clockKeys.weather),
       shell.ctx.pressed(shell.user.actions.view), shell.ctx.pressed(shell.user.actions.swap),
@@ -718,6 +732,13 @@ fn main(argc i32, argv **u8) i32 {
       imm result = runChecks();
       finalAll();
       return result;
+    } elif libc.strcmp(arg, "--bake-people") == 0i32 and a + 1i32 < argc {
+      // Humanbody's people made (the blend sets, about 16 s each, once) and stored in the folder given, to put in a zip
+      // beside the executable as 'people' (personasset.cone), and nothing else
+      imm dir = String.fromCStr(cstr.fromPtr(*(argv + usize.from(a + 1i32))));
+      imm ok = bakePeopleInto(dir.view());
+      finalAll();
+      return if ok { 0i32; } else { 1i32; };
     } elif libc.strcmp(arg, "--island") == 0i32 and a + 1i32 < argc {
       // The island's preview picture, as a BMP, and nothing else
       imm path = String.fromCStr(cstr.fromPtr(*(argv + usize.from(a + 1i32))));
@@ -920,6 +941,13 @@ fn main(argc i32, argv **u8) i32 {
       return 2i32;
     }
     if startup.playerName.len() == 0usize { startup.playerName = defaultPlayerName(); }
+  }
+  // The people: from their files, or made once (personasset.cone)
+  {
+    mut peopleLog = new PeopleLog();
+    startup.people = loadPeople(&mut peopleLog, &Path.from(""));
+    print <- "People: "; print <- peopleLog.loaded; print <- " read in "; print <- peopleLog.loadMs; print <- " ms, ";
+    print <- peopleLog.made; print <- " made in "; print <- peopleLog.makeMs; print <- " ms\n";
   }
   if startup.serve.on {
     config.headless = true;
