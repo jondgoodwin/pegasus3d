@@ -176,6 +176,14 @@ pub struct LampRow {
   pub direction Vec3;
 }
 
+// A morphable mesh: the target set uploaded and the morphed copy that is drawn (its handle is the mesh's row's)
+pub struct MorphRow {
+  pub set MorphSetHandle;
+  pub copy MorphHandle;       // none until the frame's pre-pass has made it
+  pub base MeshHandle;        // the skinned mesh it is a copy of
+  pub changed bool;           // its weights changed since the pre-pass last ran
+}
+
 pub struct RenderSystem {
   pub meshes Table[MeshRow];          // keyed by a mesh's id
   pub materials Table[MaterialRow];   // keyed by a material's id
@@ -213,8 +221,12 @@ pub struct RenderSystem {
   pub threads ThreadDraw;        // Ariadne's threads (portalview.cone)
   pub creatures CreatureDraw;    // the Worm's spheres and the Minotaur's stars (creatureview.cone)
   pub shadedTextures List[TextureHandle];   // the textures shaded materials were made with (their fields, their masks), released with a world
+  pub morpher Morpher;           // the face morphs' compute pre-pass (render's morph.cone): a person's body is a morphed copy
+  pub morphs Table[MorphRow];    // keyed by a morphable mesh's id (DefineMorphed)
+  unmade List[MeshId];           // the morphable meshes whose copies the next pre-pass makes
   pub sceneEye Vec3 = new Vec3(0., 0., 0.);   // the eye at the last 'syncScene': a jump of it is a cut, with no fade
   pub sceneNow f64 = 0d;    // the snapshot time of the last 'syncScene', for the fades' step
+  pub morphPending bool = false;   // a Morph has come since the pre-pass last ran
   pub sceneMade u64 = 0u64;   // scene items made, ever
   pub sceneMoved u64 = 0u64;  // scene items moved because their part did, ever
   pub glows u64 = 0u64;       // Glow requests applied, ever
@@ -233,7 +245,8 @@ pub struct RenderSystem {
       List[EmitterHandle].empty(), 0usize, 0usize, 0d, List[PipelineHandle].empty(), 0usize, Table[PoseRow].empty(),
       List[Mat4].empty(), 0usize, List[u32].empty(), List[u32].empty(), List[EmitterHandle].empty(),
       Table[LampRow].empty(), Table[u32].empty(), MotionList.empty(), Table[PrevRow].empty(), List[Mat4].empty(),
-      List[Mat4].empty(), Table[SceneRow].empty(), ViewSurfaces.make(), ThreadDraw.make(), CreatureDraw.make(), List[TextureHandle].empty());
+      List[Mat4].empty(), Table[SceneRow].empty(), ViewSurfaces.make(), ThreadDraw.make(), CreatureDraw.make(), List[TextureHandle].empty(),
+      Morpher.create(device), Table[MorphRow].empty(), List[MeshId].empty());
     sys.cullMode = cullMode;
     sys;
   }
@@ -292,6 +305,60 @@ pub struct RenderSystem {
     mut row = new MeshRow(handle);
     row.midY = (b.min.y + b.max.y) * 0.5;
     meshes.put(id.id, row);
+  }
+
+  // Apply a DefineMorphed: the skinned mesh uploaded, its targets made a set and a morphed copy of it (as modelled until its first
+  // Morph); the copy's mesh is what 'id' draws
+  pub fn defineMorphed(self &mut, renderer &mut Renderer, device &mut Device, id MeshId, m &Mesh, skin &Skin, targets &MorphTargets) {
+    imm base = renderer.addSkinnedMesh(device, m, skin);
+    imm b = m.bounds();
+    mut row = new MeshRow(base);
+    row.midY = (b.min.y + b.max.y) * 0.5;
+    meshes.put(id.id, row);
+    if morpher.isValid() {
+      imm set = morpher.addSet(device, targets, m);
+      if !set.isNone() {
+        // (the morphed copy is made at the frame's pre-pass, in its one submission: 'updateMorphs')
+        morphs.put(id.id, new MorphRow(set, MorphHandle.none(), base, false));
+        unmade.push(id);
+      }
+    }
+  }
+
+  // Apply a Morph: the morphable mesh 'id' takes 'weights' (one a target)
+  pub fn morph(self &mut, renderer &mut Renderer, id MeshId, weights &List[f32]) {
+    imm row = morphs.find(id.id);
+    if row == NO_ROW or morphs.rows[row].copy.isNone() { return; }
+    morpher.setWeights(renderer, morphs.rows[row].copy, weights);
+    morphPending = true;
+  }
+
+  // The morph pre-pass for the copies whose weights changed, and the copies of the meshes defined since made, recorded into the frame's
+  // encoder 'enc' (a frame may record only 16 command buffers), before the render that draws them. A copy made now is drawn from the
+  // next frame's list (this frame's was built with the mesh as modelled)
+  pub fn updateMorphs(self &mut, renderer &mut Renderer, device &mut Device, enc &mut CommandEncoder) {
+    if !morphPending and unmade.len() == 0usize { return; }
+    morphPending = false;
+    mut k = 0usize;
+    while k < unmade.len() {
+      imm id = *unmade[k];
+      imm row = morphs.find(id.id);
+      if row != NO_ROW {
+        imm copy = morpher.addCopy(device, enc, renderer, morphs.rows[row].base, morphs.rows[row].set, false);
+        if !copy.isNone() {
+          imm mr = &mut morphs.rows[row];
+          mr.copy = copy;
+          imm mrow = meshes.find(id.id);
+          if mrow != NO_ROW {
+            imm mm = &mut meshes.rows[mrow];
+            mm.handle = morpher.mesh(copy);
+          }
+        }
+      }
+      k = k + 1usize;
+    }
+    unmade.clear();
+    imm n = morpher.update(device, enc, renderer);
   }
 
   // Apply a Bones: part 'id' posed by 'bones' from now on (its run in
@@ -421,6 +488,11 @@ pub struct RenderSystem {
       // Glass: the extended material, drawn by rays where the card has them (setRayTracing), else over the captured frame
       pbr = PbrMaterial.glassOf(c, surface.ior, surface.thickness, surface.absorb, surface.absorbDistance, surface.dispersion)
         .frosted(surface.roughness).glowing(surface.glow, 1.);
+    }
+    if surface.skin { pbr = pbr.skin(); }
+    if surface.clearcoat > 0. {
+      pbr.clearcoat = surface.clearcoat;
+      pbr.clearcoatRoughness = surface.clearcoatRoughness;
     }
     pbr.alphaMode = surface.alphaMode;
     pbr.alphaCutoff = surface.alphaCutoff;

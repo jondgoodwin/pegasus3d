@@ -26,6 +26,26 @@ pub const GALLERY_SETTLE = 150u32;
 // The day the clock is put in, before the shot's own 'day' (the sky's clouds are a closed form of scene time)
 const GALLERY_DAY0 = 3u64;
 
+// What a person in a shot does (person = N, x, z, yaw, STATE): stands, walks or runs on (from where it is put, so that it is at x, z at
+// the picture: the walk is back-dated), sits on the nearest seat, hails
+pub const GP_STAND = 0u32;
+pub const GP_WALK = 1u32;
+pub const GP_RUN = 2u32;
+pub const GP_SIT = 3u32;
+pub const GP_HAIL = 4u32;
+
+// A person of humanbody's cast put in a shot, where it is at the picture
+pub struct GalleryPerson {
+  pub person usize;
+  pub at Vec2;                // x, z
+  pub yaw f32;                // radians
+  pub state u32;              // GP_...
+  pub being usize;            // its being, once spawned (0: not)
+  pub y f32;                  // the floor's height, if the shot gives it: metres over the island's ground there (the porch's deck 0.6), or below -100 the world's own (the labyrinth's, -300)
+  pub hasY bool;
+  pub born u64;               // the simulation tick it was spawned at
+}
+
 pub struct GalleryShot {
   pub name String;
   pub eye Vec3;
@@ -44,15 +64,19 @@ pub struct GalleryShot {
   pub settle u32;
   hasEye bool;
   hasLook bool;
+  pub people List[GalleryPerson];    // the people in it (person = ...)
 
   fn blank() GalleryShot {
     new GalleryShot(String.empty(), new Vec3(0., 0., 0.), false, false, new Vec3(0., 0., 0.), false, 0., 0., 1.0471976, 12d, 1u32, 0u32,
-      1440u32, 810u32, GALLERY_SETTLE, false, false);
+      1440u32, 810u32, GALLERY_SETTLE, false, false, List[GalleryPerson].empty());
   }
 
   fn copy(self &) GalleryShot {
+    mut folk = List[GalleryPerson].empty();
+    mut k = 0usize;
+    while k < people.len() { folk.push(*people[k]); k = k + 1usize; }
     new GalleryShot(name.copy(), eye, eyeAgl, byAngles, target, targetAgl, yaw, pitch, fov, hour, weather, day, width, height, settle,
-      hasEye, hasLook);
+      hasEye, hasLook, folk);
   }
 }
 
@@ -60,14 +84,15 @@ pub struct GalleryShot {
 pub struct GalleryPlan {
   pub shots List[GalleryShot];
   pub ok bool;
+  pub spawned List[GalleryPerson];   // the people of the shot in hand, spawned for it (the run's)
 
-  pub fn none() GalleryPlan { new GalleryPlan(List[GalleryShot].empty(), true); }
+  pub fn none() GalleryPlan { new GalleryPlan(List[GalleryShot].empty(), true, List[GalleryPerson].empty()); }
 
   pub fn copy(self &) GalleryPlan {
     mut out = List[GalleryShot].empty();
     mut i = 0usize;
     while i < shots.len() { out.push(shots[i].copy()); i = i + 1usize; }
-    new GalleryPlan(out, ok);
+    new GalleryPlan(out, ok, List[GalleryPerson].empty());
   }
 
   // Whether a list was given (a run of the gallery)
@@ -158,6 +183,45 @@ fn applyKey(shot &mut GalleryShot, key &str, value &str, line usize) bool {
   mut text = String.from(value);
   if text.len() >= 2usize and text.view()[0usize] == '"' and text.view()[text.len() - 1usize] == '"' {
     text = text.sub(1usize, text.len() - 1usize);
+  }
+  if key == "person" {
+    // person = N, x, z, yaw, STATE: a person of humanbody's cast (0 the main avatar, 1 to 6 the others) where it is at the picture, facing
+    // 'yaw' degrees, standing, walking, running, sitting or hailing; any number of them in a shot
+    imm fields = text.split(',');
+    if fields.len() < 4usize or fields.len() > 6usize {
+      lineFault(line, "person is N, x, z, yaw, a state (stand, walk, run, sit or hail) and the floor's height if not the island's");
+      return false;
+    }
+    mut got = List[f64].empty();
+    mut f = 0usize;
+    while f < 4usize {
+      mut one = List[f64].empty();
+      if !readNumbers(fields[f].view(), &mut one) or one.len() != 1usize { lineFault(line, "person is N, x, z, yaw and a state"); return false; }
+      got.push(*one[0usize]);
+      f = f + 1usize;
+    }
+    mut state = GP_STAND;
+    mut floorY = 0.;
+    mut hasFloor = false;
+    if fields.len() == 6usize {
+      mut one = List[f64].empty();
+      if !readNumbers(fields[5usize].view(), &mut one) or one.len() != 1usize { lineFault(line, "the floor's height is one number"); return false; }
+      floorY = f32.from(*one[0usize]);
+      hasFloor = true;
+    }
+    if fields.len() >= 5usize {
+      imm word = fields[4usize].trim();
+      if word.view() == "stand" { state = GP_STAND; }
+      elif word.view() == "walk" { state = GP_WALK; }
+      elif word.view() == "run" { state = GP_RUN; }
+      elif word.view() == "sit" { state = GP_SIT; }
+      elif word.view() == "hail" { state = GP_HAIL; }
+      else { lineFault(line, "a person's state is stand, walk, run, sit or hail"); return false; }
+    }
+    if *got[0usize] < 0d or *got[0usize] > 8d { lineFault(line, "the person is 0 to 6 (humanbody's cast), or 7 and 8, the labyrinth's guards"); return false; }
+    shot.people.push(new GalleryPerson(usize.from(*got[0usize]), new Vec2(f32.from(*got[1usize]), f32.from(*got[2usize])),
+      f32.from(*got[3usize]) * 0.017453292, state, 0usize, floorY, hasFloor, 0u64));
+    return true;
   }
   if key == "weather" {
     imm w = weatherNamed(text.view());
@@ -374,6 +438,71 @@ pub fn gallerySize(plan &GalleryPlan, f u64, w &mut u32, h &mut u32) {
   *h = s.height;
 }
 
+// The people of the shot in hand taken away
+fn galleryClear(st &mut SimState) {
+  mut k = 0usize;
+  while k < st.gallery.spawned.len() {
+    imm being = &mut st.cast.beings[st.gallery.spawned[k].being];
+    if !being.gone {
+      being.gone = true;
+      st.scene.forget(being.part);
+      st.scene.send(Request.Despawn(being.part));
+    }
+    k = k + 1usize;
+  }
+  st.gallery.spawned.clear();
+}
+
+// The people of shot 'i' made and set down: each a being of the cast, put where it is to be at the picture (a walker or a runner back
+// along its way by what it covers while the shot settles, a sitter on the seat nearest the place it is put)
+fn gallerySpawn(st &mut SimState, i usize) {
+  imm shot = st.gallery.shots[i].copy();
+  print <- "Gallery: shot "; printStr(shot.name.view()); print <- ": "; print <- shot.people.len(); print <- " people; the world has "; print <- st.cast.phys.seats.len(); print <- " seats\n";
+  mut k = 0usize;
+  while k < shot.people.len() {
+    mut p = *shot.people[k];
+    imm covered = if p.state == GP_WALK { WALK_SPEED; } elif p.state == GP_RUN { RUN_SPEED; } else { 0.; };
+    // (it speeds up over the first second or so: the distance of the rest of the time)
+    imm dist = covered * (f32.from(shot.settle) - 14.) / 60.;
+    imm fx = 0. - sin(p.yaw);
+    imm fz = 0. - cos(p.yaw);
+    imm from = new Vec2(p.at.x - fx * dist, p.at.y - fz * dist);
+    // (a floor's height the shot gives: metres over the island's ground there, or, under it, the world's own: the labyrinth's -300)
+    imm base = if p.hasY and p.y < -100. { new Vec3(from.x, p.y, from.y); }
+      elif p.hasY { new Vec3(from.x, groundHeight(&st.land, from.x, from.y) + p.y, from.y); } else { standing(&st.land, from.x, from.y); };
+    // (persons 7 and 8 are the labyrinth's guards, in their kit: the west guard in blue, the east in red)
+    imm idx = if p.person >= PERSON_GUARD_W {
+      st.addCreatureBeing("gallery guard", "Guard", if p.person == PERSON_GUARD_W { CL_GUARD_W; } else { CL_GUARD_E; }, base, p.yaw, 1.8,
+        100u32 + u32.from(k), new Color(0.2, 0.07, 0.035, 1.));
+    } else {
+      st.addMannequin("gallery person", base, p.yaw, p.person, 100u32 + u32.from(k));
+    };
+    st.cast.beings[idx].ai = true;
+    p.being = idx;
+    p.born = st.tick;
+    st.gallery.spawned.push(p);
+    k = k + 1usize;
+  }
+  while st.given.len() < st.cast.beings.len() { st.given.push(Intents.none()); st.stepIt.push(true); }
+}
+
+// The intents of the gallery's walkers and runners, each step (the others stand)
+pub fn galleryIntents(st &mut SimState) {
+  mut k = 0usize;
+  while k < st.gallery.spawned.len() {
+    imm p = st.gallery.spawned[k];
+    if p.being < st.given.len() {
+      imm age = st.tick - p.born;
+      mut it = if p.state == GP_WALK or p.state == GP_RUN { new Intents(1., 0., p.state == GP_RUN, false); } else { Intents.none(); };
+      // (S pressed for a moment once it has settled; H pressed a second in, its wave in full at the picture)
+      if p.state == GP_SIT { it.sit = age >= 10u64 and age < 13u64; }
+      if p.state == GP_HAIL { it.hail = age >= 40u64 and age < 43u64; }
+      st.given.set(p.being, it);
+    }
+    k = k + 1usize;
+  }
+}
+
 // The scene's requests of the gallery run, after frame 'f' is presented: at the frame before a window begins, the day clock is
 // set to the shot's hour (a closed form: the sky, the clouds, the smoke and the water all follow) and the weather settled on
 // its state; at the first, the mannequins that stand on the lawn are taken away (a shot is of the island)
@@ -395,6 +524,11 @@ pub fn galleryDrive(st &mut SimState, f u64) {
   mut i = 0usize;
   while i < n {
     imm begin = galleryStart(&st.gallery, i);
+    if f + 1u64 == begin {
+      // The people of the shot before go; this shot's come (they have the shot's settling frames to arrive and settle)
+      galleryClear(st);
+      gallerySpawn(st, i);
+    }
     if f + 1u64 == begin or (i == 0usize and f == 1u64) {
       imm s = st.gallery.shots[i];
       // 60 s of scene time an hour, from the clock's start hour, 7

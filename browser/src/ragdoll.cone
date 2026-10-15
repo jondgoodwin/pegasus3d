@@ -48,15 +48,47 @@ pub struct RigSlot {
 
 fn upAxis() Vec3 { new Vec3(0., 1., 0.); }
 
+// A ragdoll is made of the humanoid's 19 bones; a person's skeleton has the jaw and the two eyes after them (humanbody's face), which
+// the ragdoll does not know. Its skeleton and poses are the first 19 bones' ('rigSkeleton', 'rigPose'), and a pose it gives is
+// 'widened' with the face's bones at rest.
+const RAG_BONES = 19usize;
+
+fn rigSkeleton(f &Figure) bonepose.Skeleton {
+  mut s = bonepose.Skeleton.empty();
+  mut i = 0usize;
+  while i < RAG_BONES and i < f.skeleton.boneCount() {
+    s.addBone(f.skeleton.parentOf(i), f.skeleton.restOf(i));
+    i = i + 1usize;
+  }
+  mut k = 0usize;
+  while k < f.skeleton.sockets.len() { s.sockets.push(*f.skeleton.sockets[k]); k = k + 1usize; }
+  s;
+}
+
+fn rigPose(f &Figure) bonepose.Pose {
+  mut p = bonepose.Pose.empty();
+  mut i = 0usize;
+  while i < RAG_BONES and i < f.pose.locals.len() { p.locals.push(*f.pose.locals[i]); i = i + 1usize; }
+  p;
+}
+
+fn widen(f &Figure, p &bonepose.Pose) bonepose.Pose {
+  mut out = f.skeleton.restPose();
+  mut i = 0usize;
+  while i < RAG_BONES and i < p.locals.len() and i < out.locals.len() { out.locals.set(i, *p.locals[i]); i = i + 1usize; }
+  out;
+}
+
 // The slot of figure 'f''s ragdoll in the physics world, made (parked) the first time
 fn slotFor(phys &mut Phys, f &mut Figure) usize {
   if f.rag >= 0i32 { return usize.from(u32.from(f.rag)); }
-  mut spec = ragdollrig.humanoidSpec(&f.skeleton, f.height, RAG_MASS);
+  imm skel = rigSkeleton(f);
+  mut spec = ragdollrig.humanoidSpec(&skel, f.height, RAG_MASS);
   // Free fall is gravity's alone, so the landing speed is the fall's (the spec's air drag would take 15 percent off a 45 m drop)
   spec.linearDamping = 0.;
-  imm rig = ragdollrig.Ragdoll.make(&mut phys.w, &f.skeleton, &spec, rigidcollide.Rigid.identity(), u32.from(phys.rigs.len()));
-  imm clips = ragdollrig.getUpClips(&f.skeleton, &spec);
-  imm rest = f.skeleton.restPose();
+  imm rig = ragdollrig.Ragdoll.make(&mut phys.w, &skel, &spec, rigidcollide.Rigid.identity(), u32.from(phys.rigs.len()));
+  imm clips = ragdollrig.getUpClips(&skel, &spec);
+  imm rest = skel.restPose();
   imm getup = new ragdollrig.GetUp(ragdollrig.LIE_UPRIGHT, 2, rest.copy(), rigidcollide.Rigid.identity(), 0., GETUP_MATCH);
   phys.rigs.push(new RigSlot(true, rig, spec, clips, getup, rest));
   imm at = phys.rigs.len() - 1usize;
@@ -98,7 +130,7 @@ pub fn startRagdoll(phys &mut Phys, f &mut Figure, body &Walk) {
   unparkSlot(phys, at);
   imm s = &mut phys.rigs[at];
   imm placement = new rigidcollide.Rigid(body.position, Quat.angleAxis(body.yaw, upAxis()));
-  s.rig.poseToBodies(&mut phys.w, &f.skeleton, &f.pose, placement);
+  s.rig.poseToBodies(&mut phys.w, &rigSkeleton(f), &rigPose(f), placement);
   imm v = new Vec3(f.airVx, f.vy, f.airVz);
   mut k = 0usize;
   while k < s.rig.links.len() {
@@ -121,7 +153,8 @@ fn poseFromRagdoll(phys &mut Phys, f &mut Figure, body &mut Walk) {
   imm p = phys.w.positionOf(s.rig.bodyOfBone(bonepose.PELVIS));
   body.position = p;
   body.yaw = 0.;
-  f.pose = s.rig.bodiesToPose(&phys.w, &f.skeleton, &s.rest, rigidcollide.Rigid.at(p));
+  imm lying = s.rig.bodiesToPose(&phys.w, &rigSkeleton(f), &s.rest, rigidcollide.Rigid.at(p));
+  f.pose = widen(f, &lying);
   f.skeleton.modelTransforms(&f.pose, &mut f.models);
 }
 
@@ -182,7 +215,7 @@ pub fn ragdollTurn(phys &mut Phys, f &mut Figure, body &mut Walk, dt f32) bool {
       // Up where it lies: the clip for how it lies, placed under the pelvis on the floor
       imm groundY = phys.floorAt(p.x, p.z, p.y);
       imm s = &mut phys.rigs[at];
-      s.getup = ragdollrig.beginGetUp(&s.rig, &phys.w, &f.skeleton, &s.rest, groundY, GETUP_MATCH);
+      s.getup = ragdollrig.beginGetUp(&s.rig, &phys.w, &rigSkeleton(f), &s.rest, groundY, GETUP_MATCH);
       parkSlot(phys, at);
       f.mode = FIG_GETUP;
       f.modeT = 0.;
@@ -205,7 +238,8 @@ fn poseFromGetUp(phys &mut Phys, f &mut Figure, body &mut Walk) {
   imm s = &mut phys.rigs[usize.from(u32.from(f.rag))];
   body.position = s.getup.placement.pos;
   body.yaw = yawOf(s.getup.placement.rot);
-  f.pose = s.getup.pose(&s.clips);
+  imm getting = s.getup.pose(&s.clips);
+  f.pose = widen(f, &getting);
   f.skeleton.modelTransforms(&f.pose, &mut f.models);
 }
 
@@ -252,7 +286,7 @@ pub fn followServer(phys &mut Phys, f &mut Figure, body &mut Walk, s &BeingState
       if kind == ragdollrig.LIE_FACE_UP or (kind == ragdollrig.LIE_SIDE and front.y >= 0.) { clip = 0; }
       elif kind == ragdollrig.LIE_FACE_DOWN or kind == ragdollrig.LIE_SIDE { clip = 1; }
       imm placement = new rigidcollide.Rigid(s.position, Quat.angleAxis(s.yaw, upAxis()));
-      imm start = slot.rig.bodiesToPose(&phys.w, &f.skeleton, &slot.rest, placement);
+      imm start = slot.rig.bodiesToPose(&phys.w, &rigSkeleton(f), &slot.rest, placement);
       slot.getup = new ragdollrig.GetUp(kind, clip, start, placement, 0., GETUP_MATCH);
       f.mode = FIG_GETUP;
     }

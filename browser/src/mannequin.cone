@@ -48,6 +48,12 @@
 // of 1.3 m) goes limp instead: a ragdoll (ragdoll.cone), whose landing is
 // what hurts.
 
+fn clamp01(x f32) f32 {
+  if x < 0. { return 0.; }
+  if x > 1. { return 1.; }
+  x;
+}
+
 // The capsule's radius is 0.15 H; its height is H
 pub const CAPSULE_RADIUS_OVER_H = 0.15;
 
@@ -67,6 +73,22 @@ pub const TURN_RATE = 1.0471976;      // rad/s: the same quarter turn in 1.5 s a
 pub const FIG_WALK = 0u32;
 pub const FIG_RAG = 1u32;
 pub const FIG_GETUP = 2u32;
+// Sitting down on a seat, seated, or getting up from it (the simulation's and a view's own: it is not a mode the snapshot names: its
+// BeingState says the seat and how far the sit is)
+pub const FIG_SIT = 3u32;
+
+// The phases of going to a seat and sitting on it (Figure.sitPhase)
+pub const SIT_NONE = 0u32;
+pub const SIT_APPROACH = 1u32;        // walking to where the feet stand before the seat, then turning to the seat's way
+pub const SIT_DOWN = 2u32;
+pub const SIT_SEATED = 3u32;
+pub const SIT_UP = 4u32;
+// How long sitting down, and standing up, take (humanbody's sit-to-stand: about 1.7 s), and how long a hail lasts
+pub const SIT_SECONDS = 1.7;
+pub const HAIL_SECONDS = 3.0;
+// How far from the place in front of a seat a being may press S and be taken to it, metres; and how long it is given to get there
+pub const SEAT_REACH = 2.8;
+pub const SEAT_APPROACH_SECONDS = 7.;
 
 // The kinematic capsule of a figure 'h' tall: 0.15 h round, climbing steps of STEP_UP and following the ground
 // down within SNAP_DOWN; it collides with the solids, the platforms and the ground, never a ragdoll
@@ -118,6 +140,18 @@ pub struct Figure {
   pub fxKind u32;                     // a spell in force on it (FX_ZAP, FX_JIG), or FX_NONE (spells.cone)
   pub fxT f32;                        // seconds since it began
   pub fxStart u64;                    // and the simulation tick it began at (a view sees a new spell by this)
+  pub person u32 = 0xFFFFFFFFu32;     // the person of humanbody's cast it is (personasset.cone), or NO_PERSON: a mannequin
+  // Sitting: the S key walks to the nearest seat of the world (Phys.seats: data on parts), turns to its way and sits down on it; S
+  // again stands up. 'sitPhase' is SIT_APPROACH (walking to the place in front of the seat, 'sitT' the seconds of it), SIT_DOWN and
+  // SIT_UP (the movement, 'sitT' its progress, 0 standing before the seat to 1 seated) or SIT_SEATED. In the three that are
+  // the movement, the figure's mode is FIG_SIT and nothing else moves it
+  pub seat i32 = -1;                  // the seat (a Phys.seats row) it goes to or sits on, or -1
+  pub sitPhase u32 = 0u32;
+  pub sitT f32 = 0.;
+  pub sitWas bool = false;            // the S key was down at the last step (a press is the key going down)
+  // Hailing: H waves the right arm, the EverQuest way, for HAIL_SECONDS; the face smiles (the view's)
+  pub hailT f32 = -1.;                // seconds since it began, or -1
+  pub hailWas bool = false;
 
   pub fn none() Figure {
     new Figure(false, 0., bonepose.Skeleton.empty(), bonepose.Pose.empty(), List[Transform3].empty(), walkgait.Walker.make(1., 0u32),
@@ -127,7 +161,16 @@ pub struct Figure {
 
   // A standing figure of 'height' metres, with the rigid attachments 'parts'
   pub fn make(height f32, seed u32, parts List[PartId]) Figure {
-    imm skel = bonepose.humanoid(height);
+    Figure.from(height, bonepose.humanoid(height), 0., seed, parts, 0xFFFFFFFFu32);
+  }
+
+  // A standing figure of person 'a' of humanbody's cast: its height, its own 22-bone skeleton (the hips and shoulders where the
+  // measures put them) and its hips for the gait
+  pub fn makePerson(a &PersonAsset, seed u32, parts List[PartId]) Figure {
+    Figure.from(a.height, humanbody.copySkeleton(&a.skeleton), a.hipSpan, seed, parts, a.index);
+  }
+
+  fn from(height f32, skel bonepose.Skeleton, hipSpan f32, seed u32, parts List[PartId], person u32) Figure {
     imm pose = skel.restPose();
     mut rest = List[Transform3].empty();
     skel.modelTransforms(&pose, &mut rest);
@@ -137,9 +180,13 @@ pub struct Figure {
       bind.push((*rest[i]).toMat4().inverse());
       i = i + 1usize;
     }
-    new Figure(true, height, skel, pose, List[Transform3].empty(), walkgait.Walker.make(height, seed), parts, bind,
+    mut walker = walkgait.Walker.make(height, seed);
+    if hipSpan > 0. { walker.hipSpan = hipSpan; }
+    mut f = new Figure(true, height, skel, pose, List[Transform3].empty(), walker, parts, bind,
       0., 0., 0., 0., true, 1., false, 0., 0u32, PartId.none(), new Vec3(0., 0., 0.), 0., 0u32,
       new Vec3(0., 0., 0.), new Vec3(0., 0., 0.), false, 0u32, 0u32, characterOf(height), FIG_WALK, -1i32, 0., 0., 0., FX_NONE, 0., 0u64);
+    f.person = person;
+    f;
   }
 
   // A spell of 'kind' (FX_...) begun at simulation tick 'start', 'age' seconds ago (0: now); FX_NONE ends one
@@ -164,6 +211,8 @@ pub struct Figure {
     imm feet = pos.y;
     imm floor = fn(x f32, z f32) f32 { phys.floorAt(x, z, feet); };
     walker.update(&skeleton, &mut pose, &mut models, pos, yaw, if onGround { spd; } else { 0.; }, turnRate, onGround, &floor, dt);
+    if hailT >= 0. { hailT = hailT + dt; }
+    self.applyHail();
     self.stepFx(dt);
   }
 
@@ -205,6 +254,13 @@ pub struct Figure {
 
   // The farthest any bone of its last pose is from the model's origin (the feet's ground point), metres: a standing or walking
   // figure's is under its height; a pose stretched across a teleport is metres more
+  // The face rig's frame laid on the pose: the jaw's opening and the eyes' turn (a person's, 22 bones), the model transforms made again
+  pub fn applyFace(self &mut, bones &facerig.FaceBones, frame &facerig.FaceFrame, spec &facerig.FaceSpec) {
+    if models.len() == 0usize or skeleton.boneCount() < 22usize { return; }
+    facerig.applyFace(&mut pose, bones, frame, spec, false);
+    skeleton.modelTransforms(&pose, &mut models);
+  }
+
   pub fn reach(self &) f32 {
     mut worst = 0.;
     mut i = 0usize;
@@ -227,10 +283,31 @@ pub struct Figure {
   // ground point and yaw): turn, accelerate, jump or fall, land, and pose.
   // What it stands on is the ground or a platform's floor (support.cone),
   // and a platform's walls stop it.
-  pub fn step(self &mut, phys &mut Phys, body &mut Walk, it Intents, dt f32) {
+  pub fn step(self &mut, phys &mut Phys, body &mut Walk, given Intents, dt f32) {
     landed = false;
-    if mode != FIG_WALK {
+    // The S key and the H key are presses: the key going down
+    imm sitPress = given.sit and !sitWas;
+    sitWas = given.sit;
+    imm hailPress = given.hail and !hailWas;
+    hailWas = given.hail;
+    if mode == FIG_RAG or mode == FIG_GETUP {
       // A ragdoll or a get-up: the physics world's turn moves it (ragdoll.cone), not an intent
+      hailT = -1.;
+      return;
+    }
+    if hailPress and hailT < 0. { hailT = 0.; }
+    if hailT >= 0. {
+      hailT = hailT + dt;
+      if hailT >= HAIL_SECONDS { hailT = -1.; }
+    }
+    if mode == FIG_SIT {
+      self.stepSit(phys, body, sitPress, dt);
+      return;
+    }
+    // Pressing S near a seat sends it there (and again, back); on its way to one it is steered, not driven
+    imm it = self.steered(phys, body, given, sitPress, dt);
+    if mode == FIG_SIT {
+      self.stepSit(phys, body, false, dt);
       return;
     }
     phys.ensureGround();
@@ -311,11 +388,170 @@ pub struct Figure {
     imm floor = fn(x f32, z f32) f32 { phys.floorAt(x, z, feet); };
     walker.update(&skeleton, &mut pose, &mut models, pos, body.yaw, if grounded { speed; } else { 0.; },
       it.turn * TURN_RATE, grounded, &floor, dt);
+    self.applyHail();
     self.stepFx(dt);
     // Falling fast: limp (the simulation's alone; a browser waits for the snapshot to say so)
     if !grounded and vy < 0. - RAGDOLL_FALL_SPEED and phys.authority {
       startRagdoll(phys, self, body);
     }
+  }
+
+  // The hail laid on the pose: the right arm up and waving, the head turned and the chest leaning (humanbody's hailPose), blended in over
+  // the first third of a second and out over the last half, whatever else the pose is (walking, standing, sitting). The model
+  // transforms are made again
+  pub fn applyHail(self &mut) {
+    if hailT < 0. or models.len() == 0usize or skeleton.boneCount() < 19usize { return; }
+    imm inW = clamp01(hailT / 0.33);
+    imm outW = clamp01((HAIL_SECONDS - hailT) / 0.5);
+    imm w = inW * inW * (3. - 2. * inW) * outW * outW * (3. - 2. * outW);
+    imm h = humanbody.hailPose(&skeleton, hailT);
+    imm bones Array[usize, 5] = [bonepose.UPPER_ARM_R, bonepose.FOREARM_R, bonepose.HAND_R, bonepose.NECK, bonepose.CHEST];
+    mut k = 0usize;
+    while k < 5usize {
+      imm b = bones[k];
+      imm a = *pose.locals[b];
+      imm c = *h.locals[b];
+      pose.locals.set(b, new Transform3(a.translation, a.rotation.slerp(c.rotation, w), a.scale));
+      k = k + 1usize;
+    }
+    skeleton.modelTransforms(&pose, &mut models);
+  }
+
+  // The yaw whose forward (-sin, -cos) points along (dx, dz)
+  fn headingOf(dx f32, dz f32) f32 { libc.atan2f(0. - dx, 0. - dz); }
+
+  // 'a' as an angle within half a turn of 0
+  fn wrapAngle(a f32) f32 {
+    mut r = a;
+    while r > 3.1415927 { r = r - 6.2831855; }
+    while r < -3.1415927 { r = r + 6.2831855; }
+    r;
+  }
+
+  // The intents of a being walking to a seat it chose with the S key: the intents it was given, or, on the way to a seat, the walk that
+  // takes it to the place in front of it (the thigh's length ahead of the sitting bones, humanbody's seatFeet) and the turn to the
+  // seat's way, until it arrives and sits down (the mode FIG_SIT). S again, or a jump, gives it up.
+  fn steered(self &mut, phys &mut Phys, body &mut Walk, given Intents, press bool, dt f32) Intents {
+    if sitPhase == SIT_NONE {
+      if press and grounded {
+        imm s = phys.seatNear(body.position, &skeleton);
+        if s >= 0i32 {
+          seat = s;
+          sitPhase = SIT_APPROACH;
+          sitT = 0.;
+          phys.takeSeat(usize.from(u32.from(s)));
+        }
+      }
+      return given;
+    }
+    // On the way
+    sitT = sitT + dt;
+    if press or given.jump or sitT > SEAT_APPROACH_SECONDS or seat < 0i32 or usize.from(u32.from(seat)) >= phys.seats.len() {
+      sitPhase = SIT_NONE;
+      seat = -1i32;
+      sitT = 0.;
+      return given;
+    }
+    imm sp = phys.seats[usize.from(u32.from(seat))];
+    imm feet = humanbody.seatFeet(&sp.seat, &skeleton);
+    imm dx = feet.x - body.position.x;
+    imm dz = feet.z - body.position.z;
+    imm d = libc.sqrtf(dx * dx + dz * dz);
+    if d < 0.07 {
+      // There: turned to the seat's way, it sits
+      imm diff = Figure.wrapAngle(sp.seat.yaw - body.yaw);
+      if libc.fabsf(diff) < 0.06 {
+        body.position = new Vec3(feet.x, feet.y, feet.z);
+        body.yaw = sp.seat.yaw;
+        speed = 0.;
+        mode = FIG_SIT;
+        sitPhase = SIT_DOWN;
+        sitT = 0.;
+        return Intents.none();
+      }
+      return new Intents(0., clampUnit(diff / (TURN_RATE * dt)), false, false);
+    }
+    imm diff = Figure.wrapAngle(Figure.headingOf(dx, dz) - body.yaw);
+    imm ahead = if libc.fabsf(diff) < 0.5 { clamp01(d / 0.5 + 0.2); } else { 0.; };
+    new Intents(ahead, clampUnit(diff / (TURN_RATE * dt)), false, false);
+  }
+
+  // One step of sitting down, being seated and standing up: the body is where the feet stand before the seat, facing its way, and the
+  // pose is humanbody's sitPose at the sit's progress; S while seated stands up
+  fn stepSit(self &mut, phys &mut Phys, body &mut Walk, press bool, dt f32) {
+    if seat < 0i32 or usize.from(u32.from(seat)) >= phys.seats.len() {
+      self.endSit(body);
+      return;
+    }
+    imm sp = phys.seats[usize.from(u32.from(seat))];
+    body.position = humanbody.seatFeet(&sp.seat, &skeleton);
+    body.yaw = sp.seat.yaw;
+    speed = 0.;
+    vy = 0.;
+    grounded = true;
+    if sitPhase == SIT_DOWN {
+      sitT = sitT + dt / SIT_SECONDS;
+      if sitT >= 1. { sitT = 1.; sitPhase = SIT_SEATED; }
+      if press { sitPhase = SIT_UP; }
+    } elif sitPhase == SIT_SEATED {
+      if press { sitPhase = SIT_UP; }
+    } else {
+      sitT = sitT - dt / SIT_SECONDS;
+      if sitT <= 0. {
+        self.endSit(body);
+        return;
+      }
+    }
+    self.poseSitting(&sp.seat);
+    self.applyHail();
+    self.stepFx(dt);
+  }
+
+  // The pose of a sit in 'sitT', sitting down or standing up
+  fn poseSitting(self &mut, s &humanbody.Seat) {
+    pose = humanbody.sitPose(&skeleton, s, sitT, sitPhase != SIT_UP);
+    skeleton.modelTransforms(&pose, &mut models);
+  }
+
+  // Standing on its feet again where the sit left it, its gait started afresh
+  pub fn endSit(self &mut, body &Walk) {
+    mode = FIG_WALK;
+    seat = -1i32;
+    sitPhase = SIT_NONE;
+    sitT = 0.;
+    speed = 0.;
+    vy = 0.;
+    airVx = 0.;
+    airVz = 0.;
+    grounded = true;
+    anchored = false;
+    walker.started = false;
+    walker.crouchDepth = 0.;
+    ch.teleport(body.position);
+    ch.grounded = true;
+  }
+
+  // Posed as the snapshot of a being sitting says (a view drawing another's sit, or its own after a correction): on seat 'slot' of the
+  // physics world, 'progress' of the way from standing to seated, sitting down or standing up. 'slot' -1: not sitting
+  pub fn poseSeated(self &mut, phys &mut Phys, slot i32, progress f32, down bool, dt f32) {
+    if slot < 0i32 or usize.from(u32.from(slot)) >= phys.seats.len() {
+      if seat >= 0i32 {
+        seat = -1i32;
+        sitPhase = SIT_NONE;
+        mode = FIG_WALK;
+        walker.started = false;
+        walker.crouchDepth = 0.;
+      }
+      return;
+    }
+    seat = slot;
+    mode = FIG_SIT;
+    sitT = progress;
+    sitPhase = if progress >= 1. { SIT_SEATED; } elif down { SIT_DOWN; } else { SIT_UP; };
+    imm sp = phys.seats[usize.from(u32.from(slot))];
+    self.poseSitting(&sp.seat);
+    self.applyHail();
+    self.stepFx(dt);
   }
 
   // Standing again where the body is, whole as it is, after a ragdoll's get-up: its gait started afresh
