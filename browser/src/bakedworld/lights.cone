@@ -35,6 +35,15 @@
 // (a Tint on those two parts) and its lights' intensity by NEAR_GAIN, over
 // NEAR_SECONDS, and going out dims them back: the event machinery made visible.
 //
+// HOW THEY MOVE. The lamp level and each lantern's gain are tweenstack's fields (a registry of animators
+// over (target, property) values: the content language's model, in which an animated value is a cell that
+// formulas read). The level is one field, LAMP_LEVEL; dusk starts a linear transition on it and dawn another,
+// the newest taking over from where the level has got to. Each path lantern's gain is a field of its own;
+// when the target (1.45 near a lit lantern, else 1) changes, a linear transition from the gain now to the new
+// target is started, over the time its distance takes at the steady rate (NEAR_GAIN - 1) / NEAR_SECONDS (a
+// steady rate, as before, not the exponential approach of tweenstack's 'chase'). The glows, tints and
+// intensities stay formulas over those two values, worked out each tick.
+//
 // Every change is sent through the Door as requests (Glow on a material,
 // Tint on a part, a LightSource on a light's part), only when it has changed
 // by more than a hundredth, so a lamp that is steady costs nothing.
@@ -58,6 +67,12 @@ pub const FADE_SECONDS f64 = 15d;
 pub const NEAR_RADIUS f32 = 4.;
 pub const NEAR_GAIN f32 = 1.45;
 pub const NEAR_SECONDS f32 = 0.4;
+
+// tweenstack's targets and property keys (a program's own keys start at 1024)
+const LAMP_TARGET = 1u32;       // the world's lamps: one field, their level
+const LAMP_LEVEL = 1024u32;
+const LANTERN_TARGET = 2u32;    // a path lantern: this plus its row's index
+const LANTERN_GAIN = 1025u32;
 
 // Each glow's share of the bulb's radiance
 pub const GLOW_BULB f32 = 1.;
@@ -157,8 +172,10 @@ pub struct LanternRow {
   pub glass PartId;
   pub bulb PartId;
   pub near bool;              // the possessed being is in its area
-  pub gain f32;               // how much brighter it is drawn now (1 to NEAR_GAIN)
+  pub gain f32;               // how much brighter it is drawn now (1 to NEAR_GAIN): its field's value as last ticked
   pub sentGain f32;
+  pub goal f32;               // the gain it is moving to (its transition's end)
+  pub anim u32;               // that transition's handle (0: none)
 }
 
 // No lantern: a lamp that nearness does not brighten
@@ -178,9 +195,13 @@ pub struct LampRow {
 
 pub struct Lights {
   pub on bool;                // switched on (dusk) or off (dawn)
-  pub switchedAt f64;         // the scene's time the last switch was for
-  pub fromLevel f32;          // the level when it switched
   pub level f32;              // 0 off to 1 fully on, as last ticked
+  levelAnim u32;              // the transition that is fading it (0: none)
+  switched bool;              // a switch has been read: the fade below is the last one
+  switchAt f64;               // the scene's time it was for
+  switchFrom f32;             // the level when it switched
+  lamp tweenstack.Animators;  // the lamp level's field
+  gains tweenstack.Animators; // each path lantern's gain's field
   pub lanterns List[LanternRow];
   sent Array[f32, 4];         // each glow's radiance last sent (bulb, glass, room, head)
   lastTick f64;
@@ -193,7 +214,7 @@ pub struct Lights {
   pub lampsSent u64;          // LightSource requests sent, ever
 
   pub fn make() Lights {
-    new Lights(false, -1.0e9d, 0., 0., List[LanternRow].empty(), [-1., -1., -1., -1.], 0d, 0u64, 0u64, 0u64, 0u64,
+    new Lights(false, 0., 0u32, false, 0d, 0., tweenstack.Animators.make(), tweenstack.Animators.make(), List[LanternRow].empty(), [-1., -1., -1., -1.], 0d, 0u64, 0u64, 0u64, 0u64,
       false, List[LampRow].empty(), 0u64);
   }
 
@@ -205,16 +226,19 @@ pub struct Lights {
     lastTick = now;
     imm h = hourAt(now);
     on = h >= DUSK_HOUR or h < DAWN_HOUR;
-    switchedAt = -1.0e9d;
-    fromLevel = if on { 1.; } else { 0.; };
-    level = fromLevel;
+    level = if on { 1.; } else { 0.; };
+    lamp.setF32(LAMP_TARGET, LAMP_LEVEL, level);
+    lamp.tick(now);
+    gains.tick(now);
   }
 
   // A path lantern whose area is part 'area' (sent its Area already), its
   // glass and bulb to brighten; the index it has
   pub fn addLantern(self &mut, area PartId, glass PartId, bulb PartId) usize {
-    lanterns.push(new LanternRow(area, glass, bulb, false, 1., 1.));
-    lanterns.len() - 1usize;
+    lanterns.push(new LanternRow(area, glass, bulb, false, 1., 1., 1., 0u32));
+    imm ix = lanterns.len() - 1usize;
+    gains.setF32(LANTERN_TARGET + u32.from(ix), LANTERN_GAIN, 1.);
+    ix;
   }
 
   // A light the world switches: part 'part' (already sent as the light 'look'
@@ -232,9 +256,54 @@ pub struct Lights {
   fn switch(self &mut, toOn bool, at f64) {
     switches = switches + 1u64;
     if toOn == on { return; }
-    fromLevel = level;
     on = toOn;
-    switchedAt = at;
+    switched = true;
+    switchAt = at;
+    switchFrom = level;
+    self.beginFade();
+  }
+
+  // The fade of the last switch: linear over FADE_SECONDS from the level it switched at, counted from the time the
+  // switch was for. One read late (the registry's clock already past it) is put that far into its fade, so a clock
+  // set forward past dusk finds the lamps on; one for a time still to come waits, the level as it was
+  fn beginFade(self &mut) {
+    imm a = tweenstack.Anim.transition(LAMP_TARGET, LAMP_LEVEL, tweenstack.Value.ofF32(if on { 1.; } else { 0.; }),
+      f32.from(FADE_SECONDS)).withFrom(tweenstack.Value.ofF32(switchFrom)).withLinear();
+    // (the one before is stopped: one still waiting for its moment would take the field over when it came)
+    if levelAnim != 0u32 { lamp.stop(levelAnim); }
+    levelAnim = lamp.startAt(&a, switchAt);
+    if switchAt < lamp.now { lamp.seek(levelAnim, lamp.now - switchAt); }
+  }
+
+  // The scene's clock has been set back (a registry's time only runs forward): its lamps' field made again at
+  // the new time, the last fade begun again from its own start, as if the clock had been there all along
+  fn rewindLamps(self &mut, now f64) {
+    lamp = tweenstack.Animators.make();
+    lamp.tick(now);
+    lamp.setF32(LAMP_TARGET, LAMP_LEVEL, if switched { switchFrom; } else { level; });
+    if switched { self.beginFade(); }
+  }
+
+  // The same for the lanterns' gains: each as it is, its move to its goal begun again (the clock stands still
+  // for the tick it was set back in)
+  fn rewindGains(self &mut, now f64) {
+    gains = tweenstack.Animators.make();
+    gains.tick(now);
+    mut i = 0usize;
+    while i < lanterns.len() {
+      mut row = *lanterns[i];
+      imm tg = LANTERN_TARGET + u32.from(i);
+      gains.setF32(tg, LANTERN_GAIN, row.gain);
+      row.anim = 0u32;
+      imm dist = absF(row.goal - row.gain);
+      if dist > 0. {
+        imm a = tweenstack.Anim.transition(tg, LANTERN_GAIN, tweenstack.Value.ofF32(row.goal),
+          dist / ((NEAR_GAIN - 1.) / NEAR_SECONDS)).withLinear();
+        row.anim = gains.start(&a);
+      }
+      lanterns.set(i, row);
+      i = i + 1usize;
+    }
   }
 
   // Area 'area' entered (true) or left; false if it is no lantern's
@@ -253,35 +322,49 @@ pub struct Lights {
     false;
   }
 
-  // The level at scene time 'now': the fade from the last switch
-  pub fn levelAt(self &, now f64) f32 {
-    imm t = f32.from((now - switchedAt) / FADE_SECONDS);
-    imm k = if t < 0. { 0.; } elif t > 1. { 1.; } else { t; };
-    imm target = if on { 1.; } else { 0.; };
-    fromLevel + (target - fromLevel) * k;
-  }
+  // The level as last ticked (the lamp level's field)
+  pub fn levelAt(self &, now f64) f32 { lamp.valueF32(LAMP_TARGET, LAMP_LEVEL, level); }
 
   // Once a frame at scene time 'now': the level faded on, every glow's
   // radiance worked out and sent where it changed, each lantern's
   // nearness brightening eased towards its target and sent where it changed,
   // and each light's intensity
   pub fn tick(self &mut, door &mut Door, now f64, mats &GlowMaterials) {
-    level = self.levelAt(now);
+    if now < lamp.now { self.rewindLamps(now); }
+    lamp.tick(now);
+    level = lamp.valueF32(LAMP_TARGET, LAMP_LEVEL, level);
     imm n = level * nitsAt(hourAt(now));
     self.send(door, 0usize, mats.bulb, lampColor(), n * GLOW_BULB);
     self.send(door, 1usize, mats.glass, glassColor(), n * GLOW_GLASS);
     self.send(door, 3usize, mats.head, glassColor(), n * GLOW_HEAD);
     self.send(door, 2usize, mats.room, roomColor(), n * GLOW_ROOM);
     // Nearness: only a lit lantern brightens
-    imm dt = f32.from(now - lastTick);
     lastTick = now;
-    imm step = if dt > 0. { dt / NEAR_SECONDS * (NEAR_GAIN - 1.); } else { 0.; };
+    if now < gains.now { self.rewindGains(now); }
     mut i = 0usize;
+    // (a changed target starts a new transition from the gain now, before the registry moves on to 'now')
     while i < lanterns.len() {
       mut row = *lanterns[i];
       imm want = if row.near and level > 0. { NEAR_GAIN; } else { 1.; };
-      if row.gain < want { row.gain = minF(row.gain + step, want); }
-      elif row.gain > want { row.gain = maxF(row.gain - step, want); }
+      if want != row.goal {
+        imm dist = absF(want - row.gain);
+        if row.anim != 0u32 { gains.stop(row.anim); row.anim = 0u32; }
+        if dist > 0. {
+          imm a = tweenstack.Anim.transition(LANTERN_TARGET + u32.from(i), LANTERN_GAIN, tweenstack.Value.ofF32(want),
+            dist / ((NEAR_GAIN - 1.) / NEAR_SECONDS)).withLinear();
+          row.anim = gains.start(&a);
+        }
+        row.goal = want;
+      }
+      lanterns.set(i, row);
+      i = i + 1usize;
+    }
+    gains.tick(now);
+    i = 0usize;
+    while i < lanterns.len() {
+      mut row = *lanterns[i];
+      imm want = row.goal;
+      row.gain = gains.valueF32(LANTERN_TARGET + u32.from(i), LANTERN_GAIN, row.gain);
       if absF(row.gain - row.sentGain) > 0.01 or (row.gain == want and row.gain != row.sentGain) {
         imm g = row.gain;
         imm tint = new Color(g, g, g, 1.);

@@ -106,6 +106,7 @@ import render use Image;
 import vfx use Emitter, SHAPE_DISC;
 import parts use *;
 import dragonship;
+import tweenstack;
 // The island: where the ground is, and where the path runs
 import island use { Island, Item, groundHeight, groundSlope, forestDensity, groveDensity, pathCentreline, pathDistanceAt, insideDressed, PATH_HALF_WIDTH,
   START_X, START_Z, BrookPoint, brookPoints, brookLength, brookDistanceAt, BROOK_BRIDGE };
@@ -113,6 +114,10 @@ import island use { Island, Item, groundHeight, groundSlope, forestDensity, grov
 import weberpenn;
 import noiserock;
 import leafrosette;
+
+// tweenstack's target and property for the launch button's cap (a program's own keys start at 1024)
+const CAP_TARGET = 3u32;
+const CAP_DIP_Y = 1026u32;
 
 fn v(x f32, y f32, z f32) Vec3 { new Vec3(x, y, z); }
 fn p2(x f32, y f32) Vec2 { new Vec2(x, y); }
@@ -628,7 +633,8 @@ pub struct BakedWorld {
   pub log List[Hydration];
   pub flight Flight;          // the balloon's
   pub pressedAt f64;          // when the button was last pressed; negative: never
-  capDown bool;               // the button's cap is drawn pressed
+  sentCap f32;                // the dip last sent for the button's cap (the balloon's units, 0 up)
+  cap tweenstack.Animators;   // the cap's dip field (tweenstack)
   sentRide f32;               // the seconds into the balloon's ride last sent (0: on its spot)
   pub fires u64;              // bursts of the burner fired (Fire requests sent)
   pub moves u64;              // Place requests sent by motions
@@ -646,7 +652,7 @@ pub struct BakedWorld {
 
   pub fn make() BakedWorld {
     new BakedWorld(0u32, List[PartId].empty(), List[Transform3].empty(), List[usize].empty(), List[Hydration].empty(),
-      Flight.grounded(), -1d, false, 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64,
+      Flight.grounded(), -1d, 0., tweenstack.Animators.make(), 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64,
       0u64, 0., Lights.make());
   }
 
@@ -700,6 +706,15 @@ pub struct BakedWorld {
           if c.id == self.buttonCap() {
             presses = presses + 1u64;
             pressedAt = now;
+            // The cap dips and comes back: two linear transitions in a sequence, over BUTTON_HELD in all (a press
+            // during a dip takes over from where the cap is)
+            mut halves = List[tweenstack.Anim].empty();
+            halves.push(tweenstack.Anim.transition(CAP_TARGET, CAP_DIP_Y, tweenstack.Value.ofF32(0. - CAP_DIP),
+              f32.from(BUTTON_HELD * 0.5d)).withLinear());
+            halves.push(tweenstack.Anim.transition(CAP_TARGET, CAP_DIP_Y, tweenstack.Value.ofF32(0.),
+              f32.from(BUTTON_HELD * 0.5d)).withLinear());
+            imm dipAnim = tweenstack.sequence(&halves);
+            cap.start(&dipAnim);
             imm wasFlying = flight.flying(now);
             flight = flight.pressed(now);
             print <- "The world: the launch button pressed at "; print <- now; print <- " s; the balloon ";
@@ -754,12 +769,14 @@ pub struct BakedWorld {
     lights.tick(door, now, &glowing);
     if self.has(BALLOON) {
       // The button's cap, on its mount in the basket (in the basket's frame: the balloon's units)
-      imm down = pressedAt >= 0d and now - pressedAt < BUTTON_HELD;
-      if down != capDown {
-        capDown = down;
+      // (its dip is the field CAP_DIP_Y, moved by the transitions a press starts; sent when it has changed)
+      cap.tick(now);
+      imm dip = cap.valueF32(CAP_TARGET, CAP_DIP_Y, 0.);
+      if dip != sentCap {
+        sentCap = dip;
         imm j = *firstOf[usize.from(BALLOON)] + BALLOON_CAP;
         mut at = *places[j];
-        if down { at.translation.y = at.translation.y - CAP_DIP; }
+        at.translation.y = at.translation.y + dip;
         door.send(Request.Place(*ids[j], at));
         moves = moves + 1u64;
       }
