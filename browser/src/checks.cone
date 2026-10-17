@@ -1173,7 +1173,97 @@ fn checkLights() bool {
   mut late = Lights.make();
   late.arrive(900d);
   ok = expect("a world arriving at 22:00 finds them on", late.on and late.levelAt(900d) == 1.) and ok;
+  // A clock set forward past dusk finds them on at once, the fade counted from when dusk was due
+  mut s2 = Scene.empty();
+  imm bulb2 = s2.door.defineMaterial(Look.plain(new Color(1., 1., 1., 1.)), Image.empty(), Maps.none());
+  imm you2 = livePart(&mut s2, "you");
+  mut jump = Lights.make();
+  jump.arrive(s2.now());
+  mut mats2 = GlowMaterials.none();
+  mats2.bulb = bulb2;
+  s2.takeInbox();
+  stepLights(&mut s2, &mut jump, &mats2, you2, new Vec3(0., 0., 0.));
+  s2.advanceClock(700000000000u64);
+  s2.ring();
+  mut mail2 = s2.door.takeMail();
+  imm msgs2 = mail2.viewMut();
+  mut k2 = 0usize;
+  while k2 < msgs2.len {
+    mut m2 Message = Message.Read;
+    m2 <=> msgs2[k2];
+    match &mut m2 {
+      case mut d &mut Dusk { jump.dusk(d.at); }
+      case mut d &mut Dawn { jump.dawn(d.at); }
+      else {}
+    }
+    k2 = k2 + 1usize;
+  }
+  jump.tick(&mut s2.door, s2.now(), &mats2);
+  print <- "  the clock set forward to "; print <- s2.now(); print <- " s ("; print <- hourAt(s2.now()); print <- " h): level "; print <- jump.level;
+  print <- ", the bulb "; print <- jump.sentNits(0usize); print <- " nits\n";
+  ok = expect("a clock set forward past dusk finds the lamps fully on", jump.on and jump.level == 1.) and ok;
   ok;
+}
+
+// The lights driven by a long pseudo-random run of the kinds of input the world gives them (a tick every 1/60 s;
+// now and then the scene's clock set forward or back by minutes; a lantern's area entered and left; dusks and
+// dawns read, some late), logging their state each 500 steps and the requests they sent in all. The same lines
+// from the same code under any way of animating them: a change of method shows as a changed line.
+fn checkLightsFuzz() bool {
+  print <- "The lights under a pseudo-random run (a clock set both ways, areas entered and left, switches read late):\n";
+  mut s = Scene.empty();
+  imm bulb = s.door.defineMaterial(Look.plain(new Color(1., 1., 1., 1.)), Image.empty(), Maps.none());
+  mut lights = Lights.make();
+  mut mats = GlowMaterials.none();
+  mats.bulb = bulb;
+  mut stakes = List[PartId].empty();
+  mut k = 0usize;
+  while k < 3usize {
+    imm stake = livePart(&mut s, "stake");
+    imm glass = livePart(&mut s, "glass");
+    imm bp = livePart(&mut s, "bulb");
+    imm lamp = livePart(&mut s, "light");
+    imm row = lights.addLantern(stake, glass, bp);
+    lights.addLamp(lamp, lanternLight(), CD_LANTERN, row);
+    stakes.push(stake);
+    k = k + 1usize;
+  }
+  s.takeInbox();
+  mut rng = 12345u64;
+  mut t = 300d;
+  lights.arrive(t);
+  mut i = 0u32;
+  mut prevSent Array[f32, 3] = [1., 1., 1.];
+  mut nearDup = 0u32;
+  while i < 40000u32 {
+    rng = rng * 6364136223846793005u64 + 1442695040888963407u64;
+    imm r = u32.from((rng >> 33u64) % 100000u64);
+    t = t + 1d / 60d;
+    if r < 15u32 { t = t + f64.from(r) * 40d; }                 // set forward by up to 10 minutes
+    elif r < 30u32 { t = t - f64.from(r - 15u32) * 30d; }       // or back by up to 7
+    if t < 0d { t = 0d; }
+    if r % 997u32 == 0u32 { lights.dusk(t - f64.from(r % 7u32) * 0.5d); }
+    elif r % 991u32 == 0u32 { lights.dawn(t - f64.from(r % 5u32) * 0.5d); }
+    if r % 53u32 == 0u32 { lights.near(*stakes[usize.from(r / 53u32) % 3usize], (r / 7u32) % 2u32 == 0u32); }
+    lights.tick(&mut s.door, t, &mats);
+    s.takeInbox();
+    mut q = 0usize;
+    while q < 3usize {
+      imm sg = lights.lanterns[q].sentGain;
+      imm d = sg - prevSent[q];
+      if d != 0. { if d < 0.001 and d > -0.001 { nearDup = nearDup + 1u32; } prevSent[q] = sg; }
+      q = q + 1usize;
+    }
+    if i % 500u32 == 0u32 {
+      print <- "  fuzz "; print <- i; print <- " t "; print <- t; print <- " level "; print <- lights.level; print <- " gains ";
+      print <- lights.lanterns[0].gain; print <- " "; print <- lights.lanterns[1].gain; print <- " "; print <- lights.lanterns[2].gain;
+      print <- " sent "; print <- lights.glowsSent; print <- " "; print <- lights.tintsSent; print <- " "; print <- lights.lampsSent; print <- "\n";
+    }
+    i = i + 1u32;
+  }
+  print <- "  tints that moved the sent gain by under 0.001 (the ends of ramps, a rounding apart): "; print <- nearDup; print <- "\n";
+  print <- "  totals: glows "; print <- lights.glowsSent; print <- ", tints "; print <- lights.tintsSent; print <- ", lights "; print <- lights.lampsSent; print <- "\n";
+  true;
 }
 
 // No two shared-material keys the same (two objects sharing a key silently share one material)
@@ -1208,6 +1298,7 @@ pub fn runChecks() i32 {
   ok = checkPeople() and ok;         // peoplechecks.cone
   ok = checkSky(&flat) and ok;
   ok = checkLights() and ok;
+  ok = checkLightsFuzz() and ok;
   ok = checkMirror() and ok;         // mirrorchecks.cone
   ok = checkPortal() and ok;         // portalchecks.cone
   ok = checkBakeCache() and ok;      // bakedworld/bakecache.cone

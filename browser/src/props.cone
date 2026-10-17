@@ -46,6 +46,10 @@ const PM_HOME = 0u32;
 const PM_LIVE = 1u32;
 const PM_GLIDE = 2u32;
 
+// tweenstack's target (plus the prop's slot) and property key for a glide's progress (a program's own keys start at 1024)
+const GLIDE_TARGET = 100u32;
+const GLIDE_PROGRESS = 1024u32;
+
 // What the snapshot says of a prop
 pub struct PropState {
   pub slot u32;
@@ -61,8 +65,9 @@ struct Prop {
   homeRot Quat;
   from Vec3;                // where its glide began
   fromRot Quat;
-  t f32;                    // seconds into the glide
+  t f32;                    // how far through the glide it is, 0 to 1 (its tweenstack field's value as last stepped)
   stillT f32;               // seconds its body has been nearly still (see STILL_SPEED)
+  anim u32;                 // the transition moving that field (0: none)
 }
 
 pub struct Props {
@@ -74,9 +79,11 @@ pub struct Props {
   pub resets u32;           // resets finished, counted
   ballShape u32;
   pinShape u32;
+  glides tweenstack.Animators;   // each glide's progress is a field (target GLIDE_TARGET + slot) the registry moves
+  clock f64;                // seconds of steps taken: the registry's time
 
   pub fn empty() Props {
-    new Props(false, List[Prop].empty(), false, 0., 0u32, 0u32, 0u32, 0u32);
+    new Props(false, List[Prop].empty(), false, 0., 0u32, 0u32, 0u32, 0u32, tweenstack.Animators.make(), 0d);
   }
 }
 
@@ -111,13 +118,13 @@ pub fn propsEnsure(phys &mut Phys, p &mut Props) {
   p.pinShape = phys.w.addShape(rigidcollide.Shape.single(pinHull()));
   imm bh = ballHomeSpot();
   p.props.push(new Prop(NO_PROP_BODY, PM_HOME, new Vec3(bh.x, groundHeight(&phys.island, bh.x, bh.y) + BALL_RADIUS, bh.y), Quat.identity(),
-    new Vec3(0., 0., 0.), Quat.identity(), 0., 0.));
+    new Vec3(0., 0., 0.), Quat.identity(), 0., 0., 0u32));
   mut k = 0usize;
   while k < PIN_COUNT {
     imm s = pinSpot(k);
     imm at = new Vec3(s.x, groundHeight(&phys.island, s.x, s.y), s.y);
     imm id = makePin(phys, p, at, Quat.identity());
-    p.props.push(new Prop(id, PM_HOME, at, Quat.identity(), at, Quat.identity(), 0., 0.));
+    p.props.push(new Prop(id, PM_HOME, at, Quat.identity(), at, Quat.identity(), 0., 0., 0u32));
     k = k + 1usize;
   }
 }
@@ -162,12 +169,6 @@ pub fn propsAwake(phys &Phys, p &Props) bool {
     i = i + 1usize;
   }
   false;
-}
-
-fn smooth01p(x f32) f32 {
-  if x <= 0. { return 0.; }
-  if x >= 1. { return 1.; }
-  x * x * (3. - 2. * x);
 }
 
 // One fixed step of the props, after the physics world's step: pins hit are live; when all have been still long enough they
@@ -232,6 +233,12 @@ pub fn propsStep(phys &mut Phys, p &mut Props, dt f32) {
           q.body = NO_PROP_BODY;
           q.mode = PM_GLIDE;
           q.t = 0.;
+          // Its progress, 0 to 1 over GLIDE_SECONDS (smoothstep, as the glide's easing always was); the pose
+          // is a formula over it (propPose)
+          imm tg = GLIDE_TARGET + u32.from(i);
+          p.glides.setF32(tg, GLIDE_PROGRESS, 0.);
+          imm a = tweenstack.Anim.transition(tg, GLIDE_PROGRESS, tweenstack.Value.ofF32(1.), GLIDE_SECONDS).withEase(keyframetracks.EASE_SMOOTHSTEP);
+          q.anim = p.glides.start(&a);
         }
         i = i + 1usize;
       }
@@ -239,13 +246,17 @@ pub fn propsStep(phys &mut Phys, p &mut Props, dt f32) {
   } else {
     p.quiet = 0.;
   }
-  // The glides
+  // The glides: the registry moves on by this step (a glide begun above has its first step now), and each
+  // prop's progress is read back; a glide whose transition has ended is home
+  p.clock = p.clock + f64.from(dt);
+  p.glides.tick(p.clock);
   i = 0usize;
   while i < p.props.len() {
     imm q = &mut p.props[i];
     if q.mode == PM_GLIDE {
-      q.t = q.t + dt;
-      if q.t >= GLIDE_SECONDS {
+      q.t = p.glides.valueF32(GLIDE_TARGET + u32.from(i), GLIDE_PROGRESS, q.t);
+      if !p.glides.exists(q.anim) {
+        q.anim = 0u32;
         q.mode = PM_HOME;
         if i == PROP_BALL {
           // The ball waits at the head of the lane: a body, asleep
@@ -297,6 +308,7 @@ pub fn propsBowl(phys &mut Phys, p &mut Props, feet Vec3, aim Vec3) {
   def.angVel = upV().cross(d * BOWL_SPEED) * (1. / BALL_RADIUS);
   q.body = phys.w.createBody(def);
   q.mode = PM_LIVE;
+  if q.anim != 0u32 { p.glides.stop(q.anim); q.anim = 0u32; }
   q.t = 0.;
   p.moved = true;
   p.quiet = 0.;
@@ -307,7 +319,7 @@ pub fn propsBowl(phys &mut Phys, p &mut Props, feet Vec3, aim Vec3) {
 fn propPose(phys &Phys, q &Prop) rigidcollide.Rigid {
   if q.mode == PM_LIVE { return phys.w.transformOf(q.body); }
   if q.mode == PM_GLIDE {
-    imm s = smooth01p(q.t / GLIDE_SECONDS);
+    imm s = q.t;
     imm lift = GLIDE_LIFT * libc.sinf(pi * s);
     new rigidcollide.Rigid(new Vec3(q.from.x + (q.home.x - q.from.x) * s, q.from.y + (q.home.y - q.from.y) * s + lift,
       q.from.z + (q.home.z - q.from.z) * s), q.fromRot.slerp(q.homeRot, s));
