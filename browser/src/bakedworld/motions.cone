@@ -13,16 +13,20 @@
 //   goes so that its basket's open front faces the view (below). A press
 //   while it flies is ignored: the ride has one way down, its end.
 //
-// THE RIDE is a centripetal Catmull-Rom spline through WAYPOINTS (its
-// corners never overshoot into loops, however unevenly the waypoints are
-// spaced), travelled by its length at an eased speed: from rest over
-// EASE_SECONDS, steady, and to rest again over the last EASE_SECONDS. Each
-// waypoint names what its rider should be looking at; the balloon turns so
-// its open front faces it, the heading interpolated between waypoints
-// along the same spline's parameter, always the short way round from the
-// last (so over the whole ride it turns once round, clockwise seen from
-// above, and a rider who walked in and turned about faces every view in
-// turn). At the start and the end it faces as it stands.
+// THE RIDE is one tweenstack 'along' animator: a centripetal Catmull-Rom
+// spline through WAYPOINTS (its corners never overshoot into loops, however
+// unevenly the waypoints are spaced), travelled by its length at an eased
+// speed: from rest over EASE_SECONDS, steady, and to rest again over the last
+// EASE_SECONDS (the end ramps, the speed rising as 1 - cos). Each waypoint
+// names what its rider should be looking at; the balloon turns so its open
+// front faces it, the heading interpolated between waypoints along the same
+// spline's parameter, always the short way round from the last (so over the
+// whole ride it turns once round, clockwise seen from above, and a rider who
+// walked in and turned about faces every view in turn): tweenstack's heading
+// curve, 'facingHeadings'. At the start and the end it faces as it stands.
+// The animator is begun at the press's moment, so a reader that comes to it
+// late (a view arriving mid-ride) is put as far into the ride as the press
+// was ago.
 //
 // The views, in order (x east, z south to the sea; the balloon's spot is
 // (-10, 300), 24 m behind the cottage, whose front faces the path):
@@ -85,16 +89,26 @@ imm WAYPOINT Array[f32, 60] = [
   -10., 0., 300.,       REST, REST];        // landed
 // The highest waypoint: the climb ends there
 const TOP_WAYPOINT = 5usize;
-// Samples of each span between waypoints, for its length
-const SPAN_SAMPLES = 32usize;
+
+// tweenstack's target and property keys for the ride (a program's own keys start at 1024): the envelope's place
+// (a Vec3, the path's point) and its heading (a rotation about +y)
+const RIDE_TARGET = 4u32;
+const RIDE_AT = 1027u32;
+const RIDE_FACING = 1028u32;
 
 // Where the balloon is on the ride: its envelope's place moved by 'offset'
-// (metres, from where it stands), turned to 'yaw' (radians about +y, as the
+// (metres, from where it stands), turned by 'rotation' (about +y, as the
 // world's place turns it: its open front, +z, faces (sin yaw, cos yaw))
 pub struct FlightPose {
   pub offset Vec3;
-  pub yaw f32;
+  pub rotation Quat;
+
+  // The heading in radians (as the rotation says it, within a turn either way)
+  pub fn yaw(self &) f32 { 2. * libc.atan2f(rotation.y, rotation.w); }
 }
+
+// As it stands, on its spot
+fn restPose(restYaw f32) FlightPose { new FlightPose(new Vec3(0., 0., 0.), Quat.angleAxis(restYaw, new Vec3(0., 1., 0.))); }
 
 // A burst of the burner: from 'start' until 'stop' (the scene's seconds)
 pub struct Burst {
@@ -129,11 +143,12 @@ pub struct Flight {
   // When the ride ended (or will): its landing
   pub fn landedAt(self &) f64 { since + f64.from(FLIGHT_SECONDS); }
 
-  // Where it is at 'now'
-  pub fn pose(self &, now f64, restYaw f32) FlightPose { ridePose(self.elapsed(now), restYaw); }
-
-  // The basket's height above its spot at 'now'
-  pub fn altitude(self &, now f64, restYaw f32) f32 { self.pose(now, restYaw).offset.y; }
+  // The basket's height above its spot at 'now' (for one that has no RideAnim of its own: a ride begun at the press
+  // and read at 'now', as a late reader would)
+  pub fn altitude(self &, now f64, restYaw f32) f32 {
+    mut ride = RideAnim.make();
+    ride.pose(self, now, restYaw).offset.y;
+  }
 
   // Pressed at 'now': the ride begins, if it is on the ground; a press
   // while it flies is ignored
@@ -166,136 +181,62 @@ fn bursts(from f64, period f64, on f64, now f64) Burst {
 
 // ---- The ride's path ----
 
-// Waypoint 'i' (clamped to the ends, and one span past each end mirrored, so
-// the path leaves its spot and comes down onto it straight up and down)
-fn waypointAt(i i32) Vec3 {
-  imm n = i32.from(WAYPOINTS);
-  if i < 0 { return waypointAt(0) * 2. - waypointAt(1); }
-  if i >= n { return waypointAt(n - 1) * 2. - waypointAt(n - 2); }
-  imm k = usize.from(i) * 5usize;
-  new Vec3(WAYPOINT[k], WAYPOINT[k + 1usize], WAYPOINT[k + 2usize]);
+// The waypoints' places, the path's points
+fn ridePoints() List[Vec3] {
+  mut pts = List[Vec3].empty();
+  mut i = 0usize;
+  while i < WAYPOINTS {
+    pts.push(new Vec3(WAYPOINT[i * 5usize], WAYPOINT[i * 5usize + 1usize], WAYPOINT[i * 5usize + 2usize]));
+    i = i + 1usize;
+  }
+  pts;
 }
 
-fn knotStep(a Vec3, b Vec3) f32 {
-  imm d = (b - a).length();
-  if d < 0.0001 { 0.01; } else { libc.sqrtf(d); };
+// The path: centripetal Catmull-Rom through the waypoints, one past each end mirrored (so it leaves its spot and
+// comes down onto it straight up and down)
+fn rideCurve() tweenstack.Curve3 {
+  imm pts = ridePoints();
+  tweenstack.Curve3.centripetal(&pts);
 }
 
-// The point 'u' (0 to 1) of the way along the span from waypoint 'i' to
-// 'i' + 1: centripetal Catmull-Rom (Barry and Goldman's pyramid)
-fn spanPoint(i i32, u f32) Vec3 {
-  imm p0 = waypointAt(i - 1);
-  imm p1 = waypointAt(i);
-  imm p2 = waypointAt(i + 1);
-  imm p3 = waypointAt(i + 2);
-  imm t0 = 0.;
-  imm t1 = t0 + knotStep(p0, p1);
-  imm t2 = t1 + knotStep(p1, p2);
-  imm t3 = t2 + knotStep(p2, p3);
-  imm t = t1 + (t2 - t1) * u;
-  imm a1 = p0 * ((t1 - t) / (t1 - t0)) + p1 * ((t - t0) / (t1 - t0));
-  imm a2 = p1 * ((t2 - t) / (t2 - t1)) + p2 * ((t - t1) / (t2 - t1));
-  imm a3 = p2 * ((t3 - t) / (t3 - t2)) + p3 * ((t - t2) / (t3 - t2));
-  imm b1 = a1 * ((t2 - t) / (t2 - t0)) + a2 * ((t - t0) / (t2 - t0));
-  imm b2 = a2 * ((t3 - t) / (t3 - t1)) + a3 * ((t - t1) / (t3 - t1));
-  b1 * ((t2 - t) / (t2 - t1)) + b2 * ((t - t1) / (t2 - t1));
-}
-
-// The heading at waypoint 'i' for a balloon standing at 'restYaw': facing
-// its target, or as it stands
+// The heading at waypoint 'i' for a balloon standing at 'restYaw': facing its target, or as it stands
 fn targetYaw(i usize, restYaw f32) f32 {
   imm k = i * 5usize;
   if WAYPOINT[k + 3usize] == REST { return restYaw; }
   libc.atan2f(WAYPOINT[k + 3usize] - WAYPOINT[k], WAYPOINT[k + 4usize] - WAYPOINT[k + 2usize]);
 }
 
-fn wrapAngle(a f32) f32 {
-  mut x = a;
-  while x > pi { x = x - 2. * pi; }
-  while x < 0. - pi { x = x + 2. * pi; }
-  x;
-}
-
-// The heading at waypoint 'i' (clamped to the ends), unwound: each the
-// short way round from the one before, from the first's
-fn headingAt(i i32, restYaw f32) f32 {
-  imm n = i32.from(WAYPOINTS);
-  imm last = if i < 0 { 0; } elif i >= n { n - 1; } else { i; };
-  mut h = targetYaw(0usize, restYaw);
-  mut k = 1;
-  while k <= last {
-    h = h + wrapAngle(targetYaw(usize.from(k), restYaw) - h);
-    k = k + 1;
+// The ride as an animator: along the path over FLIGHT_SECONDS at one speed, eased from and to rest over
+// EASE_SECONDS, the heading at each waypoint a turn towards its view (tweenstack unwinds them the short way round)
+fn rideAnim(curve &tweenstack.Curve3, restYaw f32) tweenstack.Anim {
+  mut headings = List[f32].empty();
+  mut i = 0usize;
+  while i < WAYPOINTS {
+    headings.push(targetYaw(i, restYaw));
+    i = i + 1usize;
   }
-  h;
-}
-
-// The heading 'u' of the way along span 'i': Catmull-Rom on the waypoints' headings
-fn spanHeading(i i32, u f32, restYaw f32) f32 {
-  imm h0 = headingAt(i - 1, restYaw);
-  imm h1 = headingAt(i, restYaw);
-  imm h2 = headingAt(i + 1, restYaw);
-  imm h3 = headingAt(i + 2, restYaw);
-  imm u2 = u * u;
-  imm u3 = u2 * u;
-  0.5 * (2. * h1 + (h2 - h0) * u + (2. * h0 - 5. * h1 + 4. * h2 - h3) * u2 + (3. * h1 - h0 - 3. * h2 + h3) * u3);
-}
-
-// The path's length from its start to each sample, into 'out' (one more
-// than the samples), its spans SPAN_SAMPLES samples each
-fn pathLengths(out &mut List[f32]) {
-  out.clear();
-  out.push(0.);
-  mut acc = 0.;
-  mut prev = waypointAt(0);
-  mut i = 0;
-  while i + 1 < i32.from(WAYPOINTS) {
-    mut j = 1usize;
-    while j <= SPAN_SAMPLES {
-      imm p = spanPoint(i, f32.from(j) / f32.from(SPAN_SAMPLES));
-      acc = acc + (p - prev).length();
-      out.push(acc);
-      prev = p;
-      j = j + 1usize;
-    }
-    i = i + 1;
-  }
+  tweenstack.Anim.along(RIDE_TARGET, RIDE_AT, curve, FLIGHT_SECONDS).byArcLength(true).withEndRamps(EASE_SECONDS)
+    .facingHeadings(RIDE_FACING, &headings);
 }
 
 // The ride's whole length, metres
-pub fn rideLength() f32 {
-  mut l = List[f32].empty();
-  pathLengths(&mut l);
-  *l[l.len() - 1usize];
-}
+pub fn rideLength() f32 { rideCurve().length(); }
 
 // Its steady speed, m/s: the length over the time less one ease
 pub fn rideSpeed() f32 { rideLength() / (FLIGHT_SECONDS - EASE_SECONDS); }
 
-// How far along the path it is 't' seconds in: eased from rest (its speed
-// rising as 1 - cos over EASE_SECONDS), steady, eased to rest again
-fn distanceAt(t f32, length f32) f32 {
-  imm vmax = length / (FLIGHT_SECONDS - EASE_SECONDS);
-  if t <= 0. { return 0.; }
-  if t >= FLIGHT_SECONDS { return length; }
-  if t < EASE_SECONDS { return vmax * (0.5 * t - EASE_SECONDS / (2. * pi) * sin(pi * t / EASE_SECONDS)); }
-  if t > FLIGHT_SECONDS - EASE_SECONDS { return length - distanceAt(FLIGHT_SECONDS - t, length); }
-  vmax * (0.5 * EASE_SECONDS + t - EASE_SECONDS);
-}
-
-// When it reaches waypoint 'i', seconds into the ride (found by halving the
-// time, the distance only growing with it)
+// When it reaches waypoint 'i', seconds into the ride (found by halving the time, the distance only growing with
+// it; the end ramps' own distance)
 pub fn rideTimeAt(i usize) f32 {
-  mut l = List[f32].empty();
-  pathLengths(&mut l);
-  imm length = *l[l.len() - 1usize];
-  imm s = *l[i * SPAN_SAMPLES];
+  imm c = rideCurve();
+  imm perSegment = (c.lens.len() - 1usize) / c.segments();
+  imm fraction = *c.lens[i * perSegment] / c.total;
   mut lo = 0.;
   mut hi = FLIGHT_SECONDS;
   mut k = 0;
   while k < 40 {
     imm mid = 0.5 * (lo + hi);
-    if distanceAt(mid, length) < s { lo = mid; } else { hi = mid; }
+    if tweenstack.rampProgress(mid / FLIGHT_SECONDS, FLIGHT_SECONDS, EASE_SECONDS) < fraction { lo = mid; } else { hi = mid; }
     k = k + 1;
   }
   0.5 * (lo + hi);
@@ -308,23 +249,34 @@ pub fn rideTopTime() f32 { rideTimeAt(TOP_WAYPOINT); }
 pub fn rideWaypoints() usize { WAYPOINTS; }
 pub fn rideWaypointHeight(i usize) f32 { WAYPOINT[i * 5usize + 1usize]; }
 
-// Where the balloon is 't' seconds into the ride, standing at 'restYaw'
-// on its spot: exactly as it stands before and after
-pub fn ridePose(t f32, restYaw f32) FlightPose {
-  if t <= 0. or t >= FLIGHT_SECONDS { return new FlightPose(new Vec3(0., 0., 0.), restYaw); }
-  mut l = List[f32].empty();
-  pathLengths(&mut l);
-  imm length = *l[l.len() - 1usize];
-  imm s = distanceAt(t, length);
-  // The sample at or before it, and the way to the next
-  mut k = 0usize;
-  while k + 2usize < l.len() and *l[k + 1usize] <= s { k = k + 1usize; }
-  imm a = *l[k];
-  imm b = *l[k + 1usize];
-  imm f = if b > a { (s - a) / (b - a); } else { 0.; };
-  imm span = i32.from(k / SPAN_SAMPLES);
-  imm u = (f32.from(k % SPAN_SAMPLES) + f) / f32.from(SPAN_SAMPLES);
-  imm p = spanPoint(span, u);
-  imm start = waypointAt(0);
-  new FlightPose(new Vec3(p.x - start.x, p.y - start.y, p.z - start.z), spanHeading(span, u, restYaw));
+// A ride in progress: a tweenstack registry holding the animator of the balloon's ride, begun at the press's
+// moment. It is read at the scene's time (forward or back: the ride is a function of the time since the press).
+pub struct RideAnim {
+  reg tweenstack.Animators;
+  begunFor f64;             // the press the animator was begun for
+  begun bool;
+  start Vec3;               // the path's first point (where the balloon stands)
+
+  pub fn make() RideAnim { new RideAnim(tweenstack.Animators.make(), 0d, false, new Vec3(0., 0., 0.)); }
+
+  // Where the balloon is at 'now' on 'flight''s ride, standing at 'restYaw' on its spot: exactly as it stands before
+  // the ride and after it
+  pub fn pose(self &mut, flight &Flight, now f64, restYaw f32) FlightPose {
+    imm t = flight.elapsed(now);
+    if t <= 0. or t >= FLIGHT_SECONDS { return restPose(restYaw); }
+    if !begun or begunFor != flight.since {
+      imm curve = rideCurve();
+      imm a = rideAnim(&curve, restYaw);
+      imm pts = ridePoints();
+      start = *pts[0usize];
+      // (the registry's clock is brought to 'now' first: a press in its past is put that far into the ride)
+      reg.tick(now);
+      reg.startAt(&a, flight.since);
+      begun = true;
+      begunFor = flight.since;
+    }
+    reg.tick(now);
+    imm p = reg.valueVec3(RIDE_TARGET, RIDE_AT, start);
+    new FlightPose(p - start, reg.valueQuat(RIDE_TARGET, RIDE_FACING, Quat.angleAxis(restYaw, new Vec3(0., 1., 0.))));
+  }
 }
