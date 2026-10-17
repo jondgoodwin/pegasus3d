@@ -635,6 +635,7 @@ pub struct BakedWorld {
   pub pressedAt f64;          // when the button was last pressed; negative: never
   sentCap f32;                // the dip last sent for the button's cap (the balloon's units, 0 up)
   cap tweenstack.Animators;   // the cap's dip field (tweenstack)
+  capAnim u32;                // the hold that keeps it down (0: none)
   sentRide f32;               // the seconds into the balloon's ride last sent (0: on its spot)
   pub fires u64;              // bursts of the burner fired (Fire requests sent)
   pub moves u64;              // Place requests sent by motions
@@ -652,7 +653,7 @@ pub struct BakedWorld {
 
   pub fn make() BakedWorld {
     new BakedWorld(0u32, List[PartId].empty(), List[Transform3].empty(), List[usize].empty(), List[Hydration].empty(),
-      Flight.grounded(), -1d, 0., tweenstack.Animators.make(), 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64,
+      Flight.grounded(), -1d, 0., tweenstack.Animators.make(), 0u32, 0., 0u64, 0u64, 0u64, List[MaterialId].empty(), 0u64, -1d, 0u64, 0u64, 0u64, 0u64,
       0u64, 0., Lights.make());
   }
 
@@ -666,6 +667,24 @@ pub struct BakedWorld {
   fn sharedOf(self &, key u32) MaterialId {
     imm k = usize.from(key);
     if k < shared.len() { *shared[k]; } else { MaterialId.none(); };
+  }
+
+  // The scene's clock has been set back (a registry's time only runs forward): the cap's field made again at the
+  // new time, down while the time since the press is under BUTTON_HELD (negative, with the clock back before the
+  // press, too: it stays down until the press's quarter second has passed), as it was
+  fn rewindCap(self &mut, now f64) {
+    cap = tweenstack.Animators.make();
+    cap.tick(now);
+    capAnim = 0u32;
+    if pressedAt >= 0d and now - pressedAt < BUTTON_HELD {
+      cap.setF32(CAP_TARGET, CAP_DIP_Y, 0. - CAP_DIP);
+      imm held = tweenstack.Anim.transitionFrom(CAP_TARGET, CAP_DIP_Y, tweenstack.Value.ofF32(0. - CAP_DIP),
+        tweenstack.Value.ofF32(0. - CAP_DIP), f32.from(BUTTON_HELD)).withLinear();
+      capAnim = cap.startAt(&held, pressedAt);
+      if pressedAt < now { cap.seek(capAnim, now - pressedAt); }
+    } else {
+      cap.setF32(CAP_TARGET, CAP_DIP_Y, 0.);
+    }
   }
 
   // Whether every object has been sent
@@ -706,15 +725,12 @@ pub struct BakedWorld {
           if c.id == self.buttonCap() {
             presses = presses + 1u64;
             pressedAt = now;
-            // The cap dips and comes back: two linear transitions in a sequence, over BUTTON_HELD in all (a press
-            // during a dip takes over from where the cap is)
-            mut halves = List[tweenstack.Anim].empty();
-            halves.push(tweenstack.Anim.transition(CAP_TARGET, CAP_DIP_Y, tweenstack.Value.ofF32(0. - CAP_DIP),
-              f32.from(BUTTON_HELD * 0.5d)).withLinear());
-            halves.push(tweenstack.Anim.transition(CAP_TARGET, CAP_DIP_Y, tweenstack.Value.ofF32(0.),
-              f32.from(BUTTON_HELD * 0.5d)).withLinear());
-            imm dipAnim = tweenstack.sequence(&halves);
-            cap.start(&dipAnim);
+            // The cap is pressed down and held for BUTTON_HELD, then up: a step, not a slide (two Place requests a
+            // press). A transition from the dip to the dip holds it for that long, begun at this moment; when it
+            // ends the cap comes up (the tick below). A press during the hold begins a new one: held 0.25 s again.
+            imm held = tweenstack.Anim.transitionFrom(CAP_TARGET, CAP_DIP_Y, tweenstack.Value.ofF32(0. - CAP_DIP),
+              tweenstack.Value.ofF32(0. - CAP_DIP), f32.from(BUTTON_HELD)).withLinear();
+            capAnim = cap.startAt(&held, now);
             imm wasFlying = flight.flying(now);
             flight = flight.pressed(now);
             print <- "The world: the launch button pressed at "; print <- now; print <- " s; the balloon ";
@@ -770,7 +786,12 @@ pub struct BakedWorld {
     if self.has(BALLOON) {
       // The button's cap, on its mount in the basket (in the basket's frame: the balloon's units)
       // (its dip is the field CAP_DIP_Y, moved by the transitions a press starts; sent when it has changed)
+      if now < cap.now { self.rewindCap(now); }
       cap.tick(now);
+      if capAnim != 0u32 and !cap.exists(capAnim) {
+        capAnim = 0u32;
+        cap.setF32(CAP_TARGET, CAP_DIP_Y, 0.);
+      }
       imm dip = cap.valueF32(CAP_TARGET, CAP_DIP_Y, 0.);
       if dip != sentCap {
         sentCap = dip;
