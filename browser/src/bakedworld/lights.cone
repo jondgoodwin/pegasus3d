@@ -35,6 +35,15 @@
 // (a Tint on those two parts) and its lights' intensity by NEAR_GAIN, over
 // NEAR_SECONDS, and going out dims them back: the event machinery made visible.
 //
+// HOW THEY MOVE. The lamp level and each lantern's gain are tweenstack's fields (a registry of animators
+// over (target, property) values: the content language's model, in which an animated value is a cell that
+// formulas read). The level is one field, LAMP_LEVEL; dusk starts a linear transition on it and dawn another,
+// the newest taking over from where the level has got to. A dusk read late is started at the moment it was for
+// (the registry samples it that far in), and the scene's clock set back moves the fade back with it. Each path
+// lantern's gain is a field of its own, moved by one constant-speed chase (NEAR_GAIN - 1 in NEAR_SECONDS, the
+// steady rate as before) whose goal the lantern's nearness moves: 1.45 near a lit lantern, else 1. The glows,
+// tints and intensities stay formulas over those two values, worked out each tick.
+//
 // Every change is sent through the Door as requests (Glow on a material,
 // Tint on a part, a LightSource on a light's part), only when it has changed
 // by more than a hundredth, so a lamp that is steady costs nothing.
@@ -42,22 +51,28 @@
 // The lamps' warm colour: about 2700 K, an incandescent bulb's, as linear
 // RGB. 2700 K is about sRGB (255, 169, 87) (Mitchell Charity's blackbody
 // table, recalled, not re-checked), decoded with the sRGB curve.
-pub fn lampColor() Color { new Color(1., 0.397, 0.0953, 1.); }
+pub fn lampColor() Color { new Color(1., 0.397, 0.0953, 1.) }
 // A lit room's amber, deeper than the bulb (a shaded lamp through cloth;
 // deep enough that AgX, which pales bright colours, leaves it amber)
-pub fn roomColor() Color { new Color(1., 0.25, 0.028, 1.); }
+pub fn roomColor() Color { new Color(1., 0.25, 0.028, 1.) }
 
 // The amber the lantern's panes and lining glow: deeper than the bulb, so that the tone mapping
 // leaves the interior amber and not peach
-pub fn glassColor() Color { new Color(1., 0.3, 0.045, 1.); }
+pub fn glassColor() Color { new Color(1., 0.3, 0.045, 1.) }
 pub const GLOW_HEAD f32 = 0.0015;        // a lantern's roof and frame: a faint warm lift, not a light
 
 // How long a switch on or off takes (scene seconds: a minute is an hour)
-pub const FADE_SECONDS f64 = 15d;
+pub const FADE_SECONDS f64 = 15.0;
 // Nearness: the area's radius (metres), how much brighter, how fast
 pub const NEAR_RADIUS f32 = 4.;
 pub const NEAR_GAIN f32 = 1.45;
 pub const NEAR_SECONDS f32 = 0.4;
+
+// tweenstack's targets and property keys (a program's own keys start at 1024)
+const LAMP_TARGET = 1u32;       // the world's lamps: one field, their level
+const LAMP_LEVEL = 1024u32;
+const LANTERN_TARGET = 2u32;    // a path lantern: this plus its row's index
+const LANTERN_GAIN = 1025u32;
 
 // Each glow's share of the bulb's radiance
 pub const GLOW_BULB f32 = 1.;
@@ -84,58 +99,58 @@ pub const LAYER_FRAME u32 = 3u32;
 // it by its own colour, which is mostly green, so a light as green as the glass's (0.3) made a yellow-green
 // pool; with the green at 0.14 the pool reads the photograph's warm gold on grass, and a warm brown on the
 // deck and the stone
-pub fn poolColor() Color { new Color(1., 0.14, 0.01, 1.); }
+pub fn poolColor() Color { new Color(1., 0.14, 0.01, 1.) }
 
 // A lantern's light on its surroundings: a point light at its bulb, a source of 2 cm, warm gold, dark until
 // the hour sets its candela; it casts a shadow (render gives the nearest few the shadow maps there are, and
 // fades each by its rank so that a pool does not change as you walk)
 pub fn lanternLight() LightLook {
-  mut l = LightLook.point(new Vec3(0., 0., 0.), poolColor(), 0., RANGE_LANTERN);
+  var l = LightLook.point(new Vec3(0., 0., 0.), poolColor(), 0., RANGE_LANTERN);
   l.radius = 0.02;
   l.layers = LAYER_WORLD;
   l.shadow = true;
-  l;
+  l
 }
 
 // and its small interior light, on its own layer, 35 cm of range: it lights the lantern's frame, the
 // underside of its roof and its floor plate, and nothing else
 pub fn interiorLight() LightLook {
-  mut l = LightLook.point(new Vec3(0., 0., 0.), lampColor(), 0., RANGE_INTERIOR);
+  var l = LightLook.point(new Vec3(0., 0., 0.), lampColor(), 0., RANGE_INTERIOR);
   l.radius = 0.02;
   l.layers = LAYER_INTERIOR;
-  l;
+  l
 }
 
 // A lit window's light: a spot light, a broad cone out and down from just in front of the glass, a source
 // of 30 cm (the glass), warm, dark until the hour sets its candela; it casts no shadow
 pub fn windowLight() LightLook {
-  mut l = LightLook.spot(new Vec3(0., 0., 0.), new Vec3(0., -0.5, 1.).normalize(), roomColor(), 0., RANGE_WINDOW,
+  var l = LightLook.spot(new Vec3(0., 0., 0.), new Vec3(0., -0.5, 1.).normalize(), roomColor(), 0., RANGE_WINDOW,
     WINDOW_CONE_INNER, WINDOW_CONE_OUTER);
   l.radius = 0.3;
-  l;
+  l
 }
 
 // A bulb's radiance (nits) with the day clock at 'hour': log-linear between
 // hours of an evening (the morning's are the evening's mirrored about noon,
 // where the sun's height is the same)
 // (the evening's hours are counted from dusk, 17:28 on 15 October; they were from 19:30 in May)
-imm GLOW_HOURS Array[f32, 8] = [16.975, 17.475, 17.725, 17.975, 18.475, 18.975, 19.475, 19.975];
-imm GLOW_NITS Array[f32, 8] = [3600., 2800., 1600., 800., 160., 24., 3., 1.3];
+let GLOW_HOURS Array[f32, 8] = [16.975, 17.475, 17.725, 17.975, 18.475, 18.975, 19.475, 19.975];
+let GLOW_NITS Array[f32, 8] = [3600., 2800., 1600., 800., 160., 24., 3., 1.3];
 pub fn nitsAt(hour f64) f32 {
-  mut x = f32.from(hour);
+  var x = f32.from(hour);
   if x < 12. { x = 24. - x; }
   if x <= GLOW_HOURS[0] { return GLOW_NITS[0]; }
-  mut i = 1usize;
+  var i = 1usize;
   while i < 8usize {
     if x <= GLOW_HOURS[i] {
-      imm t = (x - GLOW_HOURS[i - 1usize]) / (GLOW_HOURS[i] - GLOW_HOURS[i - 1usize]);
-      imm a = libc.logf(GLOW_NITS[i - 1usize]);
-      imm b = libc.logf(GLOW_NITS[i]);
+      let t = (x - GLOW_HOURS[i - 1usize]) / (GLOW_HOURS[i] - GLOW_HOURS[i - 1usize]);
+      let a = libc.logf(GLOW_NITS[i - 1usize]);
+      let b = libc.logf(GLOW_NITS[i]);
       return libc.expf(a + (b - a) * t);
     }
     i = i + 1usize;
   }
-  GLOW_NITS[7];
+  GLOW_NITS[7]
 }
 
 // The materials that glow, by what they are (none: not yet defined)
@@ -146,7 +161,7 @@ pub struct GlowMaterials {
   pub head MaterialId;        // a lantern's roof and frame: the faint warm rim of the light inside
 
   pub fn none() GlowMaterials {
-    new GlowMaterials(MaterialId.none(), MaterialId.none(), MaterialId.none(), MaterialId.none());
+    new GlowMaterials(MaterialId.none(), MaterialId.none(), MaterialId.none(), MaterialId.none())
   }
 }
 
@@ -157,8 +172,10 @@ pub struct LanternRow {
   pub glass PartId;
   pub bulb PartId;
   pub near bool;              // the possessed being is in its area
-  pub gain f32;               // how much brighter it is drawn now (1 to NEAR_GAIN)
+  pub gain f32;               // how much brighter it is drawn now (1 to NEAR_GAIN): its field's value as last ticked
   pub sentGain f32;
+  pub goal f32;               // the gain it is chasing
+  pub anim u32;               // the chase's handle
 }
 
 // No lantern: a lamp that nearness does not brighten
@@ -178,12 +195,11 @@ pub struct LampRow {
 
 pub struct Lights {
   pub on bool;                // switched on (dusk) or off (dawn)
-  pub switchedAt f64;         // the scene's time the last switch was for
-  pub fromLevel f32;          // the level when it switched
   pub level f32;              // 0 off to 1 fully on, as last ticked
+  lamp tweenstack.Animators;  // the lamp level's field
+  gains tweenstack.Animators; // each path lantern's gain's field
   pub lanterns List[LanternRow];
   sent Array[f32, 4];         // each glow's radiance last sent (bulb, glass, room, head)
-  lastTick f64;
   pub glowsSent u64;          // Glow requests sent, ever
   pub tintsSent u64;          // Tint requests sent, ever
   pub switches u64;           // dusks and dawns read
@@ -193,8 +209,8 @@ pub struct Lights {
   pub lampsSent u64;          // LightSource requests sent, ever
 
   pub fn make() Lights {
-    new Lights(false, -1.0e9d, 0., 0., List[LanternRow].empty(), [-1., -1., -1., -1.], 0d, 0u64, 0u64, 0u64, 0u64,
-      false, List[LampRow].empty(), 0u64);
+    new Lights(false, 0., tweenstack.Animators.make(), tweenstack.Animators.make(), List[LanternRow].empty(), [-1., -1., -1., -1.], 0u64, 0u64, 0u64, 0u64,
+      false, List[LampRow].empty(), 0u64)
   }
 
   // Set on or off for a world arriving at scene time 'now' (no fade: as
@@ -202,19 +218,23 @@ pub struct Lights {
   pub fn arrive(self &mut, now f64) {
     if arrived { return; }
     arrived = true;
-    lastTick = now;
-    imm h = hourAt(now);
+    let h = hourAt(now);
     on = h >= DUSK_HOUR or h < DAWN_HOUR;
-    switchedAt = -1.0e9d;
-    fromLevel = if on { 1.; } else { 0.; };
-    level = fromLevel;
+    level = if on { 1. } else { 0. };
+    lamp.setF32(LAMP_TARGET, LAMP_LEVEL, level);
+    lamp.tick(now);
+    gains.tick(now);
   }
 
   // A path lantern whose area is part 'area' (sent its Area already), its
   // glass and bulb to brighten; the index it has
   pub fn addLantern(self &mut, area PartId, glass PartId, bulb PartId) usize {
-    lanterns.push(new LanternRow(area, glass, bulb, false, 1., 1.));
-    lanterns.len() - 1usize;
+    let ix = lanterns.len();
+    let tg = LANTERN_TARGET + u32.from(ix);
+    gains.setF32(tg, LANTERN_GAIN, 1.);
+    let chase = tweenstack.Anim.chaseSpeed(tg, LANTERN_GAIN, tweenstack.Value.ofF32(1.), NEAR_GAIN - 1., NEAR_SECONDS);
+    lanterns.push(new LanternRow(area, glass, bulb, false, 1., 1., 1., gains.start(&chase)));
+    ix
   }
 
   // A light the world switches: part 'part' (already sent as the light 'look'
@@ -229,20 +249,25 @@ pub struct Lights {
   // and its dawn: off
   pub fn dawn(self &mut, at f64) { self.switch(false, at); }
 
+  // A fade for scene time 'at': linear over FADE_SECONDS from the level now, started at the moment the switch was
+  // for. The registry puts one read late that far into its fade (a clock set forward past dusk finds the lamps on)
+  // and lets one for a time still to come wait, the level as it was; the newest takes over from the one before,
+  // running or waiting; and the clock set back moves the fade back with it
   fn switch(self &mut, toOn bool, at f64) {
     switches = switches + 1u64;
     if toOn == on { return; }
-    fromLevel = level;
     on = toOn;
-    switchedAt = at;
+    let a = tweenstack.Anim.transition(LAMP_TARGET, LAMP_LEVEL, tweenstack.Value.ofF32(if on { 1. } else { 0. }),
+      f32.from(FADE_SECONDS)).withLinear();
+    lamp.startAt(&a, at);
   }
 
   // Area 'area' entered (true) or left; false if it is no lantern's
   pub fn near(self &mut, area PartId, inside bool) bool {
-    mut i = 0usize;
+    var i = 0usize;
     while i < lanterns.len() {
       if lanterns[i].area == area {
-        mut row = *lanterns[i];
+        var row = *lanterns[i];
         if inside and !row.near { comings = comings + 1u64; }
         row.near = inside;
         lanterns.set(i, row);
@@ -250,41 +275,46 @@ pub struct Lights {
       }
       i = i + 1usize;
     }
-    false;
+    false
   }
 
-  // The level at scene time 'now': the fade from the last switch
-  pub fn levelAt(self &, now f64) f32 {
-    imm t = f32.from((now - switchedAt) / FADE_SECONDS);
-    imm k = if t < 0. { 0.; } elif t > 1. { 1.; } else { t; };
-    imm target = if on { 1.; } else { 0.; };
-    fromLevel + (target - fromLevel) * k;
-  }
+  // The level as last ticked (the lamp level's field)
+  pub fn levelAt(self &, now f64) f32 { lamp.valueF32(LAMP_TARGET, LAMP_LEVEL, level) }
 
   // Once a frame at scene time 'now': the level faded on, every glow's
   // radiance worked out and sent where it changed, each lantern's
   // nearness brightening eased towards its target and sent where it changed,
   // and each light's intensity
   pub fn tick(self &mut, door &mut Door, now f64, mats &GlowMaterials) {
-    level = self.levelAt(now);
-    imm n = level * nitsAt(hourAt(now));
+    lamp.tick(now);
+    level = lamp.valueF32(LAMP_TARGET, LAMP_LEVEL, level);
+    let n = level * nitsAt(hourAt(now));
     self.send(door, 0usize, mats.bulb, lampColor(), n * GLOW_BULB);
     self.send(door, 1usize, mats.glass, glassColor(), n * GLOW_GLASS);
     self.send(door, 3usize, mats.head, glassColor(), n * GLOW_HEAD);
     self.send(door, 2usize, mats.room, roomColor(), n * GLOW_ROOM);
     // Nearness: only a lit lantern brightens
-    imm dt = f32.from(now - lastTick);
-    lastTick = now;
-    imm step = if dt > 0. { dt / NEAR_SECONDS * (NEAR_GAIN - 1.); } else { 0.; };
-    mut i = 0usize;
+    var i = 0usize;
+    // (a changed target moves the chase's goal, before the registry moves on to 'now')
     while i < lanterns.len() {
-      mut row = *lanterns[i];
-      imm want = if row.near and level > 0. { NEAR_GAIN; } else { 1.; };
-      if row.gain < want { row.gain = minF(row.gain + step, want); }
-      elif row.gain > want { row.gain = maxF(row.gain - step, want); }
+      var row = *lanterns[i];
+      let want = if row.near and level > 0. { NEAR_GAIN } else { 1. };
+      if want != row.goal {
+        gains.setGoal(row.anim, 0u32, tweenstack.Value.ofF32(want));
+        row.goal = want;
+      }
+      lanterns.set(i, row);
+      i = i + 1usize;
+    }
+    gains.tick(now);
+    i = 0usize;
+    while i < lanterns.len() {
+      var row = *lanterns[i];
+      let want = row.goal;
+      row.gain = gains.valueF32(LANTERN_TARGET + u32.from(i), LANTERN_GAIN, row.gain);
       if absF(row.gain - row.sentGain) > 0.01 or (row.gain == want and row.gain != row.sentGain) {
-        imm g = row.gain;
-        imm tint = new Color(g, g, g, 1.);
+        let g = row.gain;
+        let tint = new Color(g, g, g, 1.);
         door.tint(row.glass, tint);
         door.tint(row.bulb, tint);
         tintsSent = tintsSent + 1u64;
@@ -296,13 +326,13 @@ pub struct Lights {
     // The lights: the hour's intensity, brightened by their lantern's nearness
     i = 0usize;
     while i < lamps.len() {
-      mut lamp = *lamps[i];
-      imm gain = if lamp.lantern == NO_LANTERN { 1.; } else { lanterns[lamp.lantern].gain; };
-      imm candela = n * lamp.perNit * gain;
-      imm last = lamp.sent;
-      imm changed = last < 0. or (candela == 0.) != (last == 0.) or absF(candela - last) > 0.01 * maxF(last, candela);
+      var lamp = *lamps[i];
+      let gain = if lamp.lantern == NO_LANTERN { 1. } else { lanterns[lamp.lantern].gain };
+      let candela = n * lamp.perNit * gain;
+      let last = lamp.sent;
+      let changed = last < 0. or (candela == 0.) != (last == 0.) or absF(candela - last) > 0.01 * maxF(last, candela);
       if changed {
-        mut look = lamp.look;
+        var look = lamp.look;
         look.candela = candela;
         door.light(lamp.part, look);
         lamp.sent = candela;
@@ -317,8 +347,8 @@ pub struct Lights {
   // hundredth (or to or from black)
   fn send(self &mut, door &mut Door, k usize, m MaterialId, color Color, nits f32) {
     if m.isNone() { return; }
-    imm last = sent[k];
-    imm changed = last < 0. or (nits == 0.) != (last == 0.) or absF(nits - last) > 0.01 * maxF(last, nits);
+    let last = sent[k];
+    let changed = last < 0. or (nits == 0.) != (last == 0.) or absF(nits - last) > 0.01 * maxF(last, nits);
     if !changed { return; }
     sent[k] = nits;
     door.glow(m, new Color(color.red * nits, color.green * nits, color.blue * nits, 1.));
@@ -327,21 +357,21 @@ pub struct Lights {
 
   // The radiance last sent for glow 'k' (bulb 0, glass 1, room 2, head 3), nits;
   // negative if none yet
-  pub fn sentNits(self &, k usize) f32 { sent[k]; }
+  pub fn sentNits(self &, k usize) f32 { sent[k] }
 
   // The candela last sent for the first light a path lantern's nearness brightens (negative: none yet)
   pub fn firstLanternCandela(self &) f32 {
-    mut i = 0usize;
+    var i = 0usize;
     while i < lamps.len() {
       if lamps[i].lantern != NO_LANTERN { return lamps[i].sent; }
       i = i + 1usize;
     }
-    -1.;
+    -1.
   }
 
   // The candela last sent for light 'k' (in the order added), negative if none yet
-  pub fn sentCandela(self &, k usize) f32 { lamps[k].sent; }
+  pub fn sentCandela(self &, k usize) f32 { lamps[k].sent }
 }
 
-fn absF(x f32) f32 { if x < 0. { 0. - x; } else { x; }; }
-fn maxF(a f32, b f32) f32 { if a > b { a; } else { b; }; }
+fn absF(x f32) f32 { if x < 0. { 0. - x } else { x } }
+fn maxF(a f32, b f32) f32 { if a > b { a } else { b } }
