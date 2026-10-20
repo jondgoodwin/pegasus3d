@@ -33,7 +33,7 @@ build\release\browser.exe
 (`C:\src\cone\tools\congo\congo.bat run` builds and runs in one step; `-- args` passes arguments.)
 It needs `conec` built in the Cone checkout (`build\x64-release\conec.exe`), Python 3.11 or later, a
 GPU driver with Vulkan 1.3, and SDL3: `SDL3.lib` on `LIB` to link (Congo copies `SDL3.dll` beside the
-program). With the Vulkan SDK installed, the validation layer is on.
+program). With the Vulkan SDK installed, the validation layer is off in a window run unless `--validate` asks for it (the scripted runs have it on).
 `GPU_POWER_PREFERENCE=low-power` picks the integrated GPU where there are two.
 
 The build also compiles the browser's `gpu/` folder (the starship's distance field and kernels) for the
@@ -565,6 +565,7 @@ browser.exe --no-vegetation           the same without the trees, rocks and plan
 browser.exe --checks                  the scene core's own checks, on scenes of their own (below), the sky's and the vegetation's layout
 browser.exe --no-sky                  the static sky and light, no birds (to time what the day costs)
 browser.exe --frames 600              600 frames on frame's synthetic clock
+browser.exe --validate                the Vulkan validation layer on in a window run (off otherwise: it costs ~12 ms of CPU a frame)
 browser.exe --soak 12000              12000 frames, checking nothing grows (below)
 browser.exe --watch 300               300 s in real time, a line a second and a key probe (below)
 browser.exe --navpic PREFIX           the villagers' navigation mesh drawn top-down as PREFIX-region.bmp, -cottage.bmp and -bridge.bmp
@@ -1339,7 +1340,9 @@ glass and the bulb each its own part, in three materials the world shares.
 
 - **The validation layer.** Where the Vulkan SDK is installed the gpu package loads Khronos validation with synchronization checks, ~12 ms of CPU a frame
   (render's recording 14.6 ms with it, 1.9 ms without). It is now on only in the scripted runs (`--script`, `--checks`, `--mirror-only`... whose
-  verdict says "validation messages: 0") or with `PEGASUS_VALIDATION=1`; `PEGASUS_VALIDATION=0` turns it off even there (`validationPolicy`, renderactor.cone).
+  verdict says "validation messages: 0"), with `--validate`, or with `PEGASUS_VALIDATION=1`; `PEGASUS_VALIDATION=0` turns it off in the scripted
+  runs (`validationWanted`, renderactor.cone). The window's instance is made with `Instance.createWindowed("browser", validation)`, so a run without the layer
+  never asks the loader for it.
 - **Timers.** `PEGASUS_CPU_TIMING=1` prints the render actor's CPU time by stage, `PEGASUS_GPU_TIMING=1` the main frame's GPU time by stage (it idles the
   device each frame, so the frame time of that run is not the normal one). `frametimer.cone`.
 - **The bake cache** (`bakedworld/bakecache.cone`). A baked texture set is kept in `%LOCALAPPDATA%\pegasus3d\bakecache` (`$XDG_CACHE_HOME` or `~/.cache`
