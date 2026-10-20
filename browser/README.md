@@ -231,7 +231,57 @@ renders the mixer on the game thread, a fixed 48000 / 60 frames to each fixed st
 device. Options: `--no-audio`; `--audio-device` (use the device even in an automated run, e.g. with `SDL_AUDIODRIVER=dummy`);
 `--audio-muted` (open the device but start muted); `--audio-wav FILE` (record the offline mix); `--audio-walk FILE` (the
 scripted walk of `src/audiowalk.cone`, past the brook and over the bridge, recorded to FILE and described by its spectrum;
-add `--headless` for no window).
+add `--headless` for no window). `--xr` turns the sound off altogether (below).
+
+## In a headset: `--xr`
+
+`browser.exe --xr` draws the island into an OpenXR headset: Cone's `openxr` package and render's `Headset` (the runtime, a Quest 3
+through Link or SteamVR, or Meta's PC simulator, makes the Vulkan device; the browser draws each eye into the runtime's images and the
+runtime does the lens, the reprojection and the compositing). With no OpenXR runtime or no headset it says why and exits 1.
+
+- **The camera is the head.** Each eye is the pose the runtime locates for the frame's predicted display time, used exactly as it is
+  given: never smoothed, filtered, eased or predicted further. It is placed on the avatar's feet: the room's floor is the ground under
+  the avatar, the headset's forward is the way the avatar faces, and an eye is the feet plus the eye's position in the room's floor
+  space (`drawXr` in `renderactor.cone`). There is no follow camera, no eye-height easing and no head bob (the view rig's
+  eyes are not used); the one thing under the head that moves is the avatar's feet (the snapshot's `feetFrom`/`feetTo`, eased between
+  steps as the avatar always is). You look around only: nothing in a headset walks or turns the avatar yet, so walking, snap turns and
+  the comfort rules wait for the controllers (a windowed `--xr` run still walks with the keyboard, which moves the feet).
+- **The window mirrors the left eye** (the middle of it, cropped to the window's shape, blitted into the window's swapchain before the
+  image goes back to the runtime). The mirror never waits for the display: it is presented in the mailbox mode and skips a frame when
+  the window has no free image, so the headset keeps its own rate. `--headless` with `--xr` has no window (and no mirror) but the
+  headset's GPU all the same: what the automated runs below use.
+- **No audio device, ever.** `--xr` sets the sound off before anything reads the audio options, so `audioOpen` returns at its first
+  test (`opts.off`), before it asks for a device, and the device's thread (`audiodevice`, the only caller of SDL's audio) is never started: a run in the simulator is silent at any
+  hour. (A headset's own sound is a later piece of work.)
+- **Off under `--xr`**, each with what it cost one eye on the RTX 4060 Laptop at 1680 x 1760 (the island from the landing beach; the
+  GPU time of the eye's main pass between two timestamps):
+  - temporal anti-aliasing, auto-exposure, ambient occlusion, the froxel fog and the paint decals (the image quality passes, tier 0:
+    the plain path): they are one history of the last frame to reproject, and two eyes would share it; **+1.17 ms an eye** when forced
+    on (`PEGASUS_FX=high`: for measuring only, the picture alternates histories). The fog is the fog slabs instead, sized to the eye's
+    off-axis view;
+  - the overlay (the HUD and its name plates): a screen-space panel is wrong in a head-mounted display;
+  - ray-traced glass: the runtime makes the device, and it has no ray queries, so the glass is the raster glass (`PEGASUS_RT=off`'s
+    look); not measured on the headset's device.
+  - Kept, with their costs: the sun's shadows (cascades: **-1.05 ms an eye** when off, `PEGASUS_SHADOWS=off`; **-0.7 ms** at low) and
+    the lanterns' (no change at the landing beach, none near).
+- **What an eye costs on the island** (the landing beach, 299 frames, the simulator): CPU 1.0 ms (left) and 0.8 ms (right) for the
+  whole eye's frame, the draw list included, GPU 7.35 ms each. The two eyes' 14.7 ms do not fit the simulator's 72 Hz (13.9 ms): the
+  runtime shows the frame at the next display time, so the frame is 27.8 ms (36 Hz). 90 Hz (11.1 ms) needs about 5 ms an eye with
+  everything else in the frame: the scene is built and culled once for each eye now, and one list for two views is the next step.
+
+```
+browser.exe --xr                       drawn into the headset (the window is the mirror); Escape or the runtime ends it
+browser.exe --xr --headless            the same with no window
+browser.exe --xr --headless --frames 300 --xr-shots PREFIX
+                                       300 frames, then PREFIX-left.bmp and PREFIX-right.bmp (each eye's image), and with a window
+                                       PREFIX-mirror.bmp (the window's), as render's xrstereo example writes its own
+```
+
+To run it without a headset, in Meta's PC simulator extracted from its installer (nothing installed, no registry), from a console used
+only for this: `set XR_RUNTIME_JSON=<extracted>\PFiles\MetaXRSimulator\v207.1\meta_openxr_simulator.json`, `set META_XRSIM_CONFIG_JSON=`
+a file naming `{"use_batch_mode": true, "use_offscreen_mode": true}` (its own window cannot start without the Windows App Runtime),
+`set PATH=<OpenXR loader 1.1.65>\x64\bin;%PATH%`, and keep Vulkan's validation layer off (it leaks under the simulator: `--xr` makes
+its instance without it). The loader is opened only when `--xr` is: every other run never asks the OS for `openxr_loader.dll`.
 
 ## The HUD
 

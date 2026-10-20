@@ -38,6 +38,7 @@ struct Gfx {
   pub cover: groundcover.CoverRenderer;   // the ground's grass, flowers, ferns, needles (groundrig.cone), drawn after the scene's pass; before the device
   pub renderer: Renderer;
   pub swapchain: SwapChain;
+  pub headset: Headset;        // --xr: OpenXR's session, the eye images and the window's mirror; none otherwise. Before the device it was made on.
   pub device: Device;
   pub adapter: Adapter;
   pub surface: Surface;
@@ -50,6 +51,7 @@ struct Gfx {
   pub shotBgra: bool;
   pub shotPng: bool;
   pub skyScale: f32 = 1.;      // how bright the environment's sky is baked (fitEnvironmentSky), the share of rendersys.cone's daylight
+  pub xr: bool = false;        // --xr: the frame is the headset's (drawXr): two eyes, no overlay, none of the image quality passes
 }
 
 // The environment's sky is one fixed daylight (rendersys.cone's environmentSky), which the day dims by the renderer's
@@ -113,6 +115,7 @@ pub struct Presented {
   pub join: String;            // the panel's Join was pressed this frame: the name to play under (else empty)
   pub panel: u32 = 0u32;       // the "Play with others" panel after the frame (requestpanel.cone: PANEL_OPEN, PANEL_TEXT)
   pub talk: u32 = 0u32;        // the question chosen on a guard's panel this frame ((guard * 256 + question) + 1; talkpanel.cone), or 0
+  pub xrEnded: bool = false;   // --xr: the headset's session is over (the user took the headset off the system, or the runtime quit): the run is over
 }
 
 // How a part is drawn, as the scripted run's checks read it
@@ -206,18 +209,32 @@ actor RenderActor {
   unrendered: u64;             // render requests a headless run had no GPU for
   renderCallTicks: u64;        // the CPU time spent in render's own call (the scene's culling, batching and recording), summed
   renderCalls: u64;            // and its count
+  xrShots: String;             // --xr-shots PREFIX: the eyes' pictures (and the window's) near the end of the run go to PREFIX-left.bmp, -right.bmp, -mirror.bmp
+  xrShotAt: u64;               // the frame the first of them is taken at (the left eye; the right eye's is the next frame's)
+  xrShotsDone: u32;            // how many eyes have been written
+  xrFrames: u64;               // frames the headset showed (a session that was running and wanted the eyes)
+  xrMirrorShot: bool;          // the window's picture was asked for and not yet written
 
   // The GPU side made for the window (its SDL handle as a number, since a
   // raw pointer is not Sendable; 0 for a headless run, which has none),
   // 'width' by 'height' pixels. 'ready' is told whether it could be made.
+  // With 'opts.xr' it is the headset's: the runtime makes the GPU, the window (if there is one) shows the left eye's picture, and
+  // a headless run has the GPU too.
   fn init(self: &new, window: usize, width: u32, height: u32, opts: RunOptions, shotsDir: String,
-    ready: Sender[bool], land: Island) {
+    ready: Sender[bool], land: Island, xrShots: String, xrShotAt: u64) {
     let skyOff = opts.skyOff;
     let scripted = opts.scripted;
     var rig = SkyRig.make();
     var made: Option[Gfx] = None;
     var ok = true;
-    if window != 0usize {
+    if opts.xr {
+      made = makeGfxXr(window, width, height, skyOff, opts.cullMode, &mut rig, &land, xrShots.len() > 0usize);
+      ok = false;
+      match &mut made {
+        case var &mut Some(some) { ok = true; }
+        else {}
+      }
+    } else if window != 0usize {
       validationPolicy(scripted);
       made = makeGfx(window as *u8 as *sdl.Window, width, height, skyOff, opts.cullMode, &mut rig, &land);
       ok = false;
@@ -226,7 +243,7 @@ actor RenderActor {
         else {}
       }
     }
-    *self = Self(made, rig, skyOff, scripted, shotsDir, 0u64, 0u64, 0u64);
+    *self = Self(made, rig, skyOff, scripted, shotsDir, 0u64, 0u64, 0u64, xrShots, xrShotAt, 0u32, 0u64, false);
     var told = ready;
     told <- ok;
   }
@@ -241,6 +258,7 @@ actor RenderActor {
     var emitters = 0usize;
     var swapNs = 0u64;
     var acquireNs = 0u64;
+    var xrEnded = false;
     var status = SURFACE_TEXTURE_SUCCESS_OPTIMAL;
     var shotFailed = false;
     var facts = RenderFacts.empty();
@@ -250,48 +268,58 @@ actor RenderActor {
     var t1 = t0;
     match &mut g {
       case var &mut Some(some) {
-        some.timer.begin();
-        if o.resized { some.swapchain.resize(o.width, o.height); }
-        // A gallery run's frame is drawn off screen, at the size its shot says, whatever the window is: the offscreen target
-        // takes the swapchain's place while it is drawn, and the swapchain's image is presented as it was
-        // (not in the first frames: what was made with the device is still being uploaded, and a texture or frame made again in the
-        // device frame that made it would leave the upload's commands invalid)
-        let offscreen = o.capW > 0u32 && o.capH > 0u32 && some.target.ok() && o.frame > 3u64;
-        some.offscreen = offscreen;
-        if offscreen {
-          if some.off.texture.width != o.capW || some.off.texture.height != o.capH {
-            some.device.waitIdle();
-            some.off = makeOffscreen(&mut some.device, o.capW, o.capH, some.target.texture.format);
-          }
-          some.target <-> some.off;
-        }
-        some.sys.surfaces.width = some.target.texture.width;
-        some.sys.surfaces.height = some.target.texture.height;
-        self.apply(some, &mut o.requests);
-        some.timer.mark(0usize);
-        self.drawFrame(some, &o.snapshot, o.shot.view(), o.alpha, &o.hud);
-        if offscreen { some.target <-> some.off; }
-        panel = some.hud.panelBits();
-        join = some.hud.takeJoin();
-        talk = some.hud.takeTalk();
-        t1 = sdl.GetTicksNS();
-        let s0 = sdl.GetTicksNS();
-        if some.target.ok() {
-          some.swapchain.present(&mut some.device);
-          swapNs = sdl.GetTicksNS() - s0;
-          if !self.writeShot(some) { shotFailed = true; }
+        if some.xr {
+          // The headset's frame (drawXr): two eyes, each into its own swapchain's image, the window mirroring the left
+          xrEnded = !self.drawXr(some, &mut o);
+          t1 = sdl.GetTicksNS();
+          status = SURFACE_TEXTURE_SUCCESS_OPTIMAL;
+          rows = some.sys.rows.len();
+          emitters = some.sys.particles.emitterCount();
+          if scripted { RenderFacts.take(&some.sys, &mut facts); }
         } else {
-          sdl.Delay(10u32);
+          some.timer.begin();
+          if o.resized { some.swapchain.resize(o.width, o.height); }
+          // A gallery run's frame is drawn off screen, at the size its shot says, whatever the window is: the offscreen target
+          // takes the swapchain's place while it is drawn, and the swapchain's image is presented as it was
+          // (not in the first frames: what was made with the device is still being uploaded, and a texture or frame made again in the
+          // device frame that made it would leave the upload's commands invalid)
+          let offscreen = o.capW > 0u32 && o.capH > 0u32 && some.target.ok() && o.frame > 3u64;
+          some.offscreen = offscreen;
+          if offscreen {
+            if some.off.texture.width != o.capW || some.off.texture.height != o.capH {
+              some.device.waitIdle();
+              some.off = makeOffscreen(&mut some.device, o.capW, o.capH, some.target.texture.format);
+            }
+            some.target <-> some.off;
+          }
+          some.sys.surfaces.width = some.target.texture.width;
+          some.sys.surfaces.height = some.target.texture.height;
+          self.apply(some, &mut o.requests);
+          some.timer.mark(0usize);
+          self.drawFrame(some, &o.snapshot, o.shot.view(), o.alpha, &o.hud, &EyeView.none());
+          if offscreen { some.target <-> some.off; }
+          panel = some.hud.panelBits();
+          join = some.hud.takeJoin();
+          talk = some.hud.takeTalk();
+          t1 = sdl.GetTicksNS();
+          let s0 = sdl.GetTicksNS();
+          if some.target.ok() {
+            some.swapchain.present(&mut some.device);
+            swapNs = sdl.GetTicksNS() - s0;
+            if !self.writeShot(some) { shotFailed = true; }
+          } else {
+            sdl.Delay(10u32);
+          }
+          let a0 = sdl.GetTicksNS();
+          some.target = some.swapchain.getCurrentTexture(&mut some.device);
+          acquireNs = sdl.GetTicksNS() - a0;
+          some.timer.mark(9usize);
+          some.timer.frameDone();
+          status = some.target.status;
+          rows = some.sys.rows.len();
+          emitters = some.sys.particles.emitterCount();
+          if scripted { RenderFacts.take(&some.sys, &mut facts); }
         }
-        let a0 = sdl.GetTicksNS();
-        some.target = some.swapchain.getCurrentTexture(&mut some.device);
-        acquireNs = sdl.GetTicksNS() - a0;
-        some.timer.mark(9usize);
-        some.timer.frameDone();
-        status = some.target.status;
-        rows = some.sys.rows.len();
-        emitters = some.sys.particles.emitterCount();
-        if scripted { RenderFacts.take(&some.sys, &mut facts); }
       }
       else {
         self.countUnrendered(&mut o.requests);
@@ -305,6 +333,7 @@ actor RenderActor {
     var presented = Presented(snap, t1 - t0, t2 - t1, swapNs, acquireNs, status, rows, emitters, shotFailed, facts, join);
     presented.panel = panel;
     presented.talk = talk;
+    presented.xrEnded = xrEnded;
     presented
   }
 
@@ -380,6 +409,17 @@ actor RenderActor {
       case var &mut Some(some) {
         some.device.waitIdle();
         some.timer.report();
+        if some.xr {
+          self.reportXr(some);
+          // The session ends as OpenXR has it end: asked to exit, STOPPING answered by xrEndSession (pollEvents), then destroyed
+          some.headset.requestExit();
+          var waited = 0;
+          while some.headset.isRunning() && waited < 400 {
+            some.headset.pollEvents();
+            sdl.Delay(5u32);
+            waited = waited + 1;
+          }
+        }
         // (a run that asked to play, as the panel's scripted run does: every request must have been answered; the answer comes on the
         // real clock, so it is waited for, up to 6 s: a refusal from a closed port takes 2.05 s on Windows)
         some.hud.model.rp.waitForAnswers(&mut some.hud.model.ui, 6000i64);
@@ -408,6 +448,118 @@ actor RenderActor {
     print <- "Vulkan failures: "; print <- u64.from(failures());
     print <- "; validation messages: "; print <- u64.from(validationMessages()); print <- "\n";
     RenderEnd(failures() == 0u32 && validationMessages() == 0u32 && panelClean)
+  }
+
+  // THE HEADSET'S FRAME (--xr). The runtime's frame loop sets the pace: 'beginFrame' waits until the runtime wants a frame and
+  // answers where the eyes are at the time the frame will be shown (the predicted display time), as the runtime reports them: that
+  // pose is used as it is, never smoothed, filtered or eased. Each eye is placed on the avatar's feet (the snapshot's: the ground
+  // point and which way it is turned), the head's pose in the room's floor space being the head's offset from the feet:
+  //
+  //   eye in the world = feet + yaw(feet) * the eye's position in floor space; turned by yaw(feet) * the eye's orientation
+  //
+  // so the floor of the room is the ground under the avatar, and the headset's own forward is the way the avatar faces. There is
+  // no follow camera, no eye height easing and no head bob (the view rig's eyes are not used at all): the one thing under the head
+  // that moves is the avatar's feet, which the scene eases between steps as it always has.
+  //
+  // Each eye is a whole drawFrame (the draw list, the sky, the passes), twice a frame: the first version of the headset's frame,
+  // measured (the report at the end says what an eye costs), where one list built once and two views of it would be the fix. The
+  // left eye's picture is blitted into the window (the mirror) before its image goes back to the runtime.
+  //
+  // False once the headset's session is over (the run ends).
+  fn drawXr(self, g: &mut Gfx, o: &mut DrawOrder) bool {
+    if o.resized && o.width > 0u32 && o.height > 0u32 { g.headset.resizeMirror(o.width, o.height); }
+    g.timer.begin();
+    g.sys.surfaces.width = g.headset.eyeWidth;
+    g.sys.surfaces.height = g.headset.eyeHeight;
+    self.apply(g, &mut o.requests);
+    g.timer.mark(0usize);
+    if !g.headset.pollEvents() { return false; }
+    let frame = g.headset.beginFrame(&mut g.device);
+    if !frame.active { sdl.Delay(5u32); }     // (a session between READY and STOPPING only: not a spin)
+    var shotNow = false;
+    if frame.active && frame.shouldRender && frame.located {
+      let feet = o.snapshot.feet(o.alpha);
+      // The picture to write this frame, if --xr-shots asked: the left eye's (and the window's) first, the right eye's the next frame
+      shotNow = xrShots.len() > 0usize && o.frame >= xrShotAt && xrShotsDone < 2u32;
+      if shotNow {
+        g.headset.captureEye(usize.from(xrShotsDone));
+        if xrShotsDone == 0u32 && g.headset.hasMirror() {
+          g.headset.captureMirror();
+          xrMirrorShot = true;
+        }
+      }
+      var eye = 0usize;
+      while eye < 2usize {
+        if g.headset.acquireEye(&frame, eye) {
+          let v = frame.views[eye];
+          let at = feet.orientation * Vec3(v.pose.position.x, v.pose.position.y, v.pose.position.z);
+          let facing = feet.orientation * Quat(v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w);
+          let xv = EyeView(true, eye, Pose(feet.origin + at, facing), v.fov.angleLeft, v.fov.angleRight, v.fov.angleUp, v.fov.angleDown);
+          let started = sdl.GetPerformanceCounter();
+          g.timer.begin();
+          g.headset.swapEye(eye, &mut g.target);
+          self.drawFrame(g, &o.snapshot, "", o.alpha, &o.hud, &xv);
+          g.headset.swapEye(eye, &mut g.target);
+          let seconds = f64.from(sdl.GetPerformanceCounter() - started) / f64.from(sdl.GetPerformanceFrequency());
+          g.headset.eyeSubmitted(&g.device, eye, seconds);
+        }
+        eye = eye + 1usize;
+      }
+      // (the window shows the left eye's image while it is still held, then both go back)
+      if g.headset.hasMirror() { g.headset.mirrorEye(&mut g.device, 0usize); }
+      g.headset.releaseEye(0usize);
+      g.headset.releaseEye(1usize);
+      xrFrames = xrFrames + 1u64;
+      if xrFrames == 30u64 { g.headset.resetTimes(); }
+    }
+    g.headset.endFrame(&mut g.device, &frame);
+    if shotNow {
+      g.device.waitIdle();
+      var name = xrShots.copy();
+      name <- if xrShotsDone == 0u32 { "-left.bmp" } else { "-right.bmp" };
+      let bgra = g.headset.colorFormat == TEXTURE_FORMAT_BGRA8_UNORM_SRGB || g.headset.colorFormat == TEXTURE_FORMAT_BGRA8_UNORM;
+      let image = Image.fromTexels(g.headset.capturedBytes(), i32.from(g.headset.eyeWidth), i32.from(g.headset.eyeHeight), bgra);
+      let written = image.save(&Path.from(name.view()));
+      print <- "Screenshot of the "; print <- if xrShotsDone == 0u32 { "left" } else { "right" }; print <- " eye: "; printStr(name.view());
+      if written { print <- "\n"; } else { print <- " could NOT be written\n"; }
+      xrShotsDone = xrShotsDone + 1u32;
+    }
+    if xrMirrorShot && !g.headset.mirrorCapturePending() {
+      g.device.waitIdle();
+      var name = xrShots.copy();
+      name <- "-mirror.bmp";
+      let bgra = g.headset.mirrorFormat() == TEXTURE_FORMAT_BGRA8_UNORM_SRGB || g.headset.mirrorFormat() == TEXTURE_FORMAT_BGRA8_UNORM;
+      let image = Image.fromTexels(g.headset.capturedMirror(), i32.from(g.headset.mirrorCaptureWidth()),
+        i32.from(g.headset.mirrorCaptureHeight()), bgra);
+      let written = image.save(&Path.from(name.view()));
+      print <- "Screenshot of the window: "; printStr(name.view());
+      if written { print <- "\n"; } else { print <- " could NOT be written\n"; }
+      xrMirrorShot = false;
+    }
+    g.timer.mark(9usize);
+    g.timer.frameDone();
+    true
+  }
+
+  // --xr's end of run: the headset, how many frames it showed, and what an eye cost on each side (the CPU's: everything the
+  // eye's frame did, the draw list included; the GPU's: its main pass, between two timestamps; both means over the frames after
+  // the first 30)
+  fn reportXr(self, g: &Gfx) {
+    print <- "Headset: "; printStr(g.headset.runtimeName.view()); print <- ", "; printStr(g.headset.systemName.view());
+    print <- ", each eye "; print <- u64.from(g.headset.eyeWidth); print <- " x "; print <- u64.from(g.headset.eyeHeight); print <- "\n";
+    print <- "XR frames shown: "; print <- xrFrames; print <- "\n";
+    var e = 0usize;
+    while e < 2usize {
+      printStr(if e == 0usize { "Left eye" } else { "Right eye" });
+      print <- ": CPU "; print <- g.headset.cpuMeanMs(e); print <- " ms ("; print <- u64.from(g.headset.cpuSamples(e));
+      print <- " frames), GPU "; print <- g.headset.gpuMeanMs(e); print <- " ms ("; print <- u64.from(g.headset.gpuSamples(e));
+      print <- " frames)\n";
+      e = e + 1usize;
+    }
+    if g.headset.hasMirror() {
+      print <- "Mirror: "; print <- g.headset.mirroredFrames(); print <- " frames shown in the window, ";
+      print <- g.headset.skippedMirrorFrames(); print <- " skipped\n";
+    }
   }
 
   // The render requests a headless run has no GPU for, counted as the
@@ -473,9 +625,11 @@ actor RenderActor {
   // The frame drawn from the snapshot alone: the camera at its eye, the
   // render system's draw list, the sky and the birds, then the effects'
   // particles at the snapshot's time
-  fn drawFrame(self, g: &mut Gfx, snapshot: &Snapshot, shot: &str, alpha: f32, hud: &HudFrame) {
+  // 'xv': with --xr, the eye this frame is drawn for (its world pose and its field of view's four angles, drawXr); the desktop's
+  // frame passes EyeView.none(), and nothing below differs from what it always did
+  fn drawFrame(self, g: &mut Gfx, snapshot: &Snapshot, shot: &str, alpha: f32, hud: &HudFrame, xv: &EyeView) {
     if !g.target.ok() { return; }
-    let pose = snapshot.eye(alpha);
+    let pose = if xv.active { xv.pose } else { snapshot.eye(alpha) };
     var sky = g.sys.currentSky();
     // UNDERGROUND (the labyrinth, 300 m under the island: bakedworld/labyrinth.cone) is told by the eye's height alone, underground()
     // (parts/portal.cone), the one test for the labyrinth's light, its layer, its ground and its navigation. The day's rig keeps
@@ -500,6 +654,8 @@ actor RenderActor {
     g.camera.orientation = pose.orientation;
     // A scripted close-up may look through a longer lens
     g.camera.fov = snapshot.fov;
+    // A headset's eye looks through the four angles the runtime gave it (off-axis, and 'fov' the vertical field that holds them)
+    if xv.active { g.camera.setFovAngles(xv.left, xv.right, xv.up, xv.down); }
     // Under the island the island's terrain is 300 m overhead: the camera sees 120 m, and nothing of the sky is drawn
     g.camera.far = if under { UNDER_FAR } else { DAY_FAR };
     g.camera.background = if under { Color(0., 0., 0., 1.) } else { sky.color };
@@ -541,8 +697,10 @@ actor RenderActor {
       // The fog after the sky: depth slabs over what lies beyond them (with image quality on, the froxel
       // fog of ImageFx does it, from the same weather)
       if g.fxTier == 0u32 {
-        let aspect = f32.from(g.target.texture.width) / f32.from(g.target.texture.height);
-        rig.drawFog(&mut g.sys.list, pose.origin, pose.orientation, snapshot.fov, aspect, g.renderer.exposure);
+        var aspect = f32.from(g.target.texture.width) / f32.from(g.target.texture.height);
+        // (an off-axis eye's slabs are centred on its axis and as wide as its widest side needs: they fill every corner of it)
+        if xv.active { aspect = xv.slabAspect(); }
+        rig.drawFog(&mut g.sys.list, pose.origin, pose.orientation, g.camera.fov, aspect, g.renderer.exposure);
       }
     }
     // The pictures of the view surfaces (mirrors) in sight, drawn before the frame's own pass, each in a submission
@@ -589,6 +747,7 @@ actor RenderActor {
     // mirror, drawn before this, have the faces of the frame before)
     g.sys.updateMorphs(&mut g.renderer, &mut g.device, &mut encoder);
     g.timer.stamp(&mut encoder, 0u32);
+    if xv.active { g.headset.eyeStart(&mut encoder, xv.eye); }
     // The ground cover (groundrig.cone) is drawn into the frame after the scene and the particles; not under the island, where there is no ground in the sun
     let coverOn = g.cover.built && !under;
     var coverEnv = groundcover.CoverEnvironment(light: dayLight);
@@ -669,7 +828,12 @@ actor RenderActor {
 
     // The overlay, over the finished picture (after tone mapping)
     g.timer.stamp(&mut encoder, 2u32);
-    if !g.offscreen { g.hud.draw(&mut g.device, &mut encoder, &g.target.texture, hud); }
+    // (a headset has no overlay: a screen-space HUD is wrong in a head-mounted display; the eye's timestamp and shot instead)
+    if xv.active {
+      g.headset.eyeEnd(&mut encoder, xv.eye, &g.target.texture);
+    } else if !g.offscreen {
+      g.hud.draw(&mut g.device, &mut encoder, &g.target.texture, hud);
+    }
     g.timer.stamp(&mut encoder, 3u32);
     g.timer.resolve(&mut encoder);
 
@@ -844,8 +1008,125 @@ fn makeGfx(window: *sdl.Window, width: u32, height: u32, skyOff: bool, cullMode:
   let off = makeOffscreen(&mut device, 16u32, 16u32, swapchain.format);
   var cover = makeCover(&mut device, isl, adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   Some[Gfx](Gfx(Buffer.none(), String.empty(), target, off, post, fx, fxTier, fxMeter, splatMaterial, Vec3(0., 0., 0.),
-    Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, device, adapter, surface, instance, camera, sunShadows,
-    false, 0u32, 0u32, false, false))
+    Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, Headset.none(), device, adapter, surface, instance, camera,
+    sunShadows, false, 0u32, 0u32, false, false))
+}
+
+// The eye a frame is drawn for, with --xr (drawXr): its pose in the world (the headset's pose on the avatar's feet), and the four
+// angles of its field of view, radians from its axis (left and down negative), as the runtime located it for the display time.
+// The desktop's frame passes EyeView.none().
+struct EyeView {
+  active: bool;
+  eye: usize;                  // 0 left, 1 right
+  pose: Pose;
+  left: f32;
+  right: f32;
+  up: f32;
+  down: f32;
+
+  fn none() EyeView { EyeView(false, 0usize, Pose.look(Vec3(0., 0., 0.), 0., 0.), 0., 0., 0., 0.) }
+
+  // The width of a symmetric slab that fills every corner of this eye's view, over its height: the wider side's tangent over the
+  // taller side's (the fog's slabs are centred on the axis, which an eye's view is not)
+  fn slabAspect(self: &) f32 {
+    let l = libc.fabsf(libc.tanf(left));
+    let r = libc.fabsf(libc.tanf(right));
+    let u = libc.fabsf(libc.tanf(up));
+    let d = libc.fabsf(libc.tanf(down));
+    (if l > r { l } else { r }) / (if u > d { u } else { d })
+  }
+}
+
+// The GPU side for the headset (--xr): the runtime makes the Vulkan instance and device (the headset's GPU), a session begins,
+// and 'window' (0 for none: a headless run) shows the left eye's picture. Everything else is makeGfx's, on the headset's device,
+// with the differences the headset makes:
+//   - the target the frame is tone-mapped into is the eye's image, of the headset's format (the eye images are swapped into
+//     'target' while an eye is drawn: Headset.swapEye), and the Post is made for that format and size
+//   - the image quality passes (temporal AA, auto-exposure, ambient occlusion, froxel fog, decals) are off: fxTier 0 is the plain
+//     path; renderactor's drawXr says why
+//   - the device has no ray queries (the runtime makes it, with its own extensions), so the glass is the raster glass
+// None if the headset could not be opened or its session did not begin.
+fn makeGfxXr(window: usize, width: u32, height: u32, skyOff: bool, cullMode: u32, rig: &mut SkyRig, isl: &Island,
+    wantShots: bool) Option[Gfx] {
+  // (declared in this order: the headset ends before the GPU it draws on, and what is made on the device ends before both)
+  var gpu = HeadsetGpu.none();
+  var options = HeadsetOptions();
+  options.copySource = wantShots;
+  options.mirrorWindow = window;
+  options.mirrorWidth = width;
+  options.mirrorHeight = height;
+  var headset = Headset.open("browser", &options, &mut gpu);
+  if !headset.isValid() {
+    print <- "No headset could be opened (see above)\n";
+    return None;
+  }
+  // The session begins when the runtime says READY, a moment after it was made: the first frame waits for it
+  var waited = 0;
+  while !headset.isRunning() && waited < 1000 {
+    if !headset.pollEvents() { break; }
+    sdl.Delay(10u32);
+    waited = waited + 1;
+  }
+  if !headset.isRunning() {
+    print <- "The headset's session did not begin\n";
+    return None;
+  }
+  print <- "Adapter: "; printStr(gpu.adapterName()); print <- "; headset "; printStr(headset.systemName.view()); print <- " by ";
+  printStr(headset.runtimeName.view()); print <- ", each eye "; print <- u64.from(headset.eyeWidth); print <- " x ";
+  print <- u64.from(headset.eyeHeight); print <- if headset.hasMirror() { ", the left eye in the window\n" } else { ", no window\n" };
+  let integrated = gpu.adapterType() == ADAPTER_TYPE_INTEGRATED_GPU;
+  var renderer = Renderer.create(&mut gpu.device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  var rayWanted = true;
+  let rtEnv = libc.getenv("PEGASUS_RT");
+  if (rtEnv as usize) != 0usize { rayWanted = libc.strcmp(cstr.fromPtr(rtEnv), "off") != 0i32; }
+  let rayTraced = renderer.setRayTracing(&mut gpu.device, rayWanted);
+  print <- "Glass: "; print <- if rayTraced { "ray-traced" } else { "raster (the headset's device has no ray queries)" }; print <- "\n";
+  var post = Post.create(&mut gpu.device, headset.colorFormat, headset.eyeWidth, headset.eyeHeight);
+  lookPost(&mut post);
+  renderer.keepDepth = true;
+  let environment = environmentSky();
+  renderer.setSky(&mut gpu.device, &environment);
+  renderer.drawSky = false;
+  setShadowTiers(&mut renderer, &mut gpu.device, integrated);
+  var sys = RenderSystem.make(&mut gpu.device, TEXTURE_FORMAT_RGBA16_FLOAT, cullMode);
+  sys.surfaces.tier(integrated);
+  // The image quality passes are off in a headset (drawXr says why): tier 0, the plain path, and the pictures carry no froxel fog.
+  // PEGASUS_FX (off, low, high) asks for a tier anyway, to measure what the passes cost an eye; its temporal passes then keep one
+  // history for two eyes, so the picture is not one to look at.
+  var fxTier = 0u32;
+  if (libc.getenv("PEGASUS_FX") as usize) != 0usize { fxTier = fxTierFor(integrated); }
+  sys.surfaces.fogOn = fxTier > 0u32 && sys.surfaces.fogAllowed;
+  sys.surfaces.fogBase = pictureFog(fxTier, 0.);
+  var fx = ImageFx.create(&mut gpu.device, &renderer, &mut post);
+  let fxStart = fxBase(fxTier);
+  fx.configure(&fxStart);
+  if !renderer.isValid() || !sys.particles.isValid() || !post.isValid() {
+    print <- "The renderer could not be made\n";
+    return None;
+  }
+  if !skyOff { rig.makeGpu(&mut renderer, &mut gpu.device); }
+  sys.makeWeather(&mut gpu.device);
+  var camera = Camera.make();
+  camera.fov = FOV;
+  camera.near = 0.1;
+  camera.far = 6000.;
+  // (the eye images are swapped into this while an eye is drawn; until then it is a stand-in of the eye's format)
+  let target = makeOffscreen(&mut gpu.device, 16u32, 16u32, headset.colorFormat);
+  let hud = Hud.make(&mut gpu.device, window, headset.colorFormat, headset.eyeWidth, headset.eyeHeight, isl);
+  let sunShadows = renderer.shadow.settings.enabled;
+  let timer = FrameTimer.make(&mut gpu.device);
+  let off = makeOffscreen(&mut gpu.device, 16u32, 16u32, headset.colorFormat);
+  var cover = makeCover(&mut gpu.device, isl, integrated);
+  var swapchain = SwapChain.none();
+  var made = Gfx(Buffer.none(), String.empty(), target, off, post, fx, fxTier, false, SPLAT_NONE, Vec3(0., 0., 0.),
+    Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, Headset.none(), Device.none(), Adapter.none(), Surface.none(),
+    Instance.none(), camera, sunShadows, false, 0u32, 0u32, false, false);
+  made.headset <-> headset;
+  made.device <-> gpu.device;
+  made.adapter <-> gpu.adapter;
+  made.instance <-> gpu.instance;
+  made.xr = true;
+  Some[Gfx](made)
 }
 
 // A frame off screen, 'width' by 'height' in the swapchain's format, with a depth texture of its size: what a gallery shot is
