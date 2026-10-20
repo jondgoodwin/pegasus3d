@@ -335,10 +335,12 @@ struct Startup {
   playerName: String;          // --name NAME: the name this client plays under on a server (default: the machine's name)
   gallery: GalleryPlan;        // --gallery FILE: the shots to take (gallery.cone)
   people: People;              // humanbody's people, read from their files or made (personasset.cone)
+  xrShots: String;             // --xr-shots PREFIX: with --xr and --frames, the eyes' pictures near the end go to PREFIX-left.bmp, -right.bmp and -mirror.bmp
+  xrShotAt: u64;               // the frame the first of them is taken at
 
   fn make(startedAt: u64) Startup {
     Startup(String.empty(), String.empty(), AudioOptions.make(), RunOptions.make(), ServeOptions.make(), Watch.make(), startedAt,
-      String.empty(), GalleryPlan.none(), People.empty())
+      String.empty(), GalleryPlan.none(), People.empty(), String.empty(), 0u64)
   }
 }
 
@@ -390,6 +392,7 @@ pub struct RunOptions {
   panelJoin: u32 = 0u32;       // --panel-join (1) or --panel-join-refused (2), with --panel-only: after the answer the script clicks Join (panelscript.cone)
   switchAt: u64 = 0u64;       // --switch-at N: a test hook; at frame N the panel's Join is done for the player (the address is PEGASUS_JOIN_ADDRESS)
   gallery: bool = false;       // --gallery FILE: the shot list's stills (gallery.cone), in the scripted run's harness but none of its walk
+  xr: bool = false;            // --xr: drawn into an OpenXR headset (renderactor.cone's drawXr), the window mirroring the left eye; no audio device
 
   fn make() RunOptions { RunOptions(false, false, true, false, 2u32, false, false, false, 0u64, false) }
 }
@@ -485,7 +488,8 @@ fn shellRun(config: Config, startup: Startup) i32 {
     width = u32.from(size.w);
     height = u32.from(size.h);
   }
-  let render = RenderActor(window, width, height, opts, startup.shotsDir.copy(), readyTx, land.share());
+  let render = RenderActor(window, width, height, opts, startup.shotsDir.copy(), readyTx, land.share(), startup.xrShots.copy(),
+    startup.xrShotAt);
   var ready = false;
   match readyRx.recv() {
     case let Some(r) { ready = r; }
@@ -655,6 +659,8 @@ fn shellRun(config: Config, startup: Startup) i32 {
       refusedRun = true;
       break;
     }
+    // --xr: the headset's session is over (the runtime ended it): so is the run
+    if report.xrEnded { break; }
     host.stats.phase(PHASE_SIMULATE).add(report.simulateNs, host.frame);
     host.stats.phase(PHASE_PUBLISH).add(report.publishNs, host.frame);
     host.stats.phase(PHASE_RENDER).add(report.renderNs, host.frame);
@@ -681,7 +687,7 @@ fn shellRun(config: Config, startup: Startup) i32 {
 
   // The end: the scene's, the world's and render's reports, in that order,
   // and the run's exit code
-  view.finish(host.hasWindow());
+  view.finish(host.hasWindow() || opts.xr);   // (a headset run has the GPU whether or not it has a window)
   var code = 1i32;
   match endRx.recv() {
     case let Some(c) { code = c; }
@@ -772,6 +778,19 @@ fn main(argc: i32, argv: **u8) i32 {
       startup.audio.setWavPath(String.fromCStr(cstr.fromPtr(*(argv + usize.from(a + 1i32)))));
       config.frames = AUDIO_WALK_FRAMES;
       config.synthetic = true;
+      a = a + 1i32;
+    } else if libc.strcmp(arg, "--xr") == 0i32 {
+      // Drawn into an OpenXR headset (renderactor.cone's drawXr): the head's pose on the avatar's feet, looking round only (no walking
+      // or turning by a controller yet), the window (or none, with --headless) showing the left eye. NO AUDIO DEVICE: the sound is
+      // off ('audio.off' is checked first by audioOpen, before any device is asked for), so a run of this, in the simulator or a
+      // headset, makes no sound at any hour; the line below says so.
+      startup.opts.xr = true;
+      startup.audio.off = true;
+      print <- "Audio: off (--xr opens no audio device)\n";
+    } else if libc.strcmp(arg, "--xr-shots") == 0i32 && a + 1i32 < argc {
+      // With --xr and --frames N: each eye's picture, and the window's, near the end of the run, to PREFIX-left.bmp, PREFIX-right.bmp and
+      // PREFIX-mirror.bmp (as render's xrstereo does), for a check with no one in the headset
+      startup.xrShots = String.fromCStr(cstr.fromPtr(*(argv + usize.from(a + 1i32))));
       a = a + 1i32;
     } else if libc.strcmp(arg, "--no-audio") == 0i32 {
       startup.audio.off = true;
@@ -891,6 +910,10 @@ fn main(argc: i32, argv: **u8) i32 {
       a = a + 3i32;
     }
     a = a + 1i32;
+  }
+  // --xr-shots: the left eye is written on the frame this says, the right eye's on the next (and the window's with the left's)
+  if startup.opts.xr && startup.xrShots.len() > 0usize {
+    startup.xrShotAt = if config.frames > 8u64 { config.frames - 5u64 } else { 1u64 };
   }
   if galleryFile.len() > 0usize {
     var found = false;
