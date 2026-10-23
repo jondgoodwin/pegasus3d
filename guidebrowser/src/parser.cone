@@ -1,0 +1,484 @@
+// The parser: a ConeScript text made into its syntax tree, by recursive
+// descent, pulling each token from the lexer as it needs it, with one token
+// of lookahead (to tell 'x: ...', a labeled argument, from 'x').
+//
+// A part is a line that starts with 'part', its name, what kind of thing it
+// is if said, and its options; the lines indented under it are its children:
+//
+//   part NAME [: KIND] [, LABEL: EXPR]*
+//
+// A line under a part that is not a part is one of its behaviors, an
+// expression such as 'solid(self, derived)'. Behaviors are kept here and set
+// aside by the next stage; what a world does on load comes first.
+//
+// Expressions, loosest first:
+//
+//   a ..= b                    a range, both ends in
+//   -a                         negative
+//   80000 lux, 30 deg          a number with its unit
+//   f(a, label: b)             a call, its arguments by position or label
+//   materials.stone            a path of names
+//   (a, b, c)                  a triple (any number of items), or (a)
+//   true, false, names, numbers
+//
+// Names in the tree are numbers in the Names table (lexer.cone).
+//
+// A mistake in a part's own line loses that part, with its children: the
+// rest of the world is read on. A mistake in a behavior loses the behavior.
+
+// An expression
+pub enum Expr {
+  pub struct Number {
+    pub at: Spot;
+    pub value: f64;
+    pub unit: u32;               // N_NONE: no unit
+  }
+  pub struct Truth {
+    pub at: Spot;
+    pub value: bool;
+  }
+  pub struct Path {
+    pub at: Spot;
+    pub names: List[u32];
+  }
+  pub struct Tuple {
+    pub at: Spot;
+    pub items: List[Expr];
+  }
+  pub struct Range {
+    pub at: Spot;
+    pub ends: List[Expr];        // the low end, then the high
+  }
+  pub struct Negative {
+    pub at: Spot;
+    pub operand: List[Expr];     // one
+  }
+  pub struct Call {
+    pub at: Spot;
+    pub callee: List[u32];       // a path
+    pub args: List[Arg];
+  }
+
+  // Where it was written
+  pub fn spot(self: &Expr) Spot {
+    match self {
+      case let Number(n) { n.at }
+      case let Truth(t) { t.at }
+      case let Path(p) { p.at }
+      case let Tuple(t) { t.at }
+      case let Range(r) { r.at }
+      case let Negative(g) { g.at }
+      case let Call(c) { c.at }
+    }
+  }
+}
+
+// An argument of a call, or an option of a part
+pub struct Arg {
+  pub label: u32;                // N_NONE: by position
+  pub value: Expr;
+}
+
+// A part as written
+pub struct PartDecl {
+  pub at: Spot;
+  pub name: u32;
+  pub kind: Option[Expr];
+  pub options: List[Arg];
+  pub children: List[PartDecl];
+  pub behaviors: List[Expr];
+}
+
+// The parts a text writes at its top (a world is one); its names are added
+// to names, its mistakes to problems
+pub fn parse(src: &Array[u8], names: &mut Names, problems: &mut List[Problem]) List[PartDecl] {
+  var table = Names.empty();
+  table <-> *names;
+  var p = Parser(lexer(src, table), token(TokKind.End, Spot(1u32, 1u32)), token(TokKind.End, Spot(1u32, 1u32)));
+  p.cur = p.lex.next();
+  p.ahead = p.lex.next();
+  let parts = p.top();
+  *names <-> p.lex.names;
+  var i = 0usize;
+  while i < p.lex.problems.len() {
+    problems.push(Problem(p.lex.problems[i].at, p.lex.problems[i].message.copy()));
+    i = i + 1usize;
+  }
+  parts
+}
+
+struct Parser['a] {
+  lex: Lexer['a];
+  cur: Token;
+  ahead: Token;
+
+  fn kind(self: &) TokKind { self.cur.kind }
+  fn at(self: &) Spot { self.cur.at }
+  fn isSymbol(self: &, c: u8) bool { self.cur.kind == TokKind.Symbol && self.cur.sym == c }
+  fn isName(self: &, n: u32) bool { self.cur.kind == TokKind.Name && self.cur.name == n }
+  fn labelNext(self: &) bool {
+    self.cur.kind == TokKind.Name && self.ahead.kind == TokKind.Symbol && self.ahead.sym == ':'
+  }
+  fn advance(self: &mut) {
+    if self.cur.kind == TokKind.End { return; }
+    self.cur = self.ahead;
+    if self.ahead.kind != TokKind.End { self.ahead = self.lex.next(); }
+  }
+
+  fn fail(self: &mut, message: &str) {
+    // A line the lexer cut short, at a new part, has been reported already
+    if self.kind() == TokKind.Newline && self.cur.sym == 'c' { return; }
+    var m = String.from(message);
+    if self.kind() == TokKind.Bad {
+      m = String.from("'");
+      m.appendByte(self.cur.sym);
+      m.append("' is not part of ConeScript");
+    }
+    else if self.kind() == TokKind.Name {
+      m.append(", not '"); m.append(self.lex.names.text(self.cur.name)); m.append("'");
+    }
+    else if self.kind() == TokKind.Number { m.append(", not a number"); }
+    else if self.kind() == TokKind.Symbol {
+      m.append(", not '");
+      if self.cur.sym == '=' { m.append("..="); } else { m.appendByte(self.cur.sym); }
+      m.append("'");
+    }
+    else if self.kind() == TokKind.Newline { m.append(", not the line's end"); }
+    else if self.kind() == TokKind.End { m.append(", not the text's end"); }
+    self.lex.problems.push(Problem(self.at(), m));
+  }
+
+  // Past the rest of this line, and the lines indented under it
+  fn skipLine(self: &mut) {
+    while self.kind() != TokKind.Newline && self.kind() != TokKind.End {
+      // An Indent can only come after a Newline, so none is met here
+      self.advance();
+    }
+    if self.kind() == TokKind.Newline { self.advance(); }
+    self.skipBlock();
+  }
+
+  // Past an indented block, if one starts here
+  fn skipBlock(self: &mut) {
+    if self.kind() != TokKind.Indent { return; }
+    var levels = 0u32;
+    while self.kind() != TokKind.End {
+      if self.kind() == TokKind.Indent { levels = levels + 1u32; }
+      else if self.kind() == TokKind.Dedent {
+        levels = levels - 1u32;
+        if levels == 0u32 { self.advance(); return; }
+      }
+      self.advance();
+    }
+  }
+
+  fn top(self: &mut) List[PartDecl] {
+    var parts = List[PartDecl].empty();
+    while self.kind() != TokKind.End {
+      if self.isName(N_PART) {
+        match self.part() {
+          case let Some(d) { parts.push(d); }
+          case is None {}
+        }
+      }
+      else {
+        self.fail("a world is made of parts: expected 'part'");
+        self.skipLine();
+      }
+    }
+    parts
+  }
+
+  // A part and the lines under it; None, all of it skipped, after a mistake
+  // in its own line
+  fn part(self: &mut) Option[PartDecl] {
+    let at = self.at();
+    self.advance();                                   // 'part'
+    if self.kind() != TokKind.Name {
+      self.fail("expected the part's name");
+      self.skipLine();
+      return None;
+    }
+    let name = self.cur.name;
+    self.advance();
+    var kind: Option[Expr] = None;
+    if self.isSymbol(':') {
+      self.advance();
+      match self.expr() {
+        case let Some(e) { kind = Some[Expr](e); }
+        case is None { self.skipLine(); return None; }
+      }
+    }
+    var options = List[Arg].empty();
+    while self.isSymbol(',') {
+      self.advance();
+      match self.labeled() {
+        case let Some(a) { options.push(a); }
+        case is None { self.skipLine(); return None; }
+      }
+    }
+    if self.kind() != TokKind.Newline {
+      self.fail("expected ',' and another option, or the line's end");
+      self.skipLine();
+      return None;
+    }
+    self.advance();
+
+    var children = List[PartDecl].empty();
+    var behaviors = List[Expr].empty();
+    if self.kind() == TokKind.Indent {
+      self.advance();
+      while self.kind() != TokKind.Dedent && self.kind() != TokKind.End {
+        if self.isName(N_PART) {
+          match self.part() {
+            case let Some(d) { children.push(d); }
+            case is None {}
+          }
+        }
+        else {
+          match self.expr() {
+            case let Some(e) {
+              if self.kind() == TokKind.Newline {
+                behaviors.push(e);
+                self.advance();
+              }
+              else {
+                self.fail("expected the line's end after the behavior");
+                self.skipLine();
+              }
+            }
+            case is None { self.skipLine(); }
+          }
+        }
+      }
+      if self.kind() == TokKind.Dedent { self.advance(); }
+    }
+    Some[PartDecl](PartDecl(at, name, kind, options, children, behaviors))
+  }
+
+  // LABEL: EXPR
+  fn labeled(self: &mut) Option[Arg] {
+    if !self.labelNext() {
+      self.fail("expected an option: a name, ':' and its value");
+      return None;
+    }
+    let label = self.cur.name;
+    self.advance();
+    self.advance();
+    match self.expr() {
+      case let Some(e) { Some[Arg](Arg(label, e)) }
+      case is None { None }
+    }
+  }
+
+  // a ..= b, or a
+  fn expr(self: &mut) Option[Expr] {
+    let at = self.at();
+    var low: Expr;
+    match self.unary() {
+      case let Some(e) { low = e; }
+      case is None { return None; }
+    }
+    if !self.isSymbol('=') { return Some[Expr](low); }
+    self.advance();
+    match self.unary() {
+      case let Some(high) {
+        var ends = List[Expr].empty();
+        ends.push(low);
+        ends.push(high);
+        Some[Expr](Expr.Range(at, ends))
+      }
+      case is None { None }
+    }
+  }
+
+  // -a; a negative number is folded into the number
+  fn unary(self: &mut) Option[Expr] {
+    if !self.isSymbol('-') { return self.postfix(); }
+    let at = self.at();
+    self.advance();
+    match self.unary() {
+      case let Some(e) {
+        var operand = e;
+        match &mut operand {
+          case var &mut Number(n) {
+            return Some[Expr](Expr.Number(at, -n.value, n.unit));
+          }
+          else {}
+        }
+        var one = List[Expr].empty();
+        one.push(operand);
+        Some[Expr](Expr.Negative(at, one))
+      }
+      case is None { None }
+    }
+  }
+
+  // A primary, then a path's names and a call's arguments
+  fn postfix(self: &mut) Option[Expr] {
+    let at = self.at();
+    if self.kind() == TokKind.Number {
+      let value = self.cur.value;
+      self.advance();
+      var unit = N_NONE;
+      if self.kind() == TokKind.Name {
+        unit = self.cur.name;
+        self.advance();
+      }
+      return Some[Expr](Expr.Number(at, value, unit));
+    }
+    if self.isSymbol('(') {
+      self.advance();
+      var items = List[Expr].empty();
+      while true {
+        match self.expr() {
+          case let Some(e) { items.push(e); }
+          case is None { return None; }
+        }
+        if self.isSymbol(',') { self.advance(); }
+        else if self.isSymbol(')') { self.advance(); break; }
+        else { self.fail("expected ',' or ')'"); return None; }
+      }
+      if items.len() == 1usize {
+        var only: Option[Expr] = items.pop();
+        return only;
+      }
+      return Some[Expr](Expr.Tuple(at, items));
+    }
+    if self.kind() != TokKind.Name {
+      self.fail("expected a value");
+      return None;
+    }
+    if self.isName(N_TRUE) || self.isName(N_FALSE) {
+      let value = self.isName(N_TRUE);
+      self.advance();
+      return Some[Expr](Expr.Truth(at, value));
+    }
+    var names = List[u32].empty();
+    names.push(self.cur.name);
+    self.advance();
+    while self.isSymbol('.') {
+      self.advance();
+      if self.kind() != TokKind.Name {
+        self.fail("expected a name after '.'");
+        return None;
+      }
+      names.push(self.cur.name);
+      self.advance();
+    }
+    if !self.isSymbol('(') { return Some[Expr](Expr.Path(at, names)); }
+    self.advance();
+    var args = List[Arg].empty();
+    if self.isSymbol(')') {
+      self.advance();
+      return Some[Expr](Expr.Call(at, names, args));
+    }
+    while true {
+      if self.labelNext() {
+        match self.labeled() {
+          case let Some(a) { args.push(a); }
+          case is None { return None; }
+        }
+      }
+      else {
+        match self.expr() {
+          case let Some(e) { args.push(Arg(N_NONE, e)); }
+          case is None { return None; }
+        }
+      }
+      if self.isSymbol(',') { self.advance(); }
+      else if self.isSymbol(')') { self.advance(); break; }
+      else { self.fail("expected ',' or ')' in the call"); return None; }
+    }
+    Some[Expr](Expr.Call(at, names, args))
+  }
+}
+
+// -------- shown, to check what was read --------
+
+pub fn showParts(parts: &List[PartDecl], names: &Names, depth: usize) {
+  var i = 0usize;
+  while i < parts.len() {
+    showPart(parts[i], names, depth);
+    i = i + 1usize;
+  }
+}
+
+fn showPart(d: &PartDecl, names: &Names, depth: usize) {
+  var k = 0usize;
+  while k < depth { printStr("  "); k = k + 1usize; }
+  printStr("part ");
+  printStr(names.text(d.name));
+  match &d.kind {
+    case let Some(e) { printStr(": "); showExpr(e, names); }
+    case is None {}
+  }
+  var i = 0usize;
+  while i < d.options.len() {
+    printStr(", ");
+    showArg(d.options[i], names);
+    i = i + 1usize;
+  }
+  print <- "   @"; print <- d.at.line; print <- ":"; print <- d.at.column; print <- "\n";
+  i = 0usize;
+  while i < d.behaviors.len() {
+    k = 0usize;
+    while k <= depth { printStr("  "); k = k + 1usize; }
+    printStr("behavior ");
+    showExpr(d.behaviors[i], names);
+    printStr("\n");
+    i = i + 1usize;
+  }
+  showParts(&d.children, names, depth + 1usize);
+}
+
+fn showArg(a: &Arg, names: &Names) {
+  if a.label != N_NONE { printStr(names.text(a.label)); printStr(": "); }
+  showExpr(&a.value, names);
+}
+
+fn showNames(path: &List[u32], names: &Names) {
+  var i = 0usize;
+  while i < path.len() {
+    if i > 0usize { printStr("."); }
+    printStr(names.text(*path[i]));
+    i = i + 1usize;
+  }
+}
+
+fn showList(items: &List[Expr], names: &Names, sep: &str) {
+  var i = 0usize;
+  while i < items.len() {
+    if i > 0usize { printStr(sep); }
+    showExpr(items[i], names);
+    i = i + 1usize;
+  }
+}
+
+fn showExpr(e: &Expr, names: &Names) {
+  match e {
+    case let Number(n) {
+      match json.formatF64(n.value) {
+        case let Some(t) { printStr(t.view()); }
+        case is None { printStr("?"); }
+      }
+      if n.unit != N_NONE { printStr(" "); printStr(names.text(n.unit)); }
+    }
+    case let Truth(t) { if t.value { printStr("true"); } else { printStr("false"); } }
+    case let Path(p) { showNames(&p.names, names); }
+    case let Tuple(t) { printStr("("); showList(&t.items, names, ", "); printStr(")"); }
+    case let Range(r) { printStr("["); showList(&r.ends, names, " ..= "); printStr("]"); }
+    case let Negative(g) { printStr("-("); showList(&g.operand, names, ""); printStr(")"); }
+    case let Call(c) {
+      showNames(&c.callee, names);
+      printStr("(");
+      var i = 0usize;
+      while i < c.args.len() {
+        if i > 0usize { printStr(", "); }
+        showArg(c.args[i], names);
+        i = i + 1usize;
+      }
+      printStr(")");
+    }
+  }
+}

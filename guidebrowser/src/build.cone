@@ -1,0 +1,173 @@
+// Building: an understood world's parts made, in its order, each sent to the
+// loop the moment it is made. This is the interpreter: it walks the checked
+// values and calls the builders they name. (A generator of code takes its
+// place where measuring shows a part is built often enough to matter.)
+//
+//   a material      its color, kept by slot for the shapes that name it
+//   a shape         its mesh made from its recipe, its look, its place: an
+//                   Arrival.Part
+//   a light         the sun, in physical units: an Arrival.Sun
+//   an arrival      the first one is where the visitor stands: an Arrival.Stand
+//   a group         only its place, which the parts inside it start from
+//
+// A part's place is its parent's place, then its own 'at:' and 'rotation:'.
+
+// How high a visitor's eyes are above where they stand, in meters (mine:
+// a standing adult, until a world says what body arrives)
+pub const EYE_HEIGHT = 1.6;
+
+// The sky's even light on everything, in nits, while a world has no sky
+// (page 1 has none: the guide leaves what is behind everything open). Mine:
+// a clear sky is several thousand nits.
+pub const SKY_NITS = 4000.;
+
+// Every part of the world built and sent (built and dropped, unless send:
+// to time building alone); how many parts were
+pub fn build(w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
+  var colors = List[Color].empty();   // by slot: a material's color
+  var places = List[Mat4].empty();    // by slot: where the part's own origin is, in the world
+  var s = 0usize;
+  while s < w.nodes.len() {
+    colors.push(Color(0., 0., 0., 1.));
+    places.push(Mat4.identity());
+    s = s + 1usize;
+  }
+  var standing = false;
+  var parts = 0u64;
+  var i = 0usize;
+  while i < w.order.len() {
+    let slot = *w.order[i];
+    let kind = w.nodes[slot].kind;
+    let parent = w.nodes[slot].parent;
+    if kind == Kind.Group || kind == Kind.Shape {
+      let own = placement(w.units[slot].options[OPT_AT], w.units[slot].options[OPT_ROTATION]);
+      places.set(slot, *places[parent] * own);
+    }
+    if kind == Kind.Material {
+      colors.set(slot, colorOf(&w.units[slot].make));
+    }
+    else if kind == Kind.Shape {
+      var color = Color(0.5, 0.5, 0.5, 1.);
+      match w.units[slot].options[OPT_MATERIAL] {
+        case let Ref(m) { color = *colors[*m]; }
+        case let Make(made) { color = colorOf(made.args[0]); }
+        else {}
+      }
+      let a = Arrival.Part(Built(String.from(w.names.text(w.nodes[slot].name)), boxMesh(&w.units[slot].make), color, *places[slot]));
+      if send { ready.send(a); }
+      parts = parts + 1u64;
+    }
+    else if kind == Kind.Light {
+      let a = sunOf(&w.units[slot].make);
+      if send { ready.send(a); }
+    }
+    else if kind == Kind.Arrival && !standing {
+      let base = *places[parent];
+      let feet = base * vec3(w.units[slot].options[OPT_AT]);
+      let facing = base.transformVector(vec3(w.units[slot].options[OPT_FACING]));
+      let a = Arrival.Stand(feet + Vec3(0., f32.from(EYE_HEIGHT), 0.), facing);
+      if send { ready.send(a); }
+      standing = true;
+    }
+    i = i + 1usize;
+  }
+  parts
+}
+
+// 'at:' then 'rotation:', either left out
+fn placement(at: &Val, rotation: &Val) Mat4 {
+  var turn = Quat.identity();
+  match rotation {
+    case let Make(m) { turn = Quat.angleAxis(f32.from(numOf(m.args[0])), Vec3(0., 1., 0.)); }
+    else {}
+  }
+  var origin = Vec3(0., 0., 0.);
+  if !(at is Absent) { origin = vec3(at); }
+  Mat4.fromTrs(origin, turn, Vec3(1., 1., 1.))
+}
+
+// box(x: a ..= b, y: ..., z: ...): a unit cube stretched over the three ranges
+fn boxMesh(make: &Val) Mesh {
+  var mesh = Mesh.cube(0.5);
+  match make {
+    case let Make(m) {
+      var low = Array[f32, 3]() <- fill 0.;
+      var high = Array[f32, 3]() <- fill 0.;
+      var k = 0usize;
+      while k < 3usize {
+        match m.args[k] {
+          case let Range(ends) {
+            low[k] = f32.from(numOf(ends[0]));
+            high[k] = f32.from(numOf(ends[1]));
+          }
+          else {}
+        }
+        k = k + 1usize;
+      }
+      let center = Vec3((low[0] + high[0]) * 0.5, (low[1] + high[1]) * 0.5, (low[2] + high[2]) * 0.5);
+      let size = Vec3(high[0] - low[0], high[1] - low[1], high[2] - low[2]);
+      mesh.transform(Mat4.fromTrs(center, Quat.identity(), size));
+    }
+    else {}
+  }
+  mesh
+}
+
+// plain(c), or a color itself: srgb(r, g, b) with the true sRGB curve, or
+// color(r, g, b), linear already
+fn colorOf(make: &Val) Color {
+  match make {
+    case let Make(m) {
+      if m.builder == Builder.Plain { return colorOf(m.args[0]); }
+      var opacity = 1.;
+      if !(m.args[3] is Absent) { opacity = numOf(m.args[3]); }
+      if m.builder == Builder.Srgb {
+        return Color(srgbToLinear(numOf(m.args[0])), srgbToLinear(numOf(m.args[1])), srgbToLinear(numOf(m.args[2])),
+          f32.from(opacity));
+      }
+      return Color(f32.from(numOf(m.args[0])), f32.from(numOf(m.args[1])), f32.from(numOf(m.args[2])), f32.from(opacity));
+    }
+    else {}
+  }
+  Color(0.5, 0.5, 0.5, 1.)
+}
+
+fn srgbToLinear(n: f64) f32 {
+  let c = n / 255.;
+  if c <= 0.04045 { return f32.from(c / 12.92); }
+  f32.from(libc.pow((c + 0.055) / 1.055, 2.4))
+}
+
+// sunLight(direction:, color:, lux:, castsShadow:): 'direction' points to the
+// sun, so its light travels the other way; its color times its lux is the
+// light on a surface facing it
+fn sunOf(make: &Val) Arrival {
+  var light = Light.directional(Vec3(0., -1., 0.), Color(0., 0., 0., 1.), Color(0., 0., 0., 1.));
+  var shadows = false;
+  match make {
+    case let Make(m) {
+      let toSun = vec3(m.args[0]);
+      let c = colorOf(m.args[1]);
+      let lux = f32.from(numOf(m.args[2]));
+      let sky = f32.from(SKY_NITS);
+      light = Light.directional(Vec3(0., 0., 0.) - toSun, Color(c.red * lux, c.green * lux, c.blue * lux, 1.),
+        Color(0.80 * sky, 0.88 * sky, 1.0 * sky, 1.));
+      match m.args[3] {
+        case let Truth(b) { shadows = *b; }
+        else {}
+      }
+    }
+    else {}
+  }
+  Arrival.Sun(light, shadows)
+}
+
+fn vec3(v: &Val) Vec3 {
+  match v {
+    case let Tuple(items) {
+      return Vec3(f32.from(numOf(items[0])), f32.from(numOf(items[1])), f32.from(numOf(items[2])));
+    }
+    else {}
+  }
+  Vec3(0., 0., 0.)
+}

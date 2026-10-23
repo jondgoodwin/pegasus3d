@@ -1,0 +1,185 @@
+// The loader: an actor that takes a world from wherever it comes and builds
+// its parts, off the loop. Its stages, for each world:
+//
+//   arrived      the world's files are here (from a file, later from the network)
+//   understood   read and checked into the browser's own form (step 2)
+//   built        each part's mesh and look made
+//   registered   each built part sent to the loop, as an Arrival
+//   active       made live by the loop's activation slice (scene.cone), which
+//                says so itself
+//
+// The world is read from worlds\NAME.ddd, or fetched when NAME is a URL
+// (http:// or https://), then lexed (lexer.cone), parsed
+// (parser.cone), understood (understand.cone), built (build.cone). It prints
+// every mistake and each stage's time; '--show' prints the tree and the
+// understood slots too. '--test-part' adds one grey cube, as step 1 did.
+
+actor Loader {
+  ready: Sender[Arrival];
+
+  pool: Pool;                   // the buffers a file is read into
+  client: Client;               // what fetches a world named by a URL
+
+  fn init(self: &new, ready: Sender[Arrival]) {
+    *self = Self(ready: ready, pool: Pool.make(), client: Client.standard());
+  }
+
+  // Bring in the world named 'world', asked for at 'askedAt' (a performance
+  // count). The file is read by the aio package: the open and each read are
+  // done on the I/O thread, and this behaviour awaits them, so the worker is
+  // free meanwhile. For a file under one chunk that is two round trips, the
+  // open and one read; dropping the File closes it, behind the read.
+  //
+  // A world named by a URL is fetched by actorhttp's client, awaited the same
+  // way: the fetch runs on the client's own thread, and the whole response
+  // comes back as a message. The client keeps the connection, so the warm
+  // pass below reuses it.
+  //
+  // Each stage is timed on its own, with nothing printed between; then the
+  // whole of it again, warm, its parts built and dropped: the first time pays
+  // for what is touched for the first time.
+  pub async fn arrive(self, world: String, askedAt: u64, testPart: bool, show: bool) {
+    let fetched = world.view().startsWith("http://") || world.view().startsWith("https://");
+    var file = String.empty();
+    if fetched { file.append(world.view()); }
+    else {
+      file.append("worlds/");
+      file.append(world.view());
+      file.append(".ddd");
+    }
+    let path = Path.from(file.view());
+    var parts = 0u64;
+    var pass = 0u32;
+    while pass < 2u32 {
+      var at = Array[u64, 6]() <- fill 0u64;
+      at[0] = sdl.GetPerformanceCounter();
+      var text = String.empty();
+      if fetched {
+        let r = await client.getIn(file.view(), IoLimits.until(Instant.now() + Duration.fromSeconds(30i64)));
+        let back = Instant.now();
+        at[1] = sdl.GetPerformanceCounter();
+        match r {
+          case let Ok(ok) {
+            text.append(ok.body.view());
+            at[2] = sdl.GetPerformanceCounter();
+            fetchStages(if pass == 0u32 {"cold"} else {"warm"}, &ok.timing, back, ok.status, ok.body.len());
+          }
+          case let Error(e) {
+            at[2] = sdl.GetPerformanceCounter();
+            print <- "loader: "; printStr(file.view()); print <- " cannot be fetched: "; printStr(e.message().view()); print <- "\n";
+          }
+        }
+      }
+      else {
+        var f = File.none();
+        var opened = await aio.openFile(&path, Access.Read);
+        match &mut opened {
+          case var &mut Ok(ok) { f <-> *ok; }
+          case var &mut Error(e) { print <- "loader: "; printStr(file.view()); print <- " cannot be opened: error "; print <- e.code; print <- "\n"; }
+        }
+        at[1] = sdl.GetPerformanceCounter();
+        var offset = 0u64;
+        var going = !f.isNone();
+        while going {
+          var read = await f.readAt(offset, self.pool.mustTake(CHUNK));
+          going = false;
+          match &mut read {
+            case var &mut Ok(buf) {
+              text.appendBytes(buf.view());
+              offset = offset + u64.from(buf.len());
+              going = buf.len() == CHUNK;
+            }
+            case var &mut Error(e) { print <- "loader: "; printStr(file.view()); print <- " cannot be read: error "; print <- e.code; print <- "\n"; }
+          }
+        }
+        at[2] = sdl.GetPerformanceCounter();
+      }
+      let made = self.digest(file.view(), text.view(), &mut at, pass == 0u32, show && pass == 0u32);
+      if pass == 0u32 {
+        parts = made;
+        if testPart {
+          let cube = Built(String.from("test cube"), Mesh.cube(1.), Color(0.6, 0.6, 0.6, 1.),
+            Mat4.fromTrs(Vec3(0., 0., 0.), Quat.angleAxis(0.6, Vec3(0., 1., 0.)), Vec3(1., 1., 1.)));
+          ready.send(Arrival.Part(cube));
+          parts = parts + 1u64;
+        }
+        ready.send(Arrival.Whole(world.copy(), parts));
+        print <- "loader: "; printStr(world.view()); print <- ": the message took ";
+        print <- micros(askedAt, at[0]); print <- " us to reach the loader\n";
+        stages("cold", &at, fetched);
+      }
+      else { stages("warm", &at, fetched); }
+      pass = pass + 1u32;
+    }
+  }
+
+  // A world's text lexed and parsed (together: the parser pulls each token),
+  // understood and built; at[3..5] the performance count as each stage ends
+  fn digest(self, file: &str, text: &str, at: &mut Array[u64, 6], send: bool, show: bool) u64 {
+    var problems = List[Problem].empty();
+    let tableAt = sdl.GetPerformanceCounter();
+    var names = Names.standard();
+    let tableMade = sdl.GetPerformanceCounter();
+    let decls = parse(text, &mut names, &mut problems);
+    at[3] = sdl.GetPerformanceCounter();
+    let understood = understand(&decls, names, &mut problems);
+    at[4] = sdl.GetPerformanceCounter();
+    // Each part is registered, sent to the loop, the moment it is built
+    let parts = build(&understood, &ready, send);
+    at[5] = sdl.GetPerformanceCounter();
+    if show {
+      showParts(&decls, &understood.names, 1usize);
+      showUnderstood(&understood);
+    }
+    if send { showProblems(file, &problems); }
+    print <- "loader: of lex and parse, making the per-load name table (a stand-in) took ";
+    print <- micros(tableAt, tableMade); print <- " us\n";
+    parts
+  }
+}
+
+// What one read asks for: a world file under this is one read
+const CHUNK = 65536usize;
+
+// The time each stage took, in microseconds. Fetched, the first two are the
+// whole await and the body copied out of the response.
+fn stages(label: &str, at: &Array[u64, 6], fetched: bool) {
+  print <- "loader: "; printStr(label); print <- (if fetched {": fetch "} else {": open "}); print <- micros(at[0], at[1]);
+  print <- (if fetched {", copy "} else {", read "}); print <- micros(at[1], at[2]); print <- ", lex and parse "; print <- micros(at[2], at[3]);
+  print <- ", understand "; print <- micros(at[3], at[4]); print <- ", build "; print <- micros(at[4], at[5]);
+  print <- "; all "; print <- micros(at[0], at[5]); print <- " us\n";
+}
+
+// Where a fetch's time went, in microseconds, by the client's own clock:
+// waiting for a connection (a new one: DNS, TCP connect and the TLS handshake
+// together), the request until the head of the response, the body, and the
+// response's way back to this behaviour
+fn fetchStages(label: &str, t: &Timing, back: Instant, status: u16, bytes: usize) {
+  print <- "loader: "; printStr(label); print <- " fetch: status "; print <- status;
+  print <- (if t.reused {", connection reused"} else {", new connection"});
+  print <- "; connect "; print <- nanosToMicros((t.dispatched - t.queued).nanos());
+  print <- ", first byte "; print <- nanosToMicros((t.firstByte - t.dispatched).nanos());
+  print <- ", body ("; print <- bytes; print <- " B) "; print <- nanosToMicros((t.ended - t.firstByte).nanos());
+  print <- ", back to the loader "; print <- nanosToMicros((back - t.ended).nanos());
+  print <- " us; "; print <- t.attempts; print <- " request(s)\n";
+}
+
+fn nanosToMicros(ns: i64) f64 { f64.from(ns) / 1000.0 }
+
+pub fn micros(from: u64, to: u64) f64 {
+  f64.from(to - from) / f64.from(sdl.GetPerformanceFrequency()) * 1000000.0
+}
+
+// Each mistake, as 'file:line:column: message'
+fn showProblems(file: &str, problems: &List[Problem]) {
+  var i = 0usize;
+  while i < problems.len() {
+    printStr(file); print <- ":"; print <- problems[i].at.line; print <- ":"; print <- problems[i].at.column;
+    print <- ": "; printStr(problems[i].message.view()); print <- "\n";
+    i = i + 1usize;
+  }
+}
+
+pub fn millisSince(startedAt: u64) f64 {
+  f64.from(sdl.GetPerformanceCounter() - startedAt) / f64.from(sdl.GetPerformanceFrequency()) * 1000.0
+}
