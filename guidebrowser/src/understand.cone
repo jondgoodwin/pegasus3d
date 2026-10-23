@@ -1,0 +1,788 @@
+// Understanding: a world's syntax tree checked and resolved into the form the
+// builders read.
+//
+// Every part gets a SLOT, its number in the world, in the order written; the
+// world itself is slot 0. What code reads is by slot, never by name: a path
+// such as 'materials.stone' becomes the slot of the part it names, a call's
+// arguments are put in the builder's own order, and a part's options in its
+// kind's (the option slots below). Names stay only to say where a mistake is.
+//
+// A path's first name is looked for outward: among the children of the part
+// the path is written in, then its parent's, and so on to the world; the
+// nearest wins. The world's own name starts a path from the top.
+//
+// Numbers are checked against what they measure (Values and Types: units):
+// a plain number where a shape wants a length is meters, a radian is a plain
+// number, and a light's strength needs its unit. Each is kept in its kind's
+// base unit: meters, radians, lux.
+//
+// Then the order: each part comes after the parts it uses and the part that
+// holds it, as a spreadsheet's cells come after the cells they read. A part
+// with a mistake is left out, with what is inside it and what uses it; the
+// rest of the world goes on.
+//
+// What a world DOES (a behavior, such as 'solid(self, derived)') is counted
+// and set aside here: page 1 has only what it is.
+
+// What a value is
+pub enum Ty {
+  Pure;           // a plain number
+  Length;
+  Angle;
+  Illuminance;
+  Truth;
+  Point;          // three lengths
+  Direction;      // three plain numbers
+  LengthRange;
+  Color;
+  Rotation;
+  Shape;
+  Material;
+  Light;
+}
+
+// The builders page 1 calls
+pub enum Builder {
+  Box;            // box(x: range, y: range, z: range)
+  Plain;          // plain(color): a matte material
+  Srgb;           // srgb(r, g, b), 0 to 255 as a paint program shows them
+  LinearColor;    // color(r, g, b), 0 to 1
+  Turn;           // rotation(angle): about the upright axis
+  SunLight;       // sunLight(direction:, color:, lux:, castsShadow:)
+}
+
+// What kind of thing a part is, by what makes it
+pub enum Kind {
+  Group;          // holds other parts: the world, 'materials'
+  Shape;
+  Material;
+  Light;
+  Arrival;        // a part of the world's 'arrivals'
+}
+
+// The option slots of each kind
+pub const OPT_AT = 0usize;            // Group, Shape, Arrival: where (a Point)
+pub const OPT_ROTATION = 1usize;      // Group, Shape: a Rotation
+pub const OPT_MATERIAL = 2usize;      // Shape: a Material
+pub const OPT_FACING = 1usize;        // Arrival: a Direction
+
+// A value checked
+pub enum Val {
+  Absent;                 // an optional argument or option not given
+  Num(f64);               // in its kind's base unit
+  Truth(bool);
+  Tuple(List[Val]);
+  Range(List[Val]);       // the low end, then the high
+  Ref(usize);             // a part, by slot
+  Make(Made);             // a builder called
+}
+
+pub struct Made {
+  pub builder: Builder;
+  pub args: List[Val];    // in the builder's order
+}
+
+// A part's place in the tree
+pub struct Node {
+  pub name: u32;
+  pub at: Spot;
+  pub parent: usize;      // the world's is itself
+  pub children: List[usize];
+  pub kind: Kind;
+}
+
+// A part understood
+pub struct Unit {
+  pub make: Val;          // what makes it (Absent for a group or an arrival)
+  pub options: List[Val]; // by its kind's option slots
+  pub behaviors: usize;   // lines set aside
+}
+
+pub struct Understood {
+  pub nodes: List[Node];  // by slot
+  pub units: List[Unit];  // by slot
+  pub alive: List[bool];  // by slot: false, left out for a mistake
+  pub order: List[usize]; // the live slots, each after what it uses
+  pub names: Names;       // the names the slots were written with, for what is said about them
+}
+
+// A parameter of a builder, or an option of a kind
+struct Param {
+  name: u32;
+  ty: Ty;
+  required: bool;
+}
+
+fn param(name: u32, ty: Ty, required: bool) Param { Param(name, ty, required) }
+
+fn signature(b: Builder) List[Param] {
+  var p = List[Param].empty();
+  if b == Builder.Box {
+    p.push(param(N_X, Ty.LengthRange, true));
+    p.push(param(N_Y, Ty.LengthRange, true));
+    p.push(param(N_Z, Ty.LengthRange, true));
+  }
+  else if b == Builder.Plain { p.push(param(N_COLOR, Ty.Color, true)); }
+  else if b == Builder.Srgb || b == Builder.LinearColor {
+    p.push(param(N_R, Ty.Pure, true));
+    p.push(param(N_G, Ty.Pure, true));
+    p.push(param(N_B, Ty.Pure, true));
+    p.push(param(N_OPACITY, Ty.Pure, false));
+  }
+  else if b == Builder.Turn { p.push(param(N_ANGLE, Ty.Angle, true)); }
+  else if b == Builder.SunLight {
+    p.push(param(N_DIRECTION, Ty.Direction, true));
+    p.push(param(N_COLOR, Ty.Color, true));
+    p.push(param(N_LUX, Ty.Illuminance, true));
+    p.push(param(N_CASTSSHADOW, Ty.Truth, false));
+  }
+  p
+}
+
+fn optionsOf(k: Kind) List[Param] {
+  var p = List[Param].empty();
+  if k == Kind.Group {
+    p.push(param(N_AT, Ty.Point, false));
+    p.push(param(N_ROTATION, Ty.Rotation, false));
+  }
+  else if k == Kind.Shape {
+    p.push(param(N_AT, Ty.Point, false));
+    p.push(param(N_ROTATION, Ty.Rotation, false));
+    p.push(param(N_MATERIAL, Ty.Material, true));
+  }
+  else if k == Kind.Arrival {
+    p.push(param(N_AT, Ty.Point, true));
+    p.push(param(N_FACING, Ty.Direction, true));
+  }
+  p
+}
+
+fn builderNamed(name: u32) Option[Builder] {
+  if name == N_BOX { return Some[Builder](Builder.Box); }
+  if name == N_PLAIN { return Some[Builder](Builder.Plain); }
+  if name == N_SRGB { return Some[Builder](Builder.Srgb); }
+  if name == N_COLOR { return Some[Builder](Builder.LinearColor); }
+  if name == N_ROTATION { return Some[Builder](Builder.Turn); }
+  if name == N_SUNLIGHT { return Some[Builder](Builder.SunLight); }
+  None
+}
+
+fn makes(b: Builder) Ty {
+  if b == Builder.Box { return Ty.Shape; }
+  if b == Builder.Plain { return Ty.Material; }
+  if b == Builder.Srgb || b == Builder.LinearColor { return Ty.Color; }
+  if b == Builder.Turn { return Ty.Rotation; }
+  Ty.Light
+}
+
+fn tyName(t: Ty) &str {
+  if t == Ty.Pure { return "a plain number"; }
+  if t == Ty.Length { return "a length"; }
+  if t == Ty.Angle { return "an angle"; }
+  if t == Ty.Illuminance { return "light falling on a surface (lux)"; }
+  if t == Ty.Truth { return "true or false"; }
+  if t == Ty.Point { return "a point (three lengths)"; }
+  if t == Ty.Direction { return "a direction (three numbers)"; }
+  if t == Ty.LengthRange { return "a range of lengths"; }
+  if t == Ty.Color { return "a color"; }
+  if t == Ty.Rotation { return "a rotation"; }
+  if t == Ty.Shape { return "a shape"; }
+  if t == Ty.Material { return "a material"; }
+  "a light"
+}
+
+fn kindName(k: Kind) &str {
+  if k == Kind.Group { return "a group of parts"; }
+  if k == Kind.Shape { return "a shape"; }
+  if k == Kind.Material { return "a material"; }
+  if k == Kind.Light { return "a light"; }
+  "an arrival"
+}
+
+// A unit's kind and how many of the kind's base unit it is; Pure for no unit known
+fn unitDim(unit: u32) Ty {
+  if unit == N_M || unit == N_CM || unit == N_MM { return Ty.Length; }
+  if unit == N_DEG || unit == N_DEGSIGN || unit == N_RAD { return Ty.Angle; }
+  if unit == N_LUX { return Ty.Illuminance; }
+  Ty.Pure
+}
+
+fn unitScale(unit: u32) f64 {
+  if unit == N_CM { return 0.01; }
+  if unit == N_MM { return 0.001; }
+  if unit == N_DEG || unit == N_DEGSIGN { return 3.14159265358979323846 / 180.; }
+  1.
+}
+
+// The world a text's parts describe
+pub fn understand(decls: &List[PartDecl], names: Names, problems: &mut List[Problem]) Understood {
+  var c = Checker(List[Node].empty(), List[Problem].empty(), names);
+  var units = List[Unit].empty();
+  if decls.len() > 0usize {
+    c.place(decls[0], 0usize);
+    c.check(decls[0], &mut units);
+    var i = 1usize;
+    while i < decls.len() {
+      problems.push(problem(decls[i].at, "a world file holds one world: this part is left out"));
+      i = i + 1usize;
+    }
+  }
+  var alive = List[bool].empty();
+  var k = 0usize;
+  while k < units.len() { alive.push(true); k = k + 1usize; }
+  var nodes = List[Node].empty();
+  nodes <-> c.nodes;
+  var table = Names.empty();
+  table <-> c.names;
+  var w = Understood(nodes, units, alive, List[usize].empty(), table);
+  order(&mut w, &mut c.problems);
+  var i = 0usize;
+  while i < c.problems.len() {
+    problems.push(Problem(c.problems[i].at, c.problems[i].message.copy()));
+    i = i + 1usize;
+  }
+  w
+}
+
+struct Checker {
+  nodes: List[Node];
+  problems: List[Problem];
+  names: Names;
+
+  fn failName(self: &mut, at: Spot, a: &str, name: u32, c: &str) {
+    var m = String.from(a);
+    m.append(self.names.text(name));
+    m.append(c);
+    self.problems.push(Problem(at, m));
+  }
+
+  fn fail(self: &mut, at: Spot, a: &str, b: &str, c: &str) {
+    var m = String.from(a);
+    m.append(b);
+    m.append(c);
+    self.problems.push(Problem(at, m));
+  }
+
+  // Pass 1: every part its slot, its place in the tree, and its kind, so a
+  // path may name a part written later
+  fn place(self: &mut, d: &PartDecl, parent: usize) {
+    let slot = self.nodes.len();
+    var kind = Kind.Group;
+    match &d.kind {
+      case let Some(e) {
+        match e {
+          case let Call(call) {
+            if call.callee.len() == 1usize {
+              match builderNamed(*call.callee[0]) {
+                case let Some(b) {
+                  let t = makes(b);
+                  if t == Ty.Shape { kind = Kind.Shape; }
+                  else if t == Ty.Material { kind = Kind.Material; }
+                  else if t == Ty.Light { kind = Kind.Light; }
+                }
+                case is None {}
+              }
+            }
+          }
+          else {}
+        }
+      }
+      case is None {}
+    }
+    // A part with no kind inside the world's 'arrivals' is a place to arrive
+    if d.kind is None && slot != 0usize && self.nodes[parent].name == N_ARRIVALS && self.nodes[parent].parent == 0usize
+      && parent != 0usize {
+      kind = Kind.Arrival;
+    }
+    self.nodes.push(Node(d.name, d.at, parent, List[usize].empty(), kind));
+    if slot != parent {
+      // A second part of the same name beside it could never be reached
+      var i = 0usize;
+      while i < self.nodes[parent].children.len() {
+        let sib = *self.nodes[parent].children[i];
+        if self.nodes[sib].name == d.name {
+          self.failName(d.at, "a part named '", d.name, "' is already here: this one cannot be reached by its name");
+        }
+        i = i + 1usize;
+      }
+      (&mut self.nodes[parent]).children.push(slot);
+    }
+    var i = 0usize;
+    while i < d.children.len() {
+      self.place(d.children[i], slot);
+      i = i + 1usize;
+    }
+  }
+
+  // Pass 2, in the same order: what makes each part, and its options
+  fn check(self: &mut, d: &PartDecl, units: &mut List[Unit]) {
+    let slot = units.len();
+    let kind = self.nodes[slot].kind;
+    var make = Val.Absent;
+    match &d.kind {
+      case let Some(e) {
+        if kind == Kind.Group || kind == Kind.Arrival {
+          // Nothing that makes a part, as pass 1 found: checked as a shape
+          // only to say what it is instead
+          match self.value(e, Ty.Shape, slot) {
+            case let Some(v) {}
+            case is None {}
+          }
+        }
+        else {
+          var want = Ty.Shape;
+          if kind == Kind.Material { want = Ty.Material; }
+          else if kind == Kind.Light { want = Ty.Light; }
+          match self.value(e, want, slot) {
+            case let Some(v) { make = v; }
+            case is None {}
+          }
+        }
+      }
+      case is None {}
+    }
+    let opts = optionsOf(kind);
+    var options = List[Val].empty();
+    var given = List[bool].empty();
+    var k = 0usize;
+    while k < opts.len() { options.push(Val.Absent); given.push(false); k = k + 1usize; }
+    var i = 0usize;
+    while i < d.options.len() {
+      let label = d.options[i].label;
+      var found = false;
+      k = 0usize;
+      while k < opts.len() {
+        if opts[k].name == label {
+          found = true;
+          if *given[k] { self.failName(d.options[i].value.spot(), "the option '", label, "' is given twice"); }
+          // Given, even if wrong: its own mistake is reported, not its absence
+          given.set(k, true);
+          match self.value(&d.options[i].value, opts[k].ty, slot) {
+            case let Some(v) { options.set(k, v); }
+            case is None {}
+          }
+        }
+        k = k + 1usize;
+      }
+      if !found {
+        var m = String.from("'");
+        m.append(self.names.text(label));
+        m.append("' is not an option of ");
+        m.append(kindName(kind));
+        self.problems.push(Problem(d.options[i].value.spot(), m));
+      }
+      i = i + 1usize;
+    }
+    k = 0usize;
+    while k < opts.len() {
+      if opts[k].required && !*given[k] {
+        var m = String.from("'");
+        m.append(self.names.text(d.name));
+        m.append("' needs the option '");
+        m.append(self.names.text(opts[k].name));
+        m.append("': ");
+        m.append(tyName(opts[k].ty));
+        self.problems.push(Problem(d.at, m));
+      }
+      k = k + 1usize;
+    }
+    units.push(Unit(make, options, d.behaviors.len()));
+    i = 0usize;
+    while i < d.children.len() {
+      self.check(d.children[i], units);
+      i = i + 1usize;
+    }
+  }
+
+  // An expression checked as a value of the type wanted; None after a mistake,
+  // reported
+  fn value(self: &mut, e: &Expr, want: Ty, scope: usize) Option[Val] {
+    match e {
+      case let Number(n) { return self.number(n.value, n.unit, n.at, want); }
+      case let Truth(t) {
+        if want == Ty.Truth { return Some[Val](Val.Truth(t.value)); }
+        self.fail(t.at, "expected ", tyName(want), ", not true or false");
+        return None;
+      }
+      case let Negative(g) {
+        self.fail(g.at, "only a number can be negative, for now", "", "");
+        return None;
+      }
+      case let Tuple(t) {
+        var item = Ty.Length;
+        if want == Ty.Direction { item = Ty.Pure; }
+        else if want != Ty.Point {
+          self.fail(t.at, "expected ", tyName(want), ", not a group of values in ( )");
+          return None;
+        }
+        if t.items.len() != 3usize {
+          self.fail(t.at, "expected ", tyName(want), ", written as three values in ( )");
+          return None;
+        }
+        var items = List[Val].empty();
+        var i = 0usize;
+        while i < t.items.len() {
+          match self.value(t.items[i], item, scope) {
+            case let Some(v) { items.push(v); }
+            case is None { return None; }
+          }
+          i = i + 1usize;
+        }
+        return Some[Val](Val.Tuple(items));
+      }
+      case let Range(r) {
+        if want != Ty.LengthRange {
+          self.fail(r.at, "expected ", tyName(want), ", not a range");
+          return None;
+        }
+        var ends = List[Val].empty();
+        var i = 0usize;
+        while i < 2usize {
+          match self.value(r.ends[i], Ty.Length, scope) {
+            case let Some(v) { ends.push(v); }
+            case is None { return None; }
+          }
+          i = i + 1usize;
+        }
+        if numOf(ends[0]) > numOf(ends[1]) {
+          self.fail(r.at, "this range runs backward: its low end comes first", "", "");
+          return None;
+        }
+        return Some[Val](Val.Range(ends));
+      }
+      case let Path(p) { return self.path(&p.names, p.at, want, scope); }
+      case let Call(call) { return self.call(&call.callee, &call.args, call.at, want, scope); }
+    }
+  }
+
+  fn number(self: &mut, value: f64, unit: u32, at: Spot, want: Ty) Option[Val] {
+    if want != Ty.Pure && want != Ty.Length && want != Ty.Angle && want != Ty.Illuminance {
+      self.fail(at, "expected ", tyName(want), ", not a number");
+      return None;
+    }
+    if unit == N_NONE {
+      // A plain number: meters in a shape, radians as an angle; a light's
+      // strength says its unit
+      if want == Ty.Illuminance {
+        self.fail(at, "expected ", tyName(want), ": a number with its unit, such as 80000 lux");
+        return None;
+      }
+      return Some[Val](Val.Num(value));
+    }
+    let dim = unitDim(unit);
+    if dim == Ty.Pure {
+      self.failName(at, "'", unit, "' is not a unit");
+      return None;
+    }
+    if dim != want {
+      self.fail(at, "expected ", tyName(want), ", not a number in that unit");
+      return None;
+    }
+    Some[Val](Val.Num(value * unitScale(unit)))
+  }
+
+  // A path to a part, which must be of the kind wanted
+  fn path(self: &mut, path: &List[u32], at: Spot, want: Ty, scope: usize) Option[Val] {
+    var slot = 0usize;
+    match self.lookOutward(*path[0], scope) {
+      case let Some(s) { slot = s; }
+      case is None {
+        self.failName(at, "nothing named '", *path[0], "' is in reach here");
+        return None;
+      }
+    }
+    var i = 1usize;
+    while i < path.len() {
+      match self.childNamed(slot, *path[i]) {
+        case let Some(s) { slot = s; }
+        case is None {
+          var m = String.from("'");
+          m.append(self.names.text(self.nodes[slot].name));
+          m.append("' holds no part named '");
+          m.append(self.names.text(*path[i]));
+          m.append("'");
+          self.problems.push(Problem(at, m));
+          return None;
+        }
+      }
+      i = i + 1usize;
+    }
+    let kind = self.nodes[slot].kind;
+    if (want == Ty.Material && kind == Kind.Material) || (want == Ty.Shape && kind == Kind.Shape)
+      || (want == Ty.Light && kind == Kind.Light) {
+      return Some[Val](Val.Ref(slot));
+    }
+    var m = String.from("expected ");
+    m.append(tyName(want));
+    m.append(", but '");
+    m.append(self.names.text(self.nodes[slot].name));
+    m.append("' is ");
+    m.append(kindName(kind));
+    self.problems.push(Problem(at, m));
+    None
+  }
+
+  // The nearest part of this name: among the children of scope, then of its
+  // parent, and so on; then the world itself
+  fn lookOutward(self: &, name: u32, scope: usize) Option[usize] {
+    var s = scope;
+    while true {
+      match self.childNamed(s, name) {
+        case let Some(found) { return Some[usize](found); }
+        case is None {}
+      }
+      if s == 0usize { break; }
+      s = self.nodes[s].parent;
+    }
+    if self.nodes[0].name == name { return Some[usize](0usize); }
+    None
+  }
+
+  fn childNamed(self: &, slot: usize, name: u32) Option[usize] {
+    var i = 0usize;
+    while i < self.nodes[slot].children.len() {
+      let c = *self.nodes[slot].children[i];
+      if self.nodes[c].name == name { return Some[usize](c); }
+      i = i + 1usize;
+    }
+    None
+  }
+
+  // A builder called: its arguments put in its own order and checked
+  fn call(self: &mut, callee: &List[u32], args: &List[Arg], at: Spot, want: Ty, scope: usize) Option[Val] {
+    var b = Builder.Box;
+    var found = false;
+    if callee.len() == 1usize {
+      match builderNamed(*callee[0]) {
+        case let Some(x) { b = x; found = true; }
+        case is None {}
+      }
+    }
+    if !found {
+      self.failName(at, "there is no '", *callee[callee.len() - 1usize], "' to call, for now");
+      return None;
+    }
+    if makes(b) != want {
+      var m = String.from("expected ");
+      m.append(tyName(want));
+      m.append(", but '");
+      m.append(self.names.text(*callee[0]));
+      m.append("' makes ");
+      m.append(tyName(makes(b)));
+      self.problems.push(Problem(at, m));
+      return None;
+    }
+    let params = signature(b);
+    var vals = List[Val].empty();
+    var given = List[bool].empty();
+    var k = 0usize;
+    while k < params.len() { vals.push(Val.Absent); given.push(false); k = k + 1usize; }
+    var ok = true;
+    var next = 0usize;            // the next parameter an argument by position fills
+    var i = 0usize;
+    while i < args.len() {
+      var p = params.len();
+      if args[i].label == N_NONE {
+        p = next;
+        if p >= params.len() {
+          self.failName(args[i].value.spot(), "too many values for '", *callee[0], "'");
+          return None;
+        }
+      }
+      else {
+        k = 0usize;
+        while k < params.len() {
+          if params[k].name == args[i].label { p = k; }
+          k = k + 1usize;
+        }
+        if p == params.len() {
+          var m = String.from("'");
+          m.append(self.names.text(*callee[0]));
+          m.append("' has nothing named '");
+          m.append(self.names.text(args[i].label));
+          m.append("'");
+          self.problems.push(Problem(args[i].value.spot(), m));
+          return None;
+        }
+      }
+      if *given[p] {
+        self.failName(args[i].value.spot(), "'", params[p].name, "' is given twice");
+        return None;
+      }
+      match self.value(&args[i].value, params[p].ty, scope) {
+        case let Some(v) { vals.set(p, v); given.set(p, true); }
+        case is None { ok = false; }
+      }
+      next = p + 1usize;
+      i = i + 1usize;
+    }
+    if !ok { return None; }
+    k = 0usize;
+    while k < params.len() {
+      if params[k].required && !*given[k] {
+        var m = String.from("'");
+        m.append(self.names.text(*callee[0]));
+        m.append("' needs '");
+        m.append(self.names.text(params[k].name));
+        m.append("': ");
+        m.append(tyName(params[k].ty));
+        self.problems.push(Problem(at, m));
+        return None;
+      }
+      k = k + 1usize;
+    }
+    Some[Val](Val.Make(Made(b, vals)))
+  }
+}
+
+fn numOf(v: &Val) f64 {
+  match v {
+    case let Num(x) { *x }
+    else { 0. }
+  }
+}
+
+// -------- the order --------
+
+// Slots in an order each comes after its parent and the parts it uses; a
+// part with a mistake, or using one, is left out, with what is inside it
+fn order(w: &mut Understood, problems: &mut List[Problem]) {
+  // A mistake reported at a part's own line, or inside it, leaves it out
+  var s = 0usize;
+  while s < w.nodes.len() {
+    let first = w.nodes[s].at.line;
+    var last = 0xFFFFFFFFu32;
+    if s + 1usize < w.nodes.len() { last = w.nodes[s + 1usize].at.line; }
+    var i = 0usize;
+    while i < problems.len() {
+      let line = problems[i].at.line;
+      if line >= first && line < last { w.alive.set(s, false); }
+      i = i + 1usize;
+    }
+    s = s + 1usize;
+  }
+  var state = List[u8].empty();       // 0 not yet, 1 under way, 2 placed
+  s = 0usize;
+  while s < w.nodes.len() { state.push(0u8); s = s + 1usize; }
+  s = 0usize;
+  while s < w.nodes.len() {
+    visit(w, s, &mut state, problems);
+    s = s + 1usize;
+  }
+}
+
+fn visit(w: &mut Understood, s: usize, state: &mut List[u8], problems: &mut List[Problem]) {
+  if *state[s] != 0u8 { return; }
+  state.set(s, 1u8);
+  var deps = List[usize].empty();
+  if s != 0usize { deps.push(w.nodes[s].parent); }
+  refsOf(&w.units[s].make, &mut deps);
+  var k = 0usize;
+  while k < w.units[s].options.len() {
+    refsOf(w.units[s].options[k], &mut deps);
+    k = k + 1usize;
+  }
+  var i = 0usize;
+  while i < deps.len() {
+    let d = *deps[i];
+    if *state[d] == 1u8 {
+      var m = String.from("'");
+      m.append(w.names.text(w.nodes[s].name));
+      m.append("' and '");
+      m.append(w.names.text(w.nodes[d].name));
+      m.append("' each need the other made first");
+      problems.push(Problem(w.nodes[s].at, m));
+      w.alive.set(s, false);
+    }
+    else {
+      visit(w, d, state, problems);
+      if !*w.alive[d] && *w.alive[s] {
+        w.alive.set(s, false);
+        // Inside a part left out says nothing more; a part used says why
+        if i > 0usize || s == 0usize {
+          var m = String.from("'");
+          m.append(w.names.text(w.nodes[s].name));
+          m.append("' is left out: it uses '");
+          m.append(w.names.text(w.nodes[d].name));
+          m.append("', which has a mistake");
+          problems.push(Problem(w.nodes[s].at, m));
+        }
+      }
+    }
+    i = i + 1usize;
+  }
+  state.set(s, 2u8);
+  if *w.alive[s] { w.order.push(s); }
+}
+
+fn refsOf(v: &Val, out: &mut List[usize]) {
+  match v {
+    case let Ref(s) { out.push(*s); }
+    case let Tuple(items) { var i = 0usize; while i < items.len() { refsOf(items[i], out); i = i + 1usize; } }
+    case let Range(items) { var i = 0usize; while i < items.len() { refsOf(items[i], out); i = i + 1usize; } }
+    case let Make(m) { var i = 0usize; while i < m.args.len() { refsOf(m.args[i], out); i = i + 1usize; } }
+    else {}
+  }
+}
+
+// -------- shown, to check what was understood --------
+
+pub fn showUnderstood(w: &Understood) {
+  print <- "  order:";
+  var i = 0usize;
+  while i < w.order.len() {
+    print <- " "; printStr(w.names.text(w.nodes[*w.order[i]].name));
+    i = i + 1usize;
+  }
+  print <- "\n";
+  var s = 0usize;
+  while s < w.nodes.len() {
+    print <- "  ["; print <- s; print <- "] "; printStr(w.names.text(w.nodes[s].name));
+    print <- " ("; printStr(kindName(w.nodes[s].kind)); print <- ")";
+    if !*w.alive[s] { print <- " LEFT OUT"; }
+    if !(w.units[s].make is Absent) { print <- " made by "; showVal(&w.units[s].make); }
+    var k = 0usize;
+    while k < w.units[s].options.len() {
+      print <- " | "; showVal(w.units[s].options[k]);
+      k = k + 1usize;
+    }
+    if w.units[s].behaviors > 0usize { print <- " | behaviors set aside: "; print <- w.units[s].behaviors; }
+    print <- "\n";
+    s = s + 1usize;
+  }
+}
+
+fn showVal(v: &Val) {
+  match v {
+    case let Num(x) {
+      match json.formatF64(*x) {
+        case let Some(t) { printStr(t.view()); }
+        case is None { print <- "?"; }
+      }
+    }
+    case let Truth(b) { if *b { print <- "true"; } else { print <- "false"; } }
+    case let Ref(s) { print <- "#"; print <- *s; }
+    case let Tuple(items) { print <- "("; showVals(items); print <- ")"; }
+    case let Range(items) { print <- "["; showVals(items); print <- "]"; }
+    case let Make(m) { print <- "make"; print <- u64.from(builderNumber(m.builder)); print <- "("; showVals(&m.args); print <- ")"; }
+    else { print <- "-"; }
+  }
+}
+
+fn showVals(items: &List[Val]) {
+  var i = 0usize;
+  while i < items.len() {
+    if i > 0usize { print <- ", "; }
+    showVal(items[i]);
+    i = i + 1usize;
+  }
+}
+
+fn builderNumber(b: Builder) u32 {
+  if b == Builder.Box { return 0u32; }
+  if b == Builder.Plain { return 1u32; }
+  if b == Builder.Srgb { return 2u32; }
+  if b == Builder.LinearColor { return 3u32; }
+  if b == Builder.Turn { return 4u32; }
+  5u32
+}

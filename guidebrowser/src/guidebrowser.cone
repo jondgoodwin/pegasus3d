@@ -1,0 +1,356 @@
+// The guide browser: a 3-D web browser grown page by page of the ConeScript
+// guide (C:\src\conescript-manual\guide-1.html onward), around the way a
+// world arrives (MyDrive\Incubator\3D Web\Architecture\Browser-and-Core-
+// Library\arrival-through-a-portal.md). It is made from the packages alone;
+// nothing of the island's browser (../browser) is in it.
+//
+// STEP 1, the skeleton: a window, the frame package's loop, an empty scene
+// (scene.cone) and the loader (loader.cone), an actor on the actors
+// package's workers. At start the loader is asked for the home world. What it
+// builds crosses to the loop over a channel, and the ACTIVATION SLICE makes
+// it live between frames. The frame package's loop has no slot by that name
+// yet, so the slice runs in its 'network' slot, which is defined the same
+// way: queues drained, never waiting. (Its phase statistics say "network".)
+//
+//   guidebrowser                    the home world (empty in step 1)
+//   guidebrowser --test-part        a grey cube stands in for its one part
+//   guidebrowser --frames 120       120 frames on frame's synthetic clock
+//   guidebrowser --world NAME       worlds\NAME.ddd
+//   guidebrowser --world URL        the world fetched from http:// or https://
+//
+// It prints each stage of the arrival, the colour at the middle of the window
+// on the tenth frame, the Vulkan failures and frame's per-phase timings, and
+// fails if the GPU reported any failure.
+
+mod guidebrowser is World;
+
+import stdio use *;
+import libc;
+import sdl;
+import collections use *;
+import geomath use *;
+import mesh use Mesh;
+import gpu use *;
+import render use *;
+import window use *;
+import arena use Arena;
+import actors;
+import sync use Channel, Sender, Receiver;
+import frame use World, Config, Host, Step, NetQueues;
+import fs;
+import path use Path;
+import json;
+import aio use File, IoLimits;
+import iobuf use Pool, IoBuf;
+import iocore use Access;
+import time use Instant, Duration;
+import httpclient use Timing;
+import actorhttp use Client;
+
+// The GPU side and the scene, made by start and released by quit. Fields die
+// in the order they are declared: the scene's handles before the renderer
+// that made them, the device after what it made, the instance last.
+struct Shell {
+  pub scene: Scene;
+  pub ready: Receiver[Arrival];   // what the loader has built
+  pub arrivedAt: u64;             // when the home world was asked for (performance counter)
+  pub activated: u64;             // parts made live so far
+  pub readback: Buffer;           // frame 10's pixels, copied in render, read in present
+  pub target: SurfaceTexture;     // the swapchain's texture the next frame draws into
+  pub renderer: Renderer;
+  pub swapchain: SwapChain;
+  pub device: Device;
+  pub adapter: Adapter;
+  pub surface: Surface;
+  pub instance: Instance;
+  pub list: DrawList;
+  pub camera: Camera;
+  pub light: Light;
+}
+
+// Made in start. (A global Option cannot be matched in place, only a borrow
+// of a local can, so each callback swaps it out into a local and back.)
+var shell: Option[Shell];
+
+// From the command line
+var @threadlocal testPart = false;
+var @threadlocal worldArg: *u8 = null;     // '--world NAME': worlds\NAME.ddd, or a URL fetched; home if not given
+var @threadlocal shot = false;             // '--shot': frame 10 to build\shot.bmp
+var @threadlocal show = false;             // '--show': the loader prints the tree and the understood slots
+
+// Frames drawn, and the colour at the middle of the window on the tenth
+var @threadlocal drawn = 0;
+var @threadlocal centre = Array[i32, 3]() <- fill 0;
+
+fn @initpure init() {
+  shell = None;
+}
+
+fn takeShell() Option[Shell] {
+  var s: Option[Shell] = None;
+  s <-> shell;
+  s
+}
+
+pub fn start(host: &mut Host) bool {
+  if !host.hasWindow() {
+    print <- "The guide browser needs a window\n";
+    return false;
+  }
+  var instance = Instance.createWindowed("guidebrowser", false);
+  var surface = instance.createSurface(host.window().sdlHandle());
+  var adapter = instance.requestAdapter(&surface, POWER_PREFERENCE_HIGH_PERFORMANCE);
+  if !adapter.isValid() {
+    print <- "No GPU can draw to the window\n";
+    return false;
+  }
+  print <- "Adapter: "; printStr(adapter.name.view()); print <- "\n";
+  var device = adapter.requestDevice();
+  let size = host.window().size();
+  var swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
+  var renderer = Renderer.create(&mut device, swapchain.format, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  if !renderer.isValid() {
+    print <- "The renderer could not be made\n";
+    return false;
+  }
+
+  // The scene is lit in physical units (lux, nits), seen by a camera set for
+  // a sunny day (EV100 15, the sunny-16 rule). Until a world's arrival says
+  // where to stand, the camera is at (0, 1.6, 3.5) looking down -z; until its
+  // sun arrives there is no light at all. Behind everything, a pale sky
+  // color, a placeholder: the guide leaves what is drawn there open.
+  renderer.exposure = exposureFromEv100(15.);
+  var camera = Camera.make();
+  camera.origin = Vec3(0., 1.6, 3.5);
+  camera.background = Color(0.55 / renderer.exposure, 0.70 / renderer.exposure, 0.85 / renderer.exposure, 1.);
+  let light = Light.directional(Vec3(0., -1., 0.), Color(0., 0., 0., 1.), Color(0., 0., 0., 1.));
+
+  // The loader, and the channel what it builds comes back by; then the home world asked for
+  var readyTx: Sender[Arrival];
+  var readyRx: Receiver[Arrival];
+  readyTx, readyRx = Channel[Arrival].make();
+  let arrivedAt = sdl.GetPerformanceCounter();
+  let loader = Loader(readyTx);
+  let world = if worldArg == null { String.from("home") } else { String.from(cstr.fromPtr(worldArg).view()) };
+  loader.arrive(world, arrivedAt, testPart, show);
+
+  let target = swapchain.getCurrentTexture(&mut device);
+  shell = Some[Shell](Shell(Scene.empty(), readyRx, arrivedAt, 0u64, Buffer.none(), target, renderer, swapchain, device,
+    adapter, surface, instance, DrawList.empty(), camera, light));
+  true
+}
+
+// The window's own events are frame's; a resize is the swapchain's
+pub fn event(host: &mut Host, e: &imm sdl.Event) {
+  if !host.window().resized { return; }
+  host.window().resized = false;
+  let s = host.window().size();
+  var g = takeShell();
+  match &mut g {
+    case var &mut Some(some) { (*some).swapchain.resize(u32.from(s.w), u32.from(s.h)); }
+    else {}
+  }
+  shell = g;
+}
+
+// Nothing moves yet
+pub fn simulate(host: &mut Host, step: &imm Step, scratch: &mut Arena) {}
+
+// The activation slice (in frame's network slot): what the loader has built,
+// made live, up to the budget
+pub fn network(host: &mut Host, net: &mut NetQueues) {
+  var g = takeShell();
+  match &mut g {
+    case var &mut Some(some) { activate(&mut *some, host.stats.frames); }
+    else {}
+  }
+  shell = g;
+}
+
+fn activate(s: &mut Shell, frame: u64) {
+  var taken = 0u64;
+  while taken < ACTIVATE_BUDGET {
+    match s.ready.tryRecv() {
+      case let Some(a) { take(s, a, frame); }
+      else { return; }
+    }
+    taken = taken + 1u64;
+  }
+}
+
+// One arrival, taken by value: matched as a local, so nothing else can change it meanwhile
+fn take(s: &mut Shell, a: Arrival, frame: u64) {
+  let began = sdl.GetPerformanceCounter();
+  var arrival = a;
+  match &mut arrival {
+    case var &mut Part(p) {
+      let mesh = s.renderer.addMesh(&mut s.device, &p.built.mesh);
+      let look = Material.plain(p.built.color);
+      let material = s.renderer.addMaterial(&mut s.device, &look);
+      s.scene.parts.push(Live(p.built.name.copy(), mesh, material, p.built.place));
+      s.activated = s.activated + 1u64;
+      print <- "loop: frame "; print <- frame; print <- ", "; printStr(p.built.name.view());
+      print <- " live: mesh and material to the GPU in "; print <- micros(began, sdl.GetPerformanceCounter()); print <- " us\n";
+    }
+    case var &mut Sun(sun) {
+      s.light = sun.light;
+      if sun.shadows { s.renderer.setShadows(&mut s.device, &ShadowSettings(enabled: true)); }
+      print <- "loop: frame "; print <- frame; print <- ", the sun";
+      if sun.shadows { print <- " with its shadow map made"; }
+      print <- " in "; print <- micros(began, sdl.GetPerformanceCounter()); print <- " us\n";
+    }
+    case var &mut Stand(st) {
+      s.camera.lookAt(st.eye, st.eye + st.facing, Vec3(0., 1., 0.));
+    }
+    case var &mut Whole(w) {
+      print <- "loop: "; printStr(w.world.view()); print <- " active at ";
+      print <- millisSince(s.arrivedAt); print <- " ms, frame "; print <- frame; print <- ", ";
+      print <- w.parts; print <- " parts\n";
+    }
+  }
+}
+
+// Record the frame: every live part
+pub fn draw(host: &mut Host, alpha: f32, scratch: &mut Arena) {
+  var g = takeShell();
+  match &mut g {
+    case var &mut Some(some) { drawScene(&mut *some); }
+    else {}
+  }
+  shell = g;
+}
+
+fn drawScene(s: &mut Shell) {
+  if !s.target.ok() { return; }
+  s.list.clear();
+  var k = 0usize;
+  while k < s.scene.parts.len() {
+    s.list.add(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place);
+    k = k + 1usize;
+  }
+  var encoder = s.device.createCommandEncoder();
+  s.renderer.render(&mut s.device, &mut encoder, &s.target.texture, &s.target.depth, &s.camera, &s.light, &s.list);
+  drawn = drawn + 1;
+
+  // What was drawn at the middle of the window on the tenth frame: copied
+  // now, read once presented
+  if drawn == 10 {
+    let w = s.target.texture.width;
+    let h = s.target.texture.height;
+    s.readback = s.device.createBuffer(u64.from(w) * u64.from(h) * 4u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+    encoder.copyTextureToBuffer(&s.target.texture, &s.readback);
+  }
+  s.device.queue.submit(encoder.finish());
+}
+
+// Show the frame, and wait for the next texture to draw into: the present wait
+pub fn present(host: &mut Host) {
+  var g = takeShell();
+  match &mut g {
+    case var &mut Some(some) { showAndAcquire(&mut *some); }
+    else {}
+  }
+  shell = g;
+}
+
+fn showAndAcquire(s: &mut Shell) {
+  if s.target.ok() {
+    s.swapchain.present(&mut s.device);
+    if drawn <= 3 {
+      print <- "loop: frame "; print <- drawn; print <- " presented at "; print <- millisSince(s.arrivedAt); print <- " ms\n";
+    }
+    if drawn == 10 && s.readback.size > 0u64 {
+      s.device.waitIdle();
+      let w = s.target.texture.width;
+      let h = s.target.texture.height;
+      let p = s.readback.mappedRange() + usize.from((h / 2u32 * w + w / 2u32) * 4u32);
+      let bgra = s.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM_SRGB
+        || s.target.texture.format == TEXTURE_FORMAT_BGRA8_UNORM;
+      centre[0] = i32.from(*(p + (if bgra {2usize} else {0usize})));
+      centre[1] = i32.from(*(p + 1usize));
+      centre[2] = i32.from(*(p + (if bgra {0usize} else {2usize})));
+      if shot { writeShot(s.readback.mappedRange(), w, h, bgra); }
+      s.readback = Buffer.none();
+    }
+  } else {
+    sdl.Delay(10u32);       // minimized: nothing to draw into
+  }
+  s.target = s.swapchain.getCurrentTexture(&mut s.device);
+  if drawn <= 3 {
+    print <- "loop: frame "; print <- drawn; print <- "'s next texture acquired at "; print <- millisSince(s.arrivedAt); print <- " ms\n";
+  }
+}
+
+// The tenth frame as build\shot.bmp: 24 bits a pixel, its rows bottom up
+fn writeShot(pixels: *u8, w: u32, h: u32, bgra: bool) {
+  let row = (w * 3u32 + 3u32) / 4u32 * 4u32;
+  var out = List[u8].empty();
+  out.push('B'); out.push('M');
+  push32(&mut out, 54u32 + row * h); push32(&mut out, 0u32); push32(&mut out, 54u32);
+  push32(&mut out, 40u32); push32(&mut out, w); push32(&mut out, h);
+  out.push(1u8); out.push(0u8); out.push(24u8); out.push(0u8);
+  push32(&mut out, 0u32); push32(&mut out, row * h); push32(&mut out, 2835u32); push32(&mut out, 2835u32);
+  push32(&mut out, 0u32); push32(&mut out, 0u32);
+  var y = h;
+  while y > 0u32 {
+    y = y - 1u32;
+    var x = 0u32;
+    while x < w {
+      let p = pixels + usize.from((y * w + x) * 4u32);
+      out.push(*(p + (if bgra {0usize} else {2usize})));
+      out.push(*(p + 1usize));
+      out.push(*(p + (if bgra {2usize} else {0usize})));
+      x = x + 1u32;
+    }
+    var pad = w * 3u32;
+    while pad < row { out.push(0u8); pad = pad + 1u32; }
+  }
+  match fs.writeFile(&Path.from("build/shot.bmp"), out.view()) {
+    case let Ok(v) { print <- "Frame 10 written to build/shot.bmp\n"; }
+    case let Error(e) { let m = e.message(); printStr(m.view()); print <- "\n"; }
+  }
+}
+
+fn push32(out: &mut List[u8], v: u32) {
+  out.push(u8.from(v & 0xFFu32)); out.push(u8.from((v >> 8u32) & 0xFFu32));
+  out.push(u8.from((v >> 16u32) & 0xFFu32)); out.push(u8.from(v >> 24u32));
+}
+
+pub fn quit(host: &mut Host) i32 {
+  var code = 0i32;
+  var g = takeShell();
+  match &mut g {
+    case var &mut Some(some) {
+      (*some).device.waitIdle();
+      print <- "Parts live: "; print <- (*some).activated; print <- "\n";
+    }
+    else {}
+  }
+  g = None;      // the GPU's objects go before the window does
+  print <- "Frames drawn: "; print <- drawn; print <- "\n";
+  print <- "Middle of the window on frame 10: ";
+  print <- centre[0]; print <- " "; print <- centre[1]; print <- " "; print <- centre[2]; print <- "\n";
+  print <- "Vulkan failures: "; print <- u64.from(failures());
+  print <- "; validation messages: "; print <- u64.from(validationMessages()); print <- "\n";
+  if failures() != 0u32 || validationMessages() != 0u32 { code = 1i32; }
+  code
+}
+
+fn main(argc: i32, argv: **u8) i32 {
+  initAll();
+  var a = 1i32;
+  while a < argc {
+    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--test-part") == 0i32 { testPart = true; }
+    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--shot") == 0i32 { shot = true; }
+    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--show") == 0i32 { show = true; }
+    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--world") == 0i32 && a + 1i32 < argc {
+      worldArg = *(argv + usize.from(a + 1i32));
+    }
+    a = a + 1i32;
+  }
+  var config = Config.fromArgs(argc, argv);
+  config.setTitle("Guide browser");
+  let code = run(config);
+  finalAll();
+  code
+}

@@ -1,0 +1,349 @@
+// The lexer: a ConeScript text cut into tokens, each with its line and
+// column, handed to the parser one at a time as it asks ('next'), as Cone's
+// own lexer does; no list of tokens is made.
+//
+// Indentation gives nesting: a line indented deeper than the one before it
+// opens a level (an Indent token), and a line indented less closes levels
+// (Dedent tokens) back to one it matches. A line ends with a Newline token,
+// except where it plainly goes on: inside '( )', or after a line that ends in
+// ','. A continued line's indentation means nothing. '//' starts a comment to
+// the end of the line; a blank or comment-only line is passed over.
+//
+// Every name is interned: the Names table holds each name's text once, and a
+// token carries the name's number. A number's value is read as it is lexed.
+// So a token is plain data and lexing allocates nothing but new names.
+//
+// A mistake (a tab in the indentation, a dedent to no outer level, a '(' never
+// closed) is reported and the lexer goes on, so one pass finds them all. A
+// byte that is no token becomes a Bad token, so the line it is in fails where
+// it stands.
+
+pub enum TokKind {
+  Name;        // a name: 'part', 'box', 'materials', 'deg', 'true'
+  Number;      // digits, with a fraction if written: '80000', '0.96'
+  Symbol;      // '(' ')' ',' ':' '.' '-', or '=' for '..='
+  Newline;
+  Indent;
+  Dedent;
+  End;
+  Bad;         // a byte that is no token
+}
+
+// Where something was written: the line from 1, the column from 1, in bytes
+pub struct Spot {
+  pub line: u32;
+  pub column: u32;
+}
+
+pub struct Token {
+  pub kind: TokKind;
+  pub at: Spot;
+  pub name: u32;       // a Name's number in the Names table
+  pub value: f64;      // a Number's value
+  pub sym: u8;         // a Symbol's byte ('=' for '..='); a Bad token's byte;
+                       // 'c' on a Newline the lexer cut short at a new part
+}
+
+fn token(kind: TokKind, at: Spot) Token { Token(kind, at, 0u32, 0., 0u8) }
+
+// A mistake in the text, where it was found
+pub struct Problem {
+  pub at: Spot;
+  pub message: String;
+}
+
+pub fn problem(at: Spot, message: &str) Problem { Problem(at, String.from(message)) }
+
+// -------- names --------
+
+// The names every world may use, numbered in the order 'Names.standard' puts
+// them in, so code compares numbers, not text
+pub const N_NONE = 0u32;           // no name: an argument by position, a number with no unit
+pub const N_PART = 1u32;
+pub const N_TRUE = 2u32;
+pub const N_FALSE = 3u32;
+pub const N_BOX = 4u32;
+pub const N_PLAIN = 5u32;
+pub const N_SRGB = 6u32;
+pub const N_COLOR = 7u32;
+pub const N_ROTATION = 8u32;
+pub const N_SUNLIGHT = 9u32;
+pub const N_ARRIVALS = 10u32;
+pub const N_AT = 11u32;
+pub const N_MATERIAL = 12u32;
+pub const N_FACING = 13u32;
+pub const N_X = 14u32;
+pub const N_Y = 15u32;
+pub const N_Z = 16u32;
+pub const N_R = 17u32;
+pub const N_G = 18u32;
+pub const N_B = 19u32;
+pub const N_OPACITY = 20u32;
+pub const N_DIRECTION = 21u32;
+pub const N_LUX = 22u32;
+pub const N_CASTSSHADOW = 23u32;
+pub const N_M = 24u32;
+pub const N_CM = 25u32;
+pub const N_MM = 26u32;
+pub const N_DEG = 27u32;
+pub const N_DEGSIGN = 28u32;
+pub const N_RAD = 29u32;
+pub const N_ANGLE = 30u32;
+
+// Each name's text once, and its number. A STAND-IN: one table a load, over a
+// Dict. The interning wanted is static and shared, as Cone's name table is,
+// so a name has one number everywhere (to be designed with Jon).
+pub struct Names {
+  ids: Dict[String, u32];
+  texts: List[String];
+  count: u32;
+
+  // A table holding nothing, to swap a table out with
+  pub fn empty() Names { Names(Dict[String, u32].empty(), List[String].empty(), 0u32) }
+
+  // The table holding the standard names, at their numbers
+  pub fn standard() Names {
+    var n = Names(Dict[String, u32].empty(), List[String].empty(), 0u32);
+    let words = ["", "part", "true", "false", "box", "plain", "srgb", "color", "rotation", "sunLight",
+      "arrivals", "at", "material", "facing", "x", "y", "z", "r", "g", "b", "opacity", "direction", "lux",
+      "castsShadow", "m", "cm", "mm", "deg", "°", "rad", "angle"];
+    var i = 0usize;
+    while i <= usize.from(N_ANGLE) {          // the last standard name
+      n.intern(words[i]);
+      i = i + 1usize;
+    }
+    n
+  }
+
+  // The number of a name, which is added if it is new
+  pub fn intern(self: &mut, s: &str) u32 {
+    match self.ids.get(s) {
+      case let Some(id) { return *id; }
+      case is None {}
+    }
+    let id = self.count;
+    self.ids.insert(String.from(s), id);
+    self.texts.push(String.from(s));
+    self.count = self.count + 1u32;
+    id
+  }
+
+  // A name's text
+  pub fn text(self: &, id: u32) &str { self.texts[usize.from(id)].view() }
+}
+
+// -------- the lexer --------
+
+pub struct Lexer['a] {
+  src: &'a Array[u8];
+  pos: usize;
+  line: u32;
+  lineStart: usize;
+  atLineStart: bool;
+  levels: List[u32];        // the indentation of each open level
+  depth: u32;               // '(' open
+  openAt: Spot;             // where the outermost open '(' is
+  continued: bool;          // the last line ended in ','
+  logicalIndent: u32;       // the indentation of the line the continued lines began
+  last: Token;              // the token handed out last
+  pending: List[Token];     // tokens made and not yet handed out (a line's Dedents)
+  head: usize;              // the next of them
+  ended: bool;              // End has been made
+  pub names: Names;
+  pub problems: List[Problem];
+
+  // The next token
+  pub fn next(self: &mut) Token {
+    while self.head >= self.pending.len() {
+      self.pending.clear();
+      self.head = 0usize;
+      if self.ended { return token(TokKind.End, self.last.at); }
+      self.scan();
+    }
+    let t = *self.pending[self.head];
+    self.head = self.head + 1usize;
+    self.last = t;
+    t
+  }
+
+  fn emit(self: &mut, t: Token) {
+    self.pending.push(t);
+  }
+
+  fn spot(self: &) Spot { Spot(self.line, u32.from(self.pos - self.lineStart) + 1u32) }
+
+  // The kind of the token made last, whether handed out yet or not
+  fn lastMade(self: &) Token {
+    if self.pending.len() > 0usize { return *self.pending[self.pending.len() - 1usize]; }
+    self.last
+  }
+
+  // Scan on until at least one token is made
+  fn scan(self: &mut) {
+    let n = self.src.len;
+    while self.pending.len() == 0usize {
+      if self.atLineStart { self.beginLine(); }
+      if self.pos >= n {
+        self.finish();
+        return;
+      }
+      let c = self.src[self.pos];
+      let at = self.spot();
+      if c == '\n' {
+        // The end of a line that does not go on
+        if self.depth == 0u32 {
+          let l = self.lastMade();
+          if l.kind == TokKind.Symbol && l.sym == ',' { self.continued = true; }
+          else if self.sawToken() { self.emit(token(TokKind.Newline, at)); }
+        }
+        self.pos = self.pos + 1usize;
+        self.line = self.line + 1u32;
+        self.lineStart = self.pos;
+        self.atLineStart = true;
+      }
+      else if c == ' ' || c == '\t' || c == '\r' {
+        self.pos = self.pos + 1usize;
+      }
+      else if c == '/' && self.pos + 1usize < n && self.src[self.pos + 1usize] == '/' {
+        while self.pos < n && self.src[self.pos] != '\n' { self.pos = self.pos + 1usize; }
+      }
+      else if isLetter(c) {
+        let start = self.pos;
+        while self.pos < n && (isLetter(self.src[self.pos]) || isDigit(self.src[self.pos])) { self.pos = self.pos + 1usize; }
+        var t = token(TokKind.Name, at);
+        t.name = self.names.intern(textOf(self.src, start, self.pos));
+        self.emit(t);
+      }
+      else if isDigit(c) {
+        let start = self.pos;
+        while self.pos < n && isDigit(self.src[self.pos]) { self.pos = self.pos + 1usize; }
+        // A fraction only where a digit follows the point: '0 ..= 5' is a range
+        if self.pos + 1usize < n && self.src[self.pos] == '.' && isDigit(self.src[self.pos + 1usize]) {
+          self.pos = self.pos + 1usize;
+          while self.pos < n && isDigit(self.src[self.pos]) { self.pos = self.pos + 1usize; }
+        }
+        var t = token(TokKind.Number, at);
+        match json.numberF64(&self.src[start..<self.pos]) {
+          case let Ok(x) { t.value = x; }
+          else {}
+        }
+        self.emit(t);
+      }
+      else if c == '.' && self.pos + 2usize < n && self.src[self.pos + 1usize] == '.' && self.src[self.pos + 2usize] == '=' {
+        var t = token(TokKind.Symbol, at);
+        t.sym = '=';
+        self.emit(t);
+        self.pos = self.pos + 3usize;
+      }
+      else if c == '(' || c == ')' || c == ',' || c == ':' || c == '.' || c == '-' {
+        if c == '(' {
+          if self.depth == 0u32 { self.openAt = at; }
+          self.depth = self.depth + 1u32;
+        }
+        else if c == ')' && self.depth > 0u32 { self.depth = self.depth - 1u32; }
+        var t = token(TokKind.Symbol, at);
+        t.sym = c;
+        self.emit(t);
+        self.pos = self.pos + 1usize;
+      }
+      else {
+        var t = token(TokKind.Bad, at);
+        t.sym = c;
+        self.emit(t);
+        self.pos = self.pos + 1usize;
+      }
+    }
+  }
+
+  // Has any real token been made yet (so a Newline means something)?
+  fn sawToken(self: &) bool {
+    let l = self.lastMade();
+    l.kind == TokKind.Name || l.kind == TokKind.Number || l.kind == TokKind.Symbol || l.kind == TokKind.Bad
+  }
+
+  // A line's indentation, when it decides nesting
+  fn beginLine(self: &mut) {
+    self.atLineStart = false;
+    let n = self.src.len;
+    var indent = 0u32;
+    while self.pos < n && (self.src[self.pos] == ' ' || self.src[self.pos] == '\t') {
+      if self.src[self.pos] == '\t' {
+        self.problems.push(problem(self.spot(), "a tab in the indentation: indent with spaces"));
+      }
+      indent = indent + 1u32;
+      self.pos = self.pos + 1usize;
+    }
+    // A blank or comment-only line says nothing about nesting
+    if self.pos >= n || self.src[self.pos] == '\n' || self.src[self.pos] == '\r'
+      || (self.src[self.pos] == '/' && self.pos + 1usize < n && self.src[self.pos + 1usize] == '/') {
+      return;
+    }
+    // A line starting 'part' no deeper than the line before began is a new
+    // part: whatever that line left open, a '(' or a ',', ends there
+    if (self.depth > 0u32 || self.continued) && indent <= self.logicalIndent && startsPart(self.src, self.pos) {
+      if self.depth > 0u32 { self.problems.push(problem(self.openAt, "this '(' is never closed")); }
+      else { self.problems.push(problem(self.lastMade().at, "a ',' ends this line, so it should go on, but the next line is a new part")); }
+      var t = token(TokKind.Newline, Spot(self.line, 1u32));
+      t.sym = 'c';
+      self.emit(t);
+      self.depth = 0u32;
+      self.continued = false;
+    }
+    if self.depth == 0u32 && !self.continued {
+      self.logicalIndent = indent;
+      self.nest(indent, Spot(self.line, indent + 1u32));
+    }
+    self.continued = false;
+  }
+
+  // A line that begins a level: deeper than the open level opens one,
+  // shallower closes levels back to the one it matches
+  fn nest(self: &mut, indent: u32, at: Spot) {
+    if indent > *self.levels[self.levels.len() - 1usize] {
+      self.levels.push(indent);
+      self.emit(token(TokKind.Indent, at));
+      return;
+    }
+    while indent < *self.levels[self.levels.len() - 1usize] {
+      self.levels.pop();
+      self.emit(token(TokKind.Dedent, at));
+    }
+    // Between two levels: taken as the outer one, the nearer guess
+    if indent != *self.levels[self.levels.len() - 1usize] {
+      self.problems.push(problem(at, "this line's indentation matches no outer line"));
+    }
+  }
+
+  // The text's end closes every open level
+  fn finish(self: &mut) {
+    let at = self.spot();
+    if self.sawToken() { self.emit(token(TokKind.Newline, at)); }
+    while self.levels.len() > 1usize {
+      self.levels.pop();
+      self.emit(token(TokKind.Dedent, at));
+    }
+    self.emit(token(TokKind.End, at));
+    self.ended = true;
+  }
+}
+
+// A lexer at the start of src, its names and mistakes in their own tables
+pub fn lexer(src: &'a Array[u8], names: Names) Lexer['a] {
+  var levels = List[u32].empty();
+  levels.push(0u32);
+  Lexer(src, 0usize, 1u32, 0usize, true, levels, 0u32, Spot(1u32, 1u32), false, 0u32,
+    token(TokKind.Newline, Spot(1u32, 1u32)), List[Token].empty(), 0usize, false, names, List[Problem].empty())
+}
+
+// The word 'part', alone, at pos
+fn startsPart(src: &Array[u8], pos: usize) bool {
+  pos + 4usize <= src.len && src[pos] == 'p' && src[pos + 1usize] == 'a' && src[pos + 2usize] == 'r'
+    && src[pos + 3usize] == 't' && (pos + 4usize == src.len || !(isLetter(src[pos + 4usize]) || isDigit(src[pos + 4usize])))
+}
+
+// Any byte of a UTF-8 character past ASCII counts, so '°' is a unit's name
+fn isLetter(c: u8) bool { (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80u8 }
+
+fn isDigit(c: u8) bool { c >= '0' && c <= '9' }
+
+fn textOf(src: &Array[u8], start: usize, end: usize) &str { &src[start..<end] as &str }
