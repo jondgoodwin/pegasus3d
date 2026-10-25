@@ -170,6 +170,10 @@ pub struct UserController {
   // The view's pitch keys this frame: PageUp 1 (look up) to PageDown -1
   pub fn lookKeys(self: &, ctx: &Context) f32 { clampUnit(ctx.axis1(actions.look)) }
 
+  // The follow camera's keys this frame: '=' 1 (farther) to '-' -1, and ']' 1 (higher) to '[' -1
+  pub fn boomKeys(self: &, ctx: &Context) f32 { clampUnit(ctx.axis1(actions.boom)) }
+  pub fn liftKeys(self: &, ctx: &Context) f32 { clampUnit(ctx.axis1(actions.lift)) }
+
   // The view's pitch change this frame from the mouse, in radians: a drag
   // upward with the right button held looks up
   pub fn lookDrag(self: &, ctx: &Context) f32 { 0. - ctx.axis2(actions.drag).y * LOOK_PER_UNIT }
@@ -212,10 +216,28 @@ pub struct ViewRig {
   pub pitch: f32;              // the user's look up (+) or down (-), radians, added to the view's own; 0 is as it was
   pub feetBefore: Pose;        // where the being's feet stand (the ground point) and which way it is turned (its yaw about +y), at the step
   pub feetNow: Pose;           // before the last and at the last: what a headset's head is placed on (--xr), whatever the mode and the smoothing
+  pub behind: f32;             // the third-person camera's distance behind (THIRD_BEHIND until '=' or '-' changes it)
+  pub above: f32;              // and its height over the chest (THIRD_ABOVE until ']' or '[')
 
   pub fn make(mode: u32) ViewRig {
     let still = Pose.look(Vec3(0., 0., 0.), 0., 0.);
-    ViewRig(mode, still, still, Vec3(0., 0., 0.), 0., true, 0., still, still)
+    ViewRig(mode, still, still, Vec3(0., 0., 0.), 0., true, 0., still, still, THIRD_BEHIND, THIRD_ABOVE)
+  }
+
+  // The follow camera moved for framing a picture: 'out' (+ farther, - nearer) and 'up' (+ higher, - lower) held for 'dt' s.
+  // Its distance changes by a share of itself (twice as far in about a second), so a close and a far one are as easy to set;
+  // its height by a share of the distance, so the angle down changes at the same pace near or far
+  pub fn reframe(self: &mut, out: f32, up: f32, dt: f32) {
+    if out != 0. {
+      behind = behind * libc.expf(out * 0.7 * dt);
+      if behind < 1.5 { behind = 1.5; }
+      if behind > 400. { behind = 400. ; }
+    }
+    if up != 0. {
+      above = above + up * 0.5 * behind * dt;
+      if above < -1. { above = -1.; }
+      if above > 300. { above = 300.; }
+    }
   }
 
   // Look up (+) or down (-) by 'd' radians, held short of straight up or down
@@ -260,7 +282,7 @@ pub struct ViewRig {
         let chest = b.body.position + Vec3(0., 0.80 * h, 0.);
         let fx = 0. - sin(yaw);
         let fz = 0. - cos(yaw);
-        var want = Vec3(chest.x - fx * THIRD_BEHIND, chest.y + THIRD_ABOVE, chest.z - fz * THIRD_BEHIND);
+        var want = Vec3(chest.x - fx * behind, chest.y + above, chest.z - fz * behind);
         // (pulled up out of the ground; under the island the ground is 300 m overhead and the labyrinth's floor is the level)
         let floor = if underground(chest.y) { LAB_Y + 0.35 } else { groundHeight(isl, want.x, want.z) + 0.35 };
         if want.y < floor { want = Vec3(want.x, floor, want.z); }
@@ -268,7 +290,8 @@ pub struct ViewRig {
         // The wall clamp: a sphere cast from the head to the camera's smoothed place; the camera is put where the sphere stops, at once
         // (and eases out again at the smoothing's rate once the way is clear), so it is never in a wall, including after a crossing
         // has carried it (the looking-glass's) to a place behind the cottage's wall
-        cam = phys.clampCamera(b.body.position + Vec3(0., h * 0.92, 0.), cam, CAMERA_RADIUS);
+        // (not for a camera pulled far back to frame a picture: the trees and the hill between would bring it right in)
+        if behind <= THIRD_BEHIND * 3. { cam = phys.clampCamera(b.body.position + Vec3(0., h * 0.92, 0.), cam, CAMERA_RADIUS); }
         let d = chest - cam;
         let flat = libc.sqrtf(d.x * d.x + d.z * d.z);
         target = Pose.look(cam, libc.atan2f(0. - d.x, 0. - d.z), clampPitch(libc.atan2f(d.y, flat) + pitch));
