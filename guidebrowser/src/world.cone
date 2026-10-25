@@ -1,0 +1,303 @@
+// The World: an actor that owns a world's changing values and runs its tick
+// on the actors package's workers, while the loop draws.
+//
+// What it is started with, the Program, is built by the loader from what was
+// understood (build.cone): every part's place in its parent, the fields and
+// their defaults, the areas, the derives in the order they are worked out,
+// and the event rules with their animators already built (tweenstack's Anim,
+// plain data, so it crosses like a mesh does).
+//
+// The loop sends one message a step: the step's number, and what came in for
+// it (a part clicked, where the visitor's eye is). Nothing from outside
+// writes a value in the middle of a step. Each step, in this order:
+//
+//   take in      the first step is 'created': its rules start; a click
+//                starts the rules of the part clicked
+//   before       the animators move what they own (tweenstack's registry)
+//   physics      none yet ('solid' is set aside)
+//   after        every part's place in the world, parent first; who is
+//                inside each area; the derives, each after what it reads
+//   publish      what changed, as a Published copy, to the loop
+//
+// Every value here has this one owner. The loop never reads them, only what
+// is published, so nothing is shared and nothing is locked.
+
+// A part's place in its parent, as written
+pub struct SlotFrame {
+  pub parent: u32;
+  pub name: String;
+  pub at: Vec3;
+  pub rotation: Quat;          // its 'rotation:' option, or none
+  pub drawn: bool;             // a shape: its state is published
+}
+
+pub struct FieldRt {
+  pub slot: u32;
+  pub name: String;
+  pub value: f64;              // its default (a truth as 1 or 0)
+  pub truth: bool;
+}
+
+pub struct AreaRt {
+  pub slot: u32;
+  pub center: Vec3;            // in the part's own frame
+  pub radius: f32;
+}
+
+pub struct DeriveRt {
+  pub prop: u32;               // P_FIELD or P_TINT
+  pub index: u32;              // the field's number, or the part's slot
+  pub calc: Calc;
+}
+
+pub struct RuleRt {
+  pub clicked: bool;           // on(clicked(part), ...); else on(created, ...)
+  pub part: u32;
+  pub anim: Anim;
+  pub what: String;            // what it moves, to say so
+}
+
+// One thing a pick-and-place rule does (understand.cone's MoveAct): kind 0
+// sets the field to the part 'value' (-1: none); kind 1 starts the part the
+// field holds gliding, over 'seconds', to stand over the middle of part 'to'
+pub struct MoveActRt {
+  pub kind: u32;
+  pub field: u32;
+  pub value: i64;
+  pub to: u32;
+  pub middle: Vec3;            // the middle of 'to''s shape, in its own frame
+  pub seconds: f32;
+}
+
+pub struct MoveRt {
+  pub part: u32;               // clicked: it, or any part inside it
+  pub acts: List[MoveActRt];
+}
+
+pub struct Program {
+  pub frames: List[SlotFrame]; // by slot
+  pub fields: List[FieldRt];
+  pub areas: List[AreaRt];
+  pub derives: List[DeriveRt]; // in the order they are worked out
+  pub rules: List[RuleRt];
+  pub moves: List[MoveRt];
+}
+
+// No part clicked this step
+pub const NO_CLICK = 0xFFFFFFFFu32;
+
+actor WorldActor {
+  out: Sender[Published];
+  program: Program;
+  animators: Animators;
+  started: bool;
+  first: u64;                  // the step the world was created in
+  values: List[f64];           // by field
+  inside: List[bool];          // by area: is the visitor on this machine inside?
+  positions: List[Vec3];       // by slot: in the world, at the end of this step
+  rotations: List[Quat];
+  tints: List[f32];
+  sent: List[bool];            // by slot: published at least once
+  sentPositions: List[Vec3];   // by slot: as published last
+  sentRotations: List[Quat];
+  sentTints: List[f32];
+
+  fn init(self: &new, out: Sender[Published], program: Program) {
+    var values = List[f64].empty();
+    var i = 0usize;
+    while i < program.fields.len() { values.push(program.fields[i].value); i = i + 1usize; }
+    var inside = List[bool].empty();
+    i = 0usize;
+    while i < program.areas.len() { inside.push(false); i = i + 1usize; }
+    var positions = List[Vec3].empty();
+    var rotations = List[Quat].empty();
+    var tints = List[f32].empty();
+    var sent = List[bool].empty();
+    var sentPositions = List[Vec3].empty();
+    var sentRotations = List[Quat].empty();
+    var sentTints = List[f32].empty();
+    i = 0usize;
+    while i < program.frames.len() {
+      positions.push(Vec3(0., 0., 0.)); rotations.push(Quat.identity()); tints.push(1.);
+      sent.push(false); sentPositions.push(Vec3(0., 0., 0.)); sentRotations.push(Quat.identity()); sentTints.push(1.);
+      i = i + 1usize;
+    }
+    *self = Self(out: out, program: program, animators: Animators.make(), started: false, first: 0u64, values: values,
+      inside: inside, positions: positions, rotations: rotations, tints: tints, sent: sent,
+      sentPositions: sentPositions, sentRotations: sentRotations, sentTints: sentTints);
+  }
+
+  // One step of the world's clock: step 'index' of 'stepNs' nanoseconds,
+  // with what came in for it
+  pub async fn step(self, index: u64, stepNs: u64, clicked: u32, eye: Vec3) {
+    // Take in
+    if !started {
+      started = true;
+      first = index;
+      var r = 0usize;
+      while r < program.rules.len() {
+        if !program.rules[r].clicked {
+          animators.start(&program.rules[r].anim);
+          print <- "world: step "; print <- index; print <- ", created: "; printStr(program.rules[r].what.view());
+          print <- " started\n";
+        }
+        r = r + 1usize;
+      }
+    }
+    let now = f64.from(index - first) * f64.from(stepNs) / 1.0e9f64;
+    if clicked != NO_CLICK {
+      var any = false;
+      // Pick and place, in the order written: the part clicked or one holding it
+      var m = 0usize;
+      while m < program.moves.len() {
+        if self.within(clicked, program.moves[m].part) {
+          any = true;
+          var k = 0usize;
+          while k < program.moves[m].acts.len() {
+            let a = program.moves[m].acts[k];
+            let f = usize.from(a.field);
+            if a.kind == 0u32 {
+              values.set(f, f64.from(a.value));
+              print <- "world: step "; print <- index; print <- ", ";
+              printStr(program.fields[f].name.view()); print <- " is now ";
+              if a.value < 0i64 { print <- "None"; } else { printStr(program.frames[usize.from(a.value)].name.view()); }
+              print <- "\n";
+            }
+            else if *values[f] >= 0. {
+              let piece = usize.from(i64.from(*values[f]));
+              let to = usize.from(a.to);
+              let here = *positions[piece];
+              let there = *positions[to] + *rotations[to] * a.middle;
+              let parent = usize.from(program.frames[piece].parent);
+              // the change in the piece's own parent's frame, level: it keeps its height
+              let shift = rotations[parent].conjugate() * Vec3(there.x - here.x, 0., there.z - here.z);
+              let now = animators.valueVec3(u32.from(piece), P_OFFSET, Vec3(0., 0., 0.));
+              animators.start(&Anim.transition(u32.from(piece), P_OFFSET, AnimValue.ofVec3(now + shift), a.seconds));
+              print <- "world: step "; print <- index; print <- ", "; printStr(program.frames[piece].name.view());
+              print <- " glides to "; printStr(program.frames[to].name.view()); print <- "\n";
+            }
+            k = k + 1usize;
+          }
+        }
+        m = m + 1usize;
+      }
+      var r = 0usize;
+      while r < program.rules.len() {
+        if program.rules[r].clicked && self.within(clicked, program.rules[r].part) {
+          animators.start(&program.rules[r].anim);
+          print <- "world: step "; print <- index; print <- ", "; printStr(program.frames[usize.from(clicked)].name.view());
+          print <- " clicked: "; printStr(program.rules[r].what.view()); print <- " started\n";
+          any = true;
+        }
+        r = r + 1usize;
+      }
+      if !any {
+        print <- "world: step "; print <- index; print <- ", "; printStr(program.frames[usize.from(clicked)].name.view());
+        print <- " clicked: no rule for it\n";
+      }
+    }
+
+    // Before physics: the animators move what they own
+    animators.tick(now);
+
+    // After physics: places, parent first (a parent's slot is always lower)
+    var s = 0usize;
+    while s < program.frames.len() {
+      let f = program.frames[s];
+      let turn = animators.valueQuat(u32.from(s), P_ROTATION, f.rotation);
+      let shift = f.at + animators.valueVec3(u32.from(s), P_OFFSET, Vec3(0., 0., 0.));
+      if s == 0usize {
+        positions.set(s, shift);
+        rotations.set(s, turn);
+      } else {
+        let p = usize.from(f.parent);
+        let parentTurn = *rotations[p];
+        positions.set(s, *positions[p] + parentTurn * shift);
+        rotations.set(s, parentTurn * turn);
+      }
+      s = s + 1usize;
+    }
+    // Who is inside each area
+    var a = 0usize;
+    while a < program.areas.len() {
+      let area = program.areas[a];
+      let k = usize.from(area.slot);
+      let middle = *positions[k] + *rotations[k] * area.center;
+      inside.set(a, (eye - middle).length() <= area.radius);
+      a = a + 1usize;
+    }
+    // The derives, in their order
+    var d = 0usize;
+    while d < program.derives.len() {
+      let v = self.calc(&program.derives[d].calc);
+      let i = usize.from(program.derives[d].index);
+      if program.derives[d].prop == P_FIELD {
+        if v != *values[i] {
+          values.set(i, v);
+          let field = program.fields[i];
+          print <- "world: step "; print <- index; print <- " ("; print <- now; print <- " s), ";
+          printStr(program.frames[usize.from(field.slot)].name.view()); print <- "."; printStr(field.name.view());
+          print <- " is now ";
+          if field.truth { print <- (if v != 0. { "true" } else { "false" }); } else { print <- v; }
+          print <- "\n";
+        }
+      }
+      else if program.derives[d].prop == P_TINT { tints.set(i, f32.from(v)); }
+      d = d + 1usize;
+    }
+
+    // Publish what changed
+    var changed = List[PartState].empty();
+    s = 0usize;
+    while s < program.frames.len() {
+      if program.frames[s].drawn {
+        let pos = *positions[s];
+        let rot = *rotations[s];
+        let tint = *tints[s];
+        let was = *sentRotations[s];
+        let had = *sentPositions[s];
+        if !*sent[s] || pos.x != had.x || pos.y != had.y || pos.z != had.z
+          || rot.x != was.x || rot.y != was.y || rot.z != was.z || rot.w != was.w || tint != *sentTints[s] {
+          changed.push(PartState(u32.from(s), pos, rot, tint));
+          sent.set(s, true);
+          sentPositions.set(s, pos);
+          sentRotations.set(s, rot);
+          sentTints.set(s, tint);
+        }
+      }
+      s = s + 1usize;
+    }
+    if changed.len() > 0usize { out.send(Published(index + 1u64, changed)); }
+  }
+
+  // Is the part at slot 'part' the part 'holder', or inside it?
+  fn within(self: &, part: u32, holder: u32) bool {
+    var s = part;
+    while true {
+      if s == holder { return true; }
+      if s == 0u32 { return false; }
+      s = program.frames[usize.from(s)].parent;
+    }
+    false
+  }
+
+  // A derive's formula, worked out now
+  fn calc(self: &, c: &Calc) f64 {
+    match c {
+      case let Num(x) { *x }
+      case let Field(f) { *values[*f] }
+      case let Occupied(slot) {
+        var yes = false;
+        var a = 0usize;
+        while a < program.areas.len() {
+          if usize.from(program.areas[a].slot) == *slot && *inside[a] { yes = true; }
+          a = a + 1usize;
+        }
+        if yes { 1. } else { 0. }
+      }
+      case let Choose(parts) {
+        if self.calc(parts[0]) != 0. { self.calc(parts[1]) } else { self.calc(parts[2]) }
+      }
+    }
+  }
+}

@@ -4,22 +4,40 @@
 // Library\arrival-through-a-portal.md). It is made from the packages alone;
 // nothing of the island's browser (../browser) is in it.
 //
-// STEP 1, the skeleton: a window, the frame package's loop, an empty scene
-// (scene.cone) and the loader (loader.cone), an actor on the actors
-// package's workers. At start the loader is asked for the home world. What it
-// builds crosses to the loop over a channel, and the ACTIVATION SLICE makes
-// it live between frames. The frame package's loop has no slot by that name
-// yet, so the slice runs in its 'network' slot, which is defined the same
-// way: queues drained, never waiting. (Its phase statistics say "network".)
+// The loop (the frame package's) owns presenting: the keyboard and mouse,
+// the visitor's own view, and drawing. Two kinds of actor work beside it on
+// the actors package's workers:
 //
-//   guidebrowser                    the home world (empty in step 1)
-//   guidebrowser --test-part        a grey cube stands in for its one part
-//   guidebrowser --frames 120       120 frames on frame's synthetic clock
+// - the LOADER (loader.cone) brings a world in, reads and understands it, and
+//   builds its parts; what it builds crosses to the loop over a channel, and
+//   the ACTIVATION SLICE makes it live between frames. The frame package's
+//   loop has no slot by that name yet, so the slice runs in its 'network'
+//   slot, which is defined the same way: queues drained, never waiting.
+// - the WORLD (world.cone), started with what the world does once that
+//   arrives, owns the world's changing values. Each fixed step the loop sends
+//   it the step and what came in for it (a click, where the visitor is), and
+//   it publishes what changed. The loop draws from those published copies,
+//   placing each part between its last two, one step behind, so the picture
+//   moves smoothly whatever the display's rate.
+//
+// The visitor walks with W, A, S, D, looks with the right button held down
+// and dragged, and clicks with the left. Their view is the loop's, never sent
+// round the World, so turning shows in the very next frame.
+//
+//   guidebrowser                    the home world
 //   guidebrowser --world NAME       worlds\NAME.ddd
 //   guidebrowser --world URL        the world fetched from http:// or https://
+//   guidebrowser --frames 120       120 frames on frame's synthetic clock
+//   guidebrowser --test-part        a grey cube as well
+//   guidebrowser --show             what was read and understood
+//   guidebrowser --shot             a frame to build\shot.bmp (the tenth, or --shot-at N's)
+//   guidebrowser --approach M       once arrived, walk M meters ahead
+//   guidebrowser --click-at N       on frame N, click where the last part is drawn
+//   guidebrowser --click-xy X Y N   on frame N, click at X, Y of the window's width and height (up to four)
+//   guidebrowser --tilt D           once arrived, look D degrees up (down if negative)
 //
 // It prints each stage of the arrival, the colour at the middle of the window
-// on the tenth frame, the Vulkan failures and frame's per-phase timings, and
+// on the shot's frame, the Vulkan failures and frame's per-phase timings, and
 // fails if the GPU reported any failure.
 
 mod guidebrowser is World;
@@ -29,7 +47,9 @@ import libc;
 import sdl;
 import collections use *;
 import geomath use *;
-import mesh use Mesh;
+import mesh use Mesh, PolyMesh;
+import sculpt;
+import sculptbrush;
 import gpu use *;
 import render use *;
 import window use *;
@@ -41,11 +61,36 @@ import fs;
 import path use Path;
 import json;
 import aio use File, IoLimits;
-import iobuf use Pool, IoBuf;
+import iobuf use IoBuf;
 import iocore use Access;
 import time use Instant, Duration;
 import httpclient use Timing;
 import actorhttp use Client;
+import keyframetracks use * but Binding;
+import tweenstack use Anim, Animators, Value as AnimValue;
+import input use Input, Context, Binding, Action, AXIS2;
+import controls use Fly, Pose;
+import analyticdaylight use PreethamSky;
+
+// How fast a visitor walks, in meters a second (mine: a brisk walk)
+const WALK_SPEED = 2.;
+
+// One part as the World last published it: where it was at the two latest
+// boundaries it changed at, so the frame can place it between them
+struct PartView {
+  has: bool;
+  prevPosition: Vec3;
+  prevRotation: Quat;
+  prevAt: u64;
+  position: Vec3;
+  rotation: Quat;
+  at: u64;
+  tint: f32;
+}
+
+fn noView() PartView {
+  PartView(false, Vec3(0., 0., 0.), Quat.identity(), 0u64, Vec3(0., 0., 0.), Quat.identity(), 0u64, 1.)
+}
 
 // The GPU side and the scene, made by start and released by quit. Fields die
 // in the order they are declared: the scene's handles before the renderer
@@ -55,8 +100,22 @@ struct Shell {
   pub ready: Receiver[Arrival];   // what the loader has built
   pub arrivedAt: u64;             // when the home world was asked for (performance counter)
   pub activated: u64;             // parts made live so far
-  pub readback: Buffer;           // frame 10's pixels, copied in render, read in present
+  pub world: Option[WorldActor];       // what runs the world's tick, once its behaviors have arrived
+  pub publishedTx: Sender[Published];
+  pub published: Receiver[Published];
+  pub views: List[PartView];      // by slot
+  pub lastStep: u64;              // the last step simulated
+  pub click: u32;                 // a part clicked, for the next step to take in
+  pub input: Input;
+  pub actions: Context;
+  pub walk: Action;
+  pub look: Action;
+  pub fresh: bool;                // the frame's input not yet read
+  pub visitor: Fly;               // the visitor's eye and which way it looks
+  pub readback: Buffer;           // the shot frame's pixels, copied in render, read in present
   pub target: SurfaceTexture;     // the swapchain's texture the next frame draws into
+  pub fx: ImageFx;                // the image-quality passes round the renderer's frame
+  pub post: Post;                 // bloom and the tone map, into the swapchain's texture
   pub renderer: Renderer;
   pub swapchain: SwapChain;
   pub device: Device;
@@ -75,10 +134,20 @@ var shell: Option[Shell];
 // From the command line
 var @threadlocal testPart = false;
 var @threadlocal worldArg: *u8 = null;     // '--world NAME': worlds\NAME.ddd, or a URL fetched; home if not given
-var @threadlocal shot = false;             // '--shot': frame 10 to build\shot.bmp
+var @threadlocal programPath: *u8 = null;  // how the program was started: its worlds folder is found from it
+var @threadlocal shot = false;             // '--shot': the shot frame to build\shot.bmp
+var @threadlocal shotAt = 10;              // '--shot-at N': which frame is read back (and shot)
 var @threadlocal show = false;             // '--show': the loader prints the tree and the understood slots
+var @threadlocal approach = 0.;            // '--approach M': meters walked ahead on arriving
+var @threadlocal clickAt = 0;              // '--click-at N': the frame a click is made on
+// '--click-xy FX FY N' (up to four): on frame N, a click at FX, FY of the window's width and height
+var @threadlocal clicks = 0;
+var @threadlocal clickFrames = Array[i32, 4]() <- fill 0;
+var @threadlocal clickXs = Array[f32, 4]() <- fill 0.;
+var @threadlocal clickYs = Array[f32, 4]() <- fill 0.;
+var @threadlocal tilt = 0.;                // '--tilt D': once arrived, look D degrees further up (down if negative)
 
-// Frames drawn, and the colour at the middle of the window on the tenth
+// Frames drawn, and the colour at the middle of the window on the shot frame
 var @threadlocal drawn = 0;
 var @threadlocal centre = Array[i32, 3]() <- fill 0;
 
@@ -108,11 +177,20 @@ pub fn start(host: &mut Host) bool {
   var device = adapter.requestDevice();
   let size = host.window().size();
   var swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
-  var renderer = Renderer.create(&mut device, swapchain.format, TEXTURE_FORMAT_DEPTH32_FLOAT);
-  if !renderer.isValid() {
+  // The scene is drawn in high dynamic range, a half-float frame, which the
+  // image-quality passes (ImageFx: temporal anti-aliasing, ambient occlusion,
+  // auto-exposure) and the Post (bloom, the tone map) finish into the
+  // swapchain's texture; glass and reflections by rays where the GPU has them
+  var renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  let rays = renderer.setRayTracing(&mut device, true);
+  var post = Post.create(&mut device, swapchain.format, u32.from(size.w), u32.from(size.h));
+  if !renderer.isValid() || !post.isValid() {
     print <- "The renderer could not be made\n";
     return false;
   }
+  var fx = ImageFx.create(&mut device, &renderer, &mut post);
+  fx.configure(&FxSettings.high());        // until a world's arrival says how its picture is taken
+  print <- "Rendering: high dynamic range, image quality high, "; print <- (if rays { "ray tracing on" } else { "no ray tracing" }); print <- "\n";
 
   // The scene is lit in physical units (lux, nits), seen by a camera set for
   // a sunny day (EV100 15, the sunny-16 rule). Until a world's arrival says
@@ -125,43 +203,146 @@ pub fn start(host: &mut Host) bool {
   camera.background = Color(0.55 / renderer.exposure, 0.70 / renderer.exposure, 0.85 / renderer.exposure, 1.);
   let light = Light.directional(Vec3(0., -1., 0.), Color(0., 0., 0., 1.), Color(0., 0., 0., 1.));
 
+  // Walking and looking, as the input package's actions: W, A, S, D by where
+  // the keys are; a drag with the right button held looks
+  var actions = Context.empty();
+  let walk = actions.action("visitor.walk", AXIS2);
+  actions.bind(walk, Binding.keyAxis(sdl.SCANCODE_W, 0., 1.));
+  actions.bind(walk, Binding.keyAxis(sdl.SCANCODE_S, 0., -1.));
+  actions.bind(walk, Binding.keyAxis(sdl.SCANCODE_A, -1., 0.));
+  actions.bind(walk, Binding.keyAxis(sdl.SCANCODE_D, 1., 0.));
+  let look = actions.action("visitor.look", AXIS2);
+  actions.bind(look, Binding.pointerDelta(1.).whileHeld(sdl.BUTTON_MASK_RIGHT));
+
   // The loader, and the channel what it builds comes back by; then the home world asked for
   var readyTx: Sender[Arrival];
   var readyRx: Receiver[Arrival];
   readyTx, readyRx = Channel[Arrival].make();
+  var publishedTx: Sender[Published];
+  var publishedRx: Receiver[Published];
+  publishedTx, publishedRx = Channel[Published].make();
   let arrivedAt = sdl.GetPerformanceCounter();
   let loader = Loader(readyTx);
   let world = if worldArg == null { String.from("home") } else { String.from(cstr.fromPtr(worldArg).view()) };
-  loader.arrive(world, arrivedAt, testPart, show);
+  loader.arrive(world, worldsFolder(), arrivedAt, testPart, show);
 
   let target = swapchain.getCurrentTexture(&mut device);
-  shell = Some[Shell](Shell(Scene.empty(), readyRx, arrivedAt, 0u64, Buffer.none(), target, renderer, swapchain, device,
+  shell = Some[Shell](Shell(Scene.empty(), readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
+    List[PartView].empty(), 0u64, NO_CLICK, Input.empty(), actions, walk, look, true,
+    Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), target, fx, post, renderer, swapchain, device,
     adapter, surface, instance, DrawList.empty(), camera, light));
   true
 }
 
-// The window's own events are frame's; a resize is the swapchain's
+// The window's own events are frame's; a resize is the swapchain's. The
+// keyboard's and the mouse's go to the input package, and a left click picks
+// the part under the pointer, for the next step.
 pub fn event(host: &mut Host, e: &imm sdl.Event) {
-  if !host.window().resized { return; }
-  host.window().resized = false;
-  let s = host.window().size();
   var g = takeShell();
   match &mut g {
-    case var &mut Some(some) { (*some).swapchain.resize(u32.from(s.w), u32.from(s.h)); }
+    case var &mut Some(some) {
+      if host.window().resized {
+        host.window().resized = false;
+        let size = host.window().size();
+        (*some).swapchain.resize(u32.from(size.w), u32.from(size.h));
+        (*some).post.resize(&mut (*some).device, u32.from(size.w), u32.from(size.h));
+      }
+      (*some).input.handle(e);
+      if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
+        let b = e as &sdl.MouseButtonEvent;
+        if b.button == sdl.BUTTON_LEFT {
+          let w = host.window().windowSize();
+          clickOn(&mut *some, b.x, b.y, f32.from(w.w), f32.from(w.h), host.stats.frames);
+        }
+      }
+    }
     else {}
   }
   shell = g;
 }
 
-// Nothing moves yet
-pub fn simulate(host: &mut Host, step: &imm Step, scratch: &mut Arena) {}
+// The part drawn under (x, y), in the window's units, clicked: the nearest
+// whose box the ray from the eye through that point meets
+fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
+  let tw = f32.from(s.target.texture.width);
+  let th = f32.from(s.target.texture.height);
+  if w <= 0. || h <= 0. || th <= 0. { return; }
+  let inverse = (s.camera.projectionMatrix(tw / th) * s.camera.viewMatrix()).inverse();
+  let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
+  let eye = s.camera.origin;
+  let direction = (p.xyz() * (1. / p.w) - eye).normalize();
+  var best = 1.0e30f;
+  var hit = NO_CLICK;
+  var k = 0usize;
+  while k < s.scene.parts.len() {
+    let part = s.scene.parts[k];
+    let back = part.place.inverse();
+    let ray = Ray3(back * eye, back.transformVector(direction));
+    match ray.intersectAabb(Aabb3(part.low, part.high)) {
+      case let Some(t) { if t < best { best = t; hit = part.slot; } }
+      case is None {}
+    }
+    k = k + 1usize;
+  }
+  print <- "loop: frame "; print <- frame; print <- ", a click at ("; print <- x; print <- ", "; print <- y; print <- "): ";
+  if hit == NO_CLICK { print <- "nothing\n"; return; }
+  k = 0usize;
+  while k < s.scene.parts.len() {
+    if s.scene.parts[k].slot == hit { printStr(s.scene.parts[k].name.view()); }
+    k = k + 1usize;
+  }
+  print <- "\n";
+  s.click = hit;
+}
+
+// One fixed step: the visitor walks, and the World is sent the step with what
+// came in for it
+pub fn simulate(host: &mut Host, step: &imm Step, scratch: &mut Arena) {
+  var g = takeShell();
+  match &mut g {
+    case var &mut Some(some) { stepWorld(&mut *some, step); }
+    else {}
+  }
+  shell = g;
+}
+
+fn stepWorld(s: &mut Shell, step: &Step) {
+  if s.fresh {
+    s.actions.update(&s.input);
+    let l = s.actions.axis2(s.look);
+    if l.x != 0. || l.y != 0. { s.visitor.look(l.x, l.y); }
+    s.fresh = false;
+  }
+  // Walking stays level: ahead is where the visitor faces, flattened
+  let m = s.actions.axis2(s.walk);
+  if m.x != 0. || m.y != 0. {
+    let yaw = s.visitor.yaw;
+    let ahead = Vec3(0. - sin(yaw), 0., 0. - cos(yaw));
+    let right = Vec3(cos(yaw), 0., 0. - sin(yaw));
+    var dir = right * m.x + ahead * m.y;
+    let len = dir.length();
+    if len > 1. { dir = dir * (1. / len); }
+    s.visitor.position = s.visitor.position + dir * (f32.from(WALK_SPEED) * step.dt);
+  }
+  s.lastStep = step.index;
+  match &mut s.world {
+    case var &mut Some(w) {
+      w.step(step.index, step.ns, s.click, s.visitor.position);
+      s.click = NO_CLICK;
+    }
+    case is None {}
+  }
+}
 
 // The activation slice (in frame's network slot): what the loader has built,
-// made live, up to the budget
+// made live, up to the budget; and what the World has published, taken in
 pub fn network(host: &mut Host, net: &mut NetQueues) {
   var g = takeShell();
   match &mut g {
-    case var &mut Some(some) { activate(&mut *some, host.stats.frames); }
+    case var &mut Some(some) {
+      activate(&mut *some, host.stats.frames);
+      takePublished(&mut *some);
+    }
     else {}
   }
   shell = g;
@@ -178,6 +359,37 @@ fn activate(s: &mut Shell, frame: u64) {
   }
 }
 
+// What is drawn behind everything, and what the physically based material
+// reflects, until a world says what its sky is (the guide leaves it open).
+// Mine: a gentle robin's-egg blue overhead, fading to a pale haze at the
+// horizon, each as bright as a clear day's sky is there for the world's own
+// sun (Preetham's model, analyticdaylight, turbidity 2.5: its luminance, with
+// these colors' hue); a ground below the horizon as bright as a mid-gray
+// floor in this sun (reflectance 0.25: a quarter of lux / pi); no sun disc, as
+// the sun's own light gives the highlight.
+fn clearDaySky(toSun: Vec3, lux: f32) Sky {
+  let model = PreethamSky.make(2.5, toSun);
+  let flat = Vec3(toSun.x, 0., toSun.z);
+  let towardSun = if flat.length() > 0.001 { flat.normalize() } else { Vec3(1., 0., 0.) };
+  let zenith = hued(model.radiance(Vec3(0., 1., 0.), toSun), 160., 212., 222.);
+  let haze = hued(model.radiance((Vec3(0., 0.05, 0.) - towardSun).normalize(), toSun), 224., 238., 238.);
+  let glow = hued(model.radiance((towardSun + Vec3(0., 0.05, 0.)).normalize(), toSun), 244., 236., 222.);
+  let g = 0.25 * lux / 3.14159265;
+  Sky(toSun, 0.0047, Color(0., 0., 0., 1.), zenith, haze, 5.,
+    Color(fmaxZero(glow.red - haze.red), fmaxZero(glow.green - haze.green), fmaxZero(glow.blue - haze.blue), 1.), 8.,
+    Color(g * 0.55, g * 0.62, g * 0.45, 1.), 10., Color(0., 0., 0., 1.), 0., Color(0., 0., 0., 1.), 0., 1., 1., 0., 0u32)
+}
+
+// A radiance's brightness (its luminance) in the hue of the sRGB color (r, g, b)
+fn hued(radiance: Vec3, r: f32, g: f32, b: f32) Color {
+  let y = 0.2126 * radiance.x + 0.7152 * radiance.y + 0.0722 * radiance.z;
+  let lr = srgbToLinear(f64.from(r));
+  let lg = srgbToLinear(f64.from(g));
+  let lb = srgbToLinear(f64.from(b));
+  let ly = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+  Color(lr * y / ly, lg * y / ly, lb * y / ly, 1.)
+}
+fn fmaxZero(x: f32) f32 { if x > 0. { x } else { 0. } }
 // One arrival, taken by value: matched as a local, so nothing else can change it meanwhile
 fn take(s: &mut Shell, a: Arrival, frame: u64) {
   let began = sdl.GetPerformanceCounter();
@@ -185,9 +397,20 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
   match &mut arrival {
     case var &mut Part(p) {
       let mesh = s.renderer.addMesh(&mut s.device, &p.built.mesh);
-      let look = Material.plain(p.built.color);
-      let material = s.renderer.addMaterial(&mut s.device, &look);
-      s.scene.parts.push(Live(p.built.name.copy(), mesh, material, p.built.place));
+      let look = p.built.look;
+      var material = MaterialHandle.none();
+      if look.physical {
+        var pbr = PbrMaterial.standard(look.color, look.metal, look.roughness);
+        pbr.clearcoat = look.coat;
+        pbr.clearcoatRoughness = look.coatRoughness;
+        if look.reflects > 0. { pbr = pbr.reflective(look.reflects); }
+        material = s.renderer.addPbrMaterial(&mut s.device, &pbr);
+      } else {
+        var plain = Material.plain(look.color);
+        if look.covers < 1. { plain = plain.translucent(look.covers); }
+        material = s.renderer.addMaterial(&mut s.device, &plain);
+      }
+      s.scene.parts.push(Live(p.built.slot, p.built.name.copy(), mesh, material, p.built.low, p.built.high, p.built.place));
       s.activated = s.activated + 1u64;
       print <- "loop: frame "; print <- frame; print <- ", "; printStr(p.built.name.view());
       print <- " live: mesh and material to the GPU in "; print <- micros(began, sdl.GetPerformanceCounter()); print <- " us\n";
@@ -195,12 +418,52 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
     case var &mut Sun(sun) {
       s.light = sun.light;
       if sun.shadows { s.renderer.setShadows(&mut s.device, &ShadowSettings(enabled: true)); }
+      s.renderer.setSky(&mut s.device, &clearDaySky(sun.toSun, sun.lux));
       print <- "loop: frame "; print <- frame; print <- ", the sun";
       if sun.shadows { print <- " with its shadow map made"; }
       print <- " in "; print <- micros(began, sdl.GetPerformanceCounter()); print <- " us\n";
     }
+    case var &mut Lamp(l) {
+      let lamp = l.lamp;
+      var h = LightHandle.none();
+      if lamp.spot {
+        h = s.renderer.lights.addSpot(lamp.position, lamp.aim, lamp.color, lamp.candela, lamp.reach,
+          lamp.cone - lamp.softEdge, lamp.cone);
+      } else {
+        h = s.renderer.lights.addPoint(lamp.position, lamp.color, lamp.candela, lamp.reach);
+      }
+      s.renderer.lights.setSourceRadius(h, lamp.source);
+      if lamp.shadows { s.renderer.lights.setCastsShadow(h, true); }
+      print <- "loop: frame "; print <- frame; print <- (if lamp.spot { ", a spot light" } else { ", a point light" });
+      print <- " of "; print <- lamp.candela; print <- " candela\n";
+    }
     case var &mut Stand(st) {
-      s.camera.lookAt(st.eye, st.eye + st.facing, Vec3(0., 1., 0.));
+      // Which way they face, as a turn about the upright and a tilt up
+      let f = st.facing.normalize();
+      var eye = st.eye;
+      // How the picture is taken: the lens's field of view on a full-frame
+      // sensor (24 mm high), depth of field at the aperture, the exposure opened
+      if st.lens > 0. { s.camera.fov = 2. * atan2(0.012, st.lens); }
+      var settings = FxSettings.high();
+      settings.exposure.compensationEv = st.exposure;
+      if st.aperture > 0. {
+        settings.dof = DofSettings.high();
+        settings.dof.aperture = st.aperture;
+        settings.dof.focusDistance = st.focus;
+        if st.lens > 0. { settings.dof.focalLength = st.lens; }
+      }
+      s.fx.configure(&settings);
+      let level = Vec3(f.x, 0., f.z);
+      if approach != 0. && level.length() > 0. { eye = eye + level.normalize() * f32.from(approach); }
+      s.visitor = Fly.make(eye, atan2(0. - f.x, 0. - f.z), asin(f.y) + f32.from(tilt) * 0.0174533);
+    }
+    case var &mut Behaviors(b) {
+      var program = Program(List[SlotFrame].empty(), List[FieldRt].empty(), List[AreaRt].empty(),
+        List[DeriveRt].empty(), List[RuleRt].empty(), List[MoveRt].empty());
+      program <-> b.program;
+      while s.views.len() < program.frames.len() { s.views.push(noView()); }
+      s.world = Some[WorldActor](WorldActor(s.publishedTx.clone(), program));
+      print <- "loop: frame "; print <- frame; print <- ", the world's behaviors arrived: its World actor started\n";
     }
     case var &mut Whole(w) {
       print <- "loop: "; printStr(w.world.view()); print <- " active at ";
@@ -210,31 +473,86 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
   }
 }
 
-// Record the frame: every live part
+// What the World has published, as each part's two latest states. A part
+// that did not change in the steps between stood where it was last published,
+// so its earlier state is that, one boundary before the new one.
+fn takePublished(s: &mut Shell) {
+  while true {
+    match s.published.tryRecv() {
+      case let Some(p) {
+        var i = 0usize;
+        while i < p.parts.len() {
+          let st = *p.parts[i];
+          let k = usize.from(st.slot);
+          while s.views.len() <= k { s.views.push(noView()); }
+          let v = *s.views[k];
+          var next = v;
+          if !v.has {
+            next.prevPosition = st.position; next.prevRotation = st.rotation; next.prevAt = p.boundary;
+          } else if v.at + 1u64 < p.boundary {
+            next.prevPosition = v.position; next.prevRotation = v.rotation; next.prevAt = p.boundary - 1u64;
+          } else {
+            next.prevPosition = v.position; next.prevRotation = v.rotation; next.prevAt = v.at;
+          }
+          next.has = true;
+          next.position = st.position;
+          next.rotation = st.rotation;
+          next.at = p.boundary;
+          next.tint = st.tint;
+          s.views.set(k, next);
+          i = i + 1usize;
+        }
+      }
+      else { return; }
+    }
+  }
+}
+
+// Record the frame: every live part, where the World last put it
 pub fn draw(host: &mut Host, alpha: f32, scratch: &mut Arena) {
   var g = takeShell();
   match &mut g {
-    case var &mut Some(some) { drawScene(&mut *some); }
+    case var &mut Some(some) { drawScene(&mut *some, alpha); }
     else {}
   }
   shell = g;
 }
 
-fn drawScene(s: &mut Shell) {
+fn drawScene(s: &mut Shell, alpha: f32) {
   if !s.target.ok() { return; }
+  // The visitor's view, as late as it can be
+  let pose = s.visitor.pose();
+  s.camera.origin = pose.origin;
+  s.camera.orientation = pose.orientation;
+  // The moment drawn, in steps: one step behind the picture's own moment,
+  // so the World's states either side of it have been published
+  let moment = f64.from(s.lastStep) + f64.from(alpha) - 1.0f64;
   s.list.clear();
   var k = 0usize;
   while k < s.scene.parts.len() {
-    s.list.add(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place);
+    let slot = usize.from(s.scene.parts[k].slot);
+    var tint: f32 = 1.;
+    if slot < s.views.len() && s.views[slot].has {
+      let v = *s.views[slot];
+      var f = 1.0f64;
+      if v.at > v.prevAt { f = (moment - f64.from(v.prevAt)) / f64.from(v.at - v.prevAt); }
+      if f < 0.0f64 { f = 0.0f64; }
+      if f > 1.0f64 { f = 1.0f64; }
+      let t = f32.from(f);
+      (&mut s.scene.parts[k]).place = Mat4.fromTrs(v.prevPosition.lerp(v.position, t), v.prevRotation.slerp(v.rotation, t),
+        Vec3(1., 1., 1.));
+      tint = v.tint;
+    }
+    s.list.addTinted(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place, Color(tint, tint, tint, 1.));
     k = k + 1usize;
   }
   var encoder = s.device.createCommandEncoder();
-  s.renderer.render(&mut s.device, &mut encoder, &s.target.texture, &s.target.depth, &s.camera, &s.light, &s.list);
+  s.fx.render(&mut s.device, &mut encoder, &mut s.renderer, &mut s.post, &s.camera, &s.light, &s.list, &s.target.texture);
   drawn = drawn + 1;
 
-  // What was drawn at the middle of the window on the tenth frame: copied
+  // What was drawn at the middle of the window on the shot frame: copied
   // now, read once presented
-  if drawn == 10 {
+  if drawn == shotAt {
     let w = s.target.texture.width;
     let h = s.target.texture.height;
     s.readback = s.device.createBuffer(u64.from(w) * u64.from(h) * 4u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
@@ -247,10 +565,41 @@ fn drawScene(s: &mut Shell) {
 pub fn present(host: &mut Host) {
   var g = takeShell();
   match &mut g {
-    case var &mut Some(some) { showAndAcquire(&mut *some); }
+    case var &mut Some(some) {
+      showAndAcquire(&mut *some);
+      // '--click-at N': a click where the last part is drawn, as a person's would come
+      if clickAt != 0 && drawn == clickAt { clickLast(&mut *some, host); }
+      var c = 0;
+      while c < clicks {
+        if drawn == clickFrames[usize.from(c)] {
+          let w = host.window().windowSize();
+          let ww = f32.from(w.w);
+          let wh = f32.from(w.h);
+          clickOn(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh, host.stats.frames);
+        }
+        c = c + 1;
+      }
+      // The next frame's input starts here: its events come next
+      (*some).input.beginFrame();
+      (*some).fresh = true;
+    }
     else {}
   }
   shell = g;
+}
+
+fn clickLast(s: &mut Shell, host: &mut Host) {
+  let n = s.scene.parts.len();
+  if n == 0usize { return; }
+  let part = s.scene.parts[n - 1usize];
+  let middle = part.place * ((part.low + part.high) * 0.5);
+  let tw = f32.from(s.target.texture.width);
+  let th = f32.from(s.target.texture.height);
+  let c = s.camera.projectionMatrix(tw / th) * s.camera.viewMatrix() * Vec4(middle.x, middle.y, middle.z, 1.);
+  let w = host.window().windowSize();
+  let ww = f32.from(w.w);
+  let wh = f32.from(w.h);
+  clickOn(s, (c.x / c.w * 0.5 + 0.5) * ww, (0.5 - c.y / c.w * 0.5) * wh, ww, wh, host.stats.frames);
 }
 
 fn showAndAcquire(s: &mut Shell) {
@@ -259,7 +608,7 @@ fn showAndAcquire(s: &mut Shell) {
     if drawn <= 3 {
       print <- "loop: frame "; print <- drawn; print <- " presented at "; print <- millisSince(s.arrivedAt); print <- " ms\n";
     }
-    if drawn == 10 && s.readback.size > 0u64 {
+    if drawn == shotAt && s.readback.size > 0u64 {
       s.device.waitIdle();
       let w = s.target.texture.width;
       let h = s.target.texture.height;
@@ -281,7 +630,7 @@ fn showAndAcquire(s: &mut Shell) {
   }
 }
 
-// The tenth frame as build\shot.bmp: 24 bits a pixel, its rows bottom up
+// The shot frame as build\shot.bmp: 24 bits a pixel, its rows bottom up
 fn writeShot(pixels: *u8, w: u32, h: u32, bgra: bool) {
   let row = (w * 3u32 + 3u32) / 4u32 * 4u32;
   var out = List[u8].empty();
@@ -306,7 +655,7 @@ fn writeShot(pixels: *u8, w: u32, h: u32, bgra: bool) {
     while pad < row { out.push(0u8); pad = pad + 1u32; }
   }
   match fs.writeFile(&Path.from("build/shot.bmp"), out.view()) {
-    case let Ok(v) { print <- "Frame 10 written to build/shot.bmp\n"; }
+    case let Ok(v) { print <- "Frame "; print <- shotAt; print <- " written to build/shot.bmp\n"; }
     case let Error(e) { let m = e.message(); printStr(m.view()); print <- "\n"; }
   }
 }
@@ -328,7 +677,7 @@ pub fn quit(host: &mut Host) i32 {
   }
   g = None;      // the GPU's objects go before the window does
   print <- "Frames drawn: "; print <- drawn; print <- "\n";
-  print <- "Middle of the window on frame 10: ";
+  print <- "Middle of the window on frame "; print <- shotAt; print <- ": ";
   print <- centre[0]; print <- " "; print <- centre[1]; print <- " "; print <- centre[2]; print <- "\n";
   print <- "Vulkan failures: "; print <- u64.from(failures());
   print <- "; validation messages: "; print <- u64.from(validationMessages()); print <- "\n";
@@ -336,16 +685,58 @@ pub fn quit(host: &mut Host) i32 {
   code
 }
 
+// Where the worlds are: 'worlds' beside the program's own folder (the
+// program is build\release\guidebrowser.exe, the worlds are worlds\), so it
+// finds them whatever folder it is started from
+fn worldsFolder() String {
+  var folder = String.empty();
+  if programPath != null {
+    let p = cstr.fromPtr(programPath).view();
+    var cut = 0usize;
+    var i = 0usize;
+    while i < p.len() {
+      if p[i] == '\\' || p[i] == '/' { cut = i + 1usize; }
+      i = i + 1usize;
+    }
+    if cut > 0usize {
+      folder.append(&p[0usize..<cut]);
+      folder.append("../../");
+    }
+  }
+  folder.append("worlds/");
+  folder
+}
+
+// The number written as argument a; 0 if it is none
+fn argNumber(argv: **u8, a: i32) f64 {
+  let text = cstr.fromPtr(*(argv + usize.from(a))).view();
+  match json.numberF64(&text[0usize..<text.len()]) {
+    case let Ok(x) { x }
+    else { 0. }
+  }
+}
+
 fn main(argc: i32, argv: **u8) i32 {
   initAll();
+  programPath = *argv;
   var a = 1i32;
   while a < argc {
-    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--test-part") == 0i32 { testPart = true; }
-    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--shot") == 0i32 { shot = true; }
-    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--show") == 0i32 { show = true; }
-    if libc.strcmp(cstr.fromPtr(*(argv + usize.from(a))), "--world") == 0i32 && a + 1i32 < argc {
-      worldArg = *(argv + usize.from(a + 1i32));
+    let arg = cstr.fromPtr(*(argv + usize.from(a)));
+    let more = a + 1i32 < argc;
+    if libc.strcmp(arg, "--test-part") == 0i32 { testPart = true; }
+    if libc.strcmp(arg, "--shot") == 0i32 { shot = true; }
+    if libc.strcmp(arg, "--show") == 0i32 { show = true; }
+    if libc.strcmp(arg, "--world") == 0i32 && more { worldArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--shot-at") == 0i32 && more { shotAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--click-at") == 0i32 && more { clickAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--click-xy") == 0i32 && a + 3i32 < argc && clicks < 4 {
+      clickXs[usize.from(clicks)] = f32.from(argNumber(argv, a + 1i32));
+      clickYs[usize.from(clicks)] = f32.from(argNumber(argv, a + 2i32));
+      clickFrames[usize.from(clicks)] = i32.from(argNumber(argv, a + 3i32));
+      clicks = clicks + 1;
     }
+    if libc.strcmp(arg, "--tilt") == 0i32 && more { tilt = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--approach") == 0i32 && more { approach = argNumber(argv, a + 1i32); }
     a = a + 1i32;
   }
   var config = Config.fromArgs(argc, argv);

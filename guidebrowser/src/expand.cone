@@ -1,0 +1,706 @@
+// Expanding: loops and copies of designs made into the parts they stand for,
+// between reading a world and understanding it, so everything after sees
+// only parts, as if each had been written out (designs.html, control-flow.html).
+//
+// 1. Arithmetic on numbers known as the world is read is done here: a loop's
+//    value, '0.5 * file', '(file + rank) % 2 == 0', and an 'if' whose
+//    condition that decides. What stays unknown until the world runs is left
+//    as written, for 'understand' to report.
+//
+// 2. 'each NAME in a ..< b { ... }' makes the parts, loops and behaviors under
+//    it once for each whole number from a up to b, NAME standing for it. A part
+//    named 'sq[8 * rank + file]' is named by its number: sq[0], sq[1] ...
+//
+// 3. A part whose kind is a path to another part, 'part p: d' or
+//    'part p: d(field: value, ...)', is a COPY of the design d: it takes d's
+//    fields, functions, parts and behaviors, with each field the copy gives (by
+//    label, or by position in d's order) or d's default, and its own options
+//    (at:, rotation:) and parts after. A field's name in d's parts stands for
+//    the copy's value, so 'material: wood' in the design is the copy's wood.
+//    The path is looked for outward from the copy, as every path is. A design
+//    something copies is not itself in the world.
+//
+// Names of functions are not parts, so 'pawn()' is a copy only where a part
+// named pawn is in reach; a design's own shape function is best not named for
+// the design ('form()', not 'pawn()'). A copy keeps only the fields the
+// world's rules can read (bool, number); a material's or a shape's field is
+// put in where it is used and is done with.
+
+// A name standing for a value: a loop's number, a copy's field
+struct Bound {
+  name: u32;
+  value: Expr;
+}
+
+// Every part of the world by its path from the top, for finding designs
+struct Entry {
+  path: List[u32];
+  decl: PartDecl;
+}
+
+pub fn expand(decls: &List[PartDecl], names: &mut Names, problems: &mut List[Problem]) List[PartDecl] {
+  var env = List[Bound].empty();
+  var looped = List[PartDecl].empty();
+  var i = 0usize;
+  while i < decls.len() {
+    let d = cloneDecl(decls[i]);
+    expandPart(&d, &mut env, names, problems, &mut looped);
+    i = i + 1usize;
+  }
+  // The designs, findable by path
+  var table = List[Entry].empty();
+  var at = List[u32].empty();
+  i = 0usize;
+  while i < looped.len() {
+    enter(looped[i], &mut at, &mut table);
+    i = i + 1usize;
+  }
+  var used = List[List[u32]].empty();
+  var out = List[PartDecl].empty();
+  i = 0usize;
+  while i < looped.len() {
+    var here = List[u32].empty();
+    match copied(looped[i], &mut here, &table, &mut used, problems, 0u32) {
+      case let Some(d) { out.push(d); }
+      case is None {}
+    }
+    i = i + 1usize;
+  }
+  // A design that was copied is not in the world itself
+  var trimmed = List[PartDecl].empty();
+  i = 0usize;
+  while i < out.len() {
+    var here = List[u32].empty();
+    match withoutDesigns(out[i], &mut here, &used) {
+      case let Some(d) { trimmed.push(d); }
+      case is None {}
+    }
+    i = i + 1usize;
+  }
+  trimmed
+}
+
+// -------- 1, 2: loops unrolled, numbers worked out --------
+
+fn expandPart(d: &PartDecl, env: &mut List[Bound], names: &mut Names, problems: &mut List[Problem],
+    out: &mut List[PartDecl]) {
+  var name = d.name;
+  match &d.index {
+    case let Some(e) {
+      match fold(e, env) {
+        case let Number(n) {
+          var t = String.from(names.text(d.name));
+          t.append("[");
+          match json.formatF64(n.value) {
+            case let Some(s) { t.append(s.view()); }
+            case is None { t.append("?"); }
+          }
+          t.append("]");
+          name = names.intern(t.view());
+        }
+        else {
+          problems.push(problem(e.spot(), "a part's number must be known as the world is read"));
+          return;
+        }
+      }
+    }
+    case is None {}
+  }
+  var kind: Option[Expr] = None;
+  match &d.kind {
+    case let Some(e) { kind = Some[Expr](fold(e, env)); }
+    case is None {}
+  }
+  var children = List[PartDecl].empty();
+  var behaviors = List[Expr].empty();
+  var i = 0usize;
+  while i < d.children.len() {
+    let c = cloneDecl(d.children[i]);                 // its own copy: nothing the call grows can reach it
+    expandPart(&c, env, names, problems, &mut children);
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < d.behaviors.len() {
+    behaviors.push(fold(d.behaviors[i], env));
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < d.eaches.len() {
+    let l = cloneEach(d.eaches[i]);
+    unroll(&l, env, names, problems, &mut children, &mut behaviors);
+    i = i + 1usize;
+  }
+  out.push(PartDecl(d.at, name, None, kind, foldArgs(&d.options, env), children, foldFields(&d.fields, env),
+    foldFns(&d.functions, env), behaviors, List[EachDecl].empty()));
+}
+
+fn unroll(l: &EachDecl, env: &mut List[Bound], names: &mut Names, problems: &mut List[Problem],
+    children: &mut List[PartDecl], behaviors: &mut List[Expr]) {
+  // each p in X.parts: p stands for the path of each part X holds; X is
+  // looked for among the parts made beside the loop so far
+  var through = List[u32].empty();
+  var holder = List[u32].empty();
+  var overParts = false;
+  match &l.over {
+    case let Path(p) {
+      if p.names.len() >= 2usize && *p.names[p.names.len() - 1usize] == N_PARTS {
+        overParts = true;
+        var k = 0usize;
+        while k + 1usize < p.names.len() { holder.push(*p.names[k]); k = k + 1usize; }
+      }
+    }
+    else {}
+  }
+  if overParts {
+    if !childNames(children, &holder, 0usize, &mut through) {
+      problems.push(problem(l.at, "no part of that name is beside this loop, to go through its parts"));
+      return;
+    }
+    var c = 0usize;
+    while c < through.len() {
+      var path = copyNames(&holder);
+      path.push(*through[c]);
+      env.push(Bound(l.name, Expr.Path(l.at, path)));
+      var i = 0usize;
+      while i < l.children.len() {
+        let d = cloneDecl(l.children[i]);
+        expandPart(&d, env, names, problems, children);
+        i = i + 1usize;
+      }
+      i = 0usize;
+      while i < l.behaviors.len() {
+        behaviors.push(fold(l.behaviors[i], env));
+        i = i + 1usize;
+      }
+      env.pop();
+      c = c + 1usize;
+    }
+    return;
+  }
+  var from = 0.;
+  var to = 0.;
+  match fold(&l.over, env) {
+    case let Below(r) {
+      var known = true;
+      match r.ends[0] { case let Number(n) { from = n.value; } else { known = false; } }
+      match r.ends[1] { case let Number(n) { to = n.value; } else { known = false; } }
+      if !known {
+        problems.push(problem(l.at, "a loop's range must be known as the world is read"));
+        return;
+      }
+    }
+    else {
+      problems.push(problem(l.at, "a loop goes through a range written a ..< b, for now"));
+      return;
+    }
+  }
+  if to - from > 10000. {
+    problems.push(problem(l.at, "a loop of more than 10000: written by mistake?"));
+    return;
+  }
+  var v = from;
+  while v < to {
+    env.push(Bound(l.name, Expr.Number(l.at, v, N_NONE)));
+    var i = 0usize;
+    while i < l.children.len() {
+      let c = cloneDecl(l.children[i]);
+      expandPart(&c, env, names, problems, children);
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < l.eaches.len() {
+      let inner = cloneEach(l.eaches[i]);
+      unroll(&inner, env, names, problems, children, behaviors);
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < l.behaviors.len() {
+      behaviors.push(fold(l.behaviors[i], env));
+      i = i + 1usize;
+    }
+    env.pop();
+    v = v + 1.;
+  }
+}
+
+// The names of the parts held by the part at path[k ..] among parts; false if there is none
+fn childNames(parts: &List[PartDecl], path: &List[u32], k: usize, out: &mut List[u32]) bool {
+  var i = 0usize;
+  while i < parts.len() {
+    if parts[i].name == *path[k] {
+      if k + 1usize == path.len() {
+        var c = 0usize;
+        while c < parts[i].children.len() { out.push(parts[i].children[c].name); c = c + 1usize; }
+        return true;
+      }
+      return childNames(&parts[i].children, path, k + 1usize, out);
+    }
+    i = i + 1usize;
+  }
+  false
+}
+
+// An expression with each bound name put in and the arithmetic known now done
+fn fold(e: &Expr, env: &List[Bound]) Expr {
+  match e {
+    case let Number(n) { Expr.Number(n.at, n.value, n.unit) }
+    case let Truth(t) { Expr.Truth(t.at, t.value) }
+    case let Path(p) {
+      if p.names.len() == 1usize {
+        var k = env.len();
+        while k > 0usize {
+          k = k - 1usize;
+          if env[k].name == *p.names[0] { return fold(&env[k].value, &List[Bound].empty()); }
+        }
+      }
+      Expr.Path(p.at, copyNames(&p.names))
+    }
+    case let Tuple(t) { Expr.Tuple(t.at, foldList(&t.items, env)) }
+    case let Range(r) { Expr.Range(r.at, foldList(&r.ends, env)) }
+    case let Below(r) { Expr.Below(r.at, foldList(&r.ends, env)) }
+    case let Items(l) { Expr.Items(l.at, foldList(&l.items, env)) }
+    case let Call(c) { Expr.Call(c.at, copyNames(&c.callee), foldArgs(&c.args, env)) }
+    case let Negative(g) {
+      let x = fold(g.operand[0], env);
+      match &x {
+        case let Number(n) { return Expr.Number(g.at, -n.value, n.unit); }
+        else {}
+      }
+      var one = List[Expr].empty();
+      one.push(x);
+      Expr.Negative(g.at, one)
+    }
+    case let Not(g) {
+      let x = fold(g.operand[0], env);
+      match &x {
+        case let Truth(t) { return Expr.Truth(g.at, !t.value); }
+        else {}
+      }
+      var one = List[Expr].empty();
+      one.push(x);
+      Expr.Not(g.at, one)
+    }
+    case let If(i) {
+      let c = fold(i.parts[0], env);
+      match &c {
+        case let Truth(t) { return if t.value { fold(i.parts[1], env) } else { fold(i.parts[2], env) }; }
+        else {}
+      }
+      var parts = List[Expr].empty();
+      parts.push(c);
+      parts.push(fold(i.parts[1], env));
+      parts.push(fold(i.parts[2], env));
+      Expr.If(i.at, parts)
+    }
+    case let Binary(b) {
+      let x = fold(b.operands[0], env);
+      let y = fold(b.operands[1], env);
+      match arith(b.at, b.op, &x, &y) {
+        case let Some(r) { return r; }
+        case is None {}
+      }
+      var two = List[Expr].empty();
+      two.push(x);
+      two.push(y);
+      Expr.Binary(b.at, b.op, two)
+    }
+  }
+}
+
+// a op b when both are known: numbers (a unit on one side, or the same on
+// both for + and -), or truths for && and ||
+fn arith(at: Spot, op: u8, x: &Expr, y: &Expr) Option[Expr] {
+  var a = 0.;
+  var b = 0.;
+  var ua = N_NONE;
+  var ub = N_NONE;
+  var nums = true;
+  match x { case let Number(n) { a = n.value; ua = n.unit; } else { nums = false; } }
+  match y { case let Number(n) { b = n.value; ub = n.unit; } else { nums = false; } }
+  if nums {
+    let unit = if ua != N_NONE {ua} else {ub};
+    if op == '+' || op == '-' {
+      if ua != ub { return None; }
+      return Some[Expr](Expr.Number(at, if op == '+' {a + b} else {a - b}, unit));
+    }
+    if op == '*' {
+      if ua != N_NONE && ub != N_NONE { return None; }
+      return Some[Expr](Expr.Number(at, a * b, unit));
+    }
+    if op == '/' || op == '%' {
+      if ub != N_NONE || b == 0. { return None; }
+      if op == '/' { return Some[Expr](Expr.Number(at, a / b, ua)); }
+      return Some[Expr](Expr.Number(at, a - b * floorf64(a / b), ua));
+    }
+    if ua != ub { return None; }
+    if op == '<' { return Some[Expr](Expr.Truth(at, a < b)); }
+    if op == '>' { return Some[Expr](Expr.Truth(at, a > b)); }
+    if op == 'l' { return Some[Expr](Expr.Truth(at, a <= b)); }
+    if op == 'g' { return Some[Expr](Expr.Truth(at, a >= b)); }
+    if op == 'E' { return Some[Expr](Expr.Truth(at, a == b)); }
+    if op == 'N' { return Some[Expr](Expr.Truth(at, a != b)); }
+    return None;
+  }
+  var p = false;
+  var q = false;
+  var truths = true;
+  match x { case let Truth(t) { p = t.value; } else { truths = false; } }
+  match y { case let Truth(t) { q = t.value; } else { truths = false; } }
+  if truths {
+    if op == 'A' { return Some[Expr](Expr.Truth(at, p && q)); }
+    if op == 'O' { return Some[Expr](Expr.Truth(at, p || q)); }
+    if op == 'E' { return Some[Expr](Expr.Truth(at, p == q)); }
+    if op == 'N' { return Some[Expr](Expr.Truth(at, p != q)); }
+  }
+  None
+}
+
+fn floorf64(x: f64) f64 {
+  let t = f64.from(i64.from(x));
+  if t > x { t - 1. } else { t }
+}
+
+fn copyNames(l: &List[u32]) List[u32] {
+  var out = List[u32].withCapacity(l.len());
+  var i = 0usize;
+  while i < l.len() { out.push(*l[i]); i = i + 1usize; }
+  out
+}
+
+fn foldList(l: &List[Expr], env: &List[Bound]) List[Expr] {
+  var out = List[Expr].withCapacity(l.len());
+  var i = 0usize;
+  while i < l.len() { out.push(fold(l[i], env)); i = i + 1usize; }
+  out
+}
+
+fn foldArgs(l: &List[Arg], env: &List[Bound]) List[Arg] {
+  var out = List[Arg].withCapacity(l.len());
+  var i = 0usize;
+  while i < l.len() { out.push(Arg(l[i].label, fold(&l[i].value, env))); i = i + 1usize; }
+  out
+}
+
+fn foldFields(l: &List[FieldDecl], env: &List[Bound]) List[FieldDecl] {
+  var out = List[FieldDecl].withCapacity(l.len());
+  var i = 0usize;
+  while i < l.len() {
+    let f = l[i];
+    var value: Option[Expr] = None;
+    match &f.value {
+      case let Some(e) { value = Some[Expr](fold(e, env)); }
+      case is None {}
+    }
+    out.push(FieldDecl(f.at, f.name, f.ty, value, foldArgs(&f.options, env)));
+    i = i + 1usize;
+  }
+  out
+}
+
+fn foldFns(l: &List[FnDecl], env: &List[Bound]) List[FnDecl] {
+  var out = List[FnDecl].withCapacity(l.len());
+  var i = 0usize;
+  while i < l.len() {
+    let f = l[i];
+    var lets = List[LetDecl].withCapacity(f.lets.len());
+    var k = 0usize;
+    while k < f.lets.len() {
+      lets.push(LetDecl(f.lets[k].at, f.lets[k].name, fold(&f.lets[k].value, env)));
+      k = k + 1usize;
+    }
+    out.push(FnDecl(f.at, f.name, f.ty, lets, fold(&f.result, env)));
+    i = i + 1usize;
+  }
+  out
+}
+
+// A part, all of it, as it stands
+fn copyPart(d: &PartDecl) PartDecl {
+  let none = List[Bound].empty();
+  var kind: Option[Expr] = None;
+  match &d.kind {
+    case let Some(e) { kind = Some[Expr](fold(e, &none)); }
+    case is None {}
+  }
+  var children = List[PartDecl].withCapacity(d.children.len());
+  var i = 0usize;
+  while i < d.children.len() { children.push(copyPart(d.children[i])); i = i + 1usize; }
+  PartDecl(d.at, d.name, None, kind, foldArgs(&d.options, &none), children, foldFields(&d.fields, &none),
+    foldFns(&d.functions, &none), foldList(&d.behaviors, &none), List[EachDecl].empty())
+}
+
+// A part as written, loops and all, as a value of its own
+fn cloneDecl(d: &PartDecl) PartDecl {
+  let none = List[Bound].empty();
+  var index: Option[Expr] = None;
+  match &d.index {
+    case let Some(e) { index = Some[Expr](fold(e, &none)); }
+    case is None {}
+  }
+  var kind: Option[Expr] = None;
+  match &d.kind {
+    case let Some(e) { kind = Some[Expr](fold(e, &none)); }
+    case is None {}
+  }
+  var children = List[PartDecl].withCapacity(d.children.len());
+  var i = 0usize;
+  while i < d.children.len() { children.push(cloneDecl(d.children[i])); i = i + 1usize; }
+  var eaches = List[EachDecl].withCapacity(d.eaches.len());
+  i = 0usize;
+  while i < d.eaches.len() { eaches.push(cloneEach(d.eaches[i])); i = i + 1usize; }
+  PartDecl(d.at, d.name, index, kind, foldArgs(&d.options, &none), children, foldFields(&d.fields, &none),
+    foldFns(&d.functions, &none), foldList(&d.behaviors, &none), eaches)
+}
+
+fn cloneEach(l: &EachDecl) EachDecl {
+  let none = List[Bound].empty();
+  var children = List[PartDecl].withCapacity(l.children.len());
+  var i = 0usize;
+  while i < l.children.len() { children.push(cloneDecl(l.children[i])); i = i + 1usize; }
+  var eaches = List[EachDecl].withCapacity(l.eaches.len());
+  i = 0usize;
+  while i < l.eaches.len() { eaches.push(cloneEach(l.eaches[i])); i = i + 1usize; }
+  EachDecl(l.at, l.name, fold(&l.over, &none), children, eaches, foldList(&l.behaviors, &none))
+}
+
+// -------- 3: copies of designs --------
+
+fn enter(d: &PartDecl, at: &mut List[u32], table: &mut List[Entry]) {
+  at.push(d.name);
+  table.push(Entry(copyNames(at), copyPart(d)));
+  var i = 0usize;
+  while i < d.children.len() {
+    enter(d.children[i], at, table);
+    i = i + 1usize;
+  }
+  at.pop();
+}
+
+// The path from the top of the design a kind names, looked for outward from
+// 'here' (the path of the part the kind is written in); None if it names none
+fn findDesign(callee: &List[u32], here: &List[u32], table: &List[Entry]) Option[usize] {
+  var k = here.len();
+  while true {
+    // here[0 ..< k] + callee
+    var i = 0usize;
+    while i < table.len() {
+      let p = &table[i].path;
+      if p.len() == k + callee.len() {
+        var same = true;
+        var j = 0usize;
+        while j < k && same { if *p[j] != *here[j] { same = false; } j = j + 1usize; }
+        j = 0usize;
+        while j < callee.len() && same { if *p[k + j] != *callee[j] { same = false; } j = j + 1usize; }
+        if same { return Some[usize](i); }
+      }
+      i = i + 1usize;
+    }
+    if k == 0usize { break; }
+    k = k - 1usize;
+  }
+  None
+}
+
+// Is a function of this name written in the part at 'here' or one round it?
+fn fnInReach(name: u32, here: &List[u32], table: &List[Entry]) bool {
+  var k = here.len();
+  while k > 0usize {
+    var i = 0usize;
+    while i < table.len() {
+      let p = &table[i].path;
+      if p.len() == k {
+        var same = true;
+        var j = 0usize;
+        while j < k && same { if *p[j] != *here[j] { same = false; } j = j + 1usize; }
+        if same {
+          let fns = &table[i].decl.functions;
+          var f = 0usize;
+          while f < fns.len() { if fns[f].name == name { return true; } f = f + 1usize; }
+        }
+      }
+      i = i + 1usize;
+    }
+    k = k - 1usize;
+  }
+  false
+}
+
+fn copied(d: &PartDecl, here: &mut List[u32], table: &List[Entry], used: &mut List[List[u32]],
+    problems: &mut List[Problem], depth: u32) Option[PartDecl] {
+  if depth > 16u32 {
+    problems.push(problem(d.at, "copies inside copies more than 16 deep: does a design copy itself?"));
+    return None;
+  }
+  // Is it a copy? Its kind a path, or a call, naming a part in reach
+  var callee = List[u32].empty();
+  var args = List[Arg].empty();
+  var isCopy = false;
+  match &d.kind {
+    case let Some(e) {
+      match e {
+        case let Path(p) { callee = copyNames(&p.names); }
+        case let Call(c) { callee = copyNames(&c.callee); args = foldArgs(&c.args, &List[Bound].empty()); }
+        else {}
+      }
+    }
+    case is None {}
+  }
+  var design = 0usize;
+  if callee.len() > 0usize && !(callee.len() == 1usize && fnInReach(*callee[0], here, table)) {
+    // Outward from the part holding it; a function of the name in reach is
+    // called, and a part never copies itself or a part that holds it
+    match findDesign(&callee, here, table) {
+      case let Some(t) {
+        let p = &table[t].path;
+        var holds = p.len() <= here.len() + 1usize;
+        var j = 0usize;
+        while j < p.len() && holds {
+          let mine = if j < here.len() {*here[j]} else {d.name};
+          if *p[j] != mine { holds = false; }
+          j = j + 1usize;
+        }
+        if !holds { design = t; isCopy = true; }
+      }
+      case is None {}
+    }
+  }
+  here.push(d.name);
+  var made: PartDecl;
+  if isCopy {
+    let dd = &table[design].decl;
+    used.push(copyNames(&table[design].path));
+    // Each field: the copy's value, by label or by position, or the default
+    var env = List[Bound].empty();
+    var fields = List[FieldDecl].empty();
+    var i = 0usize;
+    var given = 0usize;
+    while i < dd.fields.len() {
+      let f = dd.fields[i];
+      var value: Option[Expr] = None;
+      var a = 0usize;
+      while a < args.len() {
+        if args[a].label == f.name { value = Some[Expr](fold(&args[a].value, &List[Bound].empty())); }
+        a = a + 1usize;
+      }
+      if value is None && given < args.len() && args[given].label == N_NONE {
+        value = Some[Expr](fold(&args[given].value, &List[Bound].empty()));
+        given = given + 1usize;
+      }
+      if value is None {
+        match &f.value {
+          case let Some(e) { value = Some[Expr](fold(e, &List[Bound].empty())); }
+          case is None {}
+        }
+      }
+      match &value {
+        case let Some(v) { env.push(Bound(f.name, fold(v, &List[Bound].empty()))); }
+        case is None { problems.push(problem(d.at, "this copy gives no value for one of its design's fields, which has no default")); }
+      }
+      // A field the world's rules can read stays a field of the copy; one that
+      // holds a material or a shape has done its work once put in
+      if f.ty == N_BOOL || f.ty == N_NUMBER {
+        fields.push(FieldDecl(f.at, f.name, f.ty, value, foldArgs(&f.options, &List[Bound].empty())));
+      }
+      i = i + 1usize;
+    }
+    var a = 0usize;
+    while a < args.len() {
+      var known = args[a].label == N_NONE;
+      var k = 0usize;
+      while k < dd.fields.len() { if dd.fields[k].name == args[a].label { known = true; } k = k + 1usize; }
+      if !known { problems.push(problem(args[a].value.spot(), "the design has no field of that name")); }
+      a = a + 1usize;
+    }
+    var children = List[PartDecl].empty();
+    i = 0usize;
+    while i < dd.children.len() {
+      let c = withFields(dd.children[i], &env);
+      match copied(&c, here, table, used, problems, depth + 1u32) {
+        case let Some(x) { children.push(x); }
+        case is None {}
+      }
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < d.children.len() {
+      match copied(d.children[i], here, table, used, problems, depth) {
+        case let Some(x) { children.push(x); }
+        case is None {}
+      }
+      i = i + 1usize;
+    }
+    var behaviors = foldList(&dd.behaviors, &env);
+    i = 0usize;
+    while i < d.behaviors.len() { behaviors.push(fold(d.behaviors[i], &List[Bound].empty())); i = i + 1usize; }
+    made = PartDecl(d.at, d.name, None, None, foldArgs(&d.options, &List[Bound].empty()), children, fields,
+      foldFns(&dd.functions, &env), behaviors, List[EachDecl].empty());
+  }
+  else {
+    var children = List[PartDecl].empty();
+    var i = 0usize;
+    while i < d.children.len() {
+      match copied(d.children[i], here, table, used, problems, depth) {
+        case let Some(x) { children.push(x); }
+        case is None {}
+      }
+      i = i + 1usize;
+    }
+    let none = List[Bound].empty();
+    var kind: Option[Expr] = None;
+    match &d.kind {
+      case let Some(e) { kind = Some[Expr](fold(e, &none)); }
+      case is None {}
+    }
+    made = PartDecl(d.at, d.name, None, kind, foldArgs(&d.options, &none), children, foldFields(&d.fields, &none),
+      foldFns(&d.functions, &none), foldList(&d.behaviors, &none), List[EachDecl].empty());
+  }
+  here.pop();
+  Some[PartDecl](made)
+}
+
+// A design's part with its fields' names put in
+fn withFields(d: &PartDecl, env: &List[Bound]) PartDecl {
+  var kind: Option[Expr] = None;
+  match &d.kind {
+    case let Some(e) { kind = Some[Expr](fold(e, env)); }
+    case is None {}
+  }
+  var children = List[PartDecl].withCapacity(d.children.len());
+  var i = 0usize;
+  while i < d.children.len() { children.push(withFields(d.children[i], env)); i = i + 1usize; }
+  PartDecl(d.at, d.name, None, kind, foldArgs(&d.options, env), children, foldFields(&d.fields, env),
+    foldFns(&d.functions, env), foldList(&d.behaviors, env), List[EachDecl].empty())
+}
+
+fn withoutDesigns(d: &PartDecl, here: &mut List[u32], used: &List[List[u32]]) Option[PartDecl] {
+  here.push(d.name);
+  var i = 0usize;
+  while i < used.len() {
+    let u = used[i];
+    if u.len() == here.len() {
+      var same = true;
+      var j = 0usize;
+      while j < u.len() && same { if *u[j] != *here[j] { same = false; } j = j + 1usize; }
+      if same { here.pop(); return None; }
+    }
+    i = i + 1usize;
+  }
+  var children = List[PartDecl].empty();
+  i = 0usize;
+  while i < d.children.len() {
+    match withoutDesigns(d.children[i], here, used) {
+      case let Some(x) { children.push(x); }
+      case is None {}
+    }
+    i = i + 1usize;
+  }
+  here.pop();
+  let none = List[Bound].empty();
+  var kind: Option[Expr] = None;
+  match &d.kind {
+    case let Some(e) { kind = Some[Expr](fold(e, &none)); }
+    case is None {}
+  }
+  Some[PartDecl](PartDecl(d.at, d.name, None, kind, foldArgs(&d.options, &none), children, foldFields(&d.fields, &none),
+    foldFns(&d.functions, &none), foldList(&d.behaviors, &none), List[EachDecl].empty()))
+}
