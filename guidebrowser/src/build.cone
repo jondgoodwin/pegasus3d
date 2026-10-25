@@ -11,6 +11,10 @@
 //   a group         only its place, which the parts inside it start from
 //
 // A part's place is its parent's place, then its own 'at:' and 'rotation:'.
+//
+// Then what the world does, as the Program its World actor is started with
+// (world.cone): each part's place in its parent, the fields, the areas, the
+// derives in their order, and each rule's animator built as tweenstack's Anim.
 
 // How high a visitor's eyes are above where they stand, in meters (mine:
 // a standing adult, until a world says what body arrives)
@@ -24,12 +28,22 @@ pub const SKY_NITS = 4000.;
 // Every part of the world built and sent (built and dropped, unless send:
 // to time building alone); how many parts were
 pub fn build(w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
-  var colors = List[Color].empty();   // by slot: a material's color
+  var looks = List[Look].empty();     // by slot: a material's look
   var places = List[Mat4].empty();    // by slot: where the part's own origin is, in the world
+  var frames = List[SlotFrame].empty();
   var s = 0usize;
   while s < w.nodes.len() {
-    colors.push(Color(0., 0., 0., 1.));
+    looks.push(Look(Color(0.5, 0.5, 0.5, 1.), false, 1., 0., 1., 0., 0.05, 0.));
     places.push(Mat4.identity());
+    var at = Vec3(0., 0., 0.);
+    var turn = Quat.identity();
+    let kind = w.nodes[s].kind;
+    if kind == Kind.Group || kind == Kind.Shape || kind == Kind.Light {
+      if !(w.units[s].options[OPT_AT] is Absent) { at = vec3(w.units[s].options[OPT_AT]); }
+      turn = turnOf(w.units[s].options[OPT_ROTATION]);
+    }
+    frames.push(SlotFrame(u32.from(w.nodes[s].parent), String.from(w.names.text(w.nodes[s].name)), at, turn,
+      kind == Kind.Shape && *w.alive[s]));
     s = s + 1usize;
   }
   var standing = false;
@@ -39,23 +53,31 @@ pub fn build(w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
     let slot = *w.order[i];
     let kind = w.nodes[slot].kind;
     let parent = w.nodes[slot].parent;
-    if kind == Kind.Group || kind == Kind.Shape {
+    if kind == Kind.Group || kind == Kind.Shape || kind == Kind.Light {
       let own = placement(w.units[slot].options[OPT_AT], w.units[slot].options[OPT_ROTATION]);
       places.set(slot, *places[parent] * own);
     }
     if kind == Kind.Material {
-      colors.set(slot, colorOf(&w.units[slot].make));
+      looks.set(slot, lookOf(&w.units[slot].make));
     }
     else if kind == Kind.Shape {
-      var color = Color(0.5, 0.5, 0.5, 1.);
+      var look = Look(Color(0.5, 0.5, 0.5, 1.), false, 1., 0., 1., 0., 0.05, 0.);
       match w.units[slot].options[OPT_MATERIAL] {
-        case let Ref(m) { color = *colors[*m]; }
-        case let Make(made) { color = colorOf(made.args[0]); }
+        case let Ref(m) { look = *looks[*m]; }
+        case let Make(made) { look = lookOf(w.units[slot].options[OPT_MATERIAL]); }
         else {}
       }
-      let a = Arrival.Part(Built(String.from(w.names.text(w.nodes[slot].name)), boxMesh(&w.units[slot].make), color, *places[slot]));
+      var low = Vec3(0., 0., 0.);
+      var high = Vec3(0., 0., 0.);
+      let mesh = shapeMesh(w, &w.units[slot].make, &mut low, &mut high);
+      let a = Arrival.Part(Built(u32.from(slot), String.from(w.names.text(w.nodes[slot].name)), mesh, low, high, look,
+        *places[slot]));
       if send { ready.send(a); }
       parts = parts + 1u64;
+    }
+    else if kind == Kind.Light && !isSun(&w.units[slot].make) {
+      let a = lampOf(&w.units[slot].make, *places[slot]);
+      if send { ready.send(a); }
     }
     else if kind == Kind.Light {
       let a = sunOf(&w.units[slot].make);
@@ -65,52 +87,1095 @@ pub fn build(w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
       let base = *places[parent];
       let feet = base * vec3(w.units[slot].options[OPT_AT]);
       let facing = base.transformVector(vec3(w.units[slot].options[OPT_FACING]));
-      let a = Arrival.Stand(feet + Vec3(0., f32.from(EYE_HEIGHT), 0.), facing);
+      var height = f32.from(EYE_HEIGHT);
+      if !(w.units[slot].options[OPT_EYE] is Absent) { height = f32.from(numOf(w.units[slot].options[OPT_EYE])); }
+      var lens: f32 = 0.;
+      var aperture: f32 = 0.;
+      var focus: f32 = 2.;
+      var exposure: f32 = 0.;
+      match w.units[slot].options[OPT_CAMERA] {
+        case let Make(c) {
+          lens = if c.args[0] is Absent { 0.05 } else { f32.from(numOf(c.args[0])) };
+          if !(c.args[1] is Absent) { aperture = f32.from(numOf(c.args[1])); }
+          if !(c.args[2] is Absent) { focus = f32.from(numOf(c.args[2])); }
+          if !(c.args[3] is Absent) { exposure = f32.from(numOf(c.args[3])); }
+        }
+        else {}
+      }
+      let a = Arrival.Stand(feet + Vec3(0., height, 0.), facing, lens, aperture, focus, exposure);
       if send { ready.send(a); }
       standing = true;
     }
     i = i + 1usize;
   }
+  if send && (w.rules.len() > 0usize || w.derives.len() > 0usize || w.areas.len() > 0usize || w.moves.len() > 0usize) {
+    ready.send(Arrival.Behaviors(program(w, frames)));
+  }
   parts
+}
+
+// What the world does, for its World actor
+fn program(w: &Understood, frames: List[SlotFrame]) Program {
+  var fields = List[FieldRt].empty();
+  var i = 0usize;
+  while i < w.fields.len() {
+    let f = w.fields[i];
+    fields.push(FieldRt(u32.from(f.slot), String.from(w.names.text(f.name)), f.init, f.ty == Ty.Truth));
+    i = i + 1usize;
+  }
+  var areas = List[AreaRt].empty();
+  i = 0usize;
+  while i < w.areas.len() {
+    let a = w.areas[i];
+    if a.live { areas.push(AreaRt(u32.from(a.slot), Vec3(f32.from(a.cx), f32.from(a.cy), f32.from(a.cz)), f32.from(a.radius))); }
+    i = i + 1usize;
+  }
+  var derives = List[DeriveRt].empty();
+  i = 0usize;
+  while i < w.deriveOrder.len() {
+    let d = w.derives[*w.deriveOrder[i]];
+    if d.live { derives.push(DeriveRt(d.target.prop, u32.from(d.target.index), copyCalc(&d.calc))); }
+    i = i + 1usize;
+  }
+  var rules = List[RuleRt].empty();
+  i = 0usize;
+  while i < w.rules.len() {
+    let r = w.rules[i];
+    if r.live {
+      var what = String.from("keys on ");
+      what.append(w.names.text(w.nodes[r.keys.slot].name));
+      what.append(if r.keys.prop == P_ROTATION { ".rotation" } else { ".offset" });
+      rules.push(RuleRt(r.clicked, u32.from(r.part), animOf(&r.keys), what));
+    }
+    i = i + 1usize;
+  }
+  var moves = List[MoveRt].empty();
+  i = 0usize;
+  while i < w.moves.len() {
+    let m = w.moves[i];
+    if *w.alive[m.part] {
+      var acts = List[MoveActRt].empty();
+      var k = 0usize;
+      while k < m.acts.len() {
+        let a = m.acts[k];
+        acts.push(MoveActRt(a.kind, u32.from(a.field), a.value, u32.from(a.to), middleOf(w, a.to), f32.from(a.seconds)));
+        k = k + 1usize;
+      }
+      moves.push(MoveRt(u32.from(m.part), acts));
+    }
+    i = i + 1usize;
+  }
+  Program(frames, fields, areas, derives, rules, moves)
+}
+
+// Where a part's shape has its middle, in its own frame: a box's, from its
+// ranges; the part's origin for any other
+fn middleOf(w: &Understood, slot: usize) Vec3 {
+  match &w.units[slot].make {
+    case let Make(m) {
+      if m.builder == Builder.Box {
+        var mid = Array[f32, 3]() <- fill 0.;
+        var k = 0usize;
+        while k < 3usize {
+          match m.args[k] {
+            case let Range(ends) { mid[k] = f32.from((numOf(ends[0]) + numOf(ends[1])) / 2.); }
+            else {}
+          }
+          k = k + 1usize;
+        }
+        return Vec3(mid[0], mid[1], mid[2]);
+      }
+    }
+    else {}
+  }
+  Vec3(0., 0., 0.)
+}
+
+fn copyCalc(c: &Calc) Calc {
+  match c {
+    case let Num(x) { Calc.Num(*x) }
+    case let Field(f) { Calc.Field(*f) }
+    case let Occupied(s) { Calc.Occupied(*s) }
+    case let Choose(parts) {
+      var out = List[Calc].empty();
+      var i = 0usize;
+      while i < parts.len() { out.push(copyCalc(parts[i])); i = i + 1usize; }
+      Calc.Choose(out)
+    }
+  }
+}
+
+// keys(...) as tweenstack's animator: one track of its keys, linear between
+// them, in a clip that loops as it says
+fn animOf(k: &KeysInfo) Anim {
+  var track = Track.make(if k.prop == P_ROTATION { TK_QUAT } else { TK_VEC3 });
+  var i = 0usize;
+  while i < k.times.len() {
+    let t = f32.from(*k.times[i]);
+    if k.prop == P_ROTATION { track.addQuat(t, turnOf(k.values[i]), INTERP_LINEAR); }
+    else { track.addVec3(t, vec3(k.values[i]), INTERP_LINEAR); }
+    i = i + 1usize;
+  }
+  var clip = Clip.make("", k.mode);
+  clip.addTrack(u32.from(k.slot), k.prop, track);
+  Anim.keys(&clip)
+}
+
+// rotation(angle, about: direction), about the upright axis when 'about' is
+// left out; none if the rotation is
+fn turnOf(rotation: &Val) Quat {
+  match rotation {
+    case let Make(m) {
+      let axis = if m.args[1] is Absent { Vec3(0., 1., 0.) } else { vec3(m.args[1]).normalize() };
+      Quat.angleAxis(f32.from(numOf(m.args[0])), axis)
+    }
+    else { Quat.identity() }
+  }
 }
 
 // 'at:' then 'rotation:', either left out
 fn placement(at: &Val, rotation: &Val) Mat4 {
-  var turn = Quat.identity();
-  match rotation {
-    case let Make(m) { turn = Quat.angleAxis(f32.from(numOf(m.args[0])), Vec3(0., 1., 0.)); }
-    else {}
-  }
   var origin = Vec3(0., 0., 0.);
   if !(at is Absent) { origin = vec3(at); }
-  Mat4.fromTrs(origin, turn, Vec3(1., 1., 1.))
+  Mat4.fromTrs(origin, turnOf(rotation), Vec3(1., 1., 1.))
 }
 
-// box(x: a ..= b, y: ..., z: ...): a unit cube stretched over the three ranges
-fn boxMesh(make: &Val) Mesh {
-  var mesh = Mesh.cube(0.5);
+// physical(color:, roughness:, metal:), or plain(color); or a list of one of
+// them and its modifiers: translucent(covers:)
+fn lookOf(make: &Val) Look {
+  var look = Look(colorOf(make), false, 1., 0., 1., 0., 0.05, 0.);
   match make {
     case let Make(m) {
-      var low = Array[f32, 3]() <- fill 0.;
-      var high = Array[f32, 3]() <- fill 0.;
-      var k = 0usize;
-      while k < 3usize {
-        match m.args[k] {
-          case let Range(ends) {
-            low[k] = f32.from(numOf(ends[0]));
-            high[k] = f32.from(numOf(ends[1]));
+      if m.builder == Builder.Layered {
+        look = lookOf(m.args[0]);
+        var i = 1usize;
+        while i < m.args.len() {
+          match m.args[i] {
+            case let Make(modifier) {
+              if modifier.builder == Builder.Translucent { look.covers = f32.from(numOf(modifier.args[0])); }
+              else if modifier.builder == Builder.ClearCoat {
+                look.coat = if modifier.args[0] is Absent { 1. } else { f32.from(numOf(modifier.args[0])) };
+                if !(modifier.args[1] is Absent) { look.coatRoughness = f32.from(numOf(modifier.args[1])); }
+              }
+              else if modifier.builder == Builder.Reflective {
+                look.reflects = if modifier.args[0] is Absent { 1. } else { f32.from(numOf(modifier.args[0])) };
+              }
+            }
+            else {}
           }
-          else {}
+          i = i + 1usize;
         }
-        k = k + 1usize;
       }
-      let center = Vec3((low[0] + high[0]) * 0.5, (low[1] + high[1]) * 0.5, (low[2] + high[2]) * 0.5);
-      let size = Vec3(high[0] - low[0], high[1] - low[1], high[2] - low[2]);
-      mesh.transform(Mat4.fromTrs(center, Quat.identity(), size));
+      else if m.builder == Builder.Physical {
+        look.physical = true;
+        if !(m.args[1] is Absent) { look.roughness = f32.from(numOf(m.args[1])); }
+        if !(m.args[2] is Absent) { look.metal = f32.from(numOf(m.args[2])); }
+      }
     }
     else {}
   }
+  look
+}
+
+// -------- shapes --------
+//
+// A shape is made by calling the sculpt package's tools as its value says,
+// as pieces, each a PolyMesh. Joining keeps the pieces apart, nothing
+// welded, as the manual's join does; a union or a difference makes one piece
+// of two, by the sculpt package's exact booleans. Each piece is made
+// triangles, faceted, and the triangles put together as one mesh; then it is
+// smoothed by angle: where faces meet at less than SMOOTH_ANGLE the surface
+// is drawn smooth (a turned post), at more it keeps its edge (a box's
+// corner, the step of a base). A function's step (Val.Local) is worked out
+// where it is read; read twice, it is made twice.
+
+// Faces meeting at less than this are drawn as one smooth surface (mine: as
+// modellers' auto-smooth defaults, 30 degrees)
+const SMOOTH_ANGLE = 0.5236;
+
+// The mesh of a shape, and its box
+fn shapeMesh(w: &Understood, make: &Val, lowOut: &mut Vec3, highOut: &mut Vec3) Mesh {
+  var pieces = List[PolyMesh].empty();
+  piecesOf(w, NO_FN, make, &mut pieces);
+  var mesh = Mesh.empty();
+  var i = 0usize;
+  while i < pieces.len() {
+    let m = pieces[i].triangulate(false);
+    mesh.append(&m);
+    i = i + 1usize;
+  }
+  smoothByAngle(&mut mesh, f32.from(SMOOTH_ANGLE));
+  var low = Vec3(1.0e30f, 1.0e30f, 1.0e30f);
+  var high = Vec3(-1.0e30f, -1.0e30f, -1.0e30f);
+  var k = 0usize;
+  while k < mesh.positions.len() {
+    let p = *mesh.positions[k];
+    low = low.min(p);
+    high = high.max(p);
+    k = k + 1usize;
+  }
+  if mesh.positions.len() > 0usize { *lowOut = low; *highOut = high; }
   mesh
+}
+
+// No function: a value written in a part's own line
+const NO_FN = 0xFFFFFFFFusize;
+
+// The pieces a shape value makes, added to out; 'within' is the function it
+// is written in, whose steps a Local reads
+fn piecesOf(w: &Understood, within: usize, v: &Val, out: &mut List[PolyMesh]) {
+  let began = sdl.GetPerformanceCounter();
+  piecesMade(w, within, v, out);
+  let took = micros(began, sdl.GetPerformanceCounter());
+  // A step slower than 3 ms says so, with what it took (its own steps' times included)
+  if took > 3000. {
+    match v {
+      case let Make(m) { print <- "build: "; printStr(toolName(m.builder)); print <- " took "; print <- took; print <- " us\n"; }
+      else {}
+    }
+  }
+}
+
+fn toolName(b: Builder) &str {
+  if b == Builder.Lathe { return "lathe"; }
+  if b == Builder.LoftAlong { return "loftAlong"; }
+  if b == Builder.Union { return "union"; }
+  if b == Builder.Difference { return "difference"; }
+  if b == Builder.Subdivide { return "subdivide"; }
+  if b == Builder.Inflate { return "inflate"; }
+  if b == Builder.Carve { return "carve"; }
+  if b == Builder.Join { return "join"; }
+  if b == Builder.Move { return "move"; }
+  if b == Builder.TurnShape { return "turn"; }
+  if b == Builder.Smooth { return "smooth"; }
+  "a shape tool"
+}
+
+fn piecesMade(w: &Understood, within: usize, v: &Val, out: &mut List[PolyMesh]) {
+  match v {
+    case let Local(k) { piecesOf(w, within, w.functions[within].lets[*k], out); }
+    case let Call(f) { piecesOf(w, *f, &w.functions[*f].result, out); }
+    case let Make(m) {
+      if m.builder == Builder.Box {
+        var low = Array[f32, 3]() <- fill 0.;
+        var high = Array[f32, 3]() <- fill 0.;
+        var k = 0usize;
+        while k < 3usize {
+          match m.args[k] {
+            case let Range(ends) { low[k] = f32.from(numOf(ends[0])); high[k] = f32.from(numOf(ends[1])); }
+            else {}
+          }
+          k = k + 1usize;
+        }
+        var cube = List[PolyMesh].empty();
+        cube.push(PolyMesh.cube(0.5));
+        var place = List[Transform3].empty();
+        place.push(Transform3(Vec3((low[0] + high[0]) * 0.5, (low[1] + high[1]) * 0.5, (low[2] + high[2]) * 0.5),
+          Quat.identity(), Vec3(high[0] - low[0], high[1] - low[1], high[2] - low[2])));
+        var problems = List[String].empty();
+        out.push(sculpt.joinPlaced(&cube, &place, &mut problems));
+      }
+      else if m.builder == Builder.Lathe {
+        let profile = outlineOf(w, within, m.args[0]);
+        let axis = if m.args[1] is Absent { Vec3(0., 1., 0.) } else { vec3(m.args[1]) };
+        let angle = if m.args[2] is Absent { 6.2831853f } else { f32.from(numOf(m.args[2])) };
+        let steps = if m.args[3] is Absent { 32u32 } else { u32.from(i64.from(numOf(m.args[3]))) };
+        out.push(sculpt.lathe(&profile, axis, angle, steps));
+      }
+      else if m.builder == Builder.LoftAlong {
+        var profiles = List[sculpt.Profile].empty();
+        match m.args[0] {
+          case let Items(items) {
+            var i = 0usize;
+            while i < items.len() { profiles.push(outlineOf(w, within, items[i])); i = i + 1usize; }
+          }
+          else {}
+        }
+        let spine = spineOf(w, within, m.args[1]);
+        let count = if m.args[2] is Absent { 0u32 } else { u32.from(i64.from(numOf(m.args[2]))) };
+        let between = if m.args[3] is Absent { 0u32 } else { u32.from(i64.from(numOf(m.args[3]))) };
+        let smooth = truthOf(m.args[4], false);
+        let caps = truthOf(m.args[5], true);
+        var stations = List[f32].empty();
+        match m.args[6] {
+          case let Items(items) {
+            var i = 0usize;
+            while i < items.len() { stations.push(f32.from(numOf(items[i]))); i = i + 1usize; }
+          }
+          else {}
+        }
+        out.push(sculpt.loftAlong(&profiles, &spine, stations.view(), count, between, smooth, caps));
+      }
+      else if m.builder == Builder.Mirror {
+        let one = onePiece(w, within, m.args[0]);
+        let normal = if m.args[1] is Absent { Vec3(1., 0., 0.) } else { vec3(m.args[1]) };
+        let origin = if m.args[2] is Absent { Vec3(0., 0., 0.) } else { vec3(m.args[2]) };
+        let merge = if m.args[3] is Absent { 0.0001f } else { f32.from(numOf(m.args[3])) };
+        out.push(sculpt.mirror(&one, origin, normal, merge));
+      }
+      else if m.builder == Builder.Carve {
+        var shape = onePiece(w, within, m.args[0]);
+        var sc = sculptbrush.Sculptor.of(&shape);
+        match m.args[1] {
+          case let Items(items) {
+            var i = 0usize;
+            while i < items.len() {
+              var st = strokeOf(w, within, items[i], &shape);
+              if !(m.args[2] is Absent) { st.mirrorAcross(Vec3(0., 0., 0.), vec3(m.args[2])); }
+              sc.stroke(&st);
+              i = i + 1usize;
+            }
+          }
+          else {}
+        }
+        out.push(sc.finish());
+      }
+      else if m.builder == Builder.Smooth {
+        var made = List[PolyMesh].empty();
+        piecesOf(w, within, m.args[0], &mut made);
+        let factor = if m.args[1] is Absent { 0.5f } else { f32.from(numOf(m.args[1])) };
+        let iterations = if m.args[2] is Absent { 1u32 } else { u32.from(i64.from(numOf(m.args[2]))) };
+        let keep = truthOf(m.args[3], false);
+        var i = 0usize;
+        while i < made.len() {
+          if keep { out.push(sculpt.smoothTaubin(made[i], factor, sculpt.taubinMu(factor, 0.1), iterations)); }
+          else { out.push(sculpt.smooth(made[i], factor, iterations)); }
+          i = i + 1usize;
+        }
+      }
+      else if m.builder == Builder.Inflate {
+        let side = outlineOf(w, within, m.args[0]);
+        let thickness = if m.args[1] is Absent { 1.f } else { f32.from(numOf(m.args[1])) };
+        let cell = if m.args[2] is Absent { 0.005f } else { f32.from(numOf(m.args[2])) };
+        let fullness = if m.args[3] is Absent { 1.f } else { f32.from(numOf(m.args[3])) };
+        out.push(inflateOutline(&side, thickness, cell, fullness));
+      }
+      else if m.builder == Builder.Subdivide {
+        var made = List[PolyMesh].empty();
+        piecesOf(w, within, m.args[0], &mut made);
+        let levels = if m.args[1] is Absent { 1u32 } else { u32.from(i64.from(numOf(m.args[1]))) };
+        var i = 0usize;
+        while i < made.len() { out.push(sculpt.subdivide(made[i], levels)); i = i + 1usize; }
+      }
+      else if m.builder == Builder.Move || m.builder == Builder.TurnShape {
+        var made = List[PolyMesh].empty();
+        piecesOf(w, within, m.args[0], &mut made);
+        var place = Transform3(vec3(m.args[1]), Quat.identity(), Vec3(1., 1., 1.));
+        if m.builder == Builder.TurnShape {
+          let axis = if m.args[2] is Absent { Vec3(0., 1., 0.) } else { vec3(m.args[2]).normalize() };
+          let origin = if m.args[3] is Absent { Vec3(0., 0., 0.) } else { vec3(m.args[3]) };
+          let q = Quat.angleAxis(f32.from(numOf(m.args[1])), axis);
+          place = Transform3(origin - q * origin, q, Vec3(1., 1., 1.));
+        }
+        var places = List[Transform3].empty();
+        places.push(place);
+        while made.len() > 0usize {
+          match made.pop() {
+            case let Some(p) {
+              var one = List[PolyMesh].empty();
+              one.push(p);
+              var problems = List[String].empty();
+              out.push(sculpt.joinPlaced(&one, &places, &mut problems));
+            }
+            case is None {}
+          }
+        }
+      }
+      else if m.builder == Builder.Join {
+        match m.args[0] {
+          case let Items(items) {
+            var i = 0usize;
+            while i < items.len() { piecesOf(w, within, items[i], out); i = i + 1usize; }
+          }
+          else {}
+        }
+      }
+      else if m.builder == Builder.Union || m.builder == Builder.Difference {
+        let a = onePiece(w, within, m.args[0]);
+        let b = onePiece(w, within, m.args[1]);
+        let crease = if m.args[2] is Absent { 0. } else { f32.from(numOf(m.args[2])) };
+        let op = if m.builder == Builder.Union { sculpt.BooleanUnion } else { sculpt.BooleanDifference };
+        var problems = List[String].empty();
+        let made = sculpt.booleanWith(&a, &b, op, crease, &mut problems);
+        var k = 0usize;
+        while k < problems.len() { print <- "build: "; printStr(problems[k].view()); print <- "\n"; k = k + 1usize; }
+        out.push(made);
+      }
+      else if m.builder == Builder.ArrayRadial {
+        var copied = List[PolyMesh].empty();
+        piecesOf(w, within, m.args[0], &mut copied);
+        let count = u32.from(i64.from(numOf(m.args[1])));
+        let axis = if m.args[2] is Absent { Vec3(0., 1., 0.) } else { vec3(m.args[2]) };
+        let angle = if m.args[3] is Absent { 6.2831853f } else { f32.from(numOf(m.args[3])) };
+        let origin = if m.args[4] is Absent { Vec3(0., 0., 0.) } else { vec3(m.args[4]) };
+        let merge = if m.args[5] is Absent { 0.0001f } else { f32.from(numOf(m.args[5])) };
+        var i = 0usize;
+        while i < copied.len() {
+          out.push(sculpt.arrayRadial(copied[i], count, axis, angle, origin, merge));
+          i = i + 1usize;
+        }
+      }
+    }
+    else {}
+  }
+}
+
+// A shape's pieces as one PolyMesh, nothing welded: what a boolean takes
+fn onePiece(w: &Understood, within: usize, v: &Val) PolyMesh {
+  var pieces = List[PolyMesh].empty();
+  piecesOf(w, within, v, &mut pieces);
+  if pieces.len() == 1usize {
+    match pieces.pop() {
+      case let Some(p) { return p; }
+      case is None {}
+    }
+  }
+  var polys = List[PolyMesh].empty();
+  while pieces.len() > 0usize {
+    match pieces.pop() {
+      case let Some(p) { polys.push(p); }
+      case is None {}
+    }
+  }
+  var problems = List[String].empty();
+  sculpt.join(&polys, &mut problems)
+}
+
+// A faceted mesh (each corner its own vertex, with its face's normal) made
+// smooth where faces meet at less than 'angle': each corner's normal becomes
+// the mean of the normals of the corners at the same place whose faces turn
+// from its own by less than the angle. Corners at the same place are found by
+// their position rounded to 0.1 mm.
+fn smoothByAngle(mesh: &mut Mesh, angle: f32) {
+  let n = mesh.positions.len();
+  if mesh.normals.len() != n { return; }
+  let limit = cos(angle);
+  var group = Dict[u64, usize].empty();     // a place's key -> its group
+  var members = List[List[usize]].empty();  // each group's corners
+  var k = 0usize;
+  while k < n {
+    let key = placeKey(*mesh.positions[k]);
+    match group.getCopy(&key) {
+      case let Some(g) { (&mut members[g]).push(k); }
+      case is None {
+        group.insert(key, members.len());
+        var one = List[usize].empty();
+        one.push(k);
+        members.push(one);
+      }
+    }
+    k = k + 1usize;
+  }
+  var smoothed = List[Vec3].empty();
+  k = 0usize;
+  while k < n { smoothed.push(*mesh.normals[k]); k = k + 1usize; }
+  var g = 0usize;
+  while g < members.len() {
+    let m = members[g];
+    var i = 0usize;
+    while i < m.len() {
+      let own = *mesh.normals[*m[i]];
+      var sum = Vec3(0., 0., 0.);
+      var j = 0usize;
+      while j < m.len() {
+        let other = *mesh.normals[*m[j]];
+        if own.dot(other) >= limit { sum = sum + other; }
+        j = j + 1usize;
+      }
+      if sum.length() > 0.000001 { smoothed.set(*m[i], sum.normalize()); }
+      i = i + 1usize;
+    }
+    g = g + 1usize;
+  }
+  mesh.normals <-> smoothed;
+}
+
+// A position's place, rounded to 0.1 mm: 21 bits a coordinate, +-100 m
+fn placeKey(p: Vec3) u64 {
+  let x = u64.from(i64.from(libc.floor(f64.from(p.x) * 10000.0 + 0.5)) + 1048576i64) & 0x1FFFFFu64;
+  let y = u64.from(i64.from(libc.floor(f64.from(p.y) * 10000.0 + 0.5)) + 1048576i64) & 0x1FFFFFu64;
+  let z = u64.from(i64.from(libc.floor(f64.from(p.z) * 10000.0 + 0.5)) + 1048576i64) & 0x1FFFFFu64;
+  (x << 42u64) | (y << 21u64) | z
+}
+
+// An outline: outline.rectangle(...), or a list of flat points (open)
+fn outlineOf(w: &Understood, within: usize, v: &Val) sculpt.Profile {
+  match v {
+    case let Local(k) { return outlineOf(w, within, w.functions[within].lets[*k]); }
+    case let Make(m) {
+      if m.builder == Builder.OutlineRect {
+        return sculpt.Profile.rectangle(f32.from(numOf(m.args[0])), f32.from(numOf(m.args[1])));
+      }
+      if m.builder == Builder.OutlinePoints {
+        var points = List[Vec2].empty();
+        var i = 0usize;
+        while i < m.args.len() {
+          match m.args[i] {
+            case let Tuple(xy) { points.push(Vec2(f32.from(numOf(xy[0])), f32.from(numOf(xy[1])))); }
+            else {}
+          }
+          i = i + 1usize;
+        }
+        return sculpt.Profile(points, false);
+      }
+      if m.builder == Builder.OutlineGiven {
+        var open = outlineOf(w, within, m.args[0]);
+        var points = List[Vec2].empty();
+        points <-> open.points;
+        return sculpt.Profile(points, truthOf(m.args[1], true));
+      }
+      if m.builder == Builder.OutlineOffset {
+        let given = outlineOf(w, within, m.args[0]);
+        return offsetOutline(&given, f32.from(numOf(m.args[1])));
+      }
+      if m.builder == Builder.OutlineEllipse {
+        let rx = f32.from(numOf(m.args[0])) * 0.5;
+        let ry = f32.from(numOf(m.args[1])) * 0.5;
+        let segments = if m.args[2] is Absent { 32u32 } else { u32.from(i64.from(numOf(m.args[2]))) };
+        var points = List[Vec2].empty();
+        var k = 0u32;
+        while k < segments {
+          let a = 6.2831853f * f32.from(k) / f32.from(segments);
+          points.push(Vec2(rx * cos(a), ry * sin(a)));
+          k = k + 1u32;
+        }
+        return sculpt.Profile(points, true);
+      }
+    }
+    else {}
+  }
+  sculpt.Profile.rectangle(0.1, 0.1)
+}
+
+// outline.offset: each point moved 'distance' outward (inward when negative)
+// along the mean of its two pieces' outward directions, lengthened as a mitre
+// is but never past twice 'distance', so a sharp corner is cut rather than
+// spiked. A STAND-IN for the manual's (rounded corners, no self-crossing): it
+// is right while 'distance' is small beside the outline's narrowest part.
+fn offsetOutline(o: &sculpt.Profile, distance: f32) sculpt.Profile {
+  let n = o.points.len();
+  var out = List[Vec2].empty();
+  if n < 2usize { return sculpt.Profile(out, o.closed); }
+  // Outward is to the right of the way round for a counterclockwise outline
+  let turn: f32 = if o.isCounterClockwise() { 1. } else { -1. };
+  var i = 0usize;
+  while i < n {
+    let p = *o.points[i];
+    let hasPrev = o.closed || i > 0usize;
+    let hasNext = o.closed || i + 1usize < n;
+    let prev = if i > 0usize { *o.points[i - 1usize] } else { *o.points[n - 1usize] };
+    let next = if i + 1usize < n { *o.points[i + 1usize] } else { *o.points[0usize] };
+    var sum = Vec2(0., 0.);
+    var count = 0u32;
+    if hasPrev { sum = sum + outwardOf(prev, p, turn); count = count + 1u32; }
+    if hasNext { sum = sum + outwardOf(p, next, turn); count = count + 1u32; }
+    let len = sum.length();
+    if count == 0u32 || len < 0.000001 { out.push(p); }
+    else {
+      let dir = sum * (1. / len);
+      // The mitre: 1 / cos of half the turn, from one piece's direction
+      let one = if hasPrev { outwardOf(prev, p, turn) } else { outwardOf(p, next, turn) };
+      var c = dir.x * one.x + dir.y * one.y;
+      if c < 0.5 { c = 0.5; }
+      out.push(p + dir * (distance / c));
+    }
+    i = i + 1usize;
+  }
+  sculpt.Profile(out, o.closed)
+}
+
+// The outward direction of the piece a to b
+fn outwardOf(a: Vec2, b: Vec2, turn: f32) Vec2 {
+  let d = b - a;
+  let len = d.length();
+  if len < 0.000001 { return Vec2(0., 0.); }
+  Vec2(d.y * turn / len, -d.x * turn / len)
+}
+
+// -------- carve --------
+//
+// A stroke, from brush.NAME(along:, at:, onto:, radius:, strength:, ends:):
+// its flat points are places on the side seen from 'onto' (front: looking
+// down -z at the x, y side view), each carried straight onto the surface
+// facing that way; three or more are joined by a smooth curve. A negative
+// strength takes away (the brush's inverted action). 'ends' is how much of
+// each end of the stroke thins away, as a hand lifts.
+fn strokeOf(w: &Understood, within: usize, v: &Val, shape: &PolyMesh) sculptbrush.Stroke {
+  match v {
+    case let Local(k) { return strokeOf(w, within, w.functions[within].lets[*k], shape); }
+    case let Make(m) {
+      let kind = brushKind(m.builder);
+      let onto = if m.args[2] is Absent { Vec3(0., 0., 1.) } else { vec3(m.args[2]) };
+      let radius = f32.from(numOf(m.args[3]));
+      let given = if m.args[4] is Absent { 0.5f } else { f32.from(numOf(m.args[4])) };
+      let strength = if given < 0. { -given } else { given };
+      var st = sculptbrush.Stroke.dab(sculptbrush.Brush.of(kind), Vec3(0., 0., 0.), radius, strength);
+      if !(m.args[0] is Absent) {
+        let flat = outlineOf(w, within, m.args[0]);
+        var pts = List[Vec3].empty();
+        var i = 0usize;
+        while i < flat.points.len() { pts.push(ontoSurface(shape, *flat.points[i], onto)); i = i + 1usize; }
+        let path = if pts.len() >= 3usize { sculptbrush.splinePoints(&pts, 6u32) } else { pts };
+        st = sculptbrush.Stroke.make(sculptbrush.Brush.of(kind), path, radius, strength);
+      } else {
+        // One dab: for the brushes that raise or press (draw, inflate, blob),
+        // its strength is the height raised, or the depth pressed in, as a
+        // fraction of its radius: Draw Sharp, which rises to a height over
+        // where the surface began (0.15 of the radius at strength 1)
+        let at = flatPointOf(w, within, m.args[1]);
+        var dabKind = kind;
+        var dabStrength = strength;
+        if kind == sculptbrush.BrushDraw || kind == sculptbrush.BrushInflate || kind == sculptbrush.BrushBlob {
+          dabKind = sculptbrush.BrushDrawSharp;
+          dabStrength = strength / 0.15;
+        }
+        st = sculptbrush.Stroke.dab(sculptbrush.Brush.of(dabKind), ontoSurface(shape, at, onto), radius, dabStrength);
+        st.falloff = sculpt.Falloff.preset(0u32);    // geomath's FalloffSmooth: a rounded hollow or swell, not a cone
+        // pressed several times, so the height is reached
+        st.points.push(*st.points[0]);
+        st.points.push(*st.points[0]);
+        st.points.push(*st.points[0]);
+        st.points.push(*st.points[0]);
+        st.points.push(*st.points[0]);
+      }
+      st.subtract = given < 0.;
+      if !(m.args[5] is Absent) {
+        let e = f32.from(numOf(m.args[5]));
+        if e > 0. {
+          let a = if e > 0.49 { 0.49f } else { e };
+          let pts: Array[Vec2, 4] = [Vec2(0., 0.1), Vec2(a, 1.), Vec2(1. - a, 1.), Vec2(1., 0.1)];
+          st.strengthCurve = sculpt.Falloff.custom(&pts);
+          st.radiusCurve = sculpt.Falloff.custom(&pts);
+        }
+      }
+      return st;
+    }
+    else {}
+  }
+  sculptbrush.Stroke.dab(sculptbrush.Brush.of(sculptbrush.BrushDraw), Vec3(0., 0., 0.), 0.001, 0.)
+}
+
+fn brushKind(b: Builder) u32 {
+  if b == Builder.BrushClay { return sculptbrush.BrushClay; }
+  if b == Builder.BrushClayStrips { return sculptbrush.BrushClayStrips; }
+  if b == Builder.BrushCrease { return sculptbrush.BrushCrease; }
+  if b == Builder.BrushInflate { return sculptbrush.BrushInflate; }
+  if b == Builder.BrushPinch { return sculptbrush.BrushPinch; }
+  if b == Builder.BrushSmooth { return sculptbrush.BrushSmooth; }
+  if b == Builder.BrushFlatten { return sculptbrush.BrushPlane; }
+  if b == Builder.BrushLayer { return sculptbrush.BrushLayer; }
+  if b == Builder.BrushBlob { return sculptbrush.BrushBlob; }
+  sculptbrush.BrushDraw
+}
+
+// A flat point: (x, y), written or a function's step
+fn flatPointOf(w: &Understood, within: usize, v: &Val) Vec2 {
+  match v {
+    case let Local(k) { return flatPointOf(w, within, w.functions[within].lets[*k]); }
+    case let Tuple(xy) { return Vec2(f32.from(numOf(xy[0])), f32.from(numOf(xy[1]))); }
+    else {}
+  }
+  Vec2(0., 0.)
+}
+
+// The place on the shape's surface facing 'onto' (front or back, along z)
+// over the flat point p: of the points within 4 mm of the line through p,
+// the one farthest that way; with none so near, the nearest
+fn ontoSurface(shape: &PolyMesh, p: Vec2, onto: Vec3) Vec3 {
+  let way: f32 = if onto.z < 0. { -1. } else { 1. };
+  var best = Vec3(p.x, p.y, 0.);
+  var bestZ: f32 = -1.0e30;
+  var nearest: f32 = 1.0e30;
+  var nearestAt = Vec3(p.x, p.y, 0.);
+  var i = 0usize;
+  while i < shape.positions.len() {
+    let q = *shape.positions[i];
+    let dx = q.x - p.x;
+    let dy = q.y - p.y;
+    let d2 = dx * dx + dy * dy;
+    if d2 < 0.000016 && q.z * way > bestZ { bestZ = q.z * way; best = Vec3(p.x, p.y, q.z); }
+    if d2 < nearest && q.z * way >= 0. { nearest = d2; nearestAt = q; }
+    i = i + 1usize;
+  }
+  if bestZ > -1.0e29 { best } else { nearestAt }
+}
+
+// -------- inflate --------
+//
+// inflate(outline, thickness:, cell:): a closed outline in (x, y) blown up
+// into a rounded solid across z, as Teddy and Monster Mash inflate a drawn
+// outline. Every point of the outline's middle (its ridge: where the distance
+// to the outline stops growing) is the center of a ball as wide as the
+// outline is there; the solid is the outside of all the balls, so every part
+// is round in section, a thin muzzle thin and a thick neck thick, then
+// flattened across to 'thickness' of that. It is worked out on a flat grid of
+// 'cell' squares: the front is the grid's squares inside the outline, cut
+// where the outline crosses them, raised; the back the same, lowered; the two
+// meet on the outline itself. All the work is flat, so it is cheap.
+fn inflateOutline(o: &sculpt.Profile, thickness: f32, cell: f32, fullness: f32) PolyMesh {
+  let pts = &o.points;
+  var low = Vec2(1.0e30f, 1.0e30f);
+  var high = Vec2(-1.0e30f, -1.0e30f);
+  var k = 0usize;
+  while k < pts.len() {
+    let p = *pts[k];
+    if p.x < low.x { low.x = p.x; }
+    if p.y < low.y { low.y = p.y; }
+    if p.x > high.x { high.x = p.x; }
+    if p.y > high.y { high.y = p.y; }
+    k = k + 1usize;
+  }
+  let h = if cell < 0.0005 { 0.0005f } else { cell };
+  let x0 = low.x - h;
+  let y0 = low.y - h;
+  let nx = usize.from(i64.from(libc.floor(f64.from((high.x - x0) / h)))) + 2usize;
+  let ny = usize.from(i64.from(libc.floor(f64.from((high.y - y0) / h)))) + 2usize;
+  let count = nx * ny;
+  // Each grid point: inside or not, and its distance to the outline
+  var inside = List[bool].withCapacity(count);
+  var dist = List[f32].withCapacity(count);
+  var j = 0usize;
+  while j < ny {
+    var i = 0usize;
+    while i < nx {
+      let p = Vec2(x0 + f32.from(i) * h, y0 + f32.from(j) * h);
+      let isIn = insideOutline(pts, p);
+      inside.push(isIn);
+      dist.push(if isIn { distanceToOutline(pts, p) } else { 0. });
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  // The ridge: inside points no nearer the outline than both neighbors
+  // across them, in some direction
+  var ridgeAt = List[Vec2].empty();
+  var ridgeR = List[f32].empty();
+  j = 1usize;
+  while j + 1usize < ny {
+    var i = 1usize;
+    while i + 1usize < nx {
+      let v = j * nx + i;
+      if *inside[v] {
+        let d = *dist[v];
+        // Strictly above one neighbor, so a flat run of equal distances is
+        // not all ridge
+        let across = (d > *dist[v - 1usize] && d >= *dist[v + 1usize])
+          || (d > *dist[v - nx] && d >= *dist[v + nx])
+          || (d > *dist[v - nx - 1usize] && d >= *dist[v + nx + 1usize])
+          || (d > *dist[v - nx + 1usize] && d >= *dist[v + nx - 1usize]);
+        if across {
+          ridgeAt.push(Vec2(x0 + f32.from(i) * h, y0 + f32.from(j) * h));
+          ridgeR.push(d);
+        }
+      }
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  // Each inside point's height: the highest of the ridge's balls over it
+  var height = List[f32].withCapacity(count);
+  j = 0usize;
+  while j < ny {
+    var i = 0usize;
+    while i < nx {
+      let v = j * nx + i;
+      var top: f32 = 0.;
+      var radius: f32 = 0.;               // the ball that gave it
+      if *inside[v] {
+        let p = Vec2(x0 + f32.from(i) * h, y0 + f32.from(j) * h);
+        top = *dist[v];
+        radius = top;
+        var r = 0usize;
+        while r < ridgeAt.len() {
+          let q = *ridgeAt[r];
+          let rr = *ridgeR[r];
+          let dx = p.x - q.x;
+          let dy = p.y - q.y;
+          if rr > top && dx < rr && dx > -rr && dy < rr && dy > -rr {
+            let s = rr * rr - dx * dx - dy * dy;
+            if s > top * top { top = s.sqrt(); radius = rr; }
+          }
+          r = r + 1usize;
+        }
+      }
+      height.push(radius);
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  // 'height' holds, for now, how thick each place is: the radius of the ball
+  // over it. Taking the highest ball leaves creases where balls meet, so the
+  // radius is eased across the grid instead (outside points keep their
+  // neighbors' value), and each point's height worked out from its own
+  // distance to the outline: off its section's middle by 1 - distance /
+  // radius, a superellipse of power 2 x fullness (2, a circle; higher, flatter
+  // sides turning over firmer edges) is (1 - off^p)^(1/p) of the radius high
+  var spread = 0u32;
+  while spread < 12u32 {
+    var eased = List[f32].withCapacity(count);
+    k = 0usize;
+    while k < count {
+      if *inside[k] && k > nx && k + nx < count {
+        var sum = *height[k] * 2.;
+        var n: f32 = 2.;
+        if *inside[k - 1usize] { sum = sum + *height[k - 1usize]; n = n + 1.; }
+        if *inside[k + 1usize] { sum = sum + *height[k + 1usize]; n = n + 1.; }
+        if *inside[k - nx] { sum = sum + *height[k - nx]; n = n + 1.; }
+        if *inside[k + nx] { sum = sum + *height[k + nx]; n = n + 1.; }
+        eased.push(sum / n);
+      } else {
+        eased.push(*height[k]);
+      }
+      k = k + 1usize;
+    }
+    height <-> eased;
+    spread = spread + 1u32;
+  }
+  let pw = 2. * f64.from(fullness);
+  k = 0usize;
+  while k < count {
+    if *inside[k] {
+      let radius = *height[k];
+      var z: f32 = 0.;
+      if radius > 0. {
+        var off = 1. - *dist[k] / radius;
+        if off < 0. { off = 0.; }
+        z = radius * f32.from(libc.pow(1. - libc.pow(f64.from(off), pw), 1. / pw));
+      }
+      height.set(k, z * thickness);
+    }
+    k = k + 1usize;
+  }
+  // The balls meet in creases a cell apart: eased by averaging each inside
+  // point with its four neighbors (outside ones 0, so the rim stays on the
+  // outline), a few times
+  var pass = 0u32;
+  while pass < 3u32 {
+    var eased = List[f32].withCapacity(count);
+    k = 0usize;
+    while k < count {
+      if *inside[k] && k > nx && k + nx < count {
+        eased.push((*height[k] * 4. + *height[k - 1usize] + *height[k + 1usize] + *height[k - nx] + *height[k + nx]) / 8.);
+      } else {
+        eased.push(*height[k]);
+      }
+      k = k + 1usize;
+    }
+    height <-> eased;
+    pass = pass + 1u32;
+  }
+  // The points: the front's grid points, the back's, then the outline's
+  // crossings of the grid's edges, shared by front and back
+  var positions = List[Vec3].empty();
+  var frontId = List[u32].withCapacity(count);
+  var backId = List[u32].withCapacity(count);
+  k = 0usize;
+  while k < count {
+    if *inside[k] {
+      let p = Vec3(x0 + f32.from(k % nx) * h, y0 + f32.from(k / nx) * h, 0.);
+      frontId.push(u32.from(positions.len()));
+      positions.push(Vec3(p.x, p.y, *height[k]));
+      backId.push(u32.from(positions.len()));
+      positions.push(Vec3(p.x, p.y, -*height[k]));
+    } else {
+      frontId.push(0xFFFFFFFFu32);
+      backId.push(0xFFFFFFFFu32);
+    }
+    k = k + 1usize;
+  }
+  var crossing = Dict[u64, u32].empty();   // a grid edge, as its two points' numbers -> the point where the outline crosses it
+  var counts = List[u32].empty();
+  var indices = List[u32].empty();
+  j = 0usize;
+  while j + 1usize < ny {
+    var i = 0usize;
+    while i + 1usize < nx {
+      // The square's corners counterclockwise from its lower left
+      var corners = Array[usize, 4]() <- fill 0usize;
+      corners[0] = j * nx + i;
+      corners[1] = j * nx + i + 1usize;
+      corners[2] = (j + 1usize) * nx + i + 1usize;
+      corners[3] = (j + 1usize) * nx + i;
+      var front = List[u32].empty();
+      var back = List[u32].empty();
+      var c = 0usize;
+      while c < 4usize {
+        let a = corners[c];
+        let b = corners[(c + 1usize) % 4usize];
+        if *inside[a] { front.push(*frontId[a]); back.push(*backId[a]); }
+        if *inside[a] != *inside[b] {
+          let key = if a < b { (u64.from(a) << 32u64) | u64.from(b) } else { (u64.from(b) << 32u64) | u64.from(a) };
+          var id = 0u32;
+          match crossing.getCopy(&key) {
+            case let Some(x) { id = x; }
+            case is None {
+              let pa = Vec2(x0 + f32.from(a % nx) * h, y0 + f32.from(a / nx) * h);
+              let pb = Vec2(x0 + f32.from(b % nx) * h, y0 + f32.from(b / nx) * h);
+              let at = crossingOf(pts,if *inside[a] { pa } else { pb }, if *inside[a] { pb } else { pa });
+              id = u32.from(positions.len());
+              positions.push(Vec3(at.x, at.y, 0.));
+              crossing.insert(key, id);
+            }
+          }
+          front.push(id);
+          back.push(id);
+        }
+        c = c + 1usize;
+      }
+      if front.len() >= 3usize {
+        counts.push(u32.from(front.len()));
+        var f = 0usize;
+        while f < front.len() { indices.push(*front[f]); f = f + 1usize; }
+        // The back faces -z: its corners the other way round
+        counts.push(u32.from(back.len()));
+        f = back.len();
+        while f > 0usize { f = f - 1usize; indices.push(*back[f]); }
+      }
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  var problems = List[String].empty();
+  PolyMesh.fromPolygons(positions.view(), counts.view(), indices.view(), &mut problems)
+}
+
+// Whether p is inside the closed outline (even-odd)
+fn insideOutline(pts: &List[Vec2], p: Vec2) bool {
+  let n = pts.len();
+  var isIn = false;
+  var i = 0usize;
+  var j = n - 1usize;
+  while i < n {
+    let a = *pts[i];
+    let b = *pts[j];
+    if (a.y > p.y) != (b.y > p.y) {
+      if p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x { isIn = !isIn; }
+    }
+    j = i;
+    i = i + 1usize;
+  }
+  isIn
+}
+
+// The distance from p to the closed outline
+fn distanceToOutline(pts: &List[Vec2], p: Vec2) f32 {
+  let n = pts.len();
+  var best: f32 = 1.0e30;
+  var i = 0usize;
+  while i < n {
+    let a = *pts[i];
+    let b = *pts[(i + 1usize) % n];
+    let ab = b - a;
+    let len2 = ab.x * ab.x + ab.y * ab.y;
+    var t: f32 = 0.;
+    if len2 > 0. { t = ((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2; }
+    if t < 0. { t = 0.; }
+    if t > 1. { t = 1.; }
+    let dx = p.x - (a.x + ab.x * t);
+    let dy = p.y - (a.y + ab.y * t);
+    let d2 = dx * dx + dy * dy;
+    if d2 < best { best = d2; }
+    i = i + 1usize;
+  }
+  best.sqrt()
+}
+
+// Where the outline crosses the grid edge from an inside point to an outside
+// one, found by halving
+fn crossingOf(pts: &List[Vec2], from: Vec2, to: Vec2) Vec2 {
+  var a = from;
+  var b = to;
+  var k = 0u32;
+  while k < 16u32 {
+    let m = Vec2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+    if insideOutline(pts, m) { a = m; } else { b = m; }
+    k = k + 1u32;
+  }
+  Vec2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
+}
+
+// A spine: spine.line(from:, to:, segments:)
+fn spineOf(w: &Understood, within: usize, v: &Val) sculpt.Path {
+  match v {
+    case let Local(k) { return spineOf(w, within, w.functions[within].lets[*k]); }
+    case let Make(m) {
+      if m.builder == Builder.SpineLine {
+        let segments = if m.args[2] is Absent { 1u32 } else { u32.from(i64.from(numOf(m.args[2]))) };
+        return sculpt.Path.line(vec3(m.args[0]), vec3(m.args[1]), segments);
+      }
+      if m.builder == Builder.SpineThrough {
+        let segments = if m.args[1] is Absent { 8u32 } else { u32.from(i64.from(numOf(m.args[1]))) };
+        var given = List[Vec3].empty();
+        match m.args[0] {
+          case let Items(items) {
+            var i = 0usize;
+            while i < items.len() { given.push(vec3(items[i])); i = i + 1usize; }
+          }
+          else {}
+        }
+        let pts = throughPoints(&given, segments);
+        return sculpt.Path.fromPoints(pts.view(), false);
+      }
+    }
+    else {}
+  }
+  sculpt.Path.line(Vec3(0., 0., 0.), Vec3(0., 1., 0.), 1u32)
+}
+
+// The points of spine.through: a centripetal Catmull-Rom curve through every
+// point given, 'segments' pieces between each two, its ends carried on by a
+// point mirrored past the first and the last (the manual's defaults)
+fn throughPoints(given: &List[Vec3], segments: u32) List[Vec3] {
+  var out = List[Vec3].empty();
+  let n = given.len();
+  if n < 2usize {
+    if n == 1usize { out.push(*given[0]); }
+    return out;
+  }
+  let pieces = if segments < 1u32 { 1u32 } else { segments };
+  var i = 0usize;
+  while i + 1usize < n {
+    let p1 = *given[i];
+    let p2 = *given[i + 1usize];
+    let p0 = if i == 0usize { p1 + (p1 - p2) } else { *given[i - 1usize] };
+    let p3 = if i + 2usize < n { *given[i + 2usize] } else { p2 + (p2 - p1) };
+    let t0: f32 = 0.;
+    let t1 = t0 + knotStep(p0, p1);
+    let t2 = t1 + knotStep(p1, p2);
+    let t3 = t2 + knotStep(p2, p3);
+    var k = 0u32;
+    while k < pieces {
+      let t = t1 + (t2 - t1) * f32.from(k) / f32.from(pieces);
+      let a1 = knotMix(p0, p1, t0, t1, t);
+      let a2 = knotMix(p1, p2, t1, t2, t);
+      let a3 = knotMix(p2, p3, t2, t3, t);
+      let b1 = knotMix(a1, a2, t0, t2, t);
+      let b2 = knotMix(a2, a3, t1, t3, t);
+      out.push(knotMix(b1, b2, t1, t2, t));
+      k = k + 1u32;
+    }
+    i = i + 1usize;
+  }
+  out.push(*given[n - 1usize]);
+  out
+}
+
+// The centripetal knot spacing: the square root of the distance, never 0
+fn knotStep(a: Vec3, b: Vec3) f32 {
+  let d = (b - a).length().sqrt();
+  if d < 0.0001 { 0.0001 } else { d }
+}
+
+// a at ta to b at tb, at t
+fn knotMix(a: Vec3, b: Vec3, ta: f32, tb: f32, t: f32) Vec3 {
+  a * ((tb - t) / (tb - ta)) + b * ((t - ta) / (tb - ta))
+}
+
+fn truthOf(v: &Val, otherwise: bool) bool {
+  match v {
+    case let Truth(b) { *b }
+    else { otherwise }
+  }
 }
 
 // plain(c), or a color itself: srgb(r, g, b) with the true sRGB curve, or
@@ -118,7 +1183,9 @@ fn boxMesh(make: &Val) Mesh {
 fn colorOf(make: &Val) Color {
   match make {
     case let Make(m) {
-      if m.builder == Builder.Plain { return colorOf(m.args[0]); }
+      if m.builder == Builder.Plain || m.builder == Builder.Physical || m.builder == Builder.Layered {
+        return colorOf(m.args[0]);
+      }
       var opacity = 1.;
       if !(m.args[3] is Absent) { opacity = numOf(m.args[3]); }
       if m.builder == Builder.Srgb {
@@ -144,11 +1211,15 @@ fn srgbToLinear(n: f64) f32 {
 fn sunOf(make: &Val) Arrival {
   var light = Light.directional(Vec3(0., -1., 0.), Color(0., 0., 0., 1.), Color(0., 0., 0., 1.));
   var shadows = false;
+  var way = Vec3(0., 1., 0.);
+  var strength: f32 = 0.;
   match make {
     case let Make(m) {
       let toSun = vec3(m.args[0]);
       let c = colorOf(m.args[1]);
       let lux = f32.from(numOf(m.args[2]));
+      way = toSun.normalize();
+      strength = lux;
       let sky = f32.from(SKY_NITS);
       light = Light.directional(Vec3(0., 0., 0.) - toSun, Color(c.red * lux, c.green * lux, c.blue * lux, 1.),
         Color(0.80 * sky, 0.88 * sky, 1.0 * sky, 1.));
@@ -159,7 +1230,39 @@ fn sunOf(make: &Val) Arrival {
     }
     else {}
   }
-  Arrival.Sun(light, shadows)
+  Arrival.Sun(light, shadows, way, strength)
+}
+
+fn isSun(make: &Val) bool {
+  match make {
+    case let Make(m) { m.builder == Builder.SunLight }
+    else { false }
+  }
+}
+
+// spotLight(reach, color:, intensity:, source:, castsShadow:, aim:, cone:,
+// softEdge:) or pointLight(reach, color:, intensity:, source:, castsShadow:),
+// placed where its part is: its aim turned as its part is
+fn lampOf(make: &Val, place: Mat4) Arrival {
+  var lamp = LampInfo(place * Vec3(0., 0., 0.), Vec3(0., -1., 0.), Color(1., 1., 1., 1.), 0., 1., 0., 0., 0., false, false);
+  match make {
+    case let Make(m) {
+      lamp.reach = f32.from(numOf(m.args[0]));
+      if !(m.args[1] is Absent) { lamp.color = colorOf(m.args[1]); }
+      if !(m.args[2] is Absent) { lamp.candela = f32.from(numOf(m.args[2])); }
+      if !(m.args[3] is Absent) { lamp.source = f32.from(numOf(m.args[3])); }
+      lamp.shadows = truthOf(m.args[4], false);
+      if m.builder == Builder.SpotLight {
+        lamp.spot = true;
+        if !(m.args[5] is Absent) { lamp.aim = vec3(m.args[5]); }
+        lamp.aim = place.transformVector(lamp.aim).normalize();
+        lamp.cone = f32.from(numOf(m.args[6]));
+        if !(m.args[7] is Absent) { lamp.softEdge = f32.from(numOf(m.args[7])); }
+      }
+    }
+    else {}
+  }
+  Arrival.Lamp(lamp)
 }
 
 fn vec3(v: &Val) Vec3 {

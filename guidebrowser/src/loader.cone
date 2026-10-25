@@ -8,7 +8,8 @@
 //   active       made live by the loop's activation slice (scene.cone), which
 //                says so itself
 //
-// The world is read from worlds\NAME.ddd, or fetched when NAME is a URL
+// The world is read from NAME.ddd in the worlds folder beside the program,
+// or fetched when NAME is a URL
 // (http:// or https://), then lexed (lexer.cone), parsed
 // (parser.cone), understood (understand.cone), built (build.cone). It prints
 // every mistake and each stage's time; '--show' prints the tree and the
@@ -17,11 +18,10 @@
 actor Loader {
   ready: Sender[Arrival];
 
-  pool: Pool;                   // the buffers a file is read into
   client: Client;               // what fetches a world named by a URL
 
   fn init(self: &new, ready: Sender[Arrival]) {
-    *self = Self(ready: ready, pool: Pool.make(), client: Client.standard());
+    *self = Self(ready: ready, client: Client.standard());
   }
 
   // Bring in the world named 'world', asked for at 'askedAt' (a performance
@@ -38,12 +38,12 @@ actor Loader {
   // Each stage is timed on its own, with nothing printed between; then the
   // whole of it again, warm, its parts built and dropped: the first time pays
   // for what is touched for the first time.
-  pub async fn arrive(self, world: String, askedAt: u64, testPart: bool, show: bool) {
+  pub async fn arrive(self, world: String, folder: String, askedAt: u64, testPart: bool, show: bool) {
     let fetched = world.view().startsWith("http://") || world.view().startsWith("https://");
     var file = String.empty();
     if fetched { file.append(world.view()); }
     else {
-      file.append("worlds/");
+      file.append(folder.view());
       file.append(world.view());
       file.append(".ddd");
     }
@@ -81,7 +81,7 @@ actor Loader {
         var offset = 0u64;
         var going = !f.isNone();
         while going {
-          var read = await f.readAt(offset, self.pool.mustTake(CHUNK));
+          var read = await f.readAt(offset, IoBuf(CHUNK));
           going = false;
           match &mut read {
             case var &mut Ok(buf) {
@@ -98,7 +98,8 @@ actor Loader {
       if pass == 0u32 {
         parts = made;
         if testPart {
-          let cube = Built(String.from("test cube"), Mesh.cube(1.), Color(0.6, 0.6, 0.6, 1.),
+          let cube = Built(0xFFFFFFFEu32, String.from("test cube"), Mesh.cube(1.), Vec3(-1., -1., -1.), Vec3(1., 1., 1.),
+            Look(Color(0.6, 0.6, 0.6, 1.), false, 1., 0., 1., 0., 0.05, 0.),
             Mat4.fromTrs(Vec3(0., 0., 0.), Quat.angleAxis(0.6, Vec3(0., 1., 0.)), Vec3(1., 1., 1.)));
           ready.send(Arrival.Part(cube));
           parts = parts + 1u64;
@@ -120,7 +121,9 @@ actor Loader {
     let tableAt = sdl.GetPerformanceCounter();
     var names = Names.standard();
     let tableMade = sdl.GetPerformanceCounter();
-    let decls = parse(text, &mut names, &mut problems);
+    let written = parse(text, &mut names, &mut problems);
+    // Loops and copies of designs made into parts (expand.cone)
+    let decls = expand(&written, &mut names, &mut problems);
     at[3] = sdl.GetPerformanceCounter();
     let understood = understand(&decls, names, &mut problems);
     at[4] = sdl.GetPerformanceCounter();

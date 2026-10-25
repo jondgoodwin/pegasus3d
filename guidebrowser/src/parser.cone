@@ -7,9 +7,13 @@
 //
 //   part NAME [: KIND] [, LABEL: EXPR]*
 //
-// A line under a part that is not a part is one of its behaviors, an
-// expression such as 'solid(self, derived)'. Behaviors are kept here and set
-// aside by the next stage; what a world does on load comes first.
+// A line under a part that starts with 'field' gives the part a value of its
+// own:
+//
+//   field NAME: TYPE [= EXPR] [, LABEL: EXPR]*
+//
+// Any other line under a part that is not a part is one of its behaviors, an
+// expression such as 'solid(self, derived)' or 'on(created, start(...))'.
 //
 // Expressions, loosest first:
 //
@@ -19,6 +23,8 @@
 //   f(a, label: b)             a call, its arguments by position or label
 //   materials.stone            a path of names
 //   (a, b, c)                  a triple (any number of items), or (a)
+//   [a, b, c]                  a list
+//   if c { a } else { b }      one of two values
 //   true, false, names, numbers
 //
 // Names in the tree are numbers in the Names table (lexer.cone).
@@ -58,6 +64,27 @@ pub enum Expr {
     pub callee: List[u32];       // a path
     pub args: List[Arg];
   }
+  pub struct Items {             // [a, b, c]
+    pub at: Spot;
+    pub items: List[Expr];
+  }
+  pub struct If {
+    pub at: Spot;
+    pub parts: List[Expr];       // the condition, the value if true, the value if false
+  }
+  pub struct Binary {            // a + b, a == b, a && b ...
+    pub at: Spot;
+    pub op: u8;                  // the lexer's symbol: '+' '-' '*' '/' '%' '<' '>' 'l' 'g' 'E' 'N' 'A' 'O'
+    pub operands: List[Expr];    // two
+  }
+  pub struct Not {               // !a
+    pub at: Spot;
+    pub operand: List[Expr];     // one
+  }
+  pub struct Below {             // a ..< b: from a up to, not including, b
+    pub at: Spot;
+    pub ends: List[Expr];
+  }
 
   // Where it was written
   pub fn spot(self: &Expr) Spot {
@@ -69,8 +96,47 @@ pub enum Expr {
       case let Range(r) { r.at }
       case let Negative(g) { g.at }
       case let Call(c) { c.at }
+      case let Items(l) { l.at }
+      case let If(i) { i.at }
+      case let Binary(b) { b.at }
+      case let Not(n) { n.at }
+      case let Below(r) { r.at }
     }
   }
+}
+
+// each NAME in EXPR { ... }: the lines under it, once for each value
+pub struct EachDecl {
+  pub at: Spot;
+  pub name: u32;                 // the name each value is given
+  pub over: Expr;                // a ..< b, for now
+  pub children: List[PartDecl];
+  pub eaches: List[EachDecl];    // loops inside this one
+  pub behaviors: List[Expr];
+}
+
+// A function of a part as written: fn NAME() TYPE { let a = EXPR; ... EXPR }
+pub struct FnDecl {
+  pub at: Spot;
+  pub name: u32;
+  pub ty: u32;                   // its result's type's name: 'shape'
+  pub lets: List[LetDecl];       // its steps, in order
+  pub result: Expr;              // its last line
+}
+
+pub struct LetDecl {
+  pub at: Spot;
+  pub name: u32;
+  pub value: Expr;
+}
+
+// A field of a part as written
+pub struct FieldDecl {
+  pub at: Spot;
+  pub name: u32;
+  pub ty: u32;                   // a type's name: 'bool', 'number'
+  pub value: Option[Expr];       // its default
+  pub options: List[Arg];
 }
 
 // An argument of a call, or an option of a part
@@ -83,10 +149,14 @@ pub struct Arg {
 pub struct PartDecl {
   pub at: Spot;
   pub name: u32;
+  pub index: Option[Expr];       // part NAME[EXPR]: one of a numbered set, made in a loop
   pub kind: Option[Expr];
   pub options: List[Arg];
   pub children: List[PartDecl];
+  pub fields: List[FieldDecl];
+  pub functions: List[FnDecl];
   pub behaviors: List[Expr];
+  pub eaches: List[EachDecl];    // loops under it (expand.cone makes them parts)
 }
 
 // The parts a text writes at its top (a world is one); its names are added
@@ -140,7 +210,7 @@ struct Parser['a] {
     else if self.kind() == TokKind.Number { m.append(", not a number"); }
     else if self.kind() == TokKind.Symbol {
       m.append(", not '");
-      if self.cur.sym == '=' { m.append("..="); } else { m.appendByte(self.cur.sym); }
+      if self.cur.sym == 'R' { m.append("..="); } else { m.appendByte(self.cur.sym); }
       m.append("'");
     }
     else if self.kind() == TokKind.Newline { m.append(", not the line's end"); }
@@ -201,6 +271,16 @@ struct Parser['a] {
     }
     let name = self.cur.name;
     self.advance();
+    var index: Option[Expr] = None;
+    if self.isSymbol('[') {
+      self.advance();
+      match self.expr() {
+        case let Some(e) { index = Some[Expr](e); }
+        case is None { self.skipLine(); return None; }
+      }
+      if !self.isSymbol(']') { self.fail("expected ']' after the part's number"); self.skipLine(); return None; }
+      self.advance();
+    }
     var kind: Option[Expr] = None;
     if self.isSymbol(':') {
       self.advance();
@@ -225,13 +305,75 @@ struct Parser['a] {
     self.advance();
 
     var children = List[PartDecl].empty();
+    var fields = List[FieldDecl].empty();
+    var functions = List[FnDecl].empty();
     var behaviors = List[Expr].empty();
+    var eaches = List[EachDecl].empty();
+    self.block(&mut children, &mut fields, &mut functions, &mut behaviors, &mut eaches);
+    Some[PartDecl](PartDecl(at, name, index, kind, options, children, fields, functions, behaviors, eaches))
+  }
+
+  // each NAME in EXPR {, the lines indented under it, and } on a line of its own
+  fn loopDecl(self: &mut) Option[EachDecl] {
+    let at = self.at();
+    self.advance();                                   // 'each'
+    if self.kind() != TokKind.Name { self.fail("expected the name each value is given"); self.skipLine(); return None; }
+    let name = self.cur.name;
+    self.advance();
+    if !self.isName(N_IN) { self.fail("expected 'in' and what to go through"); self.skipLine(); return None; }
+    self.advance();
+    var over: Expr;
+    match self.expr() {
+      case let Some(e) { over = e; }
+      case is None { self.skipLine(); return None; }
+    }
+    if !self.isSymbol('{') { self.fail("expected '{' at the end of the line"); self.skipLine(); return None; }
+    self.advance();
+    if self.kind() != TokKind.Newline { self.fail("expected the line's end after '{'"); self.skipLine(); return None; }
+    self.advance();
+    var children = List[PartDecl].empty();
+    var fields = List[FieldDecl].empty();
+    var functions = List[FnDecl].empty();
+    var behaviors = List[Expr].empty();
+    var eaches = List[EachDecl].empty();
+    self.block(&mut children, &mut fields, &mut functions, &mut behaviors, &mut eaches);
+    if fields.len() > 0usize || functions.len() > 0usize {
+      self.lex.problems.push(Problem(at, String.from("a loop holds parts, loops and behaviors, not fields or functions, for now")));
+    }
+    if !self.isSymbol('}') { self.fail("expected '}' on its own line, where the loop ends"); self.skipLine(); return None; }
+    self.advance();
+    if self.kind() == TokKind.Newline { self.advance(); }
+    Some[EachDecl](EachDecl(at, name, over, children, eaches, behaviors))
+  }
+
+  // The lines indented under a part or a loop, if any: parts, fields,
+  // functions, loops and behaviors
+  fn block(self: &mut, children: &mut List[PartDecl], fields: &mut List[FieldDecl], functions: &mut List[FnDecl],
+      behaviors: &mut List[Expr], eaches: &mut List[EachDecl]) {
     if self.kind() == TokKind.Indent {
       self.advance();
       while self.kind() != TokKind.Dedent && self.kind() != TokKind.End {
         if self.isName(N_PART) {
           match self.part() {
             case let Some(d) { children.push(d); }
+            case is None {}
+          }
+        }
+        else if self.isName(N_EACH) {
+          match self.loopDecl() {
+            case let Some(l) { eaches.push(l); }
+            case is None {}
+          }
+        }
+        else if self.isName(N_FIELD) {
+          match self.field() {
+            case let Some(f) { fields.push(f); }
+            case is None {}
+          }
+        }
+        else if self.isName(N_FN) {
+          match self.function() {
+            case let Some(f) { functions.push(f); }
             case is None {}
           }
         }
@@ -253,7 +395,100 @@ struct Parser['a] {
       }
       if self.kind() == TokKind.Dedent { self.advance(); }
     }
-    Some[PartDecl](PartDecl(at, name, kind, options, children, behaviors))
+  }
+
+  // fn NAME() TYPE { let a = EXPR; ... EXPR }: no parameters, for now. Its
+  // body is in '{ }', so the lexer gives it as one line, whatever its lines
+  fn function(self: &mut) Option[FnDecl] {
+    let at = self.at();
+    self.advance();                                   // 'fn'
+    if self.kind() != TokKind.Name { self.fail("expected the function's name"); self.skipLine(); return None; }
+    let name = self.cur.name;
+    self.advance();
+    if !self.isSymbol('(') { self.fail("expected '(' and its parameters"); self.skipLine(); return None; }
+    self.advance();
+    if !self.isSymbol(')') { self.fail("a function takes no parameters, for now: expected ')'"); self.skipLine(); return None; }
+    self.advance();
+    if self.kind() != TokKind.Name { self.fail("expected the type of its result, such as shape"); self.skipLine(); return None; }
+    let ty = self.cur.name;
+    self.advance();
+    if !self.isSymbol('{') { self.fail("expected '{' and its body"); self.skipLine(); return None; }
+    self.advance();
+    var lets = List[LetDecl].empty();
+    while self.isName(N_LET) {
+      let lat = self.at();
+      self.advance();
+      if self.kind() != TokKind.Name { self.fail("expected the name 'let' gives"); self.skipLine(); return None; }
+      let lname = self.cur.name;
+      self.advance();
+      if !self.isSymbol('=') { self.fail("expected '=' and its value"); self.skipLine(); return None; }
+      self.advance();
+      match self.expr() {
+        case let Some(e) { lets.push(LetDecl(lat, lname, e)); }
+        case is None { self.skipLine(); return None; }
+      }
+      if !self.isSymbol(';') { self.fail("expected ';' to end the step"); self.skipLine(); return None; }
+      self.advance();
+    }
+    var result: Expr;
+    match self.expr() {
+      case let Some(e) { result = e; }
+      case is None { self.skipLine(); return None; }
+    }
+    if !self.isSymbol('}') { self.fail("expected '}' after the function's result"); self.skipLine(); return None; }
+    self.advance();
+    if self.kind() != TokKind.Newline { self.fail("expected the line's end after the function"); self.skipLine(); return None; }
+    self.advance();
+    Some[FnDecl](FnDecl(at, name, ty, lets, result))
+  }
+
+  // field NAME: TYPE [= EXPR] [, LABEL: EXPR]*; None, the line skipped, after a mistake
+  fn field(self: &mut) Option[FieldDecl] {
+    let at = self.at();
+    self.advance();                                   // 'field'
+    if self.kind() != TokKind.Name {
+      self.fail("expected the field's name");
+      self.skipLine();
+      return None;
+    }
+    let name = self.cur.name;
+    self.advance();
+    if !self.isSymbol(':') {
+      self.fail("expected ':' and the field's type");
+      self.skipLine();
+      return None;
+    }
+    self.advance();
+    if self.kind() != TokKind.Name {
+      self.fail("expected the field's type");
+      self.skipLine();
+      return None;
+    }
+    let ty = self.cur.name;
+    self.advance();
+    var value: Option[Expr] = None;
+    if self.isSymbol('=') {
+      self.advance();
+      match self.expr() {
+        case let Some(e) { value = Some[Expr](e); }
+        case is None { self.skipLine(); return None; }
+      }
+    }
+    var options = List[Arg].empty();
+    while self.isSymbol(',') {
+      self.advance();
+      match self.labeled() {
+        case let Some(a) { options.push(a); }
+        case is None { self.skipLine(); return None; }
+      }
+    }
+    if self.kind() != TokKind.Newline {
+      self.fail("expected ',' and another option, or the line's end");
+      self.skipLine();
+      return None;
+    }
+    self.advance();
+    Some[FieldDecl](FieldDecl(at, name, ty, value, options))
   }
 
   // LABEL: EXPR
@@ -271,29 +506,68 @@ struct Parser['a] {
     }
   }
 
-  // a ..= b, or a
+  // a ..= b, a ..< b, or a
   fn expr(self: &mut) Option[Expr] {
     let at = self.at();
     var low: Expr;
-    match self.unary() {
+    match self.binary(0u32) {
       case let Some(e) { low = e; }
       case is None { return None; }
     }
-    if !self.isSymbol('=') { return Some[Expr](low); }
+    if !self.isSymbol('R') && !self.isSymbol('L') { return Some[Expr](low); }
+    let below = self.isSymbol('L');
     self.advance();
-    match self.unary() {
+    match self.binary(0u32) {
       case let Some(high) {
         var ends = List[Expr].empty();
         ends.push(low);
         ends.push(high);
-        Some[Expr](Expr.Range(at, ends))
+        if below { Some[Expr](Expr.Below(at, ends)) } else { Some[Expr](Expr.Range(at, ends)) }
       }
       case is None { None }
     }
   }
 
-  // -a; a negative number is folded into the number
+  // Operators by how tightly they bind, loosest first: || then && then the
+  // comparisons, then + -, then * / %; each level's operands are the next's
+  fn binary(self: &mut, level: u32) Option[Expr] {
+    if level > 4u32 { return self.unary(); }
+    let at = self.at();
+    var left: Expr;
+    match self.binary(level + 1u32) {
+      case let Some(e) { left = e; }
+      case is None { return None; }
+    }
+    while self.kind() == TokKind.Symbol && opLevel(self.cur.sym) == level {
+      let op = self.cur.sym;
+      self.advance();
+      match self.binary(level + 1u32) {
+        case let Some(right) {
+          var operands = List[Expr].empty();
+          operands.push(left);
+          operands.push(right);
+          left = Expr.Binary(at, op, operands);
+        }
+        case is None { return None; }
+      }
+    }
+    Some[Expr](left)
+  }
+
+  // -a, !a; a negative number is folded into the number
   fn unary(self: &mut) Option[Expr] {
+    if self.isSymbol('!') {
+      let at = self.at();
+      self.advance();
+      match self.unary() {
+        case let Some(e) {
+          var one = List[Expr].empty();
+          one.push(e);
+          return Some[Expr](Expr.Not(at, one));
+        }
+        case is None { return None; }
+      }
+    }
     if !self.isSymbol('-') { return self.postfix(); }
     let at = self.at();
     self.advance();
@@ -345,10 +619,26 @@ struct Parser['a] {
       }
       return Some[Expr](Expr.Tuple(at, items));
     }
+    if self.isSymbol('[') {
+      self.advance();
+      var items = List[Expr].empty();
+      if self.isSymbol(']') { self.advance(); return Some[Expr](Expr.Items(at, items)); }
+      while true {
+        match self.expr() {
+          case let Some(e) { items.push(e); }
+          case is None { return None; }
+        }
+        if self.isSymbol(',') { self.advance(); }
+        else if self.isSymbol(']') { self.advance(); break; }
+        else { self.fail("expected ',' or ']'"); return None; }
+      }
+      return Some[Expr](Expr.Items(at, items));
+    }
     if self.kind() != TokKind.Name {
       self.fail("expected a value");
       return None;
     }
+    if self.isName(N_IF) { return self.choice(); }
     if self.isName(N_TRUE) || self.isName(N_FALSE) {
       let value = self.isName(N_TRUE);
       self.advance();
@@ -392,6 +682,44 @@ struct Parser['a] {
     }
     Some[Expr](Expr.Call(at, names, args))
   }
+
+  // if COND { A } else { B }
+  fn choice(self: &mut) Option[Expr] {
+    let at = self.at();
+    self.advance();                                   // 'if'
+    var parts = List[Expr].empty();
+    match self.expr() {
+      case let Some(e) { parts.push(e); }
+      case is None { return None; }
+    }
+    var k = 0u32;
+    while k < 2u32 {
+      if k == 1u32 {
+        if !self.isName(N_ELSE) { self.fail("expected 'else' and the other value in { }"); return None; }
+        self.advance();
+      }
+      if !self.isSymbol('{') { self.fail("expected '{'"); return None; }
+      self.advance();
+      match self.expr() {
+        case let Some(e) { parts.push(e); }
+        case is None { return None; }
+      }
+      if !self.isSymbol('}') { self.fail("expected '}'"); return None; }
+      self.advance();
+      k = k + 1u32;
+    }
+    Some[Expr](Expr.If(at, parts))
+  }
+}
+
+// An operator's level in 'binary' (5: not an operator)
+fn opLevel(sym: u8) u32 {
+  if sym == 'O' { return 0u32; }
+  if sym == 'A' { return 1u32; }
+  if sym == 'E' || sym == 'N' || sym == '<' || sym == '>' || sym == 'l' || sym == 'g' { return 2u32; }
+  if sym == '+' || sym == '-' { return 3u32; }
+  if sym == '*' || sym == '/' || sym == '%' { return 4u32; }
+  5u32
 }
 
 // -------- shown, to check what was read --------
@@ -420,6 +748,20 @@ fn showPart(d: &PartDecl, names: &Names, depth: usize) {
     i = i + 1usize;
   }
   print <- "   @"; print <- d.at.line; print <- ":"; print <- d.at.column; print <- "\n";
+  i = 0usize;
+  while i < d.fields.len() {
+    k = 0usize;
+    while k <= depth { printStr("  "); k = k + 1usize; }
+    printStr("field "); printStr(names.text(d.fields[i].name)); printStr(": "); printStr(names.text(d.fields[i].ty));
+    match &d.fields[i].value {
+      case let Some(e) { printStr(" = "); showExpr(e, names); }
+      case is None {}
+    }
+    var o = 0usize;
+    while o < d.fields[i].options.len() { printStr(", "); showArg(d.fields[i].options[o], names); o = o + 1usize; }
+    printStr("\n");
+    i = i + 1usize;
+  }
   i = 0usize;
   while i < d.behaviors.len() {
     k = 0usize;
@@ -468,7 +810,21 @@ fn showExpr(e: &Expr, names: &Names) {
     case let Path(p) { showNames(&p.names, names); }
     case let Tuple(t) { printStr("("); showList(&t.items, names, ", "); printStr(")"); }
     case let Range(r) { printStr("["); showList(&r.ends, names, " ..= "); printStr("]"); }
+    case let Below(r) { printStr("["); showList(&r.ends, names, " ..< "); printStr("]"); }
     case let Negative(g) { printStr("-("); showList(&g.operand, names, ""); printStr(")"); }
+    case let Not(g) { printStr("!("); showList(&g.operand, names, ""); printStr(")"); }
+    case let Binary(b) {
+      printStr("("); showExpr(b.operands[0], names); printStr(" ");
+      if b.op == 'E' { printStr("=="); } else if b.op == 'N' { printStr("!="); } else if b.op == 'l' { printStr("<="); }
+      else if b.op == 'g' { printStr(">="); } else if b.op == 'A' { printStr("&&"); } else if b.op == 'O' { printStr("||"); }
+      else { var s = String.from(""); s.appendByte(b.op); printStr(s.view()); }
+      printStr(" "); showExpr(b.operands[1], names); printStr(")");
+    }
+    case let Items(l) { printStr("["); showList(&l.items, names, ", "); printStr("]"); }
+    case let If(i) {
+      printStr("if "); showExpr(i.parts[0], names); printStr(" { "); showExpr(i.parts[1], names);
+      printStr(" } else { "); showExpr(i.parts[2], names); printStr(" }");
+    }
     case let Call(c) {
       showNames(&c.callee, names);
       printStr("(");
