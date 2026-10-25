@@ -65,10 +65,17 @@ pub struct GalleryShot {
   hasEye: bool;
   hasLook: bool;
   pub people: List[GalleryPerson];    // the people in it (person = ...)
+  pub ride: f32;             // seconds into the balloon's ride at the picture (ride = T), 0: the balloon on its spot
+  pub rideEye: Vec3;         // the eye from the basket, in the basket's own frame: right, up, behind (ride-eye = ...)
+  pub rideLook: Vec3;        // the point looked at, the same way: right, up, ahead (ride-look = ...)
+  pub lookBirds: bool;       // look = birds: at the middle of the flock, wherever it has flown (from 'pos')
+  pub birdsAt: Vec3;         // birds-at = x, y, z, r: the flock gathered in a ball of radius r here as the shot begins
+  pub birdsR: f32;           // (0: the flock as it is)
 
   fn blank() GalleryShot {
     GalleryShot(String.empty(), Vec3(0., 0., 0.), false, false, Vec3(0., 0., 0.), false, 0., 0., 1.0471976, 12.0, 1u32, 0u32,
-      1440u32, 810u32, GALLERY_SETTLE, false, false, List[GalleryPerson].empty())
+      1440u32, 810u32, GALLERY_SETTLE, false, false, List[GalleryPerson].empty(), 0., Vec3(0., 4., 9.), Vec3(0., -20., 60.), false,
+      Vec3(0., 0., 0.), 0.)
   }
 
   fn copy(self: &) GalleryShot {
@@ -76,7 +83,7 @@ pub struct GalleryShot {
     var k = 0usize;
     while k < people.len() { folk.push(*people[k]); k = k + 1usize; }
     GalleryShot(name.copy(), eye, eyeAgl, byAngles, target, targetAgl, yaw, pitch, fov, hour, weather, day, width, height, settle,
-      hasEye, hasLook, folk)
+      hasEye, hasLook, folk, ride, rideEye, rideLook, lookBirds, birdsAt, birdsR)
   }
 }
 
@@ -223,6 +230,12 @@ fn applyKey(shot: &mut GalleryShot, key: &str, value: &str, line: usize) bool {
       f32.from(*got[3usize]) * 0.017453292, state, 0usize, floorY, hasFloor, 0u64));
     return true;
   }
+  if key == "look" {
+    if text.view() != "birds" { lineFault(line, "look is birds: the camera turned to the flock's middle"); return false; }
+    shot.lookBirds = true;
+    shot.hasLook = true;
+    return true;
+  }
   if key == "weather" {
     let w = weatherNamed(text.view());
     if w >= WEATHER_STATES { lineFault(line, "weather is clear, fair, cloudy, overcast, rain or snow"); return false; }
@@ -297,7 +310,32 @@ fn applyKey(shot: &mut GalleryShot, key: &str, value: &str, line: usize) bool {
     shot.day = u32.from(*nums[0usize]);
     return true;
   }
-  lineFault(line, "unknown key (pos, pos-agl, target, target-agl, yaw, pitch, fov, time, weather, size, settle, day)");
+  if key == "ride" {
+    // the balloon's launch button is pressed as the shot begins, and the picture is taken T seconds into the ride
+    // (its settling is the ride's T seconds; 'time' is the hour at the picture)
+    if nums.len() != 1usize || *nums[0usize] < 1.0 || *nums[0usize] > 600.0 { lineFault(line, "ride is seconds into the balloon's ride, 1 to 600"); return false; }
+    shot.ride = f32.from(*nums[0usize]);
+    shot.settle = u32.from(*nums[0usize] * 60.0);
+    // (the eye and the look come from the basket: ride-eye and ride-look, or their defaults)
+    shot.hasEye = true;
+    shot.hasLook = true;
+    return true;
+  }
+  if key == "birds-at" {
+    // the flock gathered, as the shot begins, in a ball of radius r about (x, y, z), y metres above the ground there; its
+    // groups' waypoints put there too, so it is still about the place when the picture is taken
+    if nums.len() != 4usize || *nums[3usize] < 1.0 || *nums[3usize] > 200.0 { lineFault(line, "birds-at is x, height above the ground, z, and a radius of 1 to 200 m"); return false; }
+    shot.birdsAt = Vec3(f32.from(*nums[0usize]), f32.from(*nums[1usize]), f32.from(*nums[2usize]));
+    shot.birdsR = f32.from(*nums[3usize]);
+    return true;
+  }
+  if key == "ride-eye" || key == "ride-look" {
+    if nums.len() != 3usize { lineFault(line, "ride-eye and ride-look are right, up, and behind (ride-eye) or ahead (ride-look), metres from the basket"); return false; }
+    let v = Vec3(f32.from(*nums[0usize]), f32.from(*nums[1usize]), f32.from(*nums[2usize]));
+    if key == "ride-eye" { shot.rideEye = v; } else { shot.rideLook = v; }
+    return true;
+  }
+  lineFault(line, "unknown key (pos, pos-agl, target, target-agl, yaw, pitch, fov, time, weather, size, settle, day, ride, ride-eye, ride-look)");
   false
 }
 
@@ -421,9 +459,31 @@ pub fn galleryShotAt(plan: &GalleryPlan, f: u64) String {
 // The eye and the way it looks for the shot of frame 'f'
 pub fn galleryView(st: &SimState, f: u64) Pose {
   let s = st.gallery.shots[galleryIndex(&st.gallery, f)];
+  if s.ride > 0. && !st.world.basket().isNone() {
+    // From the balloon on its ride: the eye and the look in the basket's frame (its open front, +z, ahead)
+    let m = st.scene.worldMatrix(st.world.basket());
+    let at = m.translation();
+    // (the basket turns only about the upright: its right and ahead kept level)
+    let turn = Mat3.fromMat4(m);
+    let r = turn * Vec3(1., 0., 0.);
+    let a = turn * Vec3(0., 0., 1.);
+    let right = Vec3(r.x, 0., r.z).normalize();
+    let ahead = Vec3(a.x, 0., a.z).normalize();
+    let up = Vec3(0., 1., 0.);
+    let eye = at + right * s.rideEye.x + up * s.rideEye.y - ahead * s.rideEye.z;
+    let look = at + right * s.rideLook.x + up * s.rideLook.y + ahead * s.rideLook.z;
+    return lookFrom(eye, look);
+  }
   var eye = s.eye;
   if s.eyeAgl { eye = Vec3(eye.x, groundHeight(&st.land, eye.x, eye.z) + eye.y, eye.z); }
   if s.byAngles { return Pose.look(eye, s.yaw, s.pitch); }
+  if s.lookBirds {
+    // The flock's middle: the birds go where they will, so the camera turns to them
+    var sum = Vec3(0., 0., 0.);
+    var k = 0usize;
+    while k < BIRD_COUNT { sum = sum + st.birds.flock.pose(k).position; k = k + 1usize; }
+    return lookFrom(eye, sum * (1. / f32.from(BIRD_COUNT)));
+  }
   var at = s.target;
   if s.targetAgl { at = Vec3(at.x, groundHeight(&st.land, at.x, at.z) + at.y, at.z); }
   lookFrom(eye, at)
@@ -531,12 +591,40 @@ pub fn galleryDrive(st: &mut SimState, f: u64) {
     }
     if f + 1u64 == begin || (i == 0usize && f == 1u64) {
       let s = st.gallery.shots[i];
-      // 60 s of scene time an hour, from the clock's start hour, 7
-      var away = s.hour - 7.0;
+      // 60 s of scene time an hour, from the clock's start hour, 7 (a ride shot's hour is the picture's: it begins T s before)
+      var away = s.hour - 7.0 - f64.from(s.ride) / 60.0;
       if away < 0.0 { away = away + 24.0; }
       let seconds = (away + 24.0 * f64.from(GALLERY_DAY0 + u64.from(s.day))) * 60.0;
       st.scene.clock.ns = u64.from(nanosOf(seconds));
       st.weather.setNow(s.weather);
+      // The flock gathered where the shot wants it: each bird put in the ball, spread evenly by its number (a golden-angle spiral
+      // through the ball's height), keeping its heading and speed; every group's waypoint the ball's middle
+      if f + 1u64 == begin && s.birdsR > 0. {
+        let mid = Vec3(s.birdsAt.x, groundHeight(&st.land, s.birdsAt.x, s.birdsAt.z) + s.birdsAt.y, s.birdsAt.z);
+        let n = st.birds.flock.birds.len();
+        var k = 0usize;
+        while k < n {
+          let t = (f32.from(k) + 0.5) / f32.from(n);
+          let y = 1. - 2. * t;
+          let ring = libc.sqrtf(1. - y * y);
+          let a = f32.from(k) * 2.3999632;
+          let r = s.birdsR * libc.powf(t, 0.3333333);
+          let at = mid + Vec3(cos(a) * ring * r, y * r * 0.5, sin(a) * ring * r);
+          (&mut st.birds.flock.birds[k]).pos = at;
+          if k < st.birds.prevPos.len() { st.birds.prevPos.set(k, at); }
+          k = k + 1usize;
+        }
+        var g = 0usize;
+        while g < st.birds.flock.waypoints.len() { st.birds.flock.waypoints.set(g, mid); g = g + 1usize; }
+        print <- "Gallery: shot "; printStr(s.name.view()); print <- ": the flock gathered over "; print <- mid.x; print <- ", ";
+        print <- mid.z; print <- "\n";
+      }
+      // A ride shot: the launch button pressed as its window begins (the balloon must be on its spot: one ride shot to a run,
+      // or the ones after it begun once the ride before has landed)
+      if f + 1u64 == begin && s.ride > 0. && !st.world.buttonCap().isNone() {
+        st.scene.post(Message.Clicked(st.world.buttonCap()));
+        print <- "Gallery: shot "; printStr(s.name.view()); print <- ": the balloon's launch button pressed\n";
+      }
     }
     i = i + 1usize;
   }
