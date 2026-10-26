@@ -478,11 +478,9 @@ pub fn galleryView(st: &SimState, f: u64) Pose {
   if s.eyeAgl { eye = Vec3(eye.x, groundHeight(&st.land, eye.x, eye.z) + eye.y, eye.z); }
   if s.byAngles { return Pose.look(eye, s.yaw, s.pitch); }
   if s.lookBirds {
-    // The flock's middle: the birds go where they will, so the camera turns to them
-    var sum = Vec3(0., 0., 0.);
-    var k = 0usize;
-    while k < BIRD_COUNT { sum = sum + st.birds.flock.pose(k).position; k = k + 1usize; }
-    return lookFrom(eye, sum * (1. / f32.from(BIRD_COUNT)));
+    // The flock's middle: the birds go where they will, so the camera turns to them (the view turns it again to the flock
+    // it draws: galleryBirds)
+    return lookFrom(eye, st.birds.middle());
   }
   var at = s.target;
   if s.targetAgl { at = Vec3(at.x, groundHeight(&st.land, at.x, at.z) + at.y, at.z); }
@@ -490,6 +488,19 @@ pub fn galleryView(st: &SimState, f: u64) Pose {
 }
 
 pub fn galleryFov(plan: &GalleryPlan, f: u64) f32 { plan.shots[galleryIndex(plan, f)].fov }
+
+// What the view does with its own flock, the one drawn, for the shot of frame 'f': gather it (birds-at; the serial is
+// the shot's number from 1, so the view gathers once as the shot begins) and turn the eye to its middle (look = birds)
+pub fn galleryBirds(st: &SimState, f: u64, test: &mut TestView) {
+  let i = galleryIndex(&st.gallery, f);
+  let s = st.gallery.shots[i];
+  test.lookBirds = s.lookBirds && s.ride <= 0. && !s.byAngles;
+  if s.birdsR > 0. && f >= galleryStart(&st.gallery, i) {
+    test.birdsAt = Vec3(s.birdsAt.x, groundHeight(&st.land, s.birdsAt.x, s.birdsAt.z) + s.birdsAt.y, s.birdsAt.z);
+    test.birdsR = s.birdsR;
+    test.birdsSerial = u32.from(i) + 1u32;
+  }
+}
 
 // The size the frame is drawn at
 pub fn gallerySize(plan: &GalleryPlan, f: u64, w: &mut u32, h: &mut u32) {
@@ -597,25 +608,11 @@ pub fn galleryDrive(st: &mut SimState, f: u64) {
       let seconds = (away + 24.0 * f64.from(GALLERY_DAY0 + u64.from(s.day))) * 60.0;
       st.scene.clock.ns = u64.from(nanosOf(seconds));
       st.weather.setNow(s.weather);
-      // The flock gathered where the shot wants it: each bird put in the ball, spread evenly by its number (a golden-angle spiral
-      // through the ball's height), keeping its heading and speed; every group's waypoint the ball's middle
+      // The flock gathered where the shot wants it (the simulation's flock here; the one drawn is the view's, which the
+      // shot's TestView tells to gather too: galleryBirds)
       if f + 1u64 == begin && s.birdsR > 0. {
         let mid = Vec3(s.birdsAt.x, groundHeight(&st.land, s.birdsAt.x, s.birdsAt.z) + s.birdsAt.y, s.birdsAt.z);
-        let n = st.birds.flock.birds.len();
-        var k = 0usize;
-        while k < n {
-          let t = (f32.from(k) + 0.5) / f32.from(n);
-          let y = 1. - 2. * t;
-          let ring = libc.sqrtf(1. - y * y);
-          let a = f32.from(k) * 2.3999632;
-          let r = s.birdsR * libc.powf(t, 0.3333333);
-          let at = mid + Vec3(cos(a) * ring * r, y * r * 0.5, sin(a) * ring * r);
-          (&mut st.birds.flock.birds[k]).pos = at;
-          if k < st.birds.prevPos.len() { st.birds.prevPos.set(k, at); }
-          k = k + 1usize;
-        }
-        var g = 0usize;
-        while g < st.birds.flock.waypoints.len() { st.birds.flock.waypoints.set(g, mid); g = g + 1usize; }
+        st.birds.gather(mid, s.birdsR);
         print <- "Gallery: shot "; printStr(s.name.view()); print <- ": the flock gathered over "; print <- mid.x; print <- ", ";
         print <- mid.z; print <- "\n";
       }
