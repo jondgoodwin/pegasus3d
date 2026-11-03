@@ -256,6 +256,12 @@ float3 gravelColor(float2 xz, float fp, float farB) {
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target {
     float3 p = input.world;
+    // Ground a metre or more under the sea, seen from above it, is hidden by
+    // the water (opaque, its waves under 0.4 m): shade nothing. The test is
+    // coherent over a draw's pixels but along the shoreline.
+    if (p.y < -1.0 && frame.cameraPosition.y > 0.6) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
     float2 xz = p.xz;
     float h = fieldHeight(xz);
     float3 n = fieldNormal(xz);
