@@ -107,10 +107,11 @@ struct AudioOptions {
   wavPath: String;               // --audio-wav FILE: record the offline mix
   recording: bool;
   startMuted: bool;              // --audio-muted
+  xr: bool;                      // --xr: the device only in a real interactive headset session (see audioOpen)
 
-  fn make() AudioOptions { AudioOptions(false, false, String(), false, false) }
+  fn make() AudioOptions { AudioOptions(false, false, String(), false, false, false) }
 
-  fn copy(self: &) AudioOptions { AudioOptions(forceDevice, off, wavPath.clone(), recording, startMuted) }
+  fn copy(self: &) AudioOptions { AudioOptions(forceDevice, off, wavPath.clone(), recording, startMuted, xr) }
 
   fn setWavPath(self: &mut, p: String) { wavPath = p; recording = true; }
 }
@@ -164,12 +165,51 @@ pub fn audioKeyFrame(keys: &AudioKeys, ctx: &Context) {
 // The mute toggled (the key's effect; the checks use it too)
 pub fn audioToggleMute() { audioCounts.mutePresses.add(1u64); }
 
+fn envText(name: cstr) String {
+  let raw = libc.getenv(name);
+  if (raw as usize) == 0usize { return String(); }
+  String.fromCStr(cstr.fromPtr(raw))
+}
+
+// --xr with no sound: PEGASUS_XR_AUDIO=off, or the runtime is Meta's PC simulator (XR_RUNTIME_JSON names it), so a test run
+// never makes a sound in a room; says why
+fn xrAudioOff() bool {
+  let sw = envText("PEGASUS_XR_AUDIO");
+  if sw.len() == 3usize {
+    let b: &Array[u8] = sw.view();
+    if b[0] == 111u8 && b[1] == 102u8 && b[2] == 102u8 {
+      print <- "Audio: off (PEGASUS_XR_AUDIO=off)\n";
+      return true;
+    }
+  }
+  let rt = envText("XR_RUNTIME_JSON");
+  let r: &Array[u8] = rt.view();
+  var i = 0usize;
+  while i + 8usize <= r.len {
+    // "imulator"
+    if r[i] == 105u8 && r[i + 1usize] == 109u8 && r[i + 2usize] == 117u8 && r[i + 3usize] == 108u8 && r[i + 4usize] == 97u8
+        && r[i + 5usize] == 116u8 && r[i + 6usize] == 111u8 && r[i + 7usize] == 114u8 {
+      print <- "Audio: off (the OpenXR runtime is a simulator)\n";
+      return true;
+    }
+    i = i + 1usize;
+  }
+  false
+}
+
 // The sink for this run, decided once before the actors start: automated runs render offline (the same every
 // time, no device needed), an interactive one tries the default playback device and is silent if there is none.
 // The view it answers is the view actor's own from then on.
 pub fn audioOpen(opts: &AudioOptions, automated: bool) AudioView {
   var view = AudioView.silent();
   if opts.off { return view; }
+  if opts.xr {
+    // --xr: silent as it always was in an automated run (unless a WAV or --audio-device asks for the offline mix or the device), in
+    // the Meta simulator, or by PEGASUS_XR_AUDIO=off; otherwise the headset session's sound goes to the playback device
+    if automated && !opts.recording && !opts.forceDevice { return view; }
+    if !automated && xrAudioOff() { return view; }
+    if !automated { print <- "Audio: the default playback device (a headset's own only if Windows has made it the default)\n"; }
+  }
   if automated && !opts.forceDevice {
     view = AudioView.offline(opts.recording, opts.wavPath.clone());
   } else {
@@ -939,6 +979,12 @@ pub fn audioFromView(st: &mut ViewState, steps: &List[Step]) {
   if st.own < st.cast.beings.len() { f.eye = st.cast.beings[st.own].eyes().origin; }
   f.forward = cam.forward();
   f.up = cam.up();
+  // --xr: the listener is the headset's head (the eye midpoint and its orientation, as the last frame drew them), not the avatar's body
+  if st.xrListen {
+    f.eye = st.xrLisPos;
+    f.forward = st.xrLisFwd;
+    f.up = st.xrLisUp;
+  }
   f.wind = windStrength(&st.snapshot.weather.at(st.sceneNow));
   f.aboveGround = f.eye.y - islandHeight(&st.land, f.eye.x, f.eye.z);
   var b = 0usize;

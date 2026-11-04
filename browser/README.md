@@ -233,7 +233,7 @@ renders the mixer on the game thread, a fixed 48000 / 60 frames to each fixed st
 device. Options: `--no-audio`; `--audio-device` (use the device even in an automated run, e.g. with `SDL_AUDIODRIVER=dummy`);
 `--audio-muted` (open the device but start muted); `--audio-wav FILE` (record the offline mix); `--audio-walk FILE` (the
 scripted walk of `src/audiowalk.cone`, past the brook and over the bridge, recorded to FILE and described by its spectrum;
-add `--headless` for no window). `--xr` turns the sound off altogether (below).
+add `--headless` for no window). Under `--xr` the listener is the headset and the device is opened only in a real session (below).
 
 ## In a headset: `--xr`
 
@@ -279,9 +279,15 @@ runtime does the lens, the reprojection and the compositing). With no OpenXR run
   image goes back to the runtime). The mirror never waits for the display: it is presented in the mailbox mode and skips a frame when
   the window has no free image, so the headset keeps its own rate. `--headless` with `--xr` has no window (and no mirror) but the
   headset's GPU all the same: what the automated runs below use.
-- **No audio device, ever.** `--xr` sets the sound off before anything reads the audio options, so `audioOpen` returns at its first
-  test (`opts.off`), before it asks for a device, and the device's thread (`audiodevice`, the only caller of SDL's audio) is never started: a run in the simulator is silent at any
-  hour. (A headset's own sound is a later piece of work.)
+- **Sound, with the head as the listener.** `--xr` marks the audio options (`xr`); `audioOpen` then opens the playback device only in
+  an interactive session on a real runtime. It stays silent (as before: no device, no thread) in an automated run (`--frames`, `--checks`
+  ...), with `--headless`, with `--no-audio`, with `PEGASUS_XR_AUDIO=off`, and when `XR_RUNTIME_JSON` names a simulator (Meta's PC
+  simulator); each says why on one `Audio:` line. `--audio-wav FILE` (or `--audio-device`) with `--frames` still gives the offline mix, for a
+  test with no device. The device is SDL's default playback device (the package `audiodevice` opens no other; Windows sends it to the
+  headset when the Oculus/Link software has made the headset's audio the default): choosing the headset's by name needs a change in
+  `audiodevice` and is not done. Every spatialised sound (wind's height, the brook, the burner, the steps' range) is heard from the
+  head: the eye midpoint and the left eye's orientation, placed on the avatar's feet as the eyes are (`xrStateOf`, `headWorld`), as of
+  the last frame drawn, not the avatar's body or the desktop camera. Footsteps stay at the avatar's heels.
 - **Off under `--xr`**, each with what it cost one eye on the RTX 4060 Laptop at 1680 x 1760 (the island from the landing beach; the
   GPU time of the eye's main pass between two timestamps):
   - temporal anti-aliasing, auto-exposure, ambient occlusion, the froxel fog and the paint decals (the image quality passes, tier 0:
