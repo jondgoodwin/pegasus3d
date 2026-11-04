@@ -38,7 +38,8 @@ struct Gfx {
   pub cover: groundcover.CoverRenderer;   // the ground's grass, flowers, ferns, needles (groundrig.cone), drawn after the scene's pass; before the device
   pub renderer: Renderer;
   pub swapchain: SwapChain;
-  pub headset: Headset;        // --xr: OpenXR's session, the eye images and the window's mirror; none otherwise. Before the device it was made on.
+  pub fovea: Foveation;        // --xr: each eye's shading rate image (foveation.cone), level off unless the device has it; before the headset and the device
+  pub headset: Headset;       // --xr: OpenXR's session, the eye images and the window's mirror; none otherwise. Before the device it was made on.
   pub device: Device;
   pub adapter: Adapter;
   pub surface: Surface;
@@ -52,6 +53,7 @@ struct Gfx {
   pub shotPng: bool;
   pub skyScale: f32 = 1.;      // how bright the environment's sky is baked (fitEnvironmentSky), the share of rendersys.cone's daylight
   pub xr: bool = false;        // --xr: the frame is the headset's (drawXr): two eyes, no overlay, none of the image quality passes
+  pub foveaTold: bool = false; // the coverage of the bands was printed (once, at the first frame with the images)
 }
 
 // The environment's sky is one fixed daylight (rendersys.cone's environmentSky), which the day dims by the renderer's
@@ -501,6 +503,17 @@ actor RenderActor {
       let feet = o.snapshot.feet(o.alpha);
       xrNow = xrStateOf(g, &frame, feet);
       if !xrArt.made { xrArt = XrArt.make(&mut g.renderer, &mut g.device); }
+      // The eyes' shading rate images (made once, from each eye's field of view)
+      if g.fovea.level != FOVEATION_OFF && g.fovea.prepare(&mut g.device, &frame, g.headset.eyeWidth, g.headset.eyeHeight) && !g.foveaTold {
+        g.foveaTold = true;
+        let fv = frame.views[0].fov;
+        print <- "Foveation: the left eye's field of view is "; print <- degrees(fv.angleLeft); print <- " to "; print <- degrees(fv.angleRight);
+        print <- " across and "; print <- degrees(fv.angleDown); print <- " to "; print <- degrees(fv.angleUp); print <- " up (degrees)\n";
+        print <- "Foveation: tiles "; print <- u64.from(g.fovea.texelWidth); print <- " x "; print <- u64.from(g.fovea.texelHeight);
+        print <- " pixels; the left eye is shaded 1x1 on "; print <- g.fovea.fullPercent; print <- "%, 2x2 on "; print <- g.fovea.halfPercent;
+        print <- "%, "; print <- u64.from(g.fovea.coarseWidth); print <- "x"; print <- u64.from(g.fovea.coarseHeight); print <- " on ";
+        print <- g.fovea.coarsePercent; print <- "% of its pixels\n";
+      }
       // The picture to write this frame, if --xr-shots asked: the left eye's (and the window's) first, the right eye's the next frame
       shotNow = xrShots.len() > 0usize && o.frame >= xrShotAt && xrShotsDone < 2u32;
       if shotNow {
@@ -607,6 +620,14 @@ actor RenderActor {
       print <- " frames), GPU "; print <- g.headset.gpuMeanMs(e); print <- " ms ("; print <- u64.from(g.headset.gpuSamples(e));
       print <- " frames)\n";
       e = e + 1usize;
+    }
+    print <- "Foveation: "; printStr(foveationLevelName(g.fovea.level));
+    if g.fovea.level != FOVEATION_OFF && g.headset.foveated {
+      print <- " (left eye 1x1 "; print <- g.fovea.fullPercent; print <- "%, 2x2 "; print <- g.fovea.halfPercent; print <- "%, ";
+      print <- u64.from(g.fovea.coarseWidth); print <- "x"; print <- u64.from(g.fovea.coarseHeight); print <- " "; print <- g.fovea.coarsePercent;
+      print <- "% of its pixels)\n";
+    } else {
+      print <- "\n";
     }
     if g.headset.hasMirror() {
       print <- "Mirror: "; print <- g.headset.mirroredFrames(); print <- " frames shown in the window, ";
@@ -821,7 +842,12 @@ actor RenderActor {
     if g.fxTier == 0u32 {
       g.sys.motion.clear();
       let callFrom = sdl.GetPerformanceCounter();
+      // (an eye's main lit pass only is shaded by the eye's rate image: the shadows, the mirrors' pictures, the particles, the ground
+      // cover and the tone-mapping are drawn at full rate)
+      let rated = xv.active && g.fovea.level != FOVEATION_OFF && g.fovea.ready(xv.eye);
+      if rated { g.renderer.setShadingRate(&g.device, g.fovea.rate(xv.eye), g.fovea.texelWidth, g.fovea.texelHeight); }
       g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
+      if rated { g.renderer.clearShadingRate(); }
       renderCallTicks = renderCallTicks + (sdl.GetPerformanceCounter() - callFrom);
       renderCalls = renderCalls + 1u64;
       if effectsOn {
@@ -1064,7 +1090,7 @@ fn makeGfx(window: *sdl.Window, width: u32, height: u32, skyOff: bool, cullMode:
   let off = makeOffscreen(&mut device, 16u32, 16u32, swapchain.format);
   var cover = makeCover(&mut device, isl, adapter.adapterType == ADAPTER_TYPE_INTEGRATED_GPU);
   Some[Gfx](Gfx(Buffer.none(), String(), target, off, post, fx, fxTier, fxMeter, splatMaterial, Vec3(0., 0., 0.),
-    Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, Headset.none(), device, adapter, surface, instance, camera,
+    Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, Foveation.make(FOVEATION_OFF), Headset.none(), device, adapter, surface, instance, camera,
     sunShadows, false, 0u32, 0u32, false, false))
 }
 
@@ -1166,7 +1192,8 @@ struct EyeView {
 //     'target' while an eye is drawn: Headset.swapEye), and the Post is made for that format and size
 //   - the image quality passes (temporal AA, auto-exposure, ambient occlusion, froxel fog, decals) are off: fxTier 0 is the plain
 //     path; renderactor's drawXr says why
-//   - the device has no ray queries (the runtime makes it, with its own extensions), so the glass is the raster glass
+//   - the device has no ray queries (the runtime makes it from the create-info the program hands it, and the program asks only for
+//     foveation's extension, not ray queries, yet), so the glass is the raster glass
 // None if the headset could not be opened or its session did not begin.
 fn makeGfxXr(window: usize, width: u32, height: u32, skyOff: bool, cullMode: u32, rig: &mut SkyRig, isl: &Island,
     wantShots: bool) Option[Gfx] {
@@ -1174,6 +1201,24 @@ fn makeGfxXr(window: usize, width: u32, height: u32, skyOff: bool, cullMode: u32
   var gpu = HeadsetGpu.none();
   var options = HeadsetOptions();
   options.copySource = wantShots;
+  // PEGASUS_XR_FOVEATION (off, low, medium, high; default medium): the eyes' periphery shaded in coarser blocks where the
+  // headset's GPU can (foveation.cone). Asked for at the device's creation, so it is read here.
+  var foveaLevel = FOVEATION_MEDIUM;
+  let foveaEnv = libc.getenv("PEGASUS_XR_FOVEATION");
+  if (foveaEnv as usize) != 0usize {
+    let value = cstr.fromPtr(foveaEnv);
+    var named = 99u32;
+    if libc.strcmp(value, "off") == 0i32 { named = FOVEATION_OFF; }
+    if libc.strcmp(value, "low") == 0i32 { named = FOVEATION_LOW; }
+    if libc.strcmp(value, "medium") == 0i32 { named = FOVEATION_MEDIUM; }
+    if libc.strcmp(value, "high") == 0i32 { named = FOVEATION_HIGH; }
+    if named == 99u32 {
+      print <- "PEGASUS_XR_FOVEATION is not off, low, medium or high: medium\n";
+    } else {
+      foveaLevel = named;
+    }
+  }
+  options.foveation = foveaLevel != FOVEATION_OFF;
   options.mirrorWindow = window;
   options.mirrorWidth = width;
   options.mirrorHeight = height;
@@ -1197,6 +1242,10 @@ fn makeGfxXr(window: usize, width: u32, height: u32, skyOff: bool, cullMode: u32
   printStr(headset.runtimeName.view()); print <- ", each eye "; print <- u64.from(headset.eyeWidth); print <- " x ";
   print <- u64.from(headset.eyeHeight); print <- if headset.hasMirror() { ", the left eye in the window\n" } else { ", no window\n" };
   let integrated = gpu.adapterType() == ADAPTER_TYPE_INTEGRATED_GPU;
+  // (said once, the setting asked for and the one that took effect: the device may lack the extension, or the runtime refuse it)
+  if foveaLevel != FOVEATION_OFF && !headset.foveated { foveaLevel = FOVEATION_OFF; }
+  print <- "Foveation: "; printStr(foveationLevelName(foveaLevel)); print <- if headset.foveated { " (the periphery of each eye shaded in coarser blocks)\n" }
+    else if options.foveation { " (asked for, not available on this device: no foveation)\n" } else { " (off by request)\n" };
   var renderer = Renderer.create(&mut gpu.device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
   var rayWanted = true;
   let rtEnv = libc.getenv("PEGASUS_RT");
@@ -1242,13 +1291,17 @@ fn makeGfxXr(window: usize, width: u32, height: u32, skyOff: bool, cullMode: u32
   var cover = makeCover(&mut gpu.device, isl, integrated);
   var swapchain = SwapChain.none();
   var made = Gfx(Buffer.none(), String(), target, off, post, fx, fxTier, false, SPLAT_NONE, Vec3(0., 0., 0.),
-    Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, Headset.none(), Device.none(), Adapter.none(), Surface.none(),
+    Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, Foveation.make(FOVEATION_OFF), Headset.none(), Device.none(), Adapter.none(), Surface.none(),
     Instance.none(), camera, sunShadows, false, 0u32, 0u32, false, false);
   made.headset <-> headset;
   made.device <-> gpu.device;
   made.adapter <-> gpu.adapter;
   made.instance <-> gpu.instance;
   made.xr = true;
+  made.fovea = Foveation.make(foveaLevel);
+  // PEGASUS_XR_FOVEATION_COARSE=2 keeps the outermost band at 2x2 (the default is 4x4 where the GPU does it)
+  let coarseEnv = libc.getenv("PEGASUS_XR_FOVEATION_COARSE");
+  if (coarseEnv as usize) != 0usize && libc.strcmp(cstr.fromPtr(coarseEnv), "2") == 0i32 { made.fovea.coarseLimit = 2u32; }
   Some[Gfx](made)
 }
 

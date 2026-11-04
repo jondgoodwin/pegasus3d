@@ -289,14 +289,28 @@ runtime does the lens, the reprojection and the compositing). With no OpenXR run
     on (`PEGASUS_FX=high`: for measuring only, the picture alternates histories). The fog is the fog slabs instead, sized to the eye's
     off-axis view;
   - the overlay (the HUD and its name plates): a screen-space panel is wrong in a head-mounted display;
-  - ray-traced glass: the runtime makes the device, and it has no ray queries, so the glass is the raster glass (`PEGASUS_RT=off`'s
-    look); not measured on the headset's device.
+  - ray-traced glass: the device the runtime makes has no ray queries because the program does not ask for them (the program may add its
+    own extensions to the create-info it hands `xrCreateVulkanDeviceKHR`, as it now does for foveation, below; ray queries are not asked
+    for yet), so the glass is the raster glass (`PEGASUS_RT=off`'s look); not measured on the headset's device.
   - Kept, with their costs: the sun's shadows (cascades: **-1.05 ms an eye** when off, `PEGASUS_SHADOWS=off`; **-0.7 ms** at low) and
     the lanterns' (no change at the landing beach, none near).
 - **What an eye costs on the island** (the landing beach, 299 frames, the simulator): CPU 1.0 ms (left) and 0.8 ms (right) for the
   whole eye's frame, the draw list included, GPU 7.35 ms each. The two eyes' 14.7 ms do not fit the simulator's 72 Hz (13.9 ms): the
   runtime shows the frame at the next display time, so the frame is 27.8 ms (36 Hz). 90 Hz (11.1 ms) needs about 5 ms an eye with
   everything else in the frame: the scene is built and culled once for each eye now, and one list for two views is the next step.
+- **Foveation** (`PEGASUS_XR_FOVEATION=off|low|medium|high`, default `medium`): the island is pixel-bound, so each eye's main lit pass
+  shades its periphery in coarser blocks (Vulkan's `VK_KHR_fragment_shading_rate`, one 2 x 2 or 4 x 4 block of pixels sharing a run of the
+  fragment shader; the depth is still tested at every pixel, so edges stay exact). It is fixed, not eye-tracked: bands of angle off the axis
+  of each eye's own lens (not the middle of its image: the eye's four field-of-view angles are not symmetric), from an image made once
+  per eye. `medium`: full rate out to 28 degrees, 2 x 2 to 52, 4 x 4 beyond (the corners); `low`: full to 35, 2 x 2 beyond; `high`: full
+  to 20, 2 x 2 to 40, 4 x 4 beyond (the sky and the ground show blocks). Only the eye's main pass is shaded so: the shadows, the mirrors'
+  pictures, the particles, the ground cover, the tone-mapping and the window's mirror are drawn at full rate.
+  The extension is asked of the runtime when the device is made (`xrCreateVulkanDeviceKHR` takes the program's own extensions), only if the
+  GPU offers it; if not, or the runtime refuses that device, the program makes it without, says so in one line and draws as with `off`.
+  The start-up lines say which took effect (`Foveation: medium (...)`), then the field of view, the tile size and how much of the left eye each
+  rate covers; the end of the run repeats it. `PEGASUS_XR_FOVEATION_COARSE=2` keeps the outer band at 2 x 2 (to see what 4 x 4 costs).
+  Whether the Quest 3 runtime over Link accepts the device with the extension, and what the bands look like in the lenses, only the
+  headset can say. Cost and picture: see the lane's report (`Sessions\lane-foveation-report-2026-11-04.md`).
 
 ```
 browser.exe --xr                       drawn into the headset (the window is the mirror); Escape or the runtime ends it
