@@ -295,9 +295,11 @@ runtime does the lens, the reprojection and the compositing). With no OpenXR run
     on (`PEGASUS_FX=high`: for measuring only, the picture alternates histories). The fog is the fog slabs instead, sized to the eye's
     off-axis view;
   - the overlay (the HUD and its name plates): a screen-space panel is wrong in a head-mounted display;
-  - ray-traced glass: the device the runtime makes has no ray queries because the program does not ask for them (the program may add its
-    own extensions to the create-info it hands `xrCreateVulkanDeviceKHR`, as it now does for foveation, below; ray queries are not asked
-    for yet), so the glass is the raster glass (`PEGASUS_RT=off`'s look); not measured on the headset's device.
+  - ray-traced glass is kept (it is not dropped): the program adds VK_KHR_acceleration_structure, ray_query and their features to the
+    create-info it hands `xrCreateVulkanDeviceKHR`, with foveation's extension, and the glass is ray-traced as on the desktop. `PEGASUS_XR_RT=off|on`
+    (default on); not offered by the GPU or refused by the runtime, one line is printed and the glass is the raster glass (`PEGASUS_RT=off`'s
+    look). The structure is built from the first eye's view and shared with the second (`PEGASUS_XR_RT_SHARE=off` builds one per eye, to
+    measure). `PEGASUS_XR_GLOBE=150` with `--mirror-only --soak 600 --mirror-hold 1` puts the head 1.5 m south of the garden globe.
   - Kept, with their costs: the sun's shadows (cascades: **-1.05 ms an eye** when off, `PEGASUS_SHADOWS=off`; **-0.7 ms** at low) and
     the lanterns' (no change at the landing beach, none near).
 - **What an eye costs on the island** (the landing beach, 299 frames, the simulator): CPU 1.0 ms (left) and 0.8 ms (right) for the

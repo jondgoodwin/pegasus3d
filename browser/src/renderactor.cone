@@ -846,7 +846,11 @@ actor RenderActor {
       // cover and the tone-mapping are drawn at full rate)
       let rated = xv.active && g.fovea.level != FOVEATION_OFF && g.fovea.ready(xv.eye);
       if rated { g.renderer.setShadingRate(&g.device, g.fovea.rate(xv.eye), g.fovea.texelWidth, g.fovea.texelHeight); }
+      // (the ray-traced structure is built from the first eye's view and kept for the second, which sees nearly what it sees:
+      // PEGASUS_XR_RT_SHARE=off builds one for each eye, to measure what sharing saves)
+      g.renderer.rtShare = if xv.active && (libc.getenv("PEGASUS_XR_RT_SHARE") as usize) == 0usize { if xv.eye == 0usize { 1u32 } else { 2u32 } } else { 0u32 };
       g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &g.camera, &light, &g.sys.list);
+      g.renderer.rtShare = 0u32;
       if rated { g.renderer.clearShadingRate(); }
       renderCallTicks = renderCallTicks + (sdl.GetPerformanceCounter() - callFrom);
       renderCalls = renderCalls + 1u64;
@@ -1224,6 +1228,15 @@ fn makeGfxXr(window: usize, width: u32, height: u32, skyOff: bool, cullMode: u32
     }
   }
   options.foveation = foveaLevel != FOVEATION_OFF;
+  // PEGASUS_XR_RT (off, on; default on): the glass ray-traced as on the desktop, where the headset's device can have ray queries
+  // (asked for at the device's creation, with the runtime's device; PEGASUS_RT=off also keeps the raster glass)
+  var xrRay = true;
+  let xrRayEnv = libc.getenv("PEGASUS_XR_RT");
+  if (xrRayEnv as usize) != 0usize {
+    if libc.strcmp(cstr.fromPtr(xrRayEnv), "off") == 0i32 { xrRay = false; }
+    else if libc.strcmp(cstr.fromPtr(xrRayEnv), "on") != 0i32 { print <- "PEGASUS_XR_RT is not off or on: on\n"; }
+  }
+  options.rayTracing = xrRay;
   options.mirrorWindow = window;
   options.mirrorWidth = width;
   options.mirrorHeight = height;
@@ -1256,7 +1269,8 @@ fn makeGfxXr(window: usize, width: u32, height: u32, skyOff: bool, cullMode: u32
   let rtEnv = libc.getenv("PEGASUS_RT");
   if (rtEnv as usize) != 0usize { rayWanted = libc.strcmp(cstr.fromPtr(rtEnv), "off") != 0i32; }
   let rayTraced = renderer.setRayTracing(&mut gpu.device, rayWanted);
-  print <- "Glass: "; print <- if rayTraced { "ray-traced" } else { "raster (the headset's device has no ray queries)" }; print <- "\n";
+  print <- "Glass: "; print <- if rayTraced { "ray-traced" } else if !xrRay { "raster (PEGASUS_XR_RT=off)" } else if !rayWanted { "raster (PEGASUS_RT=off)" }
+    else { "raster (the headset's device has no ray queries)" }; print <- "\n";
   var post = Post.create(&mut gpu.device, headset.colorFormat, headset.eyeWidth, headset.eyeHeight);
   lookPost(&mut post);
   renderer.keepDepth = true;
