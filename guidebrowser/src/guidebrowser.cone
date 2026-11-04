@@ -261,8 +261,72 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
   shell = g;
 }
 
+// The slot of the nearest part whose drawn surface the ray from 'eye' along 'direction' meets (NO_CLICK if none). A part's box is only
+// the first, cheap test: a ray that enters it is then tested against the part's triangles, so a tall piece's empty box (the air
+// beside a chess queen, say) takes no click meant for a pawn behind it.
+fn nearestPart(parts: &mut List[Live], eye: Vec3, direction: Vec3) u32 {
+  var best = 1.0e30f;
+  var hit = NO_CLICK;
+  var k = 0usize;
+  while k < parts.len() {
+    let part = &mut parts[k];
+    let back = part.place.inverse();
+    let ray = Ray3(back * eye, back.transformVector(direction));
+    var enters = false;
+    match ray.intersectAabb(Aabb3(part.low, part.high)) {
+      case let Some(t) { enters = t < best; }
+      case is None {}
+    }
+    if enters {
+      var t = 0usize;
+      while t + 2usize < part.indices.len() {
+        let a = *part.positions[usize.from(*part.indices[t])];
+        let b = *part.positions[usize.from(*part.indices[t + 1usize])];
+        let c = *part.positions[usize.from(*part.indices[t + 2usize])];
+        match ray.intersectTriangle(a, b, c) {
+          case let Some(d) { if d >= 0. && d < best { best = d; hit = part.slot; } }
+          case is None {}
+        }
+        t = t + 3usize;
+      }
+    }
+    k = k + 1usize;
+  }
+  hit
+}
+
+// --check-pick: a click on a piece behind another's bounding box picks the right one (no window, no GPU)
+fn checkPick() bool {
+  var parts = List[Live].empty();
+  // A: a thin triangle in z = 0 covering the lower left of its 4 x 4 box (x + y <= 4). B: a square at z = -2 around (3, 3).
+  var pa = List[Vec3].empty();
+  pa.push(Vec3(0., 0., 0.)); pa.push(Vec3(4., 0., 0.)); pa.push(Vec3(0., 4., 0.));
+  var ia = List[u32].empty();
+  ia.push(0u32); ia.push(1u32); ia.push(2u32);
+  parts.push(Live(1u32, String.from("front piece"), MeshHandle.none(), MaterialHandle.none(), Vec3(0., 0., 0.), Vec3(4., 4., 0.01),
+    Mat4.identity(), pa, ia));
+  var pb = List[Vec3].empty();
+  pb.push(Vec3(2.5, 2.5, 0. - 2.)); pb.push(Vec3(3.5, 2.5, 0. - 2.)); pb.push(Vec3(3.5, 3.5, 0. - 2.)); pb.push(Vec3(2.5, 3.5, 0. - 2.));
+  var ib = List[u32].empty();
+  ib.push(0u32); ib.push(1u32); ib.push(2u32); ib.push(0u32); ib.push(2u32); ib.push(3u32);
+  parts.push(Live(2u32, String.from("piece behind"), MeshHandle.none(), MaterialHandle.none(), Vec3(2.5, 2.5, 0. - 2.01), Vec3(3.5, 3.5, 0. - 1.99),
+    Mat4.identity(), pb, ib));
+  var ok = true;
+  let down = Vec3(0., 0., 0. - 1.);
+  let through = nearestPart(&mut parts, Vec3(3., 3., 5.), down);
+  print <- "check-pick: through the front piece's empty box corner, the piece behind: "; print <- through; print <- if through == 2u32 { " ok\n" } else { " WRONG\n" };
+  ok = ok && through == 2u32;
+  let onFront = nearestPart(&mut parts, Vec3(1., 1., 5.), down);
+  print <- "check-pick: through the front piece's own triangle, the front piece: "; print <- onFront; print <- if onFront == 1u32 { " ok\n" } else { " WRONG\n" };
+  ok = ok && onFront == 1u32;
+  let missed = nearestPart(&mut parts, Vec3(3.5, 0.8, 5.), down);
+  print <- "check-pick: through the box corner above both, nothing: "; print <- missed; print <- if missed == NO_CLICK { " ok\n" } else { " WRONG\n" };
+  ok = ok && missed == NO_CLICK;
+  ok
+}
+
 // The part drawn under (x, y), in the window's units, clicked: the nearest
-// whose box the ray from the eye through that point meets
+// whose triangles the ray from the eye through that point meets
 fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   let tw = f32.from(s.target.texture.width);
   let th = f32.from(s.target.texture.height);
@@ -271,19 +335,8 @@ fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
   let eye = s.camera.origin;
   let direction = (p.xyz() * (1. / p.w) - eye).normalize();
-  var best = 1.0e30f;
-  var hit = NO_CLICK;
+  let hit = nearestPart(&mut s.scene.parts, eye, direction);
   var k = 0usize;
-  while k < s.scene.parts.len() {
-    let part = s.scene.parts[k];
-    let back = part.place.inverse();
-    let ray = Ray3(back * eye, back.transformVector(direction));
-    match ray.intersectAabb(Aabb3(part.low, part.high)) {
-      case let Some(t) { if t < best { best = t; hit = part.slot; } }
-      case is None {}
-    }
-    k = k + 1usize;
-  }
   print <- "loop: frame "; print <- frame; print <- ", a click at ("; print <- x; print <- ", "; print <- y; print <- "): ";
   if hit == NO_CLICK { print <- "nothing\n"; return; }
   k = 0usize;
@@ -410,7 +463,13 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
         if look.covers < 1. { plain = plain.translucent(look.covers); }
         material = s.renderer.addMaterial(&mut s.device, &plain);
       }
-      s.scene.parts.push(Live(p.built.slot, p.built.name.copy(), mesh, material, p.built.low, p.built.high, p.built.place));
+      var ps = List[Vec3].withCapacity(p.built.mesh.positions.len());
+      var pi = 0usize;
+      while pi < p.built.mesh.positions.len() { ps.push(*p.built.mesh.positions[pi]); pi = pi + 1usize; }
+      var ix = List[u32].withCapacity(p.built.mesh.indices.len());
+      pi = 0usize;
+      while pi < p.built.mesh.indices.len() { ix.push(*p.built.mesh.indices[pi]); pi = pi + 1usize; }
+      s.scene.parts.push(Live(p.built.slot, p.built.name.copy(), mesh, material, p.built.low, p.built.high, p.built.place, ps, ix));
       s.activated = s.activated + 1u64;
       print <- "loop: frame "; print <- frame; print <- ", "; printStr(p.built.name.view());
       print <- " live: mesh and material to the GPU in "; print <- micros(began, sdl.GetPerformanceCounter()); print <- " us\n";
@@ -717,6 +776,9 @@ fn argNumber(argv: **u8, a: i32) f64 {
 }
 
 fn main(argc: i32, argv: **u8) i32 {
+  if argc > 1i32 && libc.strcmp(cstr.fromPtr(*(argv + 1usize)), "--check-pick") == 0i32 {
+    return if checkPick() { 0i32 } else { 1i32 };
+  }
   initAll();
   programPath = *argv;
   var a = 1i32;
