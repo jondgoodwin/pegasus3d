@@ -76,9 +76,11 @@ the one against the other, and the before pictures).
   rocks about the deck with its sitter, 0.09 rad every 3.2 s of scene time, the view's `rockSeats`), the labyrinth's throne (the feet on
   its plinth) and the east parapet of the bridge (a perch on the coping). The HUD names the key worth pressing (`S sit`, `S stand up`,
   `H hail`) under the clock.
-- **On the wire.** `PROTOCOL_VERSION` 3: `BeingAdded` carries the person, the input's flags carry S and H, and a snapshot's being carries,
-  only while it is sitting or hailing, a pose byte (with the seat and how far the sit is, a byte each, and the hail's age): a being doing
-  neither costs nothing more.
+- **On the wire.** `PROTOCOL_VERSION` 4 (3 was people: `BeingAdded` carries the person, the input's flags carry S and H, and a snapshot's
+  being carries, only while it is sitting or hailing, a pose byte (with the seat and how far the sit is, a byte each, and the hail's age): a
+  being doing neither costs nothing more). 4 is a headset's controllers: an input sample whose flag bit 16 is set carries 6 bytes after the
+  look keys (the sideways walk, the snap turns, and the head's place on the floor in millimetres, which a snap turns about); a keyboard's
+  samples are as before, so the version is raised for the one that does not (`--xr`), and a server must be this build to take it.
 
 ## The mannequin
 
@@ -244,8 +246,35 @@ runtime does the lens, the reprojection and the compositing). With no OpenXR run
   the avatar, the headset's forward is the way the avatar faces, and an eye is the feet plus the eye's position in the room's floor
   space (`drawXr` in `renderactor.cone`). There is no follow camera, no eye-height easing and no head bob (the view rig's
   eyes are not used); the one thing under the head that moves is the avatar's feet (the snapshot's `feetFrom`/`feetTo`, eased between
-  steps as the avatar always is). You look around only: nothing in a headset walks or turns the avatar yet, so walking, snap turns and
-  the comfort rules wait for the controllers (a windowed `--xr` run still walks with the keyboard, which moves the feet).
+  steps as the avatar always is). The controllers (below) walk and turn the avatar, and the keyboard still does (a windowed `--xr` run).
+- **The controllers** (`src/xrhands.cone`; needs Cone's controller input in `render`'s `Headset`, PR #856). Hand 0 is the left, 1 the
+  right; their poses are in the eyes' reference space at the same predicted display time, so they are placed on the feet exactly as the
+  eyes are.
+  - **Left stick: walk**, relative to where the HEAD faces (the horizontal part of its forward, not the body's), analog: past a dead zone
+    of 0.2 its length sets the speed up to the normal walk (the left stick clicked: run). It is a forward and a sideways part
+    (`Intents.strafe`, new), since the body faces the room's forward whichever way the head does.
+  - **Right stick: snap turn**: past 0.7 to a side it turns the avatar 30 degrees, once, instantly (no animation), and it is armed again
+    when the stick is back under 0.3. The turn is about the HEAD's place on the floor, not the feet: the feet move so that the head stays
+    where it is in the world (`Being.snapTurn`; `Intents.snap` and the head's offset `pivotX`/`pivotZ`).
+  - **Aim beam and trigger**: each active hand's aim ray picks (the mouse's ray is not used for it). A thin pale beam is drawn from the aim
+    pose to what the ray hits (at most 5 m), with a small dot where it hits; the trigger (past 0.75, released under 0.5) is the click,
+    along that hand's ray (the right hand first if both go down together), the same click as the mouse's (`ToSim.Click`, the part
+    highlighted). A click that lands on a part buzzes that hand (0.03 s at 0.4). Any pickable part counts: the view does not know which
+    parts the world listens to.
+  - **B or Y: jump**. The menu button does nothing yet (a TODO in `xrhands.cone`: the panels).
+  - A small box is drawn at each grip pose (blue left, orange right; real models later).
+  - **The user's own avatar is not drawn** (he is inside it): it is still simulated and sent to the others, and put out of sight in the
+    view's scene (`placeBeings`) while `--xr` runs; it is not picked either.
+  - **How the hands reach the simulation**: input flows shell -> view -> simulation, and the headset is read in the render actor, so render
+    reports the hands with each frame (`Presented.xr`, in the world, on the feet that frame was drawn with; `FrameReport.xr`), and the shell
+    folds the latest into the NEXT frame's `FrameInput` (`XrControls.fold`: the walk and the turn become the frame's `Intents`, a
+    trigger's click the view's `XrInput.click`). The lag is one frame (about 11-14 ms) beyond the sample, which a walk and a click do not
+    notice; the head itself is never behind (the eyes are read and drawn in the same render turn). A snap turn or a jump asked in a frame
+    with no fixed step (the headset runs faster than 60 Hz) waits for the next frame that has one, and a turn is taken by a frame's first
+    step only.
+  - **Test hook**: with `PEGASUS_XR_FAKE` set to anything (and `--xr`), the simulator's idle controllers get a scripted push of the
+    sticks and triggers by frame number (`XrControls.script`), and the run says where the avatar is every 10 frames and what each snap
+    turn did to the head. Without the variable nothing is faked.
 - **The window mirrors the left eye** (the middle of it, cropped to the window's shape, blitted into the window's swapchain before the
   image goes back to the runtime). The mirror never waits for the display: it is presented in the mailbox mode and skips a frame when
   the window has no free image, so the headset keeps its own rate. `--headless` with `--xr` has no window (and no mirror) but the

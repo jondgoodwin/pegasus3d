@@ -210,27 +210,35 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // Ripples fade out by 300 m, where their slopes would shimmer
     float fadeR = saturate(1.0 - dist / 300.0);
     fadeR *= fadeR;
-    float2 r1 = rippleSlope(xz / 3.5 + float2(0.04, 0.02) * t / 3.5 * 4.0);
-    float2 r2 = rippleSlope(xz / 0.9 - float2(0.05, 0.03) * t / 0.9 * 4.0 + 11.0);
-    n = normalize(n + float3(r1.x * 0.07 + r2.x * 0.03, 0.0, r1.y * 0.07 + r2.y * 0.03) * fadeR);
-
-    // The bed, seen through the water: the refraction shifts where we look a little
-    float2 seen = xz + n.xz * depth0 * 0.15;
-    float bedH = fieldHeight(seen);
-    float depth = max(0.0, sea - bedH);
+    // (past 300 m their weight is nil: the work is skipped, the branch coherent over a distance)
+    if (dist < 300.0) {
+        float2 r1 = rippleSlope(xz / 3.5 + float2(0.04, 0.02) * t / 3.5 * 4.0);
+        float2 r2 = rippleSlope(xz / 0.9 - float2(0.05, 0.03) * t / 0.9 * 4.0 + 11.0);
+        n = normalize(n + float3(r1.x * 0.07 + r2.x * 0.03, 0.0, r1.y * 0.07 + r2.y * 0.03) * fadeR);
+    }
 
     float3 L = frame.lightDirection.xyz;
     float3 skyLight = frame.ambient.rgb;
     float3 sunLight = frame.lightColor.rgb * (max(L.y, 0.0) / RENDER_PI);
     float3 lightOn = skyLight + sunLight;
 
-    // The bed's own colour: sand near the shore, darker in the deep
-    float3 bedAlbedo = lerp(float3(0.55, 0.43, 0.25), float3(0.12, 0.10, 0.07), smoothstep(0.5, 8.0, depth));
-    // Weed and dark rock in patches on the shelf, pale sand bars between them
-    float weed = smoothstep(0.52, 0.72, fbm3(seen * 0.045 + 5.0)) * smoothstep(1.2, 3.0, depth) * (1.0 - smoothstep(9.0, 16.0, depth));
-    bedAlbedo = lerp(bedAlbedo, float3(0.05, 0.075, 0.035), weed * 0.85);
-    bedAlbedo *= 0.85 + 0.3 * vnoise(seen * 0.6);
-    float3 bed = bedAlbedo * lightOn * exp(-depth * 0.25);
+    // The bed, seen through the water: the refraction shifts where we look a little.
+    // Past 16 m of water it is lost: its light fell by e^-4 and the water's body
+    // colour is nearly all that is seen, so the bed is not worked out there.
+    float depth = depth0;
+    float3 bed = float3(0.0, 0.0, 0.0);
+    if (depth0 < 16.0) {
+        float2 seen = xz + n.xz * depth0 * 0.15;
+        float bedH = fieldHeight(seen);
+        depth = max(0.0, sea - bedH);
+        // The bed's own colour: sand near the shore, darker in the deep
+        float3 bedAlbedo = lerp(float3(0.55, 0.43, 0.25), float3(0.12, 0.10, 0.07), smoothstep(0.5, 8.0, depth));
+        // Weed and dark rock in patches on the shelf, pale sand bars between them
+        float weed = smoothstep(0.52, 0.72, fbm3(seen * 0.045 + 5.0)) * smoothstep(1.2, 3.0, depth) * (1.0 - smoothstep(9.0, 16.0, depth));
+        bedAlbedo = lerp(bedAlbedo, float3(0.05, 0.075, 0.035), weed * 0.85);
+        bedAlbedo *= 0.85 + 0.3 * vnoise(seen * 0.6);
+        bed = bedAlbedo * lightOn * exp(-depth * 0.25);
+    }
     // Beer-Lambert: red goes first, in clear water
     float3 sigma = float3(0.85, 0.24, 0.14);
     float3 T = exp(-depth * sigma);
@@ -261,29 +269,51 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     // Surf: lines of foam rolling in to the beach, each a wave breaking (a sharp front and a lace trailing
     // behind it), parallel to the shore (the distance to it taken from the depth over the bed's slope) with
     // gaps along every line; then the swash's lace on the sand's edge. Far out the sea has a few whitecaps.
-    float eg = params.grid.z;
-    float2 slope = float2(fieldHeight(xz + float2(eg, 0.0)) - fieldHeight(xz - float2(eg, 0.0)),
-                          fieldHeight(xz + float2(0.0, eg)) - fieldHeight(xz - float2(0.0, eg))) / (2.0 * eg);
-    float ds = depth0 / max(length(slope), 0.025);          // metres to the shore across the bed
-    float spacing = 8.5;
-    float phase = ds / spacing + t / 9.0;
-    float wid = floor(phase);
-    float saw = phase - wid;
-    float front = smoothstep(0.0, 0.05, saw) * pow(1.0 - smoothstep(0.04, 0.6, saw), 1.6);
-    float gate = smoothstep(0.30, 0.62, vnoise(xz * 0.09 + wid * 7.3));
-    float lace = foamLace(xz * 1.1 + float2(t * 0.05, wid * 3.7));
-    float strength = smoothstep(55.0, 4.0, ds) * (0.55 + 0.45 * hash21(float2(wid, 3.0)));
-    float breakers = front * gate * smoothstep(0.36, 0.5, lace + front * 0.3) * strength * 1.25;
-    breakers *= smoothstep(0.1, 0.5, depth0);               // none on the sand itself
-    // The swash: a wash of lace that climbs and falls on the beach, with a bright rim at the water's edge
-    float thr = 0.34 + 0.20 * sin(6.2831853 * t / 6.5 + 5.0 * vnoise(xz * 0.2));
-    float swashLace = smoothstep(thr, 0.0, depth0) * smoothstep(0.38, 0.7, foamLace(xz * 2.2 + float2(0.0, t * 0.04)));
-    float rim = smoothstep(0.05, 0.0, depth0) * 0.9;
-    float cap = smoothstep(0.17, 0.30, disp.y) * smoothstep(0.5, 0.75, vnoise(xz * 0.7 + t * 0.03)) * smoothstep(2.0, 8.0, depth0) * 0.55;
-    float foam = saturate(breakers + swashLace * 0.9 + rim + cap * foamLace(xz * 0.9));
-    foam *= 1.0 - smoothstep(180.0, 520.0, dist);
-    float3 foamColor = float3(0.95, 0.95, 0.94) * lightOn * 1.15;
-    color = lerp(color, foamColor, foam);
+    // The foam is nil past 520 m; the surf needs the shore within 55 m across the bed
+    // (depth0 under 40 m unless the bed is steeper than 0.7), the swash under 0.6 m of water,
+    // and a whitecap a wave's crest over 2 m of water. Each is skipped where it is nil, in
+    // branches coherent over a distance.
+    if (dist < 520.0) {
+        float foam = 0.0;
+        if (depth0 < 40.0) {
+            float eg = params.grid.z;
+            float2 slope = float2(fieldHeight(xz + float2(eg, 0.0)) - fieldHeight(xz - float2(eg, 0.0)),
+                                  fieldHeight(xz + float2(0.0, eg)) - fieldHeight(xz - float2(0.0, eg))) / (2.0 * eg);
+            float ds = depth0 / max(length(slope), 0.025);          // metres to the shore across the bed
+            float spacing = 8.5;
+            float phase = ds / spacing + t / 9.0;
+            float wid = floor(phase);
+            float saw = phase - wid;
+            float front = smoothstep(0.0, 0.05, saw) * pow(1.0 - smoothstep(0.04, 0.6, saw), 1.6);
+            float gate = smoothstep(0.30, 0.62, vnoise(xz * 0.09 + wid * 7.3));
+            float strength = smoothstep(55.0, 4.0, ds) * (0.55 + 0.45 * hash21(float2(wid, 3.0)));
+            float breakers = 0.0;
+            if (front * gate * strength > 0.0) {
+                float lace = foamLace(xz * 1.1 + float2(t * 0.05, wid * 3.7));
+                breakers = front * gate * smoothstep(0.36, 0.5, lace + front * 0.3) * strength * 1.25;
+                breakers *= smoothstep(0.1, 0.5, depth0);           // none on the sand itself
+            }
+            // The swash: a wash of lace that climbs and falls on the beach, with a bright rim at the water's edge
+            float swashLace = 0.0;
+            if (depth0 < 0.6) {
+                float thr = 0.34 + 0.20 * sin(6.2831853 * t / 6.5 + 5.0 * vnoise(xz * 0.2));
+                swashLace = smoothstep(thr, 0.0, depth0) * smoothstep(0.38, 0.7, foamLace(xz * 2.2 + float2(0.0, t * 0.04)));
+            }
+            float rim = smoothstep(0.05, 0.0, depth0) * 0.9;
+            foam = breakers + swashLace * 0.9 + rim;
+        }
+        float cap = smoothstep(0.17, 0.30, disp.y) * smoothstep(2.0, 8.0, depth0);
+        if (cap > 0.0) {
+            cap *= smoothstep(0.5, 0.75, vnoise(xz * 0.7 + t * 0.03)) * 0.55;
+            if (cap > 0.0) {
+                foam += cap * foamLace(xz * 0.9);
+            }
+        }
+        foam = saturate(foam);
+        foam *= 1.0 - smoothstep(180.0, 520.0, dist);
+        float3 foamColor = float3(0.95, 0.95, 0.94) * lightOn * 1.15;
+        color = lerp(color, foamColor, foam);
+    }
 
     return float4(color * frame.exposure.x, 1.0);
 }

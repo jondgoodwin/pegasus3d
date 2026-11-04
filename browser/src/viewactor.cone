@@ -91,6 +91,7 @@ pub struct FrameInput {
   pub camNote: bool;           // G pressed: the camera is printed as a shot-list section (gallery.cone)
   pub boomKeys: f32;           // '=' 1 to '-' -1: the third-person camera farther or nearer
   pub liftKeys: f32;           // ']' 1 to '[' -1: and higher or lower
+  pub xr: XrInput = XrInput(); // --xr: the controllers of the last frame drawn (xrhands.cone); the walk and snap turn are already in 'intents'
 
   // No frame yet
   pub fn none() FrameInput {
@@ -121,6 +122,7 @@ pub struct FrameReport {
   pub online: bool = false;    // the view is connected to a server (from the start, or since a Join)
   pub dialing: bool = false;   // a Join is dialling: the frame's steps are single player's still
   pub xrEnded: bool = false;   // --xr: the headset's session is over, and so is the run
+  pub xr: XrState = XrState(); // --xr: the head and controllers as the frame drew them (the shell folds them into the next frame's input)
 
   // Nothing yet: what the shell holds until a report comes
   pub fn none() FrameReport {
@@ -282,6 +284,11 @@ pub struct ViewState {
   testBirdsDone: u32 = 0u32;   // a gallery run's: the last flock gather applied here, by its serial
   testLookBirds: bool = false; // and the eye turned to this flock's middle
   notes: u32 = 0u32;           // the camera sections G has printed
+  xrBeam0: f32 = 5.;           // --xr: how far each hand's aim ray reaches a part (at most XR_BEAM_MAX), as picked this frame; given to render
+  xrBeam1: f32 = 5.;
+  xrHit: u32 = 0u32;           // the hands (bit 0 left, 1 right) whose ray reaches a part within XR_BEAM_MAX
+  xrBuzz: u32 = 0u32;          // the hands whose trigger clicked a part this frame
+  xrHome: Vec3 = Vec3(0., 0., 0.);   // the debug line's: where the head stood (in the world) before the step that snapped
 
   pub fn make(birds: Birds, lockstep: bool, audio: AudioView, playerName: String, land: Island, opts: RunOptions) ViewState {
     let still = Pose.look(Vec3(0., 0., 0.), 0., 0.);
@@ -387,6 +394,7 @@ pub struct ViewState {
     if input.fast { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_FAST))); }
     if input.weather { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_WEATHER))); }
     if input.swap && lockstep { net.sendReliable(1u32, encodeToSim(ToSim.Command(COMMAND_SWAP))); }
+    if input.xr.state.valid { self.xrAim(input); }
     if input.click { self.click(input.pointer); }
     // The playground's keys (B, F1 to F3): turned into actions for the simulation, and the lock-on kept
     if input.hudSlots != 0u32 || play.lock.isLocked() {
@@ -419,9 +427,15 @@ pub struct ViewState {
       let step = *input.steps[i];
       if joined {
         seq = seq + 1u64;
-        let sample = InputSample(seq, if opts.creatureWalk { creatureWalkIntents(&creature, &cast, own, localTick) } else { input.intents }, input.lookKeys);
+        // (a headset's snap turn is taken once, by the frame's first step)
+        var stepIntents = input.intents;
+        if i > 0usize { stepIntents.snap = 0i32; }
+        let sample = InputSample(seq, if opts.creatureWalk { creatureWalkIntents(&creature, &cast, own, localTick) } else { stepIntents }, input.lookKeys);
         recent.push(sample);
+        let snapped = input.xr.debug && sample.intents.snap != 0i32 && own != NO_ROW && ownReady;
+        if snapped { self.xrHome = self.xrHeadAt(sample.intents); }
         self.stepOwn(sample, step);
+        if snapped { self.xrSaySnap(sample.intents); }
       }
       birds.step(&land, step.dt * f32.from(rate));
       stepSeconds = stepSeconds + step.dt;
@@ -503,9 +517,25 @@ pub struct ViewState {
     let t0 = sdl.GetPerformanceCounter();
     let hit = picks.pick(&scene, ray);
     let us = f64.from(sdl.GetPerformanceCounter() - t0) / f64.from(sdl.GetPerformanceFrequency()) * 1.0e6;
+    print <- "Click at ("; print <- pointer.x; print <- ", "; print <- pointer.y; print <- "): ";
+    self.landClick(hit, us);
+  }
+
+  // A controller's trigger, --xr: a click along the ray of hand 'hand' (0 left, 1 right) from 'origin' toward 'direction'. The same
+  // click as the mouse's, picked along a different ray. True if it landed on a part (the hand buzzes).
+  fn clickAlong(self: &mut, hand: usize, origin: Vec3, direction: Vec3) bool {
+    let t0 = sdl.GetPerformanceCounter();
+    let hit = picks.pick(&scene, Ray3(origin, direction));
+    let us = f64.from(sdl.GetPerformanceCounter() - t0) / f64.from(sdl.GetPerformanceFrequency()) * 1.0e6;
+    print <- "Click with the "; print <- if hand == 0usize { "left" } else { "right" }; print <- " controller: ";
+    self.landClick(hit, us);
+    !hit.id.isNone()
+  }
+
+  // What a click's pick did, whichever ray it was picked along: counted, reported, highlighted, and told to the simulation
+  fn landClick(self: &mut, hit: PickHit, us: f64) {
     clicks = clicks + 1u64;
     lastPick = hit;
-    print <- "Click at ("; print <- pointer.x; print <- ", "; print <- pointer.y; print <- "): ";
     if hit.id.isNone() {
       print <- "nothing";
     } else {
@@ -520,6 +550,82 @@ pub struct ViewState {
       net.sendReliable(1u32, encodeToSim(ToSim.Click(hit.id)));
     }
     picked = hit.id;
+  }
+
+  // --xr: each active hand's aim ray picks (instead of the mouse's): the beams' lengths and dots for render, and a trigger's click
+  // (from the shell's input: the hand whose trigger went down) along that hand's ray. The hands are those of the last frame drawn,
+  // placed on the feet it was drawn with, so a ray here is the ray the user saw. A click that lands on a part buzzes the hand.
+  fn xrAim(self: &mut, input: &FrameInput) {
+    xrBeam0 = XR_BEAM_MAX;
+    xrBeam1 = XR_BEAM_MAX;
+    xrHit = 0u32;
+    xrBuzz = 0u32;
+    var h = 0usize;
+    while h < 2usize {
+      let hand = input.xr.state.hand(h);
+      if hand.active && hand.aimValid {
+        var origin = hand.aimPos;
+        var direction = hand.aimDir;
+        // (the test, PEGASUS_XR_FAKE: the right hand's ray is pointed at the nearest part for a while, so that a click lands)
+        if input.xr.fakeAim && h == 1usize { direction = self.xrFakeAim(origin, direction); }
+        let hit = picks.pick(&scene, Ray3(origin, direction));
+        var reach = XR_BEAM_MAX;
+        if !hit.id.isNone() && hit.distance < XR_BEAM_MAX {
+          reach = hit.distance;
+          xrHit = xrHit | (1u32 << u32.from(h));
+        }
+        if h == 0usize { xrBeam0 = reach; } else { xrBeam1 = reach; }
+        if input.xr.click == i32.from(h) {
+          if self.clickAlong(h, origin, direction) { xrBuzz = xrBuzz | (1u32 << u32.from(h)); }
+        }
+      }
+      h = h + 1usize;
+    }
+    if input.xr.debug && input.frame % 10u64 == 0u64 && own < cast.beings.len() {
+      let b = cast.beings[own].body;
+      print <- "XR frame "; print <- input.frame; print <- ": feet ("; print <- b.position.x; print <- ", "; print <- b.position.z; print <- ") facing ";
+      print <- b.yaw * 57.29578; print <- " deg; ahead "; print <- input.intents.ahead; print <- ", strafe "; print <- input.intents.strafe;
+      print <- ", "; print <- if input.intents.run { "running" } else { "walking" }; print <- if input.intents.jump { ", jump" } else { "" };
+      print <- ", beams "; print <- xrBeam0; print <- " m / "; print <- xrBeam1; print <- " m\n";
+    }
+  }
+
+  // The test's aim (PEGASUS_XR_FAKE): the direction from 'origin' to the middle of the nearest pickable part (the user's own being,
+  // and the parts of it, aside) within 40 m; 'direction' if there is none
+  fn xrFakeAim(self: &mut, origin: Vec3, direction: Vec3) Vec3 {
+    var best = 40.f;
+    var target = origin + direction;
+    var i = 0usize;
+    while i < picks.parts.len() {
+      let id = *picks.parts.ids[i];
+      let b = picks.boundsOf(id);
+      let w = scene.worldMatrix(id);
+      let middle = w * Vec3((b.min.x + b.max.x) * 0.5, (b.min.y + b.max.y) * 0.5, (b.min.z + b.max.z) * 0.5);
+      let away = (middle - origin).length();
+      var mine = false;
+      if own < cast.beings.len() { mine = id == cast.beings[own].part; }
+      if away > 0.5 && away < best && !mine && b.max.x > b.min.x {
+        best = away;
+        target = middle;
+      }
+      i = i + 1usize;
+    }
+    (target - origin).normalize()
+  }
+
+  // The head's place in the world as a snap turn's intents have it (the body's place, and the head's offset turned by its yaw): the
+  // debug line's check that a snap turns about the head
+  fn xrHeadAt(self: &mut, it: Intents) Vec3 {
+    let body = cast.beings[own].body;
+    body.position + Quat.angleAxis(body.yaw, Vec3(0., 1., 0.)) * Vec3(it.pivotX, 0., it.pivotZ)
+  }
+
+  fn xrSaySnap(self: &mut, it: Intents) {
+    let after = self.xrHeadAt(it);
+    let body = cast.beings[own].body;
+    let away = Vec3(after.x - xrHome.x, 0., after.z - xrHome.z).length();
+    print <- "XR snap turn: "; print <- i64.from(it.snap); print <- " x 30 degrees about the head ("; print <- it.pivotX; print <- ", "; print <- it.pivotZ;
+    print <- "); the avatar now faces "; print <- body.yaw * 57.29578; print <- " degrees; the head moved "; print <- away * 1000.; print <- " mm\n";
   }
 
   // Part 'id' drawn highlighted ('on') or as it is, if it is live
@@ -1266,6 +1372,9 @@ pub struct ViewState {
         var at = b.body.position;
         if drawn { at = at + corr; }
         if !known { at = Vec3(0., 0. - 5000., 0.); }
+        // A headset's own avatar is not drawn for its user (he is inside it: the head is the camera), though it is still simulated, sent
+        // to the others: it is put where a being not yet known is, far below the island
+        if opts.xr && drawn { at = Vec3(0., 0. - 5000., 0.); }
         // A sitter on a rocker rocks with its seat (about the floor under it): placed afresh each frame it does
         let rocking = b.figure.active && b.figure.mode == FIG_SIT && b.figure.seat >= 0i32 && known && self.seatRocks(usize.from(u32.from(b.figure.seat)));
         if rocking {
@@ -1508,6 +1617,10 @@ pub struct ViewState {
     // (a gallery run draws off screen, at the size its shot says)
     order.capW = testW;
     order.capH = testH;
+    order.xrBeam0 = xrBeam0;
+    order.xrBeam1 = xrBeam1;
+    order.xrHit = xrHit;
+    order.xrBuzz = xrBuzz;
     order
   }
 
@@ -1896,6 +2009,7 @@ actor ViewActor {
       you, waiting, parts, p.rows, p.emitters, worldDone, worldSent, st.refusedNow, p.join.copy());
     report.panel = p.panel;
     report.xrEnded = p.xrEnded;
+    report.xr = p.xr;
     report.online = !st.lockstep;
     report.dialing = dialSince != 0u64;
     frames <- report;

@@ -553,6 +553,11 @@ fn shellRun(config: Config, startup: Startup) i32 {
   var refusedRun = false;
   var wentOnline = false;       // the view switched to a server (a Join): its socket's thread needs time to stop, as a --connect run's
   var panelWatch = PanelWatch.make();   // the panel's scripted run: where the player was (panelscript.cone)
+  // --xr: the controllers. The hands are read by render with each frame's eyes and come back in its report; they are folded into the
+  // next frame's input (one frame of lag), and PEGASUS_XR_FAKE (a test: set to anything) gives the simulator's idle ones a scripted push
+  // of the sticks and triggers (xrhands.cone)
+  var xrControls = XrControls.make(opts.xr && (libc.getenv("PEGASUS_XR_FAKE") as usize) != 0usize);
+  var xrState = XrState();
 
   while host.beginFrame() {
     if opts.runForSeconds > 0u64 && sdl.GetTicksNS() - runStart > opts.runForSeconds * 1000000000u64 { break; }
@@ -628,13 +633,20 @@ fn shellRun(config: Config, startup: Startup) i32 {
       intentsNow.hail = true;
       shell.hailHold = shell.hailHold - 1u32;
     }
+    // --xr: the controllers of the last frame drawn walk, turn, run and jump the avatar (and click, in the view)
+    var xrIn = XrInput();
+    if opts.xr {
+      let folded = xrControls.fold(host.frame, steps.len(), &xrState, intentsNow);
+      intentsNow = folded.intents;
+      xrIn = folded.input;
+    }
     let input = FrameInput(host.frame, steps, intentsNow, shell.user.lookKeys(&shell.ctx), shell.user.lookDrag(&shell.ctx),
       shell.ctx.pressed(shell.clockKeys.pause), shell.ctx.pressed(shell.clockKeys.fast), shell.ctx.pressed(shell.clockKeys.weather),
       shell.ctx.pressed(shell.user.actions.view), shell.ctx.pressed(shell.user.actions.swap),
       (shell.state.buttonsPressed & sdl.BUTTON_MASK_LEFT) != 0u, Vec2(shell.state.pointer.x, shell.state.pointer.y),
       viewNow, alpha, resized, width, height, shell.ctx.pressed(shell.hudKeys.hide), shell.hudKeys.pressedSlots(&shell.ctx),
       shell.panel.take(), panelHint, shell.ctx.pressed(shell.hudKeys.cam), shell.user.boomKeys(&shell.ctx),
-      shell.user.liftKeys(&shell.ctx));
+      shell.user.liftKeys(&shell.ctx), xrIn);
     view.frame(input);
 
     // The frame comes back presented, with each actor's phases
@@ -662,6 +674,7 @@ fn shellRun(config: Config, startup: Startup) i32 {
     }
     // --xr: the headset's session is over (the runtime ended it): so is the run
     if report.xrEnded { break; }
+    xrState = report.xr;
     host.stats.phase(PHASE_SIMULATE).add(report.simulateNs, host.frame);
     host.stats.phase(PHASE_PUBLISH).add(report.publishNs, host.frame);
     host.stats.phase(PHASE_RENDER).add(report.renderNs, host.frame);

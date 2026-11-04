@@ -256,6 +256,12 @@ float3 gravelColor(float2 xz, float fp, float farB) {
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target {
     float3 p = input.world;
+    // Ground a metre or more under the sea, seen from above it, is hidden by
+    // the water (opaque, its waves under 0.4 m): shade nothing. The test is
+    // coherent over a draw's pixels but along the shoreline.
+    if (p.y < -1.0 && frame.cameraPosition.y > 0.6) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
     float2 xz = p.xz;
     float h = fieldHeight(xz);
     float3 n = fieldNormal(xz);
@@ -272,89 +278,156 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     float near = saturate(1.0 - dist / 80.0);
 
     float fp = length(float2(length(ddx(xz)), length(ddy(xz))));    // the metres a pixel covers
-    float macro = fbm4(xz * 0.018);
+
+    // Each material's colour is worked out only where its weight is not nil (every skip below is exact:
+    // a weight of 0 multiplies the term out, and the bounds of the noises, 0 to 1.003, are used for the
+    // tests; the branches hold no derivatives, so a quad may divide)
     // The far field's variation, from the maps and the field alone (the same at any distance): a slope-sized
     // noise (300 m) and a hill-sized one (100 m) say where it is lush and where dry; the ground's own
     // curvature over 6 m says where it hollows (gullies, hollows: damp, dark, mossy) and where it is a rib
-    float big = fbm4(xz * 0.0035 + 71.0);
     float mid = fbm4(xz * 0.011 + 13.0);
     float grove = mask.a;
     float ce = 9.0;
     float curv = (fieldHeight(xz + float2(ce, 0.0)) + fieldHeight(xz - float2(ce, 0.0)) + fieldHeight(xz + float2(0.0, ce)) + fieldHeight(xz - float2(0.0, ce)) - 4.0 * h) / (ce * ce);
     float cavity = saturate(curv * 16.0);
     float rib = saturate(0.0 - curv * 16.0);
-    float moist = saturate(1.1 - h / 85.0 + (big - 0.5) * 1.2 + (mid - 0.5) * 0.5 + cavity * 0.25);
 
-    float sandBreak = (fbm4(xz * 0.07) - 0.5) * 1.4;
+    // The beach's edge is broken by a noise of up to 0.7 m: past 3.95 m it cannot matter
+    float sandBreak = 0.0;
+    if (h < 3.95) {
+        sandBreak = (fbm4(xz * 0.07) - 0.5) * 1.4;
+    }
     float wSand = smoothstep(2.7, 1.3, h + sandBreak);
-    float rockBreak = (fbm4(xz * 0.05 + 4.0) - 0.5) * 0.16 + (mid - 0.5) * 0.06 - rib * 0.05 + cavity * 0.02;
     float alt = smoothstep(80.0, 140.0, h);
-    float wRock = smoothstep(0.84, 0.72, n.y + rockBreak - alt * 0.05);
-    // Scree: loose stone skirting the rock, grass coming through it
-    float wScree = smoothstep(0.90, 0.82, n.y + rockBreak * 0.7 - alt * 0.03) * (1.0 - wRock) * smoothstep(25.0, 60.0, h) * 0.8;
+    // Rock and scree: none where the ground is flat enough that even the noise's lowest value leaves them nil
+    float rbLo = -0.11 - rib * 0.05;
+    float rockBreak = 0.0;
+    float wRock = 0.0;
+    float wScree = 0.0;
+    if (n.y + rbLo - alt * 0.05 < 0.84 || n.y + 0.7 * rbLo - alt * 0.03 < 0.90) {
+        rockBreak = (fbm4(xz * 0.05 + 4.0) - 0.5) * 0.16 + (mid - 0.5) * 0.06 - rib * 0.05 + cavity * 0.02;
+        wRock = smoothstep(0.84, 0.72, n.y + rockBreak - alt * 0.05);
+        // Scree: loose stone skirting the rock, grass coming through it
+        wScree = smoothstep(0.90, 0.82, n.y + rockBreak * 0.7 - alt * 0.03) * (1.0 - wRock) * smoothstep(25.0, 60.0, h) * 0.8;
+    }
     float wLitter = max(litter * 0.72, grove * 0.85) * (1.0 - wSand) * (1.0 - wRock);
     float wGrass = (1.0 - wSand) * (1.0 - wRock) * (1.0 - wLitter);
     wSand *= (1.0 - wRock);
+    bool needRock = wRock > 0.0 || wScree > 0.0;
+    bool needGrass = wGrass > 0.0 || wLitter > 0.0 || wScree > 0.0;
+
+    float macro = 0.5;
+    if (wSand > 0.0 || needGrass) {
+        macro = fbm4(xz * 0.018);
+    }
+    float big = 0.5;
+    if (needRock || needGrass) {
+        big = fbm4(xz * 0.0035 + 71.0);
+    }
+    float moist = saturate(1.1 - h / 85.0 + (big - 0.5) * 1.2 + (mid - 0.5) * 0.5 + cavity * 0.25);
 
     // Sand: ripples across it and grain, darker where the swash wets it (a warm brown, not a grey)
-    float swash = 0.30 + 0.20 * sin(6.2831853 * t / 7.0 + 6.0 * vnoise(xz * 0.15));
-    float wet = smoothstep(swash + 0.30, swash - 0.05, h);
-    float grain = vnoise(xz * 38.0) * 0.5 + vnoise(xz * 9.0) * 0.5;
-    float ripple = vnoise(float2(xz.x * 2.0 + vnoise(xz * 0.5) * 6.0, xz.y * 0.35));
-    float3 sand = SAND * (0.82 + 0.22 * ripple + 0.2 * (grain - 0.5) * near + 0.15 * (macro - 0.5));
-    // The dry upper beach is paler and warmer; the wet is a deeper, redder brown
-    sand = lerp(sand, sand * float3(1.22, 1.14, 1.0), smoothstep(0.9, 2.4, h) * 0.8);
-    sand *= lerp(float3(1.0, 1.0, 1.0), float3(0.58, 0.49, 0.40), wet);
-    // The high-tide wrack line: a dark, broken band of weed and shell grit where the swash tops out
-    float wrackAt = swash + 0.42 + (vnoise(xz * 0.9) - 0.5) * 0.35;
-    float wrack = exp(-pow((h - wrackAt) / 0.035, 2.0)) * smoothstep(0.35, 0.7, vnoise(xz * 6.0 + 2.0) * 0.6 + vnoise(xz * 1.7) * 0.4);
-    sand = lerp(sand, float3(0.09, 0.07, 0.04) * (0.6 + 0.8 * vnoise(xz * 23.0)), wrack * 0.55);
-    sand += step(0.955, vnoise(xz * 47.0)) * 0.10 * near * (1.0 - wet);    // shell grit
+    float3 sand = float3(0.0, 0.0, 0.0);
+    float wet = 0.0;
+    if (wSand > 0.0) {
+        float swash = 0.30 + 0.20 * sin(6.2831853 * t / 7.0 + 6.0 * vnoise(xz * 0.15));
+        wet = smoothstep(swash + 0.30, swash - 0.05, h);
+        float grain = 0.5;
+        if (near > 0.0) {
+            grain = vnoise(xz * 38.0) * 0.5 + vnoise(xz * 9.0) * 0.5;
+        }
+        float ripple = vnoise(float2(xz.x * 2.0 + vnoise(xz * 0.5) * 6.0, xz.y * 0.35));
+        sand = SAND * (0.82 + 0.22 * ripple + 0.2 * (grain - 0.5) * near + 0.15 * (macro - 0.5));
+        // The dry upper beach is paler and warmer; the wet is a deeper, redder brown
+        sand = lerp(sand, sand * float3(1.22, 1.14, 1.0), smoothstep(0.9, 2.4, h) * 0.8);
+        sand *= lerp(float3(1.0, 1.0, 1.0), float3(0.58, 0.49, 0.40), wet);
+        // The high-tide wrack line: a dark, broken band of weed and shell grit where the swash tops out
+        float wrackAt = swash + 0.42 + (vnoise(xz * 0.9) - 0.5) * 0.35;
+        float wrackW = exp(-pow((h - wrackAt) / 0.035, 2.0));
+        if (wrackW > 0.0) {
+            float wrack = wrackW * smoothstep(0.35, 0.7, vnoise(xz * 6.0 + 2.0) * 0.6 + vnoise(xz * 1.7) * 0.4);
+            sand = lerp(sand, float3(0.09, 0.07, 0.04) * (0.6 + 0.8 * vnoise(xz * 23.0)), wrack * 0.55);
+        }
+        if (near > 0.0) {
+            sand += step(0.955, vnoise(xz * 47.0)) * 0.10 * near * (1.0 - wet);    // shell grit
+        }
+    }
 
     // Grass: dry gold, meadow green and lush deep green by how moist the ground is, fine blades, a few dry stalks
-    float blades = vnoise(xz * 22.0) * 0.6 + vnoise(xz * 63.0) * 0.4;
-    // Patches of lusher and drier grass at two scales (about 50 m and 8 m)
-    float mottle = fbm4(xz * 0.13 + 31.0);
-    float3 grass = lerp(GRASS_A, GRASS_B, smoothstep(0.3, 0.7, macro * 0.6 + mottle * 0.4));
-    grass = lerp(float3(0.25, 0.215, 0.07) * (0.8 + 0.4 * mottle), grass, smoothstep(0.22, 0.52, moist));
-    grass = lerp(grass, float3(0.045, 0.14, 0.03) * (0.8 + 0.4 * mottle), smoothstep(0.62, 0.95, moist) * 0.5);
-    grass *= 0.85 + 0.3 * mottle;
-    grass *= 0.72 + 0.55 * lerp(0.5, blades, near);
-    // Higher up the grass is thinner, darker and browner
-    grass *= lerp(1.0, 0.62, smoothstep(20.0, 120.0, h));
-    grass = lerp(grass, float3(0.21, 0.185, 0.10) * (0.7 + 0.5 * mottle), smoothstep(70.0, 140.0, h) * 0.38);
-    grass = lerp(grass, grass * float3(1.5, 1.2, 0.6), step(0.93, vnoise(xz * 7.0)) * 0.6);
-    // Dune grass between the beach and the lawn: sparse, straw-coloured, sand showing through in flecks
-    float wDune = smoothstep(1.7, 2.7, h + sandBreak * 0.8) * (1.0 - smoothstep(2.7, 3.5, h + sandBreak * 0.6));
-    float tuft = smoothstep(0.45, 0.7, vnoise(xz * 3.3) * 0.6 + vnoise(xz * 11.0) * 0.4);
-    grass = lerp(grass, lerp(SAND * float3(0.9, 0.9, 0.8), float3(0.30, 0.29, 0.10) * (0.8 + 0.4 * mottle), tuft), wDune * 0.6);
+    float3 grass = float3(0.0, 0.0, 0.0);
+    float mottle = 0.5;
+    if (needGrass) {
+        float blades = 0.5;
+        if (near > 0.0) {
+            blades = lerp(0.5, vnoise(xz * 22.0) * 0.6 + vnoise(xz * 63.0) * 0.4, near);
+        }
+        // Patches of lusher and drier grass at two scales (about 50 m and 8 m)
+        mottle = fbm4(xz * 0.13 + 31.0);
+        grass = lerp(GRASS_A, GRASS_B, smoothstep(0.3, 0.7, macro * 0.6 + mottle * 0.4));
+        grass = lerp(float3(0.25, 0.215, 0.07) * (0.8 + 0.4 * mottle), grass, smoothstep(0.22, 0.52, moist));
+        grass = lerp(grass, float3(0.045, 0.14, 0.03) * (0.8 + 0.4 * mottle), smoothstep(0.62, 0.95, moist) * 0.5);
+        grass *= 0.85 + 0.3 * mottle;
+        grass *= 0.72 + 0.55 * blades;
+        // Higher up the grass is thinner, darker and browner
+        grass *= lerp(1.0, 0.62, smoothstep(20.0, 120.0, h));
+        grass = lerp(grass, float3(0.21, 0.185, 0.10) * (0.7 + 0.5 * mottle), smoothstep(70.0, 140.0, h) * 0.38);
+        grass = lerp(grass, grass * float3(1.5, 1.2, 0.6), step(0.93, vnoise(xz * 7.0)) * 0.6);
+        // Dune grass between the beach and the lawn: sparse, straw-coloured, sand showing through in flecks
+        float wDune = smoothstep(1.7, 2.7, h + sandBreak * 0.8) * (1.0 - smoothstep(2.7, 3.5, h + sandBreak * 0.6));
+        if (wDune > 0.0) {
+            float tuft = smoothstep(0.45, 0.7, vnoise(xz * 3.3) * 0.6 + vnoise(xz * 11.0) * 0.4);
+            grass = lerp(grass, lerp(SAND * float3(0.9, 0.9, 0.8), float3(0.30, 0.29, 0.10) * (0.8 + 0.4 * mottle), tuft), wDune * 0.6);
+        }
+    }
 
     // Forest litter: soil with leaves lying on it, in clumps
-    float leafMask = smoothstep(0.58, 0.70, vnoise(xz * 17.0 + 3.3) * 0.6 + vnoise(xz * 5.1) * 0.4);
-    float3 litterCol = lerp(SOIL * (0.7 + 0.6 * vnoise(xz * 11.0)), LEAF * (0.6 + 0.8 * vnoise(xz * 29.0)), leafMask * near);
-    // Undergrowth: grass comes through the leaf mould, more in the distance
-    litterCol = lerp(litterCol, grass * 0.55, 0.3 + 0.4 * (1.0 - near));
-    // Under a grove: the needle floor's dark green-brown, in mottles (seen from afar the crowns' shade)
-    float3 groveCol = lerp(float3(0.022, 0.040, 0.016), float3(0.040, 0.050, 0.020), mottle) * (0.7 + 0.6 * vnoise(xz * 2.1));
-    litterCol = lerp(litterCol, groveCol, saturate(grove * 1.6) * (1.0 - 0.55 * near));
+    float3 litterCol = float3(0.0, 0.0, 0.0);
+    if (wLitter > 0.0) {
+        float leafMask = 0.0;
+        float3 leafCol = LEAF;
+        if (near > 0.0) {
+            leafMask = smoothstep(0.58, 0.70, vnoise(xz * 17.0 + 3.3) * 0.6 + vnoise(xz * 5.1) * 0.4);
+            leafCol = LEAF * (0.6 + 0.8 * vnoise(xz * 29.0));
+        }
+        litterCol = lerp(SOIL * (0.7 + 0.6 * vnoise(xz * 11.0)), leafCol, leafMask * near);
+        // Undergrowth: grass comes through the leaf mould, more in the distance
+        litterCol = lerp(litterCol, grass * 0.55, 0.3 + 0.4 * (1.0 - near));
+        // Under a grove: the needle floor's dark green-brown, in mottles (seen from afar the crowns' shade)
+        float3 groveCol = lerp(float3(0.022, 0.040, 0.016), float3(0.040, 0.050, 0.020), mottle) * (0.7 + 0.6 * vnoise(xz * 2.1));
+        litterCol = lerp(litterCol, groveCol, saturate(grove * 1.6) * (1.0 - 0.55 * near));
+    }
 
-    float3 rock = rockColor(p, n, fp);
-    // Large patches of cool grey and warm tan, lichen and moss on the lower rock and in the hollows
-    rock *= lerp(float3(0.88, 0.94, 1.02), float3(1.16, 1.02, 0.84), smoothstep(0.3, 0.7, big * 0.6 + mid * 0.5));
-    rock = lerp(rock, rock * float3(0.62, 0.95, 0.48), saturate((1.0 - smoothstep(40.0, 115.0, h)) * 0.55 * smoothstep(0.35, 0.7, vnoise(xz * 0.4)) + cavity * 0.5));
-    // Scree: the rock's own tone, broken, with grass in tufts through it
-    float speck = smoothstep(0.42, 0.62, vnoise(xz * 2.7) * 0.6 + vnoise(xz * 9.0) * 0.4);
-    float3 scree = lerp(rock * 1.12, grass * 0.8, speck * 0.7);
+    float3 rock = float3(0.0, 0.0, 0.0);
+    float3 scree = float3(0.0, 0.0, 0.0);
+    if (needRock) {
+        rock = rockColor(p, n, fp);
+        // Large patches of cool grey and warm tan, lichen and moss on the lower rock and in the hollows
+        rock *= lerp(float3(0.88, 0.94, 1.02), float3(1.16, 1.02, 0.84), smoothstep(0.3, 0.7, big * 0.6 + mid * 0.5));
+        rock = lerp(rock, rock * float3(0.62, 0.95, 0.48), saturate((1.0 - smoothstep(40.0, 115.0, h)) * 0.55 * smoothstep(0.35, 0.7, vnoise(xz * 0.4)) + cavity * 0.5));
+        // Scree: the rock's own tone, broken, with grass in tufts through it
+        if (wScree > 0.0) {
+            float speck = smoothstep(0.42, 0.62, vnoise(xz * 2.7) * 0.6 + vnoise(xz * 9.0) * 0.4);
+            scree = lerp(rock * 1.12, grass * 0.8, speck * 0.7);
+        }
+    }
 
     // The path: packed earth, pebbles, an uneven edge; from afar its width is at least a pixel's or two,
-    // so it stays a line on the hillside rather than flickering out
-    float edge = pathD + (fbm4(xz * 1.6) - 0.5) * 0.5;
+    // so it stays a line on the hillside rather than flickering out. (Its edge wobbles by 0.25 m: the
+    // path and its shoulder are nil beyond the larger of half its width and 1.8 m, plus 0.6 m.)
     float halfW = max(PATH_HALF, fp * 1.2);
-    float wPath = smoothstep(halfW + 0.35, halfW - 0.2, edge);
-    float pebble = smoothstep(0.78, 0.86, vnoise(xz * 26.0 + 9.0));
-    float3 earth = EARTH * (0.8 + 0.4 * vnoise(xz * 14.0)) + pebble * 0.07 * near;
-    // The edge's shoulder: a little darker where the verge meets it
-    earth *= 1.0 - 0.25 * smoothstep(PATH_HALF + 0.9, PATH_HALF, edge) * (1.0 - wPath);
+    float wPath = 0.0;
+    float3 earth = float3(0.0, 0.0, 0.0);
+    if (pathD < max(halfW + 0.6, 2.1)) {
+        float edge = pathD + (fbm4(xz * 1.6) - 0.5) * 0.5;
+        wPath = smoothstep(halfW + 0.35, halfW - 0.2, edge);
+        float pebble = 0.0;
+        if (near > 0.0) {
+            pebble = smoothstep(0.78, 0.86, vnoise(xz * 26.0 + 9.0));
+        }
+        earth = EARTH * (0.8 + 0.4 * vnoise(xz * 14.0)) + pebble * 0.07 * near;
+        // The edge's shoulder: a little darker where the verge meets it
+        earth *= 1.0 - 0.25 * smoothstep(PATH_HALF + 0.9, PATH_HALF, edge) * (1.0 - wPath);
+    }
 
     float3 albedo = sand * wSand + grass * wGrass + litterCol * wLitter + rock * wRock;
     albedo = lerp(albedo, scree, wScree);
@@ -363,35 +436,48 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
     albedo = lerp(albedo, earth, wPath);
 
     // The brook's margin (the mask's blue: metres to the course over 8, smoothed across the 2 m grid):
-    // a damp darker margin in the grass, mud and moss on the banks and a dark wet gravel bed
-    float bd = mask.b * 8.0 + (fbm4(xz * 1.3 + 12.0) - 0.5) * 0.9;
-    float wDamp = smoothstep(4.6, 2.4, bd);
-    float wMud = smoothstep(2.5, 1.5, bd);
-    float wBed = smoothstep(1.55, 0.95, bd);
-    float mossy = smoothstep(0.35, 0.7, vnoise(xz * 3.1 + 5.0) * 0.6 + vnoise(xz * 11.0) * 0.4);
-    float farB = smoothstep(20.0, 80.0, dist);
-    float sandW = saturate(wSand);
-    // Mud and moss at the water's edge (greener far off); on the beach, sand darkened with wet instead
-    float3 mud = lerp(float3(0.050, 0.040, 0.024), float3(0.030, 0.090, 0.020), mossy * 0.8);
-    mud *= 0.8 + 0.4 * vnoise(xz * 17.0);
-    mud = lerp(mud, mud * float3(0.8, 1.2, 0.7), farB);
-    mud = lerp(mud, sand * 0.38, sandW);
-    // The lush margin: the damp ground bears thick, dark, deep green growth (grass, rush, sedge)
-    float lush = smoothstep(4.8, 2.6, bd) * smoothstep(0.7, 1.6, bd) * (1.0 - sandW);
-    float3 lushCol = lerp(float3(0.030, 0.085, 0.018), float3(0.045, 0.115, 0.022), vnoise(xz * 2.3 + 8.0)) * (0.8 + 0.4 * vnoise(xz * 9.0));
-    float3 damp = albedo * lerp(float3(0.46, 0.62, 0.38), float3(0.42, 0.40, 0.36), sandW);
-    albedo = lerp(albedo, damp, wDamp * 0.85);
-    albedo = lerp(albedo, lushCol, lush * 0.8);
-    albedo = lerp(albedo, mud, wMud * 0.85);
-    // The bed: gravel in the grass; at the beach, wet sand
-    float3 wetSand = sand * (0.27 + 0.10 * vnoise(xz * 3.0));
-    float3 bed = lerp(gravelColor(xz, fp, farB), wetSand, smoothstep(0.35, 0.8, sandW));
-    albedo = lerp(albedo, bed, wBed);
-    albedo *= input.tint.rgb;    // A touch of bump from the fine noise, near the eye
-    float bx = vnoise(xz * 9.0 + float2(0.7, 0.0)) - vnoise(xz * 9.0 - float2(0.7, 0.0));
-    float bz = vnoise(xz * 9.0 + float2(0.0, 0.7)) - vnoise(xz * 9.0 - float2(0.0, 0.7));
-    float3 nn = normalize(n + float3(bx, 0.0, bz) * 0.18 * near);
-
+    // a damp darker margin in the grass, mud and moss on the banks and a dark wet gravel bed.
+    // (The noise moves the distance by 0.45 m at most: past 5.3 m nothing of it shows.)
+    float wBed = 0.0;
+    if (mask.b * 8.0 < 5.3) {
+        float bd = mask.b * 8.0 + (fbm4(xz * 1.3 + 12.0) - 0.5) * 0.9;
+        float wDamp = smoothstep(4.6, 2.4, bd);
+        float wMud = smoothstep(2.5, 1.5, bd);
+        wBed = smoothstep(1.55, 0.95, bd);
+        float farB = smoothstep(20.0, 80.0, dist);
+        float sandW = saturate(wSand);
+        // The lush margin: the damp ground bears thick, dark, deep green growth (grass, rush, sedge)
+        float lush = smoothstep(4.8, 2.6, bd) * smoothstep(0.7, 1.6, bd) * (1.0 - sandW);
+        float3 damp = albedo * lerp(float3(0.46, 0.62, 0.38), float3(0.42, 0.40, 0.36), sandW);
+        albedo = lerp(albedo, damp, wDamp * 0.85);
+        if (lush > 0.0) {
+            float3 lushCol = lerp(float3(0.030, 0.085, 0.018), float3(0.045, 0.115, 0.022), vnoise(xz * 2.3 + 8.0)) * (0.8 + 0.4 * vnoise(xz * 9.0));
+            albedo = lerp(albedo, lushCol, lush * 0.8);
+        }
+        // Mud and moss at the water's edge (greener far off); on the beach, sand darkened with wet instead
+        if (wMud > 0.0) {
+            float mossy = smoothstep(0.35, 0.7, vnoise(xz * 3.1 + 5.0) * 0.6 + vnoise(xz * 11.0) * 0.4);
+            float3 mud = lerp(float3(0.050, 0.040, 0.024), float3(0.030, 0.090, 0.020), mossy * 0.8);
+            mud *= 0.8 + 0.4 * vnoise(xz * 17.0);
+            mud = lerp(mud, mud * float3(0.8, 1.2, 0.7), farB);
+            mud = lerp(mud, sand * 0.38, sandW);
+            albedo = lerp(albedo, mud, wMud * 0.85);
+        }
+        // The bed: gravel in the grass; at the beach, wet sand
+        if (wBed > 0.0) {
+            float3 wetSand = sand * (0.27 + 0.10 * vnoise(xz * 3.0));
+            float3 bed = lerp(gravelColor(xz, fp, farB), wetSand, smoothstep(0.35, 0.8, sandW));
+            albedo = lerp(albedo, bed, wBed);
+        }
+    }
+    albedo *= input.tint.rgb;
+    // A touch of bump from the fine noise, near the eye
+    float3 nn = n;
+    if (near > 0.0) {
+        float bx = vnoise(xz * 9.0 + float2(0.7, 0.0)) - vnoise(xz * 9.0 - float2(0.7, 0.0));
+        float bz = vnoise(xz * 9.0 + float2(0.0, 0.7)) - vnoise(xz * 9.0 - float2(0.0, 0.7));
+        nn = normalize(n + float3(bx, 0.0, bz) * 0.18 * near);
+    }
     // How much of the sun arrives (render's cascaded shadow maps: the trees, the cottage and the hill
     // shade the ground); the derivatives it takes need every pixel of a quad to call it
     float visible = sunVisibility(p, n, frame.lightDirection.xyz, input.position.xy);

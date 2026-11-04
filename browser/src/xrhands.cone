@@ -1,0 +1,202 @@
+// The controllers of a headset (--xr), from what the runtime reports to the intents the avatar acts on.
+//
+//   render (drawXr)   reads the hands with the head's pose at the frame's predicted display time, places them in the WORLD on the
+//                     feet the eyes were placed on, and hands them back with the frame (Presented.xr -> FrameReport.xr)
+//   shell             keeps the latest, and folds it into the NEXT frame's input (XrControls.fold): one frame of lag, which is fine
+//                     for a walk and a click, and the pose the pick and the beam use is the frame it was reported with
+//   view              picks along the aim rays (and a trigger's click is the mouse's click along one of them), puts the walk and
+//                     the snap turn into the steps' intents (being.cone: Intents.strafe, .snap), and gives render the beams' lengths
+//
+// The conventions are the standard comfort ones:
+//   - the LEFT stick walks, relative to where the HEAD faces (the horizontal part of its forward), analog: its length sets the speed
+//     up to the normal walk, past a dead zone of 0.2; its click runs
+//   - the RIGHT stick turns in snaps of 30 degrees: past 0.7 to a side it turns once, and it is armed again when it is back under 0.3.
+//     The turn is instant and about the HEAD, so the user does not swing sideways (being.cone: Being.snapTurn)
+//   - the trigger (past 0.75) clicks what its hand's aim ray hits; B or Y jumps; the menu button is for panels (TODO)
+
+// The stick's dead zone, and the snap turn's thresholds (to push past, and to come back under)
+pub const XR_DEAD_ZONE: f32 = 0.2;
+pub const XR_SNAP_PUSH: f32 = 0.7;
+pub const XR_SNAP_REARM: f32 = 0.3;
+// The trigger is down past this, and up again under XR_TRIGGER_UP (so a click is one press)
+pub const XR_TRIGGER_DOWN: f32 = 0.75;
+pub const XR_TRIGGER_UP: f32 = 0.5;
+// How long the aim beam is drawn at most, metres
+pub const XR_BEAM_MAX: f32 = 5.;
+// The buzz of a click that lands on something: seconds and strength
+pub const XR_BUZZ_SECONDS: f32 = 0.03;
+pub const XR_BUZZ_AMPLITUDE: f32 = 0.4;
+
+// One controller, in the world (the feet the eyes were placed on, and the controller's pose in the room's floor space on them)
+pub struct XrHandState {
+  pub active: bool = false;          // the runtime is tracking it
+  pub gripValid: bool = false;
+  pub gripPos: Vec3 = Vec3(0., 0., 0.);          // where the hand holds it: the model is drawn here
+  pub gripRot: Quat = Quat(0., 0., 0., 1.);
+  pub aimValid: bool = false;
+  pub aimPos: Vec3 = Vec3(0., 0., 0.);           // where it points from, and to (a unit vector)
+  pub aimDir: Vec3 = Vec3(0., 0., -1.);
+  pub aimRot: Quat = Quat(0., 0., 0., 1.);
+  pub trigger: f32 = 0.;
+  pub squeeze: f32 = 0.;
+  pub stickX: f32 = 0.;              // right is +
+  pub stickY: f32 = 0.;              // forward is +
+  pub stickClick: bool = false;      // (the buttons are held down or not; a press is the change between frames)
+  pub primary: bool = false;         // A on the right, X on the left
+  pub secondary: bool = false;       // B on the right, Y on the left
+  pub menu: bool = false;
+}
+
+// The headset and both controllers at one frame
+pub struct XrState {
+  pub valid: bool = false;           // the runtime located the eyes for the frame (else nothing below means anything)
+  pub head: Vec3 = Vec3(0., 0., 0.);             // the head in the room's floor space (between the eyes)
+  pub headForward: Vec3 = Vec3(0., 0., -1.);     // and where it faces there (a unit vector)
+  pub left: XrHandState = XrHandState();
+  pub right: XrHandState = XrHandState();
+
+  pub fn hand(self: &, i: usize) XrHandState { if i == 0usize { left } else { right } }
+}
+
+// What the shell hands the view each frame of a headset's run
+pub struct XrInput {
+  pub state: XrState = XrState();    // the hands as the last frame drew them (with a test's fake sticks and triggers, XrControls)
+  pub click: i32 = -1i32;            // the hand whose trigger went down this frame (0 left, 1 right), else -1
+  pub fakeAim: bool = false;         // PEGASUS_XR_FAKE: the right aim ray is pointed at the nearest part for this frame (a test)
+  pub debug: bool = false;           // PEGASUS_XR_FAKE: the view says where the avatar is
+}
+
+// Everything the controllers decided for one frame
+pub struct XrOut {
+  pub intents: Intents;
+  pub input: XrInput;
+}
+
+fn xrQuantise(x: f32) f32 { libc.floorf(x * 127. + 0.5) / 127. }
+fn xrMillimetres(x: f32) f32 {
+  var v = libc.floorf(x * 1000. + 0.5);
+  if v > 32000. { v = 32000.; }
+  if v < -32000. { v = -32000.; }
+  v / 1000.
+}
+fn xrClamp1(x: f32) f32 { if x > 1. { 1. } else if x < -1. { -1. } else { x } }
+
+// The shell's memory of the controllers between frames: what is held, what has not been delivered yet
+pub struct XrControls {
+  fake: bool;                        // PEGASUS_XR_FAKE is set: the runtime's idle controllers get a scripted push of the sticks
+  snapArmed: bool = true;
+  snapPending: i32 = 0i32;           // snap turns not yet given to a step (a frame can have none: the headset runs faster than 60 Hz)
+  jumpLatch: bool = false;
+  trigger0: bool = false;
+  trigger1: bool = false;
+  menuWas: bool = false;
+  headX: f32 = 0.;                   // where the head faces in the room, as of the last frame it faced somewhere
+  headZ: f32 = -1.;
+
+  pub fn make(fake: bool) XrControls { XrControls(fake) }
+
+  // The frame's controllers folded into the keyboard's intents 'base'. 'steps' is how many fixed steps the frame has: what is
+  // owed to a step (a snap turn, a jump) waits for a frame that has some. 'frame' is the shell's frame number (the fake's script).
+  pub fn fold(self: &mut, frame: u64, steps: usize, raw: &XrState, base: Intents) XrOut {
+    var out = XrOut(base, XrInput());
+    if !raw.valid { return out; }
+    var s = *raw;
+    if fake { self.script(frame, &mut s); out.input.fakeAim = frame >= 235u64 && frame < 250u64; out.input.debug = true; }
+    out.input.state = s;
+    // The head's way, level: the horizontal part of where it faces (where it faces up or down, the last way it faced)
+    let hl = libc.sqrtf(s.headForward.x * s.headForward.x + s.headForward.z * s.headForward.z);
+    if hl > 0.3 { headX = s.headForward.x / hl; headZ = s.headForward.z / hl; }
+    var it = base;
+    // The left stick: walks the way the head faces (forward on the stick), a little less or more to either side
+    let sx = s.left.stickX;
+    let sy = s.left.stickY;
+    let mag = libc.sqrtf(sx * sx + sy * sy);
+    if s.left.active && mag > XR_DEAD_ZONE {
+      var m = (mag - XR_DEAD_ZONE) / (1. - XR_DEAD_ZONE);
+      if m > 1. { m = 1.; }
+      let dx = sx / mag * m;                  // across the head, right +
+      let dy = sy / mag * m;                  // along the head's way
+      // (the head's right is its way turned a quarter to the right: (-z, x) on the floor)
+      let wx = dx * (0. - headZ) + dy * headX;
+      let wz = dx * headX + dy * headZ;
+      // The room's floor space is the avatar's own (the room's forward is the way it faces): ahead is -z, to the right is +x
+      it.ahead = xrClamp1(xrQuantise(xrClamp1(it.ahead + (0. - wz))));
+      it.strafe = xrClamp1(xrQuantise(xrClamp1(it.strafe + wx)));
+    }
+    if s.left.active && s.left.stickClick { it.run = true; }
+    // B or Y jumps: held down from the press until a step has taken it
+    let jumpDown = (s.right.active && s.right.secondary) || (s.left.active && s.left.secondary);
+    jumpLatch = jumpLatch || jumpDown;
+    // The right stick turns in snaps
+    let tx = s.right.stickX;
+    if s.right.active {
+      if snapArmed && libc.fabsf(tx) > XR_SNAP_PUSH {
+        snapArmed = false;
+        snapPending = snapPending + (if tx > 0. { -1i32 } else { 1i32 });      // (to the right is a negative turn: yaw grows to the left)
+      } else if !snapArmed && libc.fabsf(tx) < XR_SNAP_REARM {
+        snapArmed = true;
+      }
+    }
+    if steps > 0usize {
+      it.jump = it.jump || jumpLatch;
+      jumpLatch = jumpDown;
+      if snapPending != 0i32 {
+        it.snap = snapPending;
+        it.pivotX = xrMillimetres(s.head.x);
+        it.pivotZ = xrMillimetres(s.head.z);
+        snapPending = 0i32;
+      }
+    }
+    // The triggers: a click is one press (the right hand first if both went down together)
+    var click = -1i32;
+    var t = 0usize;
+    while t < 2usize {
+      let h = s.hand(t);
+      let was = if t == 0usize { trigger0 } else { trigger1 };
+      var down = was;
+      if h.active {
+        if h.trigger > XR_TRIGGER_DOWN { down = true; } else if h.trigger < XR_TRIGGER_UP { down = false; }
+      } else {
+        down = false;
+      }
+      if down && !was { if click < 0i32 || t == 1usize { click = i32.from(t); } }
+      if t == 0usize { trigger0 = down; } else { trigger1 = down; }
+      t = t + 1usize;
+    }
+    out.input.click = click;
+    // The menu button is for panels: nothing yet
+    // TODO: open the "Play with others" panel (and later the others) in front of the head when the left menu button goes down
+    menuWas = s.left.menu;
+    out.intents = it;
+    out
+  }
+
+  // PEGASUS_XR_FAKE: the idle controllers of the simulator get a script of pushes, by the shell's frame number (a test for the
+  // walk, the dead zone, the strafe, the run, the snap turns and their re-arming, the jump and the clicks):
+  //    20-29   the left stick a little (0.15, 0.1): inside the dead zone, nothing
+  //    60-119  the left stick forward: the walk
+  //   120-149  the left stick to the right: a strafe
+  //   150-179  forward with the stick clicked: a run
+  //   190-194  the right stick right (once, 30 degrees to the right) then let go
+  //   205-209  the right stick left (once, back)
+  //   215-219  the right stick to 0.5 (under the push: no turn); 220-224 held at 0.9: one turn; 225-229 at 0.5: not re-armed, no turn
+  //   236-238  B pressed (jump)
+  //   244-246  the right trigger (a click along the aim, pointed at the nearest part, PEGASUS_XR_FAKE's view)
+  //   262-264  the left trigger (a click along the left hand's own aim)
+  fn script(self: &mut, frame: u64, s: &mut XrState) {
+    s.left.active = true;
+    s.right.active = true;
+    if frame >= 20u64 && frame < 30u64 { s.left.stickX = 0.15; s.left.stickY = 0.1; }
+    if frame >= 60u64 && frame < 120u64 { s.left.stickY = 1.; }
+    if frame >= 120u64 && frame < 150u64 { s.left.stickX = 1.; }
+    if frame >= 150u64 && frame < 180u64 { s.left.stickY = 1.; s.left.stickClick = true; }
+    if frame >= 190u64 && frame < 195u64 { s.right.stickX = 1.; }
+    if frame >= 205u64 && frame < 210u64 { s.right.stickX = -1.; }
+    if frame >= 215u64 && frame < 220u64 { s.right.stickX = 0.5; }
+    if frame >= 220u64 && frame < 225u64 { s.right.stickX = 0.9; }
+    if frame >= 225u64 && frame < 230u64 { s.right.stickX = 0.5; }
+    if frame >= 236u64 && frame < 239u64 { s.right.secondary = true; }
+    if frame >= 244u64 && frame < 247u64 { s.right.trigger = 1.; }
+    if frame >= 262u64 && frame < 265u64 { s.left.trigger = 1.; }
+  }
+}

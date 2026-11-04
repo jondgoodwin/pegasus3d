@@ -98,6 +98,10 @@ pub struct DrawOrder {
   pub hud: HudFrame;           // what the overlay shows
   pub capW: u32 = 0u32;        // a gallery run: draw this frame off screen at 'capW' by 'capH' pixels, no overlay (0: the window's)
   pub capH: u32 = 0u32;
+  pub xrBeam0: f32 = 5.;       // --xr: how long the left and right hands' beams are drawn (the view picked along them: they end at what they hit)
+  pub xrBeam1: f32 = 5.;
+  pub xrHit: u32 = 0u32;       // and a dot is drawn at the end of the beam of each hand whose bit (0 left, 1 right) is set
+  pub xrBuzz: u32 = 0u32;      // the hands (bits as above) whose trigger clicked something this frame: a short buzz
 }
 
 // What render hands back once the frame is presented
@@ -116,6 +120,7 @@ pub struct Presented {
   pub panel: u32 = 0u32;       // the "Play with others" panel after the frame (requestpanel.cone: PANEL_OPEN, PANEL_TEXT)
   pub talk: u32 = 0u32;        // the question chosen on a guard's panel this frame ((guard * 256 + question) + 1; talkpanel.cone), or 0
   pub xrEnded: bool = false;   // --xr: the headset's session is over (the user took the headset off the system, or the runtime quit): the run is over
+  pub xr: XrState = XrState(); // --xr: the head and both controllers as this frame drew them, in the world (xrhands.cone): the next frame's input
 }
 
 // How a part is drawn, as the scripted run's checks read it
@@ -214,6 +219,11 @@ actor RenderActor {
   xrShotsDone: u32;            // how many eyes have been written
   xrFrames: u64;               // frames the headset showed (a session that was running and wanted the eyes)
   xrMirrorShot: bool;          // the window's picture was asked for and not yet written
+  xrNow: XrState;              // --xr: the head and the controllers at the frame being drawn (both eyes draw them), in the world
+  xrArt: XrArt;                // and what they are drawn with
+  xrBeam0: f32;                // the beams' lengths and dots of this frame, from its DrawOrder
+  xrBeam1: f32;
+  xrHit: u32;
 
   // The GPU side made for the window (its SDL handle as a number, since a
   // raw pointer is not Sendable; 0 for a headless run, which has none),
@@ -242,7 +252,8 @@ actor RenderActor {
         else {}
       }
     }
-    *self = Self(made, rig, skyOff, scripted, shotsDir, 0u64, 0u64, 0u64, xrShots, xrShotAt, 0u32, 0u64, false);
+    *self = Self(made, rig, skyOff, scripted, shotsDir, 0u64, 0u64, 0u64, xrShots, xrShotAt, 0u32, 0u64, false,
+      XrState(), XrArt.empty(), 5., 5., 0u32);
     var told = ready;
     told <- ok;
   }
@@ -333,6 +344,7 @@ actor RenderActor {
     presented.panel = panel;
     presented.talk = talk;
     presented.xrEnded = xrEnded;
+    presented.xr = xrNow;
     presented
   }
 
@@ -475,9 +487,20 @@ actor RenderActor {
     if !g.headset.pollEvents() { return false; }
     let frame = g.headset.beginFrame(&mut g.device);
     if !frame.active { sdl.Delay(5u32); }     // (a session between READY and STOPPING only: not a spin)
+    // The controllers: what the view's clicks asked to buzz (this frame's), and the beams it picked (the view gave their lengths)
+    xrNow = XrState();
+    xrBeam0 = o.xrBeam0;
+    xrBeam1 = o.xrBeam1;
+    xrHit = o.xrHit;
+    if frame.active {
+      if (o.xrBuzz & 1u32) != 0u32 { g.headset.vibrate(0usize, XR_BUZZ_SECONDS, XR_BUZZ_AMPLITUDE); }
+      if (o.xrBuzz & 2u32) != 0u32 { g.headset.vibrate(1usize, XR_BUZZ_SECONDS, XR_BUZZ_AMPLITUDE); }
+    }
     var shotNow = false;
     if frame.active && frame.shouldRender && frame.located {
       let feet = o.snapshot.feet(o.alpha);
+      xrNow = xrStateOf(g, &frame, feet);
+      if !xrArt.made { xrArt = XrArt.make(&mut g.renderer, &mut g.device); }
       // The picture to write this frame, if --xr-shots asked: the left eye's (and the window's) first, the right eye's the next frame
       shotNow = xrShots.len() > 0usize && o.frame >= xrShotAt && xrShotsDone < 2u32;
       if shotNow {
@@ -538,6 +561,36 @@ actor RenderActor {
     g.timer.mark(9usize);
     g.timer.frameDone();
     true
+  }
+
+  // The controllers drawn into the eye's draw list, for --xr: a small box at each active one's grip pose (blue the left, orange the
+  // right; real models are later), and from its aim pose a thin beam ahead, as long as the view picked it (to what it hits, at most
+  // XR_BEAM_MAX) with a small dot at the end where it hit something. They are lit and cast no shadow; the beam and dot also glow a
+  // little, so that they show against the grass and are not lost at dusk. Both eyes see the same poses (one located frame).
+  fn drawHands(self, g: &mut Gfx) {
+    if !xrNow.valid || !xrArt.made { return; }
+    var h = 0usize;
+    while h < 2usize {
+      let hs = xrNow.hand(h);
+      if hs.active {
+        if hs.gripValid {
+          g.sys.list.add(xrArt.cube, if h == 0usize { xrArt.leftBody } else { xrArt.rightBody },
+            Mat4.fromTrs(hs.gripPos, hs.gripRot, Vec3(0.05, 0.05, 0.12)));
+          g.sys.list.dontCastShadow();
+        }
+        if hs.aimValid {
+          let len = if h == 0usize { xrBeam0 } else { xrBeam1 };
+          let middle = hs.aimPos + hs.aimDir * (len * 0.5);
+          g.sys.list.add(xrArt.cube, xrArt.beam, Mat4.fromTrs(middle, hs.aimRot, Vec3(0.004, 0.004, len)));
+          g.sys.list.dontCastShadow();
+          if (xrHit & (1u32 << u32.from(h))) != 0u32 {
+            g.sys.list.add(xrArt.ball, xrArt.dot, Mat4.fromTrs(hs.aimPos + hs.aimDir * len, Quat(0., 0., 0., 1.), Vec3(0.02, 0.02, 0.02)));
+            g.sys.list.dontCastShadow();
+          }
+        }
+      }
+      h = h + 1usize;
+    }
   }
 
   // --xr's end of run: the headset, how many frames it showed, and what an eye cost on each side (the CPU's: everything the
@@ -690,6 +743,8 @@ actor RenderActor {
     g.sys.threads.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, &snapshot.thread);
     g.sys.creatures.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, &snapshot.bits);
     g.sys.aimLights(&mut g.renderer, snapshot);
+    // The controllers and their beams, in each eye (xrhands.cone)
+    if xv.active { self.drawHands(g); }
     g.timer.mark(3usize);
     if dayLit && !islandOut {
       rig.draw(&mut g.renderer, &mut g.device, &mut g.sys.list, f32.from(snapshot.now), alpha, &snapshot.birds);
@@ -1011,6 +1066,72 @@ fn makeGfx(window: *sdl.Window, width: u32, height: u32, skyOff: bool, cullMode:
   Some[Gfx](Gfx(Buffer.none(), String.empty(), target, off, post, fx, fxTier, fxMeter, splatMaterial, Vec3(0., 0., 0.),
     Vec3(0., 0., -1.), false, hud, timer, sys, cover, renderer, swapchain, Headset.none(), device, adapter, surface, instance, camera,
     sunShadows, false, 0u32, 0u32, false, false))
+}
+
+// What the controllers are drawn with, with --xr: a box mesh (a unit cube, scaled to a hand's box and a beam), a ball for the dot where
+// a beam hits, and the materials; made on the first headset frame
+struct XrArt {
+  made: bool;
+  cube: MeshHandle;
+  ball: MeshHandle;
+  leftBody: MaterialHandle;
+  rightBody: MaterialHandle;
+  beam: MaterialHandle;
+  dot: MaterialHandle;
+
+  fn empty() XrArt {
+    XrArt(false, MeshHandle.none(), MeshHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none())
+  }
+
+  fn make(renderer: &mut Renderer, device: &mut Device) XrArt {
+    let cube = Mesh.cube(0.5);
+    let ball = Mesh.sphere(0.5, 12);
+    let left = Material.shiny(Color(0.15, 0.35, 0.9, 1.), 0.3, 24.).glowing(Color(0.15, 0.35, 0.9, 1.), 1500.);
+    let right = Material.shiny(Color(0.9, 0.4, 0.12, 1.), 0.3, 24.).glowing(Color(0.9, 0.4, 0.12, 1.), 1500.);
+    // (a beam is a pale yellow a little under the sky's brightness, a dot brighter: the noon sky is 25 000 nits)
+    let beam = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 12000.);
+    let dot = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 40000.);
+    XrArt(true, renderer.addMesh(device, &cube), renderer.addMesh(device, &ball), renderer.addMaterial(device, &left),
+      renderer.addMaterial(device, &right), renderer.addMaterial(device, &beam), renderer.addMaterial(device, &dot))
+  }
+}
+
+// The head and both controllers of the headset frame 'frame', in the world: the room's floor space on 'feet' (the same placement
+// the eyes get), for the next frame's input (xrhands.cone). The head is kept in the room's own space too (the snap turn is about it)
+fn xrStateOf(g: &Gfx, frame: &HeadsetFrame, feet: Pose) XrState {
+  var st = XrState();
+  st.valid = true;
+  let a = frame.views[0usize].pose;
+  let b = frame.views[1usize].pose;
+  st.head = Vec3((a.position.x + b.position.x) * 0.5, (a.position.y + b.position.y) * 0.5, (a.position.z + b.position.z) * 0.5);
+  st.headForward = Quat(a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w) * Vec3(0., 0., -1.);
+  let q = feet.orientation;
+  var h = 0usize;
+  while h < 2usize {
+    let hd = g.headset.hand(frame, h);
+    var hs = XrHandState();
+    hs.active = hd.active;
+    if hd.active {
+      hs.gripValid = hd.grip.valid;
+      hs.gripPos = feet.origin + q * hd.grip.position;
+      hs.gripRot = q * hd.grip.orientation;
+      hs.aimValid = hd.aim.valid;
+      hs.aimPos = feet.origin + q * hd.aim.position;
+      hs.aimRot = q * hd.aim.orientation;
+      hs.aimDir = (q * hd.aim.forward()).normalize();
+      hs.trigger = hd.trigger;
+      hs.squeeze = hd.squeeze;
+      hs.stickX = hd.stickX;
+      hs.stickY = hd.stickY;
+      hs.stickClick = hd.stickClick.down;
+      hs.primary = hd.primary.down;
+      hs.secondary = hd.secondary.down;
+      hs.menu = hd.menu.down;
+    }
+    if h == 0usize { st.left = hs; } else { st.right = hs; }
+    h = h + 1usize;
+  }
+  st
 }
 
 // The eye a frame is drawn for, with --xr (drawXr): its pose in the world (the headset's pose on the avatar's feet), and the four

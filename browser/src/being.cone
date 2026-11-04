@@ -44,9 +44,18 @@ pub struct Intents {
   pub jump: bool;
   pub sit: bool = false;       // the S key is down: sit down on the nearest seat, or stand up from it (a press is the key going down)
   pub hail: bool = false;      // the H key is down: hail
+  // A headset's controllers (--xr, xrhands.cone). All are quantised where they are made to what the wire carries (netcodec.cone), so
+  // that the view's prediction and the simulation's step are the same
+  pub strafe: f32 = 0.;        // -1 (left) to 1 (right): walking sideways, as the left stick says when the head faces another way than the body
+  pub snap: i32 = 0i32;        // snap turns of SNAP_TURN radians to take at the start of this step (+ to the left, - to the right), about the head
+  pub pivotX: f32 = 0.;        // the head's place on the floor of the room, metres: in the body's own frame (+x right, -z ahead); what a snap turns about
+  pub pivotZ: f32 = 0.;
 
   pub fn none() Intents { Intents(0., 0., false, false) }
 }
+
+// A snap turn (a headset's right stick), radians: 30 degrees
+pub const SNAP_TURN: f32 = 0.5235988;
 
 // A being: its part in the scene, its body after the last step and the one
 // before (the picture is drawn between them), the intents it was last given,
@@ -74,9 +83,27 @@ pub struct Being {
     Being(part, body, body, Intents.none(), figure, false, false, false)
   }
 
+  // A snap turn of 'turns' times SNAP_TURN about the head at (px, pz) on the floor of the room (the body's own frame, the feet at the
+  // origin), instant: the feet are moved so that the head stays where it is in the world, and the step before is the same, so
+  // that nothing is drawn between the two
+  pub fn snapTurn(self: &mut, turns: i32, px: f32, pz: f32) {
+    let was = body.yaw;
+    let now = was + f32.from(turns) * SNAP_TURN;
+    // (a turn about +y by 'a' takes (x, z) to (x cos a + z sin a, -x sin a + z cos a): the head's offset from the feet, before and after)
+    let ax = px * cos(was) + pz * sin(was);
+    let az = 0. - px * sin(was) + pz * cos(was);
+    let bx = px * cos(now) + pz * sin(now);
+    let bz = 0. - px * sin(now) + pz * cos(now);
+    body.yaw = now;
+    body.position = Vec3(body.position.x + ax - bx, body.position.y, body.position.z + az - bz);
+  }
+
   // One fixed step of 'dt' seconds, by 'given'
   pub fn step(self: &mut, phys: &mut Phys, given: Intents, dt: f32) {
     intents = given;
+    if given.snap != 0i32 && !(figure.active && figure.mode != FIG_WALK) {
+      self.snapTurn(given.snap, given.pivotX, given.pivotZ);
+    }
     before = body;
     respawned = false;
     crossed = false;
@@ -95,6 +122,7 @@ pub struct Being {
       self.throughGate(phys);
     } else {
       body.step(&phys.island, intents.ahead, intents.turn, intents.run, dt);
+      if intents.strafe != 0. { body.slide(&phys.island, intents.strafe, intents.run, dt); }
     }
   }
 
