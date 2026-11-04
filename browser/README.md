@@ -283,9 +283,7 @@ runtime does the lens, the reprojection and the compositing). With no OpenXR run
   an interactive session on a real runtime. It stays silent (as before: no device, no thread) in an automated run (`--frames`, `--checks`
   ...), with `--headless`, with `--no-audio`, with `PEGASUS_XR_AUDIO=off`, and when `XR_RUNTIME_JSON` names a simulator (Meta's PC
   simulator); each says why on one `Audio:` line. `--audio-wav FILE` (or `--audio-device`) with `--frames` still gives the offline mix, for a
-  test with no device. The device is SDL's default playback device (the package `audiodevice` opens no other; Windows sends it to the
-  headset when the Oculus/Link software has made the headset's audio the default): choosing the headset's by name needs a change in
-  `audiodevice` and is not done. Every spatialised sound (wind's height, the brook, the burner, the steps' range) is heard from the
+  test with no device. In an interactive session the device is the first playback device whose name contains Oculus, Quest, Rift or Meta (case-insensitive; `PEGASUS_XR_AUDIO_DEVICE=<text>` matches that text instead), which udiodevice's `Device.startOn` opens; with none matching it is SDL's default playback device (what Windows has made the default). One `Audio:` line names the device opened, or says none matched and lists the names seen. Every spatialised sound (wind's height, the brook, the burner, the steps' range) is heard from the
   head: the eye midpoint and the left eye's orientation, placed on the avatar's feet as the eyes are (`xrStateOf`, `headWorld`), as of
   the last frame drawn, not the avatar's body or the desktop camera. Footsteps stay at the avatar's heels.
 - **Off under `--xr`**, each with what it cost one eye on the RTX 4060 Laptop at 1680 x 1760 (the island from the landing beach; the
