@@ -628,6 +628,14 @@ actor RenderActor {
   // little, so that they show against the grass and are not lost at dusk. Both eyes see the same poses (one located frame).
   fn drawHands(self, g: &mut Gfx) {
     if !xrNow.valid || !xrArt.made { return; }
+    // (the glow that shows as bright as noon's whatever the exposure; less still in a dark scene)
+    var scene = g.renderer.exposure;
+    if scene < 0.000001 { scene = 0.000001; }
+    var k = exposureForElevation(1.) / scene;
+    if k > 1. { k = 1.; }
+    // (PEGASUS_XR_POINTER=old: the glow as it was, fixed, to compare)
+    if (libc.getenv("PEGASUS_XR_POINTER") as usize) != 0usize { k = 1.; } else { k = k * (0.15 + 0.85 * k); }
+    xrArt.setGlow(&mut g.renderer, &mut g.device, k);
     var h = 0usize;
     while h < 2usize {
       let hs = xrNow.hand(h);
@@ -780,6 +788,8 @@ actor RenderActor {
     // Under the island the island's terrain is 300 m overhead: the camera sees 120 m, and nothing of the sky is drawn
     g.camera.far = if under { UNDER_FAR } else { DAY_FAR };
     g.camera.background = if under { Color(0., 0., 0., 1.) } else { sky.color };
+    // PEGASUS_LAB_SKYMARK=1 (a look for seams): underground, what shows past the geometry is bright magenta, not black
+    if under && (libc.getenv("PEGASUS_LAB_SKYMARK") as usize) != 0usize { g.camera.background = Color(1., 0., 1., 1.); }
     // The shaders' clock: the scene's time (the sea's waves, the swash), stopped when it is
     g.renderer.time = f32.from(snapshot.now);
     let dayLight = Light.directional(Vec3(0., 0., 0.) - sky.sunDirection, sky.sunColor, sky.ambient);
@@ -1162,9 +1172,10 @@ struct XrArt {
   rightBody: MaterialHandle;
   beam: MaterialHandle;
   dot: MaterialHandle;
+  glowK: f32;                    // the share of its noon glow the beam and dot have now (1 at noon: see drawHands)
 
   fn empty() XrArt {
-    XrArt(false, MeshHandle.none(), MeshHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none())
+    XrArt(false, MeshHandle.none(), MeshHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none(), 1.)
   }
 
   fn make(renderer: &mut Renderer, device: &mut Device) XrArt {
@@ -1176,7 +1187,24 @@ struct XrArt {
     let beam = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 12000.);
     let dot = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 40000.);
     XrArt(true, renderer.addMesh(device, &cube), renderer.addMesh(device, &ball), renderer.addMaterial(device, &left),
-      renderer.addMaterial(device, &right), renderer.addMaterial(device, &beam), renderer.addMaterial(device, &dot))
+      renderer.addMaterial(device, &right), renderer.addMaterial(device, &beam), renderer.addMaterial(device, &dot), 1.)
+  }
+
+  // The beam and dot glow in nits, which the frame's exposure turns into brightness on the screen: at night the exposure is up by
+  // thousands, and a glow made for noon's blinded the eye to what it pointed at. So the glow is that of noon (12 000 and 40 000 nits)
+  // times 'k', the share that shows on the screen as bright as at noon, however the exposure stands, less by a further 'night' share
+  // when the scene is darker than noon (a beam as bright as noon's on a dark ground still outshines the target)
+  fn setGlow(self: &mut, renderer: &mut Renderer, device: &mut Device, k: f32) {
+    if (k - glowK).abs() < 0.02 * glowK { return; }
+    glowK = k;
+    let beamM = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 12000. * k);
+    let dotM = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 40000. * k);
+    let left = Material.shiny(Color(0.15, 0.35, 0.9, 1.), 0.3, 24.).glowing(Color(0.15, 0.35, 0.9, 1.), 1500. * k);
+    let right = Material.shiny(Color(0.9, 0.4, 0.12, 1.), 0.3, 24.).glowing(Color(0.9, 0.4, 0.12, 1.), 1500. * k);
+    renderer.setMaterial(device, leftBody, &left);
+    renderer.setMaterial(device, rightBody, &right);
+    renderer.setMaterial(device, beam, &beamM);
+    renderer.setMaterial(device, dot, &dotM);
   }
 }
 
