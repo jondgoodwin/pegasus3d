@@ -220,7 +220,15 @@ actor RenderActor {
   xrShotAt: u64;               // the frame the first of them is taken at (the left eye; the right eye's is the next frame's)
   xrShotsDone: u32;            // how many eyes have been written
   xrFrames: u64;               // frames the headset showed (a session that was running and wanted the eyes)
-  xrMirrorShot: bool;          // the window's picture was asked for and not yet written
+  cbEye0: u32;                 // command buffers (of the frame's 16) used when the left eye's drawFrame ended, and the right eye's
+  cbEye1: u32;
+  cbEnc0: u32;                 // of them, the command encoders
+  cbEnc1: u32;
+  cbLast: u32;                 // the last frame's count
+  cbMax: u32;               // the most a frame used
+  cbOverFrames: u64;           // frames that asked for more than 16
+  cbDropped: u64;              // the buffers refused in them
+  xrMirrorShot: bool;         // the window's picture was asked for and not yet written
   xrNow: XrState;              // --xr: the head and the controllers at the frame being drawn (both eyes draw them), in the world
   xrArt: XrArt;                // and what they are drawn with
   xrBeam0: f32;                // the beams' lengths and dots of this frame, from its DrawOrder
@@ -254,7 +262,7 @@ actor RenderActor {
         else {}
       }
     }
-    *self = Self(made, rig, skyOff, scripted, shotsDir, 0u64, 0u64, 0u64, xrShots, xrShotAt, 0u32, 0u64, false,
+    *self = Self(made, rig, skyOff, scripted, shotsDir, 0u64, 0u64, 0u64, xrShots, xrShotAt, 0u32, 0u64, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u64, 0u64, false,
       XrState(), XrArt.empty(), 5., 5., 0u32);
     var told = ready;
     told <- ok;
@@ -487,6 +495,13 @@ actor RenderActor {
     self.apply(g, &mut o.requests);
     g.timer.mark(0usize);
     if !g.headset.pollEvents() { return false; }
+    // PEGASUS_XR_CBLIMIT=N: hold each frame to N command buffers (from XR frame PEGASUS_XR_CBLIMIT_FROM, default 0), to see what the eyes
+    // show when a frame asks for more than it has (a test of the overrun: the frame has 128, and the headset's takes about 13)
+    let cbl = libc.getenv("PEGASUS_XR_CBLIMIT");
+    if (cbl as usize) != 0usize {
+      let from = libc.getenv("PEGASUS_XR_CBLIMIT_FROM");
+      g.device.setCommandBufferLimit(if xrFrames >= (if (from as usize) != 0usize { wholeNumber(from) } else { 0u64 }) { u32.from(wholeNumber(cbl)) } else { 0u32 });
+    }
     let frame = g.headset.beginFrame(&mut g.device);
     if !frame.active { sdl.Delay(5u32); }     // (a session between READY and STOPPING only: not a spin)
     // The controllers: what the view's clicks asked to buzz (this frame's), and the beams it picked (the view gave their lengths)
@@ -538,6 +553,8 @@ actor RenderActor {
           g.headset.swapEye(eye, &mut g.target);
           self.drawFrame(g, &o.snapshot, "", o.alpha, &o.hud, &xv);
           g.headset.swapEye(eye, &mut g.target);
+          if eye == 0usize { cbEye0 = g.device.commandBuffersUsed(); cbEnc0 = g.device.commandEncodersMade(); }
+          else { cbEye1 = g.device.commandBuffersUsed(); cbEnc1 = g.device.commandEncodersMade(); }
           let seconds = f64.from(sdl.GetPerformanceCounter() - started) / f64.from(sdl.GetPerformanceFrequency());
           g.headset.eyeSubmitted(&g.device, eye, seconds);
         }
@@ -549,6 +566,31 @@ actor RenderActor {
       g.headset.releaseEye(1usize);
       xrFrames = xrFrames + 1u64;
       if xrFrames == 30u64 { g.headset.resetTimes(); }
+    }
+    if frame.active && frame.shouldRender {
+      // (the frame's command buffers: the first frame to run out is always told, with where each eye's frame had got to; the end of the
+      // run says the most a frame took; PEGASUS_XR_CB=1 also says each change)
+      let cbTrace = (libc.getenv("PEGASUS_XR_CB") as usize) != 0usize;
+      let dropped = g.device.commandBuffersDropped();
+      let total = g.device.commandBuffersUsed();
+      if cbTrace && total != cbLast {
+        cbLast = total;
+        print <- "cb: XR frame "; print <- xrFrames; print <- " used "; print <- total; print <- " (left "; print <- cbEye0; print <- ", right "; print <- cbEye1 - cbEye0; print <- ")\n";
+      }
+      if total > cbMax {
+        cbMax = total;
+        if cbTrace { print <- "cb: new most in a frame, "; print <- total; print <- " (left eye ended at "; print <- cbEye0; print <- ", "; print <- cbEnc0;
+        print <- " encoders; right ended at "; print <- cbEye1; print <- ", "; print <- cbEnc1; print <- " encoders), refused "; print <- dropped;
+        print <- ", XR frame "; print <- xrFrames; print <- "\n"; }
+      }
+      if dropped > 0u32 {
+        if cbOverFrames == 0u64 {
+          print <- "cb: FIRST overrun at XR frame "; print <- xrFrames; print <- ": left eye ended at "; print <- cbEye0; print <- " ("; print <- cbEnc0;
+          print <- " encoders), right eye ended at "; print <- cbEye1; print <- " ("; print <- cbEnc1; print <- " encoders), refused "; print <- dropped; print <- "\n";
+        }
+        cbOverFrames = cbOverFrames + 1u64;
+        cbDropped = cbDropped + u64.from(dropped);
+      }
     }
     g.headset.endFrame(&mut g.device, &frame);
     if shotNow {
@@ -617,6 +659,8 @@ actor RenderActor {
     print <- "Headset: "; printStr(g.headset.runtimeName.view()); print <- ", "; printStr(g.headset.systemName.view());
     print <- ", each eye "; print <- u64.from(g.headset.eyeWidth); print <- " x "; print <- u64.from(g.headset.eyeHeight); print <- "\n";
     print <- "XR frames shown: "; print <- xrFrames; print <- "\n";
+    print <- "Command buffers: most in a frame "; print <- cbMax; print <- "; frames that ran out: "; print <- cbOverFrames;
+    print <- "; buffers refused: "; print <- cbDropped; print <- "\n";
     var e = 0usize;
     while e < 2usize {
       printStr(if e == 0usize { "Left eye" } else { "Right eye" });
