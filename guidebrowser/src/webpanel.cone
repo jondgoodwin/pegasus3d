@@ -36,6 +36,7 @@ extern {
 
 const WEB_TEX_W = 1280u32;       // the page's size in pixels
 const WEB_TEX_H = 800u32;
+const WEB_BAND_ROWS = 40u32;     // rows of the page sent to the texture in one frame
 const WEB_WORLD_W = 1.8;         // meters across
 const WEB_GAP = 0.12;            // between the document panel's right edge and this panel's left
 
@@ -190,6 +191,12 @@ pub struct WebPanel {
   lastX: i32 = 0i32;             // the pointer on the page, in page pixels, as last seen
   lastY: i32 = 0i32;
   uploaded: u32 = 0u32;
+  pendY0: u32 = 0u32;            // rows of level 0 taken from a paint and not yet in the texture: [pendY0, pendY1)
+  pendY1: u32 = 0u32;
+  mipDirty: bool = false;        // the levels below 0 are older than level 0: redone and written whole once the page has been quiet a moment
+  mipX0: u32 = 0u32; mipY0: u32 = 0u32; mipX1: u32 = 0u32; mipY1: u32 = 0u32;
+  lastPaint: u64 = 0u64;         // when the last paint came (counter ticks)
+  firstMip: u64 = 0u64;          // when the levels first went stale (counter ticks)
 
   // None if CEF would not start or the browser could not be made
   pub fn create(device: &mut Device, outFormat: u32, url: &str) Option[WebPanel] {
@@ -254,30 +261,58 @@ pub struct WebPanel {
     }
     wasLoading = busy;
     let t0 = sdl.GetPerformanceCounter();
-    if t0 < nextAt { return; }
-    var rx = 0i32; var ry = 0i32; var rw = 0i32; var rh = 0i32;
-    let n = webFrameRect(view, &buf[0] as *u8, i32.from(buf.len()), &mut rx, &mut ry, &mut rw, &mut rh, &mut w, &mut h);
-    if n > 0i32 && u32.from(w) == WEB_TEX_W && u32.from(h) == WEB_TEX_H {
-      // the rectangle into level 0, the levels below it redone for its texels only, the whole chain to the texture
-      var j = 0i32;
-      while j < rh {
-        let dst = usize.from(u32.from(ry + j) * WEB_TEX_W + u32.from(rx));
-        libc.memcpy(&chain[dst] as *u8, &buf[usize.from(u32.from(j * rw * 4i32))] as *u8, usize.from(u32.from(rw * 4i32)));
-        j = j + 1i32;
+    let freq = sdl.GetPerformanceFrequency();
+    var worked = false;
+    if t0 >= nextAt {
+      var rx = 0i32; var ry = 0i32; var rw = 0i32; var rh = 0i32;
+      let n = webFrameRect(view, &buf[0] as *u8, i32.from(buf.len()), &mut rx, &mut ry, &mut rw, &mut rh, &mut w, &mut h);
+      if n > 0i32 && u32.from(w) == WEB_TEX_W && u32.from(h) == WEB_TEX_H {
+        // the rectangle into level 0 of the CPU copy (a memcpy of its rows); the texture gets it band by band over the next frames
+        var j = 0i32;
+        while j < rh {
+          let dst = usize.from(u32.from(ry + j) * WEB_TEX_W + u32.from(rx));
+          libc.memcpy(&chain[dst] as *u8, &buf[usize.from(u32.from(j * rw * 4i32))] as *u8, usize.from(u32.from(rw * 4i32)));
+          j = j + 1i32;
+        }
+        let x0 = u32.from(rx); let y0 = u32.from(ry); let x1 = x0 + u32.from(rw); let y1 = y0 + u32.from(rh);
+        if !textured {
+          mipRect(&mut chain, WEB_TEX_W, WEB_TEX_H, levels, x0, y0, u32.from(rw), u32.from(rh));
+          page.makeChain(device, WEB_TEX_W, WEB_TEX_H, levels, &chain); textured = true;
+          worked = true;
+        } else {
+          if pendY0 >= pendY1 { pendY0 = y0; pendY1 = y1; }
+          else { if y0 < pendY0 { pendY0 = y0; } if y1 > pendY1 { pendY1 = y1; } }
+          if !mipDirty { mipDirty = true; mipX0 = x0; mipY0 = y0; mipX1 = x1; mipY1 = y1; firstMip = t0; }
+          else {
+            if x0 < mipX0 { mipX0 = x0; } if y0 < mipY0 { mipY0 = y0; } if x1 > mipX1 { mipX1 = x1; } if y1 > mipY1 { mipY1 = y1; }
+          }
+        }
+        lastPaint = t0;
+        uploaded = uploaded + 1u32;
+        nextAt = t0 + freq / 30u64;
       }
-      mipRect(&mut chain, WEB_TEX_W, WEB_TEX_H, levels, u32.from(rx), u32.from(ry), u32.from(rw), u32.from(rh));
-      if !textured { page.makeChain(device, WEB_TEX_W, WEB_TEX_H, levels, &chain); textured = true; }
-      else { page.refreshChain(device, &chain); }
-      uploaded = uploaded + 1u32;
+    }
+    // one band of rows a frame to level 0 (about 0.2 MB), whatever the size of the paint
+    if textured && pendY0 < pendY1 {
+      var rows = pendY1 - pendY0;
+      if rows > WEB_BAND_ROWS { rows = WEB_BAND_ROWS; }
+      page.refreshRows(device, &chain[usize.from(pendY0 * WEB_TEX_W)] as *u8, WEB_TEX_W, pendY0, rows);
+      pendY0 = pendY0 + rows;
+      worked = true;
+    }
+    // the levels below: redone and written whole once the rows are all in and the page has been quiet 125 ms (or busy for 700 ms)
+    else if textured && mipDirty && ((t0 > lastPaint + freq / 8u64) || (t0 > firstMip + freq * 7u64 / 10u64)) {
+      mipRect(&mut chain, WEB_TEX_W, WEB_TEX_H, levels, mipX0, mipY0, mipX1 - mipX0, mipY1 - mipY0);
+      page.refreshChain(device, &chain);
+      mipDirty = false;
+      worked = true;
+    }
+    if worked {
       let d = sdl.GetPerformanceCounter() - t0;
       cost = d;
       webUploadTicks = webUploadTicks + d;
       webUploads = webUploads + 1u64;
       if d > webUploadMax { webUploadMax = d; }
-      // at most 30 a second, and never more than 1.5 ms of every 33: a dear paint waits longer for the next
-      let gap = sdl.GetPerformanceFrequency() / 30u64;
-      let spread = d * 22u64;
-      nextAt = t0 + (if spread > gap { spread } else { gap });
     }
   }
 

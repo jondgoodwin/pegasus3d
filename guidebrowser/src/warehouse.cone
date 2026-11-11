@@ -340,6 +340,8 @@ pub struct Warehouse {
   slotsSide: u32;
   handHeld: bool;          // a hand's grip holds the gaze
   desk: Option[DeskPanel]; // --desk: the laptop's screen at a desk spot (desk.cone)
+  grabKind: u32;           // what the grip holds besides a page: 1 the file browser, 2 the report, 3 a parked folder's post, 4 a project, else 0
+  grabIt: i32;             // its number (marker or item)
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -350,7 +352,7 @@ pub struct Warehouse {
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
       None, 0u32, 0u32, false,
       Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
-      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None)
+      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1)
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -1249,8 +1251,14 @@ pub struct Warehouse {
       if studioGood.roots.len() > 0usize { browseRoot = String.from(studioGood.roots[0usize].view()); }
       browseCfg = false; reportCfg = false;
       var pn = 0usize;
-      while pn < studioGood.panels.len() {
-        let pc = &studioGood.panels[pn];
+      // studio.toml's places, then room.toml's (what Jon moved wins)
+      var allp = List[PanelCfg]();
+      var sp = 0usize;
+      while sp < studioGood.panels.len() { let c = &studioGood.panels[sp]; allp.push(PanelCfg(c.id.clone(), c.place.clone(), c.yaw, c.hasYaw, c.width, c.hasWidth)); sp = sp + 1usize; }
+      sp = 0usize;
+      while sp < roomGood.panels.len() { let c = &roomGood.panels[sp]; allp.push(PanelCfg(c.id.clone(), c.place.clone(), c.yaw, c.hasYaw, c.width, c.hasWidth)); sp = sp + 1usize; }
+      while pn < allp.len() {
+        let pc = &allp[pn];
         var pl = Place(0u32, 0u32, 0., 0., 0.);
         let has = pc.place.len() > 0usize && parsePlace(pc.place.view(), &mut pl);
         let yw = if pc.hasYaw { f32.from(i32.from(pc.yaw)) * PI / 180. } else { 0. };
@@ -1914,6 +1922,8 @@ pub struct Warehouse {
     c.push(self.mkLabel(device, "close", 0xb3261effu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
     c.push(self.mkLabel(device, "shelve", 0x3a78b0ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
     c.push(self.mkLabel(device, "grab", 0x3a8a58ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    c.push(self.mkLabel(device, "back", 0x5a6a78ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    c.push(self.mkLabel(device, "forward", 0x5a6a78ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
     c
   }
 
@@ -1936,7 +1946,127 @@ pub struct Warehouse {
       if t > 0. && (bt < 0. || t < bt) { bt = t; bi = i32.from(i); }
       i = i + 1usize;
     }
+    // the other things a beam can hold: the browser, the report, a folder's post, a project; the nearest of all wins
+    var ok = 0u32;
+    var oi = -1;
+    var ot: f32 = -1.;
+    if browserOpen {
+      let inv = self.browserModel().inverse();
+      match &browserPanel {
+        case let Some(p) { let t = p.reach(inv * eye, inv.transformVector(dir)); if t > 0. && (ot < 0. || t < ot) { ot = t; ok = 1u32; } }
+        else {}
+      }
+    }
+    if reportOpen {
+      let inv = self.reportModel().inverse();
+      match &reportPanel {
+        case let Some(p) { let t = p.reach(inv * eye, inv.transformVector(dir)); if t > 0. && (ot < 0. || t < ot) { ot = t; ok = 2u32; } }
+        else {}
+      }
+    }
+    var q = 0usize;
+    while q < markers.len() {
+      let t = quadHit(Warehouse.faceModel(markers[q].pos, eye), Vec4(-0.36, 0., 0.36, 1.68), eye, dir);
+      if t > 0. && (ot < 0. || t < ot) { ot = t; ok = 3u32; oi = i32.from(q); }
+      q = q + 1usize;
+    }
+    var k = 0usize;
+    let dn = dir.normalize();
+    while k < items.len() {
+      if !items[k].page && items[k].part.len() > 0usize {
+        let c = items[k].pos + Vec3(0., items[k].height * items[k].scale * 0.5, 0.) - eye;
+        var rr = items[k].radius * items[k].scale;
+        if rr < 0.3 { rr = 0.3; }
+        let tca = c.dot(dn);
+        if tca > 0. && c.dot(c) - tca * tca <= rr * rr && (ot < 0. || tca < ot) { ot = tca; ok = 4u32; oi = i32.from(k); }
+      }
+      k = k + 1usize;
+    }
+    if ok > 0u32 && (bt < 0. || ot < bt) {
+      gazeEye = eye; gazeDir = dir;
+      var d = ot;
+      if d < 1.5 { d = 1.5; }
+      if d > 8. { d = 8.; }
+      grabDist = d;
+      grabKind = ok; grabIt = oi;
+      if ok == 4u32 {
+        let ku = usize.from(u32.from(oi));
+        let here = items[ku].pos;
+        self.moveItem(ku, &Place(3u32, 0u32, here.x, here.y, here.z), false);
+      }
+      print <- "warehouse: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else { "a project" }); print <- "\n";
+      return;
+    }
     if bi >= 0 { gazeEye = eye; gazeDir = dir; self.startGrab(usize.from(u32.from(bi))); }
+  }
+
+  // Each frame while the grip holds a panel, post or project: it follows the point on the floor (the height kept for a project) along the gaze
+  fn followGrab(self: &mut) {
+    if grabKind == 0u32 { return; }
+    let h = Vec3(gazeDir.x, 0., gazeDir.z);
+    if h.length() < 0.05 { return; }
+    let hn = h.normalize();
+    let p = Vec3(gazeEye.x + hn.x * grabDist, 0., gazeEye.z + hn.z * grabDist);
+    if grabKind == 1u32 { browserPos = p; browserYaw = Warehouse.faceOrigin(p); browseCfg = true; browseCfgPos = p; browseCfgYaw = browserYaw; }
+    else if grabKind == 2u32 { reportPos = p; reportCfg = true; reportCfgPos = p; reportCfgYaw = Warehouse.faceOrigin(p); }
+    else if grabKind == 3u32 { let q = usize.from(u32.from(grabIt)); if q < markers.len() { (&mut markers[q]).pos = p; } }
+    else if grabKind == 4u32 {
+      let k = usize.from(u32.from(grabIt));
+      if k < items.len() {
+        let y = items[k].freePos.y;
+        (&mut items[k]).freePos = Vec3(p.x, y, p.z);
+        (&mut items[k]).pos = Vec3(p.x, y, p.z);
+        (&mut items[k]).flight = 1.;
+      }
+    }
+  }
+
+  // The grip let go of a panel, post or project: where it stands goes to room.toml
+  fn dropOther(self: &mut) {
+    let kind = grabKind;
+    let it = grabIt;
+    grabKind = 0u32; grabIt = -1;
+    var text = String.from("at:");
+    var pos = Vec3(0., 0., 0.);
+    var yawDeg: i64 = 0i64;
+    if kind == 1u32 { pos = browserPos; yawDeg = i64.from(i32.from(browserYaw * 180. / PI)); }
+    else if kind == 2u32 { pos = reportPos; yawDeg = i64.from(i32.from(reportCfgYaw * 180. / PI)); }
+    else if kind == 3u32 { let q = usize.from(u32.from(it)); if q < markers.len() { pos = markers[q].pos; } }
+    else if kind == 4u32 { let k = usize.from(u32.from(it)); if k < items.len() { self.noteMoved(k); print <- "warehouse: dropped a project\n"; } return; }
+    text.append(floatText(pos.x).view()); text.append(","); text.append(floatText(pos.y).view()); text.append(","); text.append(floatText(pos.z).view());
+    if kind == 1u32 || kind == 2u32 {
+      let id = if kind == 1u32 { "browser" } else { "report" };
+      var found = false;
+      var pn = 0usize;
+      while pn < roomGood.panels.len() {
+        if roomGood.panels[pn].id.view() == id { roomGood.panels[pn].place = text.clone(); roomGood.panels[pn].yaw = yawDeg; roomGood.panels[pn].hasYaw = true; found = true; }
+        pn = pn + 1usize;
+      }
+      if !found { roomGood.panels.push(PanelCfg(String.from(id), text.clone(), yawDeg, true, 0i64, false)); }
+    } else if kind == 3u32 {
+      let q = usize.from(u32.from(it));
+      if q >= markers.len() { return; }
+      (&mut markers[q]).place = text.clone();
+      if markers[q].proj {
+        var pi = 0usize;
+        var found = false;
+        while pi < roomGood.projects.len() { if roomGood.projects[pi].id.view() == markers[q].id.view() { found = true; break; } pi = pi + 1usize; }
+        if !found { roomGood.projects.push(newProj(markers[q].id.view())); pi = roomGood.projects.len() - 1usize; }
+        roomGood.projects[pi].place = text.clone();
+        roomGood.projects[pi].at = isoUtc(unixMs());
+      } else {
+        var found = false;
+        var fi = 0usize;
+        while fi < roomGood.folders.len() {
+          if roomGood.folders[fi].id.view() == markers[q].id.view() { roomGood.folders[fi].place = text.clone(); roomGood.folders[fi].at = isoUtc(unixMs()); found = true; }
+          fi = fi + 1usize;
+        }
+        if !found { roomGood.folders.push(FolderCfg(markers[q].id.clone(), markers[q].name.clone(), markers[q].path.clone(), text.clone(), isoUtc(unixMs()))); }
+        (&mut markers[q]).room = true;
+      }
+    }
+    print <- "warehouse: dropped at "; printStr(text.view()); print <- "\n";
+    writeAt = nowMs() + 1000u64;
   }
 
   fn faceOrigin(p: Vec3) f32 { atan2(0. - p.x, 0. - p.z) }
@@ -2166,6 +2296,7 @@ pub struct Warehouse {
   }
 
   pub fn dropGrab(self: &mut) {
+    if grabKind > 0u32 { self.dropOther(); return; }
     if grabIx < 0 { return; }
     let i = usize.from(u32.from(grabIx));
     grabIx = -1;
@@ -2196,6 +2327,7 @@ pub struct Warehouse {
     let now = nowMs();
     var openWant = List[String]();
     var browseWant = String();
+    self.followGrab();
     var i = 0usize;
     while i < pgs.len() {
       if pgs[i].fly < 1. {
@@ -2327,7 +2459,7 @@ pub struct Warehouse {
       let hw = pgHalfW(web);
       let cy = pgTop(web) + 0.05;
       var c = 0u32;
-      while c < 3u32 {
+      while c < (if web { 3u32 } else { 5u32 }) {
         let cx = hw - 0.19 - 0.39 * f32.from(c);
         let t = quadHit(m, Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir);
         if t > 0. && (best < 0. || t < best) { best = t; *kind = 2u32 + c; }
@@ -2395,6 +2527,10 @@ pub struct Warehouse {
     if bk == 2u32 { self.closePage(pu); return true; }
     if bk == 3u32 { self.toggleShelve(pu); return true; }
     if bk == 4u32 { self.startGrab(pu); return true; }
+    if bk == 5u32 || bk == 6u32 {
+      match &mut pgs[pu].doc { case var &mut Some(p) { p.requestNav(if bk == 5u32 { -1i32 } else { 1i32 }); } else {} }
+      return true;
+    }
     if pgs[pu].shelved { self.toggleShelve(pu); return true; }
     let inv = self.pgModel(pu).inverse();
     let le = inv * eye;
@@ -2937,7 +3073,7 @@ pub struct Warehouse {
         let top = pgTop(web);
         if !pgs[idx].shelved {
           var c = 0usize;
-          while c < 3usize {
+          while c < (if web { 3usize } else { 5usize }) {
             let cx = hw - 0.19 - 0.39 * f32.from(u32.from(c));
             let cy = top + 0.05;
             Warehouse.faded(&mut pgs[idx].chips[c], device, encoder, target, depth, vp * pm,

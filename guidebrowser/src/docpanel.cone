@@ -127,6 +127,38 @@ fn loadFont(file: &str) Option[Font] {
 // one holds the monospace face, so code is asked for as bold and italic, and text that is both is drawn bold.
 // After them come fallback faces (Segoe UI Symbol, Arial) for characters those lack: richtext picks a glyph from
 // one face only, so after layout, each missing glyph is given to the first fallback that has it (fixGlyphs).
+// The fonts and the text renderer (glyph atlases, pipelines) are made once and shared by all the document panels: each
+// borrows the pair for the time of one layout or draw (richTake / richPut), as the panels draw one after another.
+struct RichPair {
+  faces: Faces;
+  rr: RichRenderer;
+}
+var @threadlocal richPool: Option[RichPair] = None;
+var @threadlocal richMade = false;
+
+fn richTake() Option[RichPair] {
+  var s: Option[RichPair] = None;
+  s <-> richPool;
+  s
+}
+
+fn richPut(p: Option[RichPair]) { richPool = p; }
+
+// Makes the pair if it is not made yet; false if no font was found or the renderer failed
+fn ensureRich(device: &mut Device) bool {
+  if richMade { return true; }
+  let tT0 = sdl.GetPerformanceCounter();
+  match makeFaces() {
+    case let Some(faces) {
+      var rr = RichRenderer.create(device, &faces, TEXTURE_FORMAT_RGBA8_UNORM);
+      print <- "docpanel: fonts and pipelines made in "; print <- micros(tT0, sdl.GetPerformanceCounter()) / 1000.; print <- " ms (shared by all panels)\n";
+      if rr.isValid() { richPool = Some[RichPair](RichPair(faces, rr)); richMade = true; return true; }
+    }
+    case is None { print <- "docpanel: no font found (C:/Windows/Fonts/georgia.ttf)\n"; }
+  }
+  false
+}
+
 fn makeFaces() Option[Faces] {
   var out: Option[Faces] = None;
   match loadFont("C:/Windows/Fonts/georgia.ttf") {
@@ -183,8 +215,6 @@ pub struct DocPanel {
   owner: List[usize];            // for each richtext block, the doc block it came from
   images: List[ImageInfo];
   layout: RichLayout;
-  faces: Faces;
-  rr: RichRenderer;
   target: Texture;
   readback: Buffer;
   stripTarget: Texture;
@@ -231,12 +261,9 @@ pub struct DocPanel {
   // Check that it came out: None if no font is installed or the renderer failed
   pub fn create(device: &mut Device, renderer: &mut Renderer, outFormat: u32, file: &str, initialScroll: f32) Option[DocPanel] {
     var made: Option[DocPanel] = None;
-    let tT0 = sdl.GetPerformanceCounter();
-    match makeFaces() {
-      case let Some(faces) {
-        var rr = RichRenderer.create(device, &faces, TEXTURE_FORMAT_RGBA8_UNORM);
-        print <- "docpanel: fonts and pipelines made in "; print <- micros(tT0, sdl.GetPerformanceCounter()) / 1000.; print <- " ms\n";
-        if rr.isValid() {
+    {
+      {
+        if ensureRich(device) {
           let desc = TextureDescriptor(DOC_TEX_W, DOC_TEX_H, TEXTURE_FORMAT_RGBA8_UNORM,
             TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
           var target = device.createTexture(&desc);
@@ -247,7 +274,7 @@ pub struct DocPanel {
           var stripBuf = device.createBuffer(u64.from(DOC_TEX_W * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
           let page = PagePass.create(device, outFormat);
           var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
-            emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, stripTarget, stripBuf,
+            emptyLayout(f32.from(DOC_TEX_W)), target, readback, stripTarget, stripBuf,
             page, List[u64](), List[u32](), List[Del](), String(), String(),
             List[HistEntry](), String(), String(), String(), String(), List[String](), String(),
             None, List[Diagram](), List[usize](), List[usize]());
@@ -257,7 +284,6 @@ pub struct DocPanel {
           made = Some[DocPanel](p);
         }
       }
-      case is None { print <- "docpanel: no font found (C:/Windows/Fonts/georgia.ttf)\n"; }
     }
     made
   }
@@ -780,8 +806,26 @@ pub struct DocPanel {
       owner.push(0usize);
       blockDiag.push(NOMATCH);
     }
-    layout = layoutRich(&blocks, &images, &faces, &self.config());
-    self.fixGlyphs();
+    var rp = richTake();
+    match &rp { case let Some(r) {
+      layout = layoutRich(&blocks, &images, &r.faces, &self.config());
+      self.fixGlyphs(&r.faces);
+    } else {} }
+    richPut(rp);
+  }
+
+  fn layoutOne(self: &, eb: &List[Block], cfg: &LayoutConfig) RichLayout {
+    var out = emptyLayout(f32.from(DOC_TEX_W));
+    var rp = richTake();
+    match &rp { case let Some(r) { out = layoutRich(eb, &images, &r.faces, cfg); } else {} }
+    richPut(rp);
+    out
+  }
+
+  fn drawStrip(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, view: &RichView, el: &RichLayout, sel: &List[RectP], caret: &CaretRect) {
+    var rp = richTake();
+    match &mut rp { case var &mut Some(r) { r.rr.draw(device, encoder, &stripTarget, view, &r.faces, el, &images, sel, caret); } else {} }
+    richPut(rp);
   }
 
   fn config(self: &) LayoutConfig {
@@ -796,7 +840,7 @@ pub struct DocPanel {
 
   // richtext takes each character's glyph from the one face its style names; where that face has none (glyph 0), the
   // glyph and its width come from the first fallback face that has the character, and the rest of the line moves over
-  fn fixGlyphs(self: &mut) {
+  fn fixGlyphs(self: &mut, faces: &Faces) {
     glyphsSwapped = 0u32;
     if u32.from(faces.count()) <= fallbackFrom { return; }
     var li = 0usize;
@@ -948,7 +992,9 @@ pub struct DocPanel {
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
     var encoder = device.createCommandEncoder();
-    rr.draw(device, &mut encoder, &target, &view, &faces, &layout, &images, &sel, &caret);
+    var rp = richTake();
+    match &mut rp { case var &mut Some(r) { r.rr.draw(device, &mut encoder, &target, &view, &r.faces, &layout, &images, &sel, &caret); } else {} }
+    richPut(rp);
     encoder.copyTextureToBuffer(&target, &readback);
     device.queue.submit(encoder.finish());
     device.waitIdle();
@@ -981,13 +1027,13 @@ pub struct DocPanel {
     var cfg = self.config();
     cfg.marginTop = 10.;
     cfg.baseSize = 22.;
-    let el = layoutRich(&eb, &images, &faces, &cfg);
+    let el = self.layoutOne(&eb, &cfg);
     let view = RichView(f32.from(DOC_TEX_W), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32,
       f32.from(DOC_TEX_W), false);
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
     var encoder = device.createCommandEncoder();
-    rr.draw(device, &mut encoder, &stripTarget, &view, &faces, &el, &images, &sel, &caret);
+    self.drawStrip(device, &mut encoder, &view, &el, &sel, &caret);
     encoder.copyTextureToBuffer(&stripTarget, &stripBuf);
     device.queue.submit(encoder.finish());
     device.waitIdle();
@@ -1013,12 +1059,12 @@ pub struct DocPanel {
     cfg.margin = 14.;
     cfg.marginTop = 10.;
     cfg.baseSize = 22.;
-    let el = layoutRich(&eb, &images, &faces, &cfg);
+    let el = self.layoutOne(&eb, &cfg);
     let view = RichView(f32.from(DOC_TEX_W), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32, f32.from(DOC_TEX_W), false);
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
     var encoder = device.createCommandEncoder();
-    rr.draw(device, &mut encoder, &stripTarget, &view, &faces, &el, &images, &sel, &caret);
+    self.drawStrip(device, &mut encoder, &view, &el, &sel, &caret);
     encoder.copyTextureToBuffer(&stripTarget, &stripBuf);
     device.queue.submit(encoder.finish());
     device.waitIdle();
@@ -1515,6 +1561,11 @@ struct PagePass {
     fresh <-> texture;
     device.queue.releaseBindGroup(&mut made);
     device.queue.releaseTexture(&mut fresh);
+  }
+
+  // 'rows' rows of level 0 from 'y', 'wide' texels each, taken from 'data' (the rows packed one after another)
+  fn refreshRows(self: &mut, device: &mut Device, data: *u8, wide: u32, y: u32, rows: u32) {
+    device.queue.writeTextureRegion(&texture, data, wide * 4u32, 0u32, y, wide, rows);
   }
 
   fn refreshChain(self: &mut, device: &mut Device, chain: &List[u32]) {
