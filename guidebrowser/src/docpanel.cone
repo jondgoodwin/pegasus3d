@@ -29,7 +29,7 @@ const DOC_CENTRE_Y = 1.45;       // meters up, the panel's middle: a little belo
 const FADE_SECONDS = 10.;
 const FADE_HOLD_SECONDS = 1.;    // full strength for this long first
 const FADE_LOW = 110.;           // the steady strength of an old mark, of 255
-const STRIP_H = 64u32;           // the error line's height at the page's foot
+const STRIP_H = 112u32;          // the error / note strip's height at the page's foot
 // Settable from the command line ('--stem P', '--page-bias B'): stem darkening's power (below 1 darkens partly covered
 // pixels), and the page's mip level bias (negative: sharper, more aliasing)
 var @threadlocal stemPower: f32 = 0.4;
@@ -182,6 +182,7 @@ pub struct DocPanel {
   kinds: List[u32];              // 1 new, 2 changed
   dels: List[Del];
   err: String;
+  note: String;                 // a line of the bridge at the page's foot (blue) when there is no error
   scrollY: f32 = 0.;
   dirty: bool = false;
   lastPoll: u64 = 0u64;
@@ -210,7 +211,7 @@ pub struct DocPanel {
           let page = PagePass.create(device, outFormat);
           var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
             emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, stripTarget, stripBuf,
-            page, List[u64](), List[u32](), List[Del](), String());
+            page, List[u64](), List[u32](), List[Del](), String(), String());
           p.scrollY = initialScroll;
           p.reload(device, renderer, true);
           made = Some[DocPanel](p);
@@ -267,6 +268,46 @@ pub struct DocPanel {
     if sameText(err.view(), message) { return; }
     err = String.from(message);
     print <- "docpanel: error line shown: "; printStr(message); print <- "\n";
+    dirty = true;
+  }
+
+  // For the bridge's turn: this document as a JSON object (file, whether it is on show, the block at the top of the view)
+  pub fn describe(self: &, showing: bool) String {
+    var s = String.from("{\"file\": ");
+    let fj = jsonStr(file.view());
+    s.append(fj.view());
+    s.append(", \"showing\": ");
+    s.append(if showing { "true" } else { "false" });
+    let top = self.topDocBlock();
+    s.append(", \"top_block\": ");
+    if top < doc.blocks.len() {
+      let pj = jsonStr(doc.blocks[top].path.view());
+      s.append(pj.view());
+    } else { s.append("null"); }
+    s.append("}");
+    s
+  }
+
+  // Show another file in this panel, through the same reload as the first one (no marks: it is a new document)
+  pub fn open(self: &mut, device: &mut Device, renderer: &mut Renderer, newFile: &str) {
+    file = String.from(newFile);
+    doc = Doc(List[DocBlock]());
+    text = String();
+    err = String();
+    note = String();
+    born = List[u64]();
+    kinds = List[u32]();
+    dels = List[Del]();
+    scrollY = 0.;
+    lastMtime = 0i64;
+    lastSize = 0i64;
+    hotUntil = 0u64;
+    self.reload(device, renderer, true);
+  }
+
+  pub fn setNote(self: &mut, message: &str) {
+    if sameText(note.view(), message) { return; }
+    note = String.from(message);
     dirty = true;
   }
 
@@ -583,23 +624,33 @@ pub struct DocPanel {
     device.waitIdle();
     while layout.rects.len() > keep { layout.rects.pop(); }
     var img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
-    darkenStems(&mut img);    if err.len() > 0usize { self.errorStrip(device, &mut img); }
+    darkenStems(&mut img);    if err.len() > 0usize || note.len() > 0usize { self.errorStrip(device, &mut img); }
     page.upload(device, &img);       // an sRGB texture with its whole mip chain, averaged in linear light
   }
 
   // The error as one red line at the foot of the page: laid out and drawn apart (richtext draws only a document),
   // then its rows written over the page's last rows
   fn errorStrip(self: &mut, device: &mut Device, img: &mut Image) {
-    var line = String.from("File error: ");
-    line.append(err.view());
-    line.append(". Showing the last good version.");
+    var line = String();
+    var bg = 0xf2a8b0ffu32;
+    var ink = 0x600010ffu32;
+    if err.len() > 0usize {
+      line.append("File error: ");
+      line.append(err.view());
+      line.append(". Showing the last good version.");
+    }
+    else {
+      line.append(note.view());
+      bg = 0xc9dcf5ffu32;
+      ink = 0x10264dffu32;
+    }
     var eb = List[Block]();
-    eb.push(Block.fromText(line.view(), Style(true, false, false, 0., 0x600010ffu32, 0u32, 0u32)));
+    eb.push(Block.fromText(line.view(), Style(true, false, false, 0., ink, 0u32, 0u32)));
     var cfg = self.config();
-    cfg.marginTop = 14.;
-    cfg.baseSize = 30.;
+    cfg.marginTop = 10.;
+    cfg.baseSize = 26.;
     let el = layoutRich(&eb, &images, &faces, &cfg);
-    let view = RichView(f32.from(DOC_TEX_W), f32.from(STRIP_H), 0., 0., 0xf2a8b0ffu32, 0xf2a8b0ffu32, 0u32, 0u32,
+    let view = RichView(f32.from(DOC_TEX_W), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32,
       f32.from(DOC_TEX_W), false);
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
@@ -652,6 +703,13 @@ pub struct DocPanel {
     }
     else { line.append("(no block here)"); }
     print <- "panel click: "; printStr(line.view()); print <- "\n";
+    // the log line is: unix ms TAB document TAB path | text (the bridge reads it)
+    var stamped = numText(unixMs());
+    stamped.append("\t");
+    stamped.append(file.view());
+    stamped.append("\t");
+    stamped.append(line.view());
+    line = stamped;
     line.append("\n");
     var bytes = List[u8]();
     var k = 0usize;

@@ -128,6 +128,8 @@ struct Shell {
   pub list: DrawList;
   pub camera: Camera;
   pub light: Light;
+  pub other: Option[DocPanel];    // the panel not shown: the document while a reply is read, or the last reply while the document is
+  pub bridge: Option[Bridge];     // '--bridge DIR': the studio bridge (bridge.cone)
 }
 
 // Made in start. (A global Option cannot be matched in place, only a borrow
@@ -156,6 +158,16 @@ var @threadlocal wheelY = 0.;
 var @threadlocal shotError = false;        // '--shot-on-error': the shot is taken shotDelay frames after the panel shows an error line
 var @threadlocal pressCReload = 0;         // '--press-c-after-reload K': the C key is pushed 40 frames after the panel's Kth reading
 var @threadlocal pressCAt = 0;            // '--press-c N': on frame N, the C key (clear the marks) is pushed through SDL's queue
+var @threadlocal bridgeArg: *u8 = null;    // '--bridge DIR': the studio bridge's folder (bridge.cone). Return sends the draft, B goes back
+var @threadlocal autoTurns = 0;            // '--auto-turns K': send K test turns, each GAP frames after the last reply (a stand-in for the key)
+var @threadlocal autoGap = 30;             // '--auto-gap F'
+var @threadlocal autoSent = 0;
+var @threadlocal autoNext = 120;
+var @threadlocal shotReply = 0;            // '--shot-after-reply K': the shot is taken 30 frames after the Kth reply is shown
+var @threadlocal backAfterShot = false;    // '--back-after-shot': 15 frames after the shot, B is pressed (the document), and a second shot follows 25 frames later
+var @threadlocal pressRetAt = 0;          // '--press-return N': on frame N, the Return key is pushed through SDL's queue
+var @threadlocal pressRetCount = 0;        // '--press-return-after-reply K': the Return key is pushed 20 frames after the Kth reply is shown
+var @threadlocal repliesShown = 0;
 var @threadlocal docScroll = 0.;         // '--doc-scroll PX': where the page starts
 var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D degrees further up (down if negative)
 
@@ -241,6 +253,8 @@ pub fn start(host: &mut Host) bool {
     panel = DocPanel.create(&mut device, &mut renderer, swapchain.format, cstr.fromPtr(docArg).view(), f32.from(docScroll));
     match &panel { case is None { print <- "The document panel could not be made\n"; } else {} }
   }
+  var bridge: Option[Bridge] = None;
+  if bridgeArg != null { bridge = Some[Bridge](Bridge.create(cstr.fromPtr(bridgeArg).view(), POINTER_LOG)); }
   let world = if worldArg == null { String.from(if docArg != null { "doc" } else { "home" }) } else { String.from(cstr.fromPtr(worldArg).view()) };
   loader.arrive(world, worldsFolder(), arrivedAt, testPart, show);
 
@@ -248,7 +262,7 @@ pub fn start(host: &mut Host) bool {
   shell = Some[Shell](Shell(Scene.empty(), panel, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
     List[PartView](), 0u64, NO_CLICK, Input(), actions, walk, look, true,
     Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), target, fx, post, renderer, swapchain, device,
-    adapter, surface, instance, DrawList(), camera, light));
+    adapter, surface, instance, DrawList(), camera, light, None, bridge));
   true
 }
 
@@ -275,6 +289,8 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
         if key.scancode == sdl.SCANCODE_C && !key.repeat {
           match &mut (*some).panel { case var &mut Some(p) { p.clearMarks(); } else {} }
         }
+        if key.scancode == KEY_RETURN && !key.repeat { sendTurn(&mut *some); }
+        if key.scancode == KEY_B && !key.repeat { toggleBack(&mut *some); }
       }
       if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
         let b = e as &sdl.MouseButtonEvent;
@@ -608,9 +624,118 @@ pub fn draw(host: &mut Host, alpha: f32, scratch: &mut Arena) {
   shell = g;
 }
 
+// ---- the studio bridge (bridge.cone) ----
+const KEY_RETURN = 40u;      // SDL scancodes (the sdl binding names only some)
+const KEY_B = 5u;
+
+// Return: the draft goes as the next turn
+fn sendTurn(s: &mut Shell) {
+  var one = String();
+  var two = String();
+  match &s.panel { case let Some(p) { one = p.describe(true); } else {} }
+  match &s.other { case let Some(p) { two = p.describe(false); } else {} }
+  var docs = String.from("[");
+  docs.append(one.view());
+  if one.len() > 0usize && two.len() > 0usize { docs.append(", "); }
+  docs.append(two.view());
+  docs.append("]");
+  var sent = 0u32;
+  let dv = docs.view();
+  match &mut s.bridge {
+    case var &mut Some(b) { if b.send(dv) { sent = b.turn; } }
+    else { print <- "bridge: not started (give --bridge DIR)\n"; }
+  }
+  if sent > 0u32 {
+    var note = String.from("Sent turn ");
+    note.append(numText(i64.from(sent)).view());
+    note.append(". Waiting for the reply...");
+    let noteView = note.view();
+    match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); } else {} }
+  }
+}
+
+// A reply has come: read it as a panel of its own. The document goes behind it (B brings it back).
+fn showReply(s: &mut Shell, n: u32) {
+  var summary = String();
+  var path = String();
+  var showing = false;
+  match &s.bridge {
+    case let Some(b) { summary = b.summary(n); path = b.replyPath(n, ".md"); showing = b.showingReply; }
+    else { return; }
+  }
+  s.device.waitIdle();
+  // The reply panel is made once and reopened on each later reply (making one loads the fonts, about 2 s)
+  let pv = path.view();
+  if showing {
+    match &mut s.panel { case var &mut Some(p) { p.open(&mut s.device, &mut s.renderer, pv); } else {} }
+  }
+  else {
+    var have = false;
+    match &s.other { case let Some(o) { have = true; } else {} }
+    if have {
+      match &mut s.other { case var &mut Some(p) { p.open(&mut s.device, &mut s.renderer, pv); } else {} }
+      s.panel <-> s.other;
+    }
+    else {
+      s.panel <-> s.other;
+      s.panel = DocPanel.create(&mut s.device, &mut s.renderer, s.swapchain.format, pv, 0.);
+    }
+  }
+  var note = String();
+  if summary.len() > 0usize { note.append(summary.view()); } else { note.append("Reply "); note.append(numText(i64.from(n)).view()); }
+  note.append("   [B: back to the document]");
+  let noteView = note.view();
+  match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); p.tick(&mut s.device, &mut s.renderer); } else {} }
+  match &mut s.other { case var &mut Some(p) { p.setNote(""); } else {} }
+  var took = 0i64;
+  match &mut s.bridge {
+    case var &mut Some(b) { b.showingReply = true; b.shown = n; took = unixMs() - b.sentMs; }
+    else {}
+  }
+  repliesShown = repliesShown + 1;
+  print <- "bridge: reply "; print <- n; print <- " on screen at "; print <- unixMs(); print <- " ms, "; print <- took; print <- " ms after the turn was sent\n";
+}
+
+// B: back to the document being read (and again to the reply)
+fn toggleBack(s: &mut Shell) {
+  var have = false;
+  match &s.other { case let Some(o) { have = true; } else {} }
+  if !have { return; }
+  var showing = false;
+  match &s.bridge { case let Some(b) { showing = b.showingReply; } else {} }
+  s.panel <-> s.other;
+  match &mut s.bridge { case var &mut Some(b) { b.showingReply = !showing; } else {} }
+  print <- "bridge: showing the "; print <- (if showing { "document" } else { "reply" }); print <- "\n";
+}
+
+fn bridgeTick(s: &mut Shell) {
+  var n = 0u32;
+  var pending = false;
+  match &mut s.bridge {
+    case var &mut Some(b) { n = b.poll(); pending = b.pending(); }
+    else { return; }
+  }
+  if backAfterShot && shotAt > 0 && drawn == shotAt + 15 { backAfterShot = false; toggleBack(s); shotAt = drawn + 25; }
+  if n > 0u32 { showReply(s, n); autoNext = drawn + autoGap; return; }
+  if autoSent < autoTurns && !pending && drawn >= autoNext {
+    autoSent = autoSent + 1;
+    var folder = String();
+    match &s.bridge { case let Some(b) { folder = String.from(b.dir.view()); } else {} }
+    var text = String.from("Automated test turn ");
+    text.append(numText(i64.from(autoSent)).view());
+    text.append(": please reply.");
+    writeAtomic(folder.view(), "draft.txt", text.view());
+    sendTurn(s);
+  }
+}
+
 fn drawScene(s: &mut Shell, alpha: f32) {
   if !s.target.ok() { return; }
   match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
+  match &mut s.other { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
+  bridgeTick(s);
+  if shotReply > 0 && repliesShown == shotReply && shotAt == 0 { shotAt = drawn + 30; }
+  if pressRetCount > 0 && repliesShown == pressRetCount && pressRetAt == 0 { pressRetAt = drawn + 20; }
   if shotReload > 0 {
     match &s.panel { case let Some(p) { if i32.from(p.reloads) == shotReload && shotAt == 0 { shotAt = drawn + shotDelay; } } else {} }
   }
@@ -695,6 +820,14 @@ pub fn present(host: &mut Host) {
         w.y = f32.from(wheelY);
         w.integer_y = i32.from(wheelY);
         if !sdl.PushEvent(&mut ev) { print <- "could not push the wheel event\n"; }
+      }
+      if pressRetAt != 0 && drawn == pressRetAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_KEY_DOWN;
+        let k = &mut ev as &mut sdl.KeyboardEvent;
+        k.scancode = KEY_RETURN;
+        k.down = true;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
       }
       if pressCAt != 0 && drawn == pressCAt {
         var ev = sdl.Event();
@@ -864,6 +997,13 @@ fn main(argc: i32, argv: **u8) i32 {
       clicks = clicks + 1;
     }
     if libc.strcmp(arg, "--doc") == 0i32 && more { docArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--bridge") == 0i32 && more { bridgeArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--auto-turns") == 0i32 && more { autoTurns = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--auto-gap") == 0i32 && more { autoGap = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--shot-after-reply") == 0i32 && more { shotReply = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
+    if libc.strcmp(arg, "--back-after-shot") == 0i32 { backAfterShot = true; }
+    if libc.strcmp(arg, "--press-return") == 0i32 && more { pressRetAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--press-return-after-reply") == 0i32 && more { pressRetCount = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--shot-after-reload") == 0i32 && more { shotReload = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
     if libc.strcmp(arg, "--stem") == 0i32 && more { stemPower = f32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--page-bias") == 0i32 && more { pageBias = f32.from(argNumber(argv, a + 1i32)); }
