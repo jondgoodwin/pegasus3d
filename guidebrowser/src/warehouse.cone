@@ -474,7 +474,7 @@ pub struct Warehouse {
       let ds = self.destScale(k);
       var want: f32 = 0.;
       if items[k].onTable {
-        want = if items[k].page { self.slotYaw(items[k].idx) + items[k].yawShelf + 0.5 * sin(clock * 0.5) } else { clock * 0.4 };
+        want = if items[k].page { self.slotYaw(items[k].idx) + items[k].yawShelf } else { clock * 0.4 };
         if items[k].isApp { want = self.slotYaw(items[k].idx) + items[k].yawShelf; }
         else if !items[k].page { want = items[k].yawShelf + clock * 0.4; }
       } else { want = items[k].yawShelf; }
@@ -1590,6 +1590,49 @@ pub struct Warehouse {
     }
   }
 
+  // The test hooks for the simulator's fake hand (w 0: not there): where the chip for action 'a' stands, the k'th link on show in the
+  // page, the k'th link on show in the file browser
+  pub fn chipPoint(self: &, a: u32, view: Vec3) Vec4 {
+    if !self.chipsShown(nowMs()) || chipAnchor != sel { return Vec4(0., 0., 0., 0.); }
+    let list = self.chipList();
+    var k = 0usize;
+    while k < list.len() {
+      if *list[k] == a {
+        let f = self.chipFrame(k, list.len(), view);
+        return Vec4(f.x, f.y, f.z, 1.);
+      }
+      k = k + 1usize;
+    }
+    Vec4(0., 0., 0., 0.)
+  }
+
+  pub fn pagePoint(self: &, page: &Option[DocPanel], k: usize) Vec4 {
+    match page {
+      case let Some(p) {
+        let l = p.linkPoint(k);
+        if l.w < 0.5 { return l; }
+        let w = self.pageModel() * Vec3(l.x, l.y, 0.);
+        return Vec4(w.x, w.y, w.z, 1.);
+      }
+      else {}
+    }
+    Vec4(0., 0., 0., 0.)
+  }
+
+  pub fn browserPoint(self: &, k: usize) Vec4 {
+    if !browserOpen { return Vec4(0., 0., 0., 0.); }
+    match &browserPanel {
+      case let Some(p) {
+        let l = p.linkPoint(k);
+        if l.w < 0.5 { return l; }
+        let w = self.browserModel() * Vec3(l.x, l.y, 0.);
+        return Vec4(w.x, w.y, w.z, 1.);
+      }
+      else {}
+    }
+    Vec4(0., 0., 0., 0.)
+  }
+
   // ---- the camera-facing quads ----
 
   fn faceModel(p: Vec3, eye: Vec3) Mat4 {
@@ -1636,7 +1679,8 @@ pub struct Warehouse {
   }
 
   // A click's ray against the chips: true if one was taken
-  pub fn clickChip(self: &mut, eye: Vec3, dir: Vec3, v: &Fly) bool {
+  // (the ray starts at 'eye'; the chips face and are sized for 'view', the head: a hand's beam starts elsewhere)
+  pub fn clickChip(self: &mut, eye: Vec3, dir: Vec3, v: &Fly, view: Vec3) bool {
     let now = nowMs();
     if !self.chipsShown(now) || chipAnchor != sel { return false; }
     let list = self.chipList();
@@ -1645,10 +1689,10 @@ pub struct Warehouse {
     while k < list.len() {
       let c = *list[k];
       if chips[usize.from(c)].alpha > 0.5 {
-        let f = self.chipFrame(k, list.len(), eye);
+        let f = self.chipFrame(k, list.len(), view);
         let w = chips[usize.from(c)].w * f.w * 0.5;
         let h = chips[usize.from(c)].h * f.w * 0.5;
-        let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
+        let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), view);
         let inv = m.inverse();
         let e = inv * eye;
         let d = inv.transformVector(dir);
@@ -1678,7 +1722,7 @@ pub struct Warehouse {
 
   // How far along a pointing ray (a unit vector) the nearest thing a click would take is met, or -1: the same tests as clickChip,
   // clickCard and the pages, taking nothing. The beam of a controller ends there. (The parts are the shell's: nearestPart.)
-  pub fn reach(self: &, eye: Vec3, dir: Vec3, page: &Option[DocPanel]) f32 {
+  pub fn reach(self: &, eye: Vec3, dir: Vec3, view: Vec3, page: &Option[DocPanel]) f32 {
     var best: f32 = -1.;
     var c = 0usize;
     while c < cards.len() {
@@ -1702,10 +1746,10 @@ pub struct Warehouse {
       while k < list.len() {
         let ci = *list[k];
         if chips[usize.from(ci)].alpha > 0.5 {
-          let f = self.chipFrame(k, list.len(), eye);
+          let f = self.chipFrame(k, list.len(), view);
           let w = chips[usize.from(ci)].w * f.w * 0.5;
           let h = chips[usize.from(ci)].h * f.w * 0.5;
-          let inv = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye).inverse();
+          let inv = Warehouse.faceModel(Vec3(f.x, f.y, f.z), view).inverse();
           let e = inv * eye;
           let d = inv.transformVector(dir);
           if d.z > 0.00001 || d.z < -0.00001 {
@@ -1876,19 +1920,19 @@ pub struct Warehouse {
       }
       else if kind == 6u32 {
         match &mut browserPanel {
-          case var &mut Some(p) { p.drawPage(device, encoder, target, vp * self.browserModel()); }
+          case var &mut Some(p) { p.drawPageDepth(device, encoder, target, depth, vp * self.browserModel()); }
           else {}
         }
       }
       else if kind == 5u32 {
         match &mut reportPanel {
-          case var &mut Some(p) { p.drawPage(device, encoder, target, vp * self.reportModel()); }
+          case var &mut Some(p) { p.drawPageDepth(device, encoder, target, depth, vp * self.reportModel()); }
           else {}
         }
       }
       else {
         match panel {
-          case var &mut Some(p) { p.drawPage(device, encoder, target, vp * self.pageModel()); }
+          case var &mut Some(p) { p.drawPageDepth(device, encoder, target, depth, vp * self.pageModel()); }
           else {}
         }
       }
