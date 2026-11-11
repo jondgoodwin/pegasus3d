@@ -15,10 +15,10 @@ const LAB_H = 128u32;
 const FLIGHT_MS = 500.0f;
 const CHIP_DELAY_MS = 300.0f;
 const FADE_S = 0.2f;
-const FLOAT_Y = 0.95f;           // projects float at waist height
 const RING_N = 5;
 const DEFAULT_ROOT_BROWSE = "C:/Users/jondg/MyDrive/Incubator";
-const RING_R = 2.5f;
+var @threadlocal ringRadius = 2.5f;     // [ring] radius_cm of studio.toml
+var @threadlocal floatHeight = 0.95f;   // [ring] float_cm: projects float at waist height
 const ZOOM1_H = 2.4f;            // "the project fills the ring": its height, meters
 const ZOOM2_H = 7.0f;            // "fills the room"
 const NO_ITEM = -1;
@@ -227,6 +227,20 @@ struct Item {
   zlevel: u32;          // 0 in the ring, 1 fills the ring, 2 fills the room
   zf: f32;              // the zoom factor now (follows the level's)
   shade: f32;           // the contact shadow's strength now
+  id: String;           // its key in studio.toml and room.toml
+  free: bool;           // placed by 'at:x,y,z' (in neither the ring nor a shelf)
+  freePos: Vec3;
+  mul: f32;             // scale_pct / 100
+  menu: List[Entry];    // its chips
+  isApp: bool;          // the architecture walk: drawn by the walk's own code (archworld.cone), no part in the world
+}
+
+// A chip of a project's menu: what it says, what it does, and which picture of the pool is its
+struct Entry {
+  text: String;
+  action: String;
+  known: bool;
+  pool: usize;
 }
 
 // The visitor gliding to look at something
@@ -277,17 +291,47 @@ pub struct Warehouse {
   browserYaw: f32;
   navWant: u32;            // a chip asked for back (6), forward (7) or the file browser (8); the shell serves it
   browserWant: String;     // a folder to show in the browser, served in 'update'
+  // the studio's configuration (studiocfg.cone)
+  cfgDir: String;
+  studioSeen: String;      // the last text of studio.toml read
+  roomSeen: String;
+  studioGood: Parsed;      // the last studio.toml that read well
+  roomGood: Parsed;        // the last room.toml that read well, plus what the room has done since
+  haveStudio: bool;
+  cfgPoll: u64;
+  studioErr: String;
+  roomErr: String;
+  errCard: Option[Label];  // the red card: what is wrong in a file
+  errShown: String;
+  applying: bool;          // the file is being applied: the moves it makes are not the room's own
+  writeAt: u64;            // when room.toml is to be written (a second after the last move), or 0
+  outLines: List[String];  // lines for the bridge, taken by the shell
+  sayWant: String;         // a say: action's text, taken by the shell
+  linkWant: String;        // a link: action's target, taken by the shell
+  reloadAsk: bool;
+  lineFileV: String;
+  browseRoot: String;
+  chipKeys: List[String];  // the pool's pictures' keys: text and colour
+  docPath: String;
+  aw: Option[Aw];
+  eyeIx: u32;              // which eye the walk's words are drawn for (0 the window or the left eye)
+  moves: u32;              // moves written to room.toml
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
       NO_ITEM, 0u64, 0u64, 0u64, Glide(false, 0., Vec3(0., 0., 0.), Vec3(0., 0., 0.), 0., 0., 0., 0.), 0u32, 0u32,
       List[PagePass](), List[f32](), NO_ITEM, List[u32](), List[Label](), -1, None, String(), -1, false,
-      Vec3(0., 0., 0.), None, false, Vec3(0., 0., 0.), 0., 0u32, String())
+      Vec3(0., 0., 0.), None, false, Vec3(0., 0., 0.), 0., 0u32, String(),
+      String(), String(), String(), newParsed(), newParsed(), false, 0u64, String(), String(), None, String(), false, 0u64,
+      List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
+      None, 0u32, 0u32)
   }
 
-  pub fn create(device: &mut Device, format: u32) Warehouse {
+  pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
     var w = Warehouse.empty();
     w.format = format;
+    w.cfgDir = String.from(cfgDir);
+    w.docPath = String.from(docPath);
     var maybe = Labeller.create(device);
     match &mut maybe {
       case var &mut Some(l) {
@@ -301,35 +345,30 @@ pub struct Warehouse {
         i = 0;
         while i < RING_N { w.decals.push(makeDecal(device, format, true)); i = i + 1; }
         i = 0;
-        while i < 9 { w.decals.push(makeDecal(device, format, false)); i = i + 1; }
+        while i < MAX_ITEMS { w.decals.push(makeDecal(device, format, false)); i = i + 1; }
         w.readout.push(readoutLabel(device, format));
-        // knight, page, amphora in the ring; six boxes on the shelf
-        w.addItem(l, device, "Knight", "knight", false, 8u32, 1.0, 0.45, 0.61, 0.2, PI * 0.5);
-        w.addItem(l, device, "Design page", "", true, 9u32, 0.5, 0.2, 1.903, 0.67, 0.);
-        w.addItem(l, device, "Amphora", "amphora", false, 10u32, 1.0, 0.6, 0.52, 0.17, 0.);
-        w.addItem(l, device, "Island", "box_island", false, 0u32, 1.6, 1.0, 0.30, 0.15, 0.);
-        w.addItem(l, device, "Labyrinth", "box_labyrinth", false, 1u32, 1.6, 1.0, 0.30, 0.15, 0.);
-        w.addItem(l, device, "Starship", "box_starship", false, 2u32, 1.6, 1.0, 0.30, 0.15, 0.);
-        w.addItem(l, device, "Cottage", "box_cottage", false, 3u32, 1.6, 1.0, 0.30, 0.15, 0.);
-        w.addItem(l, device, "Chess", "box_chess", false, 4u32, 1.6, 1.0, 0.30, 0.15, 0.);
-        w.addItem(l, device, "Horse", "box_horse", false, 5u32, 1.6, 1.0, 0.30, 0.15, 0.);
-        // who stands where at the start: the page dead ahead (slot 0), the amphora to its right (1), the knight on the left (4)
+        w.errCard = Some[Label](Label(PagePass.create(device, format), 1.2, 0.3, false, String(), 0xb3261eff, 0xffffffffu32, 26., 10., false,
+          0., false, false, 0.));
+        // knight, page, amphora in the ring; six boxes on the shelf; the architecture walk
+        w.addItem(l, device, "knight", "Knight", "knight", false, 8u32, 1.0, 0.45, 0.61, 0.2, PI * 0.5);
+        w.addItem(l, device, "page", "Design page", "", true, 9u32, 0.5, 0.2, 1.903, 0.67, 0.);
+        w.addItem(l, device, "amphora", "Amphora", "amphora", false, 10u32, 1.0, 0.6, 0.52, 0.17, 0.);
+        w.addItem(l, device, "island", "Island", "box_island", false, 0u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "labyrinth", "Labyrinth", "box_labyrinth", false, 1u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "starship", "Starship", "box_starship", false, 2u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "cottage", "Cottage", "box_cottage", false, 3u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "chess", "Chess", "box_chess", false, 4u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "horse", "Horse", "box_horse", false, 5u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "archwalk", "Architecture walk", "", false, 6u32, 0.12, 0.05, 5.0, 0.7, 0.);
+        (&mut w.items[9usize]).isApp = true;
+        // who stands where at the start: the page dead ahead (slot 0), the amphora to its right (1), the walk next (2), the knight on the left (4)
         w.settle(0, true, 4u32);
         w.settle(1, true, 0u32);
         w.settle(2, true, 1u32);
+        w.settle(9, true, 2u32);
         i = 3;
         while i < 9 { w.settle(i, false, w.items[usize.from(u32.from(i))].home); i = i + 1; }
-        let blue = 0x2a5d9fffu32;
         let white = 0xffffffffu32;
-        w.chips.push(textLabel(l, device, format, "shelve (X)", blue, white, 46., 0.30));
-        w.chips.push(textLabel(l, device, format, "bring (B)", 0x2f8a4fffu32, white, 46., 0.30));
-        w.chips.push(textLabel(l, device, format, "zoom (Z)", blue, white, 46., 0.30));
-        w.chips.push(textLabel(l, device, format, "open (O)", blue, white, 46., 0.30));
-        w.chips.push(textLabel(l, device, format, "talk (T)", 0x8a4fa8ffu32, white, 46., 0.30));
-        w.chips.push(textLabel(l, device, format, "zoom out", blue, white, 46., 0.30));
-        w.chips.push(textLabel(l, device, format, "back ([)", 0x5a6b7aff, white, 46., 0.30));
-        w.chips.push(textLabel(l, device, format, "forward (])", 0x5a6b7aff, white, 46., 0.34));
-        w.chips.push(textLabel(l, device, format, "files (F)", 0xb06a1aff, white, 46., 0.30));
         let names = ["queued", "building", "testing", "in review", "merged"];
         let tint = [0x80808affu32, 0xc08a20ffu32, 0x3a78b0ffu32, 0x8a5aa8ffu32, 0x3a8a58ffu32];
         var s = 0usize;
@@ -343,14 +382,19 @@ pub struct Warehouse {
     w.labeller = maybe;
     w.startMs = nowMs();
     w.lastMs = w.startMs;
+    if w.on {
+      w.aw = makeAw(device, renderer, format);
+      w.initConfig(device);
+    }
     w
   }
 
-  fn addItem(self: &mut, l: &mut Labeller, device: &mut Device, name: &str, part: &str, page: bool, home: u32,
+  fn addItem(self: &mut, l: &mut Labeller, device: &mut Device, id: &str, name: &str, part: &str, page: bool, home: u32,
              tableScale: f32, shelfScale: f32, height: f32, radius: f32, yawShelf: f32) {
     let label = textLabel(l, device, format, name, 0xf8f5eeffu32, 0x1c1c1cffu32, 50., 0.56);
     items.push(Item(String.from(name), String.from(part), page, home, false, 0u32, Vec3(0., 0., 0.), 1., 0.,
-      Vec3(0., 0., 0.), 1., 1., 0u64, NO_SLOT, tableScale, shelfScale, height, radius, yawShelf, label, 0u32, 1., 0.));
+      Vec3(0., 0., 0.), 1., 1., 0u64, NO_SLOT, tableScale, shelfScale, height, radius, yawShelf, label, 0u32, 1., 0.,
+      String.from(id), false, Vec3(0., 0., 0.), 1., List[Entry](), false));
   }
 
   // Put item i where it stands, with no flight
@@ -370,7 +414,7 @@ pub struct Warehouse {
   // Slot t of the ring: evenly around the start spot, slot 0 straight ahead (-z), going round to the right
   fn slotPos(t: u32) Vec3 {
     let a = f32.from(t) * 2. * PI / f32.from(RING_N);
-    Vec3(RING_R * sin(a), FLOAT_Y, 0. - RING_R * cos(a))
+    Vec3(ringRadius * sin(a), floatHeight, 0. - ringRadius * cos(a))
   }
 
   // The yaw that turns a page at slot t to face the start spot
@@ -387,11 +431,12 @@ pub struct Warehouse {
   }
 
   fn dest(self: &, k: usize) Vec3 {
-    if items[k].onTable { Warehouse.slotPos(items[k].idx) } else { Warehouse.shelfPos(items[k].idx) }
+    if items[k].free { items[k].freePos }
+    else if items[k].onTable { Warehouse.slotPos(items[k].idx) } else { Warehouse.shelfPos(items[k].idx) }
   }
 
   fn destScale(self: &, k: usize) f32 {
-    if items[k].onTable { items[k].tableScale } else { items[k].shelfScale }
+    (if items[k].onTable { items[k].tableScale } else { items[k].shelfScale }) * items[k].mul
   }
 
   // Where item k is now once zoom is counted: x, y (its foot), z and the scale. Zoom scales it about its centre,
@@ -427,8 +472,9 @@ pub struct Warehouse {
       let ds = self.destScale(k);
       var want: f32 = 0.;
       if items[k].onTable {
-        want = if items[k].page { self.slotYaw(items[k].idx) + 0.5 * sin(clock * 0.5) } else { clock * 0.4 };
-        if !items[k].page { want = items[k].yawShelf + clock * 0.4; }
+        want = if items[k].page { self.slotYaw(items[k].idx) + items[k].yawShelf + 0.5 * sin(clock * 0.5) } else { clock * 0.4 };
+        if items[k].isApp { want = self.slotYaw(items[k].idx) + items[k].yawShelf; }
+        else if !items[k].page { want = items[k].yawShelf + clock * 0.4; }
       } else { want = items[k].yawShelf; }
       // turn the short way, quickly after a flight so that the swap does not pop
       var delta = want - items[k].yaw;
@@ -485,12 +531,18 @@ pub struct Warehouse {
     var ci = 0usize;
     while ci < cards.len() { (&mut cards[ci]).alpha = fadeToward(cards[ci].alpha, 1., dt); ci = ci + 1usize; }
     self.updateReadout(dt);
+    match &mut errCard {
+      case var &mut Some(ec) { ec.alpha = fadeToward(ec.alpha, if errShown.len() > 0usize { 1. } else { 0. }, dt); }
+      else {}
+    }
     if now >= linePoll + 250u64 {
       linePoll = now;
       self.readLine(device);
     }
     self.serveReport(device, renderer);
     self.tickBrowser(device, renderer);
+    self.cfgTick(device, now);
+    self.awTick(dt);
     ticks = ticks + 1u32;
     if ticks > 4u32 { self.fillSome(device, 2); }
   }
@@ -531,6 +583,10 @@ pub struct Warehouse {
         while k < chips.len() && made < most {
           if !chips[k].ok { fillLabel(l, device, &mut chips[k]); made = made + 1; }
           k = k + 1usize;
+        }
+        match &mut errCard {
+          case var &mut Some(ec) { if made < most && !ec.ok && ec.text.len() > 0usize { fillLabel(l, device, ec); made = made + 1; } }
+          else {}
         }
         k = 0usize;
         while k < stages.len() && made < most {
@@ -886,7 +942,7 @@ pub struct Warehouse {
     var flat = Vec3(0. - c.x, 0., 0. - c.z);
     if flat.length() < 0.01 { flat = Vec3(0., 0., 1.); }
     flat = flat.normalize();
-    let dist = if level == 2u32 { 9.0 } else { RING_R };
+    let dist = if level == 2u32 { 9.0 } else { ringRadius };
     let to = Vec3(c.x + flat.x * dist, 1.6, c.z + flat.z * dist);
     let look = Vec3(c.x, cy, c.z) - to;
     let len = look.length();

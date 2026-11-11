@@ -1,0 +1,990 @@
+// The model of the walkthrough: blocks, the state of a scenario (replayed from its first step), the animation of the current step,
+// and the 3-D scene it makes. A file of the archwalk module (the imports are the root's).
+
+const NB: usize = 10usize;             // blocks: 0 Display 1 Render 2 Audio 3 Host 4 Presenter 5 Link 6 Authority 7 World 8 Arrival 9 Library
+const SLOTS: usize = 9usize;
+const CELLS: usize = 90usize;
+const R_ARC: f32 = 5.0;
+const CZ: f32 = 1.2;                   // where you start: 1.2 m behind the table, on the open side
+const ANIM: f32 = 0.7;                 // a flight takes this long
+const STEP_CAP: usize = 64usize;
+const LINE_BASE: f32 = 2.8;            // the first arrow's height; each next 0.3 m higher
+const LINE_STEP: f32 = 0.3;
+const NONE: i32 = -1i32;
+const TIME_SLOW: f32 = 0.5;            // true timing: seconds per millisecond (500 times slower)
+
+// ---- Materials ----
+const M_PLATE: usize = 0usize;
+const M_ITEM: usize = 1usize;
+const M_SHELF: usize = 2usize;
+const M_BACK: usize = 3usize;
+const M_TABLE: usize = 4usize;
+const M_LIFE: usize = 5usize;
+const M_HAZY: usize = 6usize;
+const M_HAZK: usize = 7usize;
+const M_BEAM: usize = 8usize;
+const M_BEAD: usize = 9usize;
+const M_DART: usize = 10usize;
+const M_FLY: usize = 11usize;
+const M_RIBBON: usize = 13usize;
+const M_CURSOR: usize = 14usize;
+const M_LEGEND: usize = 15usize;
+const M_TIERDIM: usize = 16usize;      // 6 of them
+const M_TIERHI: usize = 22usize;       // 6 of them
+const M_KIND: usize = 28usize;         // 10 of them
+const M_PANEL: usize = 38usize;
+const M_OFF: usize = 39usize;
+const M_OFFHOT: usize = 40usize;
+const M_ON: usize = 41usize;
+const M_ONHOT: usize = 42usize;
+const M_RAY: usize = 43usize;
+const M_RAYHIT: usize = 44usize;
+const M_INFO: usize = 45usize;
+const M_LEFT: usize = 46usize;
+const M_RIGHT: usize = 47usize;
+const M_PULSE: usize = 48usize;
+const M_BAR: usize = 49usize;
+
+// ---- Text styles ----
+const S_WHITE: usize = 0usize;
+const S_CAPTION: usize = 1usize;
+const S_GRAY: usize = 2usize;
+const S_TIER: usize = 3usize;          // 6 of them
+const S_AMBER: usize = 9usize;
+const S_GREEN: usize = 10usize;
+
+fn glow(renderer: &mut Renderer, device: &mut Device, r: f32, g: f32, b: f32) MaterialHandle {
+  renderer.addMaterial(device, &Material.plain(Color(0., 0., 0., 1.)).glowing(Color(r, g, b, 1.), 1.0))
+}
+
+fn tierColor(t: usize) Color {
+  let c: Array[Color, 7] = [Color(1.0, 0.36, 0.14, 1.), Color(1.0, 0.76, 0.10, 1.), Color(0.20, 0.85, 0.35, 1.), Color(0.66, 0.42, 1.0, 1.),
+    Color(0.30, 0.60, 1.0, 1.), Color(0.72, 0.72, 0.75, 1.), Color(0.8, 0.78, 0.7, 1.)];
+  c[t]
+}
+
+fn kindColor(k: usize) Color {
+  let c: Array[Color, 10] = [Color(1.0, 0.85, 0.2, 1.), Color(0.3, 1.0, 0.5, 1.), Color(0.4, 0.8, 1.0, 1.), Color(0.7, 1.0, 1.0, 1.),
+    Color(1.0, 0.5, 0.9, 1.), Color(1.0, 1.0, 1.0, 1.), Color(0.6, 1.0, 0.6, 1.), Color(1.0, 0.4, 0.4, 1.), Color(1.0, 0.7, 0.0, 1.),
+    Color(0.6, 1.0, 0.6, 1.)];
+  c[k]
+}
+
+struct AwLook {
+  box: MeshHandle;
+  disc: MeshHandle;
+  grid: MeshHandle;
+  mats: List[MaterialHandle];
+
+  fn load(renderer: &mut Renderer, device: &mut Device) AwLook {
+    let box = renderer.addMesh(device, &Mesh.cube(0.5));
+    let disc = renderer.addMesh(device, &Mesh.sphere(0.5, 28));
+    var p = List[Vec3]();
+    var ix = List[u32]();
+    var k = -8;
+    while k <= 8 {
+      let c = f32.from(k);
+      let b = u32.from(p.len());
+      p.push(Vec3(c, 0.003, -8.)); p.push(Vec3(c, 0.003, 8.));
+      p.push(Vec3(-8., 0.003, c)); p.push(Vec3(8., 0.003, c));
+      ix.push(b); ix.push(b + 1u); ix.push(b + 2u); ix.push(b + 3u);
+      k = k + 1;
+    }
+    let grid = renderer.addLines(device, p.view(), ix.view());
+    var m = List[MaterialHandle]();
+    m.push(glow(renderer, device, 0.012, 0.014, 0.025));   // plate
+    m.push(glow(renderer, device, 0.10, 0.12, 0.20));      // item
+    m.push(glow(renderer, device, 0.30, 0.27, 0.22));      // shelf
+    m.push(glow(renderer, device, 0.045, 0.05, 0.075));    // back
+    m.push(glow(renderer, device, 0.62, 0.60, 0.55));      // table
+    m.push(glow(renderer, device, 0.45, 0.50, 0.60));      // lifeline
+    m.push(glow(renderer, device, 1.0, 0.78, 0.0));        // hazard yellow
+    m.push(glow(renderer, device, 0.04, 0.04, 0.04));      // hazard black
+    m.push(glow(renderer, device, 0.4, 1.0, 1.0));         // beam
+    m.push(glow(renderer, device, 1.0, 0.95, 0.55));       // bead
+    m.push(glow(renderer, device, 1.0, 0.45, 0.85));       // dart
+    m.push(glow(renderer, device, 0.95, 0.95, 0.6));       // flying box
+    m.push(glow(renderer, device, 0.05, 0.06, 0.08));      // floor
+    m.push(glow(renderer, device, 0.02, 0.03, 0.05));      // ribbon
+    m.push(glow(renderer, device, 1.0, 0.2, 0.2));         // cursor
+    m.push(glow(renderer, device, 0.015, 0.02, 0.04));     // legend
+    var t = 0usize;
+    while t < 6usize { let c = tierColor(t); m.push(glow(renderer, device, c.red * 0.36, c.green * 0.36, c.blue * 0.36)); t = t + 1usize; }
+    t = 0usize;
+    while t < 6usize { let c = tierColor(t); m.push(glow(renderer, device, c.red, c.green, c.blue)); t = t + 1usize; }
+    t = 0usize;
+    while t < 10usize { let c = kindColor(t); m.push(glow(renderer, device, c.red, c.green, c.blue)); t = t + 1usize; }
+    m.push(glow(renderer, device, 0.008, 0.010, 0.018));   // menu panel
+    m.push(glow(renderer, device, 0.035, 0.040, 0.060));
+    m.push(glow(renderer, device, 0.14, 0.16, 0.24));
+    m.push(glow(renderer, device, 0.02, 0.26, 0.08));
+    m.push(glow(renderer, device, 0.07, 0.55, 0.19));
+    m.push(glow(renderer, device, 1.0, 0.75, 0.15));
+    m.push(glow(renderer, device, 0.35, 1.0, 0.45));
+    m.push(glow(renderer, device, 0.02, 0.025, 0.045));    // an info row
+    m.push(glow(renderer, device, 0.15, 0.35, 0.9));
+    m.push(glow(renderer, device, 0.9, 0.4, 0.12));
+    m.push(glow(renderer, device, 0.45, 0.55, 0.9));       // a pulsing item
+    m.push(glow(renderer, device, 0.5, 0.5, 0.55));        // ribbon bar background
+    AwLook(box, disc, grid, m)
+  }
+}
+
+// ---- The blocks ----
+fn blockName(b: i32) &str {
+  let n: Array[&str, 10] = ["Display", "Render", "Audio", "Host", "Presenter", "Link", "Authority", "World program", "Arrival", "Library"];
+  n[usize.from(b)]
+}
+
+fn blockTier(b: i32) usize {
+  let t: Array[usize, 10] = [0usize, 0usize, 0usize, 5usize, 1usize, 5usize, 2usize, 3usize, 4usize, 6usize];
+  t[usize.from(b)]
+}
+
+fn tierLine(b: i32) &str {
+  let n: Array[&str, 10] = ["The runtime, not a component", "Hard: each display frame", "Hard: audio samples", "Posts input; starts nothing",
+    "Frame: each display frame, small budget", "Three channels, so none stalls another", "Shared: 60 Hz steps", "Script: events and steps, under a budget",
+    "No clock: seconds, by nearness", "Not an actor: built once, shared, freed with its world"];
+  n[usize.from(b)]
+}
+
+fn blockPos(b: i32) Vec3 {
+  if b == 9i32 { return Vec3(0., 0., 0.); }
+  let a = radians(-100. + 25. * f32.from(b));
+  Vec3(R_ARC * sin(a), 0., 0. - R_ARC * cos(a))
+}
+
+fn blockYaw(b: i32) f32 {
+  let p = blockPos(b);
+  atan2(0. - p.x, 0. - p.z)
+}
+
+fn blockM(b: i32) Mat4 {
+  Mat4.fromTrs(blockPos(b), Quat.angleAxis(blockYaw(b), Vec3(0., 1., 0.)), Vec3(1., 1., 1.))
+}
+
+// Top of the header plate (name, tier) above the block's floor
+fn headTop(b: i32) f32 { if b == 0i32 { 2.1 } else if b == 9i32 { 2.9 } else { 2.85 } }
+
+fn slotLocal(b: i32, s: usize) Vec3 {
+  if b == 9i32 {
+    // on the table top (0.75 m): a 3 x 3 grid inside the 0.8 m radius, the front row clear of the name plate
+    let row = s / 3usize;
+    let c3 = s - row * 3usize;
+    return Vec3((f32.from(c3) - 1.) * 0.42, 0.91, -0.38 + 0.26 * f32.from(row));
+  }
+  // items fill from eye height: the shelf nearest 1.5 m first, then the middle one, the lowest last
+  let row = s / 3usize;
+  let shelf = 2usize - row;
+  let col = s - row * 3usize;
+  Vec3((f32.from(col) - 1.) * 0.52, 0.12 + 0.65 * f32.from(shelf) + 0.19, 0.0)
+}
+
+fn slotSize(b: i32) Vec3 { if b == 9i32 { Vec3(0.40, 0.30, 0.2) } else { Vec3(0.46, 0.30, 0.2) } }
+
+fn slotWorld(b: i32, s: usize) Vec3 { blockM(b) * slotLocal(b, s) }
+
+fn absf(x: f32) f32 { if x < 0. { 0. - x } else { x } }
+fn maxf(a: f32, b: f32) f32 { if a > b { a } else { b } }
+fn minf(a: f32, b: f32) f32 { if a < b { a } else { b } }
+
+// ---- State: replayed from step 0 ----
+fn cellOf(b: i32, s: usize) usize { usize.from(b) * SLOTS + s }
+
+struct State {
+  occ: Array[i32, 90];       // the item (id) in each cell, or NONE
+  lab: Array[i32, 90];       // its label: a put's number, or PUT_N + the step that last labelled it
+  waits: Array[i32, 10];      // the step that put a block to waiting, or NONE
+}
+
+fn newState() State {
+  var o = Array[i32, 90]() <- fill NONE;
+  var l = Array[i32, 90]() <- fill NONE;
+  var w = Array[i32, 10]() <- fill NONE;
+  State(o, l, w)
+}
+
+fn findCell(st: &State, b: i32, id: i32) i32 {
+  if b < 0i32 || id < 0i32 { return NONE; }
+  var s = 0usize;
+  while s < SLOTS {
+    let c = cellOf(b, s);
+    if st.occ[c] == id { return i32.from(c); }
+    s = s + 1usize;
+  }
+  NONE
+}
+
+fn labelFor(sc: i32, id: i32, g: usize) i32 {
+  var p = 0usize;
+  while p < PUT_N {
+    if PUT_SC[p] == sc && PUT_ID[p] == id { return i32.from(p); }
+    p = p + 1usize;
+  }
+  i32.from(PUT_N + g)
+}
+
+fn awLabelText(code: i32) &str {
+  if code < 0i32 { return ""; }
+  let c = usize.from(code);
+  if c < PUT_N { PUT_LABEL[c] } else { ST_LABEL[c - PUT_N] }
+}
+
+fn placeItem(st: &mut State, b: i32, id: i32, lab: i32) {
+  let have = findCell(st, b, id);
+  if have >= 0i32 { st.lab[usize.from(have)] = lab; return; }
+  var s = 0usize;
+  while s < SLOTS {
+    let c = cellOf(b, s);
+    if st.occ[c] == NONE { st.occ[c] = id; st.lab[c] = lab; return; }
+    s = s + 1usize;
+  }
+}
+
+fn scFirst(sc: usize) usize {
+  var i = 0usize;
+  while i < STEP_N && ST_SC[i] != i32.from(sc) { i = i + 1usize; }
+  i
+}
+
+fn scCount(sc: usize) usize {
+  var n = 0usize;
+  var i = 0usize;
+  while i < STEP_N { if ST_SC[i] == i32.from(sc) { n = n + 1usize; } i = i + 1usize; }
+  n
+}
+
+// One step, global number g, applied
+fn applyStep(st: &mut State, g: usize) {
+  let sc = ST_SC[g];
+  let a = ST_ACTOR[g];
+  let k = ST_KIND[g];
+  let f = if ST_FROM[g] >= 0i32 { ST_FROM[g] } else { a };
+  let t = if ST_TO[g] >= 0i32 { ST_TO[g] } else { a };
+  let id = ST_ID[g];
+  if k == 0i32 {
+    if id >= 0i32 {
+      let si = findCell(st, f, id);
+      var lab = labelFor(sc, id, g);
+      if si >= 0i32 { lab = st.lab[usize.from(si)]; st.occ[usize.from(si)] = NONE; st.lab[usize.from(si)] = NONE; }
+      placeItem(st, t, id, lab);
+    }
+  } else if k == 1i32 || k == 2i32 {
+    if id >= 0i32 {
+      let si = findCell(st, f, id);
+      let lab = if si >= 0i32 { st.lab[usize.from(si)] } else { labelFor(sc, id, g) };
+      placeItem(st, t, id, lab);
+    }
+  } else if k == 5i32 {
+    if id >= 0i32 { placeItem(st, f, id, i32.from(PUT_N + g)); }
+  } else if k == 6i32 {
+    if id >= 0i32 { placeItem(st, t, id, i32.from(PUT_N + g)); }
+  } else if k == 7i32 {
+    let c = findCell(st, f, id);
+    if c >= 0i32 { st.occ[usize.from(c)] = NONE; st.lab[usize.from(c)] = NONE; }
+  } else if k == 8i32 {
+    st.waits[usize.from(a)] = i32.from(g);
+  } else if k == 9i32 {
+    st.waits[usize.from(a)] = NONE;
+  }
+}
+
+// The state after 'n' steps of scenario 'sc': the start (its puts), then the steps replayed
+fn replay(sc: usize, n: usize) State {
+  var st = newState();
+  var p = 0usize;
+  while p < PUT_N {
+    if PUT_SC[p] == i32.from(sc) { placeItem(&mut st, PUT_BLOCK[p], PUT_ID[p], i32.from(p)); }
+    p = p + 1usize;
+  }
+  let first = scFirst(sc);
+  var j = 0usize;
+  while j < n { applyStep(&mut st, first + j); j = j + 1usize; }
+  st
+}
+
+fn stateHash(st: &State) i64 {
+  var h = 17i64;
+  var i = 0usize;
+  while i < CELLS { h = h * 31i64 + i64.from(st.occ[i]) * 7i64 + i64.from(st.lab[i]) * 3i64 + 5i64; h = h - (h / 1000000007i64) * 1000000007i64; i = i + 1usize; }
+  i = 0usize;
+  while i < NB { h = h * 31i64 + i64.from(st.waits[i]) + 11i64; h = h - (h / 1000000007i64) * 1000000007i64; i = i + 1usize; }
+  h
+}
+
+// ---- The app: where in the scenario, and what is switched on ----
+struct App {
+  sc: usize;
+  cur: usize;                // steps done (0 to the scenario's count)
+  count: usize;
+  playing: bool;
+  trueT: bool;
+  follow: bool;
+  legend: bool;
+  clock: f32;
+  timer: f32;
+  ttime: f32;                // true timing: seconds into the frame
+  stamp: Array[f32, 64];     // the clock when each step was taken
+  pend: i32;                 // a block to be taken to (follow), or NONE
+  blink: f32;                // the black blink of a move
+  centre: bool;              // asked: back to the centre
+  quit: bool;
+}
+
+fn newApp() App {
+  var s = Array[f32, 64]() <- fill -100.0;
+  App(0usize, 0usize, scCount(0usize), false, false, false, false, 0., 0., 0., s, NONE, 0., false, false)
+}
+
+fn appStart(app: &App, j: usize) usize { scFirst(app.sc) + j }
+
+fn askFollow(app: &mut App) {
+  if app.follow && app.cur > 0usize {
+    app.pend = ST_ACTOR[scFirst(app.sc) + app.cur - 1usize];
+    app.blink = 0.24;
+  }
+}
+
+fn stepForward(app: &mut App) {
+  if app.cur < app.count {
+    app.stamp[app.cur] = app.clock;
+    app.cur = app.cur + 1usize;
+    askFollow(app);
+  }
+}
+
+fn stepBack(app: &mut App) {
+  if app.cur > 0usize {
+    app.cur = app.cur - 1usize;
+    askFollow(app);
+  }
+}
+
+fn restart(app: &mut App) {
+  app.cur = 0usize;
+  app.playing = false;
+  app.ttime = 0.;
+  app.timer = 0.;
+}
+
+// True timing exists only in a scenario with times
+fn toggleTrue(app: &mut App) {
+  if !SC_TIMED[app.sc] { app.trueT = false; return; }
+  app.trueT = !app.trueT;
+  app.playing = false;
+}
+
+fn setScenario(app: &mut App, sc: usize) {
+  app.sc = sc;
+  if !SC_TIMED[sc] { app.trueT = false; }
+  app.count = scCount(sc);
+  restart(app);
+}
+
+fn startTime(app: &App, j: usize) f32 { ST_T0[scFirst(app.sc) + j] * TIME_SLOW }
+
+fn togglePlay(app: &mut App) {
+  if app.playing { app.playing = false; return; }
+  if app.cur >= app.count { restart(app); }
+  app.playing = true;
+  app.timer = 0.;
+  app.ttime = if app.cur > 0usize { startTime(app, app.cur - 1usize) } else { 0. };
+  if app.trueT && app.cur == 0usize { app.ttime = 0.; }
+}
+
+fn totalMs(app: &App) f32 {
+  var m: f32 = 0.;
+  var j = 0usize;
+  while j < app.count {
+    let g = scFirst(app.sc) + j;
+    m = maxf(m, ST_T0[g] + ST_DUR[g]);
+    j = j + 1usize;
+  }
+  m
+}
+
+// Time passes 'dt' seconds
+fn tick(app: &mut App, dt: f32) {
+  app.clock = app.clock + dt;
+  if app.blink > 0. { app.blink = app.blink - dt; }
+  if !app.playing { return; }
+  if app.trueT {
+    app.ttime = app.ttime + dt;
+    while app.cur < app.count && startTime(app, app.cur) <= app.ttime { stepForward(app); }
+    if app.cur >= app.count && app.ttime > totalMs(app) * TIME_SLOW { app.playing = false; }
+  } else {
+    app.timer = app.timer + dt;
+    if app.timer >= 3.0 {
+      app.timer = 0.;
+      stepForward(app);
+      if app.cur >= app.count { app.playing = false; }
+    }
+  }
+}
+
+fn tickMs(app: &App) f32 {
+  // the cursor's place in the frame, in ms
+  if app.playing && app.trueT { return app.ttime / TIME_SLOW; }
+  if app.cur > 0usize { return ST_T0[scFirst(app.sc) + app.cur - 1usize]; }
+  0.
+}
+
+// ---- Geometry helpers ----
+fn arcPoint(a: Vec3, b: Vec3, t: f32) Vec3 {
+  var bump = 2.5 - (a.y + b.y) * 0.5;
+  if bump < 0.4 { bump = 0.4; }
+  let k = 4. * t * (1. - t);
+  Vec3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t + bump * k, a.z + (b.z - a.z) * t)
+}
+
+fn easeT(t: f32) f32 { t * t * (3. - 2. * t) }
+
+struct Out {
+  list: DrawList;
+  jobs: List[TextJob];
+  base: Mat4;
+}
+
+struct TextJob {
+  li: usize;
+  style: usize;
+  place: Mat4;
+  ax: f32;
+  ay: f32;
+}
+
+struct LKey {
+  text: String;
+  em: f32;
+  w: f32;
+}
+
+struct TextCtx {
+  font: Font;
+  atlas: Atlas;
+  layouts: List[TextLayout];
+  keys: List[LKey];
+
+  fn make(font: Font) TextCtx { TextCtx(font, Atlas.create(AtlasConfig.standard()), List[TextLayout](), List[LKey]()) }
+
+  fn get(self: &mut, s: &str, em: f32, w: f32) usize {
+    var i = 0usize;
+    while i < keys.len() {
+      let k = &keys[i];
+      if k.em == em && k.w == w && k.text.view() == s { return i; }
+      i = i + 1usize;
+    }
+    var o = LayoutOptions.make(em);
+    o.maxWidth = w;
+    layouts.push(layoutText(&font, &mut atlas, s, &o));
+    keys.push(LKey(String.from(s), em, w));
+    keys.len() - 1usize
+  }
+
+  fn width(self: &, li: usize) f32 { let l = &layouts[li]; l.width }
+  fn height(self: &, li: usize) f32 { let l = &layouts[li]; l.height }
+}
+
+fn mat(look: &AwLook, i: usize) MaterialHandle { *look.mats[i] }
+
+fn boxAt(out: &mut Out, look: &AwLook, mi: usize, base: Mat4, c: Vec3, s: Vec3) {
+  out.list.add(look.box, mat(look, mi), out.base * base * Mat4.fromTrs(c, Quat.identity(), s));
+}
+
+// A thin box from a to b
+fn beamBox(out: &mut Out, look: &AwLook, mi: usize, a: Vec3, b: Vec3, th: f32) {
+  let d = b - a;
+  let len = d.length();
+  if len < 0.001 { return; }
+  let n = d * (1. / len);
+  let q = Quat.angleAxis(atan2(0. - n.x, 0. - n.z), Vec3(0., 1., 0.)) * Quat.angleAxis(asin(n.y), Vec3(1., 0., 0.));
+  out.list.add(look.box, mat(look, mi), out.base * Mat4.fromTrs(a + d * 0.5, q, Vec3(th, th, len)));
+}
+
+fn awAddText(out: &mut Out, tc: &mut TextCtx, s: &str, em: f32, w: f32, style: usize, place: Mat4, ax: f32, ay: f32) usize {
+  let li = tc.get(s, em, w);
+  out.jobs.push(TextJob(li, style, out.base * place, ax, ay));
+  li
+}
+
+// Text centred on 'place' (+x along the text, +z towards the reader) on a dark plate
+fn plated(out: &mut Out, look: &AwLook, tc: &mut TextCtx, s: &str, em: f32, w: f32, style: usize, place: Mat4) {
+  let li = awAddText(out, tc, s, em, w, style, place * Mat4.fromTranslation(Vec3(0., 0., 0.006)), 0.5, 0.5);
+  let pad = em * 0.45;
+  out.list.add(look.box, mat(look, M_PLATE), out.base * place * Mat4.fromTrs(Vec3(0., 0., -0.004), Quat.identity(),
+    Vec3(tc.width(li) + pad * 2., tc.height(li) + pad * 1.4, 0.012)));
+}
+
+fn facing(head: Vec3, p: Vec3) Mat4 {
+  var cam = Camera.make();
+  cam.origin = head;
+  billboardPlacement(&cam, p, true)
+}
+
+// ---- The scene ----
+fn drawBlock(out: &mut Out, look: &AwLook, tc: &mut TextCtx, b: i32, st: &State, bright: bool, server: bool, hide: &Array[i32, 90], pulse: &Array[f32, 90]) {
+  let m = blockM(b);
+  let tier = blockTier(b);
+  let frame = if bright { M_TIERHI + tier } else { M_TIERDIM + tier };
+  let top = headTop(b);
+  if b == 0i32 {
+    // the display: a small post, the runtime
+    boxAt(out, look, frame, m, Vec3(0., 0.55, 0.), Vec3(0.28, 1.1, 0.28));
+    boxAt(out, look, frame, m, Vec3(0., 1.15, 0.), Vec3(0.5, 0.08, 0.08));
+  } else if b == 9i32 {
+    boxAt(out, look, M_SHELF, m, Vec3(0., 0.35, 0.), Vec3(0.3, 0.7, 0.3));
+    out.list.add(look.disc, mat(look, M_TABLE), out.base * m * Mat4.fromTrs(Vec3(0., 0.715, 0.), Quat.identity(), Vec3(1.6, 0.07, 1.6)));
+  } else {
+    // two uprights, the top, the back, three shelves
+    boxAt(out, look, frame, m, Vec3(-0.8, 1.1, 0.), Vec3(0.07, 2.2, 0.5));
+    boxAt(out, look, frame, m, Vec3(0.8, 1.1, 0.), Vec3(0.07, 2.2, 0.5));
+    boxAt(out, look, frame, m, Vec3(0., 2.17, 0.), Vec3(1.67, 0.07, 0.5));
+    boxAt(out, look, M_BACK, m, Vec3(0., 1.1, -0.23), Vec3(1.6, 2.2, 0.03));
+    var sh = 0usize;
+    while sh < 3usize {
+      boxAt(out, look, M_SHELF, m, Vec3(0., 0.10 + 0.65 * f32.from(sh), 0.), Vec3(1.6, 0.04, 0.5));
+      sh = sh + 1usize;
+    }
+  }
+  // the header: name, tier line
+  // (the library's plate lies tilted on the table's near edge, so that it hides nothing behind the table)
+  let hm = if b == 9i32 { m * Mat4.fromTrs(Vec3(0., 1.01, 0.53), Quat.angleAxis(-0.8, Vec3(1., 0., 0.)), Vec3(1., 1., 1.)) } else { m };
+  let hy: f32 = if b == 9i32 { 0. } else { top - 0.33 };
+  let nameY = if b == 9i32 { 0.23 } else { hy + 0.17 };
+  let pw: f32 = if b == 9i32 { 1.6 } else { 1.8 };
+  let ph: f32 = if b == 9i32 { 0.7 } else { 0.66 };
+  let nem: f32 = if b == 9i32 { 0.14 } else { 0.195 };
+  boxAt(out, look, M_PLATE, hm, Vec3(0., hy, 0.), Vec3(pw, ph, 0.06));
+  awAddText(out, tc, blockName(b), nem, 0., S_TIER + tier, hm * Mat4.fromTranslation(Vec3(0., nameY, 0.04)), 0.5, 0.5);
+  awAddText(out, tc, tierLine(b), 0.084, pw - 0.1, S_GRAY, hm * Mat4.fromTranslation(Vec3(0., if b == 9i32 { 0.11 } else { hy - 0.02 }, 0.04)), 0.5, 0.0);
+  if server && (b == 6i32 || b == 7i32) {
+    plated(out, look, tc, "On the server", 0.1, 1.4, S_CAPTION, m * Mat4.fromTranslation(Vec3(0., 1.99, 0.3)));
+  }
+  // the items
+  var s = 0usize;
+  while s < SLOTS {
+    let c = cellOf(b, s);
+    if st.occ[c] >= 0i32 && b != 0i32 && hide[c] == 0i32 {
+      let sz = slotSize(b);
+      let lp = slotLocal(b, s);
+      let k = 1. + pulse[c] * 0.22;
+      let mi = if pulse[c] > 0.001 { M_PULSE } else { M_ITEM };
+      boxAt(out, look, mi, m, lp, Vec3(sz.x * k, sz.y * k, sz.z * k));
+      awAddText(out, tc, awLabelText(st.lab[c]), 0.049, sz.x - 0.04, S_WHITE, m * Mat4.fromTranslation(Vec3(lp.x, lp.y, lp.z + sz.z * 0.5 * k + 0.004)), 0.5, 0.5);
+    }
+    s = s + 1usize;
+  }
+  // the band of a block that waits, and what for
+  if st.waits[usize.from(b)] >= 0i32 && b != 0i32 {
+    let g = usize.from(st.waits[usize.from(b)]);
+    var i = 0usize;
+    while i < 8usize {
+      boxAt(out, look, if i - (i / 2usize) * 2usize == 0usize { M_HAZY } else { M_HAZK }, m, Vec3(-0.7 + 0.2 * f32.from(i), if b == 9i32 { 1.35 } else { 1.19 }, if b == 9i32 { 0. } else { 0.33 }), Vec3(0.2, 0.1, 0.05));
+      i = i + 1usize;
+    }
+    var w = String.from("Waiting for ");
+    w <- ST_LABEL[g];
+    plated(out, look, tc, w.view(), 0.085, 1.5, S_CAPTION, m * Mat4.fromTranslation(Vec3(0., if b == 9i32 { 1.55 } else { 1.38 }, if b == 9i32 { 0.03 } else { 0.36 })));
+  }
+}
+
+// Where an arrow of step j (local) goes: from its lifeline to its lifeline, at its height
+fn drawArrow(out: &mut Out, look: &AwLook, tc: &mut TextCtx, app: &App, j: usize, head: Vec3, grow: f32) {
+  let g = scFirst(app.sc) + j;
+  let a = ST_ACTOR[g];
+  let k = usize.from(ST_KIND[g]);
+  let f = if ST_FROM[g] >= 0i32 { ST_FROM[g] } else { a };
+  let t = if ST_TO[g] >= 0i32 { ST_TO[g] } else { a };
+  let y = LINE_BASE + LINE_STEP * f32.from(j);
+  let pa = blockPos(f) + Vec3(0., y, 0.);
+  let pb0 = blockPos(t) + Vec3(0., y, 0.);
+  let pb = pa + (pb0 - pa) * grow;
+  let mi = M_KIND + k;
+  if f == t || k == 5usize || k == 6usize || k == 7usize || k == 8usize || k == 9usize {
+    // a step inside one block: a tick on its lifeline (a wait: a stout one)
+    let blk = a;
+    let w: f32 = if k == 8usize { 0.55 } else if k == 9usize { 0.25 } else { 0.4 };
+    let th: f32 = if k == 8usize { 0.1 } else { 0.05 };
+    boxAt(out, look, mi, blockM(blk), Vec3(0., y, 0.), Vec3(w, th, 0.06));
+    let place = facing(head, blockPos(blk) + Vec3(0.3 + w * 0.5, y, 0.));
+    awAddText(out, tc, labelNum(j + 1usize), 0.13, 0., S_WHITE, place, 0.0, 0.5);
+    return;
+  }
+  let d = pb - pa;
+  let len = d.length();
+  if k == 0usize {
+    beamBox(out, look, mi, pa, pb, 0.05);
+  } else if k == 1usize {
+    beamBox(out, look, mi, pa + Vec3(0., 0.04, 0.), pb + Vec3(0., 0.04, 0.), 0.022);
+    beamBox(out, look, mi, pa - Vec3(0., 0.04, 0.), pb - Vec3(0., 0.04, 0.), 0.022);
+  } else if k == 2usize {
+    var i = 0usize;
+    while i < 16usize {
+      let c = pa + d * ((f32.from(i) + 0.5) / 16.);
+      boxAt(out, look, mi, Mat4.identity(), c, Vec3(0.045, 0.045, 0.045));
+      i = i + 1usize;
+    }
+  } else if k == 3usize {
+    beamBox(out, look, mi, pa, pb, 0.012);
+  } else {
+    var i = 0usize;
+    while i < 9usize {
+      beamBox(out, look, mi, pa + d * (f32.from(i) / 9.), pa + d * ((f32.from(i) + 0.5) / 9.), 0.03);
+      i = i + 1usize;
+    }
+  }
+  // the head of the arrow at the receiving end (not for a read: it looks, it does not send)
+  if len > 0.05 && k != 3usize {
+    let n = d * (1. / len);
+    beamBox(out, look, mi, pb - n * 0.2, pb, 0.11);
+  }
+  let place = facing(head, pa + d * 0.5 + Vec3(0., 0.12, 0.));
+  awAddText(out, tc, labelNum(j + 1usize), 0.13, 0., S_WHITE, place, 0.5, 0.5);
+}
+
+fn labelNum(n: usize) &str {
+  let s: Array[&str, 40] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
+    "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39"];
+  if n < 40usize { s[n] } else { "+" }
+}
+
+fn captionOf(app: &App, numbered: bool) String {
+  var s = String();
+  if app.cur == 0usize {
+    s <- SC_DESC[app.sc];
+    s <- ". Press Forward.";
+    return s;
+  }
+  let g = scFirst(app.sc) + app.cur - 1usize;
+  if numbered {
+    s.appendUInt(u64.from(app.cur));
+    s <- ". ";
+  }
+  s <- ST_CAPTION[g];
+  if app.trueT {
+    s <- "  [";
+    s.appendF32(ST_T0[g]);
+    s <- " ms in, ";
+    s.appendF32(ST_DUR[g]);
+    s <- " ms long, ";
+    s <- if ST_MEASURED[g] { "measured" } else { "est" };
+    s <- "]";
+  }
+  s
+}
+
+fn actingBlock(app: &App) i32 {
+  if app.cur == 0usize { return 4i32; }
+  ST_ACTOR[scFirst(app.sc) + app.cur - 1usize]
+}
+
+// Everything but the wrist menu
+fn drawWorld(out: &mut Out, look: &AwLook, tc: &mut TextCtx, app: &App, head: Vec3) {
+  let first = scFirst(app.sc);
+  let st = replay(app.sc, app.cur);
+  var hide = Array[i32, 90]() <- fill 0i32;
+  var pulse = Array[f32, 90]() <- fill 0.;
+  var glowing = Array[i32, 10]() <- fill 0i32;
+  glowing[usize.from(actingBlock(app))] = 1i32;
+  // the floor
+  // flights and effects of the steps that are in the air
+  var j = 0usize;
+  var from = 0usize;
+  if app.cur > 8usize { from = app.cur - 8usize; }
+  j = from;
+  while j < app.cur {
+    let age = app.clock - app.stamp[j];
+    if age >= 0. && age < ANIM {
+      let g = first + j;
+      let t = age / ANIM;
+      let a = ST_ACTOR[g];
+      glowing[usize.from(a)] = 1i32;
+      let k = ST_KIND[g];
+      let f = if ST_FROM[g] >= 0i32 { ST_FROM[g] } else { a };
+      let to = if ST_TO[g] >= 0i32 { ST_TO[g] } else { a };
+      let id = ST_ID[g];
+      let pre = replay(app.sc, j);
+      let post = replay(app.sc, j + 1usize);
+      var src = blockM(f) * Vec3(0., 1.2, 0.3);
+      let sc0 = findCell(&pre, f, id);
+      if sc0 >= 0i32 { src = slotWorld(f, usize.from(sc0) - usize.from(f) * SLOTS); }
+      var dst = blockM(to) * Vec3(0., 1.2, 0.3);
+      let dc = findCell(&post, to, id);
+      if dc >= 0i32 { dst = slotWorld(to, usize.from(dc) - usize.from(to) * SLOTS); }
+      var label = ST_LABEL[g];
+      if dc >= 0i32 { label = awLabelText(post.lab[usize.from(dc)]); }
+      if k == 0i32 || k == 1i32 || k == 6i32 {
+        if dc >= 0i32 && st.occ[usize.from(dc)] == id { hide[usize.from(dc)] = 1i32; }
+        var p = arcPoint(src, dst, easeT(t));
+        var sz = Vec3(0.46, 0.3, 0.2);
+        if k == 6i32 { p = dst; let s = easeT(t); sz = Vec3(0.46 * s, 0.3 * s, 0.2 * s); }
+        out.list.add(look.box, mat(look, M_FLY), out.base * Mat4.fromTrs(p, Quat.identity(), sz));
+        if k != 6i32 { plated(out, look, tc, label, 0.06, 0.7, S_WHITE, facing(head, p + Vec3(0., 0.28, 0.)) * Mat4.identity()); }
+      } else if k == 2i32 {
+        if dc >= 0i32 && st.occ[usize.from(dc)] == id { hide[usize.from(dc)] = 1i32; }
+        // beads along a path: out of the sender's front, through Link's front, into the receiver's, on to the item
+        var pts = List[Vec3]();
+        pts.push(src);
+        pts.push(blockM(f) * Vec3(0., 1.4, 1.0));
+        pts.push(blockM(5i32) * Vec3(0., 1.4, 1.0));
+        pts.push(blockM(to) * Vec3(0., 1.4, 1.0));
+        pts.push(dst);
+        var total: f32 = 0.;
+        var q = 1usize;
+        while q < pts.len() { total = total + (*pts[q] - *pts[q - 1usize]).length(); q = q + 1usize; }
+        var i = 0usize;
+        while i < 14usize {
+          let u = easeT(t) * 1.3 - f32.from(i) * 0.03 - 0.0;
+          if u > 0. && u < 1. {
+            var dist = u * total;
+            var s = 1usize;
+            while s < pts.len() && dist > (*pts[s] - *pts[s - 1usize]).length() { dist = dist - (*pts[s] - *pts[s - 1usize]).length(); s = s + 1usize; }
+            if s < pts.len() {
+              let seg = *pts[s] - *pts[s - 1usize];
+              let sl = seg.length();
+              let c = *pts[s - 1usize] + seg * (dist / maxf(sl, 0.001));
+              boxAt(out, look, M_BEAD, Mat4.identity(), c, Vec3(0.07, 0.07, 0.07));
+            }
+          }
+          i = i + 1usize;
+        }
+        if t > 0.8 && dc >= 0i32 { hide[usize.from(dc)] = 0i32; }
+      } else if k == 3i32 {
+        let reader = blockM(f) * Vec3(0., 1.1, 0.9);
+        var tgt = dst;
+        if findCell(&post, to, id) < 0i32 { tgt = blockM(to) * Vec3(0., 1.2, 0.3); }
+        beamBox(out, look, M_BEAM, reader, reader + (tgt - reader) * minf(1., t * 3.), 0.015);
+      } else if k == 4i32 {
+        let a0 = blockM(f) * Vec3(0., 1.3, 0.3);
+        let b0 = blockM(to) * Vec3(0., 1.3, 0.3);
+        let p = arcPoint(a0, b0, easeT(t));
+        let p2 = arcPoint(a0, b0, easeT(minf(1., t + 0.04)));
+        beamBox(out, look, M_DART, p, p + (p2 - p) * 4., 0.07);
+        plated(out, look, tc, ST_LABEL[g], 0.06, 0.7, S_WHITE, facing(head, p + Vec3(0., 0.25, 0.)));
+      } else if k == 5i32 {
+        let c = findCell(&st, f, id);
+        if c >= 0i32 { pulse[usize.from(c)] = sin(t * 3.1416); }
+      } else if k == 7i32 {
+        // free: shrinking (the box is gone from the state; draw it going)
+        let s = 1. - easeT(t);
+        out.list.add(look.box, mat(look, M_FLY), out.base * Mat4.fromTrs(src, Quat.identity(), Vec3(0.46 * s, 0.3 * s, 0.2 * s)));
+      }
+    }
+    j = j + 1usize;
+  }
+  // the blocks
+  var b = 0i32;
+  while b < 10i32 {
+    drawBlock(out, look, tc, b, &st, glowing[usize.from(b)] == 1i32, SC_SERVER[app.sc], &hide, &pulse);
+    b = b + 1i32;
+  }
+  // lifelines, arrows
+  b = 0i32;
+  let lineTop = LINE_BASE + LINE_STEP * f32.from(app.count) + 0.2;
+  while b < 10i32 {
+    let p = blockPos(b);
+    var top = lineTop;
+    if b == 9i32 {
+      // the library's line stands in front of the Presenter: only as high as the arrows that reach it
+      top = 0.;
+      var q = 0usize;
+      while q < app.cur {
+        let g = first + q;
+        if ST_FROM[g] == 9i32 || ST_TO[g] == 9i32 { top = maxf(top, LINE_BASE + LINE_STEP * f32.from(q) + 0.1); }
+        q = q + 1usize;
+      }
+    }
+    let base = if b == 9i32 { 2.6 } else { headTop(b) + 0.05 };
+    if top > base { beamBox(out, look, M_LIFE, Vec3(p.x, base, p.z), Vec3(p.x, top, p.z), 0.02); }
+    b = b + 1i32;
+  }
+  j = 0usize;
+  while j < app.cur {
+    let age = app.clock - app.stamp[j];
+    if age >= ANIM { drawArrow(out, look, tc, app, j, head, 1.); }
+    else if age >= 0. { drawArrow(out, look, tc, app, j, head, easeT(age / ANIM)); }
+    else { drawArrow(out, look, tc, app, j, head, 1.); }
+    j = j + 1usize;
+  }
+  // the caption, above the acting block, turned to the viewer
+  let ab = actingBlock(app);
+  var cap = captionOf(app, true);
+  let li = tc.get(cap.view(), 0.126, 2.0);
+  let ch = tc.height(li);
+  let ap = blockPos(ab);
+  let radial: f32 = if ab == 9i32 { 1.0 } else { 0.84 };
+  var cp = Vec3(ap.x * radial, headTop(ab) + 0.28 + (ch + 0.14) * 0.5, ap.z * radial);
+  // the library stands at your feet: its caption hangs beyond the table, low enough to read without craning
+  if ab == 9i32 { cp = Vec3(0., 1.75 + (ch + 0.14) * 0.5, -0.7); }
+  plated(out, look, tc, cap.view(), 0.126, 2.0, S_CAPTION, facing(head, cp));
+  if app.legend { drawLegend(out, look, tc); }
+  if app.trueT { drawRibbon(out, look, tc, app); }
+}
+
+fn kindWord(k: usize) &str {
+  let n: Array[&str, 10] = ["move", "copy", "bytes", "read", "signal", "work", "make / free", "free", "wait", "go"];
+  n[k]
+}
+
+// The legend: on the library's table, the kinds in their real shapes
+fn drawLegend(out: &mut Out, look: &AwLook, tc: &mut TextCtx) {
+  // above the far half of the table (the table is at your feet now): smaller, out of the way of the arc's lower shelves
+  let m = blockM(9i32) * Mat4.fromTrs(Vec3(0., 2.4, -0.6), Quat.identity(), Vec3(0.62, 0.62, 0.62));
+  boxAt(out, look, M_LEGEND, m, Vec3(0., 0.1, -0.05), Vec3(2.7, 1.5, 0.05));
+  awAddText(out, tc, "How things travel: shape first, colour second", 0.075, 0., S_CAPTION, m * Mat4.fromTranslation(Vec3(0., 0.8, 0.0)), 0.5, 0.5);
+  let words: Array[&str, 10] = ["move: the box itself flies; ownership passes", "copy: a second box flies; both now hold one",
+    "bytes: beads through Link; encoded, sent, decoded", "read: a thin beam; nothing leaves", "signal: a small dart; a nudge with no data",
+    "work: the item pulses inside its block", "make: a box appears", "free: a box shrinks away", "wait: a band goes on; the label says the limit",
+    "go: the band comes off"];
+  var i = 0usize;
+  while i < 10usize {
+    let y = 0.64 - 0.105 * f32.from(i);
+    let ix: f32 = -1.2;
+    let mi = M_KIND + i;
+    if i == 0usize { boxAt(out, look, M_FLY, m, Vec3(ix + 0.1, y, 0.), Vec3(0.18, 0.1, 0.04)); }
+    else if i == 1usize { boxAt(out, look, M_FLY, m, Vec3(ix + 0.02, y, 0.), Vec3(0.14, 0.09, 0.04)); boxAt(out, look, M_FLY, m, Vec3(ix + 0.18, y, 0.), Vec3(0.14, 0.09, 0.04)); }
+    else if i == 2usize { var q = 0usize; while q < 6usize { boxAt(out, look, M_BEAD, m, Vec3(ix + 0.04 + 0.05 * f32.from(q), y, 0.), Vec3(0.035, 0.035, 0.035)); q = q + 1usize; } }
+    else if i == 3usize { boxAt(out, look, M_BEAM, m, Vec3(ix + 0.14, y, 0.), Vec3(0.3, 0.012, 0.012)); }
+    else if i == 4usize { boxAt(out, look, M_DART, m, Vec3(ix + 0.14, y, 0.), Vec3(0.22, 0.04, 0.04)); }
+    else if i == 5usize { boxAt(out, look, M_PULSE, m, Vec3(ix + 0.1, y, 0.), Vec3(0.2, 0.11, 0.04)); }
+    else if i == 6usize { boxAt(out, look, M_FLY, m, Vec3(ix + 0.1, y, 0.), Vec3(0.12, 0.08, 0.04)); }
+    else if i == 7usize { boxAt(out, look, M_FLY, m, Vec3(ix + 0.1, y, 0.), Vec3(0.06, 0.04, 0.04)); }
+    else if i == 8usize { var q = 0usize; while q < 4usize { boxAt(out, look, if q - (q / 2usize) * 2usize == 0usize { M_HAZY } else { M_HAZK }, m, Vec3(ix + 0.04 + 0.075 * f32.from(q), y, 0.), Vec3(0.075, 0.07, 0.04)); q = q + 1usize; } }
+    else { boxAt(out, look, mi, m, Vec3(ix + 0.14, y, 0.), Vec3(0.3, 0.02, 0.04)); }
+    awAddText(out, tc, words[i], 0.05, 0., S_WHITE, m * Mat4.fromTranslation(Vec3(ix + 0.4, y, 0.03)), 0.0, 0.5);
+    i = i + 1usize;
+  }
+  awAddText(out, tc, "Proposal: a scripted model, not running code", 0.062, 0., S_AMBER, m * Mat4.fromTranslation(Vec3(0., -0.66, 0.0)), 0.5, 0.5);
+}
+
+// The ribbon: a bar for each block across the frame's length, filled as it works, with a cursor
+fn drawRibbon(out: &mut Out, look: &AwLook, tc: &mut TextCtx, app: &App) {
+  let m = Mat4.fromTranslation(Vec3(0., 3.45, -3.3));
+  let total = maxf(totalMs(app), 1.);
+  let x0: f32 = -1.15;
+  let scale = 3.2 / total;
+  boxAt(out, look, M_RIBBON, m, Vec3(0.5, 0., -0.02), Vec3(5.2, 1.7, 0.03));
+  awAddText(out, tc, "Times: today's measurements where marked, otherwise estimates.", 0.065, 0., S_AMBER, m * Mat4.fromTranslation(Vec3(0.5, 0.74, 0.0)), 0.5, 0.5);
+  var r = 0i32;
+  while r < 9i32 {
+    let y = 0.56 - 0.105 * f32.from(r);
+    awAddText(out, tc, blockName(r), 0.06, 0., S_TIER + blockTier(r), m * Mat4.fromTranslation(Vec3(x0 - 0.08, y, 0.0)), 1.0, 0.5);
+    boxAt(out, look, M_BAR, m, Vec3(x0 + 1.6, y, -0.005), Vec3(3.2, 0.012, 0.01));
+    r = r + 1i32;
+  }
+  let now = tickMs(app);
+  var j = 0usize;
+  while j < app.count {
+    let g = scFirst(app.sc) + j;
+    let r2 = ST_ACTOR[g];
+    if r2 < 9i32 && ST_DUR[g] > 0. {
+      let y = 0.56 - 0.105 * f32.from(r2);
+      let k = ST_KIND[g];
+      let w = maxf(ST_DUR[g] * scale, 0.01);
+      let xa = x0 + ST_T0[g] * scale;
+      let tier = blockTier(r2);
+      let dimM = if k == 8i32 { M_PULSE } else { M_TIERDIM + tier };
+      let hiM = if k == 8i32 { M_HAZY } else { M_TIERHI + tier };
+      boxAt(out, look, dimM, m, Vec3(xa + w * 0.5, y, 0.), Vec3(w, 0.07, 0.02));
+      // filled as it works: up to the cursor
+      var frac = (now - ST_T0[g]) / ST_DUR[g];
+      if frac > 1. { frac = 1.; }
+      if frac > 0. && j < app.cur { boxAt(out, look, hiM, m, Vec3(xa + w * frac * 0.5, y, 0.005), Vec3(w * frac, 0.07, 0.02)); }
+    }
+    j = j + 1usize;
+  }
+  // the scale, and the cursor
+  var ms: f32 = 0.;
+  while ms <= total + 0.01 {
+    let x = x0 + ms * scale;
+    boxAt(out, look, M_LIFE, m, Vec3(x, -0.4, 0.), Vec3(0.01, 0.9, 0.012));
+    var lab = String();
+    lab.appendInt(i64.from(i32.from(ms)));
+    awAddText(out, tc, lab.view(), 0.06, 0., S_GRAY, m * Mat4.fromTranslation(Vec3(x, -0.88, 0.0)), 0.5, 0.5);
+    ms = ms + 2.;
+  }
+  awAddText(out, tc, "ms", 0.06, 0., S_GRAY, m * Mat4.fromTranslation(Vec3(x0 + total * scale + 0.15, -0.88, 0.0)), 0.0, 0.5);
+  boxAt(out, look, M_CURSOR, m, Vec3(x0 + now * scale, 0.05, 0.01), Vec3(0.025, 1.05, 0.03));
+}
+
+// ---- for the warehouse (the walk as a ring project) ----
+
+fn awStyles() List[TextStyle] {
+  var l = List[TextStyle]();
+  var c = List[Color]();
+  c.push(Color(1., 1., 1., 1.));
+  c.push(Color(1.0, 0.96, 0.62, 1.));
+  c.push(Color(0.78, 0.80, 0.88, 1.));
+  var t = 0usize;
+  while t < 6usize { c.push(tierColor(t)); t = t + 1usize; }
+  c.push(Color(1.0, 0.8, 0.2, 1.));
+  c.push(Color(0.5, 1.0, 0.6, 1.));
+  var i = 0usize;
+  while i < c.len() {
+    var s = TextStyle.plain(*c[i]);
+    s.shadowColor = Color(0., 0., 0., 0.9);
+    s.shadowOffset = Vec2(0.0015, 0.0015);
+    s.shadowSoftness = 0.001;
+    l.push(s);
+    i = i + 1usize;
+  }
+  l
+}
+
+// Put the frame's texts into a TextRenderer (slot i for job i), clear the slots of the last frame's others
+fn awSetJobs(t: &mut TextRenderer, device: &mut Device, tc: &TextCtx, styles: &List[TextStyle], jobs: &List[TextJob], vp: Mat4, shown: &mut usize) {
+  t.syncAtlas(device, &tc.atlas);
+  var n = jobs.len();
+  if n > AW_TEXT_CAP { print <- "TEXT CAP HIT: "; print <- u64.from(n); print <- " texts wanted, cap "; print <- u64.from(AW_TEXT_CAP); print <- "\n"; n = AW_TEXT_CAP; }
+  var i = 0usize;
+  while i < n {
+    let j = &jobs[i];
+    let l = &tc.layouts[j.li];
+    t.set(device, TextHandle(u32.from(i)), l, &styles[j.style], worldTransform(vp, j.place, l, j.ax, j.ay));
+    i = i + 1usize;
+  }
+  while i < *shown {
+    t.clearText(TextHandle(u32.from(i)));
+    i = i + 1usize;
+  }
+  *shown = n;
+}
+
+const AW_TEXT_CAP: usize = 520usize;
+
+// The walk inside the warehouse: its model, its words and its two text renderers (one for each eye, as in the walk itself)
+struct Aw {
+  look: AwLook;
+  tc: TextCtx;
+  app: App;
+  styles: List[TextStyle];
+  text0: TextRenderer;
+  text1: TextRenderer;
+  shown0: usize;
+  shown1: usize;
+  out: Out;
+  live: bool;
+}
+
+fn makeAw(device: &mut Device, renderer: &mut Renderer, format: u32) Option[Aw] {
+  match fs.readFile(&Path.from("C:/Windows/Fonts/arialbd.ttf")) {
+    case let Ok(bytes) {
+      match Font.load(bytes.view()) {
+        case let Ok(font) {
+          let look = AwLook.load(renderer, device);
+          let tc = TextCtx.make(font);
+          var t0 = TextRenderer.create(device, &tc.atlas, format, format, TEXTURE_FORMAT_DEPTH32_FLOAT);
+          var t1 = TextRenderer.create(device, &tc.atlas, format, format, TEXTURE_FORMAT_DEPTH32_FLOAT);
+          var s = 0usize;
+          while s < AW_TEXT_CAP { t0.addText(device, SPACE_WORLD); t1.addText(device, SPACE_WORLD); s = s + 1usize; }
+          t0.syncAtlas(device, &tc.atlas);
+          t1.syncAtlas(device, &tc.atlas);
+          return Some[Aw](Aw(look, tc, newApp(), awStyles(), t0, t1, 0usize, 0usize, Out(DrawList(), List[TextJob](), Mat4.identity()), false));
+        }
+        case is Err { print <- "warehouse: the architecture walk's font could not be read\n"; }
+      }
+    }
+    case is Err { print <- "warehouse: no font file for the architecture walk\n"; }
+  }
+  None
+}
