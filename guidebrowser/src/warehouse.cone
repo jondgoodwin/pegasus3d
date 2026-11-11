@@ -14,6 +14,7 @@ const LAB_W = 512u32;
 const LAB_H = 128u32;
 const FLIGHT_MS = 500.0f;
 const CHIP_DELAY_MS = 300.0f;
+const CHIPS_ON = false;          // the chips beside a project and over a page (close, shelve, grab, back, forward, park) are replaced by the palette
 const FADE_S = 0.2f;
 const RING_N = 5;
 const MAX_ITEMS = 12;
@@ -341,7 +342,10 @@ pub struct Warehouse {
   handHeld: bool;          // a hand's grip holds the gaze
   desk: Option[DeskPanel]; // --desk: the laptop's screen at a desk spot (desk.cone)
   grabKind: u32;           // what the grip holds besides a page: 1 the file browser, 2 the report, 3 a parked folder's post, 4 a project, else 0
-  grabIt: i32;             // its number (marker or item)
+  grabIt: i32;             // its number (marker or item); for kind 5 (the palette) unused
+  pal: Palette;            // the palette (palette.cone)
+  focusPg: i32;            // the page (pgs) last clicked, or -1: with 'sel', what the palette's set follows
+  palFocused: bool;        // "focus" was pressed: the root icon shows "release"
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -352,7 +356,7 @@ pub struct Warehouse {
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
       None, 0u32, 0u32, false,
       Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
-      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1)
+      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, Palette.empty(), -1, false)
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -607,6 +611,7 @@ pub struct Warehouse {
     self.tickBrowser(device, renderer);
     self.cfgTick(device, renderer, now);
     self.tickPages(device, renderer, dt);
+    self.palTick(device, dt, now);
     self.awTick(dt);
     match &mut desk { case var &mut Some(d) { d.tick(device); } else {} }
     ticks = ticks + 1u32;
@@ -916,6 +921,7 @@ pub struct Warehouse {
   }
 
   pub fn select(self: &mut, k: i32) {
+    if focusPg >= 0 || k != sel { focusPg = -1; palFocused = false; }
     if k == sel { return; }
     var o = 0usize;
     while o < items.len() { if i32.from(o) != k { (&mut items[o]).zlevel = 0u32; } o = o + 1usize; }
@@ -1309,6 +1315,13 @@ pub struct Warehouse {
         r = r + 1usize;
       }
       restoreAt = nowMs() + 1500u64;
+    }
+    // where the palette was left (room.toml): floating there; none: on the hand
+    if grabKind != 5u32 {
+      var pp = Place(0u32, 0u32, 0., 0., 0.);
+      if roomGood.palPlace.len() > 0usize && parsePlace(roomGood.palPlace.view(), &mut pp) && pp.kind == 3u32 {
+        pal.docked = false; pal.floatPos = Vec3(pp.x, pp.y, pp.z);
+      } else { pal.docked = true; }
     }
     applied = true;
   }
@@ -1982,11 +1995,21 @@ pub struct Warehouse {
       }
       k = k + 1usize;
     }
+    // (the palette's tray is a thing a beam can hold, too, and is usually the nearest)
+    let pt = pal.reach(eye, dir);
+    if pt > 0. && (ot < 0. || pt < ot) { ot = pt; ok = 5u32; oi = -1; }
     if ok > 0u32 && (bt < 0. || ot < bt) {
       gazeEye = eye; gazeDir = dir;
       var d = ot;
       if d < 1.5 { d = 1.5; }
       if d > 8. { d = 8.; }
+      if ok == 5u32 {
+        d = ot;
+        if d < 0.25 { d = 0.25; }
+        if d > 4. { d = 4.; }
+        if pal.docked { pal.floatPos = pal.anchor(); }
+        pal.docked = false;
+      }
       grabDist = d;
       grabKind = ok; grabIt = oi;
       if ok == 4u32 {
@@ -1994,7 +2017,7 @@ pub struct Warehouse {
         let here = items[ku].pos;
         self.moveItem(ku, &Place(3u32, 0u32, here.x, here.y, here.z), false);
       }
-      print <- "warehouse: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else { "a project" }); print <- "\n";
+      print <- "warehouse: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else if ok == 5u32 { "the palette" } else { "a project" }); print <- "\n";
       return;
     }
     if bi >= 0 { gazeEye = eye; gazeDir = dir; self.startGrab(usize.from(u32.from(bi))); }
@@ -2003,6 +2026,7 @@ pub struct Warehouse {
   // Each frame while the grip holds a panel, post or project: it follows the point on the floor (the height kept for a project) along the gaze
   fn followGrab(self: &mut) {
     if grabKind == 0u32 { return; }
+    if grabKind == 5u32 { pal.floatPos = gazeEye + gazeDir.normalize() * grabDist; return; }
     let h = Vec3(gazeDir.x, 0., gazeDir.z);
     if h.length() < 0.05 { return; }
     let hn = h.normalize();
@@ -2026,6 +2050,7 @@ pub struct Warehouse {
     let kind = grabKind;
     let it = grabIt;
     grabKind = 0u32; grabIt = -1;
+    if kind == 5u32 { self.palSavePlace(); return; }
     var text = String.from("at:");
     var pos = Vec3(0., 0., 0.);
     var yawDeg: i64 = 0i64;
@@ -2459,7 +2484,7 @@ pub struct Warehouse {
       let hw = pgHalfW(web);
       let cy = pgTop(web) + 0.05;
       var c = 0u32;
-      while c < (if web { 3u32 } else { 5u32 }) {
+      while CHIPS_ON && c < (if web { 3u32 } else { 5u32 }) {
         let cx = hw - 0.19 - 0.39 * f32.from(c);
         let t = quadHit(m, Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir);
         if t > 0. && (best < 0. || t < best) { best = t; *kind = 2u32 + c; }
@@ -2478,7 +2503,7 @@ pub struct Warehouse {
 
   // The "park" chip on the browser panel's top edge: the distance along the ray, or -1
   fn parkHit(self: &, eye: Vec3, dir: Vec3) f32 {
-    if !browserOpen || pgChips.len() < 1usize { return -1.; }
+    if !CHIPS_ON || !browserOpen || pgChips.len() < 1usize { return -1.; }
     let cx = pgHalfW(false) - 0.19;
     let cy = pgTop(false) + 0.05;
     quadHit(self.browserModel(), Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir)
@@ -2524,6 +2549,7 @@ pub struct Warehouse {
     }
     if bi < 0 { self.blurWeb(); return false; }
     let pu = usize.from(u32.from(bi));
+    if focusPg != bi { focusPg = bi; palFocused = false; print <- "palette: focus on page "; printStr(pgs[pu].title.text.view()); print <- "\n"; }
     if bk == 2u32 { self.closePage(pu); return true; }
     if bk == 3u32 { self.toggleShelve(pu); return true; }
     if bk == 4u32 { self.startGrab(pu); return true; }
@@ -2759,7 +2785,7 @@ pub struct Warehouse {
   }
 
   fn chipsShown(self: &, now: u64) bool {
-    sel >= 0 && f32.from(now - selAt) >= CHIP_DELAY_MS && items[usize.from(u32.from(sel))].flight >= 1.
+    CHIPS_ON && sel >= 0 && f32.from(now - selAt) >= CHIP_DELAY_MS && items[usize.from(u32.from(sel))].flight >= 1.
   }
 
   // A click's ray against the chips: true if one was taken
@@ -2847,6 +2873,7 @@ pub struct Warehouse {
         k = k + 1usize;
       }
     }
+    best = Warehouse.nearer(best, pal.reach(eye, dir));
     if browserOpen {
       match &browserPanel {
         case let Some(p) {
@@ -3054,7 +3081,7 @@ pub struct Warehouse {
           case var &mut Some(p) { p.drawPageDepth(device, encoder, target, depth, vp * self.browserModel()); }
           else {}
         }
-        if pgChips.len() > 0usize {
+        if CHIPS_ON && pgChips.len() > 0usize {
           let cx = pgHalfW(false) - 0.19;
           let cy = pgTop(false) + 0.05;
           Warehouse.faded(&mut pgChips[0usize], device, encoder, target, depth, vp * self.browserModel(),
@@ -3073,7 +3100,7 @@ pub struct Warehouse {
         let top = pgTop(web);
         if !pgs[idx].shelved {
           var c = 0usize;
-          while c < (if web { 3usize } else { 5usize }) {
+          while CHIPS_ON && c < (if web { 3usize } else { 5usize }) {
             let cx = hw - 0.19 - 0.39 * f32.from(u32.from(c));
             let cy = top + 0.05;
             Warehouse.faded(&mut pgs[idx].chips[c], device, encoder, target, depth, vp * pm,
@@ -3104,6 +3131,7 @@ pub struct Warehouse {
       }
       n = n + 1usize;
     }
+    pal.draw(device, encoder, target, depth, vp, eye, now);
     // the level readout at the foot of the view, 0.8 m from the eye along the ray through the bottom of the screen
     if readout[0usize].alpha > 0.01 {
       let inv = vp.inverse();
@@ -3149,6 +3177,161 @@ pub struct Warehouse {
     let act = items[si].menu[*ents[n]].action.clone();
     print <- "warehouse: menu "; print <- n; print <- " ("; printStr(act.view()); print <- ")\n";
     self.doAction(act.view(), v)
+  }
+
+  // ---- the palette (palette.cone) ----
+
+  // What has focus: the page last clicked, else the selected project, else the room
+  fn palKind(self: &) String {
+    if focusPg >= 0 {
+      let i = usize.from(u32.from(focusPg));
+      if i < pgs.len() && !pgs[i].gone {
+        if pgs[i].web { return String.from("web"); }
+        let s = pgs[i].src.view();
+        if startsWithText(s, "mermaid:") || (s.len() >= 4usize && s.slice(s.len() - 4usize, s.len()) == ".mmd") { return String.from("diagram"); }
+        return String.from("document");
+      }
+    }
+    if sel >= 0 {
+      if items[usize.from(u32.from(sel))].page { return String.from("document"); }
+      return String.from("project");
+    }
+    String.from("room")
+  }
+
+  // The set of a kind: studio.toml's [palette.KIND] or the built-in one; for a project, its own menu entries are added (those that are not
+  // already a standard icon), and shelve shows only on the ring, bring only on a shelf
+  fn palBuild(self: &, kind: &str, out: &mut List[String], sig: &mut String) {
+    var set = palDefault(kind);
+    var q = 0usize;
+    while q < studioGood.palSets.len() {
+      if studioGood.palSets[q].kind.view() == kind && studioGood.palSets[q].icons.len() > 0usize { set = studioGood.palSets[q].icons.clone(); }
+      q = q + 1usize;
+    }
+    var onTable = true;
+    if kind == "project" && sel >= 0 { onTable = items[usize.from(u32.from(sel))].onTable; }
+    var i = 0usize;
+    while i < set.len() {
+      let e = palEntryOf(set[i].view());
+      let hide = kind == "project" && ((e.action.view() == "shelve" && !onTable) || (e.action.view() == "bring" && onTable));
+      if !hide { out.push(set[i].clone()); }
+      i = i + 1usize;
+    }
+    if kind == "project" && sel >= 0 {
+      let id = items[usize.from(u32.from(sel))].id.view();
+      var pi = 0usize;
+      while pi < studioGood.projects.len() {
+        if studioGood.projects[pi].id.view() == id {
+          var m = 0usize;
+          while m < studioGood.projects[pi].menu.len() {
+            let mc = &studioGood.projects[pi].menu[m];
+            let a = mc.action.view();
+            let standard = a == "zoom" || a == "zoomout" || a == "shelve" || a == "bring" || a == "open" || a == "talk" || a == "back" || a == "forward"
+              || a == "files" || a == "reload";
+            if !standard && knownAction(a) {
+              var line = String.from(palIconFor(a));
+              line.append("|"); line.append(mc.label.view()); line.append("|"); line.append(a);
+              out.push(line);
+            }
+            m = m + 1usize;
+          }
+        }
+        pi = pi + 1usize;
+      }
+    }
+    sig.append("|"); sig.append(numText(i64.from(out.len())).view());
+    sig.append(if onTable { "|r|" } else { "|s|" });
+    sig.append(numText(i64.from(studioSeen.len())).view());
+  }
+
+  fn palTick(self: &mut, device: &mut Device, dt: f32, now: u64) {
+    let kind = self.palKind();
+    var build = List[String]();
+    var sig = String.from(kind.view());
+    self.palBuild(kind.view(), &mut build, &mut sig);
+    var lab: Option[Labeller] = None;
+    lab <-> labeller;
+    match &mut lab {
+      case var &mut Some(l) { pal.tick(device, l, format, dt, now, kind.view(), sig.view(), &build, palFocused); }
+      else {}
+    }
+    labeller <-> lab;
+  }
+
+  // The hover of a hand's (or the mouse's) pointer; the beam of a hand ends at the tray (reach)
+  pub fn palPoint(self: &mut, hand: u32, eye: Vec3, dir: Vec3) { _ = pal.point(hand, eye, dir, nowMs()); }
+  pub fn setPalHand(self: &mut, pos: Vec3) { pal.setHand(pos); }
+  pub fn palSpot(self: &, n: u32, eye: Vec3) Vec4 { pal.spot(n, eye) }
+  pub fn palKindNow(self: &) String { pal.kindNow() }
+
+  // A trigger or click along a ray: a button runs its action; the plate alone is swallowed (on the desktop it lifts the tray off, in place)
+  pub fn palClick(self: &mut, device: &mut Device, eye: Vec3, dir: Vec3, v: &Fly) bool {
+    var body = false;
+    let a = pal.press(eye, dir, nowMs(), &mut body);
+    if a.len() == 0usize {
+      if body && !pal.xr && pal.docked { self.palLift(); }
+      return body;
+    }
+    _ = self.palAct(device, a.view(), v);
+    true
+  }
+
+  pub fn palLift(self: &mut) {
+    if !pal.docked { return; }
+    pal.floatPos = pal.anchor();
+    pal.docked = false;
+    self.palSavePlace();
+  }
+
+  pub fn palDock(self: &mut) {
+    pal.docked = true;
+    roomGood.palPlace = String();
+    writeAt = nowMs() + 1000u64;
+    print <- "palette: docked\n";
+  }
+
+  fn palSavePlace(self: &mut) {
+    var text = String.from("at:");
+    text.append(floatText(pal.floatPos.x).view()); text.append(","); text.append(floatText(pal.floatPos.y).view()); text.append(","); text.append(floatText(pal.floatPos.z).view());
+    roomGood.palPlace = text;
+    writeAt = nowMs() + 1000u64;
+    print <- "palette: left floating at "; printStr(roomGood.palPlace.view()); print <- " (room.toml)\n";
+  }
+
+  // The action of a palette button. 1: it did something; 2: not wired yet, it only logs; 0: not available for this focus.
+  fn palAct(self: &mut, device: &mut Device, action: &str, v: &Fly) u32 {
+    let label = pal.labelOf(action);
+    var r = 0u32;
+    let pgOk = focusPg >= 0 && usize.from(u32.from(focusPg)) < pgs.len();
+    if action == "dock" { self.palDock(); r = 1u32; }
+    else if action == "focus" {
+      if palFocused { palFocused = false; if sel >= 0 { _ = self.zoom(-1, v); } r = 1u32; }
+      else if !pgOk && sel >= 0 { _ = self.act(3u32, v); palFocused = true; r = 1u32; }
+      else { r = 2u32; }
+    }
+    else if action == "back" || action == "forward" {
+      if pgOk {
+        let i = usize.from(u32.from(focusPg));
+        match &mut pgs[i].doc { case var &mut Some(p) { p.requestNav(if action == "back" { -1i32 } else { 1i32 }); r = 1u32; } else { r = 2u32; } }
+      } else { navWant = if action == "back" { 6u32 } else { 7u32 }; r = 1u32; }
+    }
+    else if action == "files" { navWant = 8u32; r = 1u32; }
+    else if action == "close" { if pgOk { let i = usize.from(u32.from(focusPg)); focusPg = -1; self.closePage(i); r = 1u32; } }
+    else if action == "shelve" {
+      if pgOk { self.toggleShelve(usize.from(u32.from(focusPg))); r = 1u32; }
+      else if sel >= 0 && self.act(0u32, v) { r = 1u32; }
+    }
+    else if action == "park" { if browserOpen { self.parkBrowser(device); r = 1u32; } else { r = 0u32; } }
+    else if sel >= 0 && self.doAction(action, v) { r = 1u32; }
+    else if action == "reload" { cfgPoll = 0u64; studioSeen = String(); roomSeen = String(); r = 1u32; }
+    else if sel < 0 && (action == "zoom" || action == "zoomout" || action == "bring" || action == "open" || action == "talk") { r = 0u32; }
+    else if action == "undo" || action == "beforeafter" || action == "edit" || action == "dictate" || action == "newpage" || action == "linkpage"
+      || action == "webreload" || action == "address" || action == "addbox" || action == "connect" || action == "labelit" || action == "rename"
+      || action == "delete" || action == "relayout" || action == "passthrough" || action == "look" { r = 2u32; }
+    print <- "palette: "; printStr(label.view()); print <- " ("; printStr(action); print <- ") ";
+    print <- (if r == 1u32 { "done" } else if r == 2u32 { "is a stub: logged, nothing done yet" } else { "has nothing to act on" });
+    print <- "\n";
+    r
   }
 
   fn cardPos(self: &, stage: usize, n: u32) Vec3 {
