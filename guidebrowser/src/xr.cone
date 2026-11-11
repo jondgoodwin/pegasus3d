@@ -40,7 +40,7 @@ const XR_BUZZ_AMPLITUDE = 0.4f;
 const XR_STAND_EYE = 1.6f;
 
 // The foveation level asked for (PEGASUS_XR_FOVEATION: off, low, medium, high; medium by default), read when the device is made
-var @threadlocal xrFoveation = FoveationLevel.Medium;
+var @threadlocal xrFoveation: FoveationLevel = FoveationLevel.Medium;
 
 // One controller, in the world
 pub struct XrHandNow {
@@ -92,21 +92,27 @@ pub struct XrRig {
   pub fakeClickAt: u64 = 0u64;
   pub foveaTold: bool = false;
   pub artMade: bool = false;
-  pub cube: MeshHandle = MeshHandle.none();
-  pub ball: MeshHandle = MeshHandle.none();
-  pub leftBody: MaterialHandle = MaterialHandle.none();
-  pub rightBody: MaterialHandle = MaterialHandle.none();
-  pub beam: MaterialHandle = MaterialHandle.none();
-  pub dot: MaterialHandle = MaterialHandle.none();
+  pub cube: MeshHandle;
+  pub ball: MeshHandle;
+  pub leftBody: MaterialHandle;
+  pub rightBody: MaterialHandle;
+  pub beam: MaterialHandle;
+  pub dot: MaterialHandle;
   pub glowFor: f32 = 0.;                 // the exposure the materials' glow was set for
   pub fovea: Foveation;
 
   pub fn make(on: bool) XrRig {
-    var r = XrRig(fovea: Foveation.make(xrFoveation));
+    var r = XrRig(cube: MeshHandle.none(), ball: MeshHandle.none(), leftBody: MaterialHandle.none(), rightBody: MaterialHandle.none(),
+      beam: MaterialHandle.none(), dot: MaterialHandle.none(), fovea: Foveation.make(xrFoveation));
     r.on = on;
     r.fake = (libc.getenv("PEGASUS_XR_FAKE") as usize) != 0usize;
     let at = libc.getenv("PEGASUS_XR_FAKE_CLICK");
-    if (at as usize) != 0usize { r.fakeClickAt = u64.from(i32.from(libc.atoi(at))); }
+    if (at as usize) != 0usize {
+      var n = 0u64;
+      var i = 0usize;
+      while *(at + i) >= '0' && *(at + i) <= '9' { n = n * 10u64 + u64.from(*(at + i) - '0'); i = i + 1usize; }
+      r.fakeClickAt = n;
+    }
     r
   }
 }
@@ -174,7 +180,7 @@ fn openHeadset(host: &mut Host, gpu: &mut HeadsetGpu) Headset {
 fn xrYawOf(forward: Vec3) f32 { atan2(0. - forward.x, 0. - forward.z) }
 
 fn xrDeadZone(x: f32, y: f32) Vec2 {
-  let m = sqrt(x * x + y * y);
+  let m = libc.sqrtf(x * x + y * y);
   if m <= XR_DEAD_ZONE { return Vec2(0., 0.); }
   var scale = (m - XR_DEAD_ZONE) / (1. - XR_DEAD_ZONE);
   if scale > 1. { scale = 1.; }
@@ -229,7 +235,7 @@ fn xrFakeHand(s: &Shell) XrHandNow {
   hs.aimValid = true;
   hs.aimPos = head + flat * 0.35 + side * 0.2 + Vec3(0., -0.45, 0.);
   hs.aimDir = (aimAt - hs.aimPos).normalize();
-  hs.aimRot = Quat.look(hs.aimDir);
+  hs.aimRot = Pose.look(hs.aimPos, xrYawOf(hs.aimDir), libc.asinf(hs.aimDir.y)).orientation;
   hs.gripPos = hs.aimPos;
   hs.gripRot = hs.aimRot;
   if s.xr.fakeClickAt > 0u64 && s.xr.frames >= s.xr.fakeClickAt && s.xr.frames < s.xr.fakeClickAt + 4u64 { hs.trigger = 1.; }
@@ -341,6 +347,11 @@ fn xrPoint(s: &mut Shell) {
       if h == 0usize { s.xr.trigger0 = down; } else { s.xr.trigger1 = down; }
     }
     if h == 0usize { s.xr.beam0 = len; s.xr.hit0 = hit; } else { s.xr.beam1 = len; s.xr.hit1 = hit; }
+    if s.xr.fake && h == 1usize && s.xr.frames % 100u64 == 50u64 {
+      print <- "xr: the right beam from ("; print <- hs.aimPos.x; print <- ", "; print <- hs.aimPos.y; print <- ", "; print <- hs.aimPos.z; print <- ") along (";
+      print <- hs.aimDir.x; print <- ", "; print <- hs.aimDir.y; print <- ", "; print <- hs.aimDir.z; print <- ") is "; print <- len; print <- " m long";
+      print <- if hit { ", ending at something\n" } else { ", meeting nothing\n" };
+    }
     // The grip opens the file browser
     let gripDown = hs.active && hs.squeeze > XR_GRIP_DOWN;
     let gripWas = if h == 0usize { s.xr.grip0 } else { s.xr.grip1 };
@@ -412,14 +423,19 @@ fn xrDrawEye(s: &mut Shell, eye: usize) {
   var encoder = s.device.createCommandEncoder();
   s.headset.eyeStart(&mut encoder, eye);
   s.post.resize(&mut s.device, s.target.texture.width, s.target.texture.height);
-  let rated = s.xr.fovea.level != FoveationLevel.Off && s.xr.fovea.ready(eye);
-  if rated { s.renderer.setShadingRate(&s.device, s.xr.fovea.rate(eye), s.xr.fovea.texelWidth, s.xr.fovea.texelHeight); }
+  // (the Foveation is taken out of the shell for the eye: the shell is reachable from a global, which the borrow of the rate image
+  // must not be lent from)
+  var fovea = Foveation.make(FoveationLevel.Off);
+  fovea <-> s.xr.fovea;
+  let rated = fovea.level != FoveationLevel.Off && fovea.ready(eye);
+  if rated { s.renderer.setShadingRate(&s.device, fovea.rate(eye), fovea.texelWidth, fovea.texelHeight); }
   // (the ray-traced structure is built from the first eye's view and kept for the second)
   s.renderer.rtShare = if eye == 0usize { EyeShare.Build } else { EyeShare.Reuse };
   s.renderer.keepDepth = true;
   s.renderer.render(&mut s.device, &mut encoder, &s.post.hdr, &s.target.depth, &s.camera, &s.light, &s.list);
   s.renderer.rtShare = EyeShare.Own;
   if rated { s.renderer.clearShadingRate(); }
+  fovea <-> s.xr.fovea;
   s.post.apply(&mut encoder, &s.target.texture);
   let aspect = f32.from(s.target.texture.width) / f32.from(s.target.texture.height);
   let vp = s.camera.projectionMatrix(aspect) * s.camera.viewMatrix();
