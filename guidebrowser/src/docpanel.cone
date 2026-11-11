@@ -1,8 +1,9 @@
-// The document panel: a Markdown file (markdown.cone) shown on a lit page standing in the world, read again
+// The document panel: a Markdown file (markdown.cone) shown on a page standing in the world, read again
 // whenever the file changes.
 //
-//   - The page is laid out and drawn by the richtext package onto a texture (DOC_TEX_W wide), which the
-//     renderer then shows on a quad. Scrolling moves the window of the page the texture shows.
+//   - The page is laid out and drawn by the richtext package onto a texture (DOC_TEX_W wide), which PagePass then
+//     draws as an UNLIT quad on top of the finished picture (after exposure and tone mapping), so its paper and ink
+//     are the texture's own whatever the scene's light. Scrolling moves the window of the page the texture shows.
 //   - Every 250 ms the file's modification time and size are looked at (one stat). When either changes, and
 //     for 2 s after any change (the C runtime's time is whole seconds, so an edit in the same second and of the
 //     same length would otherwise be missed), the file's text is read and compared with the last text.
@@ -25,12 +26,14 @@ const DOC_TEXT_PX = 22.;         // body text, pixels of em (about 1 degree at t
 const DOC_TEX_H = 1810u32;       // A-series proportions (1 : 1.414)
 const DOC_WORLD_W = 1.346;       // meters across: 41 degrees at 1.8 m
 const DOC_CENTRE_Y = 1.45;       // meters up, the panel's middle: a little below the eye
-const DOC_GAIN = 1.5;            // the page's brightness, a multiplier on its lit colour (text and paper alike)
 const FADE_SECONDS = 10.;
 const FADE_HOLD_SECONDS = 1.;    // full strength for this long first
 const FADE_LOW = 110.;           // the steady strength of an old mark, of 255
 const STRIP_H = 64u32;           // the error line's height at the page's foot
-const STEM_POWER: f32 = 0.4;     // stem darkening (darkenStems): below 1 darkens partly covered pixels
+// Settable from the command line ('--stem P', '--page-bias B'): stem darkening's power (below 1 darkens partly covered
+// pixels), and the page's mip level bias (negative: sharper, more aliasing)
+var @threadlocal stemPower: f32 = 0.4;
+var @threadlocal pageBias: f32 = -1.;
 const POLL_MS = 250u64;
 const HOT_MS = 2000u64;
 const POINTER_LOG = "C:/src/studio-work/pointer.log";
@@ -174,9 +177,7 @@ pub struct DocPanel {
   readback: Buffer;
   stripTarget: Texture;
   stripBuf: Buffer;
-  mesh: MeshHandle;
-  tex: TextureHandle;
-  material: MaterialHandle;
+  page: PagePass;               // draws the page unlit, after the scene is tone mapped
   born: List[u64];               // for each doc block: when it was marked (ms), 0 if not
   kinds: List[u32];              // 1 new, 2 changed
   dels: List[Del];
@@ -192,7 +193,7 @@ pub struct DocPanel {
   glyphsSwapped: u32 = 0u32;
 
   // Check that it came out: None if no font is installed or the renderer failed
-  pub fn create(device: &mut Device, renderer: &mut Renderer, file: &str, initialScroll: f32) Option[DocPanel] {
+  pub fn create(device: &mut Device, renderer: &mut Renderer, outFormat: u32, file: &str, initialScroll: f32) Option[DocPanel] {
     var made: Option[DocPanel] = None;
     match makeFaces() {
       case let Some(faces) {
@@ -206,10 +207,10 @@ pub struct DocPanel {
             TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
           var stripTarget = device.createTexture(&sdesc);
           var stripBuf = device.createBuffer(u64.from(DOC_TEX_W * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
-          let mesh = renderer.addMesh(device, &quad());
+          let page = PagePass.create(device, outFormat);
           var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
-            emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, stripTarget, stripBuf, mesh,
-            TextureHandle.none(), MaterialHandle.none(), List[u64](), List[u32](), List[Del](), String());
+            emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, stripTarget, stripBuf,
+            page, List[u64](), List[u32](), List[Del](), String());
           p.scrollY = initialScroll;
           p.reload(device, renderer, true);
           made = Some[DocPanel](p);
@@ -583,12 +584,7 @@ pub struct DocPanel {
     while layout.rects.len() > keep { layout.rects.pop(); }
     var img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
     darkenStems(&mut img);    if err.len() > 0usize { self.errorStrip(device, &mut img); }
-    let t = renderer.addTexture(device, &img);
-    let m = renderer.addMaterial(device, &Material.textured(Color(1., 1., 1., 1.), t));
-    if renderer.removeMaterial(device, material) {}
-    if renderer.removeTexture(device, tex) {}
-    tex = t;
-    material = m;
+    page.upload(device, &img);       // an sRGB texture with its whole mip chain, averaged in linear light
   }
 
   // The error as one red line at the foot of the page: laid out and drawn apart (richtext draws only a document),
@@ -619,8 +615,12 @@ pub struct DocPanel {
     while p < n { img.pixels.set(p, *strip.pixels[p]); p = p + 1usize; }
   }
 
-  pub fn drawInto(self: &, list: &mut DrawList) {
-    list.addTinted(mesh, material, Mat4.identity(), Color(f32.from(DOC_GAIN), f32.from(DOC_GAIN), f32.from(DOC_GAIN), 1.));
+  // Record the page into 'target' (the finished picture, kept), unlit, from the camera's view and projection
+  pub fn drawPage(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4) {
+    let w = f32.from(DOC_WORLD_W) * 0.5;
+    let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    let y = f32.from(DOC_CENTRE_Y);
+    page.draw(device, encoder, target, viewProjection, Vec4(0. - w, y - h, w, y + h));
   }
 
   // A ray from the eye: does it meet the page? If so, name the block there.
@@ -674,7 +674,7 @@ fn darkenStems(img: &mut Image) {
     while v < 256usize {
       let ink = (paper - f32.from(v)) / paper;
       var out = f32.from(v);
-      if ink > 0. { out = paper * (1. - libc.powf(ink, STEM_POWER)); }
+      if ink > 0. { out = paper * (1. - libc.powf(ink, stemPower)); }
       if out < 0. { out = 0.; }
       tables.push(u8.from(u32.from(out + 0.5)));
       v = v + 1usize;
@@ -735,18 +735,91 @@ fn pushRun(runs: &mut List[Run], len: usize, st: Style) {
 }
 
 // The page: DOC_WORLD_W across, standing at z = 0 facing +z, its middle DOC_CENTRE_Y up. uv (0, 0) is its lower left.
-fn quad() Mesh {
-  var m = Mesh();
-  let w = f32.from(DOC_WORLD_W) * 0.5;
-  let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
-  let y = f32.from(DOC_CENTRE_Y);
-  m.positions.push(Vec3(0. - w, y - h, 0.)); m.uvs.push(Vec2(0., 0.));
-  m.positions.push(Vec3(w, y - h, 0.)); m.uvs.push(Vec2(1., 0.));
-  m.positions.push(Vec3(w, y + h, 0.)); m.uvs.push(Vec2(1., 1.));
-  m.positions.push(Vec3(0. - w, y + h, 0.)); m.uvs.push(Vec2(0., 1.));
-  var k = 0;
-  while k < 4 { m.normals.push(Vec3(0., 0., 1.)); k = k + 1; }
-  m.indices.push(0u32); m.indices.push(1u32); m.indices.push(2u32);
-  m.indices.push(0u32); m.indices.push(2u32); m.indices.push(3u32);
-  m
+struct PageParams {
+  transform: Mat4;               // the camera's projection times its view
+  rect: Vec4;                    // x0, y0, x1, y1 of the page in the world (z = 0)
+  extra: Vec4;                   // x: the mip level bias
+}
+
+// The unlit page pass (docpage.slang): a pipeline drawing one textured quad into the finished picture, so the page's
+// texels are what the screen shows, whatever the scene's light, exposure, auto-exposure, bloom and tone map. The
+// texture is the renderer's sRGB one with its mip chain, sampled trilinear and anisotropic (16) with a small
+// negative bias; the target is sRGB too, so the values go out as they came in (no second gamma).
+// Fields die in this order: the group before what it was made from.
+struct PagePass {
+  group: BindGroup;
+  texture: Texture;
+  uniforms: Buffer;
+  sampler: Sampler;
+  pipeline: RenderPipeline;
+  layout: PipelineLayout;
+  groupLayout: BindGroupLayout;
+  shader: ShaderModule;
+
+  fn create(device: &mut Device, format: u32) PagePass {
+    var shader = device.createShaderModule(&DOCPAGE_SPIRV);
+    let entries = [BindGroupLayoutEntry(binding: 0u32, visibility: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT),
+      BindGroupLayoutEntry(binding: 1u32, visibility: SHADER_STAGE_FRAGMENT, kind: BINDING_KIND_TEXTURE),
+      BindGroupLayoutEntry(binding: 2u32, visibility: SHADER_STAGE_FRAGMENT, kind: BINDING_KIND_SAMPLER)];
+    var groupLayout = device.createBindGroupLayout(&entries);
+    let groupLayouts = [&groupLayout];
+    var layout = device.createPipelineLayout(&groupLayouts, 0u32);
+    let attributes = [VertexAttribute(VERTEX_FORMAT_FLOAT32, 0u64, 0u32)];
+    let buffers = [VertexBufferLayout(arrayStride: 4u64, attributes: &attributes)];
+    let desc = RenderPipelineDescriptor(layout: &layout, vertexModule: &shader, vertexEntryPoint: "vertexMain",
+      buffers: &buffers[..<0], fragmentModule: &shader, fragmentEntryPoint: "fragmentMain", colorFormat: format);
+    var pipeline = device.createRenderPipeline(&desc);
+    let samplerDesc = SamplerDescriptor(addressModeU: ADDRESS_MODE_CLAMP_TO_EDGE, addressModeV: ADDRESS_MODE_CLAMP_TO_EDGE,
+      addressModeW: ADDRESS_MODE_CLAMP_TO_EDGE, mipmapFilter: FILTER_MODE_LINEAR, maxAnisotropy: 16u32);
+    var sampler = device.createSampler(&samplerDesc);
+    var uniforms = device.createBuffer(96u64, BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST);
+    let one = TextureDescriptor(1u32, 1u32, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST);
+    var texture = device.createTexture(&one);
+    let view = texture.createView();
+    let group = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    PagePass(group, texture, uniforms, sampler, pipeline, layout, groupLayout, shader)
+  }
+
+  // The page's new picture: a texture of it with its mip chain (averaged in linear light, as the renderer's own sRGB
+  // textures are), a bind group of that; the old ones released once the GPU is done with them
+  fn upload(self: &mut, device: &mut Device, img: &Image) {
+    let w = u32.from(img.width);
+    let h = u32.from(img.height);
+    var rgba = List[u8].withCapacity(usize.from(w * h * 4u32));
+    var p = 0usize;
+    let n = usize.from(w * h);
+    while p < n {
+      rgba.push(*img.pixels[p * 3usize]);
+      rgba.push(*img.pixels[p * 3usize + 1usize]);
+      rgba.push(*img.pixels[p * 3usize + 2usize]);
+      rgba.push(255u8);
+      p = p + 1usize;
+    }
+    let chain = buildMips(&rgba, w, h, MIP_COLOUR);
+    let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+      mipLevelCount(w, h));
+    var fresh = device.createTexture(&desc);
+    let cv = chain.view();
+    device.queue.writeTextureLevels(&fresh, &cv[0] as *u8);
+    let view = fresh.createView();
+    var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    made <-> group;
+    fresh <-> texture;
+    device.queue.releaseBindGroup(&mut made);
+    device.queue.releaseTexture(&mut fresh);
+  }
+
+  fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4, rect: Vec4) {
+    let params = PageParams(viewProjection, rect, Vec4(pageBias, 0., 0., 0.));
+    device.queue.writeBuffer(&uniforms, 0u64, &params as *u8, 96u64);
+    let color = RenderPassColorAttachment(view: target.createView(), loadOp: LOAD_OP_LOAD,
+      clearValue: Color(0., 0., 0., 0.));
+    var pass = encoder.beginRenderPass(&color);
+    pass.setPipeline(&pipeline);
+    pass.setBindGroup(0u32, &group);
+    pass.draw(6u32, 1u32, 0u32, 0u32);
+    pass.end();
+  }
 }
