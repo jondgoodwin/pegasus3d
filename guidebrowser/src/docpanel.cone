@@ -248,6 +248,8 @@ pub struct DocPanel {
   cache: List[Diagram];          // the diagrams drawn, by source and width
   blockDiag: List[usize];        // for each richtext block, its diagram in 'cache' (NOMATCH: none)
   imgDiag: List[usize];          // for each image of 'images', its diagram in 'cache'
+  pub openDirs: List[String];    // a tree page: the folders expanded
+  treeCache: TreeCache;
   pointedDiag: usize = 18446744073709551615usize;   // the diagram last clicked, and the thing in it
   pointedKey: usize = 18446744073709551615usize;
   ticks: u32 = 0u32;
@@ -269,6 +271,7 @@ pub struct DocPanel {
   histSerial: u32 = 0u32;                       // counts changes to the history
   pendingNav: i32 = 0i32;                        // back (-1) or forward (+1), done on the next tick
   recentSerial: u32 = 0u32;
+  pub treeDirty: bool = false;                   // the expanded set changed (the room keeps it in room.toml)
 
   // Check that it came out: None if no font is installed or the renderer failed
   pub fn create(device: &mut Device, renderer: &mut Renderer, outFormat: u32, file: &str, initialScroll: f32) Option[DocPanel] {
@@ -289,7 +292,7 @@ pub struct DocPanel {
             emptyLayout(f32.from(DOC_TEX_W)), target, readback, stripTarget, stripBuf,
             page, List[u64](), List[u32](), List[Del](), String(), String(),
             List[HistEntry](), String(), String(), String(), String(), List[String](), String(),
-            None, List[Diagram](), List[usize](), List[usize]());
+            None, List[Diagram](), List[usize](), List[usize](), List[String](), TreeCache());
           p.scrollY = initialScroll;
           p.reload(device, renderer, true);
           p.hist.push(HistEntry(String.from(file), 0.));
@@ -446,6 +449,23 @@ pub struct DocPanel {
   // Follow a link of the page: an anchor, a file (here, or in the document panel if this is the file browser), a folder
   // (in the file browser)
   fn follow(self: &mut, device: &mut Device, renderer: &mut Renderer, target: &str) {
+    if isTree(file.view()) {
+      // a tree: a folder row opens or closes in place; a file row opens as a page
+      let path = normalizePath(target);
+      if fs.isDir(&Path.from(path.view())) {
+        var kept = List[String]();
+        var was = false;
+        var i = 0usize;
+        while i < openDirs.len() { if openDirs[i].view() == path.view() { was = true; } else { kept.push(openDirs[i].clone()); } i = i + 1usize; }
+        if !was { kept.push(path.clone()); }
+        openDirs = kept;
+        treeDirty = true;
+        print <- "docpanel: tree "; print <- (if was { "closed " } else { "opened " }); printStr(path.view()); print <- "\n";
+        self.reload(device, renderer, false);
+      }
+      else if fs.exists(&Path.from(path.view())) { outOpen = path.clone(); }
+      return;
+    }
     print <- "docpanel: link: "; printStr(target); print <- "\n";
     if isExternal(target) {
       if target.startsWith("http://") || target.startsWith("https://") {
@@ -608,6 +628,11 @@ pub struct DocPanel {
 
   // Read the file; if its text differs from the last (or this is the first time), parse, compare, lay out, draw
   fn reload(self: &mut, device: &mut Device, renderer: &mut Renderer, first: bool) {
+    if isTree(file.view()) {
+      let listing = treeText(treeRoot(file.view()).view(), &openDirs, &mut treeCache);
+      self.reloadText(device, renderer, first, listing.view());
+      return;
+    }
     if isBrowse(file.view()) {
       let listing = browserText(browseDir(file.view()).view(), &recent);
       self.reloadText(device, renderer, first, listing.view());
@@ -617,6 +642,15 @@ pub struct DocPanel {
       case let Ok(s) { self.reloadText(device, renderer, first, s.view()); }
       case let Err(e) { self.setError("gone or locked"); }
     }
+  }
+
+  // A tree page with these folders expanded (from room.toml)
+  pub fn setOpenDirs(self: &mut, device: &mut Device, renderer: &mut Renderer, open: &List[String]) {
+    var o = List[String]();
+    var i = 0usize;
+    while i < open.len() { o.push(open[i].clone()); i = i + 1usize; }
+    openDirs = o;
+    self.reload(device, renderer, false);
   }
 
   // The file browser's page again (its folder is the same; the history it lists may have changed)

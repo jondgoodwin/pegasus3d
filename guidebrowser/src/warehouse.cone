@@ -201,6 +201,7 @@ struct Card {
   glow: Label;          // the strong frame; shown in turns with 'calm' when hot
   report: String;       // a file path, or empty
   alpha: f32;
+  zone: String;         // which zone's line it belongs to (line.json "zone")
 }
 
 // A project: a part of the world (or the document page), and where it stands
@@ -342,6 +343,10 @@ pub struct Warehouse {
   desk: Option[DeskPanel]; // --desk: the laptop's screen at a desk spot (desk.cone)
   grabKind: u32;           // what the grip holds besides a page: 1 the file browser, 2 the report, 3 a parked folder's post, 4 a project, else 0
   grabIt: i32;             // its number (marker or item)
+  zones: List[Zone];                  // the boards at the back (zones.cone)
+  dimPass: Option[PagePass];          // the veil over the room while a pane is at the workbench
+  zoneSeen: bool = false;
+  benchN: u32 = 0u32;                 // pages opened from a board's tree so far (where the next stands on the workbench)
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -352,7 +357,7 @@ pub struct Warehouse {
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
       None, 0u32, 0u32, false,
       Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
-      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1)
+      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, List[Zone](), None)
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -606,6 +611,7 @@ pub struct Warehouse {
     self.serveReport(device, renderer);
     self.tickBrowser(device, renderer);
     self.cfgTick(device, renderer, now);
+    self.tickZones(device, renderer, dt, now);
     self.tickPages(device, renderer, dt);
     self.awTick(dt);
     match &mut desk { case var &mut Some(d) { d.tick(device); } else {} }
@@ -687,6 +693,7 @@ pub struct Warehouse {
           }
           k = k + 1usize;
         }
+        self.fillZones(l, device, &mut made, most);
         k = 0usize;
         while k < markers.len() && made < most {
           if !markers[k].label.ok { fillLabel(l, device, &mut markers[k].label); made = made + 1; }
@@ -740,12 +747,15 @@ pub struct Warehouse {
                       var was: f32 = 0.;
                       var o = 0usize;
                       while o < cards.len() { if sameText(cards[o].id.view(), id.view()) { was = cards[o].alpha; } o = o + 1usize; }
-                      fresh.push(Card(id, stage, hot, calm, glow, report, was));
+                      var zn = String();
+                      match c.getText("zone") { case let Some(t) { zn.append(t); } else {} }
+                      fresh.push(Card(id, stage, hot, calm, glow, report, was, zn));
                     }
                     else {}
                   }
                   i = i + 1usize;
                 }
+                self.buildStrips(l, device, &fresh);
               }
               else {}
             }
@@ -1297,6 +1307,7 @@ pub struct Warehouse {
     let first = !applied;
     self.applyCfg(&eff, applied);
     self.applyExtra(device, renderer, &eff);
+    self.applyZones(device);
     self.syncMarkers(device);
     if first {
       // the pages the room had open, to be opened one at a time (each costs a document panel)
@@ -1307,6 +1318,16 @@ pub struct Warehouse {
         var num = 0u32;
         if g.id.len() > 1usize && cfgDigits(g.id.slice(1usize, g.id.len()), &mut num) && num > pgSerial { pgSerial = num; }
         r = r + 1usize;
+      }
+      // pages studio.toml names ([page.ID], e.g. Penny's prompts as a tree beside the workbench) stand too, unless the room has the id
+      var sg = 0usize;
+      while sg < studioGood.pages.len() {
+        let g = &studioGood.pages[sg];
+        var dup = false;
+        var q = 0usize;
+        while q < roomGood.pages.len() { if roomGood.pages[q].id.view() == g.id.view() { dup = true; } q = q + 1usize; }
+        if !dup { restoreQ.push(PageCfg(g.id.clone(), g.src.clone(), g.place.clone(), g.at.clone())); }
+        sg = sg + 1usize;
       }
       restoreAt = nowMs() + 1500u64;
     }
@@ -1784,7 +1805,7 @@ pub struct Warehouse {
       if browseCfg { browserPos = browseCfgPos; browserYaw = browseCfgYaw; }
     }
     browserWant = if folder.len() == 0usize { String.from(browseRoot.view()) } else { String.from(folder) };
-    var f = String.from(BROWSE_PREFIX);
+    var f = String.from(TREE_PREFIX);
     f.append(browserWant.view());
     browserWant = f;
   }
@@ -1792,7 +1813,7 @@ pub struct Warehouse {
   // At start-up, while the world is still loading: the browser's panel made and its first listing drawn, hidden. Making
   // it (six font atlases and their pipelines) took 2.4 s, which fell on the frame of the first F press.
   pub fn prepareBrowser(self: &mut, device: &mut Device, renderer: &mut Renderer) {
-    var f = String.from(BROWSE_PREFIX);
+    var f = String.from(TREE_PREFIX);
     f.append(browseRoot.view());
     match DocPanel.create(device, renderer, format, f.view(), 0.) {
       case let Some(p) { browserPanel = Some[DocPanel](p); }
@@ -1940,11 +1961,23 @@ pub struct Warehouse {
     var bi = -1;
     var bt: f32 = -1.;
     var i = 0usize;
+    var zbt: f32 = -1.;
+    var zbi = -1;
     while i < pgs.len() {
       var k = 0u32;
       let t = self.pgHit(i, eye, dir, &mut k);
-      if t > 0. && (bt < 0. || t < bt) { bt = t; bi = i32.from(i); }
+      if pgs[i].zone >= 0 {
+        // a grip on a pane takes its whole board
+        if t > 0. && (zbt < 0. || t < zbt) { zbt = t; zbi = pgs[i].zone; }
+      }
+      else if t > 0. && (bt < 0. || t < bt) { bt = t; bi = i32.from(i); }
       i = i + 1usize;
+    }
+    var zq = 0usize;
+    while zq < zones.len() {
+      let t = self.boardHit(zq, eye, dir);
+      if t > 0. && (zbt < 0. || t < zbt) { zbt = t; zbi = i32.from(zq); }
+      zq = zq + 1usize;
     }
     // the other things a beam can hold: the browser, the report, a folder's post, a project; the nearest of all wins
     var ok = 0u32;
@@ -1982,6 +2015,7 @@ pub struct Warehouse {
       }
       k = k + 1usize;
     }
+    if zbi >= 0 && (ok == 0u32 || zbt < ot) { ok = 5u32; oi = zbi; ot = zbt; }
     if ok > 0u32 && (bt < 0. || ot < bt) {
       gazeEye = eye; gazeDir = dir;
       var d = ot;
@@ -1994,7 +2028,7 @@ pub struct Warehouse {
         let here = items[ku].pos;
         self.moveItem(ku, &Place(3u32, 0u32, here.x, here.y, here.z), false);
       }
-      print <- "warehouse: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else { "a project" }); print <- "\n";
+      print <- "warehouse: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else if ok == 5u32 { "a board" } else { "a project" }); print <- "\n";
       return;
     }
     if bi >= 0 { gazeEye = eye; gazeDir = dir; self.startGrab(usize.from(u32.from(bi))); }
@@ -2010,6 +2044,14 @@ pub struct Warehouse {
     if grabKind == 1u32 { browserPos = p; browserYaw = Warehouse.faceOrigin(p); browseCfg = true; browseCfgPos = p; browseCfgYaw = browserYaw; }
     else if grabKind == 2u32 { reportPos = p; reportCfg = true; reportCfgPos = p; reportCfgYaw = Warehouse.faceOrigin(p); }
     else if grabKind == 3u32 { let q = usize.from(u32.from(grabIt)); if q < markers.len() { (&mut markers[q]).pos = p; } }
+    else if grabKind == 5u32 {
+      let q = usize.from(u32.from(grabIt));
+      if q < zones.len() {
+        let y = zones[q].pos.y;
+        (&mut zones[q]).pos = Vec3(p.x, y, p.z);
+        (&mut zones[q]).wantPos = Vec3(p.x, y, p.z);
+      }
+    }
     else if grabKind == 4u32 {
       let k = usize.from(u32.from(grabIt));
       if k < items.len() {
@@ -2033,6 +2075,26 @@ pub struct Warehouse {
     else if kind == 2u32 { pos = reportPos; yawDeg = i64.from(i32.from(reportCfgYaw * 180. / PI)); }
     else if kind == 3u32 { let q = usize.from(u32.from(it)); if q < markers.len() { pos = markers[q].pos; } }
     else if kind == 4u32 { let k = usize.from(u32.from(it)); if k < items.len() { self.noteMoved(k); print <- "warehouse: dropped a project\n"; } return; }
+    else if kind == 5u32 {
+      let q = usize.from(u32.from(it));
+      if q >= zones.len() { return; }
+      var zt = String.from("at:");
+      zt.append(floatText(zones[q].pos.x).view()); zt.append(",0,"); zt.append(floatText(zones[q].pos.z).view());
+      var found = false;
+      var r = 0usize;
+      while r < roomGood.zones.len() {
+        if roomGood.zones[r].id.view() == zones[q].id.view() { roomGood.zones[r].place = zt.clone(); roomGood.zones[r].at = isoUtc(unixMs()); found = true; }
+        r = r + 1usize;
+      }
+      if !found {
+        var nz = newZoneCfg(zones[q].id.view());
+        nz.place = zt.clone(); nz.at = isoUtc(unixMs());
+        roomGood.zones.push(nz);
+      }
+      print <- "warehouse: dropped board "; printStr(zones[q].id.view()); print <- " at "; printStr(zt.view()); print <- "\n";
+      writeAt = nowMs() + 1000u64;
+      return;
+    }
     text.append(floatText(pos.x).view()); text.append(","); text.append(floatText(pos.y).view()); text.append(","); text.append(floatText(pos.z).view());
     if kind == 1u32 || kind == 2u32 {
       let id = if kind == 1u32 { "browser" } else { "report" };
@@ -2086,7 +2148,7 @@ pub struct Warehouse {
   fn standing(self: &) usize {
     var n = 0usize;
     var i = 0usize;
-    while i < pgs.len() { if !pgs[i].shelved && !pgs[i].gone { n = n + 1usize; } i = i + 1usize; }
+    while i < pgs.len() { if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 { n = n + 1usize; } i = i + 1usize; }
     n
   }
 
@@ -2095,7 +2157,7 @@ pub struct Warehouse {
     var r = 0usize;
     var j = 0usize;
     while j < pgs.len() {
-      if j != i && !pgs[j].shelved && !pgs[j].free && !pgs[j].gone && (pgs[j].born > pgs[i].born || (pgs[j].born == pgs[i].born && j > i)) {
+      if j != i && !pgs[j].shelved && !pgs[j].free && !pgs[j].gone && pgs[j].zone < 0 && (pgs[j].born > pgs[i].born || (pgs[j].born == pgs[i].born && j > i)) {
         r = r + 1usize;
       }
       j = j + 1usize;
@@ -2129,7 +2191,7 @@ pub struct Warehouse {
   fn retarget(self: &mut) {
     var i = 0usize;
     while i < pgs.len() {
-      if !pgs[i].gone {
+      if !pgs[i].gone && pgs[i].zone < 0 {
         var np = pgs[i].toPos;
         var ny = pgs[i].toYaw;
         var ns: f32 = 1.;
@@ -2161,7 +2223,7 @@ pub struct Warehouse {
       var old = pgs.len();
       var i = 0usize;
       while i < pgs.len() {
-        if !pgs[i].shelved && !pgs[i].gone && (old == pgs.len() || pgs[i].born < pgs[old].born) { old = i; }
+        if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 && (old == pgs.len() || pgs[i].born < pgs[old].born) { old = i; }
         i = i + 1usize;
       }
       if old == pgs.len() { return; }
@@ -2187,7 +2249,7 @@ pub struct Warehouse {
     var order = List[usize]();
     var i = 0usize;
     while i < pgs.len() {
-      if !pgs[i].gone && !pgs[i].proj {
+      if !pgs[i].gone && !pgs[i].proj && pgs[i].zone < 0 {
         var at = order.len();
         while at > 0usize && pgs[*order[at - 1usize]].born > pgs[i].born { at = at - 1usize; }
         order.insert(at, i);
@@ -2254,7 +2316,7 @@ pub struct Warehouse {
   }
 
   fn closePage(self: &mut, i: usize) {
-    if i >= pgs.len() || pgs[i].gone { return; }
+    if i >= pgs.len() || pgs[i].gone || pgs[i].zone >= 0 { return; }
     print <- "pages: closed "; printStr(pgs[i].title.text.view()); print <- "\n";
     (&mut pgs[i]).gone = true;
     if grabIx == i32.from(i) { grabIx = -1; }
@@ -2264,7 +2326,7 @@ pub struct Warehouse {
 
   // Shelve a standing page; bring a shelved one back as the newest
   fn toggleShelve(self: &mut, i: usize) {
-    if i >= pgs.len() || pgs[i].gone { return; }
+    if i >= pgs.len() || pgs[i].gone || pgs[i].zone >= 0 { return; }
     if pgs[i].shelved {
       (&mut pgs[i]).shelved = false;
       (&mut pgs[i]).free = false;
@@ -2282,7 +2344,7 @@ pub struct Warehouse {
   }
 
   fn startGrab(self: &mut, i: usize) {
-    if i >= pgs.len() || pgs[i].gone { return; }
+    if i >= pgs.len() || pgs[i].gone || pgs[i].zone >= 0 { return; }
     var d = (pgs[i].pos - gazeEye).length();
     if d < 1.5 { d = 1.5; }
     if d > 8. { d = 8.; }
@@ -2326,11 +2388,13 @@ pub struct Warehouse {
   fn tickPages(self: &mut, device: &mut Device, renderer: &mut Renderer, dt: f32) {
     let now = nowMs();
     var openWant = List[String]();
+    var benchWant = List[String]();
     var browseWant = String();
     self.followGrab();
     var i = 0usize;
     while i < pgs.len() {
-      if pgs[i].fly < 1. {
+      if pgs[i].zone >= 0 { self.panePose(i, dt); }
+      if pgs[i].fly < 1. && pgs[i].zone < 0 {
         var f = pgs[i].fly + dt / 0.6;
         if f > 1. { f = 1.; }
         let e = f * f * (3. - 2. * f);
@@ -2368,11 +2432,15 @@ pub struct Warehouse {
           }
           if up > 0i32 { (&mut pgs[i]).webUp = up - 1i32; }
         } else if !pgs[i].shelved {
+          let isPane = pgs[i].zone >= 0;
           match &mut pgs[i].doc {
             case var &mut Some(p) {
               p.tick(device, renderer);
               p.openNew = false;
-              if p.outOpen.len() > 0usize { openWant.push(p.outOpen.clone()); p.outOpen = String(); }
+              if p.outOpen.len() > 0usize {
+                if isPane { benchWant.push(p.outOpen.clone()); } else { openWant.push(p.outOpen.clone()); }
+                p.outOpen = String();
+              }
               if p.outWeb.len() > 0usize { openWant.push(p.outWeb.clone()); p.outWeb = String(); }
               if p.outBrowse.len() > 0usize { browseWant = p.outBrowse.clone(); p.outBrowse = String(); }
             }
@@ -2384,6 +2452,22 @@ pub struct Warehouse {
     }
     var w = 0usize;
     while w < openWant.len() { self.openPage(device, renderer, openWant[w].view()); w = w + 1usize; }
+    // a file clicked in a board's tree opens as a page on the workbench: near the start spot, ahead and to the sides in turn
+    w = 0usize;
+    while w < benchWant.len() {
+      let n = self.openPageAs(device, renderer, benchWant[w].view(), "", false);
+      if n >= 0 {
+        let a = (f32.from(u32.from(benchN % 3u32)) - 1.) * 0.55;
+        benchN = benchN + 1u32;
+        let u = usize.from(u32.from(n));
+        (&mut pgs[u]).free = true;
+        (&mut pgs[u]).toPos = Vec3(2.1 * sin(a), 0., 0. - 2.1 * cos(a));
+        self.retarget();
+        self.syncRoom();
+      }
+      w = w + 1usize;
+    }
+    self.syncTrees();
     if browseWant.len() > 0usize { self.toggleBrowser(browseWant.view(), Vec3(0., 0., 0.), 0.); }
     // pages from room.toml, one at a time
     if restoreQ.len() > 0usize && now >= restoreAt {
@@ -2443,6 +2527,25 @@ pub struct Warehouse {
     else if kind == 2i32 { self.startGrab(i); }
     else if kind == 3i32 { self.dropGrab(); }
     else if kind == 4i32 { self.parkBrowser(device); }
+    // zones: 6 focus the pane zone*8+kind (n), 7 release every pane, 8 follow link n%100 of the pane n/100 (a tree row), 9 scroll the pane n/100 by n%100 notches down
+    else if kind == 6i32 {
+      let pg = self.paneIndex(i / 8usize, u32.from(i % 8usize));
+      if pg >= 0 { self.focusPane(usize.from(u32.from(pg))); }
+    }
+    else if kind == 7i32 { var j = 0usize; while j < pgs.len() { (&mut pgs[j]).wantFoc = false; j = j + 1usize; } }
+    else if kind == 8i32 || kind == 9i32 {
+      let q = i / 100usize;
+      let pg = self.paneIndex(q / 8usize, u32.from(q % 8usize));
+      if pg >= 0 {
+        let pu = usize.from(u32.from(pg));
+        match &mut pgs[pu].doc {
+          case var &mut Some(p) {
+            if kind == 8i32 { p.openNew = false; p.requestNth(i % 100usize); } else { p.scroll(0. - f32.from(u32.from(i % 100usize))); }
+          }
+          else {}
+        }
+      }
+    }
     else if kind == 5i32 && i < pgs.len() {
       match &mut pgs[i].doc { case var &mut Some(p) { p.openNew = true; p.requestNth(usize.from(u32.from(if n > 0 { 0 } else { 0 }))); } else {} }
     }
@@ -2459,7 +2562,7 @@ pub struct Warehouse {
       let hw = pgHalfW(web);
       let cy = pgTop(web) + 0.05;
       var c = 0u32;
-      while c < (if web { 3u32 } else { 5u32 }) {
+      while c < u32.from(self.chipCount(i)) {
         let cx = hw - 0.19 - 0.39 * f32.from(c);
         let t = quadHit(m, Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir);
         if t > 0. && (best < 0. || t < best) { best = t; *kind = 2u32 + c; }
@@ -2522,8 +2625,10 @@ pub struct Warehouse {
       self.toggleBrowser(path.view(), eye, 0.);
       return true;
     }
+    if self.clickZones(eye, dir, bt) { return true; }
     if bi < 0 { self.blurWeb(); return false; }
     let pu = usize.from(u32.from(bi));
+    if bk == 2u32 && pgs[pu].zone >= 0 { self.focusPane(pu); return true; }
     if bk == 2u32 { self.closePage(pu); return true; }
     if bk == 3u32 { self.toggleShelve(pu); return true; }
     if bk == 4u32 { self.startGrab(pu); return true; }
@@ -2615,6 +2720,16 @@ pub struct Warehouse {
           else {}
         }
       }
+      // a document page or a tree under the ray scrolls (the same offset the main page uses)
+      if !pgs[i].web && !pgs[i].shelved && !pgs[i].gone {
+        let inv = self.pgModel(i).inverse();
+        let le = inv * eye;
+        let ld = inv.transformVector(dir);
+        match &mut pgs[i].doc {
+          case var &mut Some(p) { if p.reach(le, ld) > 0. { p.scroll(notches); return true; } }
+          else {}
+        }
+      }
       i = i + 1usize;
     }
     false
@@ -2637,6 +2752,8 @@ pub struct Warehouse {
 
   // The markers: the folders of studio.toml and of room.toml (the room's win by id), and those of projects (kept as they are)
   fn syncMarkers(self: &mut, device: &mut Device) {
+    // Jon, 11 Nov: no folder posts that retarget another pane. Each folder is its own tree pane (park, or a board's panes).
+    if markers.len() < 1000000usize { return; }
     var want = Folders();
     var wroom = List[bool]();
     var i = 0usize;
@@ -2691,30 +2808,20 @@ pub struct Warehouse {
     match &browserPanel {
       case let Some(p) {
         let f = p.file.view();
-        if startsWithText(f, BROWSE_PREFIX) { path = String.from(f.slice(BROWSE_PREFIX.len(), f.len())); }
+        if startsWithText(f, TREE_PREFIX) { path = String.from(f.slice(TREE_PREFIX.len(), f.len())); }
       }
       else {}
     }
     if path.len() == 0usize { print <- "pages: park: the browser shows no folder\n"; return; }
-    var m = 0usize;
-    while m < markers.len() {
-      if markers[m].path.view() == path.view() { print <- "pages: park: already parked as "; printStr(markers[m].name.view()); print <- "\n"; return; }
-      m = m + 1usize;
+    // park the folder last opened in the tree (else its root) as a tree pane of its own: a page, grip-movable, kept in room.toml
+    match &browserPanel {
+      case let Some(p) { if p.openDirs.len() > 0usize { path = p.openDirs[p.openDirs.len() - 1usize].clone(); } }
+      else {}
     }
-    var nroom = 0usize;
-    m = 0usize;
-    while m < roomGood.folders.len() { nroom = nroom + 1usize; m = m + 1usize; }
-    let right = Vec3(cos(browserYaw), 0., 0. - sin(browserYaw));
-    let at = Vec3(browserPos.x + right.x * (1.15 + 0.45 * f32.from(u32.from(nroom))) + (0. - right.z) * 0., 0., browserPos.z + right.z * (1.15 + 0.45 * f32.from(u32.from(nroom))));
-    var place = String.from("at:");
-    place.append(floatText(at.x).view()); place.append(",0,"); place.append(floatText(at.z).view());
-    pgSerial = pgSerial + 1u32;
-    var id = String.from("f");
-    id.append(numText(i64.from(pgSerial)).view());
-    roomGood.folders.push(FolderCfg(id, folderName(path.view()), path.clone(), place, isoUtc(unixMs())));
-    writeAt = nowMs() + 1000u64;
-    print <- "pages: parked "; printStr(path.view()); print <- "\n";
-    self.syncMarkers(device);
+    var src = String.from(TREE_PREFIX);
+    src.append(path.view());
+    print <- "pages: park: a tree pane for "; printStr(path.view()); print <- "\n";
+    self.wantPage(src.view());
   }
 
   // ---- the camera-facing quads ----
@@ -2863,6 +2970,8 @@ pub struct Warehouse {
       best = Warehouse.nearer(best, self.pgHit(pi, eye, dir, &mut pk));
       pi = pi + 1usize;
     }
+    var zk = 0u32; var zzi = 0usize; var zix = 0usize;
+    best = Warehouse.nearer(best, self.zoneHit(eye, dir, &mut zk, &mut zzi, &mut zix));
     var mi = 0usize;
     while mi < markers.len() {
       let inv = Warehouse.faceModel(markers[mi].pos, view).inverse();
@@ -2968,8 +3077,30 @@ pub struct Warehouse {
     }
     var pq = 0usize;
     while pq < pgs.len() {
-      if !pgs[pq].gone { codes.push(Warehouse.sortKey(7u32, u32.from(pq))); dists.push((pgs[pq].pos - eye).length() - 0.5); }
+      if !pgs[pq].gone {
+        codes.push(Warehouse.sortKey(7u32, u32.from(pq)));
+        // a pane on its board is drawn just after the board's face (and before anything nearer than the board)
+        if pgs[pq].zone >= 0 && pgs[pq].foc < 0.02 { dists.push((zones[usize.from(u32.from(pgs[pq].zone))].pos - eye).length() + 1.); }
+        else { dists.push((pgs[pq].pos - eye).length() - 0.5); }
+      }
       pq = pq + 1usize;
+    }
+    var zq = 0usize;
+    while zq < zones.len() {
+      codes.push(Warehouse.sortKey(11u32, u32.from(zq)));
+      dists.push((zones[zq].pos - eye).length() + 2.);
+      zq = zq + 1usize;
+    }
+    let dimNow = self.dimAmount();
+    if dimNow > 0.01 {
+      var near: f32 = 1000.;
+      var dq = 0usize;
+      while dq < pgs.len() {
+        if pgs[dq].zone >= 0 && pgs[dq].foc > 0.02 { near = fminf(near, (pgs[dq].pos - eye).length()); }
+        dq = dq + 1usize;
+      }
+      codes.push(Warehouse.sortKey(12u32, 0u32));
+      dists.push(near - 0.3);
     }
     var mq = 0usize;
     while mq < markers.len() {
@@ -3073,16 +3204,35 @@ pub struct Warehouse {
         let top = pgTop(web);
         if !pgs[idx].shelved {
           var c = 0usize;
-          while c < (if web { 3usize } else { 5usize }) {
+          while c < self.chipCount(idx) {
             let cx = hw - 0.19 - 0.39 * f32.from(u32.from(c));
             let cy = top + 0.05;
-            Warehouse.faded(&mut pgs[idx].chips[c], device, encoder, target, depth, vp * pm,
+            let cl = if pgs[idx].zone >= 0 && pgs[idx].foc > 0.5 { 1usize } else { c };
+            Warehouse.faded(&mut pgs[idx].chips[cl], device, encoder, target, depth, vp * pm,
               Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), 1.);
             c = c + 1usize;
           }
           Warehouse.faded(&mut pgs[idx].title, device, encoder, target, depth, vp * pm, Vec4(0. - hw, top + 0.1, 0. - hw + 0.8, top + 0.3), 1.);
         } else {
           Warehouse.faded(&mut pgs[idx].title, device, encoder, target, depth, vp * pm, Vec4(0. - hw, top + 0.05, 0. - hw + 1.6, top + 0.45), 1.);
+        }
+      }
+      else if kind == 11u32 {
+        self.drawZone(idx, device, encoder, target, depth, vp, hotPhase);
+      }
+      else if kind == 12u32 {
+        match &mut dimPass {
+          case var &mut Some(dp) {
+            let inv = vp.inverse();
+            let p0 = inv * Vec4(0., 0., 0., 1.);
+            let p1 = inv * Vec4(0., 0., 1., 1.);
+            let a = p0.xyz() * (1. / p0.w);
+            let b = p1.xyz() * (1. / p1.w);
+            let d = (b - a).normalize();
+            let m = Warehouse.faceModel(eye + d * 0.5, eye);
+            dp.drawFaded(device, encoder, target, depth, vp * m, Vec4(-3., -3., 3., 3.), FOCUS_DIM * dimNow);
+          }
+          else {}
         }
       }
       else if kind == 8u32 {
@@ -3149,6 +3299,556 @@ pub struct Warehouse {
     let act = items[si].menu[*ents[n]].action.clone();
     print <- "warehouse: menu "; print <- n; print <- " ("; printStr(act.view()); print <- ")\n";
     self.doAction(act.view(), v)
+  }
+
+  // ---- zones: the boards at the back (zones.cone) ----
+
+  fn zoneModel(self: &, zi: usize) Mat4 {
+    let s = zones[zi].width / ZN_DW;
+    Mat4.fromTrs(zones[zi].pos, Quat.angleAxis(zones[zi].yaw, Vec3(0., 1., 0.)), Vec3(s, s, s))
+  }
+
+  fn paneName(kind: u32) &str {
+    if kind == ZP_SITE { "site" } else if kind == ZP_REPO { "repo" } else if kind == ZP_INCUBATOR { "incubator" }
+    else if kind == ZP_PROJECTS { "projects" } else if kind == ZP_LINE { "line" } else { "diagram" }
+  }
+
+  fn chipCount(self: &, i: usize) usize {
+    if pgs[i].zone >= 0 { 1usize } else if pgs[i].web { 3usize } else { 5usize }
+  }
+
+  // Where pane i of a board stands in its place: x, y, z of its frame's origin, and its scale
+  fn paneRest(self: &, i: usize) Vec4 {
+    let zi = usize.from(u32.from(pgs[i].zone));
+    let r = *zones[zi].rects[usize.from(pgs[i].pane)];
+    let web = pgs[i].web;
+    let nw = pgHalfW(web) * 2.;
+    let nh = nw * (if web { f32.from(WEB_TEX_H) / f32.from(WEB_TEX_W) } else { f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W) });
+    let fit = fminf(r.z / nw, r.w / nh);
+    let cy = f32.from(DOC_CENTRE_Y);
+    let p = self.zoneModel(zi) * Vec3(r.x + r.z * 0.5 - ZN_DW * 0.5, r.y + r.w * 0.5 - cy * fit, 0.04);
+    Vec4(p.x, p.y, p.z, fit * zones[zi].width / ZN_DW)
+  }
+
+  // Each frame: pane i is on its board, flying to the workbench, there, or flying back
+  fn panePose(self: &mut, i: usize, dt: f32) {
+    let zi = usize.from(u32.from(pgs[i].zone));
+    let rest = self.paneRest(i);
+    var f = pgs[i].foc;
+    let tgt: f32 = if pgs[i].wantFoc { 1. } else { 0. };
+    let step = dt / 0.7;
+    if f < tgt { f = fminf(f + step, tgt); } else { f = fmaxf(f - step, tgt); }
+    (&mut pgs[i]).foc = f;
+    let e = f * f * (3. - 2. * f);
+    let web = pgs[i].web;
+    let fsc: f32 = if web { 0.85 } else { 0.78 };
+    let cy = f32.from(DOC_CENTRE_Y);
+    let fpos = Vec3(0., 1.35 - cy * fsc, 0. - FOCUS_D);
+    var p = Vec3(rest.x, rest.y, rest.z).lerp(fpos, e);
+    p.y = p.y + 0.3 * sin(PI * e);
+    let ry = zones[zi].yaw;
+    (&mut pgs[i]).pos = p;
+    (&mut pgs[i]).yaw = ry + turnBetween(ry, 0.) * e;
+    (&mut pgs[i]).sc = rest.w + (fsc - rest.w) * e;
+    (&mut pgs[i]).toPos = p; (&mut pgs[i]).fromPos = p;
+    (&mut pgs[i]).fly = 1.;
+  }
+
+  // The focus chip: bring the pane to the workbench, or send it back; one at a time
+  fn focusPane(self: &mut, i: usize) {
+    if i >= pgs.len() || pgs[i].zone < 0 || pgs[i].gone { return; }
+    let on = !pgs[i].wantFoc;
+    var j = 0usize;
+    while j < pgs.len() { if pgs[j].zone >= 0 { (&mut pgs[j]).wantFoc = false; } j = j + 1usize; }
+    (&mut pgs[i]).wantFoc = on;
+    print <- "zones: "; print <- (if on { "focus " } else { "release " }); printStr(pgs[i].id.view()); print <- "\n";
+  }
+
+  fn dimAmount(self: &) f32 {
+    var d: f32 = 0.;
+    var i = 0usize;
+    while i < pgs.len() { if pgs[i].zone >= 0 && !pgs[i].gone && pgs[i].foc > d { d = pgs[i].foc; } i = i + 1usize; }
+    d
+  }
+
+  fn paneIndex(self: &, zi: usize, kind: u32) i32 {
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].zone == i32.from(zi) && pgs[i].pane == kind && !pgs[i].gone { return i32.from(i); }
+      i = i + 1usize;
+    }
+    -1
+  }
+
+  fn paneSrc(self: &, zi: usize, kind: u32) String {
+    let z = &zones[zi];
+    if kind == ZP_SITE { return z.site.clone(); }
+    if kind == ZP_DIAGRAM { return z.diagram.clone(); }
+    let root = if kind == ZP_REPO { z.repo.view() } else { z.incubator.view() };
+    if root.len() == 0usize { return String(); }
+    var s = String.from(TREE_PREFIX);
+    s.append(root);
+    s
+  }
+
+  fn openPane(self: &mut, device: &mut Device, renderer: &mut Renderer, zi: usize, kind: u32) {
+    let src = self.paneSrc(zi, kind);
+    if src.len() == 0usize { return; }
+    self.ensureChips(device);
+    let t0 = sdl.GetPerformanceCounter();
+    let web = isWebSrc(src.view());
+    var doc: Option[DocPanel] = None;
+    var wp: Option[WebPanel] = None;
+    var okp = true;
+    if web {
+      wp = WebPanel.create(device, format, src.view());
+      match &wp { case let Some(w0) {} case is None { okp = false; } }
+    } else {
+      doc = DocPanel.create(device, renderer, format, src.view(), 0.);
+      match &doc { case let Some(d0) {} case is None { okp = false; } }
+    }
+    if !okp { print <- "zones: could not open "; printStr(src.view()); print <- "\n"; return; }
+    var pid = String.from(zones[zi].id.view());
+    pid.append("-");
+    pid.append(Warehouse.paneName(kind));
+    var shown = String.from(zones[zi].name.view());
+    shown.append(": ");
+    shown.append(Warehouse.paneName(kind));
+    if kind == ZP_REPO || kind == ZP_INCUBATOR { shown.append("  "); shown.append(folderName(src.slice(TREE_PREFIX.len(), src.len())).view()); }
+    let tl = self.mkLabel(device, shown.view(), 0xf8f5eeffu32, 0x1c1c1cffu32, fitSize(shown.len(), 56.), 0.8, 0.2);
+    var chips = List[Label]();
+    chips.push(self.mkLabel(device, "focus", 0x3a78b0ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    chips.push(self.mkLabel(device, "release", 0xc08a20ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    let born = self.newBorn();
+    let at = Vec3(0., 0., 0.);
+    pgs.push(Pg(pid.clone(), src.clone(), web, doc, wp, tl, chips, born, at, 0., 1., at, 0., 1., at, 0., 1., String()));
+    let n = pgs.len() - 1usize;
+    (&mut pgs[n]).zone = i32.from(zi);
+    (&mut pgs[n]).pane = kind;
+    let rest = self.paneRest(n);
+    (&mut pgs[n]).pos = Vec3(rest.x, rest.y, rest.z);
+    (&mut pgs[n]).toPos = pgs[n].pos; (&mut pgs[n]).fromPos = pgs[n].pos;
+    (&mut pgs[n]).yaw = zones[zi].yaw; (&mut pgs[n]).toYaw = zones[zi].yaw; (&mut pgs[n]).fromYaw = zones[zi].yaw;
+    (&mut pgs[n]).sc = rest.w; (&mut pgs[n]).toSc = rest.w; (&mut pgs[n]).fromSc = rest.w;
+    self.restoreTree(device, renderer, n);
+    print <- "zones: opened "; printStr(pid.view()); print <- " ("; printStr(src.view()); print <- ") in ";
+    print <- f64.from((sdl.GetPerformanceCounter() - t0) * 1000000u64 / sdl.GetPerformanceFrequency()) / 1000.; print <- " ms\n";
+  }
+
+  // A tree pane takes the folders room.toml says it had open
+  fn restoreTree(self: &mut, device: &mut Device, renderer: &mut Renderer, n: usize) {
+    var open = List[String]();
+    var found = false;
+    var t = 0usize;
+    while t < roomGood.trees.len() {
+      if roomGood.trees[t].id.view() == pgs[n].id.view() {
+        found = true;
+        var q = 0usize;
+        while q < roomGood.trees[t].open.len() { open.push(roomGood.trees[t].open[q].clone()); q = q + 1usize; }
+      }
+      t = t + 1usize;
+    }
+    if !found { return; }
+    match &mut pgs[n].doc { case var &mut Some(p) { if isTree(p.file.view()) { p.setOpenDirs(device, renderer, &open); } } else {} }
+  }
+
+  // The folders a tree has open go to room.toml (a second after the last change)
+  fn syncTrees(self: &mut) {
+    var ids = List[String]();
+    var opens = List[List[String]]();
+    var i = 0usize;
+    while i < pgs.len() {
+      match &mut pgs[i].doc {
+        case var &mut Some(p) {
+          if p.treeDirty {
+            p.treeDirty = false;
+            ids.push(pgs[i].id.clone());
+            var o = List[String]();
+            var q = 0usize;
+            while q < p.openDirs.len() { o.push(p.openDirs[q].clone()); q = q + 1usize; }
+            opens.push(o);
+          }
+        }
+        else {}
+      }
+      i = i + 1usize;
+    }
+    match &mut browserPanel {
+      case var &mut Some(p) {
+        if p.treeDirty {
+          p.treeDirty = false;
+          ids.push(String.from("browser"));
+          var o = List[String]();
+          var q = 0usize;
+          while q < p.openDirs.len() { o.push(p.openDirs[q].clone()); q = q + 1usize; }
+          opens.push(o);
+        }
+      }
+      else {}
+    }
+    var k = 0usize;
+    while k < ids.len() {
+      var at = roomGood.trees.len();
+      var t = 0usize;
+      while t < roomGood.trees.len() { if roomGood.trees[t].id.view() == ids[k].view() { at = t; } t = t + 1usize; }
+      if at == roomGood.trees.len() { roomGood.trees.push(TreeCfg(ids[k].clone(), List[String]())); }
+      var o = List[String]();
+      var q = 0usize;
+      while q < opens[k].len() { o.push(opens[k][q].clone()); q = q + 1usize; }
+      roomGood.trees[at].open = o;
+      print <- "zones: tree "; printStr(ids[k].view()); print <- " keeps "; print <- opens[k].len(); print <- " folders open\n";
+      writeAt = nowMs() + 1000u64;
+      k = k + 1usize;
+    }
+  }
+
+  // The projects pane's cell j, and the line strip's slot s, as rectangles in the board's design frame
+  fn projRect(self: &, zi: usize, j: usize) Vec4 {
+    let r = *zones[zi].rects[3usize];
+    let cw = r.z / 2.;
+    let cx = r.x - ZN_DW * 0.5 + cw * (f32.from(u32.from(j % 2usize)) + 0.5);
+    let cy = r.y + r.w - 0.32 * (f32.from(u32.from(j / 2usize)) + 0.5);
+    Vec4(cx - 0.6, cy - 0.15, cx + 0.6, cy + 0.15)
+  }
+
+  fn stripRect(self: &, zi: usize, s: usize) Vec4 {
+    let r = *zones[zi].rects[4usize];
+    let cw = r.z / 3.;
+    let cx = r.x - ZN_DW * 0.5 + cw * (f32.from(u32.from(s % 3usize)) + 0.5);
+    let cy = r.y + r.w - 0.32 * (f32.from(u32.from(s / 3usize)) + 0.5);
+    Vec4(cx - 0.55, cy - 0.1375, cx + 0.55, cy + 0.1375)
+  }
+
+  // What a ray meets of the boards' own labels: kind 1 a project (ix), 2 a line card (ix); the distance, or -1
+  fn zoneHit(self: &, eye: Vec3, dir: Vec3, kind: &mut u32, zo: &mut usize, ix: &mut usize) f32 {
+    *kind = 0u32;
+    var best: f32 = -1.;
+    var zi = 0usize;
+    while zi < zones.len() {
+      let m = self.zoneModel(zi);
+      var j = 0usize;
+      while j < zones[zi].projLabels.len() {
+        let t = quadHit(m, self.projRect(zi, j), eye, dir);
+        if t > 0. && (best < 0. || t < best) { best = t; *kind = 1u32; *zo = zi; *ix = j; }
+        j = j + 1usize;
+      }
+      var s = 0usize;
+      while s < zones[zi].strip.len() {
+        let t = quadHit(m, self.stripRect(zi, s + 1usize), eye, dir);
+        if t > 0. && (best < 0. || t < best) { best = t; *kind = 2u32; *zo = zi; *ix = s; }
+        s = s + 1usize;
+      }
+      zi = zi + 1usize;
+    }
+    best
+  }
+
+  fn boardHit(self: &, zi: usize, eye: Vec3, dir: Vec3) f32 {
+    quadHit(self.zoneModel(zi), Vec4(0. - ZN_DW * 0.5, ZN_BASE, ZN_DW * 0.5, ZN_BASE + ZN_DH), eye, dir)
+  }
+
+  fn clickZones(self: &mut, eye: Vec3, dir: Vec3, limit: f32) bool {
+    var k = 0u32;
+    var zi = 0usize;
+    var ix = 0usize;
+    let t = self.zoneHit(eye, dir, &mut k, &mut zi, &mut ix);
+    if t < 0. || (limit > 0. && t > limit) { return false; }
+    if k == 1u32 {
+      let it = *zones[zi].projItem[ix];
+      if it >= 0 {
+        let ku = usize.from(u32.from(it));
+        print <- "zones: project "; printStr(items[ku].name.view()); print <- "\n";
+        if !items[ku].onTable { _ = self.bring(ku); }
+        self.select(it);
+      }
+      return true;
+    }
+    if k == 2u32 {
+      let rp = zones[zi].strip[ix].report.clone();
+      print <- "zones: line card "; printStr(zones[zi].strip[ix].id.view()); print <- "\n";
+      if rp.len() > 0usize { self.wantPage(rp.view()); }
+      return true;
+    }
+    false
+  }
+
+  fn copyZoneCfg(z: &ZoneCfg) ZoneCfg {
+    var r = newZoneCfg(z.id.view());
+    r.name = z.name.clone(); r.place = z.place.clone(); r.yaw = z.yaw; r.hasYaw = z.hasYaw; r.width = z.width; r.hasWidth = z.hasWidth;
+    r.site = z.site.clone(); r.repo = z.repo.clone(); r.incubator = z.incubator.clone(); r.diagram = z.diagram.clone();
+    r.projects = z.projects.clone(); r.line = z.line.clone(); r.at = z.at.clone();
+    var i = 0usize;
+    while i < 6usize { r.rects.set(i, z.rects[i].clone()); i = i + 1usize; }
+    r
+  }
+
+  fn makeZone(self: &mut, device: &mut Device, c: &ZoneCfg) Zone {
+    let nm = if c.name.len() > 0usize { c.name.clone() } else { c.id.clone() };
+    var rects = List[Vec4]();
+    var i = 0usize;
+    while i < ZN_PANES { rects.push(defaultRect(i)); i = i + 1usize; }
+    let title = self.mkLabel(device, nm.view(), 0x2a3340ffu32, 0xffffffffu32, 70., 1.6, 0.4);
+    let none = self.mkLabel(device, "no projects yet", 0xe9e4d8ffu32, 0x555555ffu32, 48., 2.4, 0.6);
+    let count = self.mkLabel(device, "-", 0x2a3340ffu32, 0xffffffffu32, 44., 1.1, 0.275);
+    Zone(c.id.clone(), nm, Vec3(0., 0., 0. - 6.), 0., 7.2, Vec3(0., 0., 0. - 6.), 0., 7.2, String(), String(), String(), String(),
+      String.from(c.id.view()), List[String](), rects, 0u32, nowMs() + 2500u64, title, makeBoardPass(device, format),
+      List[Label](), List[i32](), List[bool](), none, List[StripCard](), count, Vec4(0., 0., 0., 0.))
+  }
+
+  // studio.toml's boards (or the built-in two if the file has none), under room.toml's moves; what changed is applied, flying
+  fn applyZones(self: &mut, device: &mut Device) {
+    var eff = List[ZoneCfg]();
+    var i = 0usize;
+    if studioGood.zones.len() > 0usize {
+      while i < studioGood.zones.len() { eff.push(Warehouse.copyZoneCfg(&studioGood.zones[i])); i = i + 1usize; }
+    } else {
+      let d = parseConfig(zonesDefaultText().view(), "defaults");
+      while i < d.zones.len() { eff.push(Warehouse.copyZoneCfg(&d.zones[i])); i = i + 1usize; }
+    }
+    var e = 0usize;
+    while e < eff.len() {
+      var c = Warehouse.copyZoneCfg(&eff[e]);
+      var r = 0usize;
+      while r < roomGood.zones.len() {
+        let rz = &roomGood.zones[r];
+        if rz.id.view() == c.id.view() && rz.at.view() >= c.at.view() {
+          if rz.place.len() > 0usize { c.place = rz.place.clone(); }
+          if rz.hasYaw { c.yaw = rz.yaw; c.hasYaw = true; }
+          if rz.hasWidth { c.width = rz.width; c.hasWidth = true; }
+        }
+        r = r + 1usize;
+      }
+      var zi = 0usize;
+      var have = false;
+      while zi < zones.len() { if zones[zi].id.view() == c.id.view() { have = true; break; } zi = zi + 1usize; }
+      if !have { let made = self.makeZone(device, &c); zones.push(made); zi = zones.len() - 1usize; }
+      var pl = Place(3u32, 0u32, 0., 0., 0. - 6.);
+      if c.place.len() > 0usize { _ = parsePlace(c.place.view(), &mut pl); }
+      let wp = Vec3(pl.x, pl.y, pl.z);
+      let wy = (if c.hasYaw { f32.from(i32.from(c.yaw)) } else { 0. }) * PI / 180.;
+      let ww = if c.hasWidth { f32.from(i32.from(c.width)) / 100. } else { 7.2 };
+      let moved = (wp - zones[zi].wantPos).length() > 0.001 || (wy - zones[zi].wantYaw).abs() > 0.0005 || (ww - zones[zi].wantWidth).abs() > 0.001;
+      (&mut zones[zi]).wantPos = wp; (&mut zones[zi]).wantYaw = wy; (&mut zones[zi]).wantWidth = ww;
+      if !have {
+        (&mut zones[zi]).pos = wp; (&mut zones[zi]).yaw = wy; (&mut zones[zi]).width = ww;
+      } else if moved {
+        print <- "studio: zone '"; printStr(c.id.view()); print <- "' now at ("; print <- wp.x; print <- ", "; print <- wp.z; print <- ") yaw "; print <- wy * 180. / PI;
+        print <- " width "; print <- ww; print <- "\n";
+      }
+      (&mut zones[zi]).lineKey = if c.line.len() > 0usize { c.line.clone() } else { c.id.clone() };
+      if c.name.len() > 0usize && zones[zi].name.view() != c.name.view() {
+        (&mut zones[zi]).name = c.name.clone(); (&mut zones[zi]).title.text = c.name.clone(); (&mut zones[zi]).title.ok = false;
+      }
+      var k = 0usize;
+      while k < ZN_PANES {
+        var rc = defaultRect(k);
+        var parsed = Vec4(0., 0., 0., 0.);
+        if c.rects[k].len() > 0usize && parseRect(c.rects[k].view(), &mut parsed) { rc = parsed; }
+        zones[zi].rects.set(k, rc);
+        k = k + 1usize;
+      }
+      // sources: a changed one closes its pane, and the queue opens it again
+      let srcs = [c.site.clone(), c.repo.clone(), c.incubator.clone(), String(), String(), c.diagram.clone()];
+      k = 0usize;
+      while k < ZN_PANES {
+        if k != 3usize && k != 4usize {
+          let want = srcs[k].clone();
+          let kind = u32.from(k);
+          var cur = String();
+          if kind == ZP_SITE { cur = zones[zi].site.clone(); } else if kind == ZP_REPO { cur = zones[zi].repo.clone(); }
+          else if kind == ZP_INCUBATOR { cur = zones[zi].incubator.clone(); } else { cur = zones[zi].diagram.clone(); }
+          if cur.view() != want.view() {
+            let pg = self.paneIndex(zi, kind);
+            if pg >= 0 { (&mut pgs[usize.from(u32.from(pg))]).gone = true; }
+            (&mut zones[zi]).made = zones[zi].made & (0xFFFFFFFFu32 ^ (1u32 << kind));
+            if kind == ZP_SITE { (&mut zones[zi]).site = want.clone(); } else if kind == ZP_REPO { (&mut zones[zi]).repo = want.clone(); }
+            else if kind == ZP_INCUBATOR { (&mut zones[zi]).incubator = want.clone(); } else { (&mut zones[zi]).diagram = want.clone(); }
+          }
+        }
+        k = k + 1usize;
+      }
+      // projects
+      let ids = cfgSplit(c.projects.view(), ',');
+      var same = ids.len() == zones[zi].projIds.len() && !(ids.len() == 1usize && ids[0usize].len() == 0usize && zones[zi].projIds.len() == 0usize);
+      if same {
+        var q = 0usize;
+        while q < ids.len() { if ids[q].view() != zones[zi].projIds[q].view() { same = false; } q = q + 1usize; }
+      }
+      if !same {
+        var pids = List[String]();
+        var labels = List[Label]();
+        var pitems = List[i32]();
+        var pon = List[bool]();
+        var q = 0usize;
+        while q < ids.len() {
+          let ik = self.itemById(ids[q].view());
+          if ik >= 0 && ids[q].len() > 0usize {
+            let iu = usize.from(u32.from(ik));
+            pids.push(ids[q].clone());
+            pitems.push(ik);
+            pon.push(items[iu].onTable);
+            labels.push(self.mkLabel(device, items[iu].name.view(), if items[iu].onTable { 0xcfe6d2ffu32 } else { 0xf8f5eeffu32 }, 0x1c1c1cffu32, 50., 1.2, 0.3));
+          }
+          q = q + 1usize;
+        }
+        (&mut zones[zi]).projIds = pids; (&mut zones[zi]).projLabels = labels; (&mut zones[zi]).projItem = pitems; (&mut zones[zi]).projOn = pon;
+      }
+      e = e + 1usize;
+    }
+    var haveDim = false;
+    match &dimPass { case let Some(d0) { haveDim = true; } else {} }
+    if !haveDim { dimPass = Some[PagePass](makeVeilPass(device, format)); }
+    self.rebuildStripsNow();
+  }
+
+  // The line strips again from the cards now held (also after the boards are first made)
+  fn rebuildStripsNow(self: &mut) {
+    lineText = String();
+  }
+
+  // The live cards of line.json whose zone is the board's: building, testing, review or a question; done work is a count
+  fn buildStrips(self: &mut, l: &mut Labeller, device: &mut Device, fresh: &List[Card]) {
+    var zi = 0usize;
+    while zi < zones.len() {
+      var live = List[usize]();
+      var pass = 0u32;
+      while pass < 2u32 {
+        var c = 0usize;
+        while c < fresh.len() {
+          if fresh[c].zone.view() == zones[zi].lineKey.view() {
+            let isLive = fresh[c].hot || (fresh[c].stage >= 1u32 && fresh[c].stage <= 3u32);
+            if isLive && (fresh[c].hot == (pass == 0u32)) { live.push(c); }
+          }
+          c = c + 1usize;
+        }
+        pass = pass + 1u32;
+      }
+      var done = 0u32;
+      var queued = 0u32;
+      var c2 = 0usize;
+      while c2 < fresh.len() {
+        if fresh[c2].zone.view() == zones[zi].lineKey.view() && !fresh[c2].hot {
+          if fresh[c2].stage == 4u32 { done = done + 1u32; } else if fresh[c2].stage == 0u32 { queued = queued + 1u32; }
+        }
+        c2 = c2 + 1usize;
+      }
+      var strip = List[StripCard]();
+      var shown = 0usize;
+      while shown < live.len() && shown < 8usize {
+        let cd = &fresh[*live[shown]];
+        let calm = cardLabel(l, device, format, cd.calm.text.view(), cd.calm.progress, cd.hot, false);
+        let glow = cardLabel(l, device, format, cd.calm.text.view(), cd.calm.progress, cd.hot, true);
+        strip.push(StripCard(cd.id.clone(), cd.report.clone(), cd.hot, calm, glow));
+        shown = shown + 1usize;
+      }
+      var ct = String.from(numText(i64.from(done)).view());
+      ct.append(" done");
+      if queued > 0u32 { ct.append(", "); ct.append(numText(i64.from(queued)).view()); ct.append(" queued"); }
+      if live.len() > 8usize { ct.append(", +"); ct.append(numText(i64.from(live.len() - 8usize)).view()); ct.append(" live"); }
+      (&mut zones[zi]).strip = strip;
+      (&mut zones[zi]).count.text = ct.clone();
+      (&mut zones[zi]).count.size = fitSize(ct.len(), 48.);
+      (&mut zones[zi]).count.ok = false;
+      zi = zi + 1usize;
+    }
+  }
+
+  // Each frame: boards glide to where the files put them, panes open one at a time, project cells follow the ring
+  fn tickZones(self: &mut, device: &mut Device, renderer: &mut Renderer, dt: f32, now: u64) {
+    var zi = 0usize;
+    while zi < zones.len() {
+      var f = dt * 4.;
+      if f > 1. { f = 1.; }
+      if grabKind != 5u32 || grabIt != i32.from(zi) {
+        (&mut zones[zi]).pos = zones[zi].pos + (zones[zi].wantPos - zones[zi].pos) * f;
+        (&mut zones[zi]).yaw = zones[zi].yaw + turnBetween(zones[zi].yaw, zones[zi].wantYaw) * f;
+        (&mut zones[zi]).width = zones[zi].width + (zones[zi].wantWidth - zones[zi].width) * f;
+      }
+      if now >= zones[zi].nextAt && ticks > 4u32 {
+        var opened = false;
+        let order = [ZP_SITE, ZP_REPO, ZP_INCUBATOR, ZP_DIAGRAM];
+        var o = 0usize;
+        while o < 4usize && !opened {
+          let kind = order[o];
+          if (zones[zi].made & (1u32 << kind)) == 0u32 {
+            (&mut zones[zi]).made = zones[zi].made | (1u32 << kind);
+            if self.paneSrc(zi, kind).len() > 0usize {
+              self.openPane(device, renderer, zi, kind);
+              (&mut zones[zi]).nextAt = now + 700u64;
+              opened = true;
+            }
+          }
+          o = o + 1usize;
+        }
+      }
+      var j = 0usize;
+      while j < zones[zi].projLabels.len() {
+        let ik = *zones[zi].projItem[j];
+        if ik >= 0 {
+          let on = items[usize.from(u32.from(ik))].onTable;
+          if on != *zones[zi].projOn[j] {
+            zones[zi].projOn.set(j, on);
+            (&mut zones[zi].projLabels[j]).bg = if on { 0xcfe6d2ffu32 } else { 0xf8f5eeffu32 };
+            (&mut zones[zi].projLabels[j]).ok = false;
+          }
+        }
+        j = j + 1usize;
+      }
+      zi = zi + 1usize;
+    }
+  }
+
+  // A few of the boards' pictures a frame
+  fn fillZones(self: &mut, l: &mut Labeller, device: &mut Device, made: &mut i32, most: i32) {
+    var zi = 0usize;
+    while zi < zones.len() {
+      if *made < most && !zones[zi].title.ok { fillLabel(l, device, &mut zones[zi].title); *made = *made + 1; }
+      if *made < most && !zones[zi].count.ok { fillLabel(l, device, &mut zones[zi].count); *made = *made + 1; }
+      if zones[zi].projLabels.len() == 0usize && *made < most && !zones[zi].none.ok { fillLabel(l, device, &mut zones[zi].none); *made = *made + 1; }
+      var j = 0usize;
+      while j < zones[zi].projLabels.len() && *made < most {
+        if !zones[zi].projLabels[j].ok { fillLabel(l, device, &mut zones[zi].projLabels[j]); *made = *made + 1; }
+        j = j + 1usize;
+      }
+      j = 0usize;
+      while j < zones[zi].strip.len() && *made < most {
+        if !zones[zi].strip[j].calm.ok { fillLabel(l, device, &mut zones[zi].strip[j].calm); *made = *made + 1; }
+        if *made < most && !zones[zi].strip[j].glow.ok { fillLabel(l, device, &mut zones[zi].strip[j].glow); *made = *made + 1; }
+        j = j + 1usize;
+      }
+      zi = zi + 1usize;
+    }
+  }
+
+  // One board: its face, its name, its projects and its line strip (the panes are pages, drawn in their own turn)
+  fn drawZone(self: &mut, zi: usize, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4, hotPhase: bool) {
+    let m = vp * self.zoneModel(zi);
+    (&mut zones[zi]).back.drawFaded(device, encoder, target, depth, m, Vec4(0. - ZN_DW * 0.5, ZN_BASE, ZN_DW * 0.5, ZN_BASE + ZN_DH), 1.);
+    Warehouse.faded(&mut zones[zi].title, device, encoder, target, depth, m, Vec4(0. - 3.6, 3.98, 0. - 2.0, 4.38), 1.);
+    if zones[zi].projLabels.len() == 0usize {
+      let r = *zones[zi].rects[3usize];
+      let cx = r.x - ZN_DW * 0.5 + r.z * 0.5;
+      let cy = r.y + r.w * 0.5;
+      Warehouse.faded(&mut zones[zi].none, device, encoder, target, depth, m, Vec4(cx - 1.0, cy - 0.25, cx + 1.0, cy + 0.25), 1.);
+    }
+    var j = 0usize;
+    while j < zones[zi].projLabels.len() {
+      let rc = self.projRect(zi, j);
+      Warehouse.faded(&mut zones[zi].projLabels[j], device, encoder, target, depth, m, rc, 1.);
+      j = j + 1usize;
+    }
+    let cr = self.stripRect(zi, 0usize);
+    Warehouse.faded(&mut zones[zi].count, device, encoder, target, depth, m, cr, 1.);
+    var s = 0usize;
+    while s < zones[zi].strip.len() {
+      let rc = self.stripRect(zi, s + 1usize);
+      if zones[zi].strip[s].hot && hotPhase {
+        Warehouse.faded(&mut zones[zi].strip[s].glow, device, encoder, target, depth, m, rc, 1.);
+      } else {
+        Warehouse.faded(&mut zones[zi].strip[s].calm, device, encoder, target, depth, m, rc, 1.);
+      }
+      s = s + 1usize;
+    }
   }
 
   fn cardPos(self: &, stage: usize, n: u32) Vec3 {

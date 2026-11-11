@@ -72,6 +72,45 @@ struct ShelfCfg {
   hasSlots: bool;
 }
 
+// [zone.ID]: one backdrop board at the back of the warehouse (zones.cone). place "at:x,y,z", yaw_deg and width_cm place it; site,
+// repo, incubator, diagram say what its panes show; projects lists project ids; line names the line.json zone; layout_<pane> =
+// "x,y,w,h" (meters from the board's bottom left) overrides a pane's rectangle.
+struct ZoneCfg {
+  id: String;
+  name: String;
+  place: String;
+  yaw: i64;
+  hasYaw: bool;
+  width: i64;
+  hasWidth: bool;
+  site: String;
+  repo: String;
+  incubator: String;
+  diagram: String;
+  projects: String;
+  line: String;
+  at: String;
+  rects: List[String];     // site, repo, incubator, projects, line, diagram
+}
+
+// [tree.ID] (room.toml): the folders a tree pane has open
+struct TreeCfg {
+  id: String;
+  open: List[String];
+}
+
+fn newZoneCfg(id: &str) ZoneCfg {
+  var r = List[String]();
+  var i = 0;
+  while i < 6 { r.push(String()); i = i + 1; }
+  ZoneCfg(String.from(id), String(), String(), 0i64, false, 0i64, false, String(), String(), String(), String(), String(), String(), String(), r)
+}
+
+fn zoneRectKey(i: usize) &str {
+  if i == 0usize { "layout_site" } else if i == 1usize { "layout_repo" } else if i == 2usize { "layout_incubator" }
+  else if i == 3usize { "layout_projects" } else if i == 4usize { "layout_line" } else { "layout_diagram" }
+}
+
 alias Folders = List[FolderCfg];
 alias PageCfgs = List[PageCfg];
 
@@ -90,11 +129,13 @@ struct Parsed {
   pages: PageCfgs;      // [page.ID] (room.toml)
   panels: List[PanelCfg];
   shelves: List[ShelfCfg];
+  zones: List[ZoneCfg];  // [zone.ID]
+  trees: List[TreeCfg];  // [tree.ID] (room.toml)
 }
 
 fn newParsed() Parsed {
   Parsed(true, String(), List[ProjCfg](), 0i64, 0i64, 0i64, String(), List[String](), List[String](), Folders(), PageCfgs(),
-    List[PanelCfg](), List[ShelfCfg]())
+    List[PanelCfg](), List[ShelfCfg](), List[ZoneCfg](), List[TreeCfg]())
 }
 
 // A place, parsed
@@ -224,6 +265,11 @@ fn checkKeys(p: &mut Parsed, file: &str, t: &toml.Table, kind: u32, tname: &str)
       else if kind == 5u32 { k == "wall" || k == "slots" }
       else if kind == 7u32 { k == "name" || k == "path" || k == "place" || k == "at" }
       else if kind == 8u32 { k == "src" || k == "place" || k == "at" }
+      else if kind == 9u32 {
+        k == "name" || k == "place" || k == "yaw_deg" || k == "width_cm" || k == "site" || k == "repo" || k == "incubator" || k == "diagram"
+          || k == "projects" || k == "line" || k == "at" || startsWithText(k, "layout_")
+      }
+      else if kind == 10u32 { k == "open" }
       else { k == "place" || k == "yaw_deg" || k == "width_cm" };
     if !good {
       var m = String.from("unknown key '");
@@ -373,7 +419,43 @@ fn parseConfig(text: &str, file: &str) Parsed {
           if src.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a page needs a src (a file or an address)"); }
           p.pages.push(PageCfg(String.from(seg[1usize].view()), src, tableText(&doc[nm], "place"), tableText(&doc[nm], "at")));
         }
-        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, folder, page, line, browser)"); }
+        else if seg[0usize].view() == "zone" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 9u32, nm);
+          var z = newZoneCfg(seg[1usize].view());
+          z.name = tableText(&doc[nm], "name");
+          z.place = tableText(&doc[nm], "place");
+          z.site = tableText(&doc[nm], "site");
+          z.repo = tableText(&doc[nm], "repo");
+          z.incubator = tableText(&doc[nm], "incubator");
+          z.diagram = tableText(&doc[nm], "diagram");
+          z.projects = tableText(&doc[nm], "projects");
+          z.line = tableText(&doc[nm], "line");
+          z.at = tableText(&doc[nm], "at");
+          var hy = false; var yy = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          z.hasYaw = hy; z.yaw = yy;
+          var hw = false; var ww = 0i64;
+          tableInt(&mut p, file, &doc[nm], "width_cm", &mut hw, &mut ww);
+          z.hasWidth = hw; z.width = ww;
+          if hw && (ww < 200i64 || ww > 2000i64) { cfgFail(&mut p, file, doc[nm].lineOf("width_cm"), "width_cm must be from 200 to 2000"); }
+          if z.place.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(z.place.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a zone's place is at:x,y,z"); }
+          }
+          var ri = 0usize;
+          while ri < 6usize {
+            z.rects.set(ri, tableText(&doc[nm], zoneRectKey(ri)));
+            ri = ri + 1usize;
+          }
+          p.zones.push(z);
+        }
+        else if seg[0usize].view() == "tree" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 10u32, nm);
+          var open = List[String]();
+          match doc[nm].getStrings("open") { case let Some(r) { open = r; } else {} }
+          p.trees.push(TreeCfg(String.from(seg[1usize].view()), open));
+        }
+        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, folder, page, line, browser, zone, tree)"); }
         n = n + 1usize;
       }
     }
@@ -490,6 +572,30 @@ fn extrasText(r: &Parsed) String {
     s.append("at = "); s.append(tomlStr(g.at.view()).view()); s.append("\n");
     i = i + 1usize;
   }
+  i = 0usize;
+  while i < r.zones.len() {
+    let z = &r.zones[i];
+    s.append("\n[zone."); s.append(z.id.view()); s.append("]\n");
+    if z.name.len() > 0usize { s.append("name = "); s.append(tomlStr(z.name.view()).view()); s.append("\n"); }
+    s.append("place = "); s.append(tomlStr(z.place.view()).view()); s.append("\n");
+    if z.hasYaw { s.append("yaw_deg = "); s.append(intText(z.yaw).view()); s.append("\n"); }
+    if z.hasWidth { s.append("width_cm = "); s.append(intText(z.width).view()); s.append("\n"); }
+    s.append("at = "); s.append(tomlStr(z.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.trees.len() {
+    let t = &r.trees[i];
+    s.append("\n[tree."); s.append(t.id.view()); s.append("]\nopen = [");
+    var q = 0usize;
+    while q < t.open.len() {
+      if q > 0usize { s.append(", "); }
+      s.append(tomlStr(t.open[q].view()).view());
+      q = q + 1usize;
+    }
+    s.append("]\n");
+    i = i + 1usize;
+  }
   s
 }
 
@@ -535,11 +641,30 @@ fn studioText(r: &Parsed, ringCm: i64, floatCm: i64, lineFile: &str, root: &str)
     i = i + 1usize;
   }
   s.append(extrasText(r).view());
+  s.append(zonesDefaultText().view());
   s.append("\n# Optional: [panel.browser] and [panel.report] place = \"at:x,y,z\", yaw_deg = N (where such a panel stands when it opens);\n");
   s.append("# [shelf.back] / [shelf.side] slots = N (how many slots the room may use when it shelves something by itself).\n");
   s.append("# [folder.ID] name, path, place (\"at:x,y,z\"): a parked folder, a post in the room that opens a browser rooted at path.\n");
   s.append("# A [project.ID] the building does not have, with source = \"doc:<file>\" or \"url:<address>\", appears as a page; remove it and it leaves.\n");
   s.append("# owner = \"3D Web\" on a project: who answers for it, shown on its label.\n");
+  s
+}
+
+// The two boards at the back, as the first-run file writes them (and as the room has them when a file gives no [zone.*] at all)
+fn zonesDefaultText() String {
+  var s = String.from("\n# Boards at the back of the warehouse, each made of live panes: its site (a web page), repo and Incubator folder (expandable trees),\n");
+  s.append("# its projects (a shelf strip), its production line (cards whose line.json \"zone\" is `line`) and a Mermaid diagram.\n");
+  s.append("# place = \"at:x,y,z\" (meters; the middle of the board's foot), yaw_deg (turned toward the start spot), width_cm. A board moved by hand\n");
+  s.append("# goes to room.toml. layout_site, layout_repo, layout_incubator, layout_projects, layout_line, layout_diagram = \"x,y,w,h\" (meters from\n");
+  s.append("# the board's bottom left, board 7.2 m wide at 720 cm) move or size a pane.\n");
+  s.append("\n[zone.cone]\nname = \"Cone\"\nplace = \"at:-4.2,0,-6.2\"\nyaw_deg = 25\nwidth_cm = 640\nsite = \"https://cone.jondgoodwin.com\"\n");
+  s.append("repo = \"C:/src/cone\"\nincubator = \"C:/Users/jondg/MyDrive/Incubator/Cone\"\n");
+  s.append("diagram = \"C:/Users/jondg/MyDrive/Incubator/Cone/Diagrams/architecture.md\"\nprojects = \"\"\nline = \"cone\"\nat = \"2026-11-11T00:00:00Z\"\n");
+  s.append("\n[zone.web3d]\nname = \"3D Web\"\nplace = \"at:4.2,0,-6.2\"\nyaw_deg = -25\nwidth_cm = 640\nsite = \"https://web3d.jondgoodwin.com\"\n");
+  s.append("repo = \"C:/src/pegasus3d\"\nincubator = \"C:/Users/jondg/MyDrive/Incubator/3D Web\"\n");
+  s.append("diagram = \"C:/Users/jondg/MyDrive/Incubator/3D Web/Diagrams/architecture.md\"\nprojects = \"knight,archwalk,amphora\"\nline = \"web3d\"\nat = \"2026-11-11T00:00:00Z\"\n");
+  s.append("\n# Penny's prompts folder: its own tree pane beside the workbench (no posts that retarget another pane)\n");
+  s.append("[page.penny]\nsrc = \"tree:C:/Users/jondg/MyDrive/Incubator/Penny/prompts\"\nplace = \"at:-3.4,0,-0.2\"\nat = \"2026-11-11T00:00:00Z\"\n");
   s
 }
 
