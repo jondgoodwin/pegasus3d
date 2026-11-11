@@ -1,0 +1,257 @@
+// The desk panel: the laptop's own screen as a workstation in the studio (WI\studio-warehouse.md, "desk").
+//
+// A 1.6 m wide panel stands at a desk spot beside the start, angled toward it. Each frame the DXGI Desktop Duplication
+// shim (shim\deskshim.c) is asked for a new picture of the primary output; when there is one it is copied (through the
+// CPU) into the panel's texture. A chip under the panel, "control laptop", is off at the start: while it is on, a click
+// along the mouse's or the beam's ray that meets the panel is made on the real pointer (SendInput) at the pixel it
+// meets, and the wheel scrolls it; a red frame shows that the panel is in control. The physical keyboard types into
+// whichever window has focus, as it always did. --desk-dry-run prints the input instead of sending it.
+//
+// On the desktop build the studio's own window is on the screen it shows, so the panel can show itself, smaller and
+// smaller; on the desktop the pointer is moved only at a click (it is the mouse's own, and would be pulled out of the
+// window); in the headset a beam moves it while it rests on the panel.
+
+const DESK_HALF_W = 0.8f;          // 1.6 m across
+const DESK_BOTTOM = 0.95f;         // the panel's lower edge, metres above the floor
+const DESK_CHIP_W = 0.6f;
+const DESK_CHIP_BOTTOM = 0.765f;   // the chip under the panel: 0.6 x 0.15
+
+// Stays where the visitor can reach it: beside the start spot (0, 3.5), on its right, turned to face it
+const DESK_X = 3.4f;
+const DESK_Z = 4.6f;
+
+var @threadlocal deskWheelAcc: f32 = 0.;   // the headset's stick, summed toward a notch of the laptop's wheel
+var @threadlocal deskOn = false;          // '--desk': the panel is in the warehouse
+var @threadlocal deskControl = false;      // '--desk-control'
+var @threadlocal deskDryRun = false;       // '--desk-dry-run'
+var @threadlocal deskProbe = false;        // '--desk-probe': on a frame, five rays at the corners and the centre (needs --desk-dry-run)
+
+pub struct DeskPanel {
+  pass: PagePass;                  // the screen
+  frame: PagePass;                 // the red frame while in control
+  chipOff: Label;
+  chipOn: Label;
+  open: bool;                      // the capture is running
+  control: bool;
+  w: u32;
+  h: u32;
+  pos: Vec3;
+  yaw: f32;
+  tries: u32;                      // ticks, new pictures, and what they cost (microseconds, summed)
+  fresh: u32;
+  lost: u32;
+  captureUs: u64;
+  uploadUs: u64;
+  lastX: i32;                      // the pixel the pointer was last sent to (-1: none), so a resting beam sends nothing
+  lastY: i32;
+  probed: bool;
+
+  fn create(l: &mut Labeller, device: &mut Device, format: u32) DeskPanel {
+    var frame = PagePass.create(device, format);
+    var px = List[u8].withCapacity(16usize);
+    var i = 0;
+    while i < 4 { px.push(255u8); px.push(70u8); px.push(40u8); px.push(255u8); i = i + 1; }
+    frame.uploadRgba(device, 2u32, 2u32, &px);
+    let isOpen = deskc.open(-1i32) == 1i32;
+    if isOpen { deskc.set_dry_run(if deskDryRun { 1i32 } else { 0i32 }); }
+    else { print <- "desk: the screen could not be duplicated\n"; }
+    let toward = atan2(0. - DESK_X, 3.5 - DESK_Z);
+    print <- "desk: capture "; print <- if isOpen { "open " } else { "FAILED " };
+    if isOpen { print <- deskc.width(); print <- "x"; print <- deskc.height(); }
+    print <- ", panel at ("; print <- DESK_X; print <- ", "; print <- DESK_Z; print <- "), dry run "; print <- if deskDryRun { "on\n" } else { "off\n" };
+    DeskPanel(PagePass.createDepth(device, format), frame,
+      textLabel(l, device, format, "control laptop", 0x3a4a5affu32, 0xffffffffu32, 46., DESK_CHIP_W),
+      textLabel(l, device, format, "release laptop", 0xc0392bffu32, 0xffffffffu32, 46., DESK_CHIP_W),
+      isOpen, false, 0u32, 0u32, Vec3(DESK_X, 0., DESK_Z), toward, 0u32, 0u32, 0u32, 0u64, 0u64, -1i32, -1i32, false)
+  }
+
+  fn model(self: &) Mat4 { Mat4.fromTrs(pos, Quat.angleAxis(yaw, Vec3(0., 1., 0.)), Vec3(1., 1., 1.)) }
+
+  fn top(self: &) f32 { DESK_BOTTOM + 2. * DESK_HALF_W * f32.from(h) / f32.from(w) }
+
+  // The new picture of the screen, if there is one, into the panel's texture
+  fn tick(self: &mut, device: &mut Device) {
+    if !open { return; }
+    let r = deskc.update(0i32);
+    tries = tries + 1u32;
+    if r < 0i32 { lost = lost + 1u32; return; }
+    if r == 0i32 { return; }
+    let t0 = sdl.GetPerformanceCounter();
+    w = u32.from(deskc.width());
+    h = u32.from(deskc.height());
+    pass.uploadFrame(device, w, h, deskc.pixels());
+    let t1 = sdl.GetPerformanceCounter();
+    fresh = fresh + 1u32;
+    captureUs = captureUs + u64.from(deskc.update_us());
+    uploadUs = uploadUs + (t1 - t0) * 1000000u64 / sdl.GetPerformanceFrequency();
+  }
+
+  fn report(self: &) {
+    if !open { return; }
+    print <- "desk: "; print <- tries; print <- " ticks, "; print <- fresh; print <- " new pictures of "; print <- w; print <- "x"; print <- h;
+    print <- ", lost "; print <- lost;
+    if fresh > 0u32 {
+      print <- "; per new picture: capture and copy to the CPU "; print <- captureUs / u64.from(fresh);
+      print <- " us, upload to the GPU texture (record) "; print <- uploadUs / u64.from(fresh); print <- " us";
+    }
+    print <- "\n";
+  }
+
+  // Where a ray from 'eye' along 'dir' (world) meets the panel's plane: the distance (-1 if it does not meet the plane in
+  // front of the eye), and the point in the panel's own units: u across and v up, each 0 to 1 over the picture
+  fn plane(self: &, eye: Vec3, dir: Vec3, lx: &mut f32, ly: &mut f32) f32 {
+    let inv = self.model().inverse();
+    let e = inv * eye;
+    let d = inv.transformVector(dir);
+    if d.z > -0.00001 && d.z < 0.00001 { return -1.; }
+    let t = (0. - e.z) / d.z;
+    if t < 0. { return -1.; }
+    *lx = e.x + d.x * t;
+    *ly = e.y + d.y * t;
+    t
+  }
+
+  // The pixel of the screen a ray meets (the distance, or -1 if it misses the screen)
+  fn screenPixel(self: &, eye: Vec3, dir: Vec3, px: &mut i32, py: &mut i32) f32 {
+    if !open || w == 0u32 { return -1.; }
+    var lx: f32 = 0.;
+    var ly: f32 = 0.;
+    let t = self.plane(eye, dir, &mut lx, &mut ly);
+    if t < 0. { return -1.; }
+    let u = (lx + DESK_HALF_W) / (2. * DESK_HALF_W);
+    let v = (ly - DESK_BOTTOM) / (self.top() - DESK_BOTTOM);
+    if u < -0.0005 || u > 1.0005 || v < -0.0005 || v > 1.0005 { return -1.; }
+    var x = i32.from(u * f32.from(w));
+    var y = i32.from((1. - v) * f32.from(h));
+    if u <= 0. { x = 0i32; }
+    if v >= 1. { y = 0i32; }
+    if x > i32.from(w) - 1i32 { x = i32.from(w) - 1i32; }
+    if y > i32.from(h) - 1i32 { y = i32.from(h) - 1i32; }
+    *px = x;
+    *py = y;
+    t
+  }
+
+  fn chipHit(self: &, eye: Vec3, dir: Vec3) f32 {
+    if !open { return -1.; }
+    var lx: f32 = 0.;
+    var ly: f32 = 0.;
+    let t = self.plane(eye, dir, &mut lx, &mut ly);
+    if t < 0. { return -1.; }
+    if lx < 0. - DESK_CHIP_W * 0.5 || lx > DESK_CHIP_W * 0.5 || ly < DESK_CHIP_BOTTOM || ly > DESK_CHIP_BOTTOM + DESK_CHIP_W * 0.25 { return -1.; }
+    t
+  }
+
+  // How far along the ray the panel (its screen or chip) is met, or -1: the headset's beam ends there
+  fn reach(self: &, eye: Vec3, dir: Vec3) f32 {
+    var px: i32 = 0i32;
+    var py: i32 = 0i32;
+    let t = self.screenPixel(eye, dir, &mut px, &mut py);
+    if t >= 0. { return t; }
+    self.chipHit(eye, dir)
+  }
+
+  fn setControl(self: &mut, on: bool) {
+    control = on;
+    lastX = -1i32;
+    lastY = -1i32;
+    print <- "desk: control of the laptop "; print <- if on { "ON" } else { "off" }; print <- if deskDryRun { " (dry run: nothing is sent)\n" } else { "\n" };
+  }
+
+  // A click along a ray. True if it met the chip or the screen (taken either way); on the screen, with control on, the real
+  // pointer is moved there and clicked
+  fn click(self: &mut, eye: Vec3, dir: Vec3) bool {
+    if !open { return false; }
+    let tc = self.chipHit(eye, dir);
+    var px: i32 = 0i32;
+    var py: i32 = 0i32;
+    let ts = self.screenPixel(eye, dir, &mut px, &mut py);
+    if tc < 0. && ts < 0. { return false; }
+    if tc >= 0. { self.setControl(!control); return true; }
+    if control {
+      print <- "desk: click at pixel ("; print <- px; print <- ", "; print <- py; print <- ")\n";
+      deskc.move(px, py);
+      deskc.button(0i32, 1i32);
+      deskc.button(0i32, 0i32);
+      lastX = px;
+      lastY = py;
+    }
+    true
+  }
+
+  // The wheel over the panel: scrolls the laptop's window under that pixel. True if it was the panel's.
+  fn wheel(self: &mut, eye: Vec3, dir: Vec3, notches: f32) bool {
+    var px: i32 = 0i32;
+    var py: i32 = 0i32;
+    if self.screenPixel(eye, dir, &mut px, &mut py) < 0. { return false; }
+    if control {
+      let n = i32.from(notches);
+      print <- "desk: wheel "; print <- n; print <- " at pixel ("; print <- px; print <- ", "; print <- py; print <- ")\n";
+      deskc.move(px, py);
+      deskc.wheel(n);
+    }
+    true
+  }
+
+  // A beam resting on the screen moves the pointer with it (only when the pixel changes)
+  fn point(self: &mut, eye: Vec3, dir: Vec3) {
+    if !control { return; }
+    var px: i32 = 0i32;
+    var py: i32 = 0i32;
+    if self.screenPixel(eye, dir, &mut px, &mut py) < 0. { return; }
+    if px != lastX || py != lastY { deskc.move(px, py); lastX = px; lastY = py; }
+  }
+
+  // --desk-probe: five rays from in front of the panel, aimed at the four corners and the middle of the screen, each with
+  // the pixel it should give. (Dry run only: nothing is sent.)
+  fn probeCorners(self: &mut) {
+    if !deskDryRun || !open || w == 0u32 { return; }
+    probed = true;
+    let m = self.model();
+    let eye = m * Vec3(0.3, 1.6, 2.2);
+    let wl: f32 = 0. - DESK_HALF_W;
+    let wr: f32 = DESK_HALF_W;
+    let tp = self.top();
+    // (the middle is aimed at the centre of pixel (w/2, h/2): the exact middle is the edge between four pixels)
+    let xs = [wl, wr, wl, wr, 1.6 * 0.5 / f32.from(w)];
+    let ys = [tp, tp, DESK_BOTTOM, DESK_BOTTOM, (tp + DESK_BOTTOM) * 0.5 - (tp - DESK_BOTTOM) * 0.5 / f32.from(h)];
+    let names = ["top left", "top right", "bottom left", "bottom right", "centre"];
+    let ex = [0i32, i32.from(w) - 1i32, 0i32, i32.from(w) - 1i32, i32.from(w) / 2i32];
+    let ey = [0i32, 0i32, i32.from(h) - 1i32, i32.from(h) - 1i32, i32.from(h) / 2i32];
+    let was = control;
+    control = true;
+    var k = 0usize;
+    while k < 5usize {
+      let target = m * Vec3(xs[k], ys[k], 0.);
+      let dir = (target - eye).normalize();
+      var px: i32 = -9i32;
+      var py: i32 = -9i32;
+      let t = self.screenPixel(eye, dir, &mut px, &mut py);
+      print <- "desk-probe: "; printStr(names[k]); print <- ": expect ("; print <- ex[k]; print <- ", "; print <- ey[k]; print <- "), ray gives (";
+      print <- px; print <- ", "; print <- py; print <- ") at "; print <- t; print <- " m";
+      print <- if px == ex[k] && py == ey[k] { " OK\n" } else { " WRONG\n" };
+      self.click(eye, dir);
+      k = k + 1usize;
+    }
+    control = was;
+  }
+
+  fn drawAll(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4, which: u32) {
+    if !open || w == 0u32 { return; }
+    let m = vp * self.model();
+    let tp = self.top();
+    if which == 0u32 {
+      if control {
+        frame.drawFaded(device, encoder, target, depth, m, Vec4(0. - DESK_HALF_W - 0.035, DESK_BOTTOM - 0.035, DESK_HALF_W + 0.035, tp + 0.035), 1.);
+      }
+      pass.drawFaded(device, encoder, target, depth, m, Vec4(0. - DESK_HALF_W, DESK_BOTTOM, DESK_HALF_W, tp), 1.);
+    } else {
+      let r = Vec4(0. - DESK_CHIP_W * 0.5, DESK_CHIP_BOTTOM, DESK_CHIP_W * 0.5, DESK_CHIP_BOTTOM + DESK_CHIP_W * 0.25);
+      if control {
+        if chipOn.ok { chipOn.pass.drawFaded(device, encoder, target, depth, m, r, 1.); }
+      } else {
+        if chipOff.ok { chipOff.pass.drawFaded(device, encoder, target, depth, m, r, 1.); }
+      }
+    }
+  }
+}

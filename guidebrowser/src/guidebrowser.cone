@@ -307,6 +307,7 @@ pub fn start(host: &mut Host) bool {
   let target = if xrOn { standInTarget(&mut device, headset.eyeWidth, headset.eyeHeight, format) } else { swapchain.getCurrentTexture(&mut device) };
   var wh = Warehouse.empty();
   if worldArg != null && libc.strcmp(cstr.fromPtr(worldArg), "warehouse") == 0i32 { wh = Warehouse.create(&mut device, format); if startYaw == 0. { startYaw = 72.; } }
+  if deskOn && wh.on { wh.initDesk(&mut device); if deskControl { wh.deskToggle(); } }
   var made = Shell(Scene.empty(), panel, wh, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
     List[PartView](), 0u64, NO_CLICK, Input(), actions, walk, look, true,
     Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), XrRig.make(xrOn), target, fx, post, renderer, swapchain, Headset.none(), device,
@@ -336,7 +337,15 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
       (*some).input.handle(e);
       if e.type == sdl.EVENT_MOUSE_WHEEL {
         let wheel = e as &sdl.MouseWheelEvent;
-        match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} }
+        var onDesk = false;
+        if (*some).wh.on {
+          let ws = host.window().windowSize();
+          if ws.w > 0 && ws.h > 0 {
+            let dir = mouseRay(&*some, wheel.mouse_x, wheel.mouse_y, f32.from(ws.w), f32.from(ws.h));
+            onDesk = (*some).wh.deskWheel((*some).camera.origin, dir, wheel.y);
+          }
+        }
+        if !onDesk { match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} } }
       }
       if e.type == sdl.EVENT_KEY_DOWN {
         let key = e as &sdl.KeyboardEvent;
@@ -357,6 +366,7 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
           if key.scancode == KEY_LBRACKET || (alt && key.scancode == KEY_LEFT) { browseAct(&mut *some, 6u32); }
           if key.scancode == KEY_RBRACKET || (alt && key.scancode == KEY_RIGHT) { browseAct(&mut *some, 7u32); }
           if key.scancode == KEY_F && (*some).wh.on { browseAct(&mut *some, 8u32); }
+          if key.scancode == KEY_L && (*some).wh.on { (*some).wh.deskToggle(); }
         }
       }
       if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
@@ -449,11 +459,16 @@ fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   let tw = f32.from(s.target.texture.width);
   let th = f32.from(s.target.texture.height);
   if w <= 0. || h <= 0. || th <= 0. { return; }
+  clickRay(s, s.camera.origin, mouseRay(s, x, y, w, h), x, y, false, frame);
+}
+
+// The direction of the ray from the eye through the point x, y of the window (w x h, the window's units)
+fn mouseRay(s: &Shell, x: f32, y: f32, w: f32, h: f32) Vec3 {
+  let tw = f32.from(s.target.texture.width);
+  let th = f32.from(s.target.texture.height);
   let inverse = (s.camera.projectionMatrix(tw / th) * s.camera.viewMatrix()).inverse();
   let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
-  let eye = s.camera.origin;
-  let direction = (p.xyz() * (1. / p.w) - eye).normalize();
-  clickRay(s, eye, direction, x, y, false, frame);
+  (p.xyz() * (1. / p.w) - s.camera.origin).normalize()
 }
 
 // A click along a ray from 'eye': the mouse's (through the point x, y of the window) or a controller's beam (xr.cone, 'beam' true).
@@ -461,6 +476,7 @@ fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
 fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: bool, frame: u64) {
   var onPanel = false;
   if s.wh.on {
+    if s.wh.deskClick(eye, direction) { return; }
     if s.wh.clickChip(eye, direction, &s.visitor) { return; }
     if s.wh.clickCard(eye, direction) { return; }
     let inv = s.wh.pageModel().inverse();
@@ -735,6 +751,7 @@ const KEY_O = 18u;
 const KEY_T = 23u;
 const KEY_Z = 29u;
 const KEY_F = 9u;
+const KEY_L = 15u;           // control of the laptop from the desk panel, on or off
 const KEY_LBRACKET = 47u;
 const KEY_RBRACKET = 48u;
 const KEY_RIGHT = 79u;
@@ -905,6 +922,7 @@ fn prepareScene(s: &mut Shell, alpha: f32) {
   if s.wh.on {
     s.renderer.keepDepth = true;      // the labels hide behind what stands in front of them
     s.wh.update(&mut s.device, &mut s.renderer);
+    if deskProbe && drawn == 90 { s.wh.deskProbe(); }
     let nav = s.wh.takeNav();
     if nav != 0u32 { browseAct(s, nav); }
     whBrowse(s);
@@ -1126,6 +1144,7 @@ pub fn quit(host: &mut Host) i32 {
       (*some).device.waitIdle();
       print <- "Parts live: "; print <- (*some).activated; print <- "\n";
       if (*some).xr.on { reportXr(&*some); }
+      (*some).wh.deskReport();
     }
     else {}
   }
@@ -1182,6 +1201,10 @@ fn main(argc: i32, argv: **u8) i32 {
     let more = a + 1i32 < argc;
     if libc.strcmp(arg, "--test-part") == 0i32 { testPart = true; }
     if libc.strcmp(arg, "--xr") == 0i32 { xrOn = true; }
+    if libc.strcmp(arg, "--desk") == 0i32 { deskOn = true; }
+    if libc.strcmp(arg, "--desk-dry-run") == 0i32 { deskOn = true; deskDryRun = true; }
+    if libc.strcmp(arg, "--desk-probe") == 0i32 { deskOn = true; deskProbe = true; }
+    if libc.strcmp(arg, "--desk-control") == 0i32 { deskOn = true; deskControl = true; }   // control on from the start (with --desk-dry-run, for a picture of the frame)
     if libc.strcmp(arg, "--xr-shots") == 0i32 && more { xrShotsArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--xr-shot-at") == 0i32 && more { xrShotAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--shot") == 0i32 { shot = true; }
