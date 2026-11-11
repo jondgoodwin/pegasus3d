@@ -133,16 +133,22 @@ struct RichPair {
   faces: Faces;
   rr: RichRenderer;
 }
-var @threadlocal richPool: Option[RichPair] = None;
+// (kept on the heap behind an address: a global of this type would make the borrow checker doubt every String the panels lend)
+var @threadlocal richAt = 0usize;
 var @threadlocal richMade = false;
 
-fn richTake() Option[RichPair] {
-  var s: Option[RichPair] = None;
-  s <-> richPool;
-  s
-}
+fn richRef() &mut RichPair { richAt as &mut RichPair }
 
-fn richPut(p: Option[RichPair]) { richPool = p; }
+// Let go of the pair (before the device is)
+fn richDrop() {
+  if richAt != 0usize {
+    let cell = richAt as *RichPair;
+    mem.finalize[RichPair](cell);
+    libc.free(cell as *u8);
+    richAt = 0usize;
+    richMade = false;
+  }
+}
 
 // Makes the pair if it is not made yet; false if no font was found or the renderer failed
 fn ensureRich(device: &mut Device) bool {
@@ -152,7 +158,13 @@ fn ensureRich(device: &mut Device) bool {
     case let Some(faces) {
       var rr = RichRenderer.create(device, &faces, TEXTURE_FORMAT_RGBA8_UNORM);
       print <- "docpanel: fonts and pipelines made in "; print <- micros(tT0, sdl.GetPerformanceCounter()) / 1000.; print <- " ms (shared by all panels)\n";
-      if rr.isValid() { richPool = Some[RichPair](RichPair(faces, rr)); richMade = true; return true; }
+      if rr.isValid() {
+        let cell = libc.malloc(mem.sizeof[RichPair]()) as *RichPair;
+        mem.writeRaw[RichPair](cell, RichPair(faces, rr));
+        richAt = cell as usize;
+        richMade = true;
+        return true;
+      }
     }
     case is None { print <- "docpanel: no font found (C:/Windows/Fonts/georgia.ttf)\n"; }
   }
@@ -806,26 +818,21 @@ pub struct DocPanel {
       owner.push(0usize);
       blockDiag.push(NOMATCH);
     }
-    var rp = richTake();
-    match &rp { case let Some(r) {
+    if richMade {
+      let r = richRef();
       layout = layoutRich(&blocks, &images, &r.faces, &self.config());
       self.fixGlyphs(&r.faces);
-    } else {} }
-    richPut(rp);
+    }
   }
 
   fn layoutOne(self: &, eb: &List[Block], cfg: &LayoutConfig) RichLayout {
     var out = emptyLayout(f32.from(DOC_TEX_W));
-    var rp = richTake();
-    match &rp { case let Some(r) { out = layoutRich(eb, &images, &r.faces, cfg); } else {} }
-    richPut(rp);
+    if richMade { let r = richRef(); out = layoutRich(eb, &images, &r.faces, cfg); }
     out
   }
 
   fn drawStrip(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, view: &RichView, el: &RichLayout, sel: &List[RectP], caret: &CaretRect) {
-    var rp = richTake();
-    match &mut rp { case var &mut Some(r) { r.rr.draw(device, encoder, &stripTarget, view, &r.faces, el, &images, sel, caret); } else {} }
-    richPut(rp);
+    if richMade { let r = richRef(); r.rr.draw(device, encoder, &stripTarget, view, &r.faces, el, &images, sel, caret); }
   }
 
   fn config(self: &) LayoutConfig {
@@ -991,19 +998,24 @@ pub struct DocPanel {
       f32.from(DOC_TEX_W), false);
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
+    let s0 = sdl.GetPerformanceCounter();
     var encoder = device.createCommandEncoder();
-    var rp = richTake();
-    match &mut rp { case var &mut Some(r) { r.rr.draw(device, &mut encoder, &target, &view, &r.faces, &layout, &images, &sel, &caret); } else {} }
-    richPut(rp);
+    if richMade { let r = richRef(); r.rr.draw(device, &mut encoder, &target, &view, &r.faces, &layout, &images, &sel, &caret); }
     encoder.copyTextureToBuffer(&target, &readback);
     device.queue.submit(encoder.finish());
     device.waitIdle();
+    let s1 = sdl.GetPerformanceCounter();
     while layout.rects.len() > keep { layout.rects.pop(); }
     var img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
+    let s2 = sdl.GetPerformanceCounter();
     darkenStems(&mut img);
     blitDiagrams(&mut img, &layout, &imgDiag, &cache, scrollY, pointedDiag, pointedKey);
     if err.len() > 0usize || note.len() > 0usize { self.errorStrip(device, &mut img); }
+    let s3 = sdl.GetPerformanceCounter();
     page.upload(device, &img);       // an sRGB texture with its whole mip chain, averaged in linear light
+    let s4 = sdl.GetPerformanceCounter();
+    print <- "docpanel: redraw: draw+wait "; print <- micros(s0, s1) / 1000.; print <- " ms, to image "; print <- micros(s1, s2) / 1000.;
+    print <- " ms, stems+diagrams "; print <- micros(s2, s3) / 1000.; print <- " ms, upload "; print <- micros(s3, s4) / 1000.; print <- " ms\n";
   }
 
   // The error as one red line at the foot of the page: laid out and drawn apart (richtext draws only a document),
