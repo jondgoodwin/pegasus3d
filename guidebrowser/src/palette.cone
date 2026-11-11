@@ -1,0 +1,708 @@
+// The palette (WI\studio-warehouse.md, "The palette"): one small tray of round icon buttons on the left hand (at the left foot of the view on the
+// desktop) that shows the set for what has focus (a document page, a web page, a diagram, a project, the room), with a few constant icons at its
+// root (undo, before/after, focus/release). The beam's dot on a button shows its name after 0.3 s; the trigger presses it. The grip lifts the tray
+// off the hand and leaves it floating (its place goes to room.toml); the dock icon returns it. A change of focus swaps the set with a short fan.
+//
+// Icons are Lucide's (ISC licence, ICONS-CREDIT.txt): paletteicons.cone holds them as path commands (tools\icons\gen_palette_icons.py), and
+// 'buildIconAtlas' strokes them through Cone's vector2d renderer into one RGBA atlas (128 px cells) when the studio starts; a button's picture
+// is a disc with its icon cut from that atlas, given to a PagePass like every other small page of the studio.
+
+const PAL_CELL = 128u32;
+const PAL_COLS = 8u32;
+const PAL_R = 0.0175f;            // a button's radius, meters (3.5 cm across)
+const PAL_HOVER_MS = 300u64;
+const PAL_PREFILL = 30usize;      // passes made in advance, two a frame: a pass is two pipelines
+const PAL_HUB_Y = -0.025f;        // where the fan opens from
+const PAL_DESK_SCALE = 1.1f;     // on the desktop the tray is drawn this much larger
+
+// ---- the default sets (studio.toml's [palette.KIND] overrides them; a set that is absent there is this) ----
+
+fn palDefault(kind: &str) List[String] {
+  var s = List[String]();
+  if kind == "document" {
+    s.push(String.from("pencil|Edit|edit")); s.push(String.from("mic|Dictate here|dictate")); s.push(String.from("file-plus|New page|newpage"));
+    s.push(String.from("external-link|Link as page|linkpage")); s.push(String.from("arrow-left|Back|back")); s.push(String.from("arrow-right|Forward|forward"));
+    s.push(String.from("archive|Shelve|shelve")); s.push(String.from("x|Close|close")); s.push(String.from("folder-open|Files|files"));
+  } else if kind == "web" {
+    s.push(String.from("arrow-left|Back|back")); s.push(String.from("arrow-right|Forward|forward")); s.push(String.from("rotate-cw|Reload page|webreload"));
+    s.push(String.from("globe|Address|address")); s.push(String.from("archive|Shelve|shelve")); s.push(String.from("x|Close|close"));
+    s.push(String.from("folder-open|Files|files"));
+  } else if kind == "diagram" {
+    s.push(String.from("square|Box|addbox")); s.push(String.from("move-up-right|Connect|connect")); s.push(String.from("tag|Label|labelit"));
+    s.push(String.from("type|Rename|rename")); s.push(String.from("trash|Delete|delete")); s.push(String.from("layout-dashboard|Re-lay out|relayout"));
+    s.push(String.from("archive|Shelve|shelve")); s.push(String.from("x|Close|close"));
+  } else if kind == "project" {
+    s.push(String.from("zoom-in|Zoom in|zoom")); s.push(String.from("zoom-out|Zoom out|zoomout")); s.push(String.from("eye|Look at it|open"));
+    s.push(String.from("archive|Shelve|shelve")); s.push(String.from("arrow-down-to-line|Bring|bring")); s.push(String.from("message-circle|Talk about it|talk"));
+  } else if kind == "laptop" {
+    s.push(String.from("laptop-minimal-check|Control laptop|laptopon")); s.push(String.from("monitor-off|Release laptop|laptopoff"));
+    s.push(String.from("folder-open|Files|files"));
+  } else {
+    s.push(String.from("file-plus|New page|newpage")); s.push(String.from("folder-plus|Park folder|park")); s.push(String.from("folder-open|Files|files"));
+    s.push(String.from("sun-dim|Passthrough|passthrough")); s.push(String.from("palette|Look|look")); s.push(String.from("refresh-cw|Reload config|reload"));
+  }
+  s
+}
+
+// The same as tables, for the first-run studio.toml
+fn paletteDefaultsText() String {
+  var s = String.from("\n# The palette (left hand; left foot of the view on the desktop): [palette.KIND] icons = [\"icon|Label|action\", ...] for the kinds of focus\n");
+  s.append("# document, web, diagram, project, room, laptop (the desk panel). Icons are Lucide names; a project's own [project.ID.menu.N] entries are added to the project set.\n");
+  s.append("# Actions: back forward shelve bring close files zoom zoomout open talk reload step:+1 ... link:X say:X; the others (edit dictate newpage ...) are\n");
+  s.append("# logged as not wired yet. Root icons (undo, before/after, focus/release) are always there.\n");
+  let kinds = ["document", "web", "diagram", "project", "room", "laptop"];
+  var k = 0usize;
+  while k < 6usize {
+    let set = palDefault(kinds[k]);
+    s.append("\n[palette."); s.append(kinds[k]); s.append("]\nicons = [");
+    var i = 0usize;
+    while i < set.len() {
+      if i > 0usize { s.append(", "); }
+      s.append(tomlStr(set[i].view()).view());
+      i = i + 1usize;
+    }
+    s.append("]\n");
+    k = k + 1usize;
+  }
+  s
+}
+
+// The icon a menu action of a project gets when the project's own menu adds it to the palette
+fn palIconFor(action: &str) &'static str {
+  if action == "step:+1" { return "skip-forward"; }
+  if action == "step:-1" { return "skip-back"; }
+  if action == "play" { return "play"; }
+  if action == "restart" || startsWithText(action, "scenario:") { return "list-restart"; }
+  if action == "legend" { return "info"; }
+  if action == "follow" { return "scan-eye"; }
+  if startsWithText(action, "link:") { return "external-link"; }
+  if startsWithText(action, "say:") { return "message-circle"; }
+  "circle-dot"
+}
+
+// ---- the icon atlas ----
+
+struct IconAtlas {
+  w: u32;
+  h: u32;
+  px: List[u8];           // RGBA, rows from the top; the alpha is each icon's coverage
+  names: List[String];
+}
+
+fn iconPathPx(cmds: &str, ox: f32, oy: f32, s: f32) VectorPath {
+  var path = VectorPath.make();
+  let t = cfgSplit(cmds, ' ');
+  var i = 0usize;
+  while i < t.len() {
+    let c = t[i].view();
+    i = i + 1usize;
+    if c == "M" || c == "L" {
+      var x = 0.0f; var y = 0.0f;
+      _ = cfgFloat(t[i].view(), &mut x); _ = cfgFloat(t[i + 1usize].view(), &mut y);
+      i = i + 2usize;
+      if c == "M" { path.moveTo(ox + x * s, oy + y * s); } else { path.lineTo(ox + x * s, oy + y * s); }
+    } else if c == "C" {
+      var v = List[f32]();
+      var j = 0usize;
+      while j < 6usize { var q = 0.0f; _ = cfgFloat(t[i + j].view(), &mut q); v.push(q); j = j + 1usize; }
+      i = i + 6usize;
+      path.cubicTo(ox + *v[0usize] * s, oy + *v[1usize] * s, ox + *v[2usize] * s, oy + *v[3usize] * s, ox + *v[4usize] * s, oy + *v[5usize] * s);
+    } else if c == "Z" { path.close(); }
+  }
+  path
+}
+
+// Every icon of paletteicons.cone stroked white (2 wide in its 24 box, round caps and joins) into its cell of one texture, and read back
+fn buildIconAtlas(device: &mut Device) IconAtlas {
+  let names = iconNames();
+  let cols = PAL_COLS;
+  let rows = (u32.from(names.len()) + cols - 1u32) / cols;
+  let aw = cols * PAL_CELL;
+  let ah = rows * PAL_CELL;
+  var out = IconAtlas(aw, ah, List[u8](), names.clone());
+  var maybe = makePainter(device);
+  match &mut maybe {
+    case var &mut Some(p) {
+      var canvas = Canvas.make(f32.from(aw), f32.from(ah));
+      let scale = 3.2f;
+      let pad = (f32.from(PAL_CELL) - 24. * scale) * 0.5;
+      var style = StrokeStyle.make(2. * scale);
+      style.cap = CAP_ROUND;
+      style.join = JOIN_ROUND;
+      var i = 0usize;
+      while i < names.len() {
+        let ox = f32.from((u32.from(i) % cols) * PAL_CELL) + pad;
+        let oy = f32.from((u32.from(i) / cols) * PAL_CELL) + pad;
+        let path = iconPathPx(iconCommands(names[i].view()).view(), ox, oy, scale);
+        canvas.stroke(&path, &Paint.solid(Color(1., 1., 1., 1.)), &style);
+        i = i + 1usize;
+      }
+      let desc = TextureDescriptor(aw, ah, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+      var target = device.createTexture(&desc);
+      var readback = device.createBuffer(u64.from(aw * ah * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+      var encoder = device.createCommandEncoder();
+      p.renderer.render(device, &mut encoder, &target, &canvas, &p.font, &mut p.atlas, true, Color(0., 0., 0., 0.));
+      encoder.copyTextureToBuffer(&target, &readback);
+      device.queue.submit(encoder.finish());
+      device.waitIdle();
+      let src = readback.mappedRange();
+      out.px = List[u8].withCapacity(usize.from(aw * ah * 4u32));
+      var n = 0usize;
+      let total = usize.from(aw * ah * 4u32);
+      while n < total { out.px.push(*(src + n)); n = n + 1usize; }
+      print <- "palette: icon atlas "; print <- aw; print <- "x"; print <- ah; print <- ", "; print <- names.len(); print <- " icons, "; print <- canvas.triangleCount(); print <- " triangles\n";
+    }
+    else { print <- "palette: no vector painter, no icons\n"; }
+  }
+  out
+}
+
+fn clamp01(v: f32) f32 { if v < 0. { 0. } else if v > 1. { 1. } else { v } }
+
+// A button's picture: a disc of 'bg' with a rim of 'rim' and the icon (white) over it; the corners are transparent
+fn composeButton(a: &IconAtlas, idx: usize, bg: u32, rim: u32) List[u8] {
+  let n = PAL_CELL;
+  var out = List[u8].withCapacity(usize.from(n * n * 4u32));
+  let cellX = (u32.from(idx) % PAL_COLS) * n;
+  let cellY = (u32.from(idx) / PAL_COLS) * n;
+  let have = idx < a.names.len() && a.px.len() > 0usize;
+  var y = 0u32;
+  while y < n {
+    var x = 0u32;
+    while x < n {
+      let fx = f32.from(x) + 0.5 - 64.;
+      let fy = f32.from(y) + 0.5 - 64.;
+      let d = (fx * fx + fy * fy).sqrt();
+      let cov = clamp01(63.5 - d);
+      let rc = if d > 58. { rim } else { bg };
+      var r = f32.from((rc >> 16u32) & 255u32);
+      var g = f32.from((rc >> 8u32) & 255u32);
+      var b = f32.from(rc & 255u32);
+      if have {
+        let o = usize.from(((cellY + y) * a.w + cellX + x) * 4u32 + 3u32);
+        let ia = f32.from(u32.from(*a.px[o])) / 255.;
+        r = r + (255. - r) * ia; g = g + (255. - g) * ia; b = b + (255. - b) * ia;
+      }
+      out.push(u8.from(u32.from(r))); out.push(u8.from(u32.from(g))); out.push(u8.from(u32.from(b)));
+      out.push(u8.from(u32.from(cov * 255.)));
+      x = x + 1u32;
+    }
+    y = y + 1u32;
+  }
+  out
+}
+
+// The tray under the buttons: a dark translucent rounded plate (336 x 248 px for 0.42 x 0.31 m); or, 'halo', a white disc
+fn composeBlob(w: u32, h: u32, radius: f32, halo: bool) List[u8] {
+  var out = List[u8].withCapacity(usize.from(w * h * 4u32));
+  var y = 0u32;
+  while y < h {
+    var x = 0u32;
+    while x < w {
+      let px = f32.from(x) + 0.5 - f32.from(w) * 0.5;
+      let py = f32.from(y) + 0.5 - f32.from(h) * 0.5;
+      var ax = px.abs() - (f32.from(w) * 0.5 - radius);
+      var ay = py.abs() - (f32.from(h) * 0.5 - radius);
+      if ax < 0. { ax = 0.; }
+      if ay < 0. { ay = 0.; }
+      let d = (ax * ax + ay * ay).sqrt() - radius;
+      let cov = clamp01(0.5 - d);
+      if halo {
+        out.push(255u8); out.push(236u8); out.push(160u8); out.push(u8.from(u32.from(cov * 0.95 * 255.)));
+      } else if d > -3. {
+        out.push(120u8); out.push(140u8); out.push(180u8); out.push(u8.from(u32.from(cov * 0.9 * 255.)));
+      } else {
+        out.push(22u8); out.push(30u8); out.push(46u8); out.push(u8.from(u32.from(cov * 0.62 * 255.)));
+      }
+      x = x + 1u32;
+    }
+    y = y + 1u32;
+  }
+  out
+}
+
+// ---- the palette ----
+
+struct PalEntry {
+  icon: String;
+  label: String;
+  action: String;
+}
+
+fn palEntryOf(text: &str) PalEntry {
+  let p = cfgSplit(text, '|');
+  if p.len() >= 3usize { return PalEntry(String.from(p[0usize].view()), String.from(p[1usize].view()), String.from(p[2usize].view())); }
+  PalEntry(String.from("circle-dot"), String.from(text), String.from(text))
+}
+
+struct PalBtn {
+  icon: String;
+  label: String;
+  action: String;
+  pass: usize;
+  imgKey: String;         // the picture the pass holds now (icon + colour)
+  ready: bool;
+  x: f32;                 // where it is now, and where it is going, in the tray's own meters
+  y: f32;
+  tx: f32;
+  ty: f32;
+  alpha: f32;
+  want: f32;
+  pressAt: u64;
+  root: bool;
+  lit: bool;              // the focus icon while focused ("release")
+}
+
+pub struct Palette {
+  pub ready: bool;
+  tried: bool;
+  fmt: u32;
+  atlas: IconAtlas;
+  passes: List[PagePass];
+  used: List[bool];
+  tray: Option[PagePass];
+  halo: Option[PagePass];
+  hoverLabel: Option[Label];
+  kind: String;
+  sig: String;
+  rootSig: String;
+  cur: List[PalBtn];
+  old: List[PalBtn];
+  roots: List[PalBtn];
+  pub docked: bool;
+  pub floatPos: Vec3;
+  pub xr: bool;
+  hand: Vec3;
+  deskAnchor: Vec3;
+  hoverRoot: bool;
+  hoverIdx: i32;
+  hoverSince: u64;
+  hoverHand: u32;
+  hoverText: String;
+  pub swaps: u32;
+  pub pressed: u32;
+  pub lastAction: String;
+  faceEye: Vec3;          // the head it was last drawn for: the tray faces it, for drawing and for pointing alike
+
+  pub fn empty() Palette {
+    Palette(false, false, 0u32, IconAtlas(0u32, 0u32, List[u8](), List[String]()), List[PagePass](), List[bool](), None, None, None,
+      String(), String(), String(), List[PalBtn](), List[PalBtn](), List[PalBtn](), true, Vec3(0., 0., 0.), false, Vec3(0., 1., 0.),
+      Vec3(0., 0., 0.), false, -1, 0u64, 0u32, String(), 0u32, 0u32, String(), Vec3(0., 1.6, 0.))
+  }
+
+  fn scale(self: &) f32 { if xr { 1. } else { PAL_DESK_SCALE } }
+
+  fn anchor(self: &) Vec3 {
+    if !docked { return floatPos; }
+    if xr { return hand + Vec3(0., 0.06, 0.); }
+    deskAnchor
+  }
+
+  // The tray's model: its own frame (meters, z = 0) facing 'eye', at the anchor, scaled
+  pub fn model(self: &, eye: Vec3) Mat4 {
+    let p = self.anchor();
+    let n = (eye - p).normalize();
+    let th = atan2(n.x, n.z);
+    let tilt = 0. - libc.asinf(n.y);
+    let s = self.scale();
+    Mat4.fromTrs(p, Quat.angleAxis(th, Vec3(0., 1., 0.)) * Quat.angleAxis(tilt, Vec3(1., 0., 0.)), Vec3(s, s, s))
+  }
+
+  pub fn setHand(self: &mut, pos: Vec3) { xr = true; hand = pos; }
+
+  fn acquire(self: &mut, device: &mut Device) usize {
+    var i = 0usize;
+    while i < used.len() { if !*used[i] { used.set(i, true); return i; } i = i + 1usize; }
+    passes.push(PagePass.create(device, fmt));
+    used.push(true);
+    passes.len() - 1usize
+  }
+
+  fn release(self: &mut, b: &PalBtn) { if b.pass < used.len() { used.set(b.pass, false); } }
+
+  fn newBtn(self: &mut, device: &mut Device, e: &PalEntry, root: bool) PalBtn {
+    let pass = self.acquire(device);
+    PalBtn(e.icon.clone(), e.label.clone(), e.action.clone(), pass, String(), false, 0., PAL_HUB_Y, 0., PAL_HUB_Y, 0., 1., 0u64, root, false)
+  }
+
+  // Where the buttons of a set of n stand: an arc of up to 7, then a second arc outside it
+  fn setSpot(i: usize, n: usize, ty: &mut f32) f32 {
+    let first = if n > 7usize { 7usize } else { n };
+    var arc = i;
+    var cnt = first;
+    var r = 0.095f;
+    if i >= 7usize { arc = i - 7usize; cnt = n - 7usize; r = 0.145; }
+    var deg = 90.0f;
+    if cnt > 1usize { deg = 155. - 130. * f32.from(u32.from(arc)) / f32.from(u32.from(cnt - 1usize)); }
+    let a = deg * 3.14159265 / 180.;
+    *ty = PAL_HUB_Y + r * sin(a);
+    r * cos(a)
+  }
+
+  fn layoutCur(self: &mut) {
+    var i = 0usize;
+    while i < cur.len() {
+      var y = 0.0f;
+      let x = Palette.setSpot(i, cur.len(), &mut y);
+      (&mut cur[i]).tx = x;
+      (&mut cur[i]).ty = y;
+      i = i + 1usize;
+    }
+    let m = roots.len();
+    var j = 0usize;
+    while j < m {
+      (&mut roots[j]).tx = (f32.from(u32.from(j)) - (f32.from(u32.from(m)) - 1.) * 0.5) * 0.045;
+      (&mut roots[j]).ty = -0.085;
+      j = j + 1usize;
+    }
+  }
+
+  // The set for a kind of focus changes: the old buttons fold back into the hub, the new ones fan out of it
+  fn swapSet(self: &mut, device: &mut Device, kindNow: &str, sigNow: &str, entries: &List[PalEntry]) {
+    var j = 0usize;
+    while j < old.len() { let b = &old[j]; if b.pass < used.len() { used.set(b.pass, false); } j = j + 1usize; }
+    old = List[PalBtn]();
+    var tmp = List[PalBtn]();
+    tmp <-> cur;
+    while tmp.len() > 0usize {
+      var b = tmp.remove(0usize);
+      b.want = 0.;
+      b.tx = 0.; b.ty = PAL_HUB_Y;
+      old.push(b);
+    }
+    var i = 0usize;
+    while i < entries.len() {
+      let b = self.newBtn(device, &entries[i], false);
+      cur.push(b);
+      i = i + 1usize;
+    }
+    self.layoutCur();
+    if kind.len() > 0usize { swaps = swaps + 1u32; }
+    print <- "palette: "; printStr(kindNow); print <- " set, "; print <- entries.len(); print <- " icons\n";
+    kind = String.from(kindNow);
+    sig = String.from(sigNow);
+  }
+
+  fn buildRoots(self: &mut, device: &mut Device, focusOn: bool) {
+    var i = 0usize;
+    while i < roots.len() { let b = &roots[i]; if b.pass < used.len() { used.set(b.pass, false); } i = i + 1usize; }
+    roots = List[PalBtn]();
+    let e0 = PalEntry(String.from("undo-2"), String.from("Undo"), String.from("undo"));
+    let r0 = self.newBtn(device, &e0, true);
+    roots.push(r0);
+    let e1 = PalEntry(String.from("square-split-horizontal"), String.from("Before / after"), String.from("beforeafter"));
+    let r1 = self.newBtn(device, &e1, true);
+    roots.push(r1);
+    let e2 = PalEntry(String.from(if focusOn { "minimize-2" } else { "focus" }), String.from(if focusOn { "Release" } else { "Focus" }), String.from("focus"));
+    var r2 = self.newBtn(device, &e2, true);
+    r2.lit = focusOn;
+    roots.push(r2);
+    if !docked {
+      let e3 = PalEntry(String.from("pin"), String.from("Dock on the hand"), String.from("dock"));
+      let r3 = self.newBtn(device, &e3, true);
+      roots.push(r3);
+    }
+    var k = 0usize;
+    while k < roots.len() { (&mut roots[k]).want = 1.; (&mut roots[k]).x = 0.; (&mut roots[k]).y = PAL_HUB_Y; k = k + 1usize; }
+    self.layoutCur();
+  }
+
+  fn iconIndex(self: &, name: &str) usize {
+    var i = 0usize;
+    while i < atlas.names.len() { if atlas.names[i].view() == name { return i; } i = i + 1usize; }
+    atlas.names.len()
+  }
+
+  // A few pictures a frame: the button's disc and icon into its pass
+  fn uploadSome(self: &mut, device: &mut Device) {
+    var left = 6;
+    var lists = 0u32;
+    while lists < 3u32 && left > 0 {
+      let n = if lists == 0u32 { cur.len() } else if lists == 1u32 { old.len() } else { roots.len() };
+      var i = 0usize;
+      while i < n && left > 0 {
+        if self.uploadOne(device, lists, i) { left = left - 1; }
+        i = i + 1usize;
+      }
+      lists = lists + 1u32;
+    }
+  }
+
+  // Button i of list 0 (the set), 1 (the leaving) or 2 (the roots): its picture into its pass, if it has none yet
+  fn uploadOne(self: &mut, device: &mut Device, which: u32, i: usize) bool {
+    var icon = String();
+    var pass = 0usize;
+    var root = false;
+    var lit = false;
+    var ready = false;
+    if which == 0u32 { let b = &cur[i]; icon = b.icon.clone(); pass = b.pass; root = b.root; lit = b.lit; ready = b.ready; }
+    else if which == 1u32 { let b = &old[i]; icon = b.icon.clone(); pass = b.pass; root = b.root; lit = b.lit; ready = b.ready; }
+    else { let b = &roots[i]; icon = b.icon.clone(); pass = b.pass; root = b.root; lit = b.lit; ready = b.ready; }
+    if ready || pass >= passes.len() { return false; }
+    let idx = self.iconIndex(icon.view());
+    let img = composeButton(&atlas, idx, if root { if lit { 0x8a5a14u32 } else { 0x4a3a78u32 } } else { 0x2c4a7au32 }, 0xa8bce0u32);
+    passes[pass].uploadRgba(device, PAL_CELL, PAL_CELL, &img);
+    if which == 0u32 { (&mut cur[i]).ready = true; } else if which == 1u32 { (&mut old[i]).ready = true; } else { (&mut roots[i]).ready = true; }
+    true
+  }
+
+  // Once a frame. 'entries' is only read when 'sigNow' differs from the set shown; 'sigNow' says what the set is for.
+  pub fn tick(self: &mut, device: &mut Device, lab: &mut Labeller, format: u32, dt: f32, now: u64, kindNow: &str, sigNow: &str,
+              build: &List[String], focusOn: bool) {
+    if !tried {
+      tried = true;
+      fmt = format;
+      atlas = buildIconAtlas(device);
+      tray = Some[PagePass](PagePass.create(device, format));
+      halo = Some[PagePass](PagePass.create(device, format));
+      match &mut tray { case var &mut Some(t) { t.uploadRgba(device, 336u32, 248u32, &composeBlob(336u32, 248u32, 44., false)); } else {} }
+      match &mut halo { case var &mut Some(h) { h.uploadRgba(device, PAL_CELL, PAL_CELL, &composeBlob(PAL_CELL, PAL_CELL, 64., true)); } else {} }
+      hoverLabel = Some[Label](Label(PagePass.create(device, format), 0.24, 0.06, false, String(), 0x1b2436ffu32, 0xffffffffu32, 56., 22.,
+        false, 0., false, false, 0.));
+      ready = atlas.px.len() > 0usize;
+      return;
+    }
+    if !ready { return; }
+    // passes made ahead, two a frame
+    var made = 0;
+    while passes.len() < PAL_PREFILL && made < 2 { passes.push(PagePass.create(device, fmt)); used.push(false); made = made + 1; }
+    if made > 0 && passes.len() < PAL_PREFILL { return; }
+    var rootNow = String.from(if focusOn { "f" } else { "n" });
+    rootNow.append(if docked { "d" } else { "u" });
+    if rootNow.view() != rootSig.view() {
+      rootSig = rootNow;
+      self.buildRoots(device, focusOn);
+    }
+    if sigNow != sig.view() {
+      var entries = List[PalEntry]();
+      var e = 0usize;
+      while e < build.len() { entries.push(palEntryOf(build[e].view())); e = e + 1usize; }
+      self.swapSet(device, kindNow, sigNow, &entries);
+    }
+    self.uploadSome(device);
+    // motion: toward the targets; old ones fade away and are released
+    let follow = if dt * 14. > 1. { 1. } else { dt * 14. };
+    var i = 0usize;
+    while i < cur.len() {
+      (&mut cur[i]).x = cur[i].x + (cur[i].tx - cur[i].x) * follow;
+      (&mut cur[i]).y = cur[i].y + (cur[i].ty - cur[i].y) * follow;
+      (&mut cur[i]).alpha = fadeToward(cur[i].alpha, cur[i].want, dt);
+      i = i + 1usize;
+    }
+    var r = 0usize;
+    while r < roots.len() {
+      (&mut roots[r]).x = roots[r].x + (roots[r].tx - roots[r].x) * follow;
+      (&mut roots[r]).y = roots[r].y + (roots[r].ty - roots[r].y) * follow;
+      (&mut roots[r]).alpha = fadeToward(roots[r].alpha, roots[r].want, dt);
+      r = r + 1usize;
+    }
+    var o = 0usize;
+    while o < old.len() {
+      (&mut old[o]).x = old[o].x + (old[o].tx - old[o].x) * follow;
+      (&mut old[o]).y = old[o].y + (old[o].ty - old[o].y) * follow;
+      (&mut old[o]).alpha = fadeToward(old[o].alpha, 0., dt);
+      o = o + 1usize;
+    }
+    var k = 0usize;
+    while k < old.len() {
+      if old[k].alpha < 0.01 { let b = old.remove(k); if b.pass < used.len() { used.set(b.pass, false); } } else { k = k + 1usize; }
+    }
+    // the hover label
+    var want: f32 = 0.;
+    var text = String();
+    if hoverIdx >= 0 && now >= hoverSince + PAL_HOVER_MS {
+      let hi = usize.from(u32.from(hoverIdx));
+      if hoverRoot && hi < roots.len() { text = roots[hi].label.clone(); }
+      else if !hoverRoot && hi < cur.len() { text = cur[hi].label.clone(); }
+      if text.len() > 0usize { want = 1.; }
+    }
+    match &mut hoverLabel {
+      case var &mut Some(hl) {
+        if text.len() > 0usize && text.view() != hl.text.view() {
+          hl.text = text;
+          hl.size = fitSize(hl.text.len(), 60.);
+          hl.ok = false;
+        }
+        if !hl.ok && hl.text.len() > 0usize {
+          fillLabel(lab, device, hl);
+          print <- "palette: name shown: "; printStr(hl.text.view()); print <- "\n";
+        }
+        hl.alpha = fadeToward(hl.alpha, want, dt);
+      }
+      else {}
+    }
+  }
+
+  // The button under a ray: 1 + the index among the roots, or 1001 + the index in the set, or 0; and how far along the ray. 'body' tells if
+  // the ray meets the tray's plate (for grabbing and for swallowing a click).
+  fn hitAt(self: &, eye: Vec3, dir: Vec3, t: &mut f32, body: &mut bool) u32 {
+    *t = -1.;
+    *body = false;
+    if !ready { return 0u32; }
+    let inv = self.model(faceEye).inverse();
+    let e = inv * eye;
+    let d = inv.transformVector(dir);
+    if d.z > -0.00001 && d.z < 0.00001 { return 0u32; }
+    let tt = (0. - e.z) / d.z;
+    if tt <= 0. { return 0u32; }
+    let p = e + d * tt;
+    *t = tt;
+    var top = 0.11f;
+    if cur.len() > 7usize { top = 0.165; }
+    if p.x >= -0.2 && p.x <= 0.2 && p.y >= -0.12 && p.y <= top { *body = true; } else { *t = -1.; return 0u32; }
+    let rr = PAL_R * 1.25;
+    var i = 0usize;
+    while i < roots.len() {
+      if roots[i].ready && roots[i].alpha > 0.5 && (p.x - roots[i].x).abs() <= rr && (p.y - roots[i].y).abs() <= rr
+        && (p.x - roots[i].x) * (p.x - roots[i].x) + (p.y - roots[i].y) * (p.y - roots[i].y) <= rr * rr { return 1u32 + u32.from(i); }
+      i = i + 1usize;
+    }
+    var c = 0usize;
+    while c < cur.len() {
+      if cur[c].ready && cur[c].alpha > 0.5 && (p.x - cur[c].x) * (p.x - cur[c].x) + (p.y - cur[c].y) * (p.y - cur[c].y) <= rr * rr { return 1001u32 + u32.from(c); }
+      c = c + 1usize;
+    }
+    0u32
+  }
+
+  // A hand's (or the mouse's) pointer along a ray: sets the hover; true if it is on the tray
+  pub fn point(self: &mut, hand2: u32, eye: Vec3, dir: Vec3, now: u64) bool {
+    var t = 0.0f;
+    var body = false;
+    let h = self.hitAt(eye, dir, &mut t, &mut body);
+    if h == 0u32 {
+      if hoverIdx >= 0 && hoverHand == hand2 { hoverIdx = -1; }
+      return body;
+    }
+    let isRoot = h < 1001u32;
+    let idx = if isRoot { i32.from(h - 1u32) } else { i32.from(h - 1001u32) };
+    if hoverIdx != idx || hoverRoot != isRoot {
+      hoverSince = now;
+      print <- "palette: pointer on "; print <- (if isRoot { "root icon " } else { "icon " }); print <- idx; print <- ", name after 0.3 s\n";
+    }
+    hoverIdx = idx; hoverRoot = isRoot; hoverHand = hand2;
+    true
+  }
+
+  pub fn reach(self: &, eye: Vec3, dir: Vec3) f32 {
+    var t = 0.0f;
+    var body = false;
+    _ = self.hitAt(eye, dir, &mut t, &mut body);
+    t
+  }
+
+  // The action a click on the tray takes: an empty string if it was not on a button; 'onBody' if it was on the plate
+  pub fn press(self: &mut, eye: Vec3, dir: Vec3, now: u64, onBody: &mut bool) String {
+    var t = 0.0f;
+    var body = false;
+    let h = self.hitAt(eye, dir, &mut t, &mut body);
+    *onBody = body;
+    if h == 0u32 { return String(); }
+    pressed = pressed + 1u32;
+    if h < 1001u32 {
+      let i = usize.from(h - 1u32);
+      (&mut roots[i]).pressAt = now;
+      lastAction = roots[i].action.clone();
+      return roots[i].action.clone();
+    }
+    let i = usize.from(h - 1001u32);
+    (&mut cur[i]).pressAt = now;
+    lastAction = cur[i].action.clone();
+    cur[i].action.clone()
+  }
+
+  // The label of a button just pressed, for the log
+  pub fn labelOf(self: &, action: &str) String {
+    var i = 0usize;
+    while i < roots.len() { if roots[i].action.view() == action { return roots[i].label.clone(); } i = i + 1usize; }
+    var c = 0usize;
+    while c < cur.len() { if cur[c].action.view() == action { return cur[c].label.clone(); } c = c + 1usize; }
+    String.from(action)
+  }
+
+  // The world position of button n of the set (n >= 1000: n - 1000 of the roots), for the test hooks; w 0 if there is none
+  pub fn spot(self: &, n: u32, eye: Vec3) Vec4 {
+    var x = 0.0f; var y = 0.0f;
+    if n >= 1000u32 {
+      let i = usize.from(n - 1000u32);
+      if i >= roots.len() { return Vec4(0., 0., 0., 0.); }
+      x = roots[i].tx; y = roots[i].ty;
+    } else {
+      let i = usize.from(n);
+      if i >= cur.len() { return Vec4(0., 0., 0., 0.); }
+      x = cur[i].tx; y = cur[i].ty;
+    }
+    let p = self.model(faceEye) * Vec3(x, y, 0.);
+    Vec4(p.x, p.y, p.z, 1.)
+  }
+
+  pub fn setCount(self: &) usize { cur.len() }
+  pub fn kindNow(self: &) String { kind.clone() }
+
+  // Into the frame: the tray, the leaving buttons, the set, the root, the halo behind the hovered one, then its name. No depth test: it is the
+  // hand's, and stays whole.
+  pub fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4, eye: Vec3, now: u64) {
+    if !ready { return; }
+    if !xr {
+      // the left foot of the view, 0.8 m from the eye
+      let inv = vp.inverse();
+      let p0 = inv * Vec4(-0.52, -0.58, 0., 1.);
+      let p1 = inv * Vec4(-0.52, -0.58, 1., 1.);
+      let a = p0.xyz() * (1. / p0.w);
+      let b = p1.xyz() * (1. / p1.w);
+      deskAnchor = eye + (b - a).normalize() * 0.8;
+    }
+    faceEye = eye;
+    let m = vp * self.model(eye);
+    var top = 0.11f;
+    if cur.len() > 7usize { top = 0.165; }
+    match &mut tray {
+      case var &mut Some(t) { t.drawFaded(device, encoder, target, depth, m, Vec4(-0.2, -0.12, 0.2, top), 1.); }
+      else {}
+    }
+    var o = 0usize;
+    while o < old.len() { self.drawBtn(device, encoder, target, depth, m, 0u32, o, now); o = o + 1usize; }
+    var c = 0usize;
+    while c < cur.len() { self.drawBtn(device, encoder, target, depth, m, 1u32, c, now); c = c + 1usize; }
+    var r = 0usize;
+    while r < roots.len() { self.drawBtn(device, encoder, target, depth, m, 2u32, r, now); r = r + 1usize; }
+    match &mut hoverLabel {
+      case var &mut Some(hl) {
+        if hl.ok && hl.alpha > 0.01 && hoverIdx >= 0 {
+          let hi = usize.from(u32.from(hoverIdx));
+          var bx = 0.0f; var byy = 0.0f;
+          if hoverRoot && hi < roots.len() { bx = roots[hi].x; byy = roots[hi].y; }
+          else if !hoverRoot && hi < cur.len() { bx = cur[hi].x; byy = cur[hi].y; }
+          let w = hl.w * 0.55;
+          let h = hl.h * 0.55;
+          let ly = byy + 0.045;
+          hl.pass.drawFaded(device, encoder, target, depth, m, Vec4(bx - w * 0.5, ly - h * 0.5, bx + w * 0.5, ly + h * 0.5), hl.alpha);
+        }
+      }
+      else {}
+  }
+  }
+
+  // kind: 0 leaving, 1 the set, 2 the roots
+  fn drawBtn(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, m: Mat4, kindL: u32, i: usize, now: u64) {
+    var bx = 0.0f; var byy = 0.0f; var al = 0.0f; var pass = 0usize; var ready = false; var pressAt = 0u64;
+    if kindL == 0u32 { let b = &old[i]; bx = b.x; byy = b.y; al = b.alpha; pass = b.pass; ready = b.ready; pressAt = b.pressAt; }
+    else if kindL == 1u32 { let b = &cur[i]; bx = b.x; byy = b.y; al = b.alpha; pass = b.pass; ready = b.ready; pressAt = b.pressAt; }
+    else { let b = &roots[i]; bx = b.x; byy = b.y; al = b.alpha; pass = b.pass; ready = b.ready; pressAt = b.pressAt; }
+    if !ready || al < 0.01 || pass >= passes.len() { return; }
+    var sc = 1.0f;
+    let hov = kindL != 0u32 && hoverIdx >= 0 && usize.from(u32.from(hoverIdx)) == i && hoverRoot == (kindL == 2u32);
+    if hov { sc = 1.18; }
+    if now < pressAt + 160u64 { sc = 0.82; }
+    if kindL == 0u32 { sc = 0.6 + 0.4 * al; } else if al < 1. { sc = sc * (0.5 + 0.5 * al); }
+    let rr = PAL_R * sc;
+    if hov {
+      let hr = PAL_R * 1.32;
+      match &mut halo {
+        case var &mut Some(h) { h.drawFaded(device, encoder, target, depth, m, Vec4(bx - hr, byy - hr, bx + hr, byy + hr), 1.); }
+        else {}
+      }
+    }
+    passes[pass].drawFaded(device, encoder, target, depth, m, Vec4(bx - rr, byy - rr, bx + rr, byy + rr), al);
+  }
+}

@@ -26,6 +26,17 @@ const DOC_TEXT_PX = 22.;         // body text, pixels of em (about 1 degree at t
 const DOC_TEX_H = 1810u32;       // A-series proportions (1 : 1.414)
 const DOC_WORLD_W = 1.346;       // meters across: 41 degrees at 1.8 m
 const DOC_CENTRE_Y = 1.45;       // meters up, the panel's middle: a little below the eye
+// A code or plain-text file opens on a wider page (1.6 times as wide, the same pixels to the metre): lines are not wrapped, the
+// right stick / wheel scrolls it sideways. Its bottom edge stands where the standard page's does.
+const WIDE_TEX_W = 2048u32;
+const WIDE_TEX_H = 1290u32;
+const WIDE_WORLD_W = 2.154f;
+const CODE_LAYOUT_W = 9000.f;     // a code page is laid out this wide, so a line wraps only past it
+const SCROLL_NOTCH_PX = 110.f;    // one wheel notch, in page pixels
+const UP_BAND_ROWS = 160u32;     // rows of RGB -> RGBA per slice of the first upload
+const UP_SLICE_MS = 3.;          // the upload's budget a frame, milliseconds
+const UP_MIP_HOLD_MS = 150u64;   // the mip chain waits this long after the last redraw (a scroll is redrawing every frame)
+const REDRAW_GAP_MS = 30u64;     // a scroll redraws at most this often
 const FADE_SECONDS = 10.;
 const FADE_HOLD_SECONDS = 1.;    // full strength for this long first
 const FADE_LOW = 110.;           // the steady strength of an old mark, of 255
@@ -206,6 +217,32 @@ fn codePointAt(t: &str, o: usize) u32 {
   cp
 }
 
+// A page's pass (a shader module and two pipelines: about 15 ms of a frame) made a frame ahead of the page that will want it, so that opening a
+// page does not pay for it (the worst-frame gate). Kept on the heap behind an address, as the shared fonts are.
+var @threadlocal spareAt = 0usize;
+var @threadlocal spareWaitUntil = 0u64;
+
+fn spareTake(device: &mut Device, format: u32) PagePass {
+  spareWaitUntil = nowMs() + 400u64;
+  if spareAt != 0usize {
+    let cell = spareAt as *PagePass;
+    let v = mem.readRaw[PagePass](cell);
+    libc.free(cell as *u8);
+    spareAt = 0usize;
+    return v;
+  }
+  PagePass.create(device, format)
+}
+
+// Called once a frame when the studio is idle: makes the spare if there is none (and none was taken a moment ago)
+fn spareMake(device: &mut Device, format: u32) {
+  if spareAt != 0usize || nowMs() < spareWaitUntil { return; }
+  let p = PagePass.create(device, format);
+  let cell = libc.malloc(mem.sizeof[PagePass]()) as *PagePass;
+  mem.writeRaw[PagePass](cell, p);
+  spareAt = cell as usize;
+}
+
 // A mark where a block was taken away: the margin line stands at the top of block 'before' (the new index of the next
 // block that stayed; the block count if none did)
 struct Del {
@@ -250,6 +287,17 @@ pub struct DocPanel {
   imgDiag: List[usize];          // for each image of 'images', its diagram in 'cache'
   pub openDirs: List[String];    // a tree page: the folders expanded
   treeCache: TreeCache;
+  up: PageUp;                   // the picture on its way to the GPU, a slice a frame (pageup.cone)
+  texW: u32 = 1280u32;           // this page's texture and its size in the world (a code page is wider)
+  texH: u32 = 1810u32;
+  worldW: f32 = 1.346;
+  wide: bool = false;
+  scrollX: f32 = 0.;             // how far a wide page is scrolled sideways, and the most it can be
+  maxX: f32 = 0.;
+  pendingFirst: bool = false;    // created, not yet read: the first tick does it (opening a page is spread over frames)
+  phase2: bool = false;          // the page is drawn into 'target'; the rest of the redraw (to image, upload) comes next frame
+  drawScrollY: f32 = 0.;
+  drawScrollX: f32 = 0.;
   pointedDiag: usize = 18446744073709551615usize;   // the diagram last clicked, and the thing in it
   pointedKey: usize = 18446744073709551615usize;
   ticks: u32 = 0u32;
@@ -278,23 +326,37 @@ pub struct DocPanel {
     var made: Option[DocPanel] = None;
     {
       {
+        let c0 = sdl.GetPerformanceCounter();
         if ensureRich(device) {
-          let desc = TextureDescriptor(DOC_TEX_W, DOC_TEX_H, TEXTURE_FORMAT_RGBA8_UNORM,
+          let isWide = wantsWide(file);
+          let tw = if isWide { WIDE_TEX_W } else { DOC_TEX_W };
+          let th = if isWide { WIDE_TEX_H } else { DOC_TEX_H };
+          let desc = TextureDescriptor(tw, th, TEXTURE_FORMAT_RGBA8_UNORM,
             TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
           var target = device.createTexture(&desc);
-          var readback = device.createBuffer(u64.from(DOC_TEX_W * DOC_TEX_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
-          let sdesc = TextureDescriptor(DOC_TEX_W, STRIP_H, TEXTURE_FORMAT_RGBA8_UNORM,
+          var readback = device.createBuffer(u64.from(tw * th * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+          let sdesc = TextureDescriptor(tw, STRIP_H, TEXTURE_FORMAT_RGBA8_UNORM,
             TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
           var stripTarget = device.createTexture(&sdesc);
-          var stripBuf = device.createBuffer(u64.from(DOC_TEX_W * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
-          let page = PagePass.create(device, outFormat);
+          var stripBuf = device.createBuffer(u64.from(tw * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+          let c1 = sdl.GetPerformanceCounter();
+          let page = spareTake(device, outFormat);
+          let c2 = sdl.GetPerformanceCounter();
           var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
-            emptyLayout(f32.from(DOC_TEX_W)), target, readback, stripTarget, stripBuf,
+            emptyLayout(f32.from(tw)), target, readback, stripTarget, stripBuf,
             page, List[u64](), List[u32](), List[Del](), String(), String(),
             List[HistEntry](), String(), String(), String(), String(), List[String](), String(),
-            None, List[Diagram](), List[usize](), List[usize](), List[String](), TreeCache());
+            None, List[Diagram](), List[usize](), List[usize](), List[String](), TreeCache(), PageUp.idle());
+          p.wide = isWide;
+          p.texW = tw;
+          p.texH = th;
+          p.worldW = if isWide { WIDE_WORLD_W } else { f32.from(DOC_WORLD_W) };
           p.scrollY = initialScroll;
-          p.reload(device, renderer, true);
+          let c3 = sdl.GetPerformanceCounter();
+          p.pendingFirst = true;
+          let c4 = sdl.GetPerformanceCounter();
+          print <- "docpanel: create: fonts "; print <- micros(c0, c1) / 1000.; print <- " ms (textures included), page pass "; print <- micros(c1, c2) / 1000.;
+          print <- " ms, reload "; print <- micros(c3, c4) / 1000.; print <- " ms\n";
           p.hist.push(HistEntry(String.from(file), 0.));
           made = Some[DocPanel](p);
         }
@@ -306,6 +368,7 @@ pub struct DocPanel {
   // Look at the file every POLL_MS, read it again when it has changed, and redraw what has to be
   pub fn tick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     let now = nowMs();
+    if pendingFirst { pendingFirst = false; self.reload(device, renderer, true); return; }
     self.serveLinks(device, renderer);
     // the first frames are crowded with the arrival's own command buffers (a frame may record 16): diagrams wait
     ticks = ticks + 1u32;
@@ -328,11 +391,18 @@ pub struct DocPanel {
       }
       if again { self.reload(device, renderer, false); }
     }
+    // The picture drawn last frame goes to the CPU image and starts up to the GPU; a slice of that upload each frame after
+    if phase2 {
+      // (the image, stems and diagrams are about 9 ms: alone in their frame, after the slices of the others)
+      if upSpentUs == 0u64 { self.redrawFinish(device); upSpentUs = UP_SLICE_US; }
+      return;
+    }
+    if up.busy { up.step(device, &mut page, now); }
     // the bars fade: redraw while any is still fading, then once more at rest
     if now >= lastDraw + POLL_MS && self.fading(now) {
       self.redraw(device, renderer);
     }
-    else if dirty { self.redraw(device, renderer); }
+    else if dirty && now >= lastDraw + REDRAW_GAP_MS { self.redraw(device, renderer); }
   }
 
   // ---- links, history, anchors ----
@@ -382,22 +452,22 @@ pub struct DocPanel {
     while li < layout.lines.len() {
       let ln = layout.lines[li];
       let py = ln.top + ln.height * 0.5;
-      if py > scrollY + 30. && py < scrollY + f32.from(DOC_TEX_H) - 30. {
+      if py > scrollY + 30. && py < scrollY + f32.from(texH) - 30. {
         var last = String();
         var from = 0.f;
         var x = 20.f;
-        while x <= f32.from(DOC_TEX_W) {
+        while x <= f32.from(texW) {
           var t = String();
-          if x < f32.from(DOC_TEX_W) - 20. { t = self.linkAtPx(li, x, py); }
+          if x < f32.from(texW) - 20. { t = self.linkAtPx(li, x, py); }
           if !sameText(t.view(), last.view()) {
             if last.len() > 0usize {
               if seen == k {
                 let px = (from + x) * 0.5;
-                let w = f32.from(DOC_WORLD_W);
-                let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
-                let u = px / f32.from(DOC_TEX_W);
-                let v = 1. - (py - scrollY) / f32.from(DOC_TEX_H);
-                return Vec4(u * w - w * 0.5, v * h + (f32.from(DOC_CENTRE_Y) - h * 0.5), 0., 1.);
+                let w = f32.from(worldW);
+                let h = w * f32.from(texH) / f32.from(texW);
+                let u = (px - scrollX) / f32.from(texW);
+                let v = 1. - (py - scrollY) / f32.from(texH);
+                return Vec4(u * w - w * 0.5, v * h + (self.centreY() - h * 0.5), 0., 1.);
               }
               seen = seen + 1usize;
             }
@@ -663,7 +733,34 @@ pub struct DocPanel {
       let md = diagramMarkdown(file.view(), text.view());
       return parseMarkdown(md.view());
     }
-    if isBrowse(file.view()) || isDocument(file.view()) { parseMarkdown(text.view()) } else { parseCode(text.view(), file.view()) }
+    if wantsWide(file.view()) { parseCode(text.view(), file.view()) } else { parseMarkdown(text.view()) }
+  }
+
+  // The page's height in the world, and where its middle stands: the bottom edge is the standard page's whatever the size
+  fn worldH(self: &) f32 { f32.from(worldW) * f32.from(texH) / f32.from(texW) }
+  fn centreY(self: &) f32 {
+    let stdHalf = 0.5 * f32.from(DOC_WORLD_W) * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    f32.from(DOC_CENTRE_Y) - stdHalf + 0.5 * self.worldH()
+  }
+
+  // A file that wants the other page shape (a code file after a document, or back) gets new targets before it is laid out
+  fn fitShape(self: &mut, device: &mut Device) {
+    let want = wantsWide(file.view());
+    if want == wide { return; }
+    wide = want;
+    texW = if want { WIDE_TEX_W } else { DOC_TEX_W };
+    texH = if want { WIDE_TEX_H } else { DOC_TEX_H };
+    worldW = if want { WIDE_WORLD_W } else { f32.from(DOC_WORLD_W) };
+    let desc = TextureDescriptor(texW, texH, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+    target = device.createTexture(&desc);
+    readback = device.createBuffer(u64.from(texW * texH * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+    let sdesc = TextureDescriptor(texW, STRIP_H, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+    stripTarget = device.createTexture(&sdesc);
+    stripBuf = device.createBuffer(u64.from(texW * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+    phase2 = false;
+    up.cancel();
+    scrollX = 0.;
+    print <- "docpanel: page shape "; print <- if want { "wide (code)" } else { "standard" }; print <- ", "; print <- texW; print <- "x"; print <- texH; print <- "\n";
   }
 
   fn reloadText(self: &mut, device: &mut Device, renderer: &mut Renderer, first: bool, s: &str) {
@@ -673,6 +770,7 @@ pub struct DocPanel {
         if !first && sameText(s, text.view()) && err.len() == 0usize { return; }
         let hadError = err.len() > 0usize;
         text = String.from(s);
+        self.fitShape(device);
         if hadError { err = String(); dirty = true; print <- "docpanel: error line cleared\n"; }
         let fresh = self.parseText();
         // where the top of the view is, to put it back
@@ -828,7 +926,7 @@ pub struct DocPanel {
         }
         // the painter (a font, an atlas, a pipeline) is made when the first diagram is wanted
         if !painterTried { painterTried = true; painter = makePainter(device); }
-        let di = diagramFor(&mut painter, device, &mut cache, src.view(), DOC_TEX_W - 128u32);
+        let di = diagramFor(&mut painter, device, &mut cache, src.view(), texW - 128u32);
         if di != NOMATCH && cache[di].w > 0u32 {
           images.push(ImageInfo(f32.from(cache[di].w), f32.from(cache[di].h), PL_INLINE, String.from("diagram"), 0u32, 0u32, List[u8]()));
           imgDiag.push(di);
@@ -861,10 +959,25 @@ pub struct DocPanel {
       layout = layoutRich(&blocks, &images, &r.faces, &self.config());
       self.fixGlyphs(&r.faces);
     }
+    // a wide page scrolls sideways as far as its longest line
+    maxX = 0.;
+    if wide {
+      var right: f32 = 0.;
+      var gi = 0usize;
+      while gi < layout.glyphs.len() {
+        let e = layout.glyphs[gi].x + layout.glyphs[gi].adv;
+        if e > right { right = e; }
+        gi = gi + 1usize;
+      }
+      maxX = right + 64. - f32.from(texW);
+      if maxX < 0. { maxX = 0.; }
+      print <- "docpanel: longest line reaches "; print <- right; print <- " px; sideways scroll up to "; print <- maxX; print <- "\n";
+    }
+    self.clampScroll();
   }
 
   fn layoutOne(self: &, eb: &List[Block], cfg: &LayoutConfig) RichLayout {
-    var out = emptyLayout(f32.from(DOC_TEX_W));
+    var out = emptyLayout(f32.from(texW));
     if richMade { let r = richRef(); out = layoutRich(eb, &images, &r.faces, cfg); }
     out
   }
@@ -874,7 +987,7 @@ pub struct DocPanel {
   }
 
   fn config(self: &) LayoutConfig {
-    var cfg = LayoutConfig.standard(f32.from(DOC_TEX_W));
+    var cfg = LayoutConfig.standard(if wide { CODE_LAYOUT_W } else { f32.from(texW) });
     cfg.margin = 64.;
     cfg.marginTop = 48.;
     cfg.baseSize = f32.from(DOC_TEXT_PX);
@@ -952,18 +1065,39 @@ pub struct DocPanel {
   }
 
   fn clampScroll(self: &mut) {
-    let most = layout.height - f32.from(DOC_TEX_H);
+    let most = layout.height - f32.from(texH);
     if scrollY > most { scrollY = most; }
     if scrollY < 0. { scrollY = 0.; }
+    if scrollX > maxX { scrollX = maxX; }
+    if scrollX < 0. { scrollX = 0.; }
   }
 
   // The wheel: 'notches' (positive: away from the user, which is up the page)
   pub fn scroll(self: &mut, notches: f32) {
-    scrollY = scrollY - notches * 110.;
+    scrollY = scrollY - notches * SCROLL_NOTCH_PX;
     self.clampScroll();
     dirty = true;
     print <- "docpanel: wheel "; print <- notches; print <- ": scroll "; print <- scrollY; print <- " of "; print <- layout.height; print <- "\n";
   }
+
+  // The one way every kind of panel is scrolled (the document pages, the browser, the report, the main panel; the trees of the zones
+  // build use it too): 'dx' and 'dy' are wheel notches, positive meaning right and up the page (so a stick's push up or right is positive).
+  // A page redraws at most every REDRAW_GAP_MS while it is scrolled; the log is left to the caller.
+  pub fn scrollBy(self: &mut, dx: f32, dy: f32) {
+    let ox = scrollX;
+    let oy = scrollY;
+    scrollY = scrollY - dy * SCROLL_NOTCH_PX;
+    if wide { scrollX = scrollX + dx * SCROLL_NOTCH_PX; }
+    self.clampScroll();
+    if scrollX != ox || scrollY != oy { dirty = true; }
+  }
+
+  // This panel's scroll offset, in page pixels, and the most it goes (for a caller that draws a bar or shares the offset)
+  pub fn offset(self: &) ScrollOffset {
+    ScrollOffset(scrollX, scrollY, maxX, if layout.height > f32.from(texH) { layout.height - f32.from(texH) } else { 0. })
+  }
+
+  pub fn isWide(self: &) bool { wide }
 
   // A mark's strength, 0 to 255: strong for a while, then down to FADE_LOW and staying there
   fn strength(now: u64, born: u64) u32 {
@@ -1013,7 +1147,7 @@ pub struct DocPanel {
       if any {
         top = top - 4.;
         bot = bot + 4.;
-        let wd = f32.from(DOC_TEX_W);
+        let wd = f32.from(texW);
         layout.rects.push(RectP(36., top, wd - 72., bot - top, 0xf5b02000u32 | 0x34u32, RK_UNDERLINE));
         layout.rects.push(RectP(36., top, wd - 72., 3., 0xd9820000u32 | 0xe0u32, RK_UNDERLINE));
         layout.rects.push(RectP(36., bot - 3., wd - 72., 3., 0xd9820000u32 | 0xe0u32, RK_UNDERLINE));
@@ -1032,8 +1166,8 @@ pub struct DocPanel {
       layout.rects.push(RectP(10., y - 1.5, 26., 3., 0xd0203000u32 | DocPanel.strength(now, dels[k].born), RK_UNDERLINE));
       k = k + 1usize;
     }
-    let view = RichView(f32.from(DOC_TEX_W), f32.from(DOC_TEX_H), 0., scrollY, PAPER, PAPER, 0u32, 0u32,
-      f32.from(DOC_TEX_W), false);
+    let view = RichView(f32.from(texW), f32.from(texH), 0. - scrollX, scrollY, PAPER, PAPER, 0u32, 0u32,
+      if wide { CODE_LAYOUT_W } else { f32.from(texW) }, false);
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
     let s0 = sdl.GetPerformanceCounter();
@@ -1044,16 +1178,28 @@ pub struct DocPanel {
     device.waitIdle();
     let s1 = sdl.GetPerformanceCounter();
     while layout.rects.len() > keep { layout.rects.pop(); }
-    var img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
+    // (the rest, next frame: the readback, the stems and the upload are each a frame's work of their own)
+    drawScrollY = scrollY;
+    drawScrollX = scrollX;
+    phase2 = true;
+    print <- "docpanel: redraw: draw+wait "; print <- micros(s0, s1) / 1000.; print <- " ms\n";
+  }
+
+  // The second half of a redraw: the target's pixels to an image, the stems darkened, the diagrams and the error strip put on, and the
+  // image handed to the sliced upload (pageup.cone), which a tick advances a little at a time
+  fn redrawFinish(self: &mut, device: &mut Device) {
+    phase2 = false;
+    let s1 = sdl.GetPerformanceCounter();
+    var img = Image.fromTexels(readback.mappedRange(), i32.from(texW), i32.from(texH), false);
     let s2 = sdl.GetPerformanceCounter();
     darkenStems(&mut img);
-    blitDiagrams(&mut img, &layout, &imgDiag, &cache, scrollY, pointedDiag, pointedKey);
+    blitDiagrams(&mut img, &layout, &imgDiag, &cache, drawScrollY, pointedDiag, pointedKey, i32.from(texW), i32.from(texH));
     if err.len() > 0usize || note.len() > 0usize { self.errorStrip(device, &mut img); }
     let s3 = sdl.GetPerformanceCounter();
-    page.upload(device, &img);       // an sRGB texture with its whole mip chain, averaged in linear light
+    up.begin(&mut img, nowMs() + UP_MIP_HOLD_MS);
     let s4 = sdl.GetPerformanceCounter();
-    print <- "docpanel: redraw: draw+wait "; print <- micros(s0, s1) / 1000.; print <- " ms, to image "; print <- micros(s1, s2) / 1000.;
-    print <- " ms, stems+diagrams "; print <- micros(s2, s3) / 1000.; print <- " ms, upload "; print <- micros(s3, s4) / 1000.; print <- " ms\n";
+    print <- "docpanel: redraw: to image "; print <- micros(s1, s2) / 1000.;
+    print <- " ms, stems+diagrams "; print <- micros(s2, s3) / 1000.; print <- " ms, upload begun "; print <- micros(s3, s4) / 1000.; print <- " ms\n";
   }
 
   // The error as one red line at the foot of the page: laid out and drawn apart (richtext draws only a document),
@@ -1078,8 +1224,8 @@ pub struct DocPanel {
     cfg.marginTop = 10.;
     cfg.baseSize = 22.;
     let el = self.layoutOne(&eb, &cfg);
-    let view = RichView(f32.from(DOC_TEX_W), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32,
-      f32.from(DOC_TEX_W), false);
+    let view = RichView(f32.from(texW), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32,
+      f32.from(texW), false);
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
     var encoder = device.createCommandEncoder();
@@ -1087,9 +1233,9 @@ pub struct DocPanel {
     encoder.copyTextureToBuffer(&stripTarget, &stripBuf);
     device.queue.submit(encoder.finish());
     device.waitIdle();
-    let strip = Image.fromTexels(stripBuf.mappedRange(), i32.from(DOC_TEX_W), i32.from(STRIP_H), false);
+    let strip = Image.fromTexels(stripBuf.mappedRange(), i32.from(texW), i32.from(STRIP_H), false);
     // both are bottom row first: the strip's rows 0.. go over the page's rows 0..
-    let n = usize.from(DOC_TEX_W * STRIP_H * 3u32);
+    let n = usize.from(texW * STRIP_H * 3u32);
     var p = 0usize;
     while p < n { img.pixels.set(p, *strip.pixels[p]); p = p + 1usize; }
     if err.len() == 0usize {
@@ -1110,7 +1256,7 @@ pub struct DocPanel {
     cfg.marginTop = 10.;
     cfg.baseSize = 22.;
     let el = self.layoutOne(&eb, &cfg);
-    let view = RichView(f32.from(DOC_TEX_W), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32, f32.from(DOC_TEX_W), false);
+    let view = RichView(f32.from(texW), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32, f32.from(texW), false);
     let sel = List[RectP]();
     let caret = CaretRect(0., 0., 0.);
     var encoder = device.createCommandEncoder();
@@ -1118,7 +1264,7 @@ pub struct DocPanel {
     encoder.copyTextureToBuffer(&stripTarget, &stripBuf);
     device.queue.submit(encoder.finish());
     device.waitIdle();
-    let strip = Image.fromTexels(stripBuf.mappedRange(), i32.from(DOC_TEX_W), i32.from(STRIP_H), false);
+    let strip = Image.fromTexels(stripBuf.mappedRange(), i32.from(texW), i32.from(STRIP_H), false);
     let x0 = usize.from(CHIP_X0 + slot * CHIP_STEP);
     var ry = 0usize;
     while ry < usize.from(CHIP_H) {
@@ -1128,7 +1274,7 @@ pub struct DocPanel {
       while cx < usize.from(CHIP_W) {
         var c = 0usize;
         while c < 3usize {
-          img.pixels.set((dstRow * usize.from(DOC_TEX_W) + x0 + cx) * 3usize + c, *strip.pixels[(srcRow * usize.from(DOC_TEX_W) + cx) * 3usize + c]);
+          img.pixels.set((dstRow * usize.from(texW) + x0 + cx) * 3usize + c, *strip.pixels[(srcRow * usize.from(texW) + cx) * 3usize + c]);
           c = c + 1usize;
         }
         cx = cx + 1usize;
@@ -1146,7 +1292,7 @@ pub struct DocPanel {
       var x = cx - 14i32;
       while x <= cx + 14i32 {
         if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= 196i32 {
-          let o = (usize.from(y) * usize.from(DOC_TEX_W) + usize.from(x)) * 3usize;
+          let o = (usize.from(y) * usize.from(texW) + usize.from(x)) * 3usize;
           img.pixels.set(o, 230u8);
           img.pixels.set(o + 1usize, 20u8);
           img.pixels.set(o + 2usize, 20u8);
@@ -1159,17 +1305,17 @@ pub struct DocPanel {
 
   // Record the page into 'target' (the finished picture, kept), unlit, from the camera's view and projection
   pub fn drawPage(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4) {
-    let w = f32.from(DOC_WORLD_W) * 0.5;
-    let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
-    let y = f32.from(DOC_CENTRE_Y);
+    let w = f32.from(worldW) * 0.5;
+    let h = w * f32.from(texH) / f32.from(texW);
+    let y = self.centreY();
     page.draw(device, encoder, target, viewProjection, Vec4(0. - w, y - h, w, y + h));
   }
 
   // As drawPage, hidden where the scene's depth is nearer (the warehouse: a beam or a dot in front of the page shows)
   pub fn drawPageDepth(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, viewProjection: Mat4) {
-    let w = f32.from(DOC_WORLD_W) * 0.5;
-    let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
-    let y = f32.from(DOC_CENTRE_Y);
+    let w = f32.from(worldW) * 0.5;
+    let h = w * f32.from(texH) / f32.from(texW);
+    let y = self.centreY();
     page.drawDepthed(device, encoder, target, depth, viewProjection, Vec4(0. - w, y - h, w, y + h));
   }
 
@@ -1180,10 +1326,10 @@ pub struct DocPanel {
     let t = (0. - eye.z) / direction.z;
     if t < 0. { return -1.; }
     let hit = eye + direction * t;
-    let w = f32.from(DOC_WORLD_W);
-    let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    let w = f32.from(worldW);
+    let h = w * f32.from(texH) / f32.from(texW);
     let u = (hit.x + w * 0.5) / w;
-    let v = (hit.y - (f32.from(DOC_CENTRE_Y) - h * 0.5)) / h;
+    let v = (hit.y - (self.centreY() - h * 0.5)) / h;
     if u < 0. || u > 1. || v < 0. || v > 1. { return -1.; }
     t
   }
@@ -1227,16 +1373,16 @@ pub struct DocPanel {
     let t = (0. - eye.z) / direction.z;
     if t < 0. { return false; }
     let hit = eye + direction * t;
-    let w = f32.from(DOC_WORLD_W);
-    let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    let w = f32.from(worldW);
+    let h = w * f32.from(texH) / f32.from(texW);
     let u = (hit.x + w * 0.5) / w;
-    let v = (hit.y - (f32.from(DOC_CENTRE_Y) - h * 0.5)) / h;
+    let v = (hit.y - (self.centreY() - h * 0.5)) / h;
     if u < 0. || u > 1. || v < 0. || v > 1. { return false; }
     // a chip on the note strip (the strip is fixed at the page's foot, whatever the scroll)
     if note.len() > 0usize && err.len() == 0usize {
-      let tx = u * f32.from(DOC_TEX_W);
-      let ty = (1. - v) * f32.from(DOC_TEX_H);
-      if ty >= f32.from(DOC_TEX_H - CHIP_BOTTOM - CHIP_H) && ty <= f32.from(DOC_TEX_H - CHIP_BOTTOM) {
+      let tx = u * f32.from(texW);
+      let ty = (1. - v) * f32.from(texH);
+      if ty >= f32.from(texH - CHIP_BOTTOM - CHIP_H) && ty <= f32.from(texH - CHIP_BOTTOM) {
         var slot = 0u32;
         while slot < 3u32 {
           let x0 = f32.from(CHIP_X0 + slot * CHIP_STEP);
@@ -1245,8 +1391,8 @@ pub struct DocPanel {
         }
       }
     }
-    let px = u * f32.from(DOC_TEX_W);
-    let py = (1. - v) * f32.from(DOC_TEX_H) + scrollY;
+    let px = u * f32.from(texW) + scrollX;
+    let py = (1. - v) * f32.from(texH) + scrollY;
     if layout.lines.len() == 0usize { return true; }
     // the line under the pointer (by its own rows); between lines, the nearest one by distance
     var best = layout.lines.len();
@@ -1320,9 +1466,7 @@ pub struct DocPanel {
 
 // Copy each diagram's pixels over its picture box in the page (both are bottom row first, 3 bytes a pixel), clipped to
 // the view; the thing last pointed at gets an amber frame
-fn blitDiagrams(img: &mut Image, layout: &RichLayout, imgDiag: &List[usize], cache: &List[Diagram], scrollY: f32, hd: usize, hk: usize) {
-  let pw = i32.from(DOC_TEX_W);
-  let ph = i32.from(DOC_TEX_H);
+fn blitDiagrams(img: &mut Image, layout: &RichLayout, imgDiag: &List[usize], cache: &List[Diagram], scrollY: f32, hd: usize, hk: usize, pw: i32, ph: i32) {
   var b = 0usize;
   while b < layout.boxes.len() {
     let bx = &layout.boxes[b];
@@ -1365,14 +1509,14 @@ fn blitDiagrams(img: &mut Image, layout: &RichLayout, imgDiag: &List[usize], cac
       while t < 3i32 {
         var k = 0i32;
         while k < fw + 6i32 {
-          putPixel(img, fx - 3i32 + k, fy - 3i32 + t);
-          putPixel(img, fx - 3i32 + k, fy + fh + t);
+          putPixel(img, pw, ph, fx - 3i32 + k, fy - 3i32 + t);
+          putPixel(img, pw, ph, fx - 3i32 + k, fy + fh + t);
           k = k + 1i32;
         }
         k = 0i32;
         while k < fh + 6i32 {
-          putPixel(img, fx - 3i32 + t, fy - 3i32 + k);
-          putPixel(img, fx + fw + t, fy - 3i32 + k);
+          putPixel(img, pw, ph, fx - 3i32 + t, fy - 3i32 + k);
+          putPixel(img, pw, ph, fx + fw + t, fy - 3i32 + k);
           k = k + 1i32;
         }
         t = t + 1i32;
@@ -1382,9 +1526,7 @@ fn blitDiagrams(img: &mut Image, layout: &RichLayout, imgDiag: &List[usize], cac
 }
 
 // An amber pixel at x, y of the view (y down)
-fn putPixel(img: &mut Image, x: i32, y: i32) {
-  let pw = i32.from(DOC_TEX_W);
-  let ph = i32.from(DOC_TEX_H);
+fn putPixel(img: &mut Image, pw: i32, ph: i32, x: i32, y: i32) {
   if x < 0i32 || y < 0i32 || x >= pw || y >= ph { return; }
   let at = usize.from(((ph - 1i32 - y) * pw + x) * 3i32);
   img.pixels.set(at, 0xd9u8);
@@ -1585,6 +1727,22 @@ struct PagePass {
       1u32);
     var fresh = device.createTexture(&desc);
     let cv = rgba.view();
+    device.queue.writeTextureLevels(&fresh, &cv[0] as *u8);
+    let view = fresh.createView();
+    var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    made <-> group;
+    fresh <-> texture;
+    device.queue.releaseBindGroup(&mut made);
+    device.queue.releaseTexture(&mut fresh);
+  }
+
+  // The page's texture with its whole mip chain from bytes already built (pageup.cone): 'levels' levels, the largest first, tightly packed
+  fn uploadChain(self: &mut, device: &mut Device, w: u32, h: u32, levels: u32, chain: &List[u8]) {
+    let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+      levels);
+    var fresh = device.createTexture(&desc);
+    let cv = chain.view();
     device.queue.writeTextureLevels(&fresh, &cv[0] as *u8);
     let view = fresh.createView();
     var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),

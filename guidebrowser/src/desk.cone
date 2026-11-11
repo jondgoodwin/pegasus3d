@@ -11,15 +11,16 @@
 // smaller; on the desktop the pointer is moved only at a click (it is the mouse's own, and would be pulled out of the
 // window); in the headset a beam moves it while it rests on the panel.
 
-const DESK_HALF_W = 0.8f;          // 1.6 m across
-const DESK_BOTTOM = 0.95f;         // the panel's lower edge, metres above the floor
-const DESK_CHIP_W = 0.6f;
-const DESK_CHIP_BOTTOM = 0.765f;   // the chip under the panel: 0.6 x 0.15
+const DESK_HALF_W = 1.1f;          // 2.2 m across (Jon, 11 Nov: it was too small to read or hit)
+const DESK_CENTRE_Y = 1.40f;       // the panel's middle, metres above the floor: a little below the eye
+// (its control is no chip on the panel any more: a click on the screen makes the laptop what has focus and the palette shows its icons,
+// "laptop" set: control the laptop, release it)
 
-// Stays where the visitor can reach it: beside the start spot (0, 3.5), on its right, turned to face it
-const DESK_X = 3.4f;
-const DESK_Z = 4.6f;
+// Beside the seat at the start spot (0, 3.5): 1.4 m from it, on its right and a little ahead, turned to face it
+const DESK_X = 1.38f;
+const DESK_Z = 3.26f;
 
+var @threadlocal deskFocus = false;       // the laptop was the last thing clicked: the palette shows its set ("laptop")
 var @threadlocal deskWheelAcc: f32 = 0.;   // the headset's stick, summed toward a notch of the laptop's wheel
 var @threadlocal deskOn = false;          // '--desk': the panel is in the warehouse
 var @threadlocal deskControl = false;      // '--desk-control'
@@ -60,14 +61,17 @@ pub struct DeskPanel {
     print <- "desk: capture "; print <- if isOpen { "open " } else { "FAILED " };
     print <- ", panel at ("; print <- DESK_X; print <- ", "; print <- DESK_Z; print <- "), dry run "; print <- if deskDryRun { "on\n" } else { "off\n" };
     DeskPanel(PagePass.createDepth(device, format), frame,
-      textLabel(l, device, format, "control laptop", 0x3a4a5affu32, 0xffffffffu32, 46., DESK_CHIP_W),
-      textLabel(l, device, format, "release laptop", 0xc0392bffu32, 0xffffffffu32, 46., DESK_CHIP_W),
+      textLabel(l, device, format, "control laptop", 0x3a4a5affu32, 0xffffffffu32, 46., 0.6),
+      textLabel(l, device, format, "release laptop", 0xc0392bffu32, 0xffffffffu32, 46., 0.6),
       isOpen, false, 0u32, 0u32, Vec3(DESK_X, 0., DESK_Z), toward, 0u32, 0u32, 0u32, 0u64, 0u64, 0u64, -1i32, -1i32, false)
   }
 
   fn model(self: &) Mat4 { Mat4.fromTrs(pos, Quat.angleAxis(yaw, Vec3(0., 1., 0.)), Vec3(1., 1., 1.)) }
 
-  fn top(self: &) f32 { DESK_BOTTOM + 2. * DESK_HALF_W * f32.from(h) / f32.from(w) }
+  // The screen's lower and upper edges: its middle stands at DESK_CENTRE_Y whatever the screen's shape (16:9 until the first picture)
+  fn halfH(self: &) f32 { if w == 0u32 || h == 0u32 { DESK_HALF_W * 0.5625 } else { DESK_HALF_W * f32.from(h) / f32.from(w) } }
+  fn bottom(self: &) f32 { DESK_CENTRE_Y - self.halfH() }
+  fn top(self: &) f32 { DESK_CENTRE_Y + self.halfH() }
 
   // The new picture of the screen, if there is one, into the panel's texture
   fn tick(self: &mut, device: &mut Device) {
@@ -121,7 +125,7 @@ pub struct DeskPanel {
     let t = self.plane(eye, dir, &mut lx, &mut ly);
     if t < 0. { return -1.; }
     let u = (lx + DESK_HALF_W) / (2. * DESK_HALF_W);
-    let v = (ly - DESK_BOTTOM) / (self.top() - DESK_BOTTOM);
+    let v = (ly - self.bottom()) / (self.top() - self.bottom());
     if u < -0.0005 || u > 1.0005 || v < -0.0005 || v > 1.0005 { return -1.; }
     var x = i32.from(u * f32.from(w));
     var y = i32.from((1. - v) * f32.from(h));
@@ -134,26 +138,15 @@ pub struct DeskPanel {
     t
   }
 
-  fn chipHit(self: &, eye: Vec3, dir: Vec3) f32 {
-    if !open { return -1.; }
-    var lx: f32 = 0.;
-    var ly: f32 = 0.;
-    let t = self.plane(eye, dir, &mut lx, &mut ly);
-    if t < 0. { return -1.; }
-    if lx < 0. - DESK_CHIP_W * 0.5 || lx > DESK_CHIP_W * 0.5 || ly < DESK_CHIP_BOTTOM || ly > DESK_CHIP_BOTTOM + DESK_CHIP_W * 0.25 { return -1.; }
-    t
-  }
-
   // How far along the ray the panel (its screen or chip) is met, or -1: the headset's beam ends there
   fn reach(self: &, eye: Vec3, dir: Vec3) f32 {
     var px: i32 = 0i32;
     var py: i32 = 0i32;
-    let t = self.screenPixel(eye, dir, &mut px, &mut py);
-    if t >= 0. { return t; }
-    self.chipHit(eye, dir)
+    self.screenPixel(eye, dir, &mut px, &mut py)
   }
 
   fn setControl(self: &mut, on: bool) {
+    if control == on { return; }
     control = on;
     lastX = -1i32;
     lastY = -1i32;
@@ -164,12 +157,11 @@ pub struct DeskPanel {
   // pointer is moved there and clicked
   fn click(self: &mut, eye: Vec3, dir: Vec3) bool {
     if !open { return false; }
-    let tc = self.chipHit(eye, dir);
     var px: i32 = 0i32;
     var py: i32 = 0i32;
     let ts = self.screenPixel(eye, dir, &mut px, &mut py);
-    if tc < 0. && ts < 0. { return false; }
-    if tc >= 0. { self.setControl(!control); return true; }
+    if ts < 0. { return false; }
+    deskFocus = true;
     if control {
       print <- "desk: click at pixel ("; print <- px; print <- ", "; print <- py; print <- ")\n";
       deskc.move(px, py);
@@ -215,8 +207,9 @@ pub struct DeskPanel {
     let wr: f32 = DESK_HALF_W;
     let tp = self.top();
     // (the middle is aimed at the centre of pixel (w/2, h/2): the exact middle is the edge between four pixels)
-    let xs = [wl, wr, wl, wr, 1.6 * 0.5 / f32.from(w)];
-    let ys = [tp, tp, DESK_BOTTOM, DESK_BOTTOM, (tp + DESK_BOTTOM) * 0.5 - (tp - DESK_BOTTOM) * 0.5 / f32.from(h)];
+    let xs = [wl, wr, wl, wr, 2. * DESK_HALF_W * 0.5 / f32.from(w)];
+    let bt = self.bottom();
+    let ys = [tp, tp, bt, bt, (tp + bt) * 0.5 - (tp - bt) * 0.5 / f32.from(h)];
     let names = ["top left", "top right", "bottom left", "bottom right", "centre"];
     let ex = [0i32, i32.from(w) - 1i32, 0i32, i32.from(w) - 1i32, i32.from(w) / 2i32];
     let ey = [0i32, 0i32, i32.from(h) - 1i32, i32.from(h) - 1i32, i32.from(h) / 2i32];
@@ -242,18 +235,12 @@ pub struct DeskPanel {
     if !open || w == 0u32 { return; }
     let m = vp * self.model();
     let tp = self.top();
+    let bt = self.bottom();
     if which == 0u32 {
       if control {
-        frame.drawFaded(device, encoder, target, depth, m, Vec4(0. - DESK_HALF_W - 0.035, DESK_BOTTOM - 0.035, DESK_HALF_W + 0.035, tp + 0.035), 1.);
+        frame.drawFaded(device, encoder, target, depth, m, Vec4(0. - DESK_HALF_W - 0.035, bt - 0.035, DESK_HALF_W + 0.035, tp + 0.035), 1.);
       }
-      pass.drawFaded(device, encoder, target, depth, m, Vec4(0. - DESK_HALF_W, DESK_BOTTOM, DESK_HALF_W, tp), 1.);
-    } else {
-      let r = Vec4(0. - DESK_CHIP_W * 0.5, DESK_CHIP_BOTTOM, DESK_CHIP_W * 0.5, DESK_CHIP_BOTTOM + DESK_CHIP_W * 0.25);
-      if control {
-        if chipOn.ok { chipOn.pass.drawFaded(device, encoder, target, depth, m, r, 1.); }
-      } else {
-        if chipOff.ok { chipOff.pass.drawFaded(device, encoder, target, depth, m, r, 1.); }
-      }
+      pass.drawFaded(device, encoder, target, depth, m, Vec4(0. - DESK_HALF_W, bt, DESK_HALF_W, tp), 1.);
     }
   }
 }

@@ -74,7 +74,7 @@ import analyticdaylight use PreethamSky;
 import richtext use Faces, Block, Run, Style, sameStyle, LayoutConfig, layoutRich, emptyLayout, RichLayout, RichRenderer, RichView, ImageInfo, RectP, CaretRect, posAt, BK_H1, BK_H2, BK_H3, BK_BULLET, BK_NUMBER, RK_UNDERLINE, GF_SPACE, isContByte, PL_INLINE;
 import msdftext use Font, Atlas, AtlasConfig, DEMO_FONT, TextRenderer, TextStyle, TextHandle, TextLayout, LayoutOptions, layoutText, worldTransform, billboardPlacement, SPACE_WORLD;
 import toml;
-import vector2d use measureText, Canvas, VectorRenderer, Paint, StrokeStyle, VectorPath;
+import vector2d use measureText, Canvas, VectorRenderer, Paint, StrokeStyle, VectorPath, CAP_ROUND, JOIN_ROUND;
 import diagramlayout use Graph, LayeredOptions, RouteOptions, DiagramStyle, SequenceDiagram, SequenceOptions, layoutLayered, routeEdges, layoutSequence, drawGraph, drawSequence, DIR_LR, FLOW_HORIZONTAL;
 
 // How fast a visitor walks, in meters a second (mine: a brisk walk)
@@ -167,6 +167,7 @@ var @threadlocal shotReload = 0;           // '--shot-after-reload K': the shot 
 var @threadlocal shotDelay = 20;           // '--shot-delay N': frames after that reading ('--shot-after-reload')
 var @threadlocal wheelAt = 0;              // '--wheel Y N': on frame N, a mouse wheel event of Y notches is pushed through SDL's queue
 var @threadlocal wheelY = 0.;
+var @threadlocal wheelX = 0.;              // '--wheel-x X': the same event's sideways notches
 var @threadlocal shotError = false;        // '--shot-on-error': the shot is taken shotDelay frames after the panel shows an error line
 var @threadlocal pressCReload = 0;         // '--press-c-after-reload K': the C key is pushed 40 frames after the panel's Kth reading
 var @threadlocal pressCAt = 0;            // '--press-c N': on frame N, the C key (clear the marks) is pushed through SDL's queue
@@ -221,6 +222,10 @@ var @threadlocal drawn = 0;
 var @threadlocal lastT = 0u64;
 var @threadlocal frameMs = Array[f32, 1024]() <- fill 0.;
 var @threadlocal frameN = 0usize;
+var @threadlocal worstFrom = 31;           // '--worst A B': the worst frame interval from frame A to B is printed on the shot frame
+var @threadlocal worstTo = 1000000;
+var @threadlocal worstMs: f32 = 0.;
+var @threadlocal worstAt = 0;
 var @threadlocal centre = Array[i32, 3]() <- fill 0;
 
 fn @initpure init() {
@@ -385,6 +390,10 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
         let m = e as &sdl.MouseMotionEvent;
         let w = host.window().windowSize();
         webPointer(&mut *some, m.x, m.y, f32.from(w.w), f32.from(w.h));
+        if (*some).wh.on && !(*some).xr.on {
+          let d = mouseRay(&*some, m.x, m.y, f32.from(w.w), f32.from(w.h));
+          (*some).wh.palPoint(0u32, (*some).camera.origin, d);
+        }
       }
       if e.type == sdl.EVENT_MOUSE_BUTTON_UP {
         let b = e as &sdl.MouseButtonEvent;
@@ -394,15 +403,18 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
         let wheel = e as &sdl.MouseWheelEvent;
         let w = host.window().windowSize();
         var onDesk = false;
+        var onPage = false;
         if (*some).wh.on {
           let ws = host.window().windowSize();
           if ws.w > 0 && ws.h > 0 {
             let dir = mouseRay(&*some, wheel.mouse_x, wheel.mouse_y, f32.from(ws.w), f32.from(ws.h));
             onDesk = (*some).wh.deskWheel((*some).camera.origin, dir, wheel.y);
+            // the page, browser, report or web page under the pointer scrolls (sideways too, on a wide code page)
+            if !onDesk { onPage = (*some).wh.scrollRay((*some).camera.origin, dir, wheel.x, wheel.y, false, &mut (*some).panel); }
           }
         }
-        if !onDesk && !webWheelOn(&mut *some, wheel.mouse_x, wheel.mouse_y, f32.from(w.w), f32.from(w.h), wheel.y) {
-          match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} }
+        if !onDesk && !onPage && !webWheelOn(&mut *some, wheel.mouse_x, wheel.mouse_y, f32.from(w.w), f32.from(w.h), wheel.y) {
+          match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); if wheel.x != 0. { p.scrollBy(wheel.x, 0.); } } else {} }
         }
       }
       if e.type == sdl.EVENT_KEY_DOWN || e.type == sdl.EVENT_KEY_UP {
@@ -542,6 +554,7 @@ fn mouseRay(s: &Shell, x: f32, y: f32, w: f32, h: f32) Vec3 {
 fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: bool, frame: u64) {
   var onPanel = false;
   if s.wh.on {
+    if s.wh.palClick(&mut s.device, eye, direction, &s.visitor) { return; }
     if s.wh.deskClick(eye, direction) { return; }
     // (a hand's beam starts at the hand; the chips stand for the head)
     if s.wh.clickChip(eye, direction, &s.visitor, if beam { s.visitor.position } else { eye }) { return; }
@@ -1065,6 +1078,7 @@ fn drawScene(s: &mut Shell, alpha: f32) {
 // Everything a frame needs before a picture is taken: the panels ticked, the warehouse updated, the visitor's pose (the camera's
 // origin and orientation) and the draw list. The window's frame (drawDesktop) and each of a headset's eyes (xr.cone) draw from it.
 fn prepareScene(s: &mut Shell, alpha: f32) {
+  upNewFrame();
   match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); p.openNew = false; } else {} }
   match &mut s.other { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
   webFrameTick(s);
@@ -1106,6 +1120,27 @@ fn prepareScene(s: &mut Shell, alpha: f32) {
         else if whKind[usize.from(e)] == 7 { s.wh.menuNth(usize.from(whArg[usize.from(e)]), &s.visitor); }
         else if whKind[usize.from(e)] == 5 { browseAct(s, u32.from(whArg[usize.from(e)])); }
         else if whKind[usize.from(e)] == 6 { s.wh.browserLink(usize.from(whArg[usize.from(e)])); }
+        else if whKind[usize.from(e)] >= 40 && whKind[usize.from(e)] < 50 {
+          // palette test hooks: 40 hover button N, 41 click button N (a ray from the eye to it), 42 lift, 43 dock (N >= 1000: a root icon)
+          let kk = whKind[usize.from(e)];
+          if kk == 42 { s.wh.palLift(); }
+          else if kk == 43 { s.wh.palDock(); }
+          else if kk == 44 || kk == 45 {
+            // scroll test hooks: what the view's middle looks at scrolls by N tenths of a notch (44 up the page, 45 to the right), as the stick does
+            let fwd = s.camera.orientation * Vec3(0., 0., -1.);
+            let amount = f32.from(whArg[usize.from(e)]) * 0.1;
+            let took = s.wh.scrollRay(s.camera.origin, fwd, if kk == 45 { amount } else { 0. }, if kk == 44 { amount } else { 0. }, false, &mut s.panel);
+            print <- "scroll: "; print <- (if kk == 45 { "sideways " } else { "vertical " }); print <- amount; print <- if took { " taken\n" } else { " nothing under the view's middle\n" };
+          }
+          else {
+            let sp = s.wh.palSpot(u32.from(whArg[usize.from(e)]), s.camera.origin);
+            if sp.w > 0.5 {
+              let d = (Vec3(sp.x, sp.y, sp.z) - s.camera.origin).normalize();
+              if kk == 40 { s.wh.palPoint(0u32, s.camera.origin, d); }
+              else { clickRay(s, s.camera.origin, d, 0., 0., false, u64.from(drawn)); }
+            } else { print <- "palette: no button "; print <- whArg[usize.from(e)]; print <- "\n"; }
+          }
+        }
         else if whKind[usize.from(e)] >= 20 { s.wh.actPage(&mut s.device, whKind[usize.from(e)] - 20, whArg[usize.from(e)]); }
         else { whAct(s, u32.from(whArg[usize.from(e)])); }
       }
@@ -1179,6 +1214,13 @@ fn drawDesktop(s: &mut Shell) {
   // the interval between frames, for the p50 and p95 printed on the shot frame
   let nowT = sdl.GetPerformanceCounter();
   if lastT != 0u64 && drawn > 30 && frameN < 1024usize { frameMs[frameN] = f32.from(f64.from((nowT - lastT) * 1000000u64 / sdl.GetPerformanceFrequency()) / 1000.); frameN = frameN + 1usize; }
+  // the worst frame interval between '--worst A B' (frames A to B; the default is every frame after the 30th), for the page-open gate
+  if lastT != 0u64 && drawn >= worstFrom && drawn <= worstTo {
+    let iv = f32.from(f64.from((nowT - lastT) * 1000000u64 / sdl.GetPerformanceFrequency()) / 1000.);
+    if iv > worstMs { worstMs = iv; worstAt = drawn; }
+    if iv > 25. { print <- "frame: "; print <- drawn; print <- " took "; print <- iv; print <- " ms\n"; }
+  }
+  if drawn == shotAt { print <- "Worst frame interval from frame "; print <- worstFrom; print <- " to "; print <- worstTo; print <- ": "; print <- worstMs; print <- " ms at frame "; print <- worstAt; print <- "\n"; }
   lastT = nowT;
   if drawn == shotAt && frameN > 10usize {
     var v = List[f32]();
@@ -1231,6 +1273,7 @@ pub fn present(host: &mut Host) {
         ev.type = sdl.EVENT_MOUSE_WHEEL;
         let w = &mut ev as &mut sdl.MouseWheelEvent;
         w.y = f32.from(wheelY);
+        w.x = f32.from(wheelX);
         w.integer_y = i32.from(wheelY);
         if !sdl.PushEvent(&mut ev) { print <- "could not push the wheel event\n"; }
       }
@@ -1445,6 +1488,10 @@ fn main(argc: i32, argv: **u8) i32 {
     if libc.strcmp(arg, "--stem") == 0i32 && more { stemPower = f32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--page-bias") == 0i32 && more { pageBias = f32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--shot-delay") == 0i32 && more { shotDelay = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--worst") == 0i32 && a + 2i32 < argc {
+      worstFrom = i32.from(argNumber(argv, a + 1i32)); worstTo = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--wheel-x") == 0i32 && more { wheelX = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--wheel") == 0i32 && a + 2i32 < argc {
       wheelY = argNumber(argv, a + 1i32);
       wheelAt = i32.from(argNumber(argv, a + 2i32));

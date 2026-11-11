@@ -14,6 +14,8 @@ const LAB_W = 512u32;
 const LAB_H = 128u32;
 const FLIGHT_MS = 500.0f;
 const CHIP_DELAY_MS = 300.0f;
+const BENCH_R = 1.4;      // how far from the start spot a page opened from a board stands (as a focused pane)
+const CHIPS_ON = false;          // the chips beside a project and over a page (close, shelve, grab, back, forward, park) are replaced by the palette
 const FADE_S = 0.2f;
 const RING_N = 5;
 const MAX_ITEMS = 12;
@@ -156,7 +158,11 @@ fn readoutLabel(device: &mut Device, format: u32) Label {
 
 // A card of the line: title, a bar, and an amber frame if it needs Jon (strong or soft)
 fn cardLabel(l: &mut Labeller, device: &mut Device, format: u32, title: &str, progress: f32, hot: bool, strong: bool) Label {
-  Label(PagePass.createDepth(device, format), 1.1, 0.275, false, String.from(title), 0xf8f5eeffu32, 0x1c1c1cffu32, 32., 6., true,
+  // 1.5x the old 32 px: one line up to 48 px, longer ones two lines of 38 (the progress bar starts at 98 px)
+  let one = 470. / (0.6 * f32.from(u32.from(title.len() + 1usize)));
+  let sz: f32 = if one >= 34. { if one < 48. { one } else { 48. } } else { 38. };
+  let tp: f32 = if one >= 34. { 14. } else { 3. };
+  Label(PagePass.createDepth(device, format), 1.1, 0.275, false, String.from(title), 0xf8f5eeffu32, 0x1c1c1cffu32, sz, tp, true,
     progress, hot, strong, 1.)       // its own alpha stays 1: the card's (Card.alpha) fades both frames together
 }
 
@@ -342,8 +348,11 @@ pub struct Warehouse {
   handHeld: bool;          // a hand's grip holds the gaze
   desk: Option[DeskPanel]; // --desk: the laptop's screen at a desk spot (desk.cone)
   grabKind: u32;           // what the grip holds besides a page: 1 the file browser, 2 the report, 3 a parked folder's post, 4 a project, else 0
-  grabIt: i32;             // its number (marker or item)
-  zones: List[Zone];                  // the boards at the back (zones.cone)
+  grabIt: i32;             // its number (marker or item); for kind 5 (the palette) unused; kind 6 is a board (zone number in grabIt)
+  pal: Palette;            // the palette (palette.cone)
+  focusPg: i32;            // the page (pgs) last clicked, or -1: with 'sel', what the palette's set follows
+  palFocused: bool;        // "focus" was pressed: the root icon shows "release"
+  zones: List[Zone];                 // the boards at the back (zones.cone)
   dimPass: Option[PagePass];          // the veil over the room while a pane is at the workbench
   addrBuf: String;                    // what is typed into the general browser's address strip
   addrShown: String;                  // what the strip's picture says now
@@ -363,7 +372,7 @@ pub struct Warehouse {
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
       None, 0u32, 0u32, false,
       Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
-      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, List[Zone](), None, String(), String())
+      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, Palette.empty(), -1, false, List[Zone](), None, String(), String())
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -619,6 +628,7 @@ pub struct Warehouse {
     self.cfgTick(device, renderer, now);
     self.tickZones(device, renderer, dt, now);
     self.tickPages(device, renderer, dt);
+    self.palTick(device, dt, now);
     self.awTick(dt);
     match &mut desk { case var &mut Some(d) { d.tick(device); } else {} }
     ticks = ticks + 1u32;
@@ -932,6 +942,8 @@ pub struct Warehouse {
   }
 
   pub fn select(self: &mut, k: i32) {
+    deskFocus = false;
+    if focusPg >= 0 || k != sel { focusPg = -1; palFocused = false; }
     if k == sel { return; }
     var o = 0usize;
     while o < items.len() { if i32.from(o) != k { (&mut items[o]).zlevel = 0u32; } o = o + 1usize; }
@@ -1336,6 +1348,13 @@ pub struct Warehouse {
         sg = sg + 1usize;
       }
       restoreAt = nowMs() + 1500u64;
+    }
+    // where the palette was left (room.toml): floating there; none: on the hand
+    if grabKind != 5u32 {
+      var pp = Place(0u32, 0u32, 0., 0., 0.);
+      if roomGood.palPlace.len() > 0usize && parsePlace(roomGood.palPlace.view(), &mut pp) && pp.kind == 3u32 {
+        pal.docked = false; pal.floatPos = Vec3(pp.x, pp.y, pp.z);
+      } else { pal.docked = true; }
     }
     applied = true;
   }
@@ -1937,6 +1956,13 @@ pub struct Warehouse {
     Label(PagePass.createDepth(device, format), w, h, false, String.from(text), bg, ink, size, 22., false, 0., false, false, 1.)
   }
 
+  // A board strip card: its text as large as the card holds (one or two lines, see cardSize)
+  fn mkCard(self: &, device: &mut Device, text: &str, bg: u32, ink: u32, w: f32, h: f32) Label {
+    var lb = self.mkLabel(device, text, bg, ink, cardSize(text.len()), w, h);
+    lb.top = cardTop(text.len(), lb.size);
+    lb
+  }
+
   // The chips over a page (close, shelve, grab) and the browser's (park): made once
   fn ensureChips(self: &mut, device: &mut Device) {
     if pgChips.len() > 0usize { return; }
@@ -2025,25 +2051,25 @@ pub struct Warehouse {
   fn tabRect(self: &, slot: usize, count: usize) Vec4 {
     let hw = pgHalfW(true);
     let top = pgTop(true);
-    let pitch = fminf(0.42, 1.5 / f32.from(u32.from(count)));
+    let pitch = fminf(0.63, 2.2 / f32.from(u32.from(count)));
     let x0 = 0. - hw + pitch * f32.from(u32.from(slot));
-    Vec4(x0, top + 0.1, x0 + pitch - 0.02, top + 0.1 + (pitch - 0.02) * 0.25)
+    Vec4(x0, top + 0.1, x0 + pitch - 0.03, top + 0.1 + (pitch - 0.03) * 0.25)
   }
   fn tabPlusRect(self: &, count: usize) Vec4 {
     let hw = pgHalfW(true);
     let top = pgTop(true);
-    let pitch = fminf(0.42, 1.5 / f32.from(u32.from(count)));
-    let x0 = 0. - hw + pitch * f32.from(u32.from(count)) + 0.02;
-    Vec4(x0, top + 0.1, x0 + 0.2, top + 0.2)
+    let pitch = fminf(0.63, 2.2 / f32.from(u32.from(count)));
+    let x0 = 0. - hw + pitch * f32.from(u32.from(count)) + 0.03;
+    Vec4(x0, top + 0.1, x0 + 0.3, top + 0.25)
   }
   fn tabCloseRect(self: &, count: usize) Vec4 {
     let p = self.tabPlusRect(count);
-    Vec4(p.z + 0.03, p.y, p.z + 0.23, p.w)
+    Vec4(p.z + 0.04, p.y, p.z + 0.34, p.w)
   }
   fn addrRect(self: &) Vec4 {
     let hw = pgHalfW(true);
     let b = pgBottom(true);
-    Vec4(0. - hw, b - 0.22, 0. - hw + 1.1, b - 0.02)
+    Vec4(0. - hw, b - 0.33, 0. - hw + 1.65, b - 0.03)
   }
 
   // The address strip's and tab titles' pictures follow the shown tab (a few times a second)
@@ -2201,12 +2227,22 @@ pub struct Warehouse {
       }
       k = k + 1usize;
     }
-    if zbi >= 0 && (ok == 0u32 || zbt < ot) { ok = 5u32; oi = zbi; ot = zbt; }
+    if zbi >= 0 && (ok == 0u32 || zbt < ot) { ok = 6u32; oi = zbi; ot = zbt; }
+    // (the palette's tray is a thing a beam can hold, too, and is usually the nearest)
+    let pt = pal.reach(eye, dir);
+    if pt > 0. && (ot < 0. || pt < ot) { ot = pt; ok = 5u32; oi = -1; }
     if ok > 0u32 && (bt < 0. || ot < bt) {
       gazeEye = eye; gazeDir = dir;
       var d = ot;
       if d < 1.5 { d = 1.5; }
       if d > 8. { d = 8.; }
+      if ok == 5u32 {
+        d = ot;
+        if d < 0.25 { d = 0.25; }
+        if d > 4. { d = 4.; }
+        if pal.docked { pal.floatPos = pal.anchor(); }
+        pal.docked = false;
+      }
       grabDist = d;
       grabKind = ok; grabIt = oi;
       if ok == 4u32 {
@@ -2214,7 +2250,7 @@ pub struct Warehouse {
         let here = items[ku].pos;
         self.moveItem(ku, &Place(3u32, 0u32, here.x, here.y, here.z), false);
       }
-      print <- "warehouse: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else if ok == 5u32 { "a board" } else { "a project" }); print <- "\n";
+      print <- "warehouse: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else if ok == 5u32 { "the palette" } else if ok == 6u32 { "a board" } else { "a project" }); print <- "\n";
       return;
     }
     if bi >= 0 { gazeEye = eye; gazeDir = dir; self.startGrab(usize.from(u32.from(bi))); }
@@ -2223,6 +2259,7 @@ pub struct Warehouse {
   // Each frame while the grip holds a panel, post or project: it follows the point on the floor (the height kept for a project) along the gaze
   fn followGrab(self: &mut) {
     if grabKind == 0u32 { return; }
+    if grabKind == 5u32 { pal.floatPos = gazeEye + gazeDir.normalize() * grabDist; return; }
     let h = Vec3(gazeDir.x, 0., gazeDir.z);
     if h.length() < 0.05 { return; }
     let hn = h.normalize();
@@ -2230,7 +2267,7 @@ pub struct Warehouse {
     if grabKind == 1u32 { browserPos = p; browserYaw = Warehouse.faceOrigin(p); browseCfg = true; browseCfgPos = p; browseCfgYaw = browserYaw; }
     else if grabKind == 2u32 { reportPos = p; reportCfg = true; reportCfgPos = p; reportCfgYaw = Warehouse.faceOrigin(p); }
     else if grabKind == 3u32 { let q = usize.from(u32.from(grabIt)); if q < markers.len() { (&mut markers[q]).pos = p; } }
-    else if grabKind == 5u32 {
+    else if grabKind == 6u32 {
       let q = usize.from(u32.from(grabIt));
       if q < zones.len() {
         let y = zones[q].pos.y;
@@ -2254,6 +2291,7 @@ pub struct Warehouse {
     let kind = grabKind;
     let it = grabIt;
     grabKind = 0u32; grabIt = -1;
+    if kind == 5u32 { self.palSavePlace(); return; }
     var text = String.from("at:");
     var pos = Vec3(0., 0., 0.);
     var yawDeg: i64 = 0i64;
@@ -2261,7 +2299,7 @@ pub struct Warehouse {
     else if kind == 2u32 { pos = reportPos; yawDeg = i64.from(i32.from(reportCfgYaw * 180. / PI)); }
     else if kind == 3u32 { let q = usize.from(u32.from(it)); if q < markers.len() { pos = markers[q].pos; } }
     else if kind == 4u32 { let k = usize.from(u32.from(it)); if k < items.len() { self.noteMoved(k); print <- "warehouse: dropped a project\n"; } return; }
-    else if kind == 5u32 {
+    else if kind == 6u32 {
       let q = usize.from(u32.from(it));
       if q >= zones.len() { return; }
       var zt = String.from("at:");
@@ -2460,8 +2498,25 @@ pub struct Warehouse {
 
   // A file or an address becomes a new page, at the near end of the arc. Returns its number, or -1.
   pub fn openPage(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str) {
+    if src.startsWith("bench:") { self.openOnBench(device, renderer, src.sliceFrom(6usize)); return; }
     if isWebSrc(src) { self.openTab(device, renderer, src); return; }
     _ =self.openPageAs(device, renderer, src, "", false);
+  }
+
+  // A page opened at the workbench, 1.4 m from the start spot (as far as a focused pane): ahead, then to the left and right in turn
+  fn openOnBench(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str) {
+    let n = self.openPageAs(device, renderer, src, "", false);
+    if n >= 0 {
+      let k = benchN % 3u32;
+      let a: f32 = if k == 0u32 { 0. } else if k == 1u32 { 0. - 0.85 } else { 0.85 };
+      benchN = benchN + 1u32;
+      let u = usize.from(u32.from(n));
+      (&mut pgs[u]).free = true;
+      let br = f32.from(BENCH_R);
+      (&mut pgs[u]).toPos = Vec3(br * sin(a), 0., 0. - br * cos(a));
+      self.retarget();
+      self.syncRoom();
+    }
   }
 
   fn openPageAs(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str, id: &str, proj: bool) i32 {
@@ -2585,6 +2640,7 @@ pub struct Warehouse {
   // Once a frame: pages glide, tick and report; the grabbed one follows the gaze; the closed leave
   fn tickPages(self: &mut, device: &mut Device, renderer: &mut Renderer, dt: f32) {
     let now = nowMs();
+    spareMake(device, format);
     var openWant = List[String]();
     var benchWant = List[String]();
     var browseWant = String();
@@ -2654,19 +2710,7 @@ pub struct Warehouse {
     self.refreshTabs();
     // a file clicked in a board's tree opens as a page on the workbench: near the start spot, ahead and to the sides in turn
     w = 0usize;
-    while w < benchWant.len() {
-      let n = self.openPageAs(device, renderer, benchWant[w].view(), "", false);
-      if n >= 0 {
-        let a = (f32.from(u32.from(benchN % 3u32)) - 1.) * 0.55;
-        benchN = benchN + 1u32;
-        let u = usize.from(u32.from(n));
-        (&mut pgs[u]).free = true;
-        (&mut pgs[u]).toPos = Vec3(2.1 * sin(a), 0., 0. - 2.1 * cos(a));
-        self.retarget();
-        self.syncRoom();
-      }
-      w = w + 1usize;
-    }
+    while w < benchWant.len() { self.openOnBench(device, renderer, benchWant[w].view()); w = w + 1usize; }
     self.syncTrees();
     if browseWant.len() > 0usize { self.toggleBrowser(browseWant.view(), Vec3(0., 0., 0.), 0.); }
     // pages from room.toml, one at a time
@@ -2761,6 +2805,7 @@ pub struct Warehouse {
       let pg = self.paneIndex(q / 8usize, u32.from(q % 8usize));
       if pg >= 0 {
         let pu = usize.from(u32.from(pg));
+        if focusPg != pg { focusPg = pg; palFocused = false; }   // as a click on the pane does
         match &mut pgs[pu].doc {
           case var &mut Some(p) {
             if kind == 8i32 { p.openNew = false; p.requestNth(i % 100usize); } else { p.scroll(0. - f32.from(u32.from(i % 100usize))); }
@@ -2800,7 +2845,7 @@ pub struct Warehouse {
       let hw = pgHalfW(web);
       let cy = pgTop(web) + 0.05;
       var c = 0u32;
-      while c < u32.from(self.chipCount(i)) {
+      while CHIPS_ON && c < u32.from(self.chipCount(i)) {
         let cx = hw - 0.19 - 0.39 * f32.from(c);
         let t = quadHit(m, Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir);
         if t > 0. && (best < 0. || t < best) { best = t; *kind = 2u32 + c; }
@@ -2819,7 +2864,7 @@ pub struct Warehouse {
 
   // The "park" chip on the browser panel's top edge: the distance along the ray, or -1
   fn parkHit(self: &, eye: Vec3, dir: Vec3) f32 {
-    if !browserOpen || pgChips.len() < 1usize { return -1.; }
+    if !CHIPS_ON || !browserOpen || pgChips.len() < 1usize { return -1.; }
     let cx = pgHalfW(false) - 0.19;
     let cy = pgTop(false) + 0.05;
     quadHit(self.browserModel(), Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir)
@@ -2867,6 +2912,8 @@ pub struct Warehouse {
     if bi < 0 { self.blurWeb(); return false; }
     let pu = usize.from(u32.from(bi));
     if bk >= 20u32 { self.tabClick(pu, bk); return true; }
+    deskFocus = false;
+    if focusPg != bi { focusPg = bi; palFocused = false; print <- "palette: focus on page "; printStr(pgs[pu].title.text.view()); print <- "\n"; }
     if bk == 2u32 && pgs[pu].zone >= 0 { self.focusPane(pu); return true; }
     if bk == 2u32 { self.closePage(pu); return true; }
     if bk == 3u32 { self.toggleShelve(pu); return true; }
@@ -2975,6 +3022,74 @@ pub struct Warehouse {
       i = i + 1usize;
     }
     false
+  }
+
+  // The scroll of a ray, one way for every scrollable (scroll.cone): the nearest page (document or web), the file browser, the report or the
+  // main page under the ray takes 'dx' and 'dy' notches (positive: right, up the page). With 'probe' nothing is scrolled: true says there is
+  // one under the ray (the right stick then scrolls rather than turns). The zones build's trees join here by their own `scrollBy`.
+  pub fn scrollRay(self: &mut, eye: Vec3, dir: Vec3, dx: f32, dy: f32, probe: bool, page: &mut Option[DocPanel]) bool {
+    var bestT: f32 = -1.;
+    var kind = 0u32;                 // 1 a page of pgs, 2 the browser, 3 the report, 4 the main page
+    var which = 0usize;
+    var i = 0usize;
+    while i < pgs.len() {
+      if !pgs[i].shelved && !pgs[i].gone {
+        var pk = 0u32;
+        let t = self.pgHit(i, eye, dir, &mut pk);
+        if pk == 1u32 && t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 1u32; which = i; }
+      }
+      i = i + 1usize;
+    }
+    if browserOpen {
+      match &browserPanel {
+        case let Some(p) {
+          let inv = self.browserModel().inverse();
+          let t = p.reach(inv * eye, inv.transformVector(dir));
+          if t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 2u32; }
+        }
+        else {}
+      }
+    }
+    if reportOpen {
+      match &reportPanel {
+        case let Some(p) {
+          let inv = self.reportModel().inverse();
+          let t = p.reach(inv * eye, inv.transformVector(dir));
+          if t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 3u32; }
+        }
+        else {}
+      }
+    }
+    let invPage = self.pageModel().inverse();
+    match page {
+      case let Some(p) {
+        let t = p.reach(invPage * eye, invPage.transformVector(dir));
+        if t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 4u32; }
+      }
+      else {}
+    }
+    if kind == 0u32 { return false; }
+    if probe { return true; }
+    if kind == 1u32 {
+      if pgs[which].web {
+        let inv = self.pgModel(which).inverse();
+        let le = inv * eye;
+        let ld = inv.transformVector(dir);
+        match &mut pgs[which].wp {
+          case var &mut Some(w) {
+            let hit = w.pickLocal(le, ld);
+            if hit.z > 0.5 { w.wheel(i32.from(hit.x), i32.from(hit.y), dy); }
+          }
+          else {}
+        }
+      } else {
+        match &mut pgs[which].doc { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} }
+      }
+    }
+    else if kind == 2u32 { match &mut browserPanel { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} } }
+    else if kind == 3u32 { match &mut reportPanel { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} } }
+    else { match page { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} } }
+    true
   }
 
   // ---- parked folders ----
@@ -3108,7 +3223,7 @@ pub struct Warehouse {
   }
 
   fn chipsShown(self: &, now: u64) bool {
-    sel >= 0 && f32.from(now - selAt) >= CHIP_DELAY_MS && items[usize.from(u32.from(sel))].flight >= 1.
+    CHIPS_ON && sel >= 0 && f32.from(now - selAt) >= CHIP_DELAY_MS && items[usize.from(u32.from(sel))].flight >= 1.
   }
 
   // A click's ray against the chips: true if one was taken
@@ -3196,6 +3311,7 @@ pub struct Warehouse {
         k = k + 1usize;
       }
     }
+    best = Warehouse.nearer(best, pal.reach(eye, dir));
     if browserOpen {
       match &browserPanel {
         case let Some(p) {
@@ -3427,7 +3543,7 @@ pub struct Warehouse {
           case var &mut Some(p) { p.drawPageDepth(device, encoder, target, depth, vp * self.browserModel()); }
           else {}
         }
-        if pgChips.len() > 0usize {
+        if CHIPS_ON && pgChips.len() > 0usize {
           let cx = pgHalfW(false) - 0.19;
           let cy = pgTop(false) + 0.05;
           Warehouse.faded(&mut pgChips[0usize], device, encoder, target, depth, vp * self.browserModel(),
@@ -3446,7 +3562,7 @@ pub struct Warehouse {
         let top = pgTop(web);
         if !pgs[idx].shelved {
           var c = 0usize;
-          while c < self.chipCount(idx) {
+          while CHIPS_ON && c < self.chipCount(idx) {
             let cx = hw - 0.19 - 0.39 * f32.from(u32.from(c));
             let cy = top + 0.05;
             let cl = if pgs[idx].zone >= 0 && pgs[idx].foc > 0.5 { 1usize } else { c };
@@ -3511,6 +3627,7 @@ pub struct Warehouse {
       }
       n = n + 1usize;
     }
+    pal.draw(device, encoder, target, depth, vp, eye, now);
     // the level readout at the foot of the view, 0.8 m from the eye along the ray through the bottom of the screen
     if readout[0usize].alpha > 0.01 {
       let inv = vp.inverse();
@@ -3821,7 +3938,7 @@ pub struct Warehouse {
     if zi >= zones.len() || pj >= zones[zi].planFiles.len() { return; }
     let f = zones[zi].planFiles[pj].clone();
     print <- "zones: plan card "; printStr(zones[zi].planLabels[pj].text.view()); print <- " opens "; printStr(f.view()); print <- "\n";
-    if f.len() > 0usize { self.wantPage(f.view()); }
+    if f.len() > 0usize { var b = String.from("bench:"); b.append(f.view()); self.wantPage(b.view()); }
   }
 
   fn clickZones(self: &mut, eye: Vec3, dir: Vec3, limit: f32) bool {
@@ -3848,7 +3965,7 @@ pub struct Warehouse {
     if k == 2u32 {
       let rp = zones[zi].strip[ix].report.clone();
       print <- "zones: line card "; printStr(zones[zi].strip[ix].id.view()); print <- "\n";
-      if rp.len() > 0usize { self.wantPage(rp.view()); }
+      if rp.len() > 0usize { var b = String.from("bench:"); b.append(rp.view()); self.wantPage(b.view()); }
       return true;
     }
     false
@@ -3970,7 +4087,7 @@ pub struct Warehouse {
             pids.push(ids[q].clone());
             pitems.push(ik);
             pon.push(items[iu].onTable);
-            labels.push(self.mkLabel(device, items[iu].name.view(), if items[iu].onTable { 0xcfe6d2ffu32 } else { 0xf8f5eeffu32 }, 0x1c1c1cffu32, 50., 1.2, 0.3));
+            labels.push(self.mkCard(device, items[iu].name.view(), if items[iu].onTable { 0xcfe6d2ffu32 } else { 0xf8f5eeffu32 }, 0x1c1c1cffu32, 1.2, 0.3));
           }
           q = q + 1usize;
         }
@@ -4030,7 +4147,8 @@ pub struct Warehouse {
       if live.len() > 7usize { ct.append(", +"); ct.append(numText(i64.from(live.len() - 7usize)).view()); ct.append(" live"); }
       (&mut zones[zi]).strip = strip;
       (&mut zones[zi]).count.text = ct.clone();
-      (&mut zones[zi]).count.size = fitSize(ct.len(), 48.);
+      (&mut zones[zi]).count.size = cardSize(ct.len());
+      (&mut zones[zi]).count.top = cardTop(ct.len(), zones[zi].count.size);
       (&mut zones[zi]).count.ok = false;
       zi = zi + 1usize;
     }
@@ -4068,7 +4186,7 @@ pub struct Warehouse {
         var c = 0usize;
         while c < show {
           let pc = &pr.cards[c];
-          labels.push(self.mkLabel(device, pc.title.view(), if pc.design { 0xdfe9f3ffu32 } else { 0xf8f5eeffu32 }, 0x1c1c1cffu32, fitSize(pc.title.len(), 56.), 1.0, 0.25));
+          labels.push(self.mkCard(device, pc.title.view(), if pc.design { 0xdfe9f3ffu32 } else { 0xf8f5eeffu32 }, 0x1c1c1cffu32, 1.0, 0.25));
           files.push(pc.file.clone());
           c = c + 1usize;
         }
@@ -4076,12 +4194,12 @@ pub struct Warehouse {
           var mt = String.from("+");
           mt.append(numText(i64.from(more)).view());
           mt.append(" more skeins");
-          labels.push(self.mkLabel(device, mt.view(), 0xe9e4d8ffu32, 0x333333ffu32, fitSize(mt.len(), 56.), 1.0, 0.25));
+          labels.push(self.mkCard(device, mt.view(), 0xe9e4d8ffu32, 0x333333ffu32, 1.0, 0.25));
           files.push(zones[zi].planPath.clone());
         }
         var bt = String.from("Backlog: ");
         bt.append(numText(i64.from(pr.backlog)).view());
-        labels.push(self.mkLabel(device, bt.view(), 0x2a3340ffu32, 0xffffffffu32, fitSize(bt.len(), 56.), 1.0, 0.25));
+        labels.push(self.mkCard(device, bt.view(), 0x2a3340ffu32, 0xffffffffu32, 1.0, 0.25));
         files.push(zones[zi].planPath.clone());
         print <- "zones: plan "; printStr(zones[zi].planPath.view()); print <- ": "; print <- pr.cards.len(); print <- " skeins, backlog "; print <- pr.backlog; print <- "\n";
         (&mut zones[zi]).planLabels = labels;
@@ -4097,7 +4215,7 @@ pub struct Warehouse {
     while zi < zones.len() {
       var f = dt * 4.;
       if f > 1. { f = 1.; }
-      if grabKind != 5u32 || grabIt != i32.from(zi) {
+      if grabKind != 6u32 || grabIt != i32.from(zi) {
         (&mut zones[zi]).pos = zones[zi].pos + (zones[zi].wantPos - zones[zi].pos) * f;
         (&mut zones[zi]).yaw = zones[zi].yaw + turnBetween(zones[zi].yaw, zones[zi].wantYaw) * f;
         (&mut zones[zi]).width = zones[zi].width + (zones[zi].wantWidth - zones[zi].width) * f;
@@ -4199,6 +4317,176 @@ pub struct Warehouse {
       }
       s = s + 1usize;
     }
+  }
+
+  // ---- the palette (palette.cone) ----
+
+  // What has focus: the page last clicked, else the selected project, else the room
+  fn palKind(self: &) String {
+    if deskFocus { return String.from("laptop"); }
+    if focusPg >= 0 {
+      let i = usize.from(u32.from(focusPg));
+      if i < pgs.len() && !pgs[i].gone {
+        if pgs[i].web { return String.from("web"); }
+        let s = pgs[i].src.view();
+        if startsWithText(s, "mermaid:") || (s.len() >= 4usize && s.slice(s.len() - 4usize, s.len()) == ".mmd") { return String.from("diagram"); }
+        return String.from("document");
+      }
+    }
+    if sel >= 0 {
+      if items[usize.from(u32.from(sel))].page { return String.from("document"); }
+      return String.from("project");
+    }
+    String.from("room")
+  }
+
+  // The set of a kind: studio.toml's [palette.KIND] or the built-in one; for a project, its own menu entries are added (those that are not
+  // already a standard icon), and shelve shows only on the ring, bring only on a shelf
+  fn palBuild(self: &, kind: &str, out: &mut List[String], sig: &mut String) {
+    var set = palDefault(kind);
+    var q = 0usize;
+    while q < studioGood.palSets.len() {
+      if studioGood.palSets[q].kind.view() == kind && studioGood.palSets[q].icons.len() > 0usize { set = studioGood.palSets[q].icons.clone(); }
+      q = q + 1usize;
+    }
+    var onTable = true;
+    if kind == "project" && sel >= 0 { onTable = items[usize.from(u32.from(sel))].onTable; }
+    var i = 0usize;
+    while i < set.len() {
+      let e = palEntryOf(set[i].view());
+      var deskOnNow = false;
+      match &desk { case let Some(dk) { deskOnNow = dk.control; } else {} }
+      let hide = (kind == "project" && ((e.action.view() == "shelve" && !onTable) || (e.action.view() == "bring" && onTable)))
+        || (kind == "laptop" && ((e.action.view() == "laptopon" && deskOnNow) || (e.action.view() == "laptopoff" && !deskOnNow)));
+      if !hide { out.push(set[i].clone()); }
+      i = i + 1usize;
+    }
+    if kind == "project" && sel >= 0 {
+      let id = items[usize.from(u32.from(sel))].id.view();
+      var pi = 0usize;
+      while pi < studioGood.projects.len() {
+        if studioGood.projects[pi].id.view() == id {
+          var m = 0usize;
+          while m < studioGood.projects[pi].menu.len() {
+            let mc = &studioGood.projects[pi].menu[m];
+            let a = mc.action.view();
+            let standard = a == "zoom" || a == "zoomout" || a == "shelve" || a == "bring" || a == "open" || a == "talk" || a == "back" || a == "forward"
+              || a == "files" || a == "reload";
+            if !standard && knownAction(a) {
+              var line = String.from(palIconFor(a));
+              line.append("|"); line.append(mc.label.view()); line.append("|"); line.append(a);
+              out.push(line);
+            }
+            m = m + 1usize;
+          }
+        }
+        pi = pi + 1usize;
+      }
+    }
+    sig.append("|"); sig.append(numText(i64.from(out.len())).view());
+    sig.append(if onTable { "|r|" } else { "|s|" });
+    if kind == "laptop" { match &desk { case let Some(dk) { sig.append(if dk.control { "|on" } else { "|off" }); } else {} } }
+    sig.append(numText(i64.from(studioSeen.len())).view());
+  }
+
+  fn palTick(self: &mut, device: &mut Device, dt: f32, now: u64) {
+    let kind = self.palKind();
+    var build = List[String]();
+    var sig = String.from(kind.view());
+    self.palBuild(kind.view(), &mut build, &mut sig);
+    var lab: Option[Labeller] = None;
+    lab <-> labeller;
+    match &mut lab {
+      case var &mut Some(l) { pal.tick(device, l, format, dt, now, kind.view(), sig.view(), &build, palFocused); }
+      else {}
+    }
+    labeller <-> lab;
+  }
+
+  // The hover of a hand's (or the mouse's) pointer; the beam of a hand ends at the tray (reach)
+  pub fn palPoint(self: &mut, hand: u32, eye: Vec3, dir: Vec3) { _ = pal.point(hand, eye, dir, nowMs()); }
+  pub fn setPalHand(self: &mut, pos: Vec3) { pal.setHand(pos); }
+  pub fn palSpot(self: &, n: u32, eye: Vec3) Vec4 { pal.spot(n, eye) }
+  pub fn palKindNow(self: &) String { pal.kindNow() }
+
+  // A trigger or click along a ray: a button runs its action; the plate alone is swallowed (on the desktop it lifts the tray off, in place)
+  pub fn palClick(self: &mut, device: &mut Device, eye: Vec3, dir: Vec3, v: &Fly) bool {
+    var body = false;
+    let a = pal.press(eye, dir, nowMs(), &mut body);
+    if a.len() == 0usize {
+      if body && !pal.xr && pal.docked { self.palLift(); }
+      return body;
+    }
+    _ = self.palAct(device, a.view(), v);
+    true
+  }
+
+  pub fn palLift(self: &mut) {
+    if !pal.docked { return; }
+    pal.floatPos = pal.anchor();
+    pal.docked = false;
+    self.palSavePlace();
+  }
+
+  pub fn palDock(self: &mut) {
+    pal.docked = true;
+    roomGood.palPlace = String();
+    writeAt = nowMs() + 1000u64;
+    print <- "palette: docked\n";
+  }
+
+  fn palSavePlace(self: &mut) {
+    var text = String.from("at:");
+    text.append(floatText(pal.floatPos.x).view()); text.append(","); text.append(floatText(pal.floatPos.y).view()); text.append(","); text.append(floatText(pal.floatPos.z).view());
+    roomGood.palPlace = text;
+    writeAt = nowMs() + 1000u64;
+    print <- "palette: left floating at "; printStr(roomGood.palPlace.view()); print <- " (room.toml)\n";
+  }
+
+  // The action of a palette button. 1: it did something; 2: not wired yet, it only logs; 0: not available for this focus.
+  fn palAct(self: &mut, device: &mut Device, action: &str, v: &Fly) u32 {
+    let label = pal.labelOf(action);
+    var r = 0u32;
+    let pgOk = focusPg >= 0 && usize.from(u32.from(focusPg)) < pgs.len();
+    if action == "dock" { self.palDock(); r = 1u32; }
+    else if action == "focus" {
+      if pgOk && pgs[usize.from(u32.from(focusPg))].zone >= 0 {
+        // a board's pane: the same fly to the workbench and release the corner chip had
+        let i = usize.from(u32.from(focusPg));
+        self.focusPane(i);
+        palFocused = pgs[i].wantFoc;
+        r = 1u32;
+      }
+      else if palFocused { palFocused = false; if sel >= 0 { _ = self.zoom(-1, v); } r = 1u32; }
+      else if !pgOk && sel >= 0 { _ = self.act(3u32, v); palFocused = true; r = 1u32; }
+      else { r = 2u32; }
+    }
+    else if action == "back" || action == "forward" {
+      if pgOk {
+        let i = usize.from(u32.from(focusPg));
+        match &mut pgs[i].doc { case var &mut Some(p) { p.requestNav(if action == "back" { -1i32 } else { 1i32 }); r = 1u32; } else { r = 2u32; } }
+      } else { navWant = if action == "back" { 6u32 } else { 7u32 }; r = 1u32; }
+    }
+    else if action == "files" { navWant = 8u32; r = 1u32; }
+    else if action == "laptopon" || action == "laptopoff" {
+      match &mut desk { case var &mut Some(dk) { dk.setControl(action == "laptopon"); r = 1u32; } else { r = 0u32; } }
+    }
+    else if action == "close" { if pgOk { let i = usize.from(u32.from(focusPg)); focusPg = -1; self.closePage(i); r = 1u32; } }
+    else if action == "shelve" {
+      if pgOk { self.toggleShelve(usize.from(u32.from(focusPg))); r = 1u32; }
+      else if sel >= 0 && self.act(0u32, v) { r = 1u32; }
+    }
+    else if action == "park" { if browserOpen { self.parkBrowser(device); r = 1u32; } else { r = 0u32; } }
+    else if sel >= 0 && self.doAction(action, v) { r = 1u32; }
+    else if action == "reload" { cfgPoll = 0u64; studioSeen = String(); roomSeen = String(); r = 1u32; }
+    else if sel < 0 && (action == "zoom" || action == "zoomout" || action == "bring" || action == "open" || action == "talk") { r = 0u32; }
+    else if action == "undo" || action == "beforeafter" || action == "edit" || action == "dictate" || action == "newpage" || action == "linkpage"
+      || action == "webreload" || action == "address" || action == "addbox" || action == "connect" || action == "labelit" || action == "rename"
+      || action == "delete" || action == "relayout" || action == "passthrough" || action == "look" { r = 2u32; }
+    print <- "palette: "; printStr(label.view()); print <- " ("; printStr(action); print <- ") ";
+    print <- (if r == 1u32 { "done" } else if r == 2u32 { "is a stub: logged, nothing done yet" } else { "has nothing to act on" });
+    print <- "\n";
+    r
   }
 
   fn cardPos(self: &, stage: usize, n: u32) Vec3 {
