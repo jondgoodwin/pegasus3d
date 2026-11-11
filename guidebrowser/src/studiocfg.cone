@@ -29,12 +29,51 @@ struct ProjCfg {
   scale: i64;
   hasScale: bool;
   at: String;           // when this table was last written
+  owner: String;        // who answers for it ("3D Web", "Cone design chat", ...); shown on its label
   menu: List[MenuCfg];
 }
 
 fn newProj(id: &str) ProjCfg {
-  ProjCfg(String.from(id), String(), String(), String(), 0i64, false, 100i64, false, String(), List[MenuCfg]())
+  ProjCfg(String.from(id), String(), String(), String(), 0i64, false, 100i64, false, String(), String(), List[MenuCfg]())
 }
+
+// A parked folder: a marker standing in the room; clicking it opens a browser panel rooted at 'path'
+struct FolderCfg {
+  id: String;
+  name: String;
+  path: String;
+  place: String;
+  at: String;
+}
+
+// A page the room opened (room.toml): a file or an address, and where it stands (arc:N, shelf:N or at:x,y,z)
+struct PageCfg {
+  id: String;
+  src: String;
+  place: String;
+  at: String;
+}
+
+// [panel.browser] / [panel.report]: where such a panel stands when it opens
+struct PanelCfg {
+  id: String;
+  place: String;
+  yaw: i64;
+  hasYaw: bool;
+  width: i64;
+  hasWidth: bool;
+}
+
+// [shelf.ID]: how many slots of a wall ("back" or "side") may be used when something is shelved by itself
+struct ShelfCfg {
+  id: String;
+  wall: String;
+  slots: i64;
+  hasSlots: bool;
+}
+
+alias Folders = List[FolderCfg];
+alias PageCfgs = List[PageCfg];
 
 // A file read: ok with its projects and the room-wide settings, or not ok with 'err' (one line for a person)
 struct Parsed {
@@ -47,10 +86,15 @@ struct Parsed {
   lineFile: String;     // [line] file
   roots: List[String];  // [browser] roots
   warnings: List[String];
+  folders: Folders;     // [folder.ID]
+  pages: PageCfgs;      // [page.ID] (room.toml)
+  panels: List[PanelCfg];
+  shelves: List[ShelfCfg];
 }
 
 fn newParsed() Parsed {
-  Parsed(true, String(), List[ProjCfg](), 0i64, 0i64, 0i64, String(), List[String](), List[String]())
+  Parsed(true, String(), List[ProjCfg](), 0i64, 0i64, 0i64, String(), List[String](), List[String](), Folders(), PageCfgs(),
+    List[PanelCfg](), List[ShelfCfg]())
 }
 
 // A place, parsed
@@ -165,7 +209,7 @@ fn knownAction(a: &str) bool {
 
 // ---- reading ----
 
-fn projKey(k: &str) bool { k == "name" || k == "source" || k == "place" || k == "yaw_deg" || k == "scale_pct" || k == "at" }
+fn projKey(k: &str) bool { k == "name" || k == "source" || k == "place" || k == "yaw_deg" || k == "scale_pct" || k == "at" || k == "owner" }
 fn menuKey(k: &str) bool { k == "label" || k == "action" || k == "key" }
 
 // Every key of the table must be one 'ok' says; the first that is not is the fault
@@ -177,7 +221,10 @@ fn checkKeys(p: &mut Parsed, file: &str, t: &toml.Table, kind: u32, tname: &str)
     let good = if kind == 0u32 { projKey(k) } else if kind == 1u32 { menuKey(k) }
       else if kind == 2u32 { k == "count" || k == "radius_cm" || k == "float_cm" }
       else if kind == 3u32 { k == "file" } else if kind == 4u32 { k == "roots" }
-      else if kind == 5u32 { k == "wall" || k == "slots" } else { k == "place" || k == "yaw_deg" || k == "width_cm" };
+      else if kind == 5u32 { k == "wall" || k == "slots" }
+      else if kind == 7u32 { k == "name" || k == "path" || k == "place" || k == "at" }
+      else if kind == 8u32 { k == "src" || k == "place" || k == "at" }
+      else { k == "place" || k == "yaw_deg" || k == "width_cm" };
     if !good {
       var m = String.from("unknown key '");
       m.append(k);
@@ -245,6 +292,7 @@ fn parseConfig(text: &str, file: &str) Parsed {
             p.projects[pi].source = tableText(&doc[nm], "source");
             p.projects[pi].place = tableText(&doc[nm], "place");
             p.projects[pi].at = tableText(&doc[nm], "at");
+            p.projects[pi].owner = tableText(&doc[nm], "owner");
             var hy = false; var yy = 0i64;
             tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
             p.projects[pi].hasYaw = hy; p.projects[pi].yaw = yy;
@@ -286,9 +334,46 @@ fn parseConfig(text: &str, file: &str) Parsed {
           checkKeys(&mut p, file, &doc[nm], 4u32, nm);
           match doc[nm].getStrings("roots") { case let Some(r) { p.roots = r; } else {} }
         }
-        else if seg[0usize].view() == "shelf" { checkKeys(&mut p, file, &doc[nm], 5u32, nm); }
-        else if seg[0usize].view() == "panel" { checkKeys(&mut p, file, &doc[nm], 6u32, nm); }
-        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, line, browser)"); }
+        else if seg[0usize].view() == "shelf" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 5u32, nm);
+          var hs = false; var sl = 0i64;
+          tableInt(&mut p, file, &doc[nm], "slots", &mut hs, &mut sl);
+          var wall = tableText(&doc[nm], "wall");
+          if wall.len() == 0usize { wall = String.from(seg[1usize].view()); }
+          if wall.view() != "back" && wall.view() != "side" { cfgFail(&mut p, file, doc[nm].line, "a shelf is on the wall \"back\" or \"side\""); }
+          p.shelves.push(ShelfCfg(String.from(seg[1usize].view()), wall, sl, hs));
+        }
+        else if seg[0usize].view() == "panel" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 6u32, nm);
+          var hy = false; var yy = 0i64;
+          var hw = false; var ww = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          tableInt(&mut p, file, &doc[nm], "width_cm", &mut hw, &mut ww);
+          let pl = tableText(&doc[nm], "place");
+          if pl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(pl.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a panel's place is at:x,y,z"); }
+          }
+          p.panels.push(PanelCfg(String.from(seg[1usize].view()), pl, yy, hy, ww, hw));
+        }
+        else if seg[0usize].view() == "folder" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 7u32, nm);
+          let path = tableText(&doc[nm], "path");
+          if path.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a folder needs a path"); }
+          let pl = tableText(&doc[nm], "place");
+          if pl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(pl.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a folder's place is at:x,y,z"); }
+          }
+          p.folders.push(FolderCfg(String.from(seg[1usize].view()), tableText(&doc[nm], "name"), path, pl, tableText(&doc[nm], "at")));
+        }
+        else if seg[0usize].view() == "page" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 8u32, nm);
+          let src = tableText(&doc[nm], "src");
+          if src.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a page needs a src (a file or an address)"); }
+          p.pages.push(PageCfg(String.from(seg[1usize].view()), src, tableText(&doc[nm], "place"), tableText(&doc[nm], "at")));
+        }
+        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, folder, page, line, browser)"); }
         n = n + 1usize;
       }
     }
@@ -371,6 +456,32 @@ fn roomText(r: &Parsed) String {
     s.append("at = "); s.append(tomlStr(p.at.view()).view()); s.append("\n");
     i = i + 1usize;
   }
+  s.append(extrasText(r).view());
+  s
+}
+
+// The parked folders and the open pages, as tables (room.toml has both; studio.toml's first-run file has the folders)
+fn extrasText(r: &Parsed) String {
+  var s = String();
+  var i = 0usize;
+  while i < r.folders.len() {
+    let f = &r.folders[i];
+    s.append("\n[folder."); s.append(f.id.view()); s.append("]\n");
+    s.append("name = "); s.append(tomlStr(f.name.view()).view()); s.append("\n");
+    s.append("path = "); s.append(tomlStr(f.path.view()).view()); s.append("\n");
+    s.append("place = "); s.append(tomlStr(f.place.view()).view()); s.append("\n");
+    s.append("at = "); s.append(tomlStr(f.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.pages.len() {
+    let g = &r.pages[i];
+    s.append("\n[page."); s.append(g.id.view()); s.append("]\n");
+    s.append("src = "); s.append(tomlStr(g.src.view()).view()); s.append("\n");
+    s.append("place = "); s.append(tomlStr(g.place.view()).view()); s.append("\n");
+    s.append("at = "); s.append(tomlStr(g.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
   s
 }
 
@@ -404,6 +515,7 @@ fn studioText(r: &Parsed, ringCm: i64, floatCm: i64, lineFile: &str, root: &str)
     s.append("yaw_deg = "); s.append(intText(p.yaw).view()); s.append("\n");
     s.append("scale_pct = "); s.append(intText(p.scale).view()); s.append("\n");
     s.append("at = "); s.append(tomlStr(p.at.view()).view()); s.append("\n");
+    if p.owner.len() > 0usize { s.append("owner = "); s.append(tomlStr(p.owner.view()).view()); s.append("\n"); }
     var m = 0usize;
     while m < p.menu.len() {
       s.append("\n[project."); s.append(p.id.view()); s.append(".menu."); s.append(numText(i64.from(m + 1usize)).view()); s.append("]\n");
@@ -414,6 +526,12 @@ fn studioText(r: &Parsed, ringCm: i64, floatCm: i64, lineFile: &str, root: &str)
     }
     i = i + 1usize;
   }
+  s.append(extrasText(r).view());
+  s.append("\n# Optional: [panel.browser] and [panel.report] place = \"at:x,y,z\", yaw_deg = N (where such a panel stands when it opens);\n");
+  s.append("# [shelf.back] / [shelf.side] slots = N (how many slots the room may use when it shelves something by itself).\n");
+  s.append("# [folder.ID] name, path, place (\"at:x,y,z\"): a parked folder, a post in the room that opens a browser rooted at path.\n");
+  s.append("# A [project.ID] the building does not have, with source = \"doc:<file>\" or \"url:<address>\", appears as a page; remove it and it leaves.\n");
+  s.append("# owner = \"3D Web\" on a project: who answers for it, shown on its label.\n");
   s
 }
 

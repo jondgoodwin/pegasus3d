@@ -14,6 +14,8 @@ extern {
   fn @c("web_open") webOpen(url: cstr, w: i32, h: i32) i32;
   fn @c("web_pump") webPump();
   fn @c("web_frame") webFrame(view: i32, dst: *u8, cap: i32, w: &mut i32, h: &mut i32) i32;
+  fn @c("web_frame_rect") webFrameRect(view: i32, dst: *u8, cap: i32, x: &mut i32, y: &mut i32, w: &mut i32, h: &mut i32,
+                                       fw: &mut i32, fh: &mut i32) i32;
   fn @c("web_paints") webPaints(view: i32) u32;
   fn @c("web_loading") webLoading(view: i32) i32;
   fn @c("web_mouse_move") webMouseMove(view: i32, x: i32, y: i32, leave: i32);
@@ -115,11 +117,73 @@ fn virtualKey(scancode: u32) i32 {
   0i32
 }
 
+// The page's picture and its mip chain, one texel a u32 (R in the low byte): level 0, then each half-size level after it
+alias Texels = List[u32];
+
+// Four texels averaged (each channel's top six bits summed, plus 3 so white stays white; alpha opaque)
+fn avg4(a: u32, b: u32, c: u32, d: u32) u32 {
+  let m = 0xFCFCFCFCu32;
+  (((a & m) >> 2u32) + ((b & m) >> 2u32) + ((c & m) >> 2u32) + ((d & m) >> 2u32) + 0x03030303u32) | 0xFF000000u32
+}
+
+fn maxu(a: u32, b: u32) u32 { if a > b { a } else { b } }
+fn minu(a: u32, b: u32) u32 { if a < b { a } else { b } }
+
+// The half-size levels of the rectangle (x, y, w, h) of level 0 (the rows of 'wide' texels): only the texels it touches are redone
+fn mipRect(chain: &mut Texels, wide: u32, high: u32, levels: u32, x: u32, y: u32, w: u32, h: u32) {
+  var lw = wide;
+  var lh = high;
+  var off = 0usize;
+  var x0 = x; var y0 = y; var x1 = x + w; var y1 = y + h;
+  var l = 1u32;
+  while l < levels {
+    let nw = maxu(1u32, lw / 2u32);
+    let nh = maxu(1u32, lh / 2u32);
+    let off1 = off + usize.from(lw * lh);
+    let nx0 = x0 / 2u32; let ny0 = y0 / 2u32;
+    let nx1 = minu((x1 + 1u32) / 2u32, nw); let ny1 = minu((y1 + 1u32) / 2u32, nh);
+    var yy = ny0;
+    while yy < ny1 {
+      let ya = minu(2u32 * yy, lh - 1u32);
+      let yb = minu(2u32 * yy + 1u32, lh - 1u32);
+      var xx = nx0;
+      while xx < nx1 {
+        let xa = minu(2u32 * xx, lw - 1u32);
+        let xb = minu(2u32 * xx + 1u32, lw - 1u32);
+        let v = avg4(*chain[off + usize.from(ya * lw + xa)], *chain[off + usize.from(ya * lw + xb)],
+                     *chain[off + usize.from(yb * lw + xa)], *chain[off + usize.from(yb * lw + xb)]);
+        chain.set(off1 + usize.from(yy * nw + xx), v);
+        xx = xx + 1u32;
+      }
+      yy = yy + 1u32;
+    }
+    off = off1; lw = nw; lh = nh; x0 = nx0; y0 = ny0; x1 = nx1; y1 = ny1;
+    l = l + 1u32;
+  }
+}
+
+// Texels of every level of a wide x high picture
+fn chainTexels(wide: u32, high: u32, levels: u32) usize {
+  var n = 0usize;
+  var lw = wide; var lh = high;
+  var l = 0u32;
+  while l < levels { n = n + usize.from(lw * lh); lw = maxu(1u32, lw / 2u32); lh = maxu(1u32, lh / 2u32); l = l + 1u32; }
+  n
+}
+
+// How wide a web page stands in a page's own frame (z = 0, middle at DOC_CENTRE_Y)
+const WEBPG_W = 1.9;
+
 pub struct WebPanel {
   page: PagePass;                // draws the page unlit, as the document panel's does
   view: i32;                     // the shim's number for the browser
-  buf: List[u8];                 // the latest frame, RGBA
+  buf: List[u8];                 // the latest paint's rectangle, RGBA
   url: String;                   // the address last asked for or shown
+  chain: Texels;                 // the picture and its mip chain, kept here and written whole to the texture
+  levels: u32 = 1u32;
+  nextAt: u64 = 0u64;            // the earliest the next paint may be taken (at most 30 a second, and about 1.5 ms in 33)
+  textured: bool = false;
+  pub cost: u64 = 0u64;          // the last paint's cost, in performance-counter ticks
   focus: bool = false;           // keys and text go to the page
   hover: bool = false;
   wasLoading: bool = false;
@@ -136,7 +200,42 @@ pub struct WebPanel {
     var buf = List[u8].withCapacity(usize.from(WEB_TEX_W * WEB_TEX_H * 4u32));
     buf.resize(usize.from(WEB_TEX_W * WEB_TEX_H * 4u32), 0u8);
     print <- "webpanel: opened "; printStr(url); print <- "\n";
-    Some[WebPanel](WebPanel(PagePass.create(device, outFormat), view, buf, u))
+    let levels = mipLevelCount(WEB_TEX_W, WEB_TEX_H);
+    var chain = Texels.withCapacity(chainTexels(WEB_TEX_W, WEB_TEX_H, levels));
+    chain.resize(chainTexels(WEB_TEX_W, WEB_TEX_H, levels), 0xFFFFFFFFu32);
+    var wp = WebPanel(PagePass.createDepth(device, outFormat), view, buf, u, chain);
+    wp.levels = levels;
+    Some[WebPanel](wp)
+  }
+
+  pub fn localRect() Vec4 {
+    let w = f32.from(WEBPG_W);
+    let h = w * f32.from(WEB_TEX_H) / f32.from(WEB_TEX_W);
+    let y = f32.from(DOC_CENTRE_Y);
+    Vec4(0. - w * 0.5, y - h * 0.5, w * 0.5, y + h * 0.5)
+  }
+
+  // As a page in the room: hidden where the scene's depth is nearer
+  pub fn drawLocal(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4) {
+    if !textured { return; }
+    page.drawDepthed(device, encoder, target, depth, vp, WebPanel.localRect());
+  }
+
+  // A ray in the page's own frame: the page pixel it meets as (x, y, 1), or z = 0; and how far along it is met (-1: not)
+  pub fn pickLocal(self: &, eye: Vec3, direction: Vec3) Vec3 {
+    if direction.z > -0.00001 && direction.z < 0.00001 { return Vec3(0., 0., 0.); }
+    let t = (0. - eye.z) / direction.z;
+    if t < 0. { return Vec3(0., 0., 0.); }
+    let hit = eye + direction * t;
+    let r = WebPanel.localRect();
+    let u = (hit.x - r.x) / (r.z - r.x);
+    let v = (hit.y - r.y) / (r.w - r.y);
+    if u < 0. || u > 1. || v < 0. || v > 1. { return Vec3(0., 0., 0.); }
+    Vec3(u * f32.from(WEB_TEX_W), (1. - v) * f32.from(WEB_TEX_H), 1.)
+  }
+  pub fn reachLocal(self: &, eye: Vec3, direction: Vec3) f32 {
+    if self.pickLocal(eye, direction).z < 0.5 { return -1.; }
+    (0. - eye.z) / direction.z
   }
 
   pub fn open(self: &mut, url: &str) {
@@ -155,14 +254,30 @@ pub struct WebPanel {
     }
     wasLoading = busy;
     let t0 = sdl.GetPerformanceCounter();
-    let n = webFrame(view, &buf[0] as *u8, i32.from(buf.len()), &mut w, &mut h);
-    if n > 0i32 {
-      page.uploadRgbaFlat(device, u32.from(w), u32.from(h), &buf);
+    if t0 < nextAt { return; }
+    var rx = 0i32; var ry = 0i32; var rw = 0i32; var rh = 0i32;
+    let n = webFrameRect(view, &buf[0] as *u8, i32.from(buf.len()), &mut rx, &mut ry, &mut rw, &mut rh, &mut w, &mut h);
+    if n > 0i32 && u32.from(w) == WEB_TEX_W && u32.from(h) == WEB_TEX_H {
+      // the rectangle into level 0, the levels below it redone for its texels only, the whole chain to the texture
+      var j = 0i32;
+      while j < rh {
+        let dst = usize.from(u32.from(ry + j) * WEB_TEX_W + u32.from(rx));
+        libc.memcpy(&chain[dst] as *u8, &buf[usize.from(u32.from(j * rw * 4i32))] as *u8, usize.from(u32.from(rw * 4i32)));
+        j = j + 1i32;
+      }
+      mipRect(&mut chain, WEB_TEX_W, WEB_TEX_H, levels, u32.from(rx), u32.from(ry), u32.from(rw), u32.from(rh));
+      if !textured { page.makeChain(device, WEB_TEX_W, WEB_TEX_H, levels, &chain); textured = true; }
+      else { page.refreshChain(device, &chain); }
       uploaded = uploaded + 1u32;
       let d = sdl.GetPerformanceCounter() - t0;
+      cost = d;
       webUploadTicks = webUploadTicks + d;
       webUploads = webUploads + 1u64;
       if d > webUploadMax { webUploadMax = d; }
+      // at most 30 a second, and never more than 1.5 ms of every 33: a dear paint waits longer for the next
+      let gap = sdl.GetPerformanceFrequency() / 30u64;
+      let spread = d * 22u64;
+      nextAt = t0 + (if spread > gap { spread } else { gap });
     }
   }
 
@@ -243,6 +358,7 @@ pub struct WebPanel {
       if cp < 65536i32 { webChar(view, cp, 0i32); }
     }
   }
+  pub fn close(self: &mut) { webClose(view); }
   pub fn back(self: &mut) { webBack(view); }
   pub fn forward(self: &mut) { webForward(view); }
 }
@@ -250,6 +366,7 @@ pub struct WebPanel {
 // ---- the web panel in the studio (Shell's side) ----
 
 fn webFocused(s: &Shell) bool {
+  if s.wh.on && s.wh.webFocused() { return true; }
   match &s.web { case let Some(w) { return w.focus; } else {} }
   false
 }
@@ -321,6 +438,9 @@ fn webRelease(s: &mut Shell) {
 
 // The wheel over the web panel scrolls the page; false if the pointer is not on it
 fn webWheelOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, notches: f32) bool {
+  if s.wh.on && w > 0. && h > 0. && f32.from(s.target.texture.height) > 0. {
+    if s.wh.webWheelRay(s.camera.origin, rayDir(&*s, x, y, w, h), notches) { return true; }
+  }
   var has = false;
   match &s.web { case let Some(wp) { has = true; } else {} }
   if !has { return false; }
@@ -334,6 +454,7 @@ fn webWheelOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, notches: f32) bool 
 fn webKeys(s: &mut Shell, e: &imm sdl.Event) {
   if e.type == sdl.EVENT_TEXT_INPUT {
     let t = e as &sdl.TextInputEvent;
+    if s.wh.on && s.wh.webFocused() { s.wh.webTyped(cstr.fromPtr(t.text).view()); return; }
     match &mut s.web { case var &mut Some(wp) { wp.typed(cstr.fromPtr(t.text).view()); } else {} }
     return;
   }
@@ -344,6 +465,10 @@ fn webKeys(s: &mut Shell, e: &imm sdl.Event) {
   if (key.keymod & 0x00C0u16) != 0u16 { mods = mods | 2i32; }
   if (key.keymod & 0x0300u16) != 0u16 { mods = mods | 4i32; }
   let vk = virtualKey(key.scancode);
+  if s.wh.on && s.wh.webFocused() {
+    s.wh.webKeyed(vk, down, mods, (mods & 4i32) != 0i32 && key.scancode == KEY_LEFT, (mods & 4i32) != 0i32 && key.scancode == KEY_RIGHT);
+    return;
+  }
   match &mut s.web {
     case var &mut Some(wp) {
       if (mods & 4i32) != 0i32 && key.scancode == KEY_LEFT { if down && !key.repeat { wp.back(); } return; }
@@ -391,5 +516,5 @@ fn webFrameTick(s: &mut Shell) {
     case var &mut Some(p) { if p.outWeb.len() > 0usize { link = p.outWeb.clone(); p.outWeb = String(); } }
     else {}
   }
-  if link.len() > 0usize { openWeb(s, link.view()); }
+  if link.len() > 0usize { if s.wh.on { s.wh.wantPage(link.view()); } else { openWeb(s, link.view()); } }
 }

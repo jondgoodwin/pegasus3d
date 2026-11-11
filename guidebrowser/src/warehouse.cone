@@ -318,6 +318,27 @@ pub struct Warehouse {
   eyeIx: u32;              // which eye the walk's words are drawn for (0 the window or the left eye)
   moves: u32;              // moves written to room.toml
   applied: bool;           // the files have been applied once (later changes fly)
+  pgs: Pgs;                // the pages (pages.cone)
+  pgChips: List[Label];    // close, shelve, grab; park
+  markers: FolderPosts;    // the parked folders
+  grabIx: i32;             // the page being moved by hand, or -1
+  grabDist: f32;
+  gazeEye: Vec3;           // where the visitor looks from and along (set by the shell each frame)
+  gazeDir: Vec3;
+  pgSerial: u32;
+  lastBorn: u64;
+  restoreQ: PageCfgs;      // pages room.toml holds that are yet to be opened
+  restoreAt: u64;
+  pageWant: String;        // a file or address to open as a page, taken by the shell
+  browseCfg: bool;         // [panel.browser] gave a place
+  browseCfgPos: Vec3;
+  browseCfgYaw: f32;
+  reportCfg: bool;         // [panel.report] gave a place
+  reportCfgPos: Vec3;
+  reportCfgYaw: f32;
+  slotsBack: u32;          // [shelf.back] / [shelf.side] slots: how many the room uses when it shelves by itself
+  slotsSide: u32;
+  handHeld: bool;          // a hand's grip holds the gaze
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -326,7 +347,9 @@ pub struct Warehouse {
       Vec3(0., 0., 0.), None, false, Vec3(0., 0., 0.), 0., 0u32, String(),
       String(), String(), String(), newParsed(), newParsed(), false, 0u64, String(), String(), None, String(), false, 0u64,
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
-      None, 0u32, 0u32, false)
+      None, 0u32, 0u32, false,
+      Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
+      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false)
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -386,7 +409,8 @@ pub struct Warehouse {
     w.lastMs = w.startMs;
     if w.on {
       w.aw = makeAw(device, renderer, format);
-      w.initConfig(device);
+      w.ensureChips(device);
+      w.initConfig(device, renderer);
     }
     w
   }
@@ -544,7 +568,8 @@ pub struct Warehouse {
     }
     self.serveReport(device, renderer);
     self.tickBrowser(device, renderer);
-    self.cfgTick(device, now);
+    self.cfgTick(device, renderer, now);
+    self.tickPages(device, renderer, dt);
     self.awTick(dt);
     ticks = ticks + 1u32;
     if ticks > 4u32 { self.fillSome(device, 2); }
@@ -600,6 +625,27 @@ pub struct Warehouse {
         while k < cards.len() && made < most {
           if !cards[k].calm.ok { fillLabel(l, device, &mut cards[k].calm); made = made + 1; }
           if made < most && !cards[k].glow.ok { fillLabel(l, device, &mut cards[k].glow); made = made + 1; }
+          k = k + 1usize;
+        }
+        k = 0usize;
+        while k < pgChips.len() && made < most {
+          if !pgChips[k].ok { fillLabel(l, device, &mut pgChips[k]); made = made + 1; }
+          k = k + 1usize;
+        }
+        k = 0usize;
+        while k < pgs.len() && made < most {
+          if !pgs[k].title.ok { fillLabel(l, device, &mut pgs[k].title); made = made + 1; }
+          var cc = 0usize;
+          while cc < pgs[k].chips.len() && made < most {
+            if !pgs[k].chips[cc].ok { fillLabel(l, device, &mut pgs[k].chips[cc]); made = made + 1; }
+            cc = cc + 1usize;
+          }
+          k = k + 1usize;
+        }
+        k = 0usize;
+        while k < markers.len() && made < most {
+          if !markers[k].label.ok { fillLabel(l, device, &mut markers[k].label); made = made + 1; }
+          if made < most && !markers[k].post.ok { fillLabel(l, device, &mut markers[k].post); made = made + 1; }
           k = k + 1usize;
         }
       }
@@ -714,13 +760,14 @@ pub struct Warehouse {
     if reportOpen && reportCard == c { reportOpen = false; reportCard = -1; print <- "warehouse: report closed\n"; return true; }
     let p = self.cardPlace(cu);
     reportPos = Vec3(-3.5, 0., p.z + (if p.z > 0. { -1.2 } else { 1.2 }));
+    if reportCfg { reportPos = reportCfgPos; }
     reportWant = String.from(cards[cu].report.view());
     reportCard = c;
     true
   }
 
   fn reportModel(self: &) Mat4 {
-    Mat4.fromTrs(reportPos, Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.))
+    Mat4.fromTrs(reportPos, Quat.angleAxis(if reportCfg { reportCfgYaw } else { PI * 0.5 }, Vec3(0., 1., 0.)), Vec3(1., 1., 1.))
   }
 
   // A click's ray: the open report page (taken, nothing more) or a card (opens its report)
@@ -875,7 +922,11 @@ pub struct Warehouse {
     let h = items[k].home;
     if *shelfItem[usize.from(h)] == NO_ITEM { return i32.from(h); }
     var j = 0usize;
-    while j < shelfItem.len() { if *shelfItem[j] == NO_ITEM { return i32.from(j); } j = j + 1usize; }
+    while j < shelfItem.len() {
+      let usable = if j < 16usize { u32.from(j) < slotsBack } else { u32.from(j) - 16u32 < slotsSide };
+      if usable && *shelfItem[j] == NO_ITEM { return i32.from(j); }
+      j = j + 1usize;
+    }
     NO_ITEM
   }
 
@@ -1063,7 +1114,7 @@ pub struct Warehouse {
   }
 
   // The first run: studio.toml written from the layout the studio was built with; then both files are read as ever
-  fn initConfig(self: &mut, device: &mut Device) {
+  fn initConfig(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     _ = fs.makeDirAll(&Path.from(cfgDir.view()));
     let sp = self.cfgPath("studio.toml");
     if !fs.exists(&Path.from(sp.view())) {
@@ -1087,15 +1138,19 @@ pub struct Warehouse {
         r.projects.push(p);
         k = k + 1usize;
       }
+      r.folders.push(FolderCfg(String.from("cone"), String.from("Cone"), String.from("C:/src/cone"), String.from("at:-3,0,2.4"), String.from(now.view())));
+      r.folders.push(FolderCfg(String.from("pegasus3d"), String.from("Pegasus 3D"), String.from("C:/src/pegasus3d"), String.from("at:-3,0,1.5"), String.from(now.view())));
+      r.folders.push(FolderCfg(String.from("3dweb"), String.from("3D Web"), String.from("C:/Users/jondg/MyDrive/Incubator/3D Web"), String.from("at:-3,0,0.6"), String.from(now.view())));
+      r.folders.push(FolderCfg(String.from("penny"), String.from("Penny prompts"), String.from("C:/Users/jondg/MyDrive/Incubator/Penny/prompts"), String.from("at:-3,0,-0.3"), String.from(now.view())));
       let text = studioText(&r, 250i64, 95i64, LINE_FILE, DEFAULT_ROOT_BROWSE);
       if writeAtomic(cfgDir.view(), "studio.toml", text.view()) { print <- "studio: no studio.toml; wrote the first-run one from today's layout\n"; }
     }
     cfgPoll = 0u64;
-    self.cfgTick(device, nowMs());
+    self.cfgTick(device, renderer, nowMs());
   }
 
   // Every 250 ms: both files are read, and a changed one that reads well is applied; one that does not keeps the last layout
-  fn cfgTick(self: &mut, device: &mut Device, now: u64) {
+  fn cfgTick(self: &mut, device: &mut Device, renderer: &mut Renderer, now: u64) {
     if writeAt != 0u64 && now >= writeAt { self.writeRoom(); }
     if now < cfgPoll + 250u64 { return; }
     cfgPoll = now;
@@ -1142,11 +1197,39 @@ pub struct Warehouse {
         match &mut errCard { case var &mut Some(ec) { if ec.text.len() > 0usize || true { ec.text = shownText; ec.ok = false; } } else {} }
       }
     }
-    if (cs || cr) && haveStudio { self.reapply(device, cs); }
+    if (cs || cr) && haveStudio { self.reapply(device, renderer, cs); }
   }
 
-  fn reapply(self: &mut, device: &mut Device, studioChanged: bool) {
+  fn reapply(self: &mut, device: &mut Device, renderer: &mut Renderer, studioChanged: bool) {
     if studioChanged {
+      // [browser] roots, [panel.*] places, [shelf.*] slots
+      if studioGood.roots.len() > 0usize { browseRoot = String.from(studioGood.roots[0usize].view()); }
+      browseCfg = false; reportCfg = false;
+      var pn = 0usize;
+      while pn < studioGood.panels.len() {
+        let pc = &studioGood.panels[pn];
+        var pl = Place(0u32, 0u32, 0., 0., 0.);
+        let has = pc.place.len() > 0usize && parsePlace(pc.place.view(), &mut pl);
+        let yw = if pc.hasYaw { f32.from(i32.from(pc.yaw)) * PI / 180. } else { 0. };
+        if pc.id.view() == "browser" {
+          if has { browseCfg = true; browseCfgPos = Vec3(pl.x, 0., pl.z); browseCfgYaw = if pc.hasYaw { yw } else { atan2(0. - pl.x, 0. - pl.z) }; }
+          else if pc.hasYaw { browseCfg = true; browseCfgPos = Vec3(0. - 1.9, 0., 0. - 2.3); browseCfgYaw = yw; }
+        } else if pc.id.view() == "report" {
+          if has { reportCfg = true; reportCfgPos = Vec3(pl.x, 0., pl.z); reportCfgYaw = if pc.hasYaw { yw } else { PI * 0.5 }; }
+          else if pc.hasYaw { reportCfg = true; reportCfgPos = Vec3(0. - 3.5, 0., 0.); reportCfgYaw = yw; }
+        } else { print <- "studio: [panel."; printStr(pc.id.view()); print <- "] is not a panel the room has (browser, report)\n"; }
+        pn = pn + 1usize;
+      }
+      slotsBack = 16u32; slotsSide = 8u32;
+      pn = 0usize;
+      while pn < studioGood.shelves.len() {
+        let sc = &studioGood.shelves[pn];
+        if sc.hasSlots && sc.slots >= 0i64 {
+          let n = u32.from(i32.from(sc.slots));
+          if sc.wall.view() == "back" { slotsBack = if n > 16u32 { 16u32 } else { n }; } else { slotsSide = if n > 8u32 { 8u32 } else { n }; }
+        }
+        pn = pn + 1usize;
+      }
       if studioGood.ringCm > 0i64 || studioGood.floatCm > 0i64 {
         if studioGood.ringCm > 0i64 { ringRadius = f32.from(i32.from(studioGood.ringCm)) / 100.; }
         if studioGood.floatCm > 0i64 { floatHeight = f32.from(i32.from(studioGood.floatCm)) / 100.; }
@@ -1160,8 +1243,125 @@ pub struct Warehouse {
       self.rebuildMenus(device);
     }
     let eff = overlay(&studioGood, &roomGood);
+    let first = !applied;
     self.applyCfg(&eff, applied);
+    self.applyExtra(device, renderer, &eff);
+    self.syncMarkers(device);
+    if first {
+      // the pages the room had open, to be opened one at a time (each costs a document panel)
+      var r = 0usize;
+      while r < roomGood.pages.len() {
+        let g = &roomGood.pages[r];
+        restoreQ.push(PageCfg(g.id.clone(), g.src.clone(), g.place.clone(), g.at.clone()));
+        var num = 0u32;
+        if g.id.len() > 1usize && cfgDigits(g.id.slice(1usize, g.id.len()), &mut num) && num > pgSerial { pgSerial = num; }
+        r = r + 1usize;
+      }
+      restoreAt = nowMs() + 1500u64;
+    }
     applied = true;
+  }
+
+  // Projects the building does not have, whose source is a document, an address or a folder: they appear as pages and markers,
+  // and leave when the file drops them
+  fn applyExtra(self: &mut, device: &mut Device, renderer: &mut Renderer, eff: &List[EffProj]) {
+    applying = true;
+    var wantIds = List[String]();
+    var e = 0usize;
+    while e < eff.len() {
+      let pj = &studioGood.projects[eff[e].pi];
+      if self.itemById(pj.id.view()) < 0 {
+        let src = pj.source.view();
+        var isPage = false;
+        var target = String();
+        if startsWithText(src, "doc:") { isPage = true; target = String.from(src.slice(4usize, src.len())); }
+        else if startsWithText(src, "url:") { isPage = true; target = String.from(src.slice(4usize, src.len())); }
+        else if startsWithText(src, "web:") { isPage = true; target = String.from(src.slice(4usize, src.len())); }
+        var shown = if pj.name.len() > 0usize { String.from(pj.name.view()) } else { String.from(pj.id.view()) };
+        if pj.owner.len() > 0usize { shown.append(" - "); shown.append(pj.owner.view()); }
+        if isPage {
+          wantIds.push(pj.id.clone());
+          var at = -1;
+          var q = 0usize;
+          while q < pgs.len() { if pgs[q].proj && pgs[q].id.view() == pj.id.view() && !pgs[q].gone { at = i32.from(q); } q = q + 1usize; }
+          if at >= 0 && pgs[usize.from(u32.from(at))].src.view() != target.view() {
+            self.closePage(usize.from(u32.from(at)));
+            at = -1;
+          }
+          if at < 0 {
+            at = self.openPageAs(device, renderer, target.view(), pj.id.view(), true);
+            print <- "studio: project '"; printStr(pj.id.view()); print <- "' appears as a page\n";
+          }
+          if at >= 0 {
+            let a = usize.from(u32.from(at));
+            if pgs[a].title.text.view() != shown.view() {
+              (&mut pgs[a]).title.text = shown.clone();
+              (&mut pgs[a]).title.size = fitSize(shown.len(), 56.);
+              (&mut pgs[a]).title.ok = false;
+            }
+            if pgs[a].placeKey.view() != eff[e].place.view() {
+              (&mut pgs[a]).placeKey = eff[e].place.clone();
+              self.placeProjPage(a, eff[e].place.view());
+            }
+          }
+        } else if startsWithText(src, "folder:") {
+          wantIds.push(pj.id.clone());
+          let path = src.slice(7usize, src.len());
+          var at = -1;
+          var q = 0usize;
+          while q < markers.len() { if markers[q].proj && markers[q].id.view() == pj.id.view() { at = i32.from(q); } q = q + 1usize; }
+          var row = 0usize;
+          q = 0usize;
+          while q < markers.len() { if markers[q].place.len() == 0usize { row = row + 1usize; } q = q + 1usize; }
+          let made = self.makeMarker(device, pj.id.view(), shown.view(), path, eff[e].place.view(), false, true, row);
+          if at < 0 { markers.push(made); print <- "studio: project '"; printStr(pj.id.view()); print <- "' appears as a marker\n"; }
+          else if markers[usize.from(u32.from(at))].path.view() != path || markers[usize.from(u32.from(at))].place.view() != eff[e].place.view() || markers[usize.from(u32.from(at))].name.view() != shown.view() {
+            markers.set(usize.from(u32.from(at)), made);
+          }
+        }
+      }
+      e = e + 1usize;
+    }
+    // the ones the file dropped leave
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].proj && !pgs[i].gone {
+        var keep = false;
+        var w = 0usize;
+        while w < wantIds.len() { if wantIds[w].view() == pgs[i].id.view() { keep = true; } w = w + 1usize; }
+        if !keep { print <- "studio: project '"; printStr(pgs[i].id.view()); print <- "' left the file: its page goes\n"; self.closePage(i); }
+      }
+      i = i + 1usize;
+    }
+    var m = markers.len();
+    while m > 0usize {
+      m = m - 1usize;
+      if markers[m].proj {
+        var keep = false;
+        var w = 0usize;
+        while w < wantIds.len() { if wantIds[w].view() == markers[m].id.view() { keep = true; } w = w + 1usize; }
+        if !keep { print <- "studio: project '"; printStr(markers[m].id.view()); print <- "' left the file: its marker goes\n"; var dead = markers.swapRemove(m); }
+      }
+    }
+    applying = false;
+  }
+
+  // Where a project's page stands, from its place text
+  fn placeProjPage(self: &mut, a: usize, place: &str) {
+    var pl = Place(0u32, 0u32, 0., 0., 0.);
+    (&mut pgs[a]).shelved = false;
+    (&mut pgs[a]).free = false;
+    if place.len() > 0usize && parsePlace(place, &mut pl) {
+      if pl.kind == 3u32 { (&mut pgs[a]).free = true; (&mut pgs[a]).toPos = Vec3(pl.x, 0., pl.z); }
+      else if pl.kind == 0u32 {
+        let s = Warehouse.slotPos(pl.idx);
+        let out = ringRadius + 1.1;
+        (&mut pgs[a]).free = true;
+        (&mut pgs[a]).toPos = Vec3(s.x * out / ringRadius, 0., s.z * out / ringRadius);
+      } else { (&mut pgs[a]).shelved = true; (&mut pgs[a]).shelfAt = self.pgShelfFree(); }
+    }
+    if !pgs[a].shelved && !pgs[a].free { (&mut pgs[a]).born = self.newBorn(); }
+    self.retarget();
   }
 
   // The action's colour class (and so its chip's picture)
@@ -1328,8 +1528,22 @@ pub struct Warehouse {
         let pi = eff[e].pi;
         if studioGood.projects[pi].name.len() > 0usize && !sameText(studioGood.projects[pi].name.view(), items[ku].name.view()) {
           (&mut items[ku]).name = String.from(studioGood.projects[pi].name.view());
-          (&mut items[ku]).label.text = String.from(studioGood.projects[pi].name.view());
+        }
+        // the label: the name, and who answers for the project
+        var shown = String.from(items[ku].name.view());
+        if studioGood.projects[pi].owner.len() > 0usize { shown.append(" - "); shown.append(studioGood.projects[pi].owner.view()); }
+        if !sameText(shown.view(), items[ku].label.text.view()) {
+          (&mut items[ku]).label.text = shown.clone();
           (&mut items[ku]).label.ok = false;
+          if studioGood.projects[pi].owner.len() > 0usize {
+            (&mut items[ku]).label.w = 1.1;
+            (&mut items[ku]).label.h = 1.1 / 4.;
+            (&mut items[ku]).label.size = fitSize(shown.len(), 50.);
+          } else {
+            (&mut items[ku]).label.w = 0.56;
+            (&mut items[ku]).label.h = 0.56 / 4.;
+            (&mut items[ku]).label.size = 50.;
+          }
         }
         if eff[e].hasYaw {
           let y = f32.from(i32.from(eff[e].yaw)) * PI / 180.;
@@ -1516,8 +1730,9 @@ pub struct Warehouse {
     if !browserOpen {
       browserPos = Vec3(0. - 1.9, 0., 0. - 2.3);
       browserYaw = atan2(0. - browserPos.x, 0. - browserPos.z);
+      if browseCfg { browserPos = browseCfgPos; browserYaw = browseCfgYaw; }
     }
-    browserWant = if folder.len() == 0usize { String.from(DEFAULT_ROOT_BROWSE) } else { String.from(folder) };
+    browserWant = if folder.len() == 0usize { String.from(browseRoot.view()) } else { String.from(folder) };
     var f = String.from(BROWSE_PREFIX);
     f.append(browserWant.view());
     browserWant = f;
@@ -1527,11 +1742,16 @@ pub struct Warehouse {
   // it (six font atlases and their pipelines) took 2.4 s, which fell on the frame of the first F press.
   pub fn prepareBrowser(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     var f = String.from(BROWSE_PREFIX);
-    f.append(DEFAULT_ROOT_BROWSE);
+    f.append(browseRoot.view());
     match DocPanel.create(device, renderer, format, f.view(), 0.) {
       case let Some(p) { browserPanel = Some[DocPanel](p); }
       case is None {}
     }
+    // the browser is a standing panel: up in its place from the start
+    browserPos = Vec3(0. - 1.9, 0., 0. - 2.3);
+    browserYaw = atan2(0. - browserPos.x, 0. - browserPos.z);
+    if browseCfg { browserPos = browseCfgPos; browserYaw = browseCfgYaw; }
+    browserOpen = true;
   }
 
   fn tickBrowser(self: &mut, device: &mut Device, renderer: &mut Renderer) {
@@ -1631,6 +1851,691 @@ pub struct Warehouse {
       else {}
     }
     Vec4(0., 0., 0., 0.)
+  }
+
+  // ---- pages and parked folders ----
+
+  fn mkLabel(self: &, device: &mut Device, text: &str, bg: u32, ink: u32, size: f32, w: f32, h: f32) Label {
+    Label(PagePass.createDepth(device, format), w, h, false, String.from(text), bg, ink, size, 22., false, 0., false, false, 1.)
+  }
+
+  // The chips over a page (close, shelve, grab) and the browser's (park): made once
+  fn ensureChips(self: &mut, device: &mut Device) {
+    if pgChips.len() > 0usize { return; }
+    pgChips.push(self.mkLabel(device, "park", 0xc08a20ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+  }
+
+  // A page's own chips (a pass has one set of uniforms, so each page needs its own pictures): close, shelve, grab
+  fn pageChips(self: &, device: &mut Device) List[Label] {
+    var c = List[Label]();
+    c.push(self.mkLabel(device, "close", 0xb3261effu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    c.push(self.mkLabel(device, "shelve", 0x3a78b0ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    c.push(self.mkLabel(device, "grab", 0x3a8a58ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    c
+  }
+
+  pub fn setGaze(self: &mut, eye: Vec3, dir: Vec3) { if !handHeld { gazeEye = eye; gazeDir = dir; } }
+
+  // A hand's beam holds the gaze while its grip is down (a zero direction lets go)
+  pub fn setHand(self: &mut, eye: Vec3, dir: Vec3) {
+    if dir.length() < 0.01 { handHeld = false; return; }
+    handHeld = true; gazeEye = eye; gazeDir = dir;
+  }
+
+  // The grip went down with the beam at (eye, dir): the page under it is grabbed and follows the hand until the grip is let go
+  pub fn gripGrab(self: &mut, device: &mut Device, eye: Vec3, dir: Vec3) {
+    var bi = -1;
+    var bt: f32 = -1.;
+    var i = 0usize;
+    while i < pgs.len() {
+      var k = 0u32;
+      let t = self.pgHit(i, eye, dir, &mut k);
+      if t > 0. && (bt < 0. || t < bt) { bt = t; bi = i32.from(i); }
+      i = i + 1usize;
+    }
+    if bi >= 0 { gazeEye = eye; gazeDir = dir; self.startGrab(usize.from(u32.from(bi))); }
+  }
+
+  fn faceOrigin(p: Vec3) f32 { atan2(0. - p.x, 0. - p.z) }
+
+  fn pgModel(self: &, i: usize) Mat4 {
+    Mat4.fromTrs(pgs[i].pos, Quat.angleAxis(pgs[i].yaw, Vec3(0., 1., 0.)), Vec3(pgs[i].sc, pgs[i].sc, pgs[i].sc))
+  }
+
+  fn newBorn(self: &mut) u64 {
+    var b = nowMs();
+    if b <= lastBorn { b = lastBorn + 1u64; }
+    lastBorn = b;
+    b
+  }
+
+  // The pages standing (not shelved, not closed)
+  fn standing(self: &) usize {
+    var n = 0usize;
+    var i = 0usize;
+    while i < pgs.len() { if !pgs[i].shelved && !pgs[i].gone { n = n + 1usize; } i = i + 1usize; }
+    n
+  }
+
+  // How many arc pages are newer than page i: its place in the arc, 0 the nearest the browser
+  fn arcRank(self: &, i: usize) usize {
+    var r = 0usize;
+    var j = 0usize;
+    while j < pgs.len() {
+      if j != i && !pgs[j].shelved && !pgs[j].free && !pgs[j].gone && (pgs[j].born > pgs[i].born || (pgs[j].born == pgs[i].born && j > i)) {
+        r = r + 1usize;
+      }
+      j = j + 1usize;
+    }
+    r
+  }
+
+  fn arcSpot(rank: usize) Vec3 {
+    let b = PG_B0 - PG_STEP * f32.from(u32.from(rank + 1usize));
+    Vec3(PG_R * sin(b), 0., 0. - PG_R * cos(b))
+  }
+
+  fn pgShelfFree(self: &) i32 {
+    var q = 0i32;
+    while q < 8i32 {
+      var used = false;
+      var i = 0usize;
+      while i < pgs.len() { if pgs[i].shelved && pgs[i].shelfAt == q && !pgs[i].gone { used = true; } i = i + 1usize; }
+      if !used { return q; }
+      q = q + 1i32;
+    }
+    7i32
+  }
+
+  fn pgShelfSpot(web: bool, q: i32) Vec3 {
+    let sp = Warehouse.shelfPos(16u32 + u32.from(q));
+    Vec3(sp.x - 0.4, sp.y - pgBottom(web) * PG_SHELVED_SCALE, sp.z)
+  }
+
+  // Every page set off toward the place it should stand now: the arc's (newest nearest), a shelf, or where it was put
+  fn retarget(self: &mut) {
+    var i = 0usize;
+    while i < pgs.len() {
+      if !pgs[i].gone {
+        var np = pgs[i].toPos;
+        var ny = pgs[i].toYaw;
+        var ns: f32 = 1.;
+        if pgs[i].shelved {
+          np = Warehouse.pgShelfSpot(pgs[i].web, pgs[i].shelfAt);
+          ny = 0. - PI * 0.5;
+          ns = PG_SHELVED_SCALE;
+        } else if pgs[i].free {
+          ny = Warehouse.faceOrigin(np);
+        } else {
+          np = Warehouse.arcSpot(self.arcRank(i));
+          ny = Warehouse.faceOrigin(np);
+        }
+        (&mut pgs[i]).fromPos = pgs[i].pos;
+        (&mut pgs[i]).fromYaw = pgs[i].yaw;
+        (&mut pgs[i]).fromSc = pgs[i].sc;
+        (&mut pgs[i]).toPos = np;
+        (&mut pgs[i]).toYaw = pgs[i].yaw + turnBetween(pgs[i].yaw, ny);
+        (&mut pgs[i]).toSc = ns;
+        (&mut pgs[i]).fly = 0.;
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // More than PG_MAX standing: the oldest are shelved
+  fn enforceLimit(self: &mut) {
+    while self.standing() > PG_MAX {
+      var old = pgs.len();
+      var i = 0usize;
+      while i < pgs.len() {
+        if !pgs[i].shelved && !pgs[i].gone && (old == pgs.len() || pgs[i].born < pgs[old].born) { old = i; }
+        i = i + 1usize;
+      }
+      if old == pgs.len() { return; }
+      print <- "pages: "; printStr(pgs[old].title.text.view()); print <- " shelved (more than "; print <- PG_MAX; print <- " standing)\n";
+      (&mut pgs[old]).shelfAt = self.pgShelfFree();
+      (&mut pgs[old]).shelved = true;
+      (&mut pgs[old]).free = false;
+    }
+  }
+
+  fn placeTextOfPage(self: &, i: usize) String {
+    if pgs[i].shelved { var s = String.from("shelf:"); s.append(numText(i64.from(pgs[i].shelfAt)).view()); return s; }
+    if pgs[i].free {
+      var s = String.from("at:");
+      s.append(floatText(pgs[i].toPos.x).view()); s.append(",0,"); s.append(floatText(pgs[i].toPos.z).view());
+      return s;
+    }
+    String.from("arc")
+  }
+
+  // The pages the room opened, to room.toml (a second after the last change), oldest first
+  fn syncRoom(self: &mut) {
+    var order = List[usize]();
+    var i = 0usize;
+    while i < pgs.len() {
+      if !pgs[i].gone && !pgs[i].proj {
+        var at = order.len();
+        while at > 0usize && pgs[*order[at - 1usize]].born > pgs[i].born { at = at - 1usize; }
+        order.insert(at, i);
+      }
+      i = i + 1usize;
+    }
+    var list = PageCfgs();
+    let now = isoUtc(unixMs());
+    var o = 0usize;
+    while o < order.len() {
+      let k = *order[o];
+      list.push(PageCfg(pgs[k].id.clone(), pgs[k].src.clone(), self.placeTextOfPage(k), String.from(now.view())));
+      o = o + 1usize;
+    }
+    roomGood.pages = list;
+    writeAt = nowMs() + 1000u64;
+  }
+
+  pub fn wantPage(self: &mut, src: &str) { pageWant = String.from(src); }
+
+  pub fn takePageWant(self: &mut) String { let s = pageWant.clone(); pageWant = String(); s }
+
+  // A file or an address becomes a new page, at the near end of the arc. Returns its number, or -1.
+  pub fn openPage(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str) {
+    _ = self.openPageAs(device, renderer, src, "", false);
+  }
+
+  fn openPageAs(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str, id: &str, proj: bool) i32 {
+    self.ensureChips(device);
+    let t0 = sdl.GetPerformanceCounter();
+    let web = isWebSrc(src);
+    var doc: Option[DocPanel] = None;
+    var wp: Option[WebPanel] = None;
+    var okp = true;
+    if web {
+      wp = WebPanel.create(device, format, src);
+      match &wp { case let Some(w0) {} case is None { okp = false; } }
+    } else {
+      doc = DocPanel.create(device, renderer, format, src, 0.);
+      match &doc { case let Some(d0) {} case is None { okp = false; } }
+    }
+    if !okp { print <- "pages: could not open "; printStr(src); print <- "\n"; return -1; }
+    var pid = String.from(id);
+    if pid.len() == 0usize {
+      pgSerial = pgSerial + 1u32;
+      pid = String.from("p");
+      pid.append(numText(i64.from(pgSerial)).view());
+    }
+    let title = pageTitle(src);
+    let tl = self.mkLabel(device, title.view(), 0xf8f5eeffu32, 0x1c1c1cffu32, fitSize(title.len(), 56.), 0.8, 0.2);
+    let from = if browserOpen { Vec3(browserPos.x, 0., browserPos.z) } else { Vec3(0. - 1.9, 0., 0. - 2.3) };
+    let yaw0 = Warehouse.faceOrigin(from);
+    let born = self.newBorn();
+    let chips = self.pageChips(device);
+    pgs.push(Pg(pid, String.from(src), web, doc, wp, tl, chips, born, from, yaw0, 0.3, from, yaw0, 0.3, from, yaw0, 1., String()));
+    let n = pgs.len() - 1usize;
+    (&mut pgs[n]).proj = proj;
+    self.enforceLimit();
+    self.retarget();
+    if !proj { self.syncRoom(); }
+    print <- "pages: opened "; printStr(src); print <- " as "; printStr(pgs[n].id.view()); print <- " in ";
+    print <- f64.from((sdl.GetPerformanceCounter() - t0) * 1000000u64 / sdl.GetPerformanceFrequency()) / 1000.; print <- " ms, "; print <- self.standing(); print <- " standing\n";
+    i32.from(n)
+  }
+
+  fn closePage(self: &mut, i: usize) {
+    if i >= pgs.len() || pgs[i].gone { return; }
+    print <- "pages: closed "; printStr(pgs[i].title.text.view()); print <- "\n";
+    (&mut pgs[i]).gone = true;
+    if grabIx == i32.from(i) { grabIx = -1; }
+    self.retarget();
+    if !pgs[i].proj { self.syncRoom(); }
+  }
+
+  // Shelve a standing page; bring a shelved one back as the newest
+  fn toggleShelve(self: &mut, i: usize) {
+    if i >= pgs.len() || pgs[i].gone { return; }
+    if pgs[i].shelved {
+      (&mut pgs[i]).shelved = false;
+      (&mut pgs[i]).free = false;
+      (&mut pgs[i]).born = self.newBorn();
+      self.enforceLimit();
+      print <- "pages: "; printStr(pgs[i].title.text.view()); print <- " brought back\n";
+    } else {
+      (&mut pgs[i]).shelfAt = self.pgShelfFree();
+      (&mut pgs[i]).shelved = true;
+      (&mut pgs[i]).free = false;
+      print <- "pages: "; printStr(pgs[i].title.text.view()); print <- " shelved\n";
+    }
+    self.retarget();
+    if !pgs[i].proj { self.syncRoom(); } else { self.noteProjPage(i); }
+  }
+
+  fn startGrab(self: &mut, i: usize) {
+    if i >= pgs.len() || pgs[i].gone { return; }
+    var d = (pgs[i].pos - gazeEye).length();
+    if d < 1.5 { d = 1.5; }
+    if d > 8. { d = 8.; }
+    grabDist = d;
+    grabIx = i32.from(i);
+    (&mut pgs[i]).shelved = false;
+    (&mut pgs[i]).free = true;
+    (&mut pgs[i]).sc = 1.;
+    print <- "pages: grabbed "; printStr(pgs[i].title.text.view()); print <- "\n";
+    self.retarget();
+  }
+
+  pub fn dropGrab(self: &mut) {
+    if grabIx < 0 { return; }
+    let i = usize.from(u32.from(grabIx));
+    grabIx = -1;
+    if i >= pgs.len() { return; }
+    print <- "pages: dropped "; printStr(pgs[i].title.text.view()); print <- " at ("; print <- pgs[i].toPos.x; print <- ", "; print <- pgs[i].toPos.z; print <- ")\n";
+    self.retarget();
+    if !pgs[i].proj { self.syncRoom(); } else { self.noteProjPage(i); }
+  }
+
+  // A project's page was moved in the room: it goes to room.toml as the project's place
+  fn noteProjPage(self: &mut, i: usize) {
+    var pi = 0usize;
+    var found = false;
+    while pi < roomGood.projects.len() { if roomGood.projects[pi].id.view() == pgs[i].id.view() { found = true; break; } pi = pi + 1usize; }
+    if !found { roomGood.projects.push(newProj(pgs[i].id.view())); pi = roomGood.projects.len() - 1usize; }
+    let pt = self.placeTextOfPage(i);
+    var text = pt.clone();
+    if pt.view() == "arc" { text = String.from("ring:0"); }
+    else if pt.view() != "" && startsWithText(pt.view(), "shelf:") { text = String.from("shelf:side:"); text.append(numText(i64.from(pgs[i].shelfAt)).view()); }
+    roomGood.projects[pi].place = text.clone();
+    roomGood.projects[pi].at = isoUtc(unixMs());
+    (&mut pgs[i]).placeKey = text;
+    writeAt = nowMs() + 1000u64;
+  }
+
+  // Once a frame: pages glide, tick and report; the grabbed one follows the gaze; the closed leave
+  fn tickPages(self: &mut, device: &mut Device, renderer: &mut Renderer, dt: f32) {
+    let now = nowMs();
+    var openWant = List[String]();
+    var browseWant = String();
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].fly < 1. {
+        var f = pgs[i].fly + dt / 0.6;
+        if f > 1. { f = 1.; }
+        let e = f * f * (3. - 2. * f);
+        (&mut pgs[i]).fly = f;
+        (&mut pgs[i]).pos = pgs[i].fromPos + (pgs[i].toPos - pgs[i].fromPos) * e;
+        (&mut pgs[i]).yaw = pgs[i].fromYaw + (pgs[i].toYaw - pgs[i].fromYaw) * e;
+        (&mut pgs[i]).sc = pgs[i].fromSc + (pgs[i].toSc - pgs[i].fromSc) * e;
+      }
+      if grabIx == i32.from(i) {
+        let h = Vec3(gazeDir.x, 0., gazeDir.z);
+        if h.length() > 0.05 {
+          let hn = h.normalize();
+          let p = Vec3(gazeEye.x + hn.x * grabDist, 0., gazeEye.z + hn.z * grabDist);
+          (&mut pgs[i]).pos = p;
+          (&mut pgs[i]).toPos = p;
+          (&mut pgs[i]).fromPos = p;
+          (&mut pgs[i]).yaw = Warehouse.faceOrigin(p);
+          (&mut pgs[i]).toYaw = pgs[i].yaw;
+          (&mut pgs[i]).fromYaw = pgs[i].yaw;
+          (&mut pgs[i]).sc = 1.; (&mut pgs[i]).toSc = 1.; (&mut pgs[i]).fromSc = 1.;
+          (&mut pgs[i]).fly = 1.;
+        }
+      }
+      if !pgs[i].gone {
+        if pgs[i].web {
+          let up = pgs[i].webUp;
+          match &mut pgs[i].wp {
+            case var &mut Some(w) {
+              w.tick(device);
+              if up > 0i32 {
+                if up == 1i32 { w.button(w.lastX, w.lastY, true); }
+              }
+            }
+            else {}
+          }
+          if up > 0i32 { (&mut pgs[i]).webUp = up - 1i32; }
+        } else if !pgs[i].shelved {
+          match &mut pgs[i].doc {
+            case var &mut Some(p) {
+              p.tick(device, renderer);
+              p.openNew = false;
+              if p.outOpen.len() > 0usize { openWant.push(p.outOpen.clone()); p.outOpen = String(); }
+              if p.outWeb.len() > 0usize { openWant.push(p.outWeb.clone()); p.outWeb = String(); }
+              if p.outBrowse.len() > 0usize { browseWant = p.outBrowse.clone(); p.outBrowse = String(); }
+            }
+            else {}
+          }
+        }
+      }
+      i = i + 1usize;
+    }
+    var w = 0usize;
+    while w < openWant.len() { self.openPage(device, renderer, openWant[w].view()); w = w + 1usize; }
+    if browseWant.len() > 0usize { self.toggleBrowser(browseWant.view(), Vec3(0., 0., 0.), 0.); }
+    // pages from room.toml, one at a time
+    if restoreQ.len() > 0usize && now >= restoreAt {
+      let pc = restoreQ[0usize].src.clone();
+      let place = restoreQ[0usize].place.clone();
+      let pid = restoreQ[0usize].id.clone();
+      let nrest = restoreQ.len();
+      var rest = PageCfgs();
+      var r = 1usize;
+      while r < restoreQ.len() { rest.push(PageCfg(restoreQ[r].id.clone(), restoreQ[r].src.clone(), restoreQ[r].place.clone(), restoreQ[r].at.clone())); r = r + 1usize; }
+      restoreQ = rest;
+      restoreAt = now + 600u64;
+      var found = false;
+      var q = 0usize;
+      while q < pgs.len() { if pgs[q].id.view() == pid.view() { found = true; } q = q + 1usize; }
+      if !found {
+        let n = self.openPageAs(device, renderer, pc.view(), pid.view(), false);
+        if n >= 0 { self.placeRestored(usize.from(u32.from(n)), place.view()); }
+      }
+    }
+    // the closed leave (the device is idle first, so nothing the GPU still reads is freed)
+    var any = false;
+    var g = 0usize;
+    while g < pgs.len() { if pgs[g].gone { any = true; } g = g + 1usize; }
+    if any {
+      device.waitIdle();
+      var k = pgs.len();
+      while k > 0usize {
+        k = k - 1usize;
+        if pgs[k].gone {
+          match &mut pgs[k].wp { case var &mut Some(wv) { wv.close(); } else {} }
+          var dead = pgs.swapRemove(k);
+        }
+      }
+      grabIx = -1;
+      self.retarget();
+    }
+  }
+
+  // A page that came back from room.toml: where it stood
+  fn placeRestored(self: &mut, n: usize, place: &str) {
+    if startsWithText(place, "shelf:") {
+      var q = 0u32;
+      if cfgDigits(place.slice(6usize, place.len()), &mut q) && q < 8u32 { (&mut pgs[n]).shelved = true; (&mut pgs[n]).shelfAt = i32.from(q); }
+    } else if startsWithText(place, "at:") {
+      var pl = Place(0u32, 0u32, 0., 0., 0.);
+      if parsePlace(place, &mut pl) { (&mut pgs[n]).free = true; (&mut pgs[n]).toPos = Vec3(pl.x, 0., pl.z); }
+    }
+    self.retarget();
+  }
+
+  // The test hooks: close (0), shelve or bring (1), grab (2) page n; drop (3); park the browser's folder (4)
+  pub fn actPage(self: &mut, device: &mut Device, kind: i32, n: i32) {
+    let i = if n >= 0 { usize.from(u32.from(n)) } else { 0usize };
+    if kind == 0i32 { self.closePage(i); }
+    else if kind == 1i32 { self.toggleShelve(i); }
+    else if kind == 2i32 { self.startGrab(i); }
+    else if kind == 3i32 { self.dropGrab(); }
+    else if kind == 4i32 { self.parkBrowser(device); }
+    else if kind == 5i32 && i < pgs.len() {
+      match &mut pgs[i].doc { case var &mut Some(p) { p.openNew = true; p.requestNth(usize.from(u32.from(if n > 0 { 0 } else { 0 }))); } else {} }
+    }
+  }
+
+  // The page under a ray and what of it: 0 nothing, 1 the page, 2 close, 3 shelve, 4 grab; the distance along the ray, or -1
+  fn pgHit(self: &, i: usize, eye: Vec3, dir: Vec3, kind: &mut u32) f32 {
+    *kind = 0u32;
+    if pgs[i].gone { return -1.; }
+    let m = self.pgModel(i);
+    var best: f32 = -1.;
+    let web = pgs[i].web;
+    if !pgs[i].shelved {
+      let hw = pgHalfW(web);
+      let cy = pgTop(web) + 0.05;
+      var c = 0u32;
+      while c < 3u32 {
+        let cx = hw - 0.19 - 0.39 * f32.from(c);
+        let t = quadHit(m, Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir);
+        if t > 0. && (best < 0. || t < best) { best = t; *kind = 2u32 + c; }
+        c = c + 1u32;
+      }
+    }
+    let inv = m.inverse();
+    let le = inv * eye;
+    let ld = inv.transformVector(dir);
+    var tb: f32 = -1.;
+    if web { match &pgs[i].wp { case let Some(w) { tb = w.reachLocal(le, ld); } else {} } }
+    else { match &pgs[i].doc { case let Some(p) { tb = p.reach(le, ld); } else {} } }
+    if tb > 0. && (best < 0. || tb < best) { best = tb; *kind = 1u32; }
+    best
+  }
+
+  // The "park" chip on the browser panel's top edge: the distance along the ray, or -1
+  fn parkHit(self: &, eye: Vec3, dir: Vec3) f32 {
+    if !browserOpen || pgChips.len() < 1usize { return -1.; }
+    let cx = pgHalfW(false) - 0.19;
+    let cy = pgTop(false) + 0.05;
+    quadHit(self.browserModel(), Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), eye, dir)
+  }
+
+  // A click's ray against the pages, their chips, the markers and the browser's park chip: true if one took it
+  pub fn clickPages(self: &mut, device: &mut Device, eye: Vec3, dir: Vec3, view: Vec3, newTab: bool) bool {
+    if grabIx >= 0 { self.dropGrab(); return true; }
+    var bi = -1;
+    var bt: f32 = -1.;
+    var bk = 0u32;
+    var i = 0usize;
+    while i < pgs.len() {
+      var k = 0u32;
+      let t = self.pgHit(i, eye, dir, &mut k);
+      if t > 0. && (bt < 0. || t < bt) { bt = t; bi = i32.from(i); bk = k; }
+      i = i + 1usize;
+    }
+    var mi = -1;
+    var mt: f32 = -1.;
+    var m = 0usize;
+    while m < markers.len() {
+      let inv = Warehouse.faceModel(markers[m].pos, view).inverse();
+      let e = inv * eye;
+      let d = inv.transformVector(dir);
+      if d.z > 0.00001 || d.z < -0.00001 {
+        let t = (0. - e.z) / d.z;
+        if t > 0. {
+          let p = e + d * t;
+          if p.x >= -0.36 && p.x <= 0.36 && p.y >= 0. && p.y <= 1.72 && (mt < 0. || t < mt) { mt = t; mi = i32.from(m); }
+        }
+      }
+      m = m + 1usize;
+    }
+    let pk = self.parkHit(eye, dir);
+    if pk > 0. && (bt < 0. || pk < bt) && (mt < 0. || pk < mt) { self.parkBrowser(device); return true; }
+    if mi >= 0 && (bt < 0. || mt < bt) {
+      let mu = usize.from(u32.from(mi));
+      print <- "pages: marker "; printStr(markers[mu].name.view()); print <- " opens the browser at "; printStr(markers[mu].path.view()); print <- "\n";
+      let path = markers[mu].path.clone();
+      self.toggleBrowser(path.view(), eye, 0.);
+      return true;
+    }
+    if bi < 0 { self.blurWeb(); return false; }
+    let pu = usize.from(u32.from(bi));
+    if bk == 2u32 { self.closePage(pu); return true; }
+    if bk == 3u32 { self.toggleShelve(pu); return true; }
+    if bk == 4u32 { self.startGrab(pu); return true; }
+    if pgs[pu].shelved { self.toggleShelve(pu); return true; }
+    let inv = self.pgModel(pu).inverse();
+    let le = inv * eye;
+    let ld = inv.transformVector(dir);
+    if pgs[pu].web {
+      self.blurWeb();
+      match &mut pgs[pu].wp {
+        case var &mut Some(w) {
+          let hit = w.pickLocal(le, ld);
+          if hit.z > 0.5 {
+            w.moved(i32.from(hit.x), i32.from(hit.y));
+            w.setFocus(true);
+            w.button(i32.from(hit.x), i32.from(hit.y), false);
+          }
+        }
+        else {}
+      }
+      (&mut pgs[pu]).webUp = 4i32;
+    } else {
+      self.blurWeb();
+      match &mut pgs[pu].doc { case var &mut Some(p) { p.openNew = newTab; _ = p.click(le, ld); } else {} }
+    }
+    true
+  }
+
+  fn blurWeb(self: &mut) {
+    var i = 0usize;
+    while i < pgs.len() {
+      match &mut pgs[i].wp { case var &mut Some(w) { if w.focus { w.setFocus(false); } } else {} }
+      i = i + 1usize;
+    }
+  }
+
+  // Keys and text for the web page that holds the focus
+  pub fn webFocused(self: &) bool {
+    var i = 0usize;
+    while i < pgs.len() {
+      match &pgs[i].wp { case let Some(w) { if w.focus { return true; } } else {} }
+      i = i + 1usize;
+    }
+    false
+  }
+
+  pub fn webTyped(self: &mut, text: &str) {
+    var i = 0usize;
+    while i < pgs.len() {
+      match &mut pgs[i].wp { case var &mut Some(w) { if w.focus { w.typed(text); } } else {} }
+      i = i + 1usize;
+    }
+  }
+
+  pub fn webKeyed(self: &mut, vk: i32, down: bool, mods: i32, back: bool, forward: bool) {
+    var i = 0usize;
+    while i < pgs.len() {
+      match &mut pgs[i].wp {
+        case var &mut Some(w) {
+          if w.focus {
+            if back { if down { w.back(); } }
+            else if forward { if down { w.forward(); } }
+            else if vk != 0i32 { w.key(vk, down, mods); }
+          }
+        }
+        else {}
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // The wheel over a web page scrolls it; false if the ray is not on one
+  pub fn webWheelRay(self: &mut, eye: Vec3, dir: Vec3, notches: f32) bool {
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].web && !pgs[i].shelved && !pgs[i].gone {
+        let inv = self.pgModel(i).inverse();
+        let le = inv * eye;
+        let ld = inv.transformVector(dir);
+        match &mut pgs[i].wp {
+          case var &mut Some(w) {
+            let hit = w.pickLocal(le, ld);
+            if hit.z > 0.5 { w.wheel(i32.from(hit.x), i32.from(hit.y), notches); return true; }
+          }
+          else {}
+        }
+      }
+      i = i + 1usize;
+    }
+    false
+  }
+
+  // ---- parked folders ----
+
+  fn markerPos(place: &str, row: usize) Vec3 {
+    var pl = Place(0u32, 0u32, 0., 0., 0.);
+    if place.len() > 0usize && parsePlace(place, &mut pl) && pl.kind == 3u32 { return Vec3(pl.x, pl.y, pl.z); }
+    Vec3(0. - 3.0, 0., 2.4 - 0.9 * f32.from(u32.from(row)))
+  }
+
+  fn makeMarker(self: &, device: &mut Device, id: &str, name: &str, path: &str, place: &str, room: bool, proj: bool, row: usize) FolderPost {
+    let shown = if name.len() > 0usize { String.from(name) } else { folderName(path) };
+    let lab = self.mkLabel(device, shown.view(), 0x2a3a46ffu32, 0xffffffffu32, fitSize(shown.len(), 54.), 0.72, 0.18);
+    let post = self.mkLabel(device, "", 0xc08a20ffu32, 0xffffffffu32, 40., 0.06, 0.015);
+    FolderPost(String.from(id), shown, String.from(path), String.from(place), Warehouse.markerPos(place, row), lab, post, room, proj)
+  }
+
+  // The markers: the folders of studio.toml and of room.toml (the room's win by id), and those of projects (kept as they are)
+  fn syncMarkers(self: &mut, device: &mut Device) {
+    var want = Folders();
+    var wroom = List[bool]();
+    var i = 0usize;
+    while i < studioGood.folders.len() {
+      let f = &studioGood.folders[i];
+      want.push(FolderCfg(f.id.clone(), f.name.clone(), f.path.clone(), f.place.clone(), f.at.clone()));
+      wroom.push(false);
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < roomGood.folders.len() {
+      let f = &roomGood.folders[i];
+      var at = want.len();
+      var j = 0usize;
+      while j < want.len() { if want[j].id.view() == f.id.view() { at = j; } j = j + 1usize; }
+      let fc = FolderCfg(f.id.clone(), f.name.clone(), f.path.clone(), f.place.clone(), f.at.clone());
+      if at == want.len() { want.push(fc); wroom.push(true); } else { want.set(at, fc); wroom.set(at, true); }
+      i = i + 1usize;
+    }
+    var k = markers.len();
+    while k > 0usize {
+      k = k - 1usize;
+      if !markers[k].proj {
+        var keep = false;
+        var j = 0usize;
+        while j < want.len() { if want[j].id.view() == markers[k].id.view() { keep = true; } j = j + 1usize; }
+        if !keep { print <- "pages: marker "; printStr(markers[k].name.view()); print <- " leaves\n"; var dead = markers.swapRemove(k); }
+      }
+    }
+    var w = 0usize;
+    while w < want.len() {
+      var at = markers.len();
+      var j = 0usize;
+      while j < markers.len() { if !markers[j].proj && markers[j].id.view() == want[w].id.view() { at = j; } j = j + 1usize; }
+      var row = 0usize;
+      var q = 0usize;
+      while q < markers.len() { if markers[q].place.len() == 0usize && q != at { row = row + 1usize; } q = q + 1usize; }
+      if at == markers.len() {
+        markers.push(self.makeMarker(device, want[w].id.view(), want[w].name.view(), want[w].path.view(), want[w].place.view(), *wroom[w], false, row));
+        print <- "pages: marker "; printStr(markers[markers.len() - 1usize].name.view()); print <- " stands for "; printStr(want[w].path.view()); print <- "\n";
+      } else if markers[at].path.view() != want[w].path.view() || markers[at].place.view() != want[w].place.view() || (want[w].name.len() > 0usize && markers[at].name.view() != want[w].name.view()) {
+        let made = self.makeMarker(device, want[w].id.view(), want[w].name.view(), want[w].path.view(), want[w].place.view(), *wroom[w], false, row);
+        markers.set(at, made);
+      }
+      w = w + 1usize;
+    }
+  }
+
+  // The browser's folder is parked: a new marker beside the browser, written to room.toml
+  pub fn parkBrowser(self: &mut, device: &mut Device) {
+    var path = String();
+    match &browserPanel {
+      case let Some(p) {
+        let f = p.file.view();
+        if startsWithText(f, BROWSE_PREFIX) { path = String.from(f.slice(BROWSE_PREFIX.len(), f.len())); }
+      }
+      else {}
+    }
+    if path.len() == 0usize { print <- "pages: park: the browser shows no folder\n"; return; }
+    var m = 0usize;
+    while m < markers.len() {
+      if markers[m].path.view() == path.view() { print <- "pages: park: already parked as "; printStr(markers[m].name.view()); print <- "\n"; return; }
+      m = m + 1usize;
+    }
+    var nroom = 0usize;
+    m = 0usize;
+    while m < roomGood.folders.len() { nroom = nroom + 1usize; m = m + 1usize; }
+    let right = Vec3(cos(browserYaw), 0., 0. - sin(browserYaw));
+    let at = Vec3(browserPos.x + right.x * (1.15 + 0.45 * f32.from(u32.from(nroom))) + (0. - right.z) * 0., 0., browserPos.z + right.z * (1.15 + 0.45 * f32.from(u32.from(nroom))));
+    var place = String.from("at:");
+    place.append(floatText(at.x).view()); place.append(",0,"); place.append(floatText(at.z).view());
+    pgSerial = pgSerial + 1u32;
+    var id = String.from("f");
+    id.append(numText(i64.from(pgSerial)).view());
+    roomGood.folders.push(FolderCfg(id, folderName(path.view()), path.clone(), place, isoUtc(unixMs())));
+    writeAt = nowMs() + 1000u64;
+    print <- "pages: parked "; printStr(path.view()); print <- "\n";
+    self.syncMarkers(device);
   }
 
   // ---- the camera-facing quads ----
@@ -1771,6 +2676,27 @@ pub struct Warehouse {
         }
         else {}
       }
+      best = Warehouse.nearer(best, self.parkHit(eye, dir));
+    }
+    var pi = 0usize;
+    while pi < pgs.len() {
+      var pk = 0u32;
+      best = Warehouse.nearer(best, self.pgHit(pi, eye, dir, &mut pk));
+      pi = pi + 1usize;
+    }
+    var mi = 0usize;
+    while mi < markers.len() {
+      let inv = Warehouse.faceModel(markers[mi].pos, view).inverse();
+      let e = inv * eye;
+      let d = inv.transformVector(dir);
+      if d.z > 0.00001 || d.z < -0.00001 {
+        let t = (0. - e.z) / d.z;
+        if t > 0. {
+          let p = e + d * t;
+          if p.x >= -0.36 && p.x <= 0.36 && p.y >= 0. && p.y <= 1.72 { best = Warehouse.nearer(best, t); }
+        }
+      }
+      mi = mi + 1usize;
     }
     if reportOpen {
       match &reportPanel {
@@ -1860,6 +2786,17 @@ pub struct Warehouse {
       codes.push(Warehouse.sortKey(6u32, 0u32));
       dists.push((self.browserPos - eye).length() - 0.5);
     }
+    var pq = 0usize;
+    while pq < pgs.len() {
+      if !pgs[pq].gone { codes.push(Warehouse.sortKey(7u32, u32.from(pq))); dists.push((pgs[pq].pos - eye).length() - 0.5); }
+      pq = pq + 1usize;
+    }
+    var mq = 0usize;
+    while mq < markers.len() {
+      codes.push(Warehouse.sortKey(8u32, u32.from(mq)));
+      dists.push((markers[mq].pos - eye).length() - 0.3);
+      mq = mq + 1usize;
+    }
     var list = List[u32]();
     var lq = 0usize;
     while lq < chipKinds.len() { list.push(*chipKinds[lq]); lq = lq + 1usize; }
@@ -1923,6 +2860,41 @@ pub struct Warehouse {
           case var &mut Some(p) { p.drawPageDepth(device, encoder, target, depth, vp * self.browserModel()); }
           else {}
         }
+        if pgChips.len() > 0usize {
+          let cx = pgHalfW(false) - 0.19;
+          let cy = pgTop(false) + 0.05;
+          Warehouse.faded(&mut pgChips[0usize], device, encoder, target, depth, vp * self.browserModel(),
+            Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), 1.);
+        }
+      }
+      else if kind == 7u32 {
+        let pm = self.pgModel(idx);
+        let web = pgs[idx].web;
+        if web {
+          match &mut pgs[idx].wp { case var &mut Some(w) { w.drawLocal(device, encoder, target, depth, vp * pm); } else {} }
+        } else {
+          match &mut pgs[idx].doc { case var &mut Some(p) { p.drawPageDepth(device, encoder, target, depth, vp * pm); } else {} }
+        }
+        let hw = pgHalfW(web);
+        let top = pgTop(web);
+        if !pgs[idx].shelved {
+          var c = 0usize;
+          while c < 3usize {
+            let cx = hw - 0.19 - 0.39 * f32.from(u32.from(c));
+            let cy = top + 0.05;
+            Warehouse.faded(&mut pgs[idx].chips[c], device, encoder, target, depth, vp * pm,
+              Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), 1.);
+            c = c + 1usize;
+          }
+          Warehouse.faded(&mut pgs[idx].title, device, encoder, target, depth, vp * pm, Vec4(0. - hw, top + 0.1, 0. - hw + 0.8, top + 0.3), 1.);
+        } else {
+          Warehouse.faded(&mut pgs[idx].title, device, encoder, target, depth, vp * pm, Vec4(0. - hw, top + 0.05, 0. - hw + 1.6, top + 0.45), 1.);
+        }
+      }
+      else if kind == 8u32 {
+        let mm = Warehouse.faceModel(markers[idx].pos, eye);
+        Warehouse.faded(&mut markers[idx].post, device, encoder, target, depth, vp * mm, Vec4(-0.03, 0., 0.03, 1.5), 1.);
+        Warehouse.faded(&mut markers[idx].label, device, encoder, target, depth, vp * mm, Vec4(-0.36, 1.5, 0.36, 1.68), 1.);
       }
       else if kind == 5u32 {
         match &mut reportPanel {

@@ -29,6 +29,7 @@ struct View {
   std::vector<unsigned char> bgra;   // the latest full frame
   int fw = 0, fh = 0;
   bool dirty = false;
+  int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;   // the union of the rectangles painted since the last read (empty: dx1 <= dx0)
   bool closed = false;
   bool loading = false;
   unsigned long paints = 0;
@@ -65,9 +66,30 @@ class Client : public CefClient, public CefRenderHandler, public CefLifeSpanHand
     info.available_rect = info.rect;
     return true;
   }
-  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&, const void* buffer, int width,
+  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList& dirtyRects, const void* buffer, int width,
                int height) override {
     if (type != PET_VIEW) return;
+    {
+      int x0 = width, y0 = height, x1 = 0, y1 = 0;
+      for (const CefRect& r : dirtyRects) {
+        if (r.x < x0) x0 = r.x;
+        if (r.y < y0) y0 = r.y;
+        if (r.x + r.width > x1) x1 = r.x + r.width;
+        if (r.y + r.height > y1) y1 = r.y + r.height;
+      }
+      if (x0 < 0) x0 = 0;
+      if (y0 < 0) y0 = 0;
+      if (x1 > width) x1 = width;
+      if (y1 > height) y1 = height;
+      if (x1 <= x0 || y1 <= y0 || v_->fw != width || v_->fh != height) { x0 = 0; y0 = 0; x1 = width; y1 = height; }
+      if (v_->dirty && v_->dx1 > v_->dx0) {
+        if (v_->dx0 < x0) x0 = v_->dx0;
+        if (v_->dy0 < y0) y0 = v_->dy0;
+        if (v_->dx1 > x1) x1 = v_->dx1;
+        if (v_->dy1 > y1) y1 = v_->dy1;
+      }
+      v_->dx0 = x0; v_->dy0 = y0; v_->dx1 = x1; v_->dy1 = y1;
+    }
     size_t n = (size_t)width * height * 4;
     if (v_->bgra.size() != n) v_->bgra.resize(n);
     memcpy(v_->bgra.data(), buffer, n);
@@ -137,7 +159,7 @@ API int web_open(const char* url, int w, int h) {
   CefWindowInfo wi;
   wi.SetAsWindowless(nullptr);
   CefBrowserSettings bs;
-  bs.windowless_frame_rate = 60;
+  bs.windowless_frame_rate = 30;
   v->browser = CefBrowserHost::CreateBrowserSync(wi, v->client, url, bs, nullptr, nullptr);
   if (!v->browser) { delete v; return -1; }
   v->browser->GetHost()->SetFocus(true);
@@ -165,6 +187,28 @@ API int web_frame(int view, unsigned char* dst, int cap, int* w, int* h) {
   *w = v->fw; *h = v->fh;
   v->dirty = false;
   return (int)n;
+}
+
+// Only the rectangle painted since the last read, as RGBA rows from the bottom of the view (the texture's row 0), packed
+// (w*4 bytes a row) into dst. *x, *y are the rectangle's corner in TEXTURE pixels (y counted from the bottom), *w, *h its size;
+// *fw, *fh the whole frame. Returns the byte count, or 0 if nothing new (or dst too small).
+API int web_frame_rect(int view, unsigned char* dst, int cap, int* x, int* y, int* w, int* h, int* fw, int* fh) {
+  View* v = get(view);
+  if (!v || !v->dirty) return 0;
+  int rw = v->dx1 - v->dx0, rh = v->dy1 - v->dy0;
+  if (rw <= 0 || rh <= 0) { v->dirty = false; return 0; }
+  if ((long long)rw * rh * 4 > cap) return 0;
+  const unsigned char* base = v->bgra.data();
+  size_t row = (size_t)v->fw * 4;
+  for (int j = 0; j < rh; j++) {
+    int srcRow = v->dy1 - 1 - j;           // the bottom row of the rectangle first
+    const unsigned char* s = base + (size_t)srcRow * row + (size_t)v->dx0 * 4;
+    unsigned char* d = dst + (size_t)j * rw * 4;
+    for (int i = 0; i < rw * 4; i += 4) { d[i] = s[i + 2]; d[i + 1] = s[i + 1]; d[i + 2] = s[i]; d[i + 3] = 255; }
+  }
+  *x = v->dx0; *y = v->fh - v->dy1; *w = rw; *h = rh; *fw = v->fw; *fh = v->fh;
+  v->dirty = false; v->dx0 = v->dy0 = v->dx1 = v->dy1 = 0;
+  return rw * rh * 4;
 }
 
 // SDL only sends text events while text input is on for the window with the keyboard focus (SDL3.dll is the

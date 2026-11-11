@@ -187,9 +187,16 @@ var @threadlocal atX = 0.;
 var @threadlocal atZ = 0.;
 // '--wh-ev KIND ARG FRAME' (up to six): on frame FRAME, KIND 1 selects item ARG, KIND 2 does action ARG on the selection
 var @threadlocal whEvs = 0;
-var @threadlocal whKind = Array[i32, 12]() <- fill 0;
-var @threadlocal whArg = Array[i32, 12]() <- fill 0;
-var @threadlocal whFrame = Array[i32, 12]() <- fill 0;
+var @threadlocal whKind = Array[i32, 32]() <- fill 0;
+var @threadlocal whArg = Array[i32, 32]() <- fill 0;
+var @threadlocal whFrame = Array[i32, 32]() <- fill 0;
+// '--wh-ev 20+K N F': page tests: K 0 closes page N, 1 shelves it (or brings it back), 2 starts moving it, 3 drops it, 4 parks the
+// browser's folder, 5 follows the first link of page N as a new page. '--open-page SRC F': on frame F a file or address opens as a page.
+var @threadlocal openPageN = 0;
+var @threadlocal openPageAt = Array[i32, 8]() <- fill 0;
+var @threadlocal openPageSrc = Array[*u8, 8]() <- fill null;
+var @threadlocal shiftHeld = false;       // Shift is down (a click opens a link as a new page)
+var @threadlocal gripUsed = false;        // the grip was held for a click, so releasing it does not open the browser
 var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D degrees further up (down if negative)
 // The web panel (webpanel.cone). Test flags act on page pixels and need no real mouse or keys.
 var @threadlocal webArg: *u8 = null;      // '--web URL': a web panel opens on this address at the start
@@ -387,6 +394,10 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
           match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} }
         }
       }
+      if e.type == sdl.EVENT_KEY_DOWN || e.type == sdl.EVENT_KEY_UP {
+        let sk = e as &sdl.KeyboardEvent;
+        shiftHeld = (sk.keymod & sdl.KMOD_SHIFT) != 0u16;
+      }
       if e.type == sdl.EVENT_KEY_DOWN && !eaten {
         let key = e as &sdl.KeyboardEvent;
         if key.scancode == sdl.SCANCODE_C && !key.repeat {
@@ -515,11 +526,14 @@ fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: boo
     // (a hand's beam starts at the hand; the chips stand for the head)
     if s.wh.clickChip(eye, direction, &s.visitor, if beam { s.visitor.position } else { eye }) { return; }
     if s.wh.clickApp(eye, direction) { return; }
+    // Shift on the desktop, the grip in a headset: a link clicked opens a new page
+    let gripOn = false;
+    if s.wh.clickPages(&mut s.device, eye, direction, if beam { s.visitor.position } else { eye }, shiftHeld || gripOn) { return; }
     if s.wh.clickCard(eye, direction) { return; }
     let inv = s.wh.pageModel().inverse();
     let le = inv * eye;
     let ld = inv.transformVector(direction);
-    match &mut s.panel { case var &mut Some(p) { onPanel = p.click(le, ld); } else {} }
+    match &mut s.panel { case var &mut Some(p) { p.openNew = shiftHeld || gripOn; onPanel = p.click(le, ld); } else {} }
     if onPanel { s.wh.selectPage(); return; }
   }
   else {
@@ -824,10 +838,7 @@ fn whBrowse(s: &mut Shell) {
     var ser = 0u32;
     match &s.panel { case let Some(p) { hf = p.historyFiles(); ser = p.histSerial; } else {} }
     let open = s.wh.syncBrowser(&mut s.device, &mut s.renderer, &hf, ser);
-    if open.len() > 0usize {
-      let ov = open.view();
-      match &mut s.panel { case var &mut Some(p) { p.go(&mut s.device, &mut s.renderer, ov, ""); } else {} }
-    }
+    if open.len() > 0usize { s.wh.wantPage(open.view()); }
   }
 }
 
@@ -964,7 +975,7 @@ fn drawScene(s: &mut Shell, alpha: f32) {
 // Everything a frame needs before a picture is taken: the panels ticked, the warehouse updated, the visitor's pose (the camera's
 // origin and orientation) and the draw list. The window's frame (drawDesktop) and each of a headset's eyes (xr.cone) draw from it.
 fn prepareScene(s: &mut Shell, alpha: f32) {
-  match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
+  match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); p.openNew = false; } else {} }
   match &mut s.other { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
   webFrameTick(s);
   bridgeTick(s);
@@ -981,7 +992,15 @@ fn prepareScene(s: &mut Shell, alpha: f32) {
   }
   if s.wh.on {
     s.renderer.keepDepth = true;      // the labels hide behind what stands in front of them
+    // where the visitor looks (a page being moved follows it)
+    if s.xr.on { s.wh.setGaze(s.xr.head, s.xr.headForward); }
+    else { let gp = s.visitor.pose(); s.wh.setGaze(gp.origin, gp.orientation * Vec3(0., 0., -1.)); }
     s.wh.update(&mut s.device, &mut s.renderer);
+    // a file or address wanted as a page: the browser's choice, a link of the main page, or a test flag
+    var pw = s.wh.takePageWant();
+    var pf = 0;
+    while pf < openPageN { if drawn == openPageAt[usize.from(pf)] { pw = String.from(cstr.fromPtr(openPageSrc[usize.from(pf)]).view()); } pf = pf + 1; }
+    if pw.len() > 0usize { s.wh.openPage(&mut s.device, &mut s.renderer, pw.view()); }
     let nav = s.wh.takeNav();
     if nav != 0u32 { browseAct(s, nav); }
     whBrowse(s);
@@ -996,6 +1015,7 @@ fn prepareScene(s: &mut Shell, alpha: f32) {
         else if whKind[usize.from(e)] == 7 { s.wh.menuNth(usize.from(whArg[usize.from(e)]), &s.visitor); }
         else if whKind[usize.from(e)] == 5 { browseAct(s, u32.from(whArg[usize.from(e)])); }
         else if whKind[usize.from(e)] == 6 { s.wh.browserLink(usize.from(whArg[usize.from(e)])); }
+        else if whKind[usize.from(e)] >= 20 { s.wh.actPage(&mut s.device, whKind[usize.from(e)] - 20, whArg[usize.from(e)]); }
         else { whAct(s, u32.from(whArg[usize.from(e)])); }
       }
       e = e + 1;
@@ -1336,7 +1356,12 @@ fn main(argc: i32, argv: **u8) i32 {
     if libc.strcmp(arg, "--doc-scroll") == 0i32 && more { docScroll = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--yaw") == 0i32 && more { startYaw = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--at") == 0i32 && a + 2i32 < argc { atSet = true; atX = argNumber(argv, a + 1i32); atZ = argNumber(argv, a + 2i32); }
-    if libc.strcmp(arg, "--wh-ev") == 0i32 && a + 3i32 < argc && whEvs < 12 {
+    if libc.strcmp(arg, "--open-page") == 0i32 && a + 2i32 < argc && openPageN < 8 {
+      openPageSrc[usize.from(openPageN)] = *(argv + usize.from(a + 1i32));
+      openPageAt[usize.from(openPageN)] = i32.from(argNumber(argv, a + 2i32));
+      openPageN = openPageN + 1;
+    }
+    if libc.strcmp(arg, "--wh-ev") == 0i32 && a + 3i32 < argc && whEvs < 32 {
       whKind[usize.from(whEvs)] = i32.from(argNumber(argv, a + 1i32));
       whArg[usize.from(whEvs)] = i32.from(argNumber(argv, a + 2i32));
       whFrame[usize.from(whEvs)] = i32.from(argNumber(argv, a + 3i32));
