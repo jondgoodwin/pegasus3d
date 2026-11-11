@@ -1,0 +1,428 @@
+// A Mermaid reader: the text of a ```mermaid block in, a plain description out (nothing here draws or lays out; it
+// imports nothing, so it could move into a Cone package as it stands). mermaidview.cone turns the description into
+// diagramlayout's Graph and SequenceDiagram.
+//
+// Flowcharts ('graph' or 'flowchart', direction TD TB BT LR RL): nodes with a shape and a label
+//   A[rect]  A(round)  A([stadium])  A((circle))  A{diamond}  A{{hexagon}}  A[[sub]]  A[(db)]  A[/slant/]
+// edges  -->  ---  -.->  ==>  with a label  -->|text|  or  -- text -->  or  -. text .->, and chains  A --> B --> C.
+// Not read: subgraph (its lines are ignored, its nodes still show), style, classDef, class, click, 'A & B'.
+//
+// Sequence diagrams: 'participant X as Name', 'actor X', messages  ->>  -->>  ->  -->  -)  --)  -x  --x  (a + or -
+// after the arrow is ignored), 'Note over A,B: text', 'Note right of A: text', 'Note left of A: text'.
+// Not read: loop, alt, opt, par and their lines, activate, autonumber.
+//
+// A line it cannot read is skipped, and counted in 'skipped'; bad input never fails.
+
+pub const MM_NONE = 0u32;
+pub const MM_FLOW = 1u32;
+pub const MM_SEQ = 2u32;
+
+pub const SH_RECT = 0u32;
+pub const SH_ROUND = 1u32;
+pub const SH_STADIUM = 2u32;
+pub const SH_DIAMOND = 3u32;
+pub const SH_CIRCLE = 4u32;
+
+pub const MK_CALL = 0u32;        // a message: solid, filled head
+pub const MK_ASYNC = 1u32;
+pub const MK_RETURN = 2u32;      // dashed
+pub const MK_SELF = 3u32;
+
+pub const NOTE_OVER = 0u32;
+pub const NOTE_RIGHT = 1u32;
+pub const NOTE_LEFT = 2u32;
+
+const NOID = 1000000000usize;
+
+pub struct MNode {
+  pub key: String;
+  pub label: String;
+  pub shape: u32;
+  pub named: bool;               // has had a label given
+}
+
+pub struct MEdge {
+  pub from: usize;
+  pub to: usize;
+  pub label: String;
+  pub dotted: bool;
+  pub arrow: bool;
+}
+
+pub struct MPart {
+  pub key: String;
+  pub name: String;
+}
+
+pub struct MMsg {
+  pub from: usize;
+  pub to: usize;
+  pub label: String;
+  pub kind: u32;
+}
+
+pub struct MNote {
+  pub first: usize;              // the participants it covers
+  pub last: usize;
+  pub side: u32;
+  pub text: String;
+  pub before: usize;             // the message it comes before (msgs.len(): after the last)
+}
+
+pub struct Mermaid {
+  pub kind: u32;
+  pub horizontal: bool;
+  pub nodes: List[MNode];
+  pub edges: List[MEdge];
+  pub parts: List[MPart];
+  pub msgs: List[MMsg];
+  pub notes: List[MNote];
+  pub skipped: u32;
+}
+
+fn emptyMermaid() Mermaid {
+  Mermaid(MM_NONE, false, List[MNode](), List[MEdge](), List[MPart](), List[MMsg](), List[MNote](), 0u32)
+}
+
+fn isIdByte(c: u8) bool {
+  (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 128u8
+}
+
+fn skipSpaces(s: &str, i: usize) usize {
+  var k = i;
+  while k < s.len() && (s[k] == ' ' || s[k] == '\t') { k = k + 1usize; }
+  k
+}
+
+fn lowerByte(c: u8) u8 { if c >= 'A' && c <= 'Z' { c + 32u8 } else { c } }
+
+// Whether 's' has 'word' at 'at' (not case sensitive) followed by a space, the end, or nothing word-like
+fn wordAt(s: &str, at: usize, word: &str) bool {
+  if at + word.len() > s.len() { return false; }
+  var i = 0usize;
+  while i < word.len() {
+    if lowerByte(s[at + i]) != word[i] { return false; }
+    i = i + 1usize;
+  }
+  at + word.len() == s.len() || !isIdByte(s[at + word.len()])
+}
+
+fn startsAt(s: &str, at: usize, p: &str) bool {
+  if at + p.len() > s.len() { return false; }
+  s.sliceFrom(at).startsWith(p)
+}
+
+// A label as text: quotes off, <br> as a space, the HTML-ish and markdown marks of Mermaid left as they are
+fn labelText(raw: &str) String {
+  let t = raw.trim();
+  var a = 0usize;
+  var b = t.len();
+  if b >= 2usize && t[0usize] == '"' && t[b - 1usize] == '"' { a = 1usize; b = b - 1usize; }
+  var out = String();
+  var i = a;
+  while i < b {
+    if t[i] == '<' && (startsAt(t, i, "<br") || startsAt(t, i, "<BR")) {
+      while i < b && t[i] != '>' { i = i + 1usize; }
+      out.append(" ");
+      i = i + 1usize;
+      continue;
+    }
+    if t[i] == '#' && startsAt(t, i, "#quot;") { out.append("'"); i = i + 6usize; continue; }
+    if t[i] == '&' && startsAt(t, i, "&amp;") { out.append("&"); i = i + 5usize; continue; }
+    out.appendByte(t[i]);
+    i = i + 1usize;
+  }
+  var r = String.from(out.view().trim());
+  // a slanted-box label /text/ or \text\
+  if r.len() >= 2usize && (r.view()[0usize] == '/' || r.view()[0usize] == '\\') && (r.view()[r.len() - 1usize] == '/' || r.view()[r.len() - 1usize] == '\\') {
+    r = String.from(r.view().slice(1usize, r.len() - 1usize).trim());
+  }
+  r
+}
+
+fn findNode(m: &Mermaid, key: &str) usize {
+  var i = 0usize;
+  while i < m.nodes.len() {
+    if m.nodes[i].key.view() == key { return i; }
+    i = i + 1usize;
+  }
+  NOID
+}
+
+fn addFlowNode(m: &mut Mermaid, key: &str, label: &str, shape: u32, named: bool) usize {
+  let at = findNode(m, key);
+  if at != NOID {
+    if named && !m.nodes[at].named {
+      m.nodes[at].label = String.from(label);
+      m.nodes[at].shape = shape;
+      m.nodes[at].named = true;
+    }
+    return at;
+  }
+  m.nodes.push(MNode(String.from(key), String.from(if named { label } else { key }), shape, named));
+  m.nodes.len() - 1usize
+}
+
+// One node term at 'pos': an id and, if it has one, its bracket (shape and label). Returns the node's index, or NOID.
+fn parseTerm(s: &str, pos: &mut usize, m: &mut Mermaid) usize {
+  var i = skipSpaces(s, *pos);
+  let st = i;
+  while i < s.len() && isIdByte(s[i]) { i = i + 1usize; }
+  if i == st { return NOID; }
+  let key = String.from(s.slice(st, i));
+  var shape = SH_RECT;
+  var openLen = 0usize;
+  var closer = "";
+  if startsAt(s, i, "((") { shape = SH_CIRCLE; openLen = 2usize; closer = "))"; }
+  else if startsAt(s, i, "([") { shape = SH_STADIUM; openLen = 2usize; closer = "])"; }
+  else if startsAt(s, i, "[(") { shape = SH_RECT; openLen = 2usize; closer = ")]"; }
+  else if startsAt(s, i, "[[") { shape = SH_RECT; openLen = 2usize; closer = "]]"; }
+  else if startsAt(s, i, "{{") { shape = SH_STADIUM; openLen = 2usize; closer = "}}"; }
+  else if startsAt(s, i, "[") { shape = SH_RECT; openLen = 1usize; closer = "]"; }
+  else if startsAt(s, i, "(") { shape = SH_ROUND; openLen = 1usize; closer = ")"; }
+  else if startsAt(s, i, "{") { shape = SH_DIAMOND; openLen = 1usize; closer = "}"; }
+  var label = String();
+  var named = false;
+  if openLen > 0usize {
+    let j = i + openLen;
+    var from = j;
+    if j < s.len() && s[j] == '"' {
+      match s.findFrom("\"", j + 1usize) { case let Some(q) { from = q + 1usize; } else {} }
+    }
+    match s.findFrom(closer, from) {
+      case let Some(c) {
+        label = labelText(s.slice(j, c));
+        named = true;
+        i = c + closer.len();
+      }
+      else { i = j; }
+    }
+  }
+  // a class marker  :::name  is skipped
+  if startsAt(s, i, ":::") {
+    i = i + 3usize;
+    while i < s.len() && isIdByte(s[i]) { i = i + 1usize; }
+  }
+  *pos = i;
+  addFlowNode(m, key.view(), label.view(), shape, named)
+}
+
+struct Conn {
+  ok: bool;
+  label: String;
+  dotted: bool;
+  arrow: bool;
+}
+
+fn isConnByte(c: u8) bool { c == '-' || c == '=' || c == '.' || c == '>' || c == '<' }
+
+// The connector at 'pos': the run of - = . > characters, with a label inside it or after it in | |
+fn parseConn(s: &str, pos: &mut usize) Conn {
+  var i = skipSpaces(s, *pos);
+  var c = Conn(false, String(), false, false);
+  if i >= s.len() || !isConnByte(s[i]) { return c; }
+  var j = i;
+  while j < s.len() && isConnByte(s[j]) { j = j + 1usize; }
+  let run = s.slice(i, j);
+  // -- text -->   ==  text ==>   -. text .->
+  if (run == "--" || run == "==" || run == "-.") && j < s.len() && s[j] == ' ' {
+    var stop = NOID;
+    var k = j;
+    while k + 1usize < s.len() && stop == NOID {
+      let a = s[k];
+      let b = s[k + 1usize];
+      if (a == '-' && b == '-') || (a == '=' && b == '=') || (a == '.' && b == '-') { stop = k; }
+      k = k + 1usize;
+    }
+    if stop == NOID { return c; }
+    c.label = labelText(s.slice(j, stop));
+    var e = stop;
+    while e < s.len() && isConnByte(s[e]) { e = e + 1usize; }
+    let tail = s.slice(stop, e);
+    c.dotted = run == "-." || tail.contains(".");
+    c.arrow = tail.endsWith(">");
+    c.ok = true;
+    *pos = e;
+    return c;
+  }
+  if run.len() < 2usize { return c; }
+  c.dotted = run.contains(".");
+  c.arrow = run.endsWith(">");
+  c.ok = true;
+  var after = skipSpaces(s, j);
+  if after < s.len() && s[after] == '|' {
+    match s.findFrom("|", after + 1usize) {
+      case let Some(q) { c.label = labelText(s.slice(after + 1usize, q)); after = q + 1usize; }
+      else {}
+    }
+  }
+  *pos = after;
+  c
+}
+
+fn parseFlowLine(t: &str, m: &mut Mermaid) {
+  var pos = 0usize;
+  var prev = parseTerm(t, &mut pos, m);
+  if prev == NOID { m.skipped = m.skipped + 1u32; return; }
+  var go = true;
+  while go {
+    // 'A & B' : the second joins the first as a node (not linked as a group)
+    pos = skipSpaces(t, pos);
+    if pos >= t.len() { go = false; }
+    else if t[pos] == '&' {
+      pos = pos + 1usize;
+      let other = parseTerm(t, &mut pos, m);
+      if other == NOID { go = false; }
+    }
+    else {
+      let c = parseConn(t, &mut pos);
+      if !c.ok { m.skipped = m.skipped + 1u32; go = false; }
+      else {
+        let next = parseTerm(t, &mut pos, m);
+        if next == NOID { m.skipped = m.skipped + 1u32; go = false; }
+        else {
+          if next != prev { m.edges.push(MEdge(prev, next, c.label.clone(), c.dotted, c.arrow)); }
+          prev = next;
+        }
+      }
+    }
+  }
+}
+
+fn partIndex(m: &mut Mermaid, key: &str) usize {
+  var i = 0usize;
+  while i < m.parts.len() {
+    if m.parts[i].key.view() == key { return i; }
+    i = i + 1usize;
+  }
+  m.parts.push(MPart(String.from(key), String.from(key)));
+  m.parts.len() - 1usize
+}
+
+// 'participant A as Alice' or 'participant A'
+fn declarePart(m: &mut Mermaid, rest: &str) {
+  let t = rest.trim();
+  var key = t;
+  var name = t;
+  match t.find(" as ") {
+    case let Some(k) { key = t.slice(0usize, k).trim(); name = t.sliceFrom(k + 4usize).trim(); }
+    else {}
+  }
+  let at = partIndex(m, key);
+  m.parts[at].name = labelText(name);
+}
+
+// The arrow operator at 'at' in a sequence line: its length and kind, or length 0
+fn arrowAt(s: &str, at: usize) (usize, u32) {
+  if startsAt(s, at, "-->>") { return (4usize, MK_RETURN); }
+  if startsAt(s, at, "->>") { return (3usize, MK_CALL); }
+  if startsAt(s, at, "--)") { return (3usize, MK_RETURN); }
+  if startsAt(s, at, "--x") { return (3usize, MK_RETURN); }
+  if startsAt(s, at, "-->") { return (3usize, MK_RETURN); }
+  if startsAt(s, at, "-)") { return (2usize, MK_ASYNC); }
+  if startsAt(s, at, "-x") { return (2usize, MK_ASYNC); }
+  if startsAt(s, at, "->") { return (2usize, MK_ASYNC); }
+  (0usize, 0u32)
+}
+
+fn parseNote(m: &mut Mermaid, t: &str) bool {
+  // Note over A,B: text | Note right of A: text | Note left of A: text
+  var i = 4usize;
+  i = skipSpaces(t, i);
+  var side = NOTE_OVER;
+  if wordAt(t, i, "over") { i = i + 4usize; }
+  else if wordAt(t, i, "right") { side = NOTE_RIGHT; i = i + 5usize; i = skipSpaces(t, i); if wordAt(t, i, "of") { i = i + 2usize; } }
+  else if wordAt(t, i, "left") { side = NOTE_LEFT; i = i + 4usize; i = skipSpaces(t, i); if wordAt(t, i, "of") { i = i + 2usize; } }
+  else { return false; }
+  match t.findFrom(":", i) {
+    case let Some(c) {
+      let who = t.slice(i, c);
+      let text = labelText(t.sliceFrom(c + 1usize));
+      var firstP = NOID;
+      var lastP = NOID;
+      var a = 0usize;
+      while a <= who.len() {
+        var b = a;
+        while b < who.len() && who[b] != ',' { b = b + 1usize; }
+        let name = who.slice(a, b).trim();
+        if name.len() > 0usize {
+          let at = partIndex(m, name);
+          if firstP == NOID || at < firstP { firstP = at; }
+          if lastP == NOID || at > lastP { lastP = at; }
+        }
+        a = b + 1usize;
+      }
+      if firstP == NOID { return false; }
+      m.notes.push(MNote(firstP, lastP, side, text, m.msgs.len()));
+      true
+    }
+    else { false }
+  }
+}
+
+fn parseSeqLine(t: &str, m: &mut Mermaid) {
+  if wordAt(t, 0usize, "participant") { declarePart(m, t.sliceFrom(11usize)); return; }
+  if wordAt(t, 0usize, "actor") { declarePart(m, t.sliceFrom(5usize)); return; }
+  if wordAt(t, 0usize, "note") { if !parseNote(m, t) { m.skipped = m.skipped + 1u32; } return; }
+  if wordAt(t, 0usize, "autonumber") || wordAt(t, 0usize, "activate") || wordAt(t, 0usize, "deactivate")
+    || wordAt(t, 0usize, "loop") || wordAt(t, 0usize, "alt") || wordAt(t, 0usize, "else") || wordAt(t, 0usize, "opt")
+    || wordAt(t, 0usize, "par") || wordAt(t, 0usize, "and") || wordAt(t, 0usize, "end") || wordAt(t, 0usize, "rect")
+    || wordAt(t, 0usize, "title") || wordAt(t, 0usize, "box") || wordAt(t, 0usize, "critical") || wordAt(t, 0usize, "break") { return; }
+  // a message:  from ARROW to : text
+  var at = 0usize;
+  var op = (0usize, 0u32);
+  while at < t.len() && op.0 == 0usize {
+    op = arrowAt(t, at);
+    if op.0 == 0usize { at = at + 1usize; }
+  }
+  if op.0 == 0usize || at == 0usize { m.skipped = m.skipped + 1u32; return; }
+  let fromName = t.slice(0usize, at).trim();
+  var rest = t.sliceFrom(at + op.0);
+  if rest.len() > 0usize && (rest[0usize] == '+' || rest[0usize] == '-') { rest = rest.sliceFrom(1usize); }
+  var toName = rest.trim();
+  var label = String();
+  match rest.find(":") {
+    case let Some(c) { toName = rest.slice(0usize, c).trim(); label = labelText(rest.sliceFrom(c + 1usize)); }
+    else {}
+  }
+  if toName.len() == 0usize || fromName.len() == 0usize { m.skipped = m.skipped + 1u32; return; }
+  let a = partIndex(m, fromName);
+  let b = partIndex(m, toName);
+  var kind = op.1;
+  if a == b { kind = MK_SELF; }
+  m.msgs.push(MMsg(a, b, label, kind));
+}
+
+pub fn parseMermaid(src: &str) Mermaid {
+  var m = emptyMermaid();
+  var pos = 0usize;
+  let n = src.len();
+  var front = false;
+  while pos <= n {
+    var end = pos;
+    while end < n && src[end] != '\n' { end = end + 1usize; }
+    var stop = end;
+    if stop > pos && src[stop - 1usize] == '\r' { stop = stop - 1usize; }
+    let t = src.slice(pos, stop).trim();
+    pos = end + 1usize;
+    if t.len() == 0usize || t.startsWith("%%") { continue; }
+    if t == "---" { front = !front; continue; }
+    if front { continue; }
+    if m.kind == MM_NONE {
+      if wordAt(t, 0usize, "sequencediagram") { m.kind = MM_SEQ; }
+      else if wordAt(t, 0usize, "graph") || wordAt(t, 0usize, "flowchart") {
+        m.kind = MM_FLOW;
+        m.horizontal = t.contains(" LR") || t.contains(" RL");
+      }
+      else { m.skipped = m.skipped + 1u32; }
+      continue;
+    }
+    if m.kind == MM_SEQ { parseSeqLine(t, &mut m); }
+    else {
+      if wordAt(t, 0usize, "subgraph") || wordAt(t, 0usize, "end") || wordAt(t, 0usize, "style") || wordAt(t, 0usize, "classdef")
+        || wordAt(t, 0usize, "class") || wordAt(t, 0usize, "linkstyle") || wordAt(t, 0usize, "click") || wordAt(t, 0usize, "direction") { continue; }
+      parseFlowLine(t, &mut m);
+    }
+  }
+  m
+}

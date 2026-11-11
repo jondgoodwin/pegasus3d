@@ -195,6 +195,14 @@ pub struct DocPanel {
   outOpen: String;               // the file browser's wish: open this file in the document panel
   outBrowse: String;             // a document panel's wish: show this folder in the file browser
   recent: List[String];          // for the file browser: the document panel's history (files)
+  painter: Option[Painter];      // draws the ```mermaid blocks (mermaidview.cone)
+  cache: List[Diagram];          // the diagrams drawn, by source and width
+  blockDiag: List[usize];        // for each richtext block, its diagram in 'cache' (NOMATCH: none)
+  imgDiag: List[usize];          // for each image of 'images', its diagram in 'cache'
+  pointedDiag: usize = 18446744073709551615usize;   // the diagram last clicked, and the thing in it
+  pointedKey: usize = 18446744073709551615usize;
+  ticks: u32 = 0u32;
+  painterTried: bool = false;
   scrollY: f32 = 0.;
   pointed: usize = 18446744073709551615usize;   // the doc block last clicked (marked amber), none if max
   dirty: bool = false;
@@ -229,7 +237,8 @@ pub struct DocPanel {
           var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
             emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, stripTarget, stripBuf,
             page, List[u64](), List[u32](), List[Del](), String(), String(),
-            List[HistEntry](), String(), String(), String(), String(), List[String]());
+            List[HistEntry](), String(), String(), String(), String(), List[String](),
+            None, List[Diagram](), List[usize](), List[usize]());
           p.scrollY = initialScroll;
           p.reload(device, renderer, true);
           p.hist.push(HistEntry(String.from(file), 0.));
@@ -245,6 +254,9 @@ pub struct DocPanel {
   pub fn tick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     let now = nowMs();
     self.serveLinks(device, renderer);
+    // the first frames are crowded with the arrival's own command buffers (a frame may record 16): diagrams wait
+    ticks = ticks + 1u32;
+    if ticks > 8u32 && paintOne(&mut painter, device, &mut cache) { dirty = true; }
     if now >= lastPoll + POLL_MS && !isBrowse(file.view()) {
       lastPoll = now;
       var again = false;
@@ -602,7 +614,7 @@ pub struct DocPanel {
         born = nBorn;
         kinds = nKinds;
         dels = nDels;
-        self.relayout();
+        self.relayout(device);
         // the same block at the top of the view
         var at = doc.blocks.len();
         var d = 0usize;
@@ -629,18 +641,54 @@ pub struct DocPanel {
   }
 
   // The richtext blocks from the doc, and their layout; the glyphs a face lacks given to a fallback face
-  fn relayout(self: &mut) {
+  fn relayout(self: &mut, device: &mut Device) {
     blocks = List[Block]();
     owner = List[usize]();
+    blockDiag = List[usize]();
+    images = List[ImageInfo]();
+    imgDiag = List[usize]();
+    pointedDiag = NOMATCH;
+    pointedKey = NOMATCH;
     var i = 0usize;
     while i < doc.blocks.len() {
+      // a fenced ```mermaid block (all its lines) becomes one block holding a picture: the page's width less the margins
+      if doc.blocks[i].kind == DK_CODE && doc.blocks[i].lang.view() == "mermaid" {
+        var src = String();
+        var j = i;
+        while j < doc.blocks.len() && doc.blocks[j].kind == DK_CODE && doc.blocks[j].lang.view() == "mermaid" && (j == i || !doc.blocks[j].first) {
+          src.append(doc.blocks[j].text.view());
+          src.append("\n");
+          j = j + 1usize;
+        }
+        // the painter (a font, an atlas, a pipeline) is made when the first diagram is wanted
+        if !painterTried { painterTried = true; painter = makePainter(device); }
+        let di = diagramFor(&mut painter, device, &mut cache, src.view(), DOC_TEX_W - 128u32);
+        if di != NOMATCH && cache[di].w > 0u32 {
+          images.push(ImageInfo(f32.from(cache[di].w), f32.from(cache[di].h), PL_INLINE, String.from("diagram"), 0u32, 0u32, List[u8]()));
+          imgDiag.push(di);
+          var blk = Block();
+          var anchor = String();
+          anchor.appendByte(0xEFu8);
+          anchor.appendByte(0xBFu8);
+          anchor.appendByte(0xBCu8);
+          blk.text = anchor;
+          blk.runs.push(Run(3usize, Style(false, false, false, 0., 0u32, 0u32, u32.from(images.len()))));
+          blocks.push(blk);
+          owner.push(i);
+          blockDiag.push(di);
+          i = j;
+          continue;
+        }
+      }
       blocks.push(toBlock(&doc.blocks[i]));
       owner.push(i);
+      blockDiag.push(NOMATCH);
       i = i + 1usize;
     }
     if blocks.len() == 0usize {
       blocks.push(Block.fromText("(empty)", Style.plain()));
       owner.push(0usize);
+      blockDiag.push(NOMATCH);
     }
     layout = layoutRich(&blocks, &images, &faces, &self.config());
     self.fixGlyphs();
@@ -816,7 +864,9 @@ pub struct DocPanel {
     device.waitIdle();
     while layout.rects.len() > keep { layout.rects.pop(); }
     var img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
-    darkenStems(&mut img);    if err.len() > 0usize || note.len() > 0usize { self.errorStrip(device, &mut img); }
+    darkenStems(&mut img);
+    blitDiagrams(&mut img, &layout, &imgDiag, &cache, scrollY, pointedDiag, pointedKey);
+    if err.len() > 0usize || note.len() > 0usize { self.errorStrip(device, &mut img); }
     page.upload(device, &img);       // an sRGB texture with its whole mip chain, averaged in linear light
   }
 
@@ -864,6 +914,39 @@ pub struct DocPanel {
     let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
     let y = f32.from(DOC_CENTRE_Y);
     page.draw(device, encoder, target, viewProjection, Vec4(0. - w, y - h, w, y + h));
+  }
+
+  // A click on a diagram: the node, message, note or participant under it, named by its key (the log line is rewritten)
+  fn pointDiagram(self: &mut, pblock: usize, px: f32, py: f32, line: &mut String) {
+    let di = *blockDiag[pblock];
+    var bi = 0usize;
+    while bi < layout.boxes.len() {
+      if usize.from(layout.boxes[bi].block) == pblock {
+        let ux = px - layout.boxes[bi].x;
+        let uy = py - layout.boxes[bi].y;
+        var k = 0usize;
+        while k < cache[di].keys.len() {
+          let rx = *cache[di].rects[k * 4usize];
+          let ry = *cache[di].rects[k * 4usize + 1usize];
+          let rw = *cache[di].rects[k * 4usize + 2usize];
+          let rh = *cache[di].rects[k * 4usize + 3usize];
+          if ux >= rx && ux <= rx + rw && uy >= ry && uy <= ry + rh {
+            pointedDiag = di;
+            pointedKey = k;
+            var path = String.from(doc.blocks[*owner[pblock]].path.view());
+            path.append(SEP);
+            path.append(cache[di].keys[k].view());
+            path.append(" | ");
+            path.append(cache[di].labels[k].view());
+            *line = path;
+            print <- "docpanel: diagram "; print <- di; print <- ": pointed at ["; printStr(cache[di].keys[k].view()); print <- "]\n";
+            return;
+          }
+          k = k + 1usize;
+        }
+      }
+      bi = bi + 1usize;
+    }
   }
 
   // A ray from the eye: does it meet the page? If so, name the block there.
@@ -932,6 +1015,7 @@ pub struct DocPanel {
       line.append(b.text.view().slice(0usize, cut));
     }
     else { line.append("(no block here)"); }
+    if bestD < 40. && pblock < blockDiag.len() && *blockDiag[pblock] != NOMATCH { self.pointDiagram(pblock, px, py, &mut line); }
     print <- "panel click: "; printStr(line.view()); print <- "\n";
     // the log line is: unix ms TAB document TAB path | text (the bridge reads it)
     var stamped = numText(unixMs());
@@ -947,6 +1031,80 @@ pub struct DocPanel {
     if let Err(e) = fs.appendFile(&Path.from(POINTER_LOG), bytes.view()) { print <- "pointer log: "; print <- e; print <- "\n"; }
     true
   }
+}
+
+// Copy each diagram's pixels over its picture box in the page (both are bottom row first, 3 bytes a pixel), clipped to
+// the view; the thing last pointed at gets an amber frame
+fn blitDiagrams(img: &mut Image, layout: &RichLayout, imgDiag: &List[usize], cache: &List[Diagram], scrollY: f32, hd: usize, hk: usize) {
+  let pw = i32.from(DOC_TEX_W);
+  let ph = i32.from(DOC_TEX_H);
+  var b = 0usize;
+  while b < layout.boxes.len() {
+    let bx = &layout.boxes[b];
+    b = b + 1usize;
+    if bx.image == 0u32 { continue; }
+    let ii = usize.from(bx.image) - 1usize;
+    if ii >= imgDiag.len() { continue; }
+    let di = *imgDiag[ii];
+    if cache[di].pixels.len() == 0usize { continue; }
+    let dw = i32.from(cache[di].w);
+    let dh = i32.from(cache[di].h);
+    let x0 = i32.from(bx.x + 0.5);
+    let y0 = i32.from(bx.y - scrollY + 4000.5) - 4000;
+    var r = 0i32;
+    while r < dh {
+      let sy = y0 + (dh - 1i32 - r);
+      if sy >= 0i32 && sy < ph {
+        let dstRow = ph - 1i32 - sy;
+        var x = 0i32;
+        while x < dw {
+          let dx = x0 + x;
+          if dx >= 0i32 && dx < pw {
+            let si = usize.from((r * dw + x) * 3i32);
+            let di3 = usize.from((dstRow * pw + dx) * 3i32);
+            img.pixels.set(di3, *cache[di].pixels[si]);
+            img.pixels.set(di3 + 1usize, *cache[di].pixels[si + 1usize]);
+            img.pixels.set(di3 + 2usize, *cache[di].pixels[si + 2usize]);
+          }
+          x = x + 1i32;
+        }
+      }
+      r = r + 1i32;
+    }
+    if di == hd && hk < cache[di].keys.len() {
+      let fx = x0 + i32.from(*cache[di].rects[hk * 4usize]);
+      let fy = y0 + i32.from(*cache[di].rects[hk * 4usize + 1usize]);
+      let fw = i32.from(*cache[di].rects[hk * 4usize + 2usize]);
+      let fh = i32.from(*cache[di].rects[hk * 4usize + 3usize]);
+      var t = 0i32;
+      while t < 3i32 {
+        var k = 0i32;
+        while k < fw + 6i32 {
+          putPixel(img, fx - 3i32 + k, fy - 3i32 + t);
+          putPixel(img, fx - 3i32 + k, fy + fh + t);
+          k = k + 1i32;
+        }
+        k = 0i32;
+        while k < fh + 6i32 {
+          putPixel(img, fx - 3i32 + t, fy - 3i32 + k);
+          putPixel(img, fx + fw + t, fy - 3i32 + k);
+          k = k + 1i32;
+        }
+        t = t + 1i32;
+      }
+    }
+  }
+}
+
+// An amber pixel at x, y of the view (y down)
+fn putPixel(img: &mut Image, x: i32, y: i32) {
+  let pw = i32.from(DOC_TEX_W);
+  let ph = i32.from(DOC_TEX_H);
+  if x < 0i32 || y < 0i32 || x >= pw || y >= ph { return; }
+  let at = usize.from(((ph - 1i32 - y) * pw + x) * 3i32);
+  img.pixels.set(at, 0xd9u8);
+  img.pixels.set(at + 1usize, 0x82u8);
+  img.pixels.set(at + 2usize, 0x00u8);
 }
 
 // Stem darkening. Thin strokes of 22-pixel text are partly covered pixels, which look pale once the page is
