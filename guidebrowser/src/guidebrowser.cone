@@ -173,6 +173,8 @@ var @threadlocal pressCAt = 0;            // '--press-c N': on frame N, the C ke
 var @threadlocal bridgeArg: *u8 = null;    // '--bridge DIR': the studio bridge's folder (bridge.cone). Return sends the draft, B goes back
 var @threadlocal autoTurns = 0;            // '--auto-turns K': send K test turns, each GAP frames after the last reply (a stand-in for the key)
 var @threadlocal autoGap = 30;             // '--auto-gap F'
+var @threadlocal autoPtt = 0;              // '--auto-ptt F': record at frame F, then (autoPttLen frames later) send: a stand-in for F2 and F3
+var @threadlocal autoPttLen = 800;         // '--auto-ptt-len N'
 var @threadlocal autoSent = 0;
 var @threadlocal autoNext = 120;
 var @threadlocal shotReply = 0;            // '--shot-after-reply K': the shot is taken 30 frames after the Kth reply is shown
@@ -413,6 +415,8 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
           match &mut (*some).panel { case var &mut Some(p) { p.clearMarks(); } else {} }
         }
         if key.scancode == KEY_RETURN && !key.repeat { sendTurn(&mut *some); }
+        if key.scancode == KEY_F2 && !key.repeat { voiceAct(&mut *some, 1u32); }
+        if key.scancode == KEY_F3 && !key.repeat { voiceAct(&mut *some, 2u32); }
         if (*some).wh.on && !key.repeat && (*some).wh.sel >= 0 {
           if key.scancode == KEY_X { whAct(&mut *some, 0u32); }
           if key.scancode == KEY_B { whAct(&mut *some, 1u32); }
@@ -550,10 +554,12 @@ fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: boo
     let le = inv * eye;
     let ld = inv.transformVector(direction);
     match &mut s.panel { case var &mut Some(p) { p.openNew = shiftHeld || gripOn; onPanel = p.click(le, ld); } else {} }
+    chipAction(s);
     if onPanel { s.wh.selectPage(); return; }
   }
   else {
     match &mut s.panel { case var &mut Some(p) { onPanel = p.click(eye, direction); } else {} }
+    chipAction(s);
     if onPanel { return; }
   }
   let hit = nearestPart(&mut s.scene.parts, eye, direction);
@@ -859,6 +865,28 @@ fn whBrowse(s: &mut Shell) {
   }
 }
 
+const KEY_F2 = 59u;
+const KEY_F3 = 60u;
+
+// Push to talk: 1 record / pause (F2), 2 send (F3: waits for the recording to be transcribed), 3 clear the draft
+fn voiceAct(s: &mut Shell, a: u32) {
+  match &mut s.bridge {
+    case var &mut Some(b) {
+      if a == 1u32 { b.toggleRecord(); print <- "bridge: "; print <- (if b.recording { "recording (rec.flag written)" } else { "paused (rec.flag removed)" }); print <- "\n"; }
+      if a == 2u32 { b.requestSend(); print <- "bridge: send asked for\n"; }
+      if a == 3u32 { b.clearDraft(); print <- "bridge: draft cleared\n"; }
+    }
+    else {}
+  }
+}
+
+// A click on one of the note strip's chips (docpanel sets chipHit)
+fn chipAction(s: &mut Shell) {
+  var hit = 0u32;
+  match &mut s.panel { case var &mut Some(p) { hit = p.chipHit; p.chipHit = 0u32; } else {} }
+  if hit > 0u32 { voiceAct(s, hit); }
+}
+
 // Return: the draft goes as the next turn
 fn sendTurn(s: &mut Shell) {
   var one = String();
@@ -978,13 +1006,43 @@ fn bridgeTick(s: &mut Shell) {
   }
   // the voice process: its send word works like Return, and the draft as it grows shows on the note strip
   if voiceSend { sendTurn(s); }
-  else if draftMoved && hasWord(draftNow.view()) {
-    var note = String.from("Draft: ");
-    note.append(draftNow.view());
-    let noteView = note.view();
-    match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); } else {} }
+  // the note strip's status line (push to talk): changes only when its text does, so a reply's own note is not trampled
+  var status = String();
+  var rec = false;
+  var busyNow = false;
+  var pend = false;
+  var turnNo = 0u32;
+  var dn = String();
+  var seen = String();
+  var have = false;
+  match &s.bridge {
+    case let Some(b) {
+      have = true;
+      rec = b.recording; busyNow = b.busy; pend = b.pending(); turnNo = b.turn;
+      dn = String.from(b.draftNote.view());
+      seen = String.from(b.statusSeen.view());
+    }
+    else {}
   }
+  if pend { status.append("Sent turn "); status.append(numText(i64.from(turnNo)).view()); status.append(". Waiting for the reply...   "); }
+  if rec { status.append("RECORDING - F2 pauses, F3 sends"); }
+  else if busyNow { status.append("Transcribing..."); }
+  else { status.append("F2 record, F3 send"); }
+  if hasWord(dn.view()) {
+    status.append("   |   Draft: ");
+    if dn.len() > 160usize { status.append(dn.sub(dn.len() - 160usize, dn.len()).view()); } else { status.append(dn.view()); }
+  }
+  if have && seen.view() != status.view() {
+    var ns = String.from(status.view());
+    match &mut s.bridge { case var &mut Some(b) { b.statusSeen <-> ns; } else {} }
+    let sv = status.view();
+    match &mut s.panel { case var &mut Some(p) { p.setNote(sv); } else {} }
+  }
+  match &mut s.panel { case var &mut Some(p) { p.setRec(rec); } else {} }
+  match &mut s.other { case var &mut Some(p) { p.setRec(rec); } else {} }
   if backAfterShot && shotAt > 0 && drawn == shotAt + 15 { backAfterShot = false; toggleBack(s); shotAt = drawn + 25; }
+  if autoPtt > 0 && i32.from(drawn) == autoPtt { voiceAct(s, 1u32); }
+  if autoPtt > 0 && i32.from(drawn) == autoPtt + autoPttLen { voiceAct(s, 2u32); }
   if n > 0u32 { showReply(s, n); autoNext = drawn + autoGap; return; }
   if autoSent < autoTurns && !pending && drawn >= autoNext {
     autoSent = autoSent + 1;
@@ -1376,6 +1434,8 @@ fn main(argc: i32, argv: **u8) i32 {
     if libc.strcmp(arg, "--bridge") == 0i32 && more { bridgeArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--auto-turns") == 0i32 && more { autoTurns = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--auto-gap") == 0i32 && more { autoGap = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--auto-ptt") == 0i32 && more { autoPtt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--auto-ptt-len") == 0i32 && more { autoPttLen = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--shot-after-reply") == 0i32 && more { shotReply = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
     if libc.strcmp(arg, "--back-after-shot") == 0i32 { backAfterShot = true; }
     if libc.strcmp(arg, "--press-return") == 0i32 && more { pressRetAt = i32.from(argNumber(argv, a + 1i32)); }

@@ -125,6 +125,13 @@ fn writeAtomic(folder: &str, name: &str, text: &str) bool {
   true
 }
 
+fn pathIn(dir: &str, name: &str) String {
+  var p = String.from(dir);
+  p.append("/");
+  p.append(name);
+  p
+}
+
 fn hasWord(s: &str) bool {
   var i = 0usize;
   while i < s.len() {
@@ -171,7 +178,8 @@ pub struct Bridge {
   dir: String;
   pointerLog: String;
   pub draftNote: String;      // the draft as last read from draft.txt, for the note strip
-  turn: u32 = 0u32;           // the last turn sent
+  pub statusSeen: String;     // the status line last shown on the note strip (the caller's)
+  turn: u32 = 0u32;          // the last turn sent
   shown: u32 = 0u32;          // the last reply shown
   pointerOff: usize = 0usize;
   lastPoll: u64 = 0u64;
@@ -179,9 +187,38 @@ pub struct Bridge {
   pub showingReply: bool = false;
   pub voiceSend: bool = false;    // send.flag was found (and deleted): the voice process says "send it"; the caller sends the draft
   pub draftChanged: bool = false; // draftNote changed since the caller last looked
+  // PUSH TO TALK: the app owns rec.flag (it exists while recording); studiovoice owns busy.flag (recording or transcribing)
+  pub recording: bool = false;
+  pub busy: bool = false;
+  wantSend: bool = false;         // send asked for: goes when the recording is over and the draft is final
+  pauseMs: u64 = 0u64;
+
+  // F2 / the record chip
+  pub fn toggleRecord(self: &mut) {
+    if recording {
+      _ = fs.removeFile(&Path.from(pathIn(dir.view(), "rec.flag").view()));
+      recording = false;
+      pauseMs = nowMs();
+    } else {
+      writeAtomic(dir.view(), "rec.flag", "rec\n");
+      recording = true;
+    }
+  }
+
+  // F3 / the send chip: a recording is paused first; the turn goes when the draft is final
+  pub fn requestSend(self: &mut) {
+    if recording { self.toggleRecord(); }
+    wantSend = true;
+    pauseMs = nowMs();
+  }
+
+  pub fn clearDraft(self: &mut) { writeAtomic(dir.view(), "draft.txt", ""); }
 
   pub fn create(dir: &str, pointerLog: &str) Bridge {
-    var b = Bridge(String.from(dir), String.from(pointerLog), String());
+    var b = Bridge(String.from(dir), String.from(pointerLog), String(), String());
+    // flags left by an earlier run are not this one's
+    _ = fs.removeFile(&Path.from(pathIn(dir, "rec.flag").view()));
+    _ = fs.removeFile(&Path.from(pathIn(dir, "busy.flag").view()));
     var sub = String.from(dir); sub.append("/inbox");
     _ = fs.makeDirAll(&Path.from(sub.view()));
     var s2 = String.from(dir); s2.append("/inbox/done");
@@ -298,6 +335,9 @@ pub struct Bridge {
       _ = fs.removeFile(&Path.from(flag.view()));
       voiceSend = true;
     }
+    busy = fs.exists(&Path.from(pathIn(dir.view(), "busy.flag").view()));
+    // a send waits for the recording to be over and transcribed (busy.flag gone, 400 ms after the pause for studiovoice to see it)
+    if wantSend && !recording && !busy && nowMs() > pauseMs + 400u64 { wantSend = false; voiceSend = true; }
     var text = String();
     var draftFile = String.from(dir.view());
     draftFile.append("/draft.txt");
