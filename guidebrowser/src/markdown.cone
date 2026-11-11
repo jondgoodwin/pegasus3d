@@ -25,7 +25,16 @@ pub struct Span {
   pub bold: bool;
   pub italic: bool;
   pub code: bool;
+  pub link: u32;                 // 0: none; else the block's target number + 1 (DocBlock.targets)
+  pub tone: u32;                 // 0: plain; else a colour class of a code file (TONE_...)
 }
+
+pub const TONE_KEYWORD = 1u32;
+pub const TONE_STRING = 2u32;
+pub const TONE_COMMENT = 3u32;
+pub const TONE_NUMBER = 4u32;
+pub const TONE_LINENO = 5u32;
+pub const TONE_TYPE = 6u32;
 
 pub struct DocBlock {
   pub kind: u32;
@@ -35,6 +44,8 @@ pub struct DocBlock {
   pub chain: String;             // the headings above it (itself last, for a heading)
   pub path: String;
   pub first: bool;               // the first line of its fenced block, or of a table: marks "changed" once per block
+  pub targets: List[String];     // where its links go (a span's 'link' - 1 indexes here)
+  pub lang: String;              // for a line of a fenced block: the fence's language word ("mermaid", "cone", ...)
 }
 
 pub struct Doc {
@@ -71,21 +82,26 @@ fn appendNum(s: &mut String, n: usize) {
 
 // Text added in a style, its span merged into the last when the style is the same
 fn addText(text: &mut String, spans: &mut List[Span], s: &str, bold: bool, italic: bool, code: bool) {
+  addToned(text, spans, s, bold, italic, code, 0u32, 0u32);
+}
+
+pub fn addToned(text: &mut String, spans: &mut List[Span], s: &str, bold: bool, italic: bool, code: bool, link: u32, tone: u32) {
   if s.len() == 0usize { return; }
   text.append(s);
   let n = spans.len();
   if n > 0usize {
-    let same = spans[n - 1usize].bold == bold && spans[n - 1usize].italic == italic && spans[n - 1usize].code == code;
+    let same = spans[n - 1usize].bold == bold && spans[n - 1usize].italic == italic && spans[n - 1usize].code == code
+      && spans[n - 1usize].link == link && spans[n - 1usize].tone == tone;
     if same {
       (&mut spans[n - 1usize]).len = spans[n - 1usize].len + s.len();
       return;
     }
   }
-  spans.push(Span(s.len(), bold, italic, code));
+  spans.push(Span(s.len(), bold, italic, code, link, tone));
 }
 
 // 'src' read for emphasis, code and links, appended to 'text' and 'spans'
-fn inlineText(src: &str, text: &mut String, spans: &mut List[Span]) {
+fn inlineText(src: &str, text: &mut String, spans: &mut List[Span], targets: &mut List[String]) {
   var bold = false;
   var italic = false;
   let n = src.len();
@@ -98,6 +114,7 @@ fn inlineText(src: &str, text: &mut String, spans: &mut List[Span]) {
     var shownFrom = 0usize;
     var shownEnd = 0usize;
     var codeText = false;
+    var target = 0u32;           // for a link: its number + 1 in 'targets'
     var done = false;            // the emphasis marker took its bytes and moved i itself
     if c == '\\' && i + 1usize < n && isPunct(src[i + 1usize]) {
       addText(text, spans, src.slice(from, i), bold, italic, false);
@@ -151,12 +168,16 @@ fn inlineText(src: &str, text: &mut String, spans: &mut List[Span]) {
             used = k + 1usize - i;
             shownFrom = open + 1usize;
             shownEnd = j;
+            if c != '!' {
+              targets.push(String.from(src.slice(j + 2usize, k).trim()));
+              target = u32.from(targets.len());
+            }
           }
         }
       }
       if used > 0usize {
         addText(text, spans, src.slice(from, i), bold, italic, false);
-        addText(text, spans, src.slice(shownFrom, shownEnd), bold, italic, codeText);
+        addToned(text, spans, src.slice(shownFrom, shownEnd), bold, italic, codeText, target, 0u32);
         i = i + used;
         from = i;
       }
@@ -172,6 +193,7 @@ struct Outline {
   starts: List[usize];           // where each heading's title starts in 'chain' (before its separator)
   chain: String;                 // the titles joined by SEP
   count: usize;
+  lang: String;                  // the language word of the fenced block being read
 }
 
 fn chainOf(o: &Outline) String {
@@ -181,8 +203,9 @@ fn chainOf(o: &Outline) String {
 fn emit(doc: &mut Doc, o: &mut Outline, kind: u32, depth: u32, src: &str, first: bool) {
   var text = String();
   var spans = List[Span]();
+  var targets = List[String]();
   if kind == DK_CODE { addText(&mut text, &mut spans, src, false, false, true); }
-  else { inlineText(src, &mut text, &mut spans); }
+  else { inlineText(src, &mut text, &mut spans, &mut targets); }
   if kind == DK_HEAD {
     while o.levels.len() > 0usize && *o.levels[o.levels.len() - 1usize] >= depth {
       let k = *o.starts[o.starts.len() - 1usize];
@@ -205,7 +228,7 @@ fn emit(doc: &mut Doc, o: &mut Outline, kind: u32, depth: u32, src: &str, first:
     path.append(SEP);
     appendNum(&mut path, o.count);
   }
-  doc.blocks.push(DocBlock(kind, depth, text, spans, chain, path, first));
+  doc.blocks.push(DocBlock(kind, depth, text, spans, chain, path, first, targets, String.from(o.lang.view())));
 }
 
 // An open paragraph, list item or quote: lines are added until something else begins
@@ -276,7 +299,7 @@ fn listMarker(t: &str) (usize, u32) {
 
 pub fn parseMarkdown(src: &str) Doc {
   var doc = Doc(List[DocBlock]());
-  var o = Outline(List[u32](), List[usize](), String(), 0usize);
+  var o = Outline(List[u32](), List[usize](), String(), 0usize, String());
   var open = Open(99u32, 0u32, String());
   var inCode = false;
   var pos = 0usize;
@@ -297,13 +320,14 @@ pub fn parseMarkdown(src: &str) Doc {
       q = q + 1usize;
     }
     if inCode {
-      if t.startsWith("```") || t.startsWith("~~~") { inCode = false; }
+      if t.startsWith("```") || t.startsWith("~~~") { inCode = false; o.lang = String(); }
       else { emit(&mut doc, &mut o, DK_CODE, 0u32, line, doc.blocks.len() == 0usize || doc.blocks[doc.blocks.len() - 1usize].kind != DK_CODE); }
     }
     else if t.len() == 0usize { flush(&mut doc, &mut o, &mut open); }
     else if t.startsWith("```") || t.startsWith("~~~") {
       flush(&mut doc, &mut o, &mut open);
       inCode = true;
+      o.lang = String.from(t.sliceFrom(3usize).trim());
     }
     else if t[0usize] == '#' {
       var level = 0usize;
@@ -355,6 +379,7 @@ fn startOrJoin(doc: &mut Doc, o: &mut Outline, open: &mut Open, t: &str) {
 fn tableRow(doc: &mut Doc, o: &mut Outline, t: &str) {
   var text = String();
   var spans = List[Span]();
+  var targets = List[String]();
   var cells = 0usize;
   var inner = t.trim();
   if inner.len() > 0usize && inner[0usize] == '|' { inner = inner.sliceFrom(1usize); }
@@ -364,7 +389,7 @@ fn tableRow(doc: &mut Doc, o: &mut Outline, t: &str) {
   while i <= inner.len() {
     if i == inner.len() || inner[i] == '|' {
       if cells > 0usize { addText(&mut text, &mut spans, "      |      ", false, false, false); }
-      inlineText(inner.slice(from, i).trim(), &mut text, &mut spans);
+      inlineText(inner.slice(from, i).trim(), &mut text, &mut spans, &mut targets);
       cells = cells + 1usize;
       from = i + 1usize;
     }
@@ -375,5 +400,5 @@ fn tableRow(doc: &mut Doc, o: &mut Outline, t: &str) {
   var path = String.from(chain.view());
   path.append(SEP);
   appendNum(&mut path, o.count);
-  doc.blocks.push(DocBlock(DK_ROW, 0u32, text, spans, chain, path, true));
+  doc.blocks.push(DocBlock(DK_ROW, 0u32, text, spans, chain, path, true, targets, String()));
 }

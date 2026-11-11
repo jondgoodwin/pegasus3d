@@ -17,6 +17,7 @@ const CHIP_DELAY_MS = 300.0f;
 const FADE_S = 0.2f;
 const FLOAT_Y = 0.95f;           // projects float at waist height
 const RING_N = 5;
+const DEFAULT_ROOT_BROWSE = "C:/Users/jondg/MyDrive/Incubator";
 const RING_R = 2.5f;
 const ZOOM1_H = 2.4f;            // "the project fills the ring": its height, meters
 const ZOOM2_H = 7.0f;            // "fills the room"
@@ -270,12 +271,18 @@ pub struct Warehouse {
   reportCard: i32;         // the card whose report is open, or -1
   reportOpen: bool;
   reportPos: Vec3;
+  browserPanel: Option[DocPanel];   // the file browser: a panel standing ahead of the visitor where F was pressed
+  browserOpen: bool;
+  browserPos: Vec3;
+  browserYaw: f32;
+  navWant: u32;            // a chip asked for back (6), forward (7) or the file browser (8); the shell serves it
+  browserWant: String;     // a folder to show in the browser, served in 'update'
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
       NO_ITEM, 0u64, 0u64, 0u64, Glide(false, 0., Vec3(0., 0., 0.), Vec3(0., 0., 0.), 0., 0., 0., 0.), 0u32, 0u32,
       List[PagePass](), List[f32](), NO_ITEM, List[u32](), List[Label](), -1, None, String(), -1, false,
-      Vec3(0., 0., 0.))
+      Vec3(0., 0., 0.), None, false, Vec3(0., 0., 0.), 0., 0u32, String())
   }
 
   pub fn create(device: &mut Device, format: u32) Warehouse {
@@ -319,6 +326,10 @@ pub struct Warehouse {
         w.chips.push(textLabel(l, device, format, "zoom (Z)", blue, white, 46., 0.30));
         w.chips.push(textLabel(l, device, format, "open (O)", blue, white, 46., 0.30));
         w.chips.push(textLabel(l, device, format, "talk (T)", 0x8a4fa8ffu32, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "zoom out", blue, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "back ([)", 0x5a6b7aff, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "forward (])", 0x5a6b7aff, white, 46., 0.34));
+        w.chips.push(textLabel(l, device, format, "files (F)", 0xb06a1aff, white, 46., 0.30));
         let names = ["queued", "building", "testing", "in review", "merged"];
         let tint = [0x80808affu32, 0xc08a20ffu32, 0x3a78b0ffu32, 0x8a5aa8ffu32, 0x3a8a58ffu32];
         var s = 0usize;
@@ -462,7 +473,7 @@ pub struct Warehouse {
       chipKinds = self.chipList();
     }
     var c = 0usize;
-    while c < 5usize {
+    while c < chips.len() {
       var has = false;
       var q = 0usize;
       while q < chipKinds.len() { if usize.from(*chipKinds[q]) == c { has = true; } q = q + 1usize; }
@@ -479,6 +490,7 @@ pub struct Warehouse {
       self.readLine(device);
     }
     self.serveReport(device, renderer);
+    self.tickBrowser(device, renderer);
     ticks = ticks + 1u32;
     if ticks > 4u32 { self.fillSome(device, 2); }
   }
@@ -609,7 +621,7 @@ pub struct Warehouse {
   fn serveReport(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     if reportWant.len() > 0usize {
       match &mut reportPanel {
-        case var &mut Some(p) { p.open(device, renderer, reportWant.view()); }
+        case var &mut Some(p) { let rw = reportWant.clone(); p.open(device, renderer, rw.view()); }
         case is None { reportPanel = DocPanel.create(device, renderer, format, reportWant.view(), 0.); }
       }
       print <- "warehouse: report opened: "; printStr(reportWant.view()); print <- "\n";
@@ -677,6 +689,17 @@ pub struct Warehouse {
     if best >= 0 {
       print <- "warehouse: card clicked: "; printStr(cards[usize.from(u32.from(best))].id.view()); print <- "\n";
       return self.openCard(best);
+    }
+    if browserOpen {
+      var bhit = false;
+      match &mut browserPanel {
+        case var &mut Some(p) {
+          let inv = self.browserModel().inverse();
+          bhit = p.click(inv * eye, inv.transformVector(dir));
+        }
+        else {}
+      }
+      if bhit { return true; }
     }
     if reportOpen {
       var hit = false;
@@ -774,7 +797,7 @@ pub struct Warehouse {
     out.push(if it.onTable { 0u32 } else { 1u32 });
     out.push(2u32);
     out.push(3u32);
-    if it.page { out.push(4u32); }
+    if it.page { out.push(4u32); out.push(6u32); out.push(7u32); out.push(8u32); }
     out
   }
 
@@ -920,7 +943,82 @@ pub struct Warehouse {
       self.glideTo(k, v.position, v.yaw, v.pitch, d);
       return true;
     }
+    if a >= 6u32 { navWant = a; return true; }
     a == 4u32
+  }
+
+  // ---- the file browser panel ----
+
+  pub fn takeNav(self: &mut) u32 {
+    let a = navWant;
+    navWant = 0u32;
+    a
+  }
+
+  fn browserModel(self: &) Mat4 {
+    Mat4.fromTrs(browserPos, Quat.angleAxis(browserYaw, Vec3(0., 1., 0.)), Vec3(1., 1., 1.))
+  }
+
+  pub fn browserIsOpen(self: &) bool { browserOpen }
+
+  // F: the browser appears 1.7 m ahead of the visitor, facing them (at 'folder', or where it was); F again puts it away
+  pub fn toggleBrowser(self: &mut, folder: &str, eye: Vec3, yaw: f32) {
+    if browserOpen && folder.len() == 0usize { browserOpen = false; print <- "warehouse: file browser closed\n"; return; }
+    let ahead = Vec3(0. - sin(yaw), 0., 0. - cos(yaw));
+    if !browserOpen {
+      browserPos = Vec3(eye.x + ahead.x * 1.7, 0., eye.z + ahead.z * 1.7);
+      browserYaw = atan2(eye.x - browserPos.x, eye.z - browserPos.z);
+    }
+    browserWant = if folder.len() == 0usize { String.from(DEFAULT_ROOT_BROWSE) } else { String.from(folder) };
+    var f = String.from(BROWSE_PREFIX);
+    f.append(browserWant.view());
+    browserWant = f;
+  }
+
+  fn tickBrowser(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if browserWant.len() > 0usize {
+      match &mut browserPanel {
+        case var &mut Some(p) { let bw = browserWant.clone(); p.go(device, renderer, bw.view(), ""); }
+        case is None { browserPanel = DocPanel.create(device, renderer, format, browserWant.view(), 0.); }
+      }
+      print <- "warehouse: file browser opened at "; printStr(browserWant.view()); print <- "\n";
+      browserWant = String();
+      browserOpen = true;
+    }
+    if browserOpen {
+      match &mut browserPanel {
+        case var &mut Some(p) { p.tick(device, renderer); }
+        else {}
+      }
+    }
+  }
+
+  // Each frame the browser is open: it learns the document panel's history, and any file it was asked to open comes back
+  pub fn syncBrowser(self: &mut, device: &mut Device, renderer: &mut Renderer, history: &List[String], serial: u32) String {
+    var out = String();
+    if !browserOpen { return out; }
+    match &mut browserPanel {
+      case var &mut Some(p) {
+        if p.recentSerial != serial {
+          p.recentSerial = serial;
+          p.recent = List[String]();
+          var i = 0usize;
+          while i < history.len() { p.recent.push(String.from(history[i].view())); i = i + 1usize; }
+          p.refreshListing(device, renderer);
+        }
+        if p.outOpen.len() > 0usize { out = String.from(p.outOpen.view()); p.outOpen = String(); }
+      }
+      else {}
+    }
+    out
+  }
+
+  // The test hook: follow link n of the browser's page
+  pub fn browserLink(self: &mut, n: usize) {
+    match &mut browserPanel {
+      case var &mut Some(p) { p.requestNth(n); }
+      else {}
+    }
   }
 
   // ---- the camera-facing quads ----
@@ -1070,6 +1168,10 @@ pub struct Warehouse {
       codes.push(Warehouse.sortKey(5u32, 0u32));
       dists.push((self.reportPos - eye).length() - 0.5);
     }
+    if browserOpen {
+      codes.push(Warehouse.sortKey(6u32, 0u32));
+      dists.push((self.browserPos - eye).length() - 0.5);
+    }
     var list = List[u32]();
     var lq = 0usize;
     while lq < chipKinds.len() { list.push(*chipKinds[lq]); lq = lq + 1usize; }
@@ -1126,6 +1228,12 @@ pub struct Warehouse {
           Warehouse.faded(&mut cards[idx].glow, device, encoder, target, depth, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375), a);
         } else {
           Warehouse.faded(&mut cards[idx].calm, device, encoder, target, depth, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375), a);
+        }
+      }
+      else if kind == 6u32 {
+        match &mut browserPanel {
+          case var &mut Some(p) { p.drawPage(device, encoder, target, vp * self.browserModel()); }
+          else {}
         }
       }
       else if kind == 5u32 {

@@ -176,9 +176,9 @@ var @threadlocal atX = 0.;
 var @threadlocal atZ = 0.;
 // '--wh-ev KIND ARG FRAME' (up to six): on frame FRAME, KIND 1 selects item ARG, KIND 2 does action ARG on the selection
 var @threadlocal whEvs = 0;
-var @threadlocal whKind = Array[i32, 6]() <- fill 0;
-var @threadlocal whArg = Array[i32, 6]() <- fill 0;
-var @threadlocal whFrame = Array[i32, 6]() <- fill 0;
+var @threadlocal whKind = Array[i32, 12]() <- fill 0;
+var @threadlocal whArg = Array[i32, 12]() <- fill 0;
+var @threadlocal whFrame = Array[i32, 12]() <- fill 0;
 var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D degrees further up (down if negative)
 
 // Frames drawn, and the colour at the middle of the window on the shot frame
@@ -310,6 +310,12 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
           if key.scancode == KEY_T { whAct(&mut *some, 4u32); }
         }
         if key.scancode == KEY_B && !key.repeat && !(*some).wh.on { toggleBack(&mut *some); }
+        if !key.repeat {
+          let alt = (key.keymod & 0x0300u16) != 0u16;
+          if key.scancode == KEY_LBRACKET || (alt && key.scancode == KEY_LEFT) { browseAct(&mut *some, 6u32); }
+          if key.scancode == KEY_RBRACKET || (alt && key.scancode == KEY_RIGHT) { browseAct(&mut *some, 7u32); }
+          if key.scancode == KEY_F && (*some).wh.on { browseAct(&mut *some, 8u32); }
+        }
       }
       if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
         let b = e as &sdl.MouseButtonEvent;
@@ -665,14 +671,47 @@ const KEY_B = 5u;
 const KEY_O = 18u;
 const KEY_T = 23u;
 const KEY_Z = 29u;
+const KEY_F = 9u;
+const KEY_LBRACKET = 47u;
+const KEY_RBRACKET = 48u;
+const KEY_RIGHT = 79u;
+const KEY_LEFT = 80u;
 const KEY_X = 27u;           // shelve (S would stop the walk backward)
 
 // An action on the selected project (S, B, Z, O, T and the chips): 0 shelve, 1 bring, 2 zoom, 3 open, 4 talk
 fn whAct(s: &mut Shell, a: u32) {
+  if a >= 6u32 { browseAct(s, a); return; }
   if !s.wh.act(a, &s.visitor) { return; }
   if a == 4u32 {
     print <- "warehouse: talk about the page: write the words in draft.txt and press Return\n";
     match &mut s.panel { case var &mut Some(p) { p.setNote("Talking about this page: write draft.txt, then press Return"); } else {} }
+  }
+}
+
+// Browsing: 6 back and 7 forward in the document panel's history, 8 the file browser (put away if it is out)
+fn browseAct(s: &mut Shell, a: u32) {
+  if a == 6u32 { match &mut s.panel { case var &mut Some(p) { p.requestNav(-1i32); } else {} } }
+  if a == 7u32 { match &mut s.panel { case var &mut Some(p) { p.requestNav(1i32); } else {} } }
+  if a == 8u32 { s.wh.toggleBrowser("", s.visitor.position, s.visitor.yaw); }
+}
+
+// The file browser and the document panel hand each other work: a folder asked for, a file chosen, the history to list
+fn whBrowse(s: &mut Shell) {
+  var dir = String();
+  match &mut s.panel {
+    case var &mut Some(p) { if p.outBrowse.len() > 0usize { dir = String.from(p.outBrowse.view()); p.outBrowse = String(); } }
+    else {}
+  }
+  if dir.len() > 0usize { s.wh.toggleBrowser(dir.view(), s.visitor.position, s.visitor.yaw); }
+  if s.wh.browserIsOpen() {
+    var hf = List[String]();
+    var ser = 0u32;
+    match &s.panel { case let Some(p) { hf = p.historyFiles(); ser = p.histSerial; } else {} }
+    let open = s.wh.syncBrowser(&mut s.device, &mut s.renderer, &hf, ser);
+    if open.len() > 0usize {
+      let ov = open.view();
+      match &mut s.panel { case var &mut Some(p) { p.go(&mut s.device, &mut s.renderer, ov, ""); } else {} }
+    }
   }
 }
 
@@ -796,11 +835,19 @@ fn drawScene(s: &mut Shell, alpha: f32) {
   if s.wh.on {
     s.renderer.keepDepth = true;      // the labels hide behind what stands in front of them
     s.wh.update(&mut s.device, &mut s.renderer);
+    let nav = s.wh.takeNav();
+    if nav != 0u32 { browseAct(s, nav); }
+    whBrowse(s);
     var e = 0;
     while e < whEvs {
       if drawn == whFrame[usize.from(e)] {
         if whKind[usize.from(e)] == 1 { s.wh.select(whArg[usize.from(e)]); }
         else if whKind[usize.from(e)] == 3 { s.wh.openCard(whArg[usize.from(e)]); }
+        else if whKind[usize.from(e)] == 4 {
+          match &mut s.panel { case var &mut Some(p) { p.requestNth(usize.from(whArg[usize.from(e)])); } else {} }
+        }
+        else if whKind[usize.from(e)] == 5 { browseAct(s, u32.from(whArg[usize.from(e)])); }
+        else if whKind[usize.from(e)] == 6 { s.wh.browserLink(usize.from(whArg[usize.from(e)])); }
         else { whAct(s, u32.from(whArg[usize.from(e)])); }
       }
       e = e + 1;
@@ -1093,7 +1140,7 @@ fn main(argc: i32, argv: **u8) i32 {
     if libc.strcmp(arg, "--doc-scroll") == 0i32 && more { docScroll = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--yaw") == 0i32 && more { startYaw = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--at") == 0i32 && a + 2i32 < argc { atSet = true; atX = argNumber(argv, a + 1i32); atZ = argNumber(argv, a + 2i32); }
-    if libc.strcmp(arg, "--wh-ev") == 0i32 && a + 3i32 < argc && whEvs < 6 {
+    if libc.strcmp(arg, "--wh-ev") == 0i32 && a + 3i32 < argc && whEvs < 12 {
       whKind[usize.from(whEvs)] = i32.from(argNumber(argv, a + 1i32));
       whArg[usize.from(whEvs)] = i32.from(argNumber(argv, a + 2i32));
       whFrame[usize.from(whEvs)] = i32.from(argNumber(argv, a + 3i32));

@@ -163,6 +163,12 @@ struct Del {
   born: u64;
 }
 
+// One step of the history: a file (or "browse:FOLDER") and where its page was scrolled to when it was left
+struct HistEntry {
+  file: String;
+  scroll: f32;
+}
+
 pub struct DocPanel {
   file: String;
   doc: Doc;
@@ -183,6 +189,12 @@ pub struct DocPanel {
   dels: List[Del];
   err: String;
   note: String;                 // a line of the bridge at the page's foot (blue) when there is no error
+  hist: List[HistEntry];         // what was opened in this panel, in order; 'hpos' is the one on show
+  pendingLink: String;           // a link the click found, followed on the next tick
+  pendingAnchor: String;
+  outOpen: String;               // the file browser's wish: open this file in the document panel
+  outBrowse: String;             // a document panel's wish: show this folder in the file browser
+  recent: List[String];          // for the file browser: the document panel's history (files)
   scrollY: f32 = 0.;
   pointed: usize = 18446744073709551615usize;   // the doc block last clicked (marked amber), none if max
   dirty: bool = false;
@@ -193,6 +205,10 @@ pub struct DocPanel {
   hotUntil: u64 = 0u64;
   reloads: u32 = 0u32;
   glyphsSwapped: u32 = 0u32;
+  hpos: usize = 0usize;
+  histSerial: u32 = 0u32;                        // counts changes to the history
+  pendingNav: i32 = 0i32;                        // back (-1) or forward (+1), done on the next tick
+  recentSerial: u32 = 0u32;
 
   // Check that it came out: None if no font is installed or the renderer failed
   pub fn create(device: &mut Device, renderer: &mut Renderer, outFormat: u32, file: &str, initialScroll: f32) Option[DocPanel] {
@@ -212,9 +228,11 @@ pub struct DocPanel {
           let page = PagePass.create(device, outFormat);
           var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
             emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, stripTarget, stripBuf,
-            page, List[u64](), List[u32](), List[Del](), String(), String());
+            page, List[u64](), List[u32](), List[Del](), String(), String(),
+            List[HistEntry](), String(), String(), String(), String(), List[String]());
           p.scrollY = initialScroll;
           p.reload(device, renderer, true);
+          p.hist.push(HistEntry(String.from(file), 0.));
           made = Some[DocPanel](p);
         }
       }
@@ -226,7 +244,8 @@ pub struct DocPanel {
   // Look at the file every POLL_MS, read it again when it has changed, and redraw what has to be
   pub fn tick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     let now = nowMs();
-    if now >= lastPoll + POLL_MS {
+    self.serveLinks(device, renderer);
+    if now >= lastPoll + POLL_MS && !isBrowse(file.view()) {
       lastPoll = now;
       var again = false;
       match fs.stat(&Path.from(file.view())) {
@@ -249,6 +268,132 @@ pub struct DocPanel {
       self.redraw(device, renderer);
     }
     else if dirty { self.redraw(device, renderer); }
+  }
+
+  // ---- links, history, anchors ----
+
+  // The files this panel has opened, oldest first (the file browser lists them)
+  pub fn historyFiles(self: &) List[String] {
+    var out = List[String]();
+    var i = 0usize;
+    while i < hist.len() {
+      if !isBrowse(hist[i].file.view()) { out.push(String.from(hist[i].file.view())); }
+      i = i + 1usize;
+    }
+    out
+  }
+
+  pub fn requestLink(self: &mut, target: &str) { pendingLink = String.from(target); }
+  pub fn requestNav(self: &mut, delta: i32) { pendingNav = delta; }
+  pub fn requestNth(self: &mut, n: usize) { pendingLink = self.linkTarget(n); }
+
+  // The n'th link of the page, in reading order (for tests, and for a voice that says "the third link")
+  pub fn linkTarget(self: &, n: usize) String {
+    var seen = 0usize;
+    var d = 0usize;
+    while d < doc.blocks.len() {
+      var s2 = 0usize;
+      var last = 0u32;
+      while s2 < doc.blocks[d].spans.len() {
+        let l = doc.blocks[d].spans[s2].link;
+        if l > 0u32 && l != last {
+          if seen == n { return String.from(doc.blocks[d].targets[usize.from(l) - 1usize].view()); }
+          seen = seen + 1usize;
+        }
+        last = l;
+        s2 = s2 + 1usize;
+      }
+      d = d + 1usize;
+    }
+    String()
+  }
+
+  fn serveLinks(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if pendingLink.len() > 0usize {
+      let t = pendingLink.clone();
+      pendingLink = String();
+      self.follow(device, renderer, t.view());
+    }
+    if pendingNav != 0i32 {
+      let d = pendingNav;
+      pendingNav = 0i32;
+      self.goHistory(device, renderer, d);
+    }
+  }
+
+  // Follow a link of the page: an anchor, a file (here, or in the document panel if this is the file browser), a folder
+  // (in the file browser)
+  fn follow(self: &mut, device: &mut Device, renderer: &mut Renderer, target: &str) {
+    print <- "docpanel: link: "; printStr(target); print <- "\n";
+    if isExternal(target) { self.setNote("A web link: not followed here"); return; }
+    let r = resolveLink(file.view(), target);
+    let path = r.0.view();
+    if isBrowse(file.view()) || target.len() == 0usize {
+      // the file browser's own links are absolute paths
+      if fs.isDir(&Path.from(path)) {
+        var f = String.from(BROWSE_PREFIX);
+        f.append(path);
+        self.go(device, renderer, f.view(), "");
+      }
+      else if fs.exists(&Path.from(path)) { outOpen = String.from(path); }
+      return;
+    }
+    if r.1.len() > 0usize && sameText(path, file.view()) { self.scrollToAnchor(r.1.view()); return; }
+    if fs.isDir(&Path.from(path)) { outBrowse = String.from(path); return; }
+    if !fs.exists(&Path.from(path)) {
+      var m = String.from("No such file: ");
+      m.append(path);
+      self.setNote(m.view());
+      return;
+    }
+    self.go(device, renderer, path, r.1.view());
+  }
+
+  // Show 'newFile' as the next step of the history (what was ahead of this step is dropped), at 'anchor' if given
+  pub fn go(self: &mut, device: &mut Device, renderer: &mut Renderer, newFile: &str, anchor: &str) {
+    if hist.len() > 0usize && hpos < hist.len() { (&mut hist[hpos]).scroll = scrollY; }
+    while hist.len() > hpos + 1usize { hist.pop(); }
+    hist.push(HistEntry(String.from(newFile), 0.));
+    hpos = hist.len() - 1usize;
+    histSerial = histSerial + 1u32;
+    self.open(device, renderer, newFile);
+    if anchor.len() > 0usize { self.scrollToAnchor(anchor); }
+    print <- "docpanel: history "; print <- hpos + 1usize; print <- " of "; print <- hist.len(); print <- ": "; printStr(newFile); print <- "\n";
+  }
+
+  fn goHistory(self: &mut, device: &mut Device, renderer: &mut Renderer, delta: i32) {
+    if hist.len() == 0usize { return; }
+    var np = i64.from(hpos) + i64.from(delta);
+    if np < 0i64 || np >= i64.from(hist.len()) { self.setNote("Nothing further in that direction"); return; }
+    (&mut hist[hpos]).scroll = scrollY;
+    hpos = usize.from(np);
+    histSerial = histSerial + 1u32;
+    let f = String.from(hist[hpos].file.view());
+    let sc = hist[hpos].scroll;
+    self.open(device, renderer, f.view());
+    scrollY = sc;
+    self.clampScroll();
+    dirty = true;
+    print <- "docpanel: history "; print <- hpos + 1usize; print <- " of "; print <- hist.len(); print <- ": "; printStr(f.view()); print <- "\n";
+  }
+
+  // Scroll to the heading whose anchor (its title, lower case, hyphens for spaces) is 'anchor'
+  fn scrollToAnchor(self: &mut, anchor: &str) {
+    let want = slug(anchor);
+    var d = 0usize;
+    while d < doc.blocks.len() {
+      if doc.blocks[d].kind == DK_HEAD && sameText(slug(doc.blocks[d].text.view()).view(), want.view()) {
+        scrollY = self.firstLineTop(d) - 24.;
+        self.clampScroll();
+        dirty = true;
+        print <- "docpanel: anchor #"; printStr(anchor); print <- " found at block "; print <- d; print <- "\n";
+        return;
+      }
+      d = d + 1usize;
+    }
+    var m = String.from("No heading #");
+    m.append(anchor);
+    self.setNote(m.view());
   }
 
   fn fading(self: &, now: u64) bool {
@@ -323,14 +468,35 @@ pub struct DocPanel {
 
   // Read the file; if its text differs from the last (or this is the first time), parse, compare, lay out, draw
   fn reload(self: &mut, device: &mut Device, renderer: &mut Renderer, first: bool) {
-    let began = sdl.GetPerformanceCounter();
+    if isBrowse(file.view()) {
+      let listing = browserText(browseDir(file.view()).view(), &recent);
+      self.reloadText(device, renderer, first, listing.view());
+      return;
+    }
     match fs.readFile(&Path.from(file.view())) {
-      case let Ok(s) {
-        if !first && sameText(s.view(), text.view()) && err.len() == 0usize { return; }
+      case let Ok(s) { self.reloadText(device, renderer, first, s.view()); }
+      case let Err(e) { self.setError("gone or locked"); }
+    }
+  }
+
+  // The file browser's page again (its folder is the same; the history it lists may have changed)
+  pub fn refreshListing(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if isBrowse(file.view()) { self.reload(device, renderer, false); }
+  }
+
+  fn parseText(self: &) Doc {
+    if isBrowse(file.view()) || isDocument(file.view()) { parseMarkdown(text.view()) } else { parseCode(text.view(), file.view()) }
+  }
+
+  fn reloadText(self: &mut, device: &mut Device, renderer: &mut Renderer, first: bool, s: &str) {
+    let began = sdl.GetPerformanceCounter();
+    {
+      {
+        if !first && sameText(s, text.view()) && err.len() == 0usize { return; }
         let hadError = err.len() > 0usize;
-        text = String.from(s.view());
+        text = String.from(s);
         if hadError { err = String(); dirty = true; print <- "docpanel: error line cleared\n"; }
-        let fresh = parseMarkdown(text.view());
+        let fresh = self.parseText();
         // where the top of the view is, to put it back
         let topDoc = self.topDocBlock();
         var keepChain = String();
@@ -458,9 +624,6 @@ pub struct DocPanel {
           print <- ", is ["; if topAfter < doc.blocks.len() { printStr(doc.blocks[topAfter].path.view()); }
           print <- "] at scroll "; print <- scrollY; print <- "\n";
         }
-      }
-      case let Err(e) {
-        self.setError("gone or locked");
       }
     }
   }
@@ -737,6 +900,24 @@ pub struct DocPanel {
     if best < layout.lines.len() { print <- " rows "; print <- layout.lines[best].top; print <- ".."; print <- layout.lines[best].top + layout.lines[best].height; }
     print <- " gap "; print <- bestD; print <- " layoutblock "; print <- pblock; print <- " (posAt said "; print <- p.block; print <- ")\n";
     var line = String();
+    if bestD < 0.5 && pblock < owner.len() && *owner[pblock] < doc.blocks.len() {
+      // a link under the pointer: followed on the next tick
+      let lb = &doc.blocks[*owner[pblock]];
+      let prefix = if lb.kind == DK_QUOTE { 6usize } else { 0usize };
+      if p.off >= prefix {
+        var at = p.off - prefix;
+        var si = 0usize;
+        var start = 0usize;
+        while si < lb.spans.len() {
+          if at >= start && at < start + lb.spans[si].len {
+            let lk = lb.spans[si].link;
+            if lk > 0u32 && usize.from(lk) <= lb.targets.len() { pendingLink = String.from(lb.targets[usize.from(lk) - 1usize].view()); }
+          }
+          start = start + lb.spans[si].len;
+          si = si + 1usize;
+        }
+      }
+    }
     if bestD < 40. && pblock < owner.len() && *owner[pblock] < doc.blocks.len() {
       pointed = *owner[pblock];
       dirty = true;
@@ -819,14 +1000,28 @@ fn toBlock(b: &DocBlock) Block {
   while i < b.spans.len() {
     let sp = &b.spans[i];
     var st = Style.plain();
-    if sp.code || wholeCode { st = Style(true, true, false, 0., CODE_INK, 0u32, 0u32); }       // bold + italic: the monospace slot
+    if sp.code || wholeCode { st = Style(true, true, false, 0., toneInk(sp.tone), 0u32, 0u32); }       // bold + italic: the monospace slot
     else if quote { st = quoteStyle(sp.bold); }
     else { st.bold = sp.bold; st.italic = sp.italic && !sp.bold; }
+    if sp.link > 0u32 { st = Style(st.bold, st.italic && !st.bold, true, 0., LINK_INK, sp.link, 0u32); }
     pushRun(&mut blk.runs, sp.len, st);
     i = i + 1usize;
   }
   blk.text = text;
   blk
+}
+
+const LINK_INK = 0x1a4fb4ffu32;
+
+// The colour of a code file's token class (0: the code ink)
+fn toneInk(tone: u32) u32 {
+  if tone == TONE_KEYWORD { return 0x0b5fa5ffu32; }
+  if tone == TONE_STRING { return 0x1f7a2fffu32; }
+  if tone == TONE_COMMENT { return 0x707070ffu32; }
+  if tone == TONE_NUMBER { return 0x9a3a86ffu32; }
+  if tone == TONE_LINENO { return 0xa0a0a0ffu32; }
+  if tone == TONE_TYPE { return 0x8a4a08ffu32; }
+  CODE_INK
 }
 
 fn quoteStyle(bold: bool) Style {

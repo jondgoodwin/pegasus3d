@@ -1,0 +1,214 @@
+// Following links and listing folders for the document panel (docpanel.cone): where a link goes, what an anchor
+// means, and the file browser's page (a generated Markdown text, so its links are followed like any others).
+
+const BROWSE_PREFIX = "browse:";
+const DEFAULT_ROOT = "C:/Users/jondg/MyDrive/Incubator";
+const MAX_ENTRIES = 300usize;
+
+fn hexVal(c: u8) i32 {
+  if c >= '0' && c <= '9' { return i32.from(c) - i32.from('0'); }
+  if c >= 'a' && c <= 'f' { return i32.from(c) - i32.from('a') + 10i32; }
+  if c >= 'A' && c <= 'F' { return i32.from(c) - i32.from('A') + 10i32; }
+  0i32 - 1i32
+}
+
+// %20 and the like turned back into bytes (a link's path written the way a browser would)
+fn urlDecode(s: &str) String {
+  var bytes = List[u8]();
+  var i = 0usize;
+  while i < s.len() {
+    if s[i] == '%' && i + 2usize < s.len() + 0usize && hexVal(s[i + 1usize]) >= 0i32 && hexVal(s[i + 2usize]) >= 0i32 {
+      bytes.push(u8.from(hexVal(s[i + 1usize]) * 16i32 + hexVal(s[i + 2usize])));
+      i = i + 3usize;
+    }
+    else { bytes.push(s[i]); i = i + 1usize; }
+  }
+  var out = String();
+  var k = 0usize;
+  while k < bytes.len() {
+    // keep bytes as they came (UTF-8 passes through)
+    out.appendByte(*bytes[k]);
+    k = k + 1usize;
+  }
+  out
+}
+
+// A link that leaves the machine's files
+pub fn isExternal(t: &str) bool {
+  t.startsWith("http://") || t.startsWith("https://") || t.startsWith("mailto:")
+}
+
+fn isAbsolute(t: &str) bool {
+  (t.len() >= 2usize && t[1usize] == ':') || t.startsWith("/")
+}
+
+// Backslashes to slashes, "." and ".." folded away
+pub fn normalizePath(p: &str) String {
+  var flat = String();
+  var i = 0usize;
+  while i < p.len() {
+    if p[i] == '\\' { flat.append("/"); } else { flat.append(p.slice(i, i + 1usize)); }
+    i = i + 1usize;
+  }
+  var parts = List[String]();
+  var from = 0usize;
+  let fv = flat.view();
+  var k = 0usize;
+  while k <= fv.len() {
+    if k == fv.len() || fv[k] == '/' {
+      let seg = fv.slice(from, k);
+      if seg == ".." {
+        if parts.len() > 1usize { parts.pop(); }
+      }
+      else if seg != "." && !(seg.len() == 0usize && parts.len() > 0usize) { parts.push(String.from(seg)); }
+      from = k + 1usize;
+    }
+    k = k + 1usize;
+  }
+  var out = String();
+  var q = 0usize;
+  while q < parts.len() {
+    if q > 0usize { out.append("/"); }
+    out.append(parts[q].view());
+    q = q + 1usize;
+  }
+  out
+}
+
+fn dirOf(file: &str) String {
+  let f = normalizePath(file);
+  var cut = 0usize;
+  var i = 0usize;
+  while i < f.len() { if f.view()[i] == '/' { cut = i; } i = i + 1usize; }
+  String.from(f.view().slice(0usize, cut))
+}
+
+// A link's target against the file it stands in: the path (normalised, slashes forward) and the anchor after '#'
+pub fn resolveLink(base: &str, target: &str) (String, String) {
+  var path = String();
+  var anchor = String();
+  var hash = target.len();
+  var i = 0usize;
+  while i < target.len() { if target[i] == '#' { hash = i; i = target.len(); } else { i = i + 1usize; } }
+  let rawPath = target.slice(0usize, hash);
+  if hash < target.len() { anchor = urlDecode(target.sliceFrom(hash + 1usize)); }
+  if rawPath.len() == 0usize { return (String.from(base), anchor); }
+  let decoded = urlDecode(rawPath);
+  if isAbsolute(decoded.view()) { path = normalizePath(decoded.view()); }
+  else {
+    var joined = dirOf(base);
+    joined.append("/");
+    joined.append(decoded.view());
+    path = normalizePath(joined.view());
+  }
+  (path, anchor)
+}
+
+// A heading's anchor: lower case, letters and digits kept, spaces and hyphens become hyphens, the rest dropped
+pub fn slug(title: &str) String {
+  var out = String();
+  var i = 0usize;
+  while i < title.len() {
+    var c = title[i];
+    if c >= 'A' && c <= 'Z' { c = c + 32u8; }
+    if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c >= 128u8 { out.appendByte(c); }
+    else if c == ' ' || c == '-' { out.append("-"); }
+    i = i + 1usize;
+  }
+  out
+}
+
+pub fn isBrowse(file: &str) bool { file.startsWith(BROWSE_PREFIX) }
+
+pub fn browseDir(file: &str) String {
+  if file.len() > BROWSE_PREFIX.len() { String.from(file.sliceFrom(BROWSE_PREFIX.len())) } else { String.from(DEFAULT_ROOT) }
+}
+
+// A Markdown extension: shown as a document; anything else is a source file
+pub fn isDocument(file: &str) bool {
+  let ext = extensionOf(file);
+  let e = ext.view();
+  e == "md" || e == "markdown" || e == "txt" || e.len() == 0usize
+}
+
+fn parentOf(dir: &str) String {
+  let d = normalizePath(dir);
+  var cut = 0usize;
+  var i = 0usize;
+  while i < d.len() { if d.view()[i] == '/' { cut = i; } i = i + 1usize; }
+  if cut < 2usize { return String.from(d.view()); }
+  String.from(d.view().slice(0usize, cut))
+}
+
+fn addEntry(out: &mut String, label: &str, path: &str, dir: bool) {
+  out.append("- [");
+  out.append(label);
+  if dir { out.append("/"); }
+  out.append("](");
+  out.append(path);
+  out.append(")\n");
+}
+
+// The page of folder 'dir': the roots, the way up, then its folders and files (a link each); 'recent' lists what was opened
+pub fn browserText(dir: &str, recent: &List[String]) String {
+  let here = normalizePath(dir);
+  var out = String();
+  out.append("# Files\n\n");
+  out.append("Folder: ");
+  out.append(here.view());
+  out.append("\n\n");
+  out.append("## Roots\n\n");
+  addEntry(&mut out, "Incubator (MyDrive)", "C:/Users/jondg/MyDrive/Incubator", true);
+  addEntry(&mut out, "MyDrive", "C:/Users/jondg/MyDrive", true);
+  addEntry(&mut out, "pegasus3d (C:/src)", "C:/src/pegasus3d-wt-studiobrowse", true);
+  addEntry(&mut out, "cone (C:/src)", "C:/src/cone", true);
+  if recent.len() > 0usize {
+    out.append("\n## Recently opened\n\n");
+    var r = recent.len();
+    var shown = 0usize;
+    while r > 0usize && shown < 8usize {
+      r = r - 1usize;
+      addEntry(&mut out, parts_last(recent[r].view()).view(), recent[r].view(), false);
+      shown = shown + 1usize;
+    }
+  }
+  out.append("\n## ");
+  out.append(parts_last(here.view()).view());
+  out.append("\n\n");
+  let up = parentOf(here.view());
+  addEntry(&mut out, "..", up.view(), true);
+  match fs.readDir(&Path.from(here.view())) {
+    case let Ok(entries) {
+      var n = 0usize;
+      var pass = 0u32;
+      while pass < 2u32 {
+        var i = 0usize;
+        while i < entries.len() {
+          let e = &entries[i];
+          let wantDir = pass == 0u32;
+          let isD = e.isDir || (e.isLink && fs.isDir(&e.path));
+          let hidden = e.name.view().startsWith(".") || e.name.view() == "build" || e.name.view() == "node_modules" || e.name.view() == "target";
+          if isD == wantDir && !hidden && n < MAX_ENTRIES {
+            var full = String.from(here.view());
+            full.append("/");
+            full.append(e.name.view());
+            addEntry(&mut out, e.name.view(), full.view(), isD);
+            n = n + 1usize;
+          }
+          i = i + 1usize;
+        }
+        pass = pass + 1u32;
+      }
+      if n >= MAX_ENTRIES { out.append("\n(only the first 300 shown)\n"); }
+    }
+    case let Err(e) { out.append("\n(this folder cannot be read)\n"); }
+  }
+  out
+}
+
+fn parts_last(p: &str) String {
+  var from = 0usize;
+  var i = 0usize;
+  while i < p.len() { if p[i] == '/' || p[i] == '\\' { from = i + 1usize; } i = i + 1usize; }
+  String.from(p.sliceFrom(from))
+}
