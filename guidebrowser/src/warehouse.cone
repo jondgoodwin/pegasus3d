@@ -356,12 +356,18 @@ pub struct Warehouse {
   dimPass: Option[PagePass];          // the veil over the room while a pane is at the workbench
   addrBuf: String;                    // what is typed into the general browser's address strip
   addrShown: String;                  // what the strip's picture says now
+  dictFile: String;                   // the file named in dictate.flag
+  editOnOpen: String;                 // the page opened from this file starts in editing (a new note)
   zoneSeen: bool = false;
   benchN: u32 = 0u32;                 // pages opened from a board's tree so far (where the next stands on the workbench)
   tabCur: u32 = 0u32;                 // the general browser: the number of the tab shown (0: no tabs)
   tabSerial: u32 = 0u32;
   tabNext: bool = false;              // the next page opened is a tab
   addrEdit: bool = false;             // the address strip is being typed into
+  dictOn: bool = false;               // "dictate" mode: the voice goes to the page's caret, and A/B are not Penny's (guidebrowser.cone voiceAct)
+  dictPg: i32 = -1;                   // the page dictated into
+  dictFlag: u32 = 0u32;               // the shell is to write (1) or remove (2) dictate.flag
+  notesMade: u32 = 0u32;
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -372,7 +378,7 @@ pub struct Warehouse {
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
       None, 0u32, 0u32, false,
       Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
-      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, Palette.empty(), -1, false, List[Zone](), None, String(), String())
+      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, Palette.empty(), -1, false, List[Zone](), None, String(), String(), String(), String())
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -548,6 +554,7 @@ pub struct Warehouse {
     var dt = f32.from(now - lastMs) / 1000.;
     if dt > 0.1 { dt = 0.1; }
     lastMs = now;
+    self.editWatch(device, renderer);
     let clock = f32.from(now - startMs) / 1000.;
     var k = 0usize;
     while k < items.len() {
@@ -2506,6 +2513,15 @@ pub struct Warehouse {
   // A page opened at the workbench, 1.4 m from the start spot (as far as a focused pane): ahead, then to the left and right in turn
   fn openOnBench(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str) {
     let n = self.openPageAs(device, renderer, src, "", false);
+    if n >= 0 && self.editOnOpen.view() == src {
+      // a new note: it opens empty with the caret in it
+      editOnOpen = String();
+      let u0 = usize.from(u32.from(n));
+      match &mut pgs[u0].doc { case var &mut Some(p) { p.editWant(0usize); } else {} }
+      focusPg = n;
+      palFocused = false;
+      webPanelText(true);
+    }
     if n >= 0 {
       let k = benchN % 3u32;
       let a: f32 = if k == 0u32 { 0. } else if k == 1u32 { 0. - 0.85 } else { 0.85 };
@@ -4358,7 +4374,10 @@ pub struct Warehouse {
       match &desk { case let Some(dk) { deskOnNow = dk.control; } else {} }
       let hide = (kind == "project" && ((e.action.view() == "shelve" && !onTable) || (e.action.view() == "bring" && onTable)))
         || (kind == "laptop" && ((e.action.view() == "laptopon" && deskOnNow) || (e.action.view() == "laptopoff" && !deskOnNow)));
-      if !hide { out.push(set[i].clone()); }
+      if !hide {
+        if dictOn && e.action.view() == "dictate" { out.push(String.from("mic-off|Stop dictating|dictate")); }
+        else { out.push(set[i].clone()); }
+      }
       i = i + 1usize;
     }
     if kind == "project" && sel >= 0 {
@@ -4387,6 +4406,168 @@ pub struct Warehouse {
     sig.append(if onTable { "|r|" } else { "|s|" });
     if kind == "laptop" { match &desk { case let Some(dk) { sig.append(if dk.control { "|on" } else { "|off" }); } else {} } }
     sig.append(numText(i64.from(studioSeen.len())).view());
+    if dictOn { sig.append("|dict"); }
+  }
+
+  // ---- editing in place, new notes, dictation (pageedit.cone; docpanel.cone) ----
+
+  // The page being edited, or -1
+  fn editIdx(self: &) i32 {
+    var i = 0usize;
+    while i < pgs.len() {
+      match &pgs[i].doc { case let Some(p) { if p.editing() { return i32.from(i); } } else {} }
+      i = i + 1usize;
+    }
+    -1
+  }
+
+  pub fn editActive(self: &) bool { self.editIdx() >= 0 }
+
+  pub fn editKeyed(self: &mut, device: &mut Device, renderer: &mut Renderer, sc: u32, mods: u16) bool {
+    let e = self.editIdx();
+    if e < 0 { return false; }
+    let u = usize.from(u32.from(e));
+    var used = false;
+    match &mut pgs[u].doc { case var &mut Some(p) { used = p.editKey(device, renderer, sc, mods); if !p.editing() { webPanelText(false); } } else {} }
+    used
+  }
+
+  pub fn editTyped(self: &mut, device: &mut Device, renderer: &mut Renderer, s: &str) {
+    let e = self.editIdx();
+    if e < 0 { return; }
+    let u = usize.from(u32.from(e));
+    match &mut pgs[u].doc { case var &mut Some(p) { p.editText(device, renderer, s); } else {} }
+  }
+
+  // A click on a page that is not the one being edited ends that editing (saving it)
+  pub fn editLeaveOthers(self: &mut, device: &mut Device, renderer: &mut Renderer, keep: i32) {
+    var i = 0usize;
+    while i < pgs.len() {
+      if i32.from(i) != keep {
+        match &mut pgs[i].doc { case var &mut Some(p) { if p.editing() { p.editEnd(device, renderer); webPanelText(false); } } else {} }
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // "New page": an empty dated Markdown file in the notes folder, opened at the workbench with the caret in it
+  fn newPage(self: &mut) bool {
+    var dir = String.from(NOTES_DIR);
+    if notesArg != null { dir = String.from(cstr.fromPtr(notesArg).view()); }
+    if let Err(e) = fs.makeDirAll(&Path.from(dir.view())) { print <- "notes: could not make "; printStr(dir.view()); print <- ": "; print <- e; print <- "\n"; return false; }
+    var stamp = String();
+    stamp.append(numText(i64.from(deskc.local_part(0i32))).view()); stamp.append("-");
+    stamp.append(pad(i64.from(deskc.local_part(1i32)), 2usize).view()); stamp.append("-");
+    stamp.append(pad(i64.from(deskc.local_part(2i32)), 2usize).view()); stamp.append("-");
+    stamp.append(pad(i64.from(deskc.local_part(3i32)), 2usize).view());
+    stamp.append(pad(i64.from(deskc.local_part(4i32)), 2usize).view());
+    var k = 1u32;
+    var path = String();
+    while k < 100u32 {
+      path = String.from(dir.view());
+      path.append("/");
+      path.append(editStampName(stamp.view(), k).view());
+      if !fs.exists(&Path.from(path.view())) { break; }
+      k = k + 1u32;
+    }
+    var none = List[u8]();
+    if let Err(e) = fs.writeFile(&Path.from(path.view()), none.view()) { print <- "notes: could not write "; printStr(path.view()); print <- ": "; print <- e; print <- "\n"; return false; }
+    editOnOpen = path.clone();
+    pageWant = String.from("bench:");
+    pageWant.append(path.view());
+    notesMade = notesMade + 1u32;
+    print <- "notes: new page "; printStr(path.view()); print <- "\n";
+    true
+  }
+
+  // "Dictate here": the focused page takes the voice at its caret, until the icon is pressed again
+  fn toggleDictate(self: &mut) bool {
+    if dictOn {
+      dictOn = false; dictPg = -1; dictFlag = 2u32;
+      print <- "dictate: off (A and B talk to Penny again)\n";
+      return true;
+    }
+    var target = self.editIdx();
+    if target < 0 && focusPg >= 0 && usize.from(u32.from(focusPg)) < pgs.len() { target = focusPg; }
+    if target < 0 { return false; }
+    let u = usize.from(u32.from(target));
+    var ok = false;
+    match &mut pgs[u].doc {
+      case var &mut Some(p) {
+        if p.editable() {
+          if !p.editing() { p.editWant(p.text.len()); webPanelText(true); }
+          dictFile = p.file.clone();
+          ok = true;
+        }
+      }
+      else {}
+    }
+    if !ok { return false; }
+    dictOn = true; dictPg = target; dictFlag = 1u32;
+    print <- "dictate: on for "; printStr(dictFile.view()); print <- " (A records into the caret; B is ignored)\n";
+    true
+  }
+
+  pub fn dictating(self: &) bool { dictOn }
+  pub fn takeDictFlag(self: &mut) u32 { let f = dictFlag; dictFlag = 0u32; f }
+  pub fn dictTarget(self: &) String { dictFile.clone() }
+
+  // Transcribed text to the caret of the dictated page
+  pub fn dictated(self: &mut, device: &mut Device, renderer: &mut Renderer, s: &str) {
+    if !dictOn || dictPg < 0 || usize.from(u32.from(dictPg)) >= pgs.len() { return; }
+    let u = usize.from(u32.from(dictPg));
+    match &mut pgs[u].doc {
+      case var &mut Some(p) {
+        var t = String.from(s.trim());
+        if t.len() == 0usize { return; }
+        t.append(" ");
+        p.editText(device, renderer, t.view());
+        print <- "dictate: "; print <- t.len(); print <- " bytes at the caret\n";
+      }
+      else {}
+    }
+  }
+
+  // Test hook: a palette action by name
+  pub fn testAct(self: &mut, device: &mut Device, name: &str, v: &Fly) { _ = self.palAct(device, name, v); }
+
+  // Test hook: a click on the page numbered i (0 the first opened) at the glyph 'off' of document block d: the page's own click, as a ray
+  pub fn testClickPage(self: &mut, i: usize, d: usize, off: usize) bool {
+    if i >= pgs.len() { return false; }
+    focusPg = i32.from(i);
+    palFocused = false;
+    var hit = false;
+    match &mut pgs[i].doc { case var &mut Some(p) { hit = p.testClickBlock(d, off); } else {} }
+    hit
+  }
+
+  // Test hook: the text of a page's file as the editor holds it
+  pub fn testText(self: &, i: usize) String {
+    var out = String();
+    if i < pgs.len() { match &pgs[i].doc { case let Some(p) { out = p.text.clone(); } else {} } }
+    out
+  }
+
+  pub fn testPageCount(self: &) usize { pgs.len() }
+
+  pub fn testSrc(self: &, i: usize) String { if i < pgs.len() { pgs[i].src.clone() } else { String() } }
+
+  // The page whose file name ends as given (the last such), or the page count if none
+  pub fn testPageIdx(self: &, suffix: &str) usize {
+    var found = pgs.len();
+    var i = 0usize;
+    while i < pgs.len() {
+      let s = pgs[i].src.view();
+      if s.len() >= suffix.len() && s.slice(s.len() - suffix.len(), s.len()) == suffix { found = i; }
+      i = i + 1usize;
+    }
+    found
+  }
+
+  // What a click elsewhere does to editing and dictation: editing ends on every page but the focused one (saved); dictation stops when the focus leaves its page
+  fn editWatch(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if focusPg >= 0 && self.editIdx() >= 0 && self.editIdx() != focusPg { self.editLeaveOthers(device, renderer, focusPg); }
+    if dictOn && focusPg >= 0 && focusPg != dictPg { dictOn = false; dictPg = -1; dictFlag = 2u32; print <- "dictate: off (focus moved)\n"; }
   }
 
   fn palTick(self: &mut, device: &mut Device, dt: f32, now: u64) {
@@ -4476,11 +4657,19 @@ pub struct Warehouse {
       if pgOk { self.toggleShelve(usize.from(u32.from(focusPg))); r = 1u32; }
       else if sel >= 0 && self.act(0u32, v) { r = 1u32; }
     }
+    else if action == "newpage" { r = if self.newPage() { 1u32 } else { 0u32 }; }
+    else if action == "edit" {
+      if pgOk {
+        let i = usize.from(u32.from(focusPg));
+        match &mut pgs[i].doc { case var &mut Some(p) { if p.editable() { p.editWant(p.text.len()); webPanelText(true); r = 1u32; } } else {} }
+      }
+    }
+    else if action == "dictate" { r = if self.toggleDictate() { 1u32 } else { 0u32 }; }
     else if action == "park" { if browserOpen { self.parkBrowser(device); r = 1u32; } else { r = 0u32; } }
     else if sel >= 0 && self.doAction(action, v) { r = 1u32; }
     else if action == "reload" { cfgPoll = 0u64; studioSeen = String(); roomSeen = String(); r = 1u32; }
     else if sel < 0 && (action == "zoom" || action == "zoomout" || action == "bring" || action == "open" || action == "talk") { r = 0u32; }
-    else if action == "undo" || action == "beforeafter" || action == "edit" || action == "dictate" || action == "newpage" || action == "linkpage"
+    else if action == "undo" || action == "beforeafter" || action == "linkpage"
       || action == "webreload" || action == "address" || action == "addbox" || action == "connect" || action == "labelit" || action == "rename"
       || action == "delete" || action == "relayout" || action == "passthrough" || action == "look" { r = 2u32; }
     print <- "palette: "; printStr(label.view()); print <- " ("; printStr(action); print <- ") ";

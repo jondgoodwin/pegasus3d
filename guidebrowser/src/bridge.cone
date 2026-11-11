@@ -192,6 +192,59 @@ pub struct Bridge {
   pub busy: bool = false;
   wantSend: bool = false;         // send asked for: goes when the recording is over and the draft is final
   pauseMs: u64 = 0u64;
+  dictPoll: u64 = 0u64;
+
+  // DICTATE MODE (the page editor): dictate.flag names the file whose caret takes the voice; while it exists studiovoice writes each
+  // transcription to dictate-NNNN.txt (not into the draft) and the app takes those. Turning the mode on or off clears the leftovers.
+  pub fn setDictate(self: &mut, on: bool, file: String) {
+    self.clearDictation();
+    if on {
+      var body = file;
+      body.append("\n");
+      writeAtomic(dir.view(), "dictate.flag", body.view());
+    } else {
+      _ = fs.removeFile(&Path.from(pathIn(dir.view(), "dictate.flag").view()));
+    }
+  }
+
+  fn clearDictation(self: &mut) {
+    match fs.readDir(&Path.from(dir.view())) {
+      case let Ok(entries) {
+        var i = 0usize;
+        while i < entries.len() {
+          if numberIn(entries[i].name.view(), "dictate-") > 0usize { _ = fs.removeFile(&Path.from(pathIn(dir.view(), entries[i].name.view()).view())); }
+          i = i + 1usize;
+        }
+      }
+      case let Err(e) {}
+    }
+  }
+
+  // The oldest transcription waiting for the page ("" if none); its file is removed
+  pub fn takeDictation(self: &mut) String {
+    let now = nowMs();
+    if now < dictPoll + 200u64 { return String(); }
+    dictPoll = now;
+    var best = 0usize;
+    var bestName = String();
+    match fs.readDir(&Path.from(dir.view())) {
+      case let Ok(entries) {
+        var i = 0usize;
+        while i < entries.len() {
+          let n = numberIn(entries[i].name.view(), "dictate-");
+          if n > 0usize && (best == 0usize || n < best) { best = n; bestName = String.from(entries[i].name.view()); }
+          i = i + 1usize;
+        }
+      }
+      case let Err(e) {}
+    }
+    if best == 0usize { return String(); }
+    let p = pathIn(dir.view(), bestName.view());
+    var out = String();
+    match fs.readFile(&Path.from(p.view())) { case let Ok(t) { out = String.from(t.view()); } case let Err(e) {} }
+    _ = fs.removeFile(&Path.from(p.view()));
+    out
+  }
 
   // F2 / the record chip
   pub fn toggleRecord(self: &mut) {
@@ -219,6 +272,7 @@ pub struct Bridge {
     // flags left by an earlier run are not this one's
     _ = fs.removeFile(&Path.from(pathIn(dir, "rec.flag").view()));
     _ = fs.removeFile(&Path.from(pathIn(dir, "busy.flag").view()));
+    _ = fs.removeFile(&Path.from(pathIn(dir, "dictate.flag").view()));
     var sub = String.from(dir); sub.append("/inbox");
     _ = fs.makeDirAll(&Path.from(sub.view()));
     var s2 = String.from(dir); s2.append("/inbox/done");

@@ -1,0 +1,225 @@
+// Editing a Markdown page in place (WI\studio-warehouse.md, design thoughts (c)): the text and caret operations, with no GPU in them.
+//
+// The text of the file is one String and the caret is a byte offset into it. A PARAGRAPH (a chunk) is a run of lines between blank lines (a
+// fenced block counts as one, its blank lines included). The chunk the caret stands in is shown raw (one monospace line per source line);
+// the others are rendered. All keys work on the file text, so what is saved is exactly what is typed.
+
+pub struct EdRange {
+  pub a: usize;
+  pub b: usize;
+}
+
+pub struct EdSnap {
+  pub text: String;
+  pub caret: usize;
+}
+
+const ED_MARK = "@@PAGE-EDIT-MARK@@";
+
+fn edBlankByte(c: u8) bool { c == ' ' || c == '\t' || c == '\r' }
+
+// The paragraphs of a text, as byte ranges (end excludes the line break)
+pub fn editChunks(t: &str) List[EdRange] {
+  var out = List[EdRange]();
+  var inFence = false;
+  var open = false;
+  var cs = 0usize;
+  var ce = 0usize;
+  var i = 0usize;
+  let n = t.len();
+  while i <= n {
+    var j = i;
+    while j < n && t[j] != '\n' { j = j + 1usize; }
+    // the line is t[i..j]
+    var blank = true;
+    var k = i;
+    while k < j { if !edBlankByte(t[k]) { blank = false; } k = k + 1usize; }
+    var fenceLine = false;
+    if !blank {
+      var f = i;
+      while f < j && edBlankByte(t[f]) { f = f + 1usize; }
+      if f + 3usize <= j && t[f] == '`' && t[f + 1usize] == '`' && t[f + 2usize] == '`' { fenceLine = true; }
+    }
+    if fenceLine { inFence = !inFence; }
+    if blank && !inFence {
+      if open { out.push(EdRange(cs, ce)); open = false; }
+    } else {
+      if !open { cs = i; open = true; }
+      ce = j;
+    }
+    i = j + 1usize;
+  }
+  if open { out.push(EdRange(cs, ce)); }
+  out
+}
+
+// The paragraph the caret is in (an empty range at the caret when it stands between paragraphs)
+pub fn editChunkAt(t: &str, caret: usize) EdRange {
+  let cs = editChunks(t);
+  var i = 0usize;
+  while i < cs.len() {
+    if cs[i].a <= caret && caret <= cs[i].b { return EdRange(cs[i].a, cs[i].b); }
+    i = i + 1usize;
+  }
+  EdRange(caret, caret)
+}
+
+fn edIsCont(c: u8) bool { (c & 0xC0u8) == 0x80u8 }
+
+pub fn edPrevChar(t: &str, c: usize) usize {
+  if c == 0usize { return 0usize; }
+  var p = c - 1usize;
+  while p > 0usize && edIsCont(t[p]) { p = p - 1usize; }
+  p
+}
+
+pub fn edNextChar(t: &str, c: usize) usize {
+  if c >= t.len() { return t.len(); }
+  var p = c + 1usize;
+  while p < t.len() && edIsCont(t[p]) { p = p + 1usize; }
+  p
+}
+
+pub fn edLineStart(t: &str, c: usize) usize {
+  var p = c;
+  while p > 0usize && t[p - 1usize] != '\n' { p = p - 1usize; }
+  p
+}
+
+pub fn edLineEnd(t: &str, c: usize) usize {
+  var p = c;
+  while p < t.len() && t[p] != '\n' { p = p + 1usize; }
+  p
+}
+
+// Up (-1) or down (+1) one source line, to the same byte column as far as the line goes
+pub fn edVertical(t: &str, c: usize, dir: i32) usize {
+  let ls = edLineStart(t, c);
+  var col = c - ls;
+  if dir < 0i32 {
+    if ls == 0usize { return 0usize; }
+    let pe = ls - 1usize;
+    let ps = edLineStart(t, pe);
+    var target = ps + col;
+    if target > pe { target = pe; }
+    while target > ps && edIsCont(t[target]) { target = target - 1usize; }
+    return target;
+  }
+  let le = edLineEnd(t, c);
+  if le >= t.len() { return t.len(); }
+  let ns = le + 1usize;
+  let ne = edLineEnd(t, ns);
+  var target = ns + col;
+  if target > ne { target = ne; }
+  while target > ns && target < t.len() && edIsCont(t[target]) { target = target - 1usize; }
+  target
+}
+
+pub fn edInsert(t: &mut String, c: usize, s: &str) usize {
+  var out = String.from(t.view().slice(0usize, c));
+  out.append(s);
+  out.append(t.view().sliceFrom(c));
+  *t = out;
+  c + s.len()
+}
+
+// Remove t[a..b]
+pub fn edCut(t: &mut String, a: usize, b: usize) {
+  var out = String.from(t.view().slice(0usize, a));
+  out.append(t.view().sliceFrom(b));
+  *t = out;
+}
+
+// The text with its blank lines at the end taken away / at the start taken away
+fn edTrimNlEnd(s: &str) &str {
+  var e = s.len();
+  while e > 0usize && (s[e - 1usize] == '\n' || s[e - 1usize] == '\r') { e = e - 1usize; }
+  s.slice(0usize, e)
+}
+
+fn edTrimNlStart(s: &str) &str {
+  var b = 0usize;
+  while b < s.len() && (s[b] == '\n' || s[b] == '\r') { b = b + 1usize; }
+  s.sliceFrom(b)
+}
+
+// The text to parse while the chunk [a, b) is being edited: the chunk is replaced by one marked paragraph
+pub fn editShown(t: &str, a: usize, b: usize) String {
+  var out = String.from(edTrimNlEnd(t.slice(0usize, a)));
+  if out.len() > 0usize { out.append("\n\n"); }
+  out.append(ED_MARK);
+  out.append("\n\n");
+  out.append(edTrimNlStart(t.sliceFrom(b)));
+  out
+}
+
+pub fn editMark() &str { ED_MARK }
+
+// The lines of the chunk (at least one, maybe empty)
+pub fn editLines(t: &str, a: usize, b: usize) List[String] {
+  var out = List[String]();
+  var s = a;
+  var i = a;
+  while i <= b {
+    if i == b || t[i] == '\n' {
+      var e = i;
+      if e > s && t[e - 1usize] == '\r' { e = e - 1usize; }
+      out.push(String.from(t.slice(s, e)));
+      s = i + 1usize;
+    }
+    i = i + 1usize;
+  }
+  if out.len() == 0usize { out.push(String()); }
+  out
+}
+
+// Where the rendered text's first 'off' bytes stand in the source chunk [a, b): the markers (* _ ` # - > [ ] ( ) digits and dots at the start)
+// the page took away are skipped. Exact for plain text.
+pub fn editMapOffset(t: &str, a: usize, b: usize, rendered: &str, off: usize) usize {
+  var s = a;
+  var r = 0usize;
+  while r < off && r < rendered.len() && s < b {
+    // skip a source byte that the rendered text does not have there
+    while s < b && t[s] != rendered[r] { s = s + 1usize; }
+    if s < b { s = s + 1usize; r = r + 1usize; }
+  }
+  if r < off || s > b { return b; }
+  s
+}
+
+pub fn editStampName(stamp: &str, n: u32) String {
+  var s = String.from(stamp);
+  if n > 1u32 { s.append("-"); s.append(numText(i64.from(n)).view()); }
+  s.append(".md");
+  s
+}
+
+// The state of the page being edited (a DocPanel's 'ed')
+pub struct EditState {
+  pub undo: List[EdSnap];
+  pub base: String;             // the file as last read or written: what a poll that finds the file unchanged by others would read
+  pub baseChunk: String;        // the paragraph as it was before the first unsaved change (to find it again if the file changed under us)
+  pub on: bool = false;
+  pub caret: usize = 0usize;
+  pub c0: usize = 0usize;       // the paragraph the caret is in (shown raw)
+  pub c1: usize = 0usize;
+  pub lines: usize = 1usize;    // how many raw lines are shown
+  pub lastKind: u32 = 0u32;
+  pub lastAt: u64 = 0u64;
+  pub dirty: bool = false;
+  pub saveAt: u64 = 0u64;
+  pub want: bool = false;       // begin editing at 'wantCaret' on the next tick (a new page)
+  pub wantCaret: usize = 0usize;
+  pub pend: bool = false;       // a click wants to start editing: doc block and offset
+  pub pendBlock: usize = 0usize;
+  pub pendOff: usize = 0usize;
+  pub saves: u32 = 0u32;
+  pub blink: u64 = 0u64;
+}
+
+pub fn editIdle() EditState { EditState(List[EdSnap](), String(), String()) }
+
+pub const NOTES_DIR = "C:/Users/jondg/MyDrive/Incubator/Studio Notes";
+
+// '--notes-dir DIR' (tests): where "new page" puts its files instead
+var @threadlocal notesArg: *u8 = null;

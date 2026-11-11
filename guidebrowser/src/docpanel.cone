@@ -288,6 +288,7 @@ pub struct DocPanel {
   pub openDirs: List[String];    // a tree page: the folders expanded
   treeCache: TreeCache;
   up: PageUp;                   // the picture on its way to the GPU, a slice a frame (pageup.cone)
+  pub ed: EditState;            // editing in place (pageedit.cone)
   texW: u32 = 1280u32;           // this page's texture and its size in the world (a code page is wider)
   texH: u32 = 1810u32;
   worldW: f32 = 1.346;
@@ -346,7 +347,7 @@ pub struct DocPanel {
             emptyLayout(f32.from(tw)), target, readback, stripTarget, stripBuf,
             page, List[u64](), List[u32](), List[Del](), String(), String(),
             List[HistEntry](), String(), String(), String(), String(), List[String](), String(),
-            None, List[Diagram](), List[usize](), List[usize](), List[String](), TreeCache(), PageUp.idle());
+            None, List[Diagram](), List[usize](), List[usize](), List[String](), TreeCache(), PageUp.idle(), editIdle());
           p.wide = isWide;
           p.texW = tw;
           p.texH = th;
@@ -369,6 +370,7 @@ pub struct DocPanel {
   pub fn tick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     let now = nowMs();
     if pendingFirst { pendingFirst = false; self.reload(device, renderer, true); return; }
+    self.edTick(device, renderer, now);
     self.serveLinks(device, renderer);
     // the first frames are crowded with the arrival's own command buffers (a frame may record 16): diagrams wait
     ticks = ticks + 1u32;
@@ -728,12 +730,360 @@ pub struct DocPanel {
     if isBrowse(file.view()) { self.reload(device, renderer, false); }
   }
 
+  // ---- editing in place (pageedit.cone has the text operations) ----
+
+  // Test hook: a click, as a ray, on the glyph 'off' of doc block d
+  pub fn testClickBlock(self: &mut, d: usize, off: usize) bool {
+    var b = 0usize;
+    while b < owner.len() && *owner[b] != d { b = b + 1usize; }
+    if b >= owner.len() { return false; }
+    var o = off;
+    if o > blocks[b].text.len() { o = blocks[b].text.len(); }
+    let cr = caretRect(&layout, pos(b, o));
+    let u = (cr.x + 1.) / f32.from(texW);
+    let v = 1. - (cr.y + cr.h * 0.5 - scrollY) / f32.from(texH);
+    let w = f32.from(worldW);
+    let h = w * f32.from(texH) / f32.from(texW);
+    let hx = u * w - w * 0.5;
+    let hy = v * h + (self.centreY() - h * 0.5);
+    print <- "pageedit: test click at block "; print <- d; print <- " offset "; print <- off; print <- " (u "; print <- u; print <- ", v "; print <- v; print <- ")\n";
+    self.click(Vec3(hx, hy, 1.), Vec3(0., 0., -1.))
+  }
+
+  pub fn editable(self: &) bool {
+    !wide && !isBrowse(file.view()) && !isTree(file.view()) && !isDiagramFile(file.view(), text.view()) && err.len() == 0usize
+  }
+
+  pub fn editing(self: &) bool { ed.on }
+
+  // Begin (or move) editing with the caret at byte 'at' of the text; used by the new-page action and dictation
+  pub fn editWant(self: &mut, at: usize) { ed.want = true; ed.wantCaret = at; }
+
+  fn edChunkSet(self: &mut) {
+    if ed.caret > text.len() { ed.caret = text.len(); }
+    let r = editChunkAt(text.view(), ed.caret);
+    ed.c0 = r.a;
+    ed.c1 = r.b;
+    ed.lines = editLines(text.view(), r.a, r.b).len();
+  }
+
+  // The doc with the paragraph being edited as raw lines (one monospace block per source line)
+  fn parseEditing(self: &) Doc {
+    let shown = editShown(text.view(), ed.c0, ed.c1);
+    var d = parseMarkdown(shown.view());
+    var m = d.blocks.len();
+    var i = 0usize;
+    while i < d.blocks.len() {
+      if d.blocks[i].kind == DK_PARA && d.blocks[i].text.view() == editMark() { m = i; break; }
+      i = i + 1usize;
+    }
+    if m >= d.blocks.len() { return d; }
+    let chain = d.blocks[m].chain.clone();
+    let path = d.blocks[m].path.clone();
+    d.blocks.remove(m);
+    let ls = editLines(text.view(), ed.c0, ed.c1);
+    var k = ls.len();
+    while k > 0usize {
+      k = k - 1usize;
+      var spans = List[Span]();
+      if ls[k].len() > 0usize { spans.push(Span(ls[k].len(), false, false, false, 0u32, 0u32)); }
+      d.blocks.insert(m, DocBlock(DK_CODE, 0u32, ls[k].clone(), spans, chain.clone(), path.clone(), k == 0usize, List[String](), String.from("@raw")));
+    }
+    d
+  }
+
+  fn rawFirst(self: &) usize {
+    var i = 0usize;
+    while i < doc.blocks.len() {
+      if doc.blocks[i].lang.view() == "@raw" { return i; }
+      i = i + 1usize;
+    }
+    NOMATCH
+  }
+
+  // The caret's rectangle in the laid-out page (none when not editing)
+  fn caretRectNow(self: &) CaretRect {
+    if !ed.on || layout.lines.len() == 0usize { return CaretRect(0., 0., 0.); }
+    let rf = self.rawFirst();
+    if rf == NOMATCH { return CaretRect(0., 0., 0.); }
+    var line = 0usize;
+    var i = ed.c0;
+    while i < ed.caret && i < text.len() { if text.view()[i] == '\n' { line = line + 1usize; } i = i + 1usize; }
+    let ls = edLineStart(text.view(), ed.caret);
+    var col = ed.caret - ls;
+    // (a CRLF file's raw lines lack the \r)
+    let want = rf + line;
+    var b = 0usize;
+    while b < owner.len() {
+      if *owner[b] == want {
+        if col > blocks[b].text.len() { col = blocks[b].text.len(); }
+        return caretRect(&layout, pos(b, col));
+      }
+      b = b + 1usize;
+    }
+    CaretRect(0., 0., 0.)
+  }
+
+  // Re-parse and draw after the text or the paragraph changed (no change marks: it is the editor's own doing)
+  fn edRefresh(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    self.edChunkSet();
+    doc = self.parseText();
+    // the change marks of an outside edit stay while the block count is the same (typing in a paragraph); else they are let go
+    if born.len() != doc.blocks.len() || kinds.len() != doc.blocks.len() {
+      var nb = List[u64]();
+      var nk = List[u32]();
+      var q = 0usize;
+      while q < doc.blocks.len() { nb.push(0u64); nk.push(0u32); q = q + 1usize; }
+      born = nb;
+      kinds = nk;
+      dels = List[Del]();
+    }
+    pointed = NOMATCH;
+    self.relayout(device);
+    // keep the caret in view
+    let cr = self.caretRectNow();
+    if cr.h > 0. {
+      let lo = scrollY + 40.;
+      let hi = scrollY + f32.from(texH) - 220.;
+      if cr.y < lo { scrollY = cr.y - 120.; }
+      else if cr.y + cr.h > hi { scrollY = cr.y + cr.h - f32.from(texH) + 360.; }
+      self.clampScroll();
+    }
+    self.redraw(device, renderer);
+  }
+
+  pub fn editBegin(self: &mut, device: &mut Device, renderer: &mut Renderer, at: usize) {
+    if !self.editable() { return; }
+    if !ed.on { ed.base = text.clone(); }
+    ed.on = true;
+    ed.caret = at;
+    ed.lastKind = 0u32;
+    self.edRefresh(device, renderer);
+    print <- "pageedit: editing "; printStr(file.view()); print <- " at byte "; print <- ed.caret; print <- " ("; print <- ed.lines; print <- " raw lines)\n";
+  }
+
+  pub fn editEnd(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if !ed.on { return; }
+    self.edSave();
+    ed.on = false;
+    self.edRefresh(device, renderer);
+    print <- "pageedit: left editing "; printStr(file.view()); print <- "\n";
+  }
+
+  // The file written under a temporary name, then renamed over it in one step
+  pub fn edSave(self: &mut) {
+    if !ed.dirty { return; }
+    var tmp = String.from(file.view());
+    tmp.append(".tmp-edit");
+    let bytes = toBytes(text.view());
+    if let Err(e) = fs.writeFile(&Path.from(tmp.view()), bytes.view()) { print <- "pageedit: write failed: "; print <- e; print <- "\n"; return; }
+    if deskc.replace_file(tmp.cstr(), file.cstr()) != 1i32 { print <- "pageedit: rename failed for "; printStr(file.view()); print <- "\n"; return; }
+    match fs.stat(&Path.from(file.view())) {
+      case let Ok(info) { lastMtime = info.modified.unixSeconds(); lastSize = info.size; }
+      case let Err(e) {}
+    }
+    ed.base = text.clone();
+    ed.dirty = false;
+    ed.baseChunk = String();
+    ed.saves = ed.saves + 1u32;
+    print <- "pageedit: saved "; printStr(file.view()); print <- " ("; print <- text.len(); print <- " bytes, save "; print <- ed.saves; print <- ")\n";
+  }
+
+  fn edTick(self: &mut, device: &mut Device, renderer: &mut Renderer, now: u64) {
+    if ed.want { ed.want = false; self.editBegin(device, renderer, ed.wantCaret); }
+    if ed.pend { ed.pend = false; self.edFromClick(device, renderer); }
+    if ed.on && ed.dirty && now >= ed.saveAt { self.edSave(); }
+  }
+
+  // Before a change: remember the text and caret for Ctrl+Z (typing in a run is one step)
+  fn edSnap(self: &mut, kind: u32, now: u64) {
+    if !(kind == 1u32 && ed.lastKind == 1u32 && now < ed.lastAt + 1500u64) {
+      ed.undo.push(EdSnap(text.clone(), ed.caret));
+      if ed.undo.len() > 200usize { ed.undo.remove(0usize); }
+    }
+    if !ed.dirty { ed.baseChunk = String.from(text.view().slice(ed.c0, ed.c1)); }
+    ed.lastKind = kind;
+    ed.lastAt = now;
+  }
+
+  fn edChanged(self: &mut, device: &mut Device, renderer: &mut Renderer, now: u64) {
+    ed.dirty = true;
+    ed.saveAt = now + 1000u64;
+    self.edRefresh(device, renderer);
+  }
+
+  // The caret moved without a change: leaving the paragraph saves
+  fn edMoved(self: &mut, device: &mut Device, renderer: &mut Renderer, to: usize) {
+    let left = to < ed.c0 || to > ed.c1;
+    ed.caret = to;
+    ed.lastKind = 0u32;
+    if left && ed.dirty { self.edSave(); }
+    self.edRefresh(device, renderer);
+  }
+
+  // Typed (or dictated) text at the caret
+  pub fn editText(self: &mut, device: &mut Device, renderer: &mut Renderer, s: &str) {
+    if !ed.on { self.editBegin(device, renderer, text.len()); }
+    if !ed.on || s.len() == 0usize { return; }
+    let now = nowMs();
+    self.edSnap(1u32, now);
+    ed.caret = edInsert(&mut text, ed.caret, s);
+    self.edChanged(device, renderer, now);
+  }
+
+  // A key (SDL scancode and modifiers) while editing; false if the key is not the editor's
+  pub fn editKey(self: &mut, device: &mut Device, renderer: &mut Renderer, sc: u32, mods: u16) bool {
+    if !ed.on { return false; }
+    let now = nowMs();
+    let ctrl = (mods & 0x00C0u16) != 0u16;
+    if sc == 41u32 { self.editEnd(device, renderer); return true; }
+    if ctrl {
+      if sc == 29u32 { self.edUndo(device, renderer); }
+      return true;
+    }
+    if sc == 42u32 {         // Backspace
+      if ed.caret > 0usize {
+        self.edSnap(2u32, now);
+        let a = edPrevChar(text.view(), ed.caret);
+        edCut(&mut text, a, ed.caret);
+        ed.caret = a;
+        self.edChanged(device, renderer, now);
+      }
+      return true;
+    }
+    if sc == 76u32 {         // Delete
+      if ed.caret < text.len() {
+        self.edSnap(2u32, now);
+        let b = edNextChar(text.view(), ed.caret);
+        edCut(&mut text, ed.caret, b);
+        self.edChanged(device, renderer, now);
+      }
+      return true;
+    }
+    if sc == 40u32 || sc == 88u32 {         // Enter: a new paragraph
+      self.edSnap(3u32, now);
+      ed.caret = edInsert(&mut text, ed.caret, "\n\n");
+      self.edChanged(device, renderer, now);
+      self.edSave();
+      return true;
+    }
+    if sc == 80u32 { self.edMoved(device, renderer, edPrevChar(text.view(), ed.caret)); return true; }
+    if sc == 79u32 { self.edMoved(device, renderer, edNextChar(text.view(), ed.caret)); return true; }
+    if sc == 82u32 { self.edMoved(device, renderer, edVertical(text.view(), ed.caret, -1i32)); return true; }
+    if sc == 81u32 { self.edMoved(device, renderer, edVertical(text.view(), ed.caret, 1i32)); return true; }
+    if sc == 74u32 { self.edMoved(device, renderer, edLineStart(text.view(), ed.caret)); return true; }
+    if sc == 77u32 { self.edMoved(device, renderer, edLineEnd(text.view(), ed.caret)); return true; }
+    // other keys (letters come as text; the rest do nothing here, and the studio does not see them)
+    true
+  }
+
+  fn edUndo(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    match ed.undo.pop() {
+      case let Some(snap) {
+        text = snap.text.clone();
+        ed.caret = snap.caret;
+        ed.lastKind = 0u32;
+        ed.dirty = true;
+        ed.saveAt = nowMs() + 1000u64;
+        self.edRefresh(device, renderer);
+        print <- "pageedit: undo, "; print <- ed.undo.len(); print <- " steps left\n";
+      }
+      else { print <- "pageedit: nothing to undo\n"; }
+    }
+  }
+
+  // Another writer changed the file: 'incoming' is what is on disk. The paragraph being edited is looked for in it (as it was before our
+  // unsaved change, if any) and our version of it put in its place; if it is not there, the edit is let go. False: nothing to show.
+  fn edExternal(self: &mut, incoming: &mut String) bool {
+    let cur = String.from(text.view().slice(ed.c0, ed.c1));
+    let off = ed.caret - ed.c0;
+    let find = if ed.dirty { ed.baseChunk.clone() } else { cur.clone() };
+    match incoming.view().find(find.view()) {
+      case let Some(p) {
+        var merged = String.from(incoming.view().slice(0usize, p));
+        merged.append(cur.view());
+        merged.append(incoming.view().sliceFrom(p + find.len()));
+        ed.base = incoming.clone();
+        ed.caret = p + off;
+        *incoming = merged;
+        if ed.dirty { ed.saveAt = nowMs() + 1000u64; }
+        print <- "pageedit: file changed outside; your paragraph kept\n";
+      }
+      else {
+        ed.base = incoming.clone();
+        ed.on = false;
+        ed.dirty = false;
+        print <- "pageedit: file changed outside, in the paragraph being edited; editing ended\n";
+      }
+    }
+    true
+  }
+
+  // The doc block clicked starts editing, or moves the caret
+  fn edFromClick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    let d = ed.pendBlock;
+    if d >= doc.blocks.len() { return; }
+    if doc.blocks[d].lang.view() == "@raw" {
+      // a line of the paragraph on show: the caret to the byte asked for
+      let rf = self.rawFirst();
+      var want = d - rf;
+      var ls = ed.c0;
+      while want > 0usize && ls < ed.c1 {
+        ls = edLineEnd(text.view(), ls) + 1usize;
+        want = want - 1usize;
+      }
+      let le = edLineEnd(text.view(), ls);
+      var at = ls + ed.pendOff;
+      if at > le { at = le; }
+      while at > ls && at < text.len() && edIsCont(text.view()[at]) { at = at - 1usize; }
+      self.edMoved(device, renderer, at);
+      return;
+    }
+    // a rendered block: which paragraph of the file made it
+    let cs = editChunks(text.view());
+    var cursor = 0usize;
+    var found = NOMATCH;
+    var gapDone = !(ed.on && ed.c0 == ed.c1);
+    var k = 0usize;
+    while k < cs.len() && found == NOMATCH {
+      if !gapDone && cs[k].a > ed.c0 { cursor = cursor + ed.lines; gapDone = true; }
+      var cnt = 0usize;
+      if ed.on && cs[k].a == ed.c0 && cs[k].b == ed.c1 { cnt = ed.lines; }
+      else { cnt = parseMarkdown(text.view().slice(cs[k].a, cs[k].b)).blocks.len(); }
+      if d < cursor + cnt { found = k; }
+      cursor = cursor + cnt;
+      k = k + 1usize;
+    }
+    if found == NOMATCH {
+      print <- "pageedit: could not tell which paragraph block "; print <- d; print <- " is\n";
+      return;
+    }
+    let a = cs[found].a;
+    let b = cs[found].b;
+    var rendered = doc.blocks[d].text.clone();
+    var start = a;
+    var cut = rendered.len();
+    if cut > 24usize { cut = 24usize; while cut > 0usize && isContByte(rendered.view()[cut]) { cut = cut - 1usize; } }
+    if cut > 0usize {
+      match text.view().slice(a, b).find(rendered.view().slice(0usize, cut)) { case let Some(q) { start = a + q; } else {} }
+    }
+    var at = editMapOffset(text.view(), start, b, rendered.view(), ed.pendOff);
+    if ed.on && ed.dirty && (at < ed.c0 || at > ed.c1) { self.edSave(); }
+    if !ed.on { ed.base = text.clone(); ed.on = true; }
+    ed.caret = at;
+    ed.lastKind = 0u32;
+    self.edRefresh(device, renderer);
+    print <- "pageedit: caret to byte "; print <- ed.caret; print <- " of "; print <- text.len(); print <- " (paragraph "; print <- found; print <- ")\n";
+  }
+
   fn parseText(self: &) Doc {
     if !isBrowse(file.view()) && isDiagramFile(file.view(), text.view()) {
       let md = diagramMarkdown(file.view(), text.view());
       return parseMarkdown(md.view());
     }
-    if wantsWide(file.view()) { parseCode(text.view(), file.view()) } else { parseMarkdown(text.view()) }
+    if wantsWide(file.view()) { return parseCode(text.view(), file.view()); }
+    if ed.on && !isBrowse(file.view()) { return self.parseEditing(); }
+    parseMarkdown(text.view())
   }
 
   // The page's height in the world, and where its middle stands: the bottom edge is the standard page's whatever the size
@@ -768,10 +1118,17 @@ pub struct DocPanel {
     {
       {
         if !first && sameText(s, text.view()) && err.len() == 0usize { return; }
+        var incoming = String.from(s);
+        if ed.on && !first {
+          // while editing: the file as we last wrote it is not news; another writer's change is merged under the paragraph being edited
+          if sameText(s, ed.base.view()) { return; }
+          if !self.edExternal(&mut incoming) { return; }
+        }
         let hadError = err.len() > 0usize;
-        text = String.from(s);
+        text = incoming;
         self.fitShape(device);
         if hadError { err = String(); dirty = true; print <- "docpanel: error line cleared\n"; }
+        if ed.on { self.edChunkSet(); }
         let fresh = self.parseText();
         // where the top of the view is, to put it back
         let topDoc = self.topDocBlock();
@@ -1166,10 +1523,10 @@ pub struct DocPanel {
       layout.rects.push(RectP(10., y - 1.5, 26., 3., 0xd0203000u32 | DocPanel.strength(now, dels[k].born), RK_UNDERLINE));
       k = k + 1usize;
     }
-    let view = RichView(f32.from(texW), f32.from(texH), 0. - scrollX, scrollY, PAPER, PAPER, 0u32, 0u32,
-      if wide { CODE_LAYOUT_W } else { f32.from(texW) }, false);
+    let view = RichView(f32.from(texW), f32.from(texH), 0. - scrollX, scrollY, PAPER, PAPER, 0u32, 0xC03000FFu32,
+      if wide { CODE_LAYOUT_W } else { f32.from(texW) }, ed.on && self.caretRectNow().h > 0.);
     let sel = List[RectP]();
-    let caret = CaretRect(0., 0., 0.);
+    let caret = self.caretRectNow();
     let s0 = sdl.GetPerformanceCounter();
     var encoder = device.createCommandEncoder();
     if richMade { let r = richRef(); r.rr.draw(device, &mut encoder, &target, &view, &r.faces, &layout, &images, &sel, &caret); }
@@ -1435,6 +1792,13 @@ pub struct DocPanel {
     if bestD < 40. && pblock < owner.len() && *owner[pblock] < doc.blocks.len() {
       pointed = *owner[pblock];
       dirty = true;
+      // a click on a paragraph of a Markdown page puts the caret there (a link followed is not an edit)
+      if self.editable() && pendingLink.len() == 0usize {
+        ed.pend = true;
+        ed.pendBlock = *owner[pblock];
+        ed.pendOff = p.off;
+        if doc.blocks[*owner[pblock]].kind == DK_QUOTE && ed.pendOff >= 6usize { ed.pendOff = ed.pendOff - 6usize; }
+      }
       let b = &doc.blocks[*owner[pblock]];
       line.append(b.path.view());
       line.append(" | ");

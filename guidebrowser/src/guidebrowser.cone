@@ -71,7 +71,7 @@ import tweenstack use Anim, Animators, Value as AnimValue;
 import input use Input, Context, Binding, Action, AXIS2;
 import controls use Fly, Pose;
 import analyticdaylight use PreethamSky;
-import richtext use Faces, Block, Run, Style, sameStyle, LayoutConfig, layoutRich, emptyLayout, RichLayout, RichRenderer, RichView, ImageInfo, RectP, CaretRect, posAt, BK_H1, BK_H2, BK_H3, BK_BULLET, BK_NUMBER, RK_UNDERLINE, GF_SPACE, isContByte, PL_INLINE;
+import richtext use Faces, Block, Run, Style, sameStyle, LayoutConfig, layoutRich, emptyLayout, RichLayout, RichRenderer, RichView, ImageInfo, RectP, CaretRect, posAt, caretRect, pos, BK_H1, BK_H2, BK_H3, BK_BULLET, BK_NUMBER, RK_UNDERLINE, GF_SPACE, isContByte, PL_INLINE;
 import msdftext use Font, Atlas, AtlasConfig, DEMO_FONT, TextRenderer, TextStyle, TextHandle, TextLayout, LayoutOptions, layoutText, worldTransform, billboardPlacement, SPACE_WORLD;
 import toml;
 import vector2d use measureText, Canvas, VectorRenderer, Paint, StrokeStyle, VectorPath, CAP_ROUND, JOIN_ROUND;
@@ -384,6 +384,21 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
       if webFocused(&*some) && (e.type == sdl.EVENT_KEY_DOWN || e.type == sdl.EVENT_KEY_UP || e.type == sdl.EVENT_TEXT_INPUT) {
         eaten = true;
         webKeys(&mut *some, e);
+      }
+      // a page being edited takes the keys and the text (F2/F3, the voice keys, stay the studio's)
+      if !eaten && (*some).wh.on && (*some).wh.editActive() {
+        if e.type == sdl.EVENT_TEXT_INPUT {
+          let t = e as &sdl.TextInputEvent;
+          (*some).wh.editTyped(&mut (*some).device, &mut (*some).renderer, cstr.fromPtr(t.text).view());
+          eaten = true;
+        }
+        else if e.type == sdl.EVENT_KEY_DOWN {
+          let ke = e as &sdl.KeyboardEvent;
+          if ke.scancode != KEY_F2 && ke.scancode != KEY_F3 {
+            _ = (*some).wh.editKeyed(&mut (*some).device, &mut (*some).renderer, u32.from(ke.scancode), ke.keymod);
+            eaten = true;
+          }
+        }
       }
       if !eaten { (*some).input.handle(e); }
       if e.type == sdl.EVENT_MOUSE_MOTION {
@@ -883,6 +898,8 @@ const KEY_F3 = 60u;
 
 // Push to talk: 1 record / pause (F2), 2 send (F3: waits for the recording to be transcribed), 3 clear the draft
 fn voiceAct(s: &mut Shell, a: u32) {
+  // dictate mode: A records into the page, and B (send) is not Penny's
+  if (a == 2u32 || a == 3u32) && s.wh.on && s.wh.dictating() { print <- "bridge: send ignored (dictate mode)\n"; return; }
   match &mut s.bridge {
     case var &mut Some(b) {
       if a == 1u32 { b.toggleRecord(); print <- "bridge: "; print <- (if b.recording { "recording (rec.flag written)" } else { "paused (rec.flag removed)" }); print <- "\n"; }
@@ -1002,6 +1019,19 @@ fn bridgeTick(s: &mut Shell) {
     if link.len() > 0usize {
       let linkView = link.view();
       match &mut s.panel { case var &mut Some(p) { p.go(&mut s.device, &mut s.renderer, linkView, ""); } else {} }
+    }
+  }
+  // dictate mode (the page editor): the flag for studiovoice, and what it transcribed goes to the page's caret
+  if s.wh.on {
+    let df = s.wh.takeDictFlag();
+    if df > 0u32 {
+      let tgt = s.wh.dictTarget();
+      match &mut s.bridge { case var &mut Some(b) { b.setDictate(df == 1u32, tgt); } else { print <- "dictate: needs --bridge for the voice\n"; } }
+    }
+    if s.wh.dictating() {
+      var got = String();
+      match &mut s.bridge { case var &mut Some(b) { got = b.takeDictation(); } else {} }
+      if got.len() > 0usize { s.wh.dictated(&mut s.device, &mut s.renderer, got.view()); }
     }
   }
   var n = 0u32;
@@ -1267,6 +1297,7 @@ pub fn present(host: &mut Host) {
         if drawn == clickFrames[usize.from(c)] + 3 { webRelease(&mut *some); }
         c = c + 1;
       }
+      if scriptArg != null { runEditScript(&mut *some, drawn); }
       // '--wheel' and '--press-c': events a person's hand would make, put into SDL's own queue
       if wheelAt != 0 && drawn == wheelAt {
         var ev = sdl.Event();
@@ -1435,6 +1466,137 @@ fn worldsFolder() String {
   folder
 }
 
+// '--edit-script FILE': test steps for the page editor, one per line, fields separated by tabs: FRAME COMMAND [ARGS...].
+//   pal NAME             a palette action (newpage, dictate, edit)       click PAGE BLOCK OFFSET   the page's own click at that glyph
+//   text STRING          an SDL text event                               key NAME [ctrl]           an SDL key event (bksp del left right up down home end enter esc z)
+//   rec / send           F2 / F3 (voiceAct)                              dump PAGE                 print the editor's text of the page
+//   ext FILE FROM TO     another writer: FROM replaced by TO in FILE     cat FILE                  print a file
+//   append FILE TEXT     another writer appends TEXT to FILE
+var @threadlocal scriptArg: *u8 = null;
+
+// The script's lines (read each frame in test runs: the file is small)
+fn readScript() List[String] {
+  var out = List[String]();
+  if scriptArg == null { return out; }
+  match fs.readFile(&Path.from(cstr.fromPtr(scriptArg).view())) {
+    case let Ok(t) {
+      var cur = String();
+      var q = 0usize;
+      while q <= t.len() {
+        if q == t.len() || t.view()[q] == '\n' { if cur.len() > 0usize { out.push(cur.clone()); } cur = String(); }
+        else { cur.appendByte(t.view()[q]); }
+        q = q + 1usize;
+      }
+    }
+    case let Err(e) {}
+  }
+  out
+}
+
+fn scriptFields(line: &str) List[String] {
+  var out = List[String]();
+  var cur = String();
+  var i = 0usize;
+  while i < line.len() {
+    if line[i] == '\t' { out.push(cur.clone()); cur = String(); }
+    else if line[i] != '\r' { cur.appendByte(line[i]); }
+    i = i + 1usize;
+  }
+  out.push(cur.clone());
+  out
+}
+
+fn scriptNum(s: &str) usize {
+  var n = 0usize;
+  var i = 0usize;
+  while i < s.len() { if s[i] >= '0' && s[i] <= '9' { n = n * 10usize + (usize.from(s[i]) - usize.from('0')); } i = i + 1usize; }
+  n
+}
+
+fn pushKey(sc: u32, mods: u16) {
+  var ev = sdl.Event();
+  ev.type = sdl.EVENT_KEY_DOWN;
+  let k = &mut ev as &mut sdl.KeyboardEvent;
+  k.scancode = sc;
+  k.keymod = mods;
+  k.down = true;
+  if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
+}
+
+fn runEditScript(s: &mut Shell, frame: i32) {
+  let lines = readScript();
+  var li = 0usize;
+  while li < lines.len() {
+    let f = scriptFields(lines[li].view());
+    li = li + 1usize;
+    if f.len() < 2usize || i32.from(scriptNum(f[0].view())) != frame { continue; }
+    let cmd = f[1].view();
+    print <- "script: frame "; print <- frame; print <- ": "; printStr(cmd); print <- "\n";
+    if cmd == "pal" && f.len() > 2usize { s.wh.testAct(&mut s.device, f[2].view(), &s.visitor); }
+    else if cmd == "click" && f.len() > 4usize {
+      let ok = s.wh.testClickPage(s.wh.testPageIdx(f[2].view()), scriptNum(f[3].view()), scriptNum(f[4].view()));
+      print <- "script: click "; print <- (if ok { "landed" } else { "missed" }); print <- "\n";
+    }
+    else if cmd == "text" && f.len() > 2usize {
+      var ev = sdl.Event();
+      ev.type = sdl.EVENT_TEXT_INPUT;
+      let t = &mut ev as &mut sdl.TextInputEvent;
+      // (a copy that stays: SDL keeps the pointer until the event is read; this is a test hook, the few bytes are not freed)
+      let keep = libc.malloc(f[2].len() + 1usize) as *u8;
+      var ci = 0usize;
+      while ci < f[2].len() { *(keep + ci) = f[2].view()[ci]; ci = ci + 1usize; }
+      *(keep + f[2].len()) = 0u8;
+      t.text = keep;
+      if !sdl.PushEvent(&mut ev) { print <- "could not push the text event\n"; }
+    }
+    else if cmd == "key" && f.len() > 2usize {
+      let name = f[2].view();
+      var sc = 0u32;
+      if name == "bksp" { sc = 42u32; } else if name == "del" { sc = 76u32; } else if name == "left" { sc = 80u32; }
+      else if name == "right" { sc = 79u32; } else if name == "up" { sc = 82u32; } else if name == "down" { sc = 81u32; }
+      else if name == "home" { sc = 74u32; } else if name == "end" { sc = 77u32; } else if name == "enter" { sc = 40u32; }
+      else if name == "esc" { sc = 41u32; } else if name == "z" { sc = 29u32; }
+      pushKey(sc, if f.len() > 3usize && f[3].view() == "ctrl" { 0x0040u16 } else { 0u16 });
+    }
+    else if cmd == "rec" { pushKey(KEY_F2, 0u16); }
+    else if cmd == "send" { pushKey(KEY_F3, 0u16); }
+    else if cmd == "dump" && f.len() > 2usize {
+      let t = s.wh.testText(s.wh.testPageIdx(f[2].view()));
+      print <- "script: page text ("; print <- t.len(); print <- " bytes) ---\n"; printStr(t.view()); print <- "\n--- end\n";
+    }
+    else if (cmd == "cat" || cmd == "catpage") && f.len() > 2usize {
+      var target = String.from(f[2].view());
+      if cmd == "catpage" { target = s.wh.testSrc(s.wh.testPageIdx(f[2].view())); }
+      match fs.readFile(&Path.from(target.view())) {
+        case let Ok(t) { print <- "script: file "; printStr(f[2].view()); print <- " ("; print <- t.len(); print <- " bytes) ---\n"; printStr(t.view()); print <- "\n--- end\n"; }
+        case let Err(e) { print <- "script: cannot read "; printStr(f[2].view()); print <- "\n"; }
+      }
+    }
+    else if (cmd == "ext" || cmd == "append") && f.len() > 3usize {
+      match fs.readFile(&Path.from(f[2].view())) {
+        case let Ok(t) {
+          var out = String();
+          if cmd == "append" { out = String.from(t.view()); out.append(f[3].view()); }
+          else {
+            match t.view().find(f[3].view()) {
+              case let Some(p) {
+                out = String.from(t.view().slice(0usize, p));
+                if f.len() > 4usize { out.append(f[4].view()); }
+                out.append(t.view().sliceFrom(p + f[3].len()));
+              }
+              else { out = String.from(t.view()); print <- "script: ext: text not found\n"; }
+            }
+          }
+          let bytes = toBytes(out.view());
+          if let Err(e) = fs.writeFile(&Path.from(f[2].view()), bytes.view()) { print <- "script: write failed\n"; }
+          else { print <- "script: another writer changed "; printStr(f[2].view()); print <- "\n"; }
+        }
+        case let Err(e) { print <- "script: cannot read "; printStr(f[2].view()); print <- "\n"; }
+      }
+    }
+  }
+}
+
 // The number written as argument a; 0 if it is none
 fn argNumber(argv: **u8, a: i32) f64 {
   let text = cstr.fromPtr(*(argv + usize.from(a))).view();
@@ -1476,6 +1638,8 @@ fn main(argc: i32, argv: **u8) i32 {
     }
     if libc.strcmp(arg, "--doc") == 0i32 && more { docArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--bridge") == 0i32 && more { bridgeArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--notes-dir") == 0i32 && more { notesArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--edit-script") == 0i32 && more { scriptArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--auto-turns") == 0i32 && more { autoTurns = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--auto-gap") == 0i32 && more { autoGap = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--auto-ptt") == 0i32 && more { autoPtt = i32.from(argNumber(argv, a + 1i32)); }

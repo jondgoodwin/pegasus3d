@@ -394,3 +394,15 @@ DESK_API void desk_close(void) {
   metaCap = 0; underOk = 0; haveFrame = 0;
   shapeCap = 0;
 }
+
+// ---- small helpers of the page editor (studio notes) ----
+// desk_local_part(k): the local time's year (0), month (1), day (2), hour (3) or minute (4)
+DESK_API int desk_local_part(int k) {
+  SYSTEMTIME t; GetLocalTime(&t);
+  switch (k) { case 0: return t.wYear; case 1: return t.wMonth; case 2: return t.wDay; case 3: return t.wHour; default: return t.wMinute; }
+}
+
+// desk_replace_file(from, to): rename 'from' over 'to' in one step (Windows will not rename over a file otherwise); 1 on success
+DESK_API int desk_replace_file(const char *from, const char *to) {
+  return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 1 : 0;
+}
