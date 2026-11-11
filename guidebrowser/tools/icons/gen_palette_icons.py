@@ -9,7 +9,7 @@ OUT = "C:/src/pegasus3d-wt-studiopalette/guidebrowser/src/paletteicons.cone"
 NAMES = """undo-2 square-split-horizontal focus minimize-2 pencil mic file-plus external-link arrow-left arrow-right archive
 folder-open rotate-cw globe square move-up-right tag type trash layout-dashboard zoom-in zoom-out arrow-down-to-line eye
 message-circle pin sun-dim refresh-cw folder-plus palette scan-eye skip-forward skip-back play circle-dot lock-open
-list-restart info x""".split()
+list-restart info x laptop-minimal-check monitor-off""".split()
 
 
 def arc_to_cubics(x1, y1, rx, ry, phi, fa, fs, x2, y2):

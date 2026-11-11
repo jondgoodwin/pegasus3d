@@ -921,6 +921,7 @@ pub struct Warehouse {
   }
 
   pub fn select(self: &mut, k: i32) {
+    deskFocus = false;
     if focusPg >= 0 || k != sel { focusPg = -1; palFocused = false; }
     if k == sel { return; }
     var o = 0usize;
@@ -2350,6 +2351,7 @@ pub struct Warehouse {
   // Once a frame: pages glide, tick and report; the grabbed one follows the gaze; the closed leave
   fn tickPages(self: &mut, device: &mut Device, renderer: &mut Renderer, dt: f32) {
     let now = nowMs();
+    spareMake(device, format);
     var openWant = List[String]();
     var browseWant = String();
     self.followGrab();
@@ -2549,6 +2551,7 @@ pub struct Warehouse {
     }
     if bi < 0 { self.blurWeb(); return false; }
     let pu = usize.from(u32.from(bi));
+    deskFocus = false;
     if focusPg != bi { focusPg = bi; palFocused = false; print <- "palette: focus on page "; printStr(pgs[pu].title.text.view()); print <- "\n"; }
     if bk == 2u32 { self.closePage(pu); return true; }
     if bk == 3u32 { self.toggleShelve(pu); return true; }
@@ -2644,6 +2647,74 @@ pub struct Warehouse {
       i = i + 1usize;
     }
     false
+  }
+
+  // The scroll of a ray, one way for every scrollable (scroll.cone): the nearest page (document or web), the file browser, the report or the
+  // main page under the ray takes 'dx' and 'dy' notches (positive: right, up the page). With 'probe' nothing is scrolled: true says there is
+  // one under the ray (the right stick then scrolls rather than turns). The zones build's trees join here by their own `scrollBy`.
+  pub fn scrollRay(self: &mut, eye: Vec3, dir: Vec3, dx: f32, dy: f32, probe: bool, page: &mut Option[DocPanel]) bool {
+    var bestT: f32 = -1.;
+    var kind = 0u32;                 // 1 a page of pgs, 2 the browser, 3 the report, 4 the main page
+    var which = 0usize;
+    var i = 0usize;
+    while i < pgs.len() {
+      if !pgs[i].shelved && !pgs[i].gone {
+        var pk = 0u32;
+        let t = self.pgHit(i, eye, dir, &mut pk);
+        if pk == 1u32 && t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 1u32; which = i; }
+      }
+      i = i + 1usize;
+    }
+    if browserOpen {
+      match &browserPanel {
+        case let Some(p) {
+          let inv = self.browserModel().inverse();
+          let t = p.reach(inv * eye, inv.transformVector(dir));
+          if t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 2u32; }
+        }
+        else {}
+      }
+    }
+    if reportOpen {
+      match &reportPanel {
+        case let Some(p) {
+          let inv = self.reportModel().inverse();
+          let t = p.reach(inv * eye, inv.transformVector(dir));
+          if t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 3u32; }
+        }
+        else {}
+      }
+    }
+    let invPage = self.pageModel().inverse();
+    match page {
+      case let Some(p) {
+        let t = p.reach(invPage * eye, invPage.transformVector(dir));
+        if t > 0. && (bestT < 0. || t < bestT) { bestT = t; kind = 4u32; }
+      }
+      else {}
+    }
+    if kind == 0u32 { return false; }
+    if probe { return true; }
+    if kind == 1u32 {
+      if pgs[which].web {
+        let inv = self.pgModel(which).inverse();
+        let le = inv * eye;
+        let ld = inv.transformVector(dir);
+        match &mut pgs[which].wp {
+          case var &mut Some(w) {
+            let hit = w.pickLocal(le, ld);
+            if hit.z > 0.5 { w.wheel(i32.from(hit.x), i32.from(hit.y), dy); }
+          }
+          else {}
+        }
+      } else {
+        match &mut pgs[which].doc { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} }
+      }
+    }
+    else if kind == 2u32 { match &mut browserPanel { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} } }
+    else if kind == 3u32 { match &mut reportPanel { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} } }
+    else { match page { case var &mut Some(p) { p.scrollBy(dx, dy); } else {} } }
+    true
   }
 
   // ---- parked folders ----
@@ -3183,6 +3254,7 @@ pub struct Warehouse {
 
   // What has focus: the page last clicked, else the selected project, else the room
   fn palKind(self: &) String {
+    if deskFocus { return String.from("laptop"); }
     if focusPg >= 0 {
       let i = usize.from(u32.from(focusPg));
       if i < pgs.len() && !pgs[i].gone {
@@ -3213,7 +3285,10 @@ pub struct Warehouse {
     var i = 0usize;
     while i < set.len() {
       let e = palEntryOf(set[i].view());
-      let hide = kind == "project" && ((e.action.view() == "shelve" && !onTable) || (e.action.view() == "bring" && onTable));
+      var deskOnNow = false;
+      match &desk { case let Some(dk) { deskOnNow = dk.control; } else {} }
+      let hide = (kind == "project" && ((e.action.view() == "shelve" && !onTable) || (e.action.view() == "bring" && onTable)))
+        || (kind == "laptop" && ((e.action.view() == "laptopon" && deskOnNow) || (e.action.view() == "laptopoff" && !deskOnNow)));
       if !hide { out.push(set[i].clone()); }
       i = i + 1usize;
     }
@@ -3241,6 +3316,7 @@ pub struct Warehouse {
     }
     sig.append("|"); sig.append(numText(i64.from(out.len())).view());
     sig.append(if onTable { "|r|" } else { "|s|" });
+    if kind == "laptop" { match &desk { case let Some(dk) { sig.append(if dk.control { "|on" } else { "|off" }); } else {} } }
     sig.append(numText(i64.from(studioSeen.len())).view());
   }
 
@@ -3316,6 +3392,9 @@ pub struct Warehouse {
       } else { navWant = if action == "back" { 6u32 } else { 7u32 }; r = 1u32; }
     }
     else if action == "files" { navWant = 8u32; r = 1u32; }
+    else if action == "laptopon" || action == "laptopoff" {
+      match &mut desk { case var &mut Some(dk) { dk.setControl(action == "laptopon"); r = 1u32; } else { r = 0u32; } }
+    }
     else if action == "close" { if pgOk { let i = usize.from(u32.from(focusPg)); focusPg = -1; self.closePage(i); r = 1u32; } }
     else if action == "shelve" {
       if pgOk { self.toggleShelve(usize.from(u32.from(focusPg))); r = 1u32; }
