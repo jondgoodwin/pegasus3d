@@ -287,6 +287,66 @@ pub struct DocPanel {
   pub fn requestNav(self: &mut, delta: i32) { pendingNav = delta; }
   pub fn requestNth(self: &mut, n: usize) { pendingLink = self.linkTarget(n); }
 
+  // The link under a texture point of line 'li' (what click would follow there), or empty
+  fn linkAtPx(self: &, li: usize, px: f32, py: f32) String {
+    let pblock = usize.from(layout.lines[li].block);
+    if pblock >= owner.len() || *owner[pblock] >= doc.blocks.len() { return String(); }
+    let lb = &doc.blocks[*owner[pblock]];
+    let p = posAt(&layout, px, py);
+    let prefix = if lb.kind == DK_QUOTE { 6usize } else { 0usize };
+    if p.off < prefix { return String(); }
+    let at = p.off - prefix;
+    var si = 0usize;
+    var start = 0usize;
+    while si < lb.spans.len() {
+      if at >= start && at < start + lb.spans[si].len {
+        let lk = lb.spans[si].link;
+        if lk > 0u32 && usize.from(lk) <= lb.targets.len() { return String.from(lb.targets[usize.from(lk) - 1usize].view()); }
+      }
+      start = start + lb.spans[si].len;
+      si = si + 1usize;
+    }
+    String()
+  }
+
+  // A test hook: the middle of the k'th run of link text on show (reading order), in the panel's own space (x, y, 0, w 1), or w 0 if none.
+  // The simulator's fake hand aims at it.
+  pub fn linkPoint(self: &, k: usize) Vec4 {
+    var seen = 0usize;
+    var li = 0usize;
+    while li < layout.lines.len() {
+      let ln = layout.lines[li];
+      let py = ln.top + ln.height * 0.5;
+      if py > scrollY + 30. && py < scrollY + f32.from(DOC_TEX_H) - 30. {
+        var last = String();
+        var from = 0.f;
+        var x = 20.f;
+        while x <= f32.from(DOC_TEX_W) {
+          var t = String();
+          if x < f32.from(DOC_TEX_W) - 20. { t = self.linkAtPx(li, x, py); }
+          if !sameText(t.view(), last.view()) {
+            if last.len() > 0usize {
+              if seen == k {
+                let px = (from + x) * 0.5;
+                let w = f32.from(DOC_WORLD_W);
+                let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+                let u = px / f32.from(DOC_TEX_W);
+                let v = 1. - (py - scrollY) / f32.from(DOC_TEX_H);
+                return Vec4(u * w - w * 0.5, v * h + (f32.from(DOC_CENTRE_Y) - h * 0.5), 0., 1.);
+              }
+              seen = seen + 1usize;
+            }
+            from = x;
+            last = t;
+          }
+          x = x + 6.;
+        }
+      }
+      li = li + 1usize;
+    }
+    Vec4(0., 0., 0., 0.)
+  }
+
   // The n'th link of the page, in reading order (for tests, and for a voice that says "the third link")
   pub fn linkTarget(self: &, n: usize) String {
     var seen = 0usize;
@@ -866,6 +926,14 @@ pub struct DocPanel {
     page.draw(device, encoder, target, viewProjection, Vec4(0. - w, y - h, w, y + h));
   }
 
+  // As drawPage, hidden where the scene's depth is nearer (the warehouse: a beam or a dot in front of the page shows)
+  pub fn drawPageDepth(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, viewProjection: Mat4) {
+    let w = f32.from(DOC_WORLD_W) * 0.5;
+    let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    let y = f32.from(DOC_CENTRE_Y);
+    page.drawDepthed(device, encoder, target, depth, viewProjection, Vec4(0. - w, y - h, w, y + h));
+  }
+
   // How far along the ray the page is met (in the page's own space), or -1 if the ray misses it: click's test, taking nothing. The
   // headset's beam ends there.
   pub fn reach(self: &, eye: Vec3, direction: Vec3) f32 {
@@ -1069,6 +1137,7 @@ struct PagePass {
   uniforms: Buffer;
   sampler: Sampler;
   pipeline: RenderPipeline;
+  pipelineD: RenderPipeline;    // the same, depth tested (for drawDepthed)
   layout: PipelineLayout;
   groupLayout: BindGroupLayout;
   shader: ShaderModule;
@@ -1095,6 +1164,13 @@ struct PagePass {
       depthCompare: COMPARE_FUNCTION_LESS_EQUAL, blendEnabled: true, colorSrcFactor: BLEND_FACTOR_SRC_ALPHA,
       colorDstFactor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
     var pipeline = device.createRenderPipeline(&desc);
+    // (and the same tested against the scene's depth, for a panel in the warehouse: what stands in front of it, a beam, hides it)
+    let descD = RenderPipelineDescriptor(layout: &layout, vertexModule: &shader, vertexEntryPoint: "vertexMain",
+      buffers: &buffers[..<0], fragmentModule: &shader, fragmentEntryPoint: "fragmentMain", colorFormat: format,
+      depthFormat: TEXTURE_FORMAT_DEPTH32_FLOAT,
+      depthCompare: COMPARE_FUNCTION_LESS_EQUAL, blendEnabled: true, colorSrcFactor: BLEND_FACTOR_SRC_ALPHA,
+      colorDstFactor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+    var pipelineD = device.createRenderPipeline(&descD);
     let samplerDesc = SamplerDescriptor(addressModeU: ADDRESS_MODE_CLAMP_TO_EDGE, addressModeV: ADDRESS_MODE_CLAMP_TO_EDGE,
       addressModeW: ADDRESS_MODE_CLAMP_TO_EDGE, mipmapFilter: FILTER_MODE_LINEAR, maxAnisotropy: 16u32);
     var sampler = device.createSampler(&samplerDesc);
@@ -1104,7 +1180,7 @@ struct PagePass {
     let view = texture.createView();
     let group = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
       BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
-    PagePass(group, texture, uniforms, sampler, pipeline, layout, groupLayout, shader, depthed)
+    PagePass(group, texture, uniforms, sampler, pipeline, pipelineD, layout, groupLayout, shader, depthed)
   }
 
   // The page's new picture: a texture of it with its mip chain (averaged in linear light, as the renderer's own sRGB
@@ -1140,6 +1216,21 @@ struct PagePass {
     fresh <-> texture;
     device.queue.releaseBindGroup(&mut made);
     device.queue.releaseTexture(&mut fresh);
+  }
+
+  // As draw, hidden where the scene's depth is nearer
+  fn drawDepthed(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture,
+                 viewProjection: Mat4, rect: Vec4) {
+    let params = PageParams(viewProjection, rect, Vec4(pageBias, 1., 0., 0.));
+    device.queue.writeBuffer(&uniforms, 0u64, &params as *u8, 96u64);
+    let color = RenderPassColorAttachment(view: target.createView(), loadOp: LOAD_OP_LOAD,
+      clearValue: Color(0., 0., 0., 0.));
+    let da = RenderPassDepthStencilAttachment(view: depth.createView(), depthLoadOp: LOAD_OP_LOAD);
+    var pass = encoder.beginRenderPassWithDepth(&color, &da);
+    pass.setPipeline(&pipelineD);
+    pass.setBindGroup(0u32, &group);
+    pass.draw(6u32, 1u32, 0u32, 0u32);
+    pass.end();
   }
 
   fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4, rect: Vec4) {
