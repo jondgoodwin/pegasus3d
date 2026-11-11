@@ -193,6 +193,8 @@ var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D de
 
 // Frames drawn, and the colour at the middle of the window on the shot frame
 var @threadlocal drawn = 0;
+var @threadlocal lastT = 0u64;
+var @threadlocal frameMs = List[f32]();
 var @threadlocal centre = Array[i32, 3]() <- fill 0;
 
 fn @initpure init() {
@@ -472,6 +474,7 @@ fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: boo
   var onPanel = false;
   if s.wh.on {
     if s.wh.clickChip(eye, direction, &s.visitor) { return; }
+    if s.wh.clickApp(eye, direction) { return; }
     if s.wh.clickCard(eye, direction) { return; }
     let inv = s.wh.pageModel().inverse();
     let le = inv * eye;
@@ -869,6 +872,29 @@ fn toggleBack(s: &mut Shell) {
 }
 
 fn bridgeTick(s: &mut Shell) {
+  // the room's lines (a project moved) go to the session; a say: chip is a turn; a link: chip opens in the page
+  if s.wh.on {
+    let lines = s.wh.takeLines();
+    var li = 0usize;
+    while li < lines.len() {
+      print <- "studio: bridge line: "; printStr(lines[li].view()); print <- "\n";
+      let lineTxt = lines[li].clone();
+      let lineView = lineTxt.view();
+      match &mut s.bridge { case var &mut Some(b) { b.postLine(lineView); } else {} }
+      li = li + 1usize;
+    }
+    let say = s.wh.takeSay();
+    if say.len() > 0usize {
+      var bdir = String();
+      match &s.bridge { case let Some(b) { bdir = String.from(b.dir.view()); } else {} }
+      if bdir.len() > 0usize { writeAtomic(bdir.view(), "draft.txt", say.view()); sendTurn(s); } else { print <- "studio: say: needs --bridge\n"; }
+    }
+    let link = s.wh.takeLink();
+    if link.len() > 0usize {
+      let linkView = link.view();
+      match &mut s.panel { case var &mut Some(p) { p.go(&mut s.device, &mut s.renderer, linkView, ""); } else {} }
+    }
+  }
   var n = 0u32;
   var pending = false;
   match &mut s.bridge {
@@ -926,6 +952,7 @@ fn prepareScene(s: &mut Shell, alpha: f32) {
         else if whKind[usize.from(e)] == 4 {
           match &mut s.panel { case var &mut Some(p) { p.requestNth(usize.from(whArg[usize.from(e)])); } else {} }
         }
+        else if whKind[usize.from(e)] == 7 { s.wh.menuNth(usize.from(whArg[usize.from(e)]), &s.visitor); }
         else if whKind[usize.from(e)] == 5 { browseAct(s, u32.from(whArg[usize.from(e)])); }
         else if whKind[usize.from(e)] == 6 { s.wh.browserLink(usize.from(whArg[usize.from(e)])); }
         else { whAct(s, u32.from(whArg[usize.from(e)])); }
@@ -967,9 +994,11 @@ fn prepareScene(s: &mut Shell, alpha: f32) {
     s.list.addTinted(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place, Color(glowR, glowG, glowB, 1.));
     k = k + 1usize;
   }
+  if s.wh.on { s.wh.collectAw(&mut s.list, s.camera.origin); }
 }
 
 fn drawDesktop(s: &mut Shell) {
+  s.wh.eyeIx = 0u32;
   var encoder = s.device.createCommandEncoder();
   s.fx.render(&mut s.device, &mut encoder, &mut s.renderer, &mut s.post, &s.camera, &s.light, &s.list, &s.target.texture);
   // The document page goes on top of the finished picture, unlit (docpanel.cone, PagePass)
@@ -987,6 +1016,20 @@ fn drawDesktop(s: &mut Shell) {
     }
   }
   drawn = drawn + 1;
+  // the interval between frames, for the p50 and p95 printed on the shot frame
+  let nowT = sdl.GetPerformanceCounter();
+  if lastT != 0u64 && drawn > 30 { frameMs.push(f32.from(f64.from((nowT - lastT) * 1000000u64 / sdl.GetPerformanceFrequency()) / 1000.)); }
+  lastT = nowT;
+  if drawn == shotAt && frameMs.len() > 10usize {
+    var v = frameMs.clone();
+    var i = 1usize;
+    while i < v.len() {
+      var j = i;
+      while j > 0usize && *v[j - 1usize] > *v[j] { let t = *v[j]; v.set(j, *v[j - 1usize]); v.set(j - 1usize, t); j = j - 1usize; }
+      i = i + 1usize;
+    }
+    print <- "Frame interval over "; print <- v.len(); print <- " frames: p50 "; print <- *v[v.len() / 2usize]; print <- " ms, p95 "; print <- *v[v.len() * 95usize / 100usize]; print <- " ms\n";
+  }
 
   // What was drawn at the middle of the window on the shot frame: copied
   // now, read once presented
@@ -1134,6 +1177,8 @@ pub fn quit(host: &mut Host) i32 {
   match &mut g {
     case var &mut Some(some) {
       (*some).device.waitIdle();
+      (*some).other = None;      // declared after the device, so would end after it (a reply's panel segfaulted on exit)
+      (*some).panel = None;
       print <- "Parts live: "; print <- (*some).activated; print <- "\n";
       if (*some).xr.on { reportXr(&*some); }
     }
@@ -1197,6 +1242,7 @@ fn main(argc: i32, argv: **u8) i32 {
     if libc.strcmp(arg, "--shot") == 0i32 { shot = true; }
     if libc.strcmp(arg, "--show") == 0i32 { show = true; }
     if libc.strcmp(arg, "--world") == 0i32 && more { worldArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--config") == 0i32 && more { configArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--shot-at") == 0i32 && more { shotAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--click-at") == 0i32 && more { clickAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--click-xy") == 0i32 && a + 3i32 < argc && clicks < 4 {

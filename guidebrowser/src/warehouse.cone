@@ -16,6 +16,7 @@ const FLIGHT_MS = 500.0f;
 const CHIP_DELAY_MS = 300.0f;
 const FADE_S = 0.2f;
 const RING_N = 5;
+const MAX_ITEMS = 12;
 const DEFAULT_ROOT_BROWSE = "C:/Users/jondg/MyDrive/Incubator";
 var @threadlocal ringRadius = 2.5f;     // [ring] radius_cm of studio.toml
 var @threadlocal floatHeight = 0.95f;   // [ring] float_cm: projects float at waist height
@@ -231,12 +232,12 @@ struct Item {
   free: bool;           // placed by 'at:x,y,z' (in neither the ring nor a shelf)
   freePos: Vec3;
   mul: f32;             // scale_pct / 100
-  menu: List[Entry];    // its chips
+  menu: List[ChipEntry];    // its chips
   isApp: bool;          // the architecture walk: drawn by the walk's own code (archworld.cone), no part in the world
 }
 
 // A chip of a project's menu: what it says, what it does, and which picture of the pool is its
-struct Entry {
+struct ChipEntry {
   text: String;
   action: String;
   known: bool;
@@ -316,6 +317,7 @@ pub struct Warehouse {
   aw: Option[Aw];
   eyeIx: u32;              // which eye the walk's words are drawn for (0 the window or the left eye)
   moves: u32;              // moves written to room.toml
+  applied: bool;           // the files have been applied once (later changes fly)
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -324,7 +326,7 @@ pub struct Warehouse {
       Vec3(0., 0., 0.), None, false, Vec3(0., 0., 0.), 0., 0u32, String(),
       String(), String(), String(), newParsed(), newParsed(), false, 0u64, String(), String(), None, String(), false, 0u64,
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
-      None, 0u32, 0u32)
+      None, 0u32, 0u32, false)
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -394,7 +396,7 @@ pub struct Warehouse {
     let label = textLabel(l, device, format, name, 0xf8f5eeffu32, 0x1c1c1cffu32, 50., 0.56);
     items.push(Item(String.from(name), String.from(part), page, home, false, 0u32, Vec3(0., 0., 0.), 1., 0.,
       Vec3(0., 0., 0.), 1., 1., 0u64, NO_SLOT, tableScale, shelfScale, height, radius, yawShelf, label, 0u32, 1., 0.,
-      String.from(id), false, Vec3(0., 0., 0.), 1., List[Entry](), false));
+      String.from(id), false, Vec3(0., 0., 0.), 1., List[ChipEntry](), false));
   }
 
   // Put item i where it stands, with no flight
@@ -531,8 +533,9 @@ pub struct Warehouse {
     var ci = 0usize;
     while ci < cards.len() { (&mut cards[ci]).alpha = fadeToward(cards[ci].alpha, 1., dt); ci = ci + 1usize; }
     self.updateReadout(dt);
+    let errWant: f32 = if errShown.len() > 0usize { 1. } else { 0. };
     match &mut errCard {
-      case var &mut Some(ec) { ec.alpha = fadeToward(ec.alpha, if errShown.len() > 0usize { 1. } else { 0. }, dt); }
+      case var &mut Some(ec) { ec.alpha = fadeToward(ec.alpha, errWant, dt); }
       else {}
     }
     if now >= linePoll + 250u64 {
@@ -607,7 +610,7 @@ pub struct Warehouse {
 
   // line.json read again when its text changes; a file that does not parse keeps the last cards
   fn readLine(self: &mut, device: &mut Device) {
-    match fs.readFile(&Path.from(LINE_FILE)) {
+    match fs.readFile(&Path.from(lineFileV.view())) {
       case let Ok(s) {
         if sameText(s.view(), lineText.view()) { return; }
         match json.parse(s.view()) {
@@ -849,11 +852,22 @@ pub struct Warehouse {
   fn chipList(self: &) List[u32] {
     var out = List[u32]();
     if sel < 0 { return out; }
-    let it = &items[usize.from(u32.from(sel))];
-    out.push(if it.onTable { 0u32 } else { 1u32 });
-    out.push(2u32);
-    out.push(3u32);
-    if it.page { out.push(4u32); out.push(6u32); out.push(7u32); out.push(8u32); }
+    let ents = self.visibleEntries(usize.from(u32.from(sel)));
+    var q = 0usize;
+    while q < ents.len() { out.push(u32.from(items[usize.from(u32.from(sel))].menu[*ents[q]].pool)); q = q + 1usize; }
+    out
+  }
+
+  // The entries of item k's menu that show now: shelve only on the ring, bring only on a shelf
+  fn visibleEntries(self: &, k: usize) List[usize] {
+    var out = List[usize]();
+    var e = 0usize;
+    while e < items[k].menu.len() {
+      let a = items[k].menu[e].action.view();
+      let hide = (a == "shelve" && !items[k].onTable) || (a == "bring" && items[k].onTable);
+      if !hide { out.push(e); }
+      e = e + 1usize;
+    }
     out
   }
 
@@ -878,6 +892,7 @@ pub struct Warehouse {
     shelfItem.set(usize.from(u32.from(j)), i32.from(k));
     (&mut items[k]).touched = nowMs();
     print <- "warehouse: "; printStr(items[k].name.view()); print <- " to shelf slot "; print <- j; print <- "\n";
+    self.noteMoved(k);
     true
   }
 
@@ -911,6 +926,7 @@ pub struct Warehouse {
     tableItem.set(usize.from(u32.from(t)), i32.from(k));
     (&mut items[k]).touched = nowMs();
     print <- "warehouse: "; printStr(items[k].name.view()); print <- " to ring slot "; print <- t; print <- "\n";
+    self.noteMoved(k);
     true
   }
 
@@ -1016,6 +1032,482 @@ pub struct Warehouse {
   }
 
   pub fn browserIsOpen(self: &) bool { browserOpen }
+
+  // ---- the studio's configuration (studiocfg.cone) ----
+
+  fn cfgPath(self: &, name: &str) String {
+    var s = String.from(cfgDir.view());
+    s.append("/");
+    s.append(name);
+    s
+  }
+
+  fn itemById(self: &, id: &str) i32 {
+    var k = 0usize;
+    while k < items.len() { if items[k].id.view() == id { return i32.from(k); } k = k + 1usize; }
+    NO_ITEM
+  }
+
+  // Where an item stands, as a file says it
+  fn placeText(self: &, k: usize) String {
+    let it = &items[k];
+    var s = String();
+    if it.free {
+      s.append("at:"); s.append(floatText(it.freePos.x).view()); s.append(",");
+      s.append(floatText(it.freePos.y).view()); s.append(","); s.append(floatText(it.freePos.z).view());
+    }
+    else if it.onTable { s.append("ring:"); s.append(numText(i64.from(it.idx)).view()); }
+    else if it.idx < 16u32 { s.append("shelf:back:"); s.append(numText(i64.from(it.idx)).view()); }
+    else { s.append("shelf:side:"); s.append(numText(i64.from(it.idx - 16u32)).view()); }
+    s
+  }
+
+  // The first run: studio.toml written from the layout the studio was built with; then both files are read as ever
+  fn initConfig(self: &mut, device: &mut Device) {
+    _ = fs.makeDirAll(&Path.from(cfgDir.view()));
+    let sp = self.cfgPath("studio.toml");
+    if !fs.exists(&Path.from(sp.view())) {
+      var r = newParsed();
+      let now = isoUtc(unixMs());
+      var k = 0usize;
+      while k < items.len() {
+        let it = &items[k];
+        var p = newProj(it.id.view());
+        p.name = String.from(it.name.view());
+        if it.isApp { p.source = String.from("app:archwalk"); }
+        else if it.page { p.source = String.from("doc:"); p.source.append(docPath.view()); }
+        else { p.source = String.from("world:warehouse.ddd#"); p.source.append(it.part.view()); }
+        p.place = self.placeText(k);
+        p.yaw = i64.from(i32.from(it.yawShelf * 180. / PI + 0.5));
+        p.hasYaw = true;
+        p.scale = 100i64;
+        p.hasScale = true;
+        p.at = String.from(now.view());
+        p.menu = defaultMenu(if it.isApp { 2u32 } else if it.page { 1u32 } else { 0u32 });
+        r.projects.push(p);
+        k = k + 1usize;
+      }
+      let text = studioText(&r, 250i64, 95i64, LINE_FILE, DEFAULT_ROOT_BROWSE);
+      if writeAtomic(cfgDir.view(), "studio.toml", text.view()) { print <- "studio: no studio.toml; wrote the first-run one from today's layout\n"; }
+    }
+    cfgPoll = 0u64;
+    self.cfgTick(device, nowMs());
+  }
+
+  // Every 250 ms: both files are read, and a changed one that reads well is applied; one that does not keeps the last layout
+  fn cfgTick(self: &mut, device: &mut Device, now: u64) {
+    if writeAt != 0u64 && now >= writeAt { self.writeRoom(); }
+    if now < cfgPoll + 250u64 { return; }
+    cfgPoll = now;
+    var cs = false;
+    var cr = false;
+    match fs.readFile(&Path.from(self.cfgPath("studio.toml").view())) {
+      case let Ok(s) {
+        if !sameText(s.view(), studioSeen.view()) {
+          studioSeen = String.from(s.view());
+          let p = parseConfig(s.view(), "studio.toml");
+          if p.ok {
+            print <- "studio: studio.toml read, "; print <- p.projects.len(); print <- " projects, at "; print <- unixMs(); print <- " ms\n";
+            studioGood = p; studioErr = String(); haveStudio = true; cs = true;
+          } else {
+            print <- "studio: "; printStr(p.err.view()); print <- " (keeping the last good layout), at "; print <- unixMs(); print <- " ms\n";
+            studioErr = String.from(p.err.view());
+          }
+        }
+      }
+      case is Err {}
+    }
+    match fs.readFile(&Path.from(self.cfgPath("room.toml").view())) {
+      case let Ok(s) {
+        if !sameText(s.view(), roomSeen.view()) {
+          roomSeen = String.from(s.view());
+          let p = parseConfig(s.view(), "room.toml");
+          if p.ok {
+            print <- "studio: room.toml read, "; print <- p.projects.len(); print <- " projects\n";
+            roomGood = p; roomErr = String(); cr = true;
+          } else {
+            print <- "studio: "; printStr(p.err.view()); print <- " (keeping the last good room)\n";
+            roomErr = String.from(p.err.view());
+          }
+        }
+      }
+      case is Err {}
+    }
+    // the red card
+    let want = if studioErr.len() > 0usize { String.from(studioErr.view()) } else { String.from(roomErr.view()) };
+    if !sameText(want.view(), errShown.view()) {
+      errShown = String.from(want.view());
+      var shownText = String.from(if want.len() > 110usize { want.slice(0usize, 110usize) } else { want.view() });
+      if want.len() > 0usize {
+        match &mut errCard { case var &mut Some(ec) { if ec.text.len() > 0usize || true { ec.text = shownText; ec.ok = false; } } else {} }
+      }
+    }
+    if (cs || cr) && haveStudio { self.reapply(device, cs); }
+  }
+
+  fn reapply(self: &mut, device: &mut Device, studioChanged: bool) {
+    if studioChanged {
+      if studioGood.ringCm > 0i64 || studioGood.floatCm > 0i64 {
+        if studioGood.ringCm > 0i64 { ringRadius = f32.from(i32.from(studioGood.ringCm)) / 100.; }
+        if studioGood.floatCm > 0i64 { floatHeight = f32.from(i32.from(studioGood.floatCm)) / 100.; }
+        var q = 0usize;
+        while q < items.len() { if items[q].onTable && applied { self.startFlight(q); } q = q + 1usize; }
+      }
+      if studioGood.lineFile.len() > 0usize && !sameText(studioGood.lineFile.view(), lineFileV.view()) {
+        lineFileV = String.from(studioGood.lineFile.view());
+        lineText = String();
+      }
+      self.rebuildMenus(device);
+    }
+    let eff = overlay(&studioGood, &roomGood);
+    self.applyCfg(&eff, applied);
+    applied = true;
+  }
+
+  // The action's colour class (and so its chip's picture)
+  fn actionClass(a: &str, known: bool) u32 {
+    if !known { return 7u32; }
+    if a == "bring" { return 1u32; }
+    if a == "talk" { return 2u32; }
+    if a == "back" || a == "forward" { return 3u32; }
+    if a == "files" { return 4u32; }
+    if a.len() >= 5usize && (a.slice(0usize, 5usize) == "step:" || a == "play" || a == "restart" || a == "legend" || a == "follow" || a == "timing") { return 5u32; }
+    if a.len() >= 9usize && a.slice(0usize, 9usize) == "scenario:" { return 5u32; }
+    if a == "reload" || a.len() >= 4usize && (a.slice(0usize, 4usize) == "say:" || a.slice(0usize, 4usize) == "link") { return 6u32; }
+    0u32
+  }
+
+  // The pool's picture for this text in this class: made once, shared
+  fn poolFor(self: &mut, l: &mut Labeller, device: &mut Device, text: &str, cls: u32) usize {
+    var key = String.from(text);
+    key.append("|");
+    key.append(numText(i64.from(cls)).view());
+    var i = 0usize;
+    while i < chipKeys.len() { if chipKeys[i].view() == key.view() { return i; } i = i + 1usize; }
+    let bgs = [0x2a5d9fffu32, 0x2f8a4fffu32, 0x8a4fa8ffu32, 0x5a6b7affu32, 0xb06a1affu32, 0x1f7a7affu32, 0x7a5a2affu32, 0x6a6a6affu32];
+    var w = 0.03 * f32.from(u32.from(text.len()));
+    if w < 0.24 { w = 0.24; }
+    if w > 0.5 { w = 0.5; }
+    chips.push(textLabel(l, device, format, text, bgs[usize.from(cls)], if cls == 7u32 { 0xc8c8c8ffu32 } else { 0xffffffffu32 }, 46., w));
+    chipKeys.push(key);
+    chips.len() - 1usize
+  }
+
+  // Each project's chips: from its [project.ID.menu.N] tables, or the default menu
+  fn rebuildMenus(self: &mut, device: &mut Device) {
+    var lab: Option[Labeller] = None;
+    lab <-> labeller;
+    match &mut lab {
+      case var &mut Some(l) {
+        var k = 0usize;
+        while k < items.len() {
+          var menu = defaultMenu(if items[k].isApp { 2u32 } else if items[k].page { 1u32 } else { 0u32 });
+          var pi = 0usize;
+          while pi < studioGood.projects.len() {
+            if studioGood.projects[pi].id.view() == items[k].id.view() && studioGood.projects[pi].menu.len() > 0usize {
+              menu = List[MenuCfg]();
+              var m = 0usize;
+              while m < studioGood.projects[pi].menu.len() {
+                let mc = &studioGood.projects[pi].menu[m];
+                menu.push(MenuCfg(String.from(mc.label.view()), String.from(mc.action.view()), String.from(mc.key.view())));
+                m = m + 1usize;
+              }
+            }
+            pi = pi + 1usize;
+          }
+          var es = List[ChipEntry]();
+          var m = 0usize;
+          while m < menu.len() {
+            let known = knownAction(menu[m].action.view());
+            if !known {
+              print <- "studio: menu '"; printStr(menu[m].label.view()); print <- "' of "; printStr(items[k].id.view());
+              print <- ": unknown action '"; printStr(menu[m].action.view()); print <- "' (greyed)\n";
+            }
+            let pool = self.poolFor(l, device, menu[m].label.view(), Warehouse.actionClass(menu[m].action.view(), known));
+            es.push(ChipEntry(String.from(menu[m].label.view()), String.from(menu[m].action.view()), known, pool));
+            m = m + 1usize;
+          }
+          (&mut items[k]).menu = es;
+          k = k + 1usize;
+        }
+      }
+      else {}
+    }
+    labeller <-> lab;
+  }
+
+  fn vacate(self: &mut, k: usize) {
+    if items[k].free { return; }
+    let me = i32.from(k);
+    let i = usize.from(items[k].idx);
+    if items[k].onTable { if *tableItem[i] == me { tableItem.set(i, NO_ITEM); } }
+    else { if *shelfItem[i] == me { shelfItem.set(i, NO_ITEM); } }
+  }
+
+  // Item o is in the way of one being placed: it goes to a free shelf, in flight (not to 'avoid')
+  fn displace(self: &mut, o: usize, avoid: i32) {
+    self.startFlight(o);
+    self.vacate(o);
+    var j = -1;
+    let h = i32.from(items[o].home);
+    if h != avoid && *shelfItem[usize.from(u32.from(h))] == NO_ITEM { j = h; }
+    var q = 0;
+    while j < 0 && q < 24 {
+      if q != avoid && *shelfItem[usize.from(u32.from(q))] == NO_ITEM { j = q; }
+      q = q + 1;
+    }
+    (&mut items[o]).zlevel = 0u32;
+    (&mut items[o]).free = false;
+    (&mut items[o]).onTable = false;
+    if j >= 0 {
+      (&mut items[o]).idx = u32.from(j);
+      shelfItem.set(usize.from(u32.from(j)), i32.from(o));
+    }
+    print <- "studio: "; printStr(items[o].name.view()); print <- " makes way, to the shelf\n";
+  }
+
+  fn moveItem(self: &mut, k: usize, pl: &Place, animate: bool) {
+    if animate { self.startFlight(k); }
+    self.vacate(k);
+    (&mut items[k]).zlevel = 0u32;
+    if pl.kind == 3u32 {
+      (&mut items[k]).free = true;
+      (&mut items[k]).freePos = Vec3(pl.x, pl.y, pl.z);
+      (&mut items[k]).onTable = false;
+    } else {
+      let onT = pl.kind == 0u32;
+      let idx = if pl.kind == 2u32 { 16u32 + pl.idx } else { pl.idx };
+      let ix = usize.from(idx);
+      let occ = if onT { *tableItem[ix] } else { *shelfItem[ix] };
+      if occ != NO_ITEM && occ != i32.from(k) { self.displace(usize.from(u32.from(occ)), if onT { -1 } else { i32.from(idx) }); }
+      (&mut items[k]).free = false;
+      (&mut items[k]).onTable = onT;
+      (&mut items[k]).idx = idx;
+      if onT { tableItem.set(ix, i32.from(k)); } else { shelfItem.set(ix, i32.from(k)); }
+    }
+    if !animate {
+      (&mut items[k]).pos = self.dest(k);
+      (&mut items[k]).scale = self.destScale(k);
+      (&mut items[k]).flight = 1.;
+      (&mut items[k]).shade = if items[k].onTable { 1. } else { 0. };
+    }
+  }
+
+  // Make the room what the two files say: an item whose place, turn or size differs moves there (in flight when 'animate')
+  fn applyCfg(self: &mut, eff: &List[EffProj], animate: bool) {
+    applying = true;
+    var want = List[Place]();
+    var move = List[bool]();
+    var who = List[i32]();
+    var e = 0usize;
+    while e < eff.len() {
+      let id = studioGood.projects[eff[e].pi].id.clone();
+      let k = self.itemById(id.view());
+      var pl = Place(0u32, 0u32, 0., 0., 0.);
+      var differs = false;
+      if k < 0 {
+        print <- "studio: project '"; printStr(id.view()); print <- "' is not in this building (ignored)\n";
+      } else {
+        let ku = usize.from(u32.from(k));
+        if eff[e].place.len() > 0usize && parsePlace(eff[e].place.view(), &mut pl) {
+          differs = !sameText(self.placeText(ku).view(), eff[e].place.view());
+          if differs { print <- "studio: "; printStr(items[ku].name.view()); print <- " moves to "; printStr(eff[e].place.view()); print <- ", at "; print <- unixMs(); print <- " ms\n"; }
+        }
+      }
+      want.push(pl); move.push(differs); who.push(k);
+      // first lift every mover off its slot, so that a swap needs no third place
+      if differs { self.vacate(usize.from(u32.from(*who[who.len() - 1usize]))); }
+      e = e + 1usize;
+    }
+    e = 0usize;
+    while e < eff.len() {
+      let k = *who[e];
+      if k >= 0 {
+        let ku = usize.from(u32.from(k));
+        if *move[e] { self.moveItem(ku, &want[e], animate); }
+        let pi = eff[e].pi;
+        if studioGood.projects[pi].name.len() > 0usize && !sameText(studioGood.projects[pi].name.view(), items[ku].name.view()) {
+          (&mut items[ku]).name = String.from(studioGood.projects[pi].name.view());
+          (&mut items[ku]).label.text = String.from(studioGood.projects[pi].name.view());
+          (&mut items[ku]).label.ok = false;
+        }
+        if eff[e].hasYaw {
+          let y = f32.from(i32.from(eff[e].yaw)) * PI / 180.;
+          if y != items[ku].yawShelf { (&mut items[ku]).yawShelf = y; print <- "studio: "; printStr(items[ku].id.view()); print <- " turned to "; print <- eff[e].yaw; print <- " degrees\n"; }
+        }
+        if eff[e].hasScale {
+          let m = f32.from(i32.from(eff[e].scale)) / 100.;
+          if m != items[ku].mul {
+            if animate && !*move[e] { self.startFlight(ku); }
+            (&mut items[ku]).mul = m;
+            if !animate { (&mut items[ku]).scale = self.destScale(ku); }
+            print <- "studio: "; printStr(items[ku].id.view()); print <- " scaled to "; print <- eff[e].scale; print <- " percent\n";
+          }
+        }
+      }
+      e = e + 1usize;
+    }
+    applying = false;
+  }
+
+  // The room moved item k by itself (Jon): remember it in room.toml (a second after the last move) and tell the session
+  fn noteMoved(self: &mut, k: usize) {
+    if applying { return; }
+    var pi = 0usize;
+    var found = false;
+    while pi < roomGood.projects.len() { if roomGood.projects[pi].id.view() == items[k].id.view() { found = true; break; } pi = pi + 1usize; }
+    if !found { roomGood.projects.push(newProj(items[k].id.view())); pi = roomGood.projects.len() - 1usize; }
+    roomGood.projects[pi].place = self.placeText(k);
+    roomGood.projects[pi].at = isoUtc(unixMs());
+    writeAt = nowMs() + 1000u64;
+    var line = String.from("moved ");
+    line.append(items[k].name.view());
+    line.append(" to ");
+    var words = self.placeText(k);
+    var w = String();
+    var c = 0usize;
+    while c < words.len() { w.append(if words[c] == ':' { " " } else { words.slice(c, c + 1usize) }); c = c + 1usize; }
+    line.append(w.view());
+    outLines.push(line);
+  }
+
+  fn writeRoom(self: &mut) {
+    writeAt = 0u64;
+    let text = roomText(&roomGood);
+    if writeAtomic(cfgDir.view(), "room.toml", text.view()) {
+      roomSeen = String.from(text.view());
+      moves = moves + 1u32;
+      print <- "studio: room.toml written, "; print <- roomGood.projects.len(); print <- " projects\n";
+    }
+  }
+
+  // Lines for the bridge, taken by the shell
+  pub fn takeLines(self: &mut) List[String] {
+    let l = outLines.clone();
+    outLines = List[String]();
+    l
+  }
+
+  pub fn takeSay(self: &mut) String { let s = sayWant.clone(); sayWant = String(); s }
+  pub fn takeLink(self: &mut) String { let s = linkWant.clone(); linkWant = String(); s }
+
+  // A menu action on the selection (the fixed vocabulary)
+  pub fn doAction(self: &mut, a: &str, v: &Fly) bool {
+    if sel < 0 { return false; }
+    if a == "zoom" { return self.act(2u32, v); }
+    if a == "zoomout" { return self.act(5u32, v); }
+    if a == "shelve" { return self.act(0u32, v); }
+    if a == "bring" { return self.act(1u32, v); }
+    if a == "open" { return self.act(3u32, v); }
+    if a == "talk" { return self.act(4u32, v); }
+    if a == "back" { return self.act(6u32, v); }
+    if a == "forward" { return self.act(7u32, v); }
+    if a == "files" { return self.act(8u32, v); }
+    if a == "reload" { cfgPoll = 0u64; studioSeen = String(); roomSeen = String(); return true; }
+    if a.len() > 5usize && a.slice(0usize, 5usize) == "link:" { linkWant = String.from(a.slice(5usize, a.len())); return true; }
+    if a.len() > 4usize && a.slice(0usize, 4usize) == "say:" { sayWant = String.from(a.slice(4usize, a.len())); return true; }
+    self.awAction(a)
+  }
+
+  fn awAction(self: &mut, a: &str) bool {
+    var did = false;
+    match &mut aw {
+      case var &mut Some(x) {
+        did = true;
+        if a == "step:+1" { stepForward(&mut x.app); }
+        else if a == "step:-1" { stepBack(&mut x.app); }
+        else if a == "play" { togglePlay(&mut x.app); }
+        else if a == "restart" { restart(&mut x.app); }
+        else if a == "legend" { x.app.legend = !x.app.legend; }
+        else if a == "follow" { x.app.follow = !x.app.follow; }
+        else if a == "timing" { toggleTrue(&mut x.app); }
+        else if a == "scenario:+1" { setScenario(&mut x.app, (x.app.sc + 1usize) % SC_N); }
+        else if a == "scenario:-1" { setScenario(&mut x.app, (x.app.sc + SC_N - 1usize) % SC_N); }
+        else if a.len() > 9usize && a.slice(0usize, 9usize) == "scenario:" {
+          var n = 0u32;
+          if cfgDigits(a.slice(9usize, a.len()), &mut n) && usize.from(n) < SC_N { setScenario(&mut x.app, usize.from(n)); } else { did = false; }
+        }
+        else { did = false; }
+        if did {
+          print <- "warehouse: walk: "; printStr(SC_NAME[x.app.sc]); print <- ", step "; print <- x.app.cur; print <- " of "; print <- x.app.count;
+          print <- (if x.app.playing { ", playing" } else { "" }); print <- "\n";
+        }
+      }
+      else {}
+    }
+    did
+  }
+
+  // ---- the architecture walk, a ring project ----
+
+  fn awTick(self: &mut, dt: f32) {
+    let k = self.itemById("archwalk");
+    if k < 0 { return; }
+    let live = items[usize.from(u32.from(k))].onTable || items[usize.from(u32.from(k))].free;
+    match &mut aw {
+      case var &mut Some(x) {
+        x.live = live;
+        if live { tick(&mut x.app, dt); x.app.pend = NONE; x.app.blink = 0.; }
+      }
+      else {}
+    }
+  }
+
+  // The walk's solids into the frame's draw list (swapped in and out of the walk, which adds to it); its words wait for 'draw'
+  pub fn collectAw(self: &mut, list: &mut DrawList, eye: Vec3) {
+    let k = self.itemById("archwalk");
+    if k < 0 { return; }
+    let ku = usize.from(u32.from(k));
+    let e = self.eff(ku);
+    let ys = items[ku].yaw;
+    let base = Mat4.fromTrs(Vec3(e.x, e.y, e.z), Quat.angleAxis(ys, Vec3(0., 1., 0.)), Vec3(e.w, e.w, e.w)) * Mat4.fromTranslation(Vec3(0., 0., 2.0));
+    match &mut aw {
+      case var &mut Some(x) {
+        x.out.jobs.clear();
+        if !x.live { return; }
+        x.out.base = base;
+        x.out.list <-> *list;
+        let head = base.inverse() * eye;
+        drawWorld(&mut x.out, &x.look, &mut x.tc, &x.app, head);
+        x.out.list <-> *list;
+      }
+      else {}
+    }
+  }
+
+  fn drawAwText(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4) {
+    let eyeNow = eyeIx;
+    match &mut aw {
+      case var &mut Some(x) {
+        if !x.live { return; }
+        if eyeNow == 0u32 {
+          awSetJobs(&mut x.text0, device, &x.tc, &x.styles, &x.out.jobs, vp, &mut x.shown0);
+          x.text0.renderWorld(encoder, target, depth);
+        } else {
+          awSetJobs(&mut x.text1, device, &x.tc, &x.styles, &x.out.jobs, vp, &mut x.shown1);
+          x.text1.renderWorld(encoder, target, depth);
+        }
+      }
+      else {}
+    }
+  }
+
+  // A click on the walk's miniature (it has no part in the world to be picked): selects it
+  pub fn clickApp(self: &mut, eye: Vec3, dir: Vec3) bool {
+    let k = self.itemById("archwalk");
+    if k < 0 { return false; }
+    let ku = usize.from(u32.from(k));
+    if !items[ku].onTable && !items[ku].free { return false; }
+    let e = self.eff(ku);
+    let r = 4.0 * e.w;
+    let c = Vec3(e.x, e.y + 1.5 * e.w, e.z);
+    let oc = eye - c;
+    let b = oc.dot(dir);
+    let disc = b * b - (oc.dot(oc) - r * r);
+    if disc < 0. { return false; }
+    self.select(k);
+    true
+  }
 
   // F: the browser stands to the left of the design page (the page is slot 0, dead ahead of the start spot, 2.5 m off),
   // turned toward the start spot so it does not block the page (at 'folder', or where it was); F again puts it away
@@ -1148,6 +1640,7 @@ pub struct Warehouse {
     let now = nowMs();
     if !self.chipsShown(now) || chipAnchor != sel { return false; }
     let list = self.chipList();
+    let ents = self.visibleEntries(usize.from(u32.from(sel)));
     var k = 0usize;
     while k < list.len() {
       let c = *list[k];
@@ -1164,8 +1657,11 @@ pub struct Warehouse {
           if t > 0. {
             let p = e + d * t;
             if p.x >= 0. - w && p.x <= w && p.y >= 0. - h && p.y <= h {
-              print <- "warehouse: chip "; print <- c; print <- "\n";
-              self.act(c, v);
+              let si = usize.from(u32.from(sel));
+              let ent = *ents[k];
+              let act = items[si].menu[ent].action.clone();
+              print <- "warehouse: chip "; printStr(items[si].menu[ent].text.view()); print <- " ("; printStr(act.view()); print <- ")\n";
+              if items[si].menu[ent].known { self.doAction(act.view(), v); }
               return true;
             }
           }
@@ -1284,6 +1780,7 @@ pub struct Warehouse {
       }
       k = k + 1usize;
     }
+    self.drawAwText(device, encoder, target, depth, vp);
     // the writing and the pages, far to near
     var codes = List[u32]();
     var dists = List[f32]();
@@ -1412,6 +1909,36 @@ pub struct Warehouse {
       let r = &mut readout[0usize];
       if r.ok { r.pass.drawFaded(device, encoder, target, depth, vp * m, Vec4(0. - hw, 0. - hh, hw, hh), r.alpha); }
     }
+    // the red card of a file that does not read: higher up the view, the same way
+    let errWant: f32 = if errShown.len() > 0usize { 1. } else { 0. };
+    match &mut errCard {
+      case var &mut Some(ec) {
+        if ec.ok && ec.alpha > 0.01 {
+          let inv = vp.inverse();
+          let p0 = inv * Vec4(0., -0.55, 0., 1.);
+          let p1 = inv * Vec4(0., -0.55, 1., 1.);
+          let a = p0.xyz() * (1. / p0.w);
+          let b = p1.xyz() * (1. / p1.w);
+          let dir = (b - a).normalize();
+          let m = Warehouse.faceModel(eye + dir * 0.8, eye);
+          let hw = ec.w * 0.5 * 0.7;
+          let hh = ec.h * 0.5 * 0.7;
+          ec.pass.drawFaded(device, encoder, target, depth, vp * m, Vec4(0. - hw, 0. - hh, hw, hh), ec.alpha);
+        }
+      }
+      else {}
+    }
+  }
+
+  // Test flag: the Nth shown chip of the selection, as a click would take it
+  pub fn menuNth(self: &mut, n: usize, v: &Fly) bool {
+    if sel < 0 { return false; }
+    let si = usize.from(u32.from(sel));
+    let ents = self.visibleEntries(si);
+    if n >= ents.len() { return false; }
+    let act = items[si].menu[*ents[n]].action.clone();
+    print <- "warehouse: menu "; print <- n; print <- " ("; printStr(act.view()); print <- ")\n";
+    self.doAction(act.view(), v)
   }
 
   fn cardPos(self: &, stage: usize, n: u32) Vec3 {
