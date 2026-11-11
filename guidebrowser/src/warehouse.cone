@@ -1,0 +1,813 @@
+// The warehouse: the studio as a place (WI\studio-warehouse.md), desktop version.
+//
+// The world file (worlds\warehouse.ddd) holds the building and each project as a part standing at its own
+// origin. THIS file, run on the loop, decides where those parts are each frame: three turntables, sixteen shelf
+// slots, the flights between them, the chips beside the selected project, and the production line's cards.
+// Everything with writing on it (names, chips, cards) is a small page, drawn by the document panel's PagePass
+// as an unlit quad on top of the finished picture, far to near. (The page pass has no depth test and no
+// blending, so labels show through things, and "fade" is a pop-in; see the lane report.)
+
+const LINE_FILE = "C:/src/studio-work/warehouse/line.json";
+const LAB_W = 512u32;
+const LAB_H = 128u32;
+const FLIGHT_MS = 500.0f;
+const CHIP_DELAY_MS = 300.0f;
+const CHIP_POP_MS = 150.0f;
+const TABLE_TOP = 0.92f;
+const NO_ITEM = -1;
+const PI = 3.14159265f;
+
+// A small page with writing on it: its quad is w x h meters at scale 1
+struct Label {
+  pass: PagePass;
+  w: f32;
+  h: f32;
+  ok: bool;             // its picture made (a few a frame: every picture is a command buffer, and a frame may record 16)
+  text: String;
+  bg: u32;
+  ink: u32;
+  size: f32;
+  top: f32;
+  card: bool;
+  progress: f32;
+  hot: bool;
+  strong: bool;
+}
+
+// Draws short texts into images (the document panel's fonts and renderer, in a small texture)
+struct Labeller {
+  faces: Faces;
+  rr: RichRenderer;
+  target: Texture;
+  readback: Buffer;
+
+  fn create(device: &mut Device) Option[Labeller] {
+    var made: Option[Labeller] = None;
+    match makeFaces() {
+      case let Some(faces) {
+        var rr = RichRenderer.create(device, &faces, TEXTURE_FORMAT_RGBA8_UNORM);
+        if rr.isValid() {
+          let desc = TextureDescriptor(LAB_W, LAB_H, TEXTURE_FORMAT_RGBA8_UNORM,
+            TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+          var target = device.createTexture(&desc);
+          var readback = device.createBuffer(u64.from(LAB_W * LAB_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+          made = Some[Labeller](Labeller(faces, rr, target, readback));
+        }
+      }
+      case is None { print <- "warehouse: no font found\n"; }
+    }
+    made
+  }
+
+  // 'text' on 'bg' in 'ink' (0xRRGGBBAA), at 'size' pixels, its first line 'top' pixels down
+  fn image(self: &mut, device: &mut Device, text: &str, bg: u32, ink: u32, size: f32, top: f32) Image {
+    var eb = List[Block]();
+    eb.push(Block.fromText(text, Style(true, false, false, 0., ink, 0u32, 0u32)));
+    var cfg = LayoutConfig.standard(f32.from(LAB_W));
+    cfg.margin = 16.;
+    cfg.marginTop = top;
+    cfg.baseSize = size;
+    cfg.lineHeight = 1.15;
+    cfg.textColor = ink;
+    let images = List[ImageInfo]();
+    let el = layoutRich(&eb, &images, &faces, &cfg);
+    let view = RichView(f32.from(LAB_W), f32.from(LAB_H), 0., 0., bg, bg, 0u32, 0u32, f32.from(LAB_W), false);
+    let sel = List[RectP]();
+    let caret = CaretRect(0., 0., 0.);
+    var encoder = device.createCommandEncoder();
+    rr.draw(device, &mut encoder, &target, &view, &faces, &el, &images, &sel, &caret);
+    encoder.copyTextureToBuffer(&target, &readback);
+    device.queue.submit(encoder.finish());
+    device.waitIdle();
+    Image.fromTexels(readback.mappedRange(), i32.from(LAB_W), i32.from(LAB_H), false)
+  }
+}
+
+// Make a label's picture and give it to its page pass
+fn fillLabel(l: &mut Labeller, device: &mut Device, lab: &mut Label) {
+  var img = l.image(device, lab.text.view(), lab.bg, lab.ink, lab.size, lab.top);
+  if lab.card {
+    var p = lab.progress;
+    if p < 0. { p = 0.; }
+    if p > 1. { p = 1.; }
+    paint(&mut img, 16, 98, 496, 114, 0xc8c4bau32);
+    paint(&mut img, 16, 98, 16 + i32.from(u32.from(p * 480.)), 114, 0x2e7d4fu32);
+    if lab.hot {
+      let b = if lab.strong { 12 } else { 5 };
+      let c = if lab.strong { 0xf5a000u32 } else { 0xe8c070u32 };
+      paint(&mut img, 0, 0, 512, b, c);
+      paint(&mut img, 0, 128 - b, 512, 128, c);
+      paint(&mut img, 0, 0, b, 128, c);
+      paint(&mut img, 512 - b, 0, 512, 128, c);
+    }
+  }
+  lab.pass.upload(device, &img);
+  lab.ok = true;
+}
+
+// A rectangle of the image, rows counted from its top, in 0xRRGGBB
+fn paint(img: &mut Image, x0: i32, y0: i32, x1: i32, y1: i32, rgb: u32) {
+  var y = y0;
+  while y < y1 {
+    if y >= 0 && y < img.height {
+      var x = x0;
+      while x < x1 {
+        if x >= 0 && x < img.width {
+          let o = usize.from(u32.from((img.height - 1 - y) * img.width + x) * 3u32);
+          img.pixels.set(o, u8.from((rgb >> 16u32) & 255u32));
+          img.pixels.set(o + 1usize, u8.from((rgb >> 8u32) & 255u32));
+          img.pixels.set(o + 2usize, u8.from(rgb & 255u32));
+        }
+        x = x + 1;
+      }
+    }
+    y = y + 1;
+  }
+}
+
+// A plain name or chip (its picture is made later, by fill)
+fn textLabel(l: &mut Labeller, device: &mut Device, format: u32, text: &str, bg: u32, ink: u32, size: f32, w: f32) Label {
+  Label(PagePass.create(device, format), w, w / 4., false, String.from(text), bg, ink, size, 22., false, 0., false, false)
+}
+
+// A card of the line: title, a bar, and an amber frame if it needs Jon (strong or soft)
+fn cardLabel(l: &mut Labeller, device: &mut Device, format: u32, title: &str, progress: f32, hot: bool, strong: bool) Label {
+  Label(PagePass.create(device, format), 1.1, 0.275, false, String.from(title), 0xf8f5eeffu32, 0x1c1c1cffu32, 32., 6., true,
+    progress, hot, strong)
+}
+
+struct Card {
+  id: String;
+  stage: u32;
+  hot: bool;
+  calm: Label;
+  glow: Label;          // the strong frame; shown in turns with 'calm' when hot
+}
+
+// A project: a part of the world (or the document page), and where it stands
+struct Item {
+  name: String;
+  part: String;         // the part's name in the world; empty for the document page
+  page: bool;
+  home: u32;            // its shelf slot when shelved
+  onTable: bool;
+  idx: u32;             // table number or shelf slot
+  pos: Vec3;
+  scale: f32;
+  yaw: f32;
+  fromPos: Vec3;
+  fromScale: f32;
+  flight: f32;          // 0 just launched, 1 arrived
+  touched: u64;
+  slot: u32;            // the part's slot once found
+  tableScale: f32;
+  shelfScale: f32;
+  height: f32;          // at scale 1
+  radius: f32;          // half its width at scale 1
+  yawShelf: f32;
+  label: Label;
+}
+
+// The visitor gliding to look at something
+struct Glide {
+  active: bool;
+  t: f32;
+  from: Vec3;
+  to: Vec3;
+  fromYaw: f32;
+  toYaw: f32;
+  fromPitch: f32;
+  toPitch: f32;
+}
+
+pub struct Warehouse {
+  pub on: bool;
+  labeller: Option[Labeller];
+  items: List[Item];
+  tableItem: List[i32];
+  shelfItem: List[i32];
+  chips: List[Label];      // shelve, bring, zoom, open, talk
+  stages: List[Label];
+  cards: List[Card];
+  lineText: String;
+  linePoll: u64;
+  linesRead: u32;
+  pub sel: i32;
+  selAt: u64;
+  lastMs: u64;
+  startMs: u64;
+  glide: Glide;
+  pub sHeld: bool;
+  format: u32;
+  ticks: u32;
+
+  pub fn empty() Warehouse {
+    Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
+      NO_ITEM, 0u64, 0u64, 0u64, Glide(false, 0., Vec3(0., 0., 0.), Vec3(0., 0., 0.), 0., 0., 0., 0.), false, 0u32, 0u32)
+  }
+
+  pub fn create(device: &mut Device, format: u32) Warehouse {
+    var w = Warehouse.empty();
+    w.format = format;
+    var maybe = Labeller.create(device);
+    match &mut maybe {
+      case var &mut Some(l) {
+        w.on = true;
+        var i = 0;
+        while i < 3 { w.tableItem.push(NO_ITEM); i = i + 1; }
+        i = 0;
+        while i < 16 { w.shelfItem.push(NO_ITEM); i = i + 1; }
+        // knight, page, amphora on the tables; six boxes on the shelf
+        w.addItem(l, device, "Knight", "knight", false, 8u32, 1.0, 0.45, 0.61, 0.2, PI * 0.5);
+        w.addItem(l, device, "Design page", "", true, 9u32, 0.5, 0.2, 1.903, 0.67, 0.);
+        w.addItem(l, device, "Amphora", "amphora", false, 10u32, 1.0, 0.6, 0.52, 0.17, 0.);
+        w.addItem(l, device, "Island", "box_island", false, 0u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "Labyrinth", "box_labyrinth", false, 1u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "Starship", "box_starship", false, 2u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "Cottage", "box_cottage", false, 3u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "Chess", "box_chess", false, 4u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        w.addItem(l, device, "Horse", "box_horse", false, 5u32, 1.6, 1.0, 0.30, 0.15, 0.);
+        // who stands where at the start: items 0..2 on tables 0, 1, 2; the rest on their home slots
+        w.settle(0, true, 0u32);
+        w.settle(1, true, 1u32);
+        w.settle(2, true, 2u32);
+        i = 3;
+        while i < 9 { w.settle(i, false, w.items[usize.from(u32.from(i))].home); i = i + 1; }
+        let blue = 0x2a5d9fffu32;
+        let white = 0xffffffffu32;
+        w.chips.push(textLabel(l, device, format, "shelve (S)", blue, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "bring (B)", 0x2f8a4fffu32, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "zoom (Z)", blue, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "open (O)", blue, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "talk (T)", 0x8a4fa8ffu32, white, 46., 0.30));
+        let names = ["queued", "building", "testing", "in review", "merged"];
+        let tint = [0x80808affu32, 0xc08a20ffu32, 0x3a78b0ffu32, 0x8a5aa8ffu32, 0x3a8a58ffu32];
+        var s = 0usize;
+        while s < 5usize {
+          w.stages.push(textLabel(l, device, format, names[s], tint[s], white, 54., 0.9));
+          s = s + 1usize;
+        }
+      }
+      else {}
+    }
+    w.labeller = maybe;
+    w.startMs = nowMs();
+    w.lastMs = w.startMs;
+    w
+  }
+
+  fn addItem(self: &mut, l: &mut Labeller, device: &mut Device, name: &str, part: &str, page: bool, home: u32,
+             tableScale: f32, shelfScale: f32, height: f32, radius: f32, yawShelf: f32) {
+    let label = textLabel(l, device, format, name, 0xf8f5eeffu32, 0x1c1c1cffu32, 50., 0.56);
+    items.push(Item(String.from(name), String.from(part), page, home, false, 0u32, Vec3(0., 0., 0.), 1., 0.,
+      Vec3(0., 0., 0.), 1., 1., 0u64, NO_SLOT, tableScale, shelfScale, height, radius, yawShelf, label));
+  }
+
+  // Put item i where it stands, with no flight
+  fn settle(self: &mut, i: i32, onTable: bool, idx: u32) {
+    let k = usize.from(u32.from(i));
+    (&mut items[k]).onTable = onTable;
+    (&mut items[k]).idx = idx;
+    if onTable { tableItem.set(usize.from(idx), i); } else { shelfItem.set(usize.from(idx), i); }
+    let d = self.dest(k);
+    (&mut items[k]).pos = d;
+    (&mut items[k]).scale = self.destScale(k);
+    (&mut items[k]).yaw = if onTable { 0. } else { items[k].yawShelf };
+    (&mut items[k]).flight = 1.;
+  }
+
+  fn tableCentre(t: u32) Vec3 {
+    if t == 0u32 { Vec3(-1.5, TABLE_TOP, -2.0) } else if t == 1u32 { Vec3(0., TABLE_TOP, -2.5) } else { Vec3(1.5, TABLE_TOP, -2.0) }
+  }
+
+  fn shelfPos(j: u32) Vec3 {
+    let col = f32.from(j % 8u32);
+    Vec3((col - 3.5) * 1.4, if j / 8u32 == 0u32 { 0.30 } else { 1.20 }, -11.0)
+  }
+
+  fn dest(self: &, k: usize) Vec3 {
+    if items[k].onTable { Warehouse.tableCentre(items[k].idx) } else { Warehouse.shelfPos(items[k].idx) }
+  }
+
+  fn destScale(self: &, k: usize) f32 {
+    if items[k].onTable { items[k].tableScale } else { items[k].shelfScale }
+  }
+
+  fn startFlight(self: &mut, k: usize) {
+    (&mut items[k]).fromPos = items[k].pos;
+    (&mut items[k]).fromScale = items[k].scale;
+    (&mut items[k]).flight = 0.;
+  }
+
+  // Per frame: the clock, the flights, the turning, the line's file
+  pub fn update(self: &mut, device: &mut Device) {
+    let now = nowMs();
+    var dt = f32.from(now - lastMs) / 1000.;
+    if dt > 0.1 { dt = 0.1; }
+    lastMs = now;
+    let clock = f32.from(now - startMs) / 1000.;
+    var k = 0usize;
+    while k < items.len() {
+      let d = self.dest(k);
+      let ds = self.destScale(k);
+      var want: f32 = 0.;
+      if items[k].onTable {
+        want = if items[k].page { 0.5 * sin(clock * 0.5) } else { clock * 0.4 };
+        if !items[k].page { want = items[k].yawShelf + clock * 0.4; }
+      } else { want = items[k].yawShelf; }
+      // turn the short way, quickly after a flight so that the swap does not pop
+      var delta = want - items[k].yaw;
+      while delta > PI { delta = delta - 2. * PI; }
+      while delta < 0. - PI { delta = delta + 2. * PI; }
+      let follow: f32 = if items[k].flight < 1. { 8. * dt } else { 1. };
+      var step: f32 = delta * (if follow > 1. { 1. } else { follow });
+      (&mut items[k]).yaw = items[k].yaw + step;
+      if items[k].flight < 1. {
+        var f = items[k].flight + dt * 1000. / FLIGHT_MS;
+        if f > 1. { f = 1.; }
+        (&mut items[k]).flight = f;
+        let e = f * f * (3. - 2. * f);
+        var p = items[k].fromPos.lerp(d, e);
+        p.y = p.y + 0.6 * sin(PI * e);
+        (&mut items[k]).pos = p;
+        (&mut items[k]).scale = items[k].fromScale + (ds - items[k].fromScale) * e;
+      } else {
+        (&mut items[k]).pos = d;
+        (&mut items[k]).scale = ds;
+      }
+      k = k + 1usize;
+    }
+    if now >= linePoll + 250u64 {
+      linePoll = now;
+      self.readLine(device);
+    }
+    ticks = ticks + 1u32;
+    if ticks > 4u32 { self.fillSome(device, 2); }
+  }
+
+  // A few pictures a frame: names, chips, stage boards, then cards
+  fn fillSome(self: &mut, device: &mut Device, most: i32) {
+    var lab: Option[Labeller] = None;
+    lab <-> labeller;
+    var made = 0;
+    match &mut lab {
+      case var &mut Some(l) {
+        var k = 0usize;
+        while k < items.len() && made < most {
+          if !items[k].label.ok { fillLabel(l, device, &mut items[k].label); made = made + 1; }
+          k = k + 1usize;
+        }
+        k = 0usize;
+        while k < chips.len() && made < most {
+          if !chips[k].ok { fillLabel(l, device, &mut chips[k]); made = made + 1; }
+          k = k + 1usize;
+        }
+        k = 0usize;
+        while k < stages.len() && made < most {
+          if !stages[k].ok { fillLabel(l, device, &mut stages[k]); made = made + 1; }
+          k = k + 1usize;
+        }
+        k = 0usize;
+        while k < cards.len() && made < most {
+          if !cards[k].calm.ok { fillLabel(l, device, &mut cards[k].calm); made = made + 1; }
+          if made < most && !cards[k].glow.ok { fillLabel(l, device, &mut cards[k].glow); made = made + 1; }
+          k = k + 1usize;
+        }
+      }
+      else {}
+    }
+    labeller <-> lab;
+  }
+
+  // line.json read again when its text changes; a file that does not parse keeps the last cards
+  fn readLine(self: &mut, device: &mut Device) {
+    match fs.readFile(&Path.from(LINE_FILE)) {
+      case let Ok(s) {
+        if sameText(s.view(), lineText.view()) { return; }
+        match json.parse(s.view()) {
+          case let Ok(doc) {
+            lineText = String.from(s.view());
+            var lab: Option[Labeller] = None;
+            lab <-> labeller;
+            var fresh = List[Card]();
+            match &mut lab {
+              case var &mut Some(l) {
+                var i = 0usize;
+                while i < doc.len() {
+                  match doc.at(i) {
+                    case let Some(c) {
+                      var title = String();
+                      match c.getText("title") { case let Some(t) { title.append(t); } else {} }
+                      var id = String();
+                      match c.getText("id") { case let Some(t) { id.append(t); } else {} }
+                      var stage = 0u32;
+                      match c.getText("stage") {
+                        case let Some(t) {
+                          if sameText(t, "building") { stage = 1u32; }
+                          else if sameText(t, "testing") { stage = 2u32; }
+                          else if sameText(t, "review") { stage = 3u32; }
+                          else if sameText(t, "merged") { stage = 4u32; }
+                        }
+                        else {}
+                      }
+                      let progress = f32.from(c.f64Or("progress", 0.0f64));
+                      let hot = c.boolOr("needs_jon", false);
+                      let calm = cardLabel(l, device, format, title.view(), progress, hot, false);
+                      let glow = cardLabel(l, device, format, title.view(), progress, hot, true);
+                      fresh.push(Card(id, stage, hot, calm, glow));
+                    }
+                    else {}
+                  }
+                  i = i + 1usize;
+                }
+              }
+              else {}
+            }
+            labeller <-> lab;
+            cards = fresh;
+            linesRead = linesRead + 1u32;
+            print <- "warehouse: line.json read: "; print <- cards.len(); print <- " cards\n";
+          }
+          case let Err(e) {
+            if linesRead == 0u32 || true { print <- "warehouse: line.json does not parse; keeping the last cards\n"; }
+            lineText = String.from(s.view());
+          }
+        }
+      }
+      case is Err {}
+    }
+  }
+
+  // ---- selection and actions ----
+
+  fn itemOfSlot(self: &mut, parts: &List[Live], pi: usize) i32 {
+    let slot = parts[pi].slot;
+    var k = 0usize;
+    while k < items.len() {
+      if !items[k].page {
+        if items[k].slot == slot { return i32.from(k); }
+        if items[k].slot == NO_SLOT && sameText(items[k].part.view(), parts[pi].name.view()) {
+          (&mut items[k]).slot = slot;
+          return i32.from(k);
+        }
+      }
+      k = k + 1usize;
+    }
+    NO_ITEM
+  }
+
+  pub fn isSelectedPart(self: &mut, parts: &List[Live], pi: usize) bool {
+    if sel < 0 { return false; }
+    self.itemOfSlot(parts, pi) == sel
+  }
+
+  // Where the part is this frame, or None for a part the loop does not move
+  pub fn placeOf(self: &mut, parts: &List[Live], pi: usize) Option[Mat4] {
+    let k = self.itemOfSlot(parts, pi);
+    if k < 0 { return None; }
+    let it = &items[usize.from(u32.from(k))];
+    Some[Mat4](Mat4.fromTrs(it.pos, Quat.angleAxis(it.yaw, Vec3(0., 1., 0.)), Vec3(it.scale, it.scale, it.scale)))
+  }
+
+  fn pageIndex(self: &) i32 {
+    var k = 0usize;
+    while k < items.len() { if items[k].page { return i32.from(k); } k = k + 1usize; }
+    NO_ITEM
+  }
+
+  // The page's model matrix: its local frame is the panel's own (z = 0, middle at DOC_CENTRE_Y)
+  pub fn pageModel(self: &) Mat4 {
+    let k = self.pageIndex();
+    if k < 0 { return Mat4.identity(); }
+    let it = &items[usize.from(u32.from(k))];
+    let bottom = f32.from(DOC_CENTRE_Y) - 0.5 * f32.from(DOC_WORLD_W) * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    Mat4.fromTrs(it.pos, Quat.angleAxis(it.yaw, Vec3(0., 1., 0.)), Vec3(it.scale, it.scale, it.scale))
+      * Mat4.fromTranslation(Vec3(0., 0. - bottom, 0.))
+  }
+
+  pub fn select(self: &mut, k: i32) {
+    if k == sel { return; }
+    sel = k;
+    selAt = nowMs();
+    if k >= 0 {
+      (&mut items[usize.from(u32.from(k))]).touched = selAt;
+      print <- "warehouse: selected "; printStr(items[usize.from(u32.from(k))].name.view()); print <- "\n";
+    }
+  }
+
+  pub fn selectPage(self: &mut) {
+    self.select(self.pageIndex());
+  }
+
+  pub fn selectSlot(self: &mut, parts: &List[Live], pi: usize) {
+    let k = self.itemOfSlot(parts, pi);
+    self.select(k);
+  }
+
+  pub fn selectedIsPage(self: &) bool {
+    sel >= 0 && items[usize.from(u32.from(sel))].page
+  }
+
+  // Which chips the selection has: 0 shelve, 1 bring, 2 zoom, 3 open, 4 talk
+  fn chipList(self: &) List[u32] {
+    var out = List[u32]();
+    if sel < 0 { return out; }
+    let it = &items[usize.from(u32.from(sel))];
+    out.push(if it.onTable { 0u32 } else { 1u32 });
+    out.push(2u32);
+    out.push(3u32);
+    if it.page { out.push(4u32); }
+    out
+  }
+
+  fn freeShelf(self: &, k: usize) i32 {
+    let h = items[k].home;
+    if *shelfItem[usize.from(h)] == NO_ITEM { return i32.from(h); }
+    var j = 0usize;
+    while j < shelfItem.len() { if *shelfItem[j] == NO_ITEM { return i32.from(j); } j = j + 1usize; }
+    NO_ITEM
+  }
+
+  // A table item to its shelf, in flight
+  pub fn shelve(self: &mut, k: usize) bool {
+    if !items[k].onTable { return false; }
+    let j = self.freeShelf(k);
+    if j < 0 { return false; }
+    self.startFlight(k);
+    tableItem.set(usize.from(items[k].idx), NO_ITEM);
+    (&mut items[k]).onTable = false;
+    (&mut items[k]).idx = u32.from(j);
+    shelfItem.set(usize.from(u32.from(j)), i32.from(k));
+    (&mut items[k]).touched = nowMs();
+    print <- "warehouse: "; printStr(items[k].name.view()); print <- " to shelf slot "; print <- j; print <- "\n";
+    true
+  }
+
+  // A shelved item to a free turntable (the oldest-untouched one goes back to its shelf if all are full)
+  pub fn bring(self: &mut, k: usize) bool {
+    if items[k].onTable { return false; }
+    var t = -1;
+    let order = [1, 0, 2];
+    var o = 0usize;
+    while o < 3usize && t < 0 {
+      if *tableItem[usize.from(u32.from(order[o]))] == NO_ITEM { t = order[o]; }
+      o = o + 1usize;
+    }
+    if t < 0 {
+      var oldest = 0usize;
+      var best = 18446744073709551615u64;
+      var q = 0usize;
+      while q < 3usize {
+        let who = usize.from(u32.from(*tableItem[q]));
+        if items[who].touched < best { best = items[who].touched; oldest = who; }
+        q = q + 1usize;
+      }
+      t = i32.from(items[oldest].idx);
+      print <- "warehouse: the ring is full; "; printStr(items[oldest].name.view()); print <- " goes back to its shelf\n";
+      self.shelve(oldest);
+    }
+    self.startFlight(k);
+    shelfItem.set(usize.from(items[k].idx), NO_ITEM);
+    (&mut items[k]).onTable = true;
+    (&mut items[k]).idx = u32.from(t);
+    tableItem.set(usize.from(u32.from(t)), i32.from(k));
+    (&mut items[k]).touched = nowMs();
+    print <- "warehouse: "; printStr(items[k].name.view()); print <- " to table "; print <- t; print <- "\n";
+    true
+  }
+
+  // Glide the visitor to stand 'dist' meters in front of item k and look at it
+  fn glideTo(self: &mut, k: usize, eye: Vec3, yaw: f32, pitch: f32, dist: f32) {
+    let c = self.dest(k);
+    let hh = items[k].height * self.destScale(k) * 0.5;
+    let target = Vec3(c.x, c.y + hh, c.z);
+    var flat = Vec3(eye.x - c.x, 0., eye.z - c.z);
+    if flat.length() < 0.01 { flat = Vec3(0., 0., 1.); }
+    flat = flat.normalize();
+    let to = Vec3(c.x + flat.x * dist, 1.6, c.z + flat.z * dist);
+    let look = target - to;
+    let len = look.length();
+    glide = Glide(true, 0., eye, to, yaw, atan2(0. - look.x, 0. - look.z), pitch, asin(look.y / len));
+  }
+
+  // The glide, one fixed step: moves the visitor
+  pub fn glideStep(self: &mut, v: &mut Fly, dt: f32) {
+    if !glide.active { return; }
+    glide.t = glide.t + dt / 0.6;
+    var t = glide.t;
+    if t >= 1. { t = 1.; glide.active = false; }
+    let e = t * t * (3. - 2. * t);
+    v.position = glide.from.lerp(glide.to, e);
+    var dy = glide.toYaw - glide.fromYaw;
+    while dy > PI { dy = dy - 2. * PI; }
+    while dy < 0. - PI { dy = dy + 2. * PI; }
+    v.yaw = glide.fromYaw + dy * e;
+    v.pitch = glide.fromPitch + (glide.toPitch - glide.fromPitch) * e;
+  }
+
+  // An action on the selection: 0 shelve, 1 bring, 2 zoom, 3 open, 4 talk. Returns true if it did something.
+  pub fn act(self: &mut, a: u32, v: &Fly) bool {
+    if sel < 0 { return false; }
+    let k = usize.from(u32.from(sel));
+    (&mut items[k]).touched = nowMs();
+    if a == 0u32 { return self.shelve(k); }
+    if a == 1u32 { return self.bring(k); }
+    var d: f32 = if items[k].page { 1.7 } else { 1.4 };
+    if a == 3u32 {
+      d = d * 0.65;
+      if !items[k].onTable { self.bring(k); }
+    }
+    if a == 2u32 || a == 3u32 {
+      self.glideTo(k, v.position, v.yaw, v.pitch, d);
+      return true;
+    }
+    a == 4u32
+  }
+
+  // ---- the camera-facing quads ----
+
+  fn faceModel(p: Vec3, eye: Vec3) Mat4 {
+    let th = atan2(eye.x - p.x, eye.z - p.z);
+    Mat4.fromTrs(p, Quat.angleAxis(th, Vec3(0., 1., 0.)), Vec3(1., 1., 1.))
+  }
+
+  fn clampScale(d: f32, per: f32, hi: f32) f32 {
+    var s = d / per;
+    if s < 1. { s = 1.; }
+    if s > hi { s = hi; }
+    s
+  }
+
+  // An item's name label: the model and the half sizes
+  fn labelFrame(self: &, k: usize, eye: Vec3) Vec4 {
+    let it = &items[k];
+    let d = (it.pos - eye).length();
+    let ls = Warehouse.clampScale(d, 3.5, 2.6);
+    let hw = it.label.w * ls * 0.5;
+    let hh = it.label.h * ls * 0.5;
+    let top = it.pos.y + it.height * it.scale + hh + 0.06;
+    Vec4(it.pos.x, top, it.pos.z, ls)
+  }
+
+  // The chip k of n beside the selection: its model and its half size
+  fn chipFrame(self: &, k: usize, n: usize, eye: Vec3, now: u64) Vec4 {
+    let it = &items[usize.from(u32.from(sel))];
+    let centre = Vec3(it.pos.x, it.pos.y + it.height * it.scale * 0.5, it.pos.z);
+    let d = (centre - eye).length();
+    var cs = Warehouse.clampScale(d, 2.5, 3.);
+    var g = (f32.from(now - selAt) - CHIP_DELAY_MS) / CHIP_POP_MS;
+    if g < 0. { g = 0.; }
+    if g > 1. { g = 1.; }
+    cs = cs * (0.3 + 0.7 * g);
+    let th = atan2(eye.x - centre.x, eye.z - centre.z);
+    let right = Vec3(cos(th), 0., 0. - sin(th));
+    let side = it.radius * it.scale + 0.2 * cs;
+    let up = ((f32.from(n) - 1.) * 0.5 - f32.from(k)) * 0.095 * cs;
+    Vec4(centre.x + right.x * side, centre.y + up, centre.z + right.z * side, cs)
+  }
+
+  fn chipsShown(self: &, now: u64) bool {
+    sel >= 0 && f32.from(now - selAt) >= CHIP_DELAY_MS && items[usize.from(u32.from(sel))].flight >= 1.
+  }
+
+  // A click's ray against the chips: true if one was taken
+  pub fn clickChip(self: &mut, eye: Vec3, dir: Vec3, v: &Fly) bool {
+    let now = nowMs();
+    if !self.chipsShown(now) { return false; }
+    let list = self.chipList();
+    var k = 0usize;
+    while k < list.len() {
+      let f = self.chipFrame(k, list.len(), eye, now);
+      let c = *list[k];
+      let w = chips[usize.from(c)].w * f.w * 0.5;
+      let h = chips[usize.from(c)].h * f.w * 0.5;
+      let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
+      let inv = m.inverse();
+      let e = inv * eye;
+      let d = inv.transformVector(dir);
+      if d.z > 0.00001 || d.z < -0.00001 {
+        let t = (0. - e.z) / d.z;
+        if t > 0. {
+          let p = e + d * t;
+          if p.x >= 0. - w && p.x <= w && p.y >= 0. - h && p.y <= h {
+            print <- "warehouse: chip "; print <- c; print <- "\n";
+            self.act(c, v);
+            return true;
+          }
+        }
+      }
+      k = k + 1usize;
+    }
+    false
+  }
+
+  // ---- drawing ----
+
+  fn sortKey(kind: u32, i: u32) u32 { kind * 1000u32 + i }
+
+  pub fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, vp: Mat4, eye: Vec3,
+              panel: &mut Option[DocPanel]) {
+    let now = nowMs();
+    var codes = List[u32]();
+    var dists = List[f32]();
+    var k = 0usize;
+    while k < items.len() {
+      let f = self.labelFrame(k, eye);
+      codes.push(Warehouse.sortKey(0u32, u32.from(k)));
+      dists.push((Vec3(f.x, f.y, f.z) - eye).length());
+      if items[k].page {
+        codes.push(Warehouse.sortKey(4u32, 0u32));
+        dists.push((items[k].pos - eye).length() - 0.01);
+      }
+      k = k + 1usize;
+    }
+    var s = 0usize;
+    while s < stages.len() {
+      codes.push(Warehouse.sortKey(2u32, u32.from(s)));
+      dists.push((Vec3(-4.74, 0.45, 3.2 - 1.6 * f32.from(s)) - eye).length());
+      s = s + 1usize;
+    }
+    var c = 0usize;
+    var inStage = List[u32]();
+    while inStage.len() < 5usize { inStage.push(0u32); }
+    while c < cards.len() {
+      let st = usize.from(cards[c].stage);
+      let n = *inStage[st];
+      inStage.set(st, n + 1u32);
+      codes.push(Warehouse.sortKey(3u32, u32.from(c)) + 100000u32 * n);
+      dists.push((self.cardPos(st, n) - eye).length());
+      c = c + 1usize;
+    }
+    let list = self.chipList();
+    if self.chipsShown(now) {
+      var q = 0usize;
+      while q < list.len() {
+        let f = self.chipFrame(q, list.len(), eye, now);
+        codes.push(Warehouse.sortKey(1u32, u32.from(q)));
+        dists.push((Vec3(f.x, f.y, f.z) - eye).length() - 0.02);
+        q = q + 1usize;
+      }
+    }
+    // far to near: nearer ones are drawn over the farther
+    var i = 1usize;
+    while i < codes.len() {
+      var j = i;
+      while j > 0usize && *dists[j - 1usize] < *dists[j] {
+        let dc = *dists[j]; dists.set(j, *dists[j - 1usize]); dists.set(j - 1usize, dc);
+        let cc = *codes[j]; codes.set(j, *codes[j - 1usize]); codes.set(j - 1usize, cc);
+        j = j - 1usize;
+      }
+      i = i + 1usize;
+    }
+    let hotPhase = (now / 600u64) % 2u64 == 0u64;
+    var n = 0usize;
+    while n < codes.len() {
+      let code = *codes[n] % 100000u32;
+      let extra = *codes[n] / 100000u32;
+      let kind = code / 1000u32;
+      let idx = usize.from(code % 1000u32);
+      if kind == 0u32 {
+        let f = self.labelFrame(idx, eye);
+        let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
+        let hw = items[idx].label.w * f.w * 0.5;
+        let hh = items[idx].label.h * f.w * 0.5;
+        if items[idx].label.ok { (&mut items[idx]).label.pass.draw(device, encoder, target, vp * m, Vec4(0. - hw, 0. - hh, hw, hh)); }
+      }
+      else if kind == 1u32 {
+        let f = self.chipFrame(idx, list.len(), eye, now);
+        let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
+        let which = usize.from(*list[idx]);
+        let hw = chips[which].w * f.w * 0.5;
+        let hh = chips[which].h * f.w * 0.5;
+        if chips[which].ok { (&mut chips[which]).pass.draw(device, encoder, target, vp * m, Vec4(0. - hw, 0. - hh, hw, hh)); }
+      }
+      else if kind == 2u32 {
+        let m = Mat4.fromTrs(Vec3(-4.74, 0.45, 3.2 - 1.6 * f32.from(idx)), Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
+        if stages[idx].ok { (&mut stages[idx]).pass.draw(device, encoder, target, vp * m, Vec4(-0.45, -0.1125, 0.45, 0.1125)); }
+      }
+      else if kind == 3u32 {
+        let st = usize.from(cards[idx].stage);
+        let pos = self.cardPos(st, extra);
+        let m = Mat4.fromTrs(pos, Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
+        if cards[idx].hot && hotPhase {
+          if cards[idx].glow.ok { (&mut cards[idx]).glow.pass.draw(device, encoder, target, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375)); }
+        } else {
+          if cards[idx].calm.ok { (&mut cards[idx]).calm.pass.draw(device, encoder, target, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375)); }
+        }
+      }
+      else {
+        match panel {
+          case var &mut Some(p) { p.drawPage(device, encoder, target, vp * self.pageModel()); }
+          else {}
+        }
+      }
+      n = n + 1usize;
+    }
+  }
+
+  fn cardPos(self: &, stage: usize, n: u32) Vec3 {
+    Vec3(-4.62, 1.11 + 0.32 * f32.from(n), 3.2 - 1.6 * f32.from(stage))
+  }
+}
+
+const NO_SLOT = 0xFFFFFFFDu32;
