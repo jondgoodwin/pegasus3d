@@ -117,11 +117,13 @@ struct Shell {
   pub fresh: bool;                // the frame's input not yet read
   pub visitor: Fly;               // the visitor's eye and which way it looks
   pub readback: Buffer;           // the shot frame's pixels, copied in render, read in present
-  pub target: SurfaceTexture;     // the swapchain's texture the next frame draws into
+  pub xr: XrRig;                  // --xr: the controllers, the rig the visitor stands on, the beams' art (xr.cone); its handles end before the renderer
+  pub target: SurfaceTexture;     // the swapchain's texture the next frame draws into (--xr: the eye's image, swapped in)
   pub fx: ImageFx;                // the image-quality passes round the renderer's frame
   pub post: Post;                 // bloom and the tone map, into the swapchain's texture
   pub renderer: Renderer;
   pub swapchain: SwapChain;
+  pub headset: Headset;           // --xr: the OpenXR session; ends before the device it draws on
   pub device: Device;
   pub adapter: Adapter;
   pub surface: Surface;
@@ -131,6 +133,7 @@ struct Shell {
   pub light: Light;
   pub other: Option[DocPanel];    // the panel not shown: the document while a reply is read, or the last reply while the document is
   pub bridge: Option[Bridge];     // '--bridge DIR': the studio bridge (bridge.cone)
+  pub format: u32;                // the color format the pictures are drawn in: the swapchain's, or a headset's eye images'
 }
 
 // Made in start. (A global Option cannot be matched in place, only a borrow
@@ -139,6 +142,9 @@ var shell: Option[Shell];
 
 // From the command line
 var @threadlocal testPart = false;
+var @threadlocal xrOn = false;             // '--xr': drawn into an OpenXR headset (xr.cone); the window, if there is one, mirrors the left eye
+var @threadlocal xrShotsArg: *u8 = null;   // '--xr-shots PREFIX': each eye's picture to PREFIX-left.bmp and PREFIX-right.bmp (and PREFIX-mirror.bmp)
+var @threadlocal xrShotAt = 90;        // '--xr-shot-at N': on headset frame N (the left eye's; the right eye's is the next frame's)
 var @threadlocal worldArg: *u8 = null;     // '--world NAME': worlds\NAME.ddd, or a URL fetched; home if not given
 var @threadlocal programPath: *u8 = null;  // how the program was started: its worlds folder is found from it
 var @threadlocal shot = false;             // '--shot': the shot frame to build\shot.bmp
@@ -196,28 +202,57 @@ fn takeShell() Option[Shell] {
 }
 
 pub fn start(host: &mut Host) bool {
-  if !host.hasWindow() {
+  if !host.hasWindow() && !xrOn {
     print <- "The guide browser needs a window\n";
     return false;
   }
-  var instance = Instance.createWindowed("guidebrowser", false);
-  var surface = instance.createSurface(host.window().sdlHandle());
-  var adapter = instance.requestAdapter(&surface, POWER_PREFERENCE_HIGH_PERFORMANCE);
-  if !adapter.isValid() {
-    print <- "No GPU can draw to the window\n";
-    return false;
+  // (declared in this order, they end the other way: the headset before the GPU it draws on, the swapchain before the device, the
+  // instance last)
+  var instance = Instance.none();
+  var surface = Surface.none();
+  var adapter = Adapter.none();
+  var device = Device.none();
+  var swapchain = SwapChain.none();
+  var gpu = HeadsetGpu.none();
+  var headset = Headset.none();
+  var format = 0u32;
+  var winW = 0u32;
+  var winH = 0u32;
+  if xrOn {
+    // --xr: the runtime makes the Vulkan instance and device (xr.cone); the window, if there is one, is the mirror of the left eye
+    headset = openHeadset(host, &mut gpu);
+    if !headset.isValid() { return false; }
+    device <-> gpu.device;
+    adapter <-> gpu.adapter;
+    instance <-> gpu.instance;
+    winW = headset.eyeWidth;
+    winH = headset.eyeHeight;
+    format = headset.colorFormat;
+  } else {
+    instance = Instance.createWindowed("guidebrowser", false);
+    surface = instance.createSurface(host.window().sdlHandle());
+    adapter = instance.requestAdapter(&surface, POWER_PREFERENCE_HIGH_PERFORMANCE);
+    if !adapter.isValid() {
+      print <- "No GPU can draw to the window\n";
+      return false;
+    }
+    print <- "Adapter: "; printStr(adapter.name.view()); print <- "\n";
+    device = adapter.requestDevice();
+    let size = host.window().size();
+    winW = u32.from(size.w);
+    winH = u32.from(size.h);
+    swapchain = device.createSwapChain(&surface, winW, winH, TEXTURE_FORMAT_DEPTH32_FLOAT);
+    format = swapchain.format;
   }
-  print <- "Adapter: "; printStr(adapter.name.view()); print <- "\n";
-  var device = adapter.requestDevice();
-  let size = host.window().size();
-  var swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
   // The scene is drawn in high dynamic range, a half-float frame, which the
   // image-quality passes (ImageFx: temporal anti-aliasing, ambient occlusion,
   // auto-exposure) and the Post (bloom, the tone map) finish into the
   // swapchain's texture; glass and reflections by rays where the GPU has them
   var renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
-  let rays = renderer.setRayTracing(&mut device, true);
-  var post = Post.create(&mut device, swapchain.format, u32.from(size.w), u32.from(size.h));
+  // (a headset's device is the runtime's, made from the create-info the program handed it: it has ray queries only if asked for,
+  // PEGASUS_XR_RT=on; the glass is then the raster glass)
+  let rays = renderer.setRayTracing(&mut device, !xrOn || xrRayTraced());
+  var post = Post.create(&mut device, format, winW, winH);
   if !renderer.isValid() || !post.isValid() {
     print <- "The renderer could not be made\n";
     return false;
@@ -260,7 +295,7 @@ pub fn start(host: &mut Host) bool {
   let loader = Loader(readyTx);
   var panel: Option[DocPanel] = None;
   if docArg != null {
-    panel = DocPanel.create(&mut device, &mut renderer, swapchain.format, cstr.fromPtr(docArg).view(), f32.from(docScroll));
+    panel = DocPanel.create(&mut device, &mut renderer, format, cstr.fromPtr(docArg).view(), f32.from(docScroll));
     match &panel { case is None { print <- "The document panel could not be made\n"; } else {} }
   }
   var bridge: Option[Bridge] = None;
@@ -268,13 +303,16 @@ pub fn start(host: &mut Host) bool {
   let world = if worldArg == null { String.from(if docArg != null { "doc" } else { "home" }) } else { String.from(cstr.fromPtr(worldArg).view()) };
   loader.arrive(world, worldsFolder(), arrivedAt, testPart, show);
 
-  let target = swapchain.getCurrentTexture(&mut device);
+  // (a headset's eye images are swapped into the target while an eye is drawn; until then it is a stand-in of the eye's format)
+  let target = if xrOn { standInTarget(&mut device, headset.eyeWidth, headset.eyeHeight, format) } else { swapchain.getCurrentTexture(&mut device) };
   var wh = Warehouse.empty();
-  if worldArg != null && libc.strcmp(cstr.fromPtr(worldArg), "warehouse") == 0i32 { wh = Warehouse.create(&mut device, swapchain.format); if startYaw == 0. { startYaw = 72.; } }
-  shell = Some[Shell](Shell(Scene.empty(), panel, wh, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
+  if worldArg != null && libc.strcmp(cstr.fromPtr(worldArg), "warehouse") == 0i32 { wh = Warehouse.create(&mut device, format); if startYaw == 0. { startYaw = 72.; } }
+  var made = Shell(Scene.empty(), panel, wh, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
     List[PartView](), 0u64, NO_CLICK, Input(), actions, walk, look, true,
-    Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), target, fx, post, renderer, swapchain, device,
-    adapter, surface, instance, DrawList(), camera, light, None, bridge));
+    Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), XrRig.make(xrOn), target, fx, post, renderer, swapchain, Headset.none(), device,
+    adapter, surface, instance, DrawList(), camera, light, None, bridge, format);
+  made.headset <-> headset;
+  shell = Some[Shell](made);
   true
 }
 
@@ -285,11 +323,15 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
   var g = takeShell();
   match &mut g {
     case var &mut Some(some) {
-      if host.window().resized {
+      if host.hasWindow() && host.window().resized {
         host.window().resized = false;
         let size = host.window().size();
-        (*some).swapchain.resize(u32.from(size.w), u32.from(size.h));
-        (*some).post.resize(&mut (*some).device, u32.from(size.w), u32.from(size.h));
+        if (*some).xr.on {
+          (*some).headset.resizeMirror(u32.from(size.w), u32.from(size.h));
+        } else {
+          (*some).swapchain.resize(u32.from(size.w), u32.from(size.h));
+          (*some).post.resize(&mut (*some).device, u32.from(size.w), u32.from(size.h));
+        }
       }
       (*some).input.handle(e);
       if e.type == sdl.EVENT_MOUSE_WHEEL {
@@ -334,6 +376,12 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
 // the first, cheap test: a ray that enters it is then tested against the part's triangles, so a tall piece's empty box (the air
 // beside a chess queen, say) takes no click meant for a pawn behind it.
 fn nearestPart(parts: &mut List[Live], eye: Vec3, direction: Vec3) u32 {
+  var distance = 0.f;
+  nearestPartAt(parts, eye, direction, &mut distance)
+}
+
+// The same, and how far along the ray (a unit vector) the surface is met (the headset's beam ends there)
+fn nearestPartAt(parts: &mut List[Live], eye: Vec3, direction: Vec3, distance: &mut f32) u32 {
   var best = 1.0e30f;
   var hit = NO_CLICK;
   var k = 0usize;
@@ -361,6 +409,7 @@ fn nearestPart(parts: &mut List[Live], eye: Vec3, direction: Vec3) u32 {
     }
     k = k + 1usize;
   }
+  *distance = best;
   hit
 }
 
@@ -404,6 +453,12 @@ fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
   let eye = s.camera.origin;
   let direction = (p.xyz() * (1. / p.w) - eye).normalize();
+  clickRay(s, eye, direction, x, y, false, frame);
+}
+
+// A click along a ray from 'eye': the mouse's (through the point x, y of the window) or a controller's beam (xr.cone, 'beam' true).
+// A chip, a card, a page, else the part the ray meets.
+fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: bool, frame: u64) {
   var onPanel = false;
   if s.wh.on {
     if s.wh.clickChip(eye, direction, &s.visitor) { return; }
@@ -420,7 +475,9 @@ fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   }
   let hit = nearestPart(&mut s.scene.parts, eye, direction);
   var k = 0usize;
-  print <- "loop: frame "; print <- frame; print <- ", a click at ("; print <- x; print <- ", "; print <- y; print <- "): ";
+  print <- "loop: frame "; print <- frame;
+  if beam { print <- ", a click by a controller's beam: "; }
+  else { print <- ", a click at ("; print <- x; print <- ", "; print <- y; print <- "): "; }
   if hit == NO_CLICK { print <- "nothing\n"; if s.wh.on { s.wh.select(-1); } return; }
   k = 0usize;
   while k < s.scene.parts.len() {
@@ -659,7 +716,13 @@ fn takePublished(s: &mut Shell) {
 pub fn draw(host: &mut Host, alpha: f32, scratch: &mut Arena) {
   var g = takeShell();
   match &mut g {
-    case var &mut Some(some) { drawScene(&mut *some, alpha); }
+    case var &mut Some(some) {
+      if (*some).xr.on {
+        if !drawXr(&mut *some, alpha) { host.stop(); }      // the headset's session is over: so is the run
+      } else {
+        drawScene(&mut *some, alpha);
+      }
+    }
     else {}
   }
   shell = g;
@@ -765,7 +828,7 @@ fn showReply(s: &mut Shell, n: u32) {
     }
     else {
       s.panel <-> s.other;
-      s.panel = DocPanel.create(&mut s.device, &mut s.renderer, s.swapchain.format, pv, 0.);
+      s.panel = DocPanel.create(&mut s.device, &mut s.renderer, s.format, pv, 0.);
     }
   }
   var note = String();
@@ -818,6 +881,13 @@ fn bridgeTick(s: &mut Shell) {
 
 fn drawScene(s: &mut Shell, alpha: f32) {
   if !s.target.ok() { return; }
+  prepareScene(s, alpha);
+  drawDesktop(s);
+}
+
+// Everything a frame needs before a picture is taken: the panels ticked, the warehouse updated, the visitor's pose (the camera's
+// origin and orientation) and the draw list. The window's frame (drawDesktop) and each of a headset's eyes (xr.cone) draw from it.
+fn prepareScene(s: &mut Shell, alpha: f32) {
   match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
   match &mut s.other { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
   bridgeTick(s);
@@ -887,6 +957,9 @@ fn drawScene(s: &mut Shell, alpha: f32) {
     s.list.addTinted(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place, Color(glowR, glowG, glowB, 1.));
     k = k + 1usize;
   }
+}
+
+fn drawDesktop(s: &mut Shell) {
   var encoder = s.device.createCommandEncoder();
   s.fx.render(&mut s.device, &mut encoder, &mut s.renderer, &mut s.post, &s.camera, &s.light, &s.list, &s.target.texture);
   // The document page goes on top of the finished picture, unlit (docpanel.cone, PagePass)
@@ -921,7 +994,7 @@ pub fn present(host: &mut Host) {
   var g = takeShell();
   match &mut g {
     case var &mut Some(some) {
-      showAndAcquire(&mut *some);
+      if !(*some).xr.on { showAndAcquire(&mut *some); }
       // '--click-at N': a click where the last part is drawn, as a person's would come
       if clickAt != 0 && drawn == clickAt { clickLast(&mut *some, host); }
       var c = 0;
@@ -1052,6 +1125,7 @@ pub fn quit(host: &mut Host) i32 {
     case var &mut Some(some) {
       (*some).device.waitIdle();
       print <- "Parts live: "; print <- (*some).activated; print <- "\n";
+      if (*some).xr.on { reportXr(&*some); }
     }
     else {}
   }
@@ -1107,6 +1181,9 @@ fn main(argc: i32, argv: **u8) i32 {
     let arg = cstr.fromPtr(*(argv + usize.from(a)));
     let more = a + 1i32 < argc;
     if libc.strcmp(arg, "--test-part") == 0i32 { testPart = true; }
+    if libc.strcmp(arg, "--xr") == 0i32 { xrOn = true; }
+    if libc.strcmp(arg, "--xr-shots") == 0i32 && more { xrShotsArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--xr-shot-at") == 0i32 && more { xrShotAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--shot") == 0i32 { shot = true; }
     if libc.strcmp(arg, "--show") == 0i32 { show = true; }
     if libc.strcmp(arg, "--world") == 0i32 && more { worldArg = *(argv + usize.from(a + 1i32)); }

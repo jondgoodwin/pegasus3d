@@ -1,0 +1,567 @@
+// The studio in a headset (--xr).
+//
+// The warehouse is drawn into an OpenXR headset (render's Headset: the runtime makes the Vulkan instance and device, hands over
+// each eye's images, and does the lens distortion and the compositing). The picture is the one the window draws, twice a frame:
+// prepareScene (guidebrowser.cone) makes the draw list once, then each eye is the renderer's plain path (render, then the tone map)
+// into that eye's image, and the document panel's PagePass quads over it in that eye's projection, depth tested against the eye's
+// depth, as on the desktop. The image-quality passes (ImageFx) are not used: their temporal passes keep one history for two eyes.
+//
+// THE RIG. The visitor of the desktop is an eye (Fly: a position and a yaw). In a headset the visitor stands on a rig, FEET and a YAW,
+// and the headset's floor space hangs on it:
+//
+//   eye in the world = feet + yaw(rig) * the eye's position in floor space; turned by yaw(rig) * the eye's orientation
+//
+// Each frame the visitor (s.visitor) is set to the head's place and facing, so everything that reads it (the chips facing him, the
+// file browser opening in front of him, the glides to a project) works as on the desktop; whatever those, or the keyboard, move it by
+// is taken back into the rig the next frame ('absorb'). The start spot is where the arrival put the visitor, at standing eye height:
+// in a floor space the rig is on the floor and the head is as tall as he is; in a seated space the rig is at the visitor's eye height.
+//
+// THE CONTROLLERS, as the browser's (xrhands.cone) and Meta's guidelines:
+//   - the left stick walks, relative to where the head faces, analog past a dead zone of 0.2
+//   - the right stick turns in snaps of 30 degrees about the head: past 0.7 to a side, armed again under 0.3
+//   - the beam of a controller is its aim ray; it ends at what a click would take (chip, card, page, file browser, report, or a
+//     part), and a dot marks the end. The trigger is the mouse's click along it (clickRay)
+//   - a grip, or the right A, opens the file browser (as F); B and X go back in the page's history, Y goes forward
+//
+// PEGASUS_XR_FAKE=1 (a test, for the simulator, which has no controllers): the right hand is held at the hip and pointed at the page;
+// PEGASUS_XR_FAKE_CLICK=N pulls its trigger on headset frame N.
+
+const XR_DEAD_ZONE = 0.2f;
+const XR_SNAP_PUSH = 0.7f;
+const XR_SNAP_REARM = 0.3f;
+const XR_SNAP_RADIANS = 0.5235988f;      // 30 degrees
+const XR_TRIGGER_DOWN = 0.75f;
+const XR_TRIGGER_UP = 0.5f;
+const XR_GRIP_DOWN = 0.8f;
+const XR_BEAM_MAX = 6.0f;                // metres, a beam that meets nothing
+const XR_BEAM_SHORT = 0.01f;             // a beam stops this short of the page, so the page's quad is not fought with
+const XR_BUZZ_SECONDS = 0.03f;
+const XR_BUZZ_AMPLITUDE = 0.4f;
+const XR_STAND_EYE = 1.6f;
+
+// The foveation level asked for (PEGASUS_XR_FOVEATION: off, low, medium, high; medium by default), read when the device is made
+var @threadlocal xrFoveation = FoveationLevel.Medium;
+
+// One controller, in the world
+pub struct XrHandNow {
+  pub active: bool = false;
+  pub gripValid: bool = false;
+  pub gripPos: Vec3 = Vec3(0., 0., 0.);
+  pub gripRot: Quat = Quat(0., 0., 0., 1.);
+  pub aimValid: bool = false;
+  pub aimPos: Vec3 = Vec3(0., 0., 0.);
+  pub aimDir: Vec3 = Vec3(0., 0., -1.);
+  pub aimRot: Quat = Quat(0., 0., 0., 1.);
+  pub trigger: f32 = 0.;
+  pub squeeze: f32 = 0.;
+  pub stickX: f32 = 0.;
+  pub stickY: f32 = 0.;
+  pub primaryPressed: bool = false;      // A on the right, X on the left
+  pub secondaryPressed: bool = false;    // B on the right, Y on the left
+}
+
+pub struct XrRig {
+  pub on: bool = false;
+  pub started: bool = false;             // the rig has been put under the visitor
+  pub floorSpace: bool = false;          // the eyes are located in a floor space (the head is as high as he is)
+  pub feet: Vec3 = Vec3(0., 0., 0.);
+  pub yaw: f32 = 0.;                     // the rig's turn, radians (0 faces -z)
+  pub head: Vec3 = Vec3(0., 0., 0.);     // the head in floor space (between the eyes)
+  pub headForward: Vec3 = Vec3(0., 0., -1.);
+  pub lastVisitor: Vec3 = Vec3(0., 0., 0.);
+  pub lastVisitorYaw: f32 = 0.;
+  pub snapArmed: bool = true;
+  pub left: XrHandNow = XrHandNow();
+  pub right: XrHandNow = XrHandNow();
+  pub trigger0: bool = false;            // each trigger was down at the last frame
+  pub trigger1: bool = false;
+  pub grip0: bool = false;
+  pub grip1: bool = false;
+  pub beam0: f32 = 0.;                   // the length drawn for each hand, and whether it ends at something
+  pub beam1: f32 = 0.;
+  pub hit0: bool = false;
+  pub hit1: bool = false;
+  pub clicks: u32 = 0u32;                // triggers pulled, and how many landed on something
+  pub frames: u64 = 0u64;                // headset frames drawn
+  pub lastTick: u64 = 0u64;
+  pub firstTick: u64 = 0u64;
+  pub lastTickMs: f64 = 0.0f64;
+  pub shotsDone: u32 = 0u32;
+  pub mirrorShot: bool = false;
+  pub fake: bool = false;
+  pub fakeClickAt: u64 = 0u64;
+  pub foveaTold: bool = false;
+  pub artMade: bool = false;
+  pub cube: MeshHandle = MeshHandle.none();
+  pub ball: MeshHandle = MeshHandle.none();
+  pub leftBody: MaterialHandle = MaterialHandle.none();
+  pub rightBody: MaterialHandle = MaterialHandle.none();
+  pub beam: MaterialHandle = MaterialHandle.none();
+  pub dot: MaterialHandle = MaterialHandle.none();
+  pub glowFor: f32 = 0.;                 // the exposure the materials' glow was set for
+  pub fovea: Foveation;
+
+  pub fn make(on: bool) XrRig {
+    var r = XrRig(fovea: Foveation.make(xrFoveation));
+    r.on = on;
+    r.fake = (libc.getenv("PEGASUS_XR_FAKE") as usize) != 0usize;
+    let at = libc.getenv("PEGASUS_XR_FAKE_CLICK");
+    if (at as usize) != 0usize { r.fakeClickAt = u64.from(i32.from(libc.atoi(at))); }
+    r
+  }
+}
+
+// PEGASUS_XR_RT=on asks for ray queries on the headset's device (the glass is then ray-traced); off by default
+fn xrRayTraced() bool {
+  let e = libc.getenv("PEGASUS_XR_RT");
+  (e as usize) != 0usize && libc.strcmp(cstr.fromPtr(e), "on") == 0i32
+}
+
+// The eye's image of the eye's format, with a depth texture: what the target is until an eye's images are swapped into it
+fn standInTarget(device: &mut Device, width: u32, height: u32, format: u32) SurfaceTexture {
+  let colorDesc = TextureDescriptor(width, height, format, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+  let color = device.createTexture(&colorDesc);
+  let depthDesc = TextureDescriptor(width, height, TEXTURE_FORMAT_DEPTH32_FLOAT, TEXTURE_USAGE_RENDER_ATTACHMENT);
+  let depth = device.createTexture(&depthDesc);
+  SurfaceTexture(color, depth, SURFACE_TEXTURE_SUCCESS_OPTIMAL)
+}
+
+// Open the headset on the runtime's GPU: the window (if there is one) mirrors the left eye. Headset.none() if there is no headset or
+// its session did not begin.
+fn openHeadset(host: &mut Host, gpu: &mut HeadsetGpu) Headset {
+  var options = HeadsetOptions();
+  options.copySource = xrShotsArg != null;
+  let foveaEnv = libc.getenv("PEGASUS_XR_FOVEATION");
+  if (foveaEnv as usize) != 0usize {
+    match FoveationLevel.named(cstr.fromPtr(foveaEnv).view()) {
+      case let Some(named) { xrFoveation = named; }
+      case is None { print <- "PEGASUS_XR_FOVEATION is not off, low, medium or high: medium\n"; }
+    }
+  }
+  options.foveation = xrFoveation != FoveationLevel.Off;
+  options.rayTracing = xrRayTraced();
+  if host.hasWindow() {
+    options.mirrorWindow = host.window().sdlHandle() as *u8 as usize;
+    let size = host.window().size();
+    options.mirrorWidth = u32.from(size.w);
+    options.mirrorHeight = u32.from(size.h);
+  }
+  var headset = Headset.open("guidebrowser", &options, gpu);
+  if !headset.isValid() {
+    print <- "No headset could be opened (see above)\n";
+    return Headset.none();
+  }
+  // The session begins when the runtime says READY, a moment after it was made: the first frame waits for it
+  var waited = 0;
+  while !headset.isRunning() && waited < 1000 {
+    if !headset.pollEvents() { break; }
+    sdl.Delay(10u32);
+    waited = waited + 1;
+  }
+  if !headset.isRunning() {
+    print <- "The headset's session did not begin\n";
+    return Headset.none();
+  }
+  print <- "Adapter: "; printStr(gpu.adapterName()); print <- "; headset "; printStr(headset.systemName.view()); print <- " by ";
+  printStr(headset.runtimeName.view()); print <- ", each eye "; print <- u64.from(headset.eyeWidth); print <- " x ";
+  print <- u64.from(headset.eyeHeight); print <- if headset.hasMirror() { ", the left eye in the window\n" } else { ", no window\n" };
+  if xrFoveation != FoveationLevel.Off && !headset.foveated { xrFoveation = FoveationLevel.Off; }
+  print <- "Foveation: "; printStr(xrFoveation.name());
+  print <- if headset.foveated { " (the periphery of each eye shaded in coarser blocks)\n" } else if options.foveation { " (asked for, not available on this device)\n" } else { " (off by request)\n" };
+  headset
+}
+
+fn xrYawOf(forward: Vec3) f32 { atan2(0. - forward.x, 0. - forward.z) }
+
+fn xrDeadZone(x: f32, y: f32) Vec2 {
+  let m = sqrt(x * x + y * y);
+  if m <= XR_DEAD_ZONE { return Vec2(0., 0.); }
+  var scale = (m - XR_DEAD_ZONE) / (1. - XR_DEAD_ZONE);
+  if scale > 1. { scale = 1.; }
+  Vec2(x / m * scale, y / m * scale)
+}
+
+fn rigQuat(r: &XrRig) Quat { Quat.angleAxis(r.yaw, Vec3(0., 1., 0.)) }
+
+// Turn the rig to 'yaw' about the head: the head stays where it is in the world
+fn turnAboutHead(r: &mut XrRig, yaw: f32) {
+  let before = Quat.angleAxis(r.yaw, Vec3(0., 1., 0.)) * r.head;
+  let after = Quat.angleAxis(yaw, Vec3(0., 1., 0.)) * r.head;
+  r.feet = Vec3(r.feet.x + before.x - after.x, r.feet.y, r.feet.z + before.z - after.z);
+  r.yaw = yaw;
+}
+
+// One controller of the frame, in the world
+fn xrHandOf(s: &Shell, frame: &HeadsetFrame, h: usize) XrHandNow {
+  var hs = XrHandNow();
+  let hd = s.headset.hand(frame, h);
+  if !hd.active { return hs; }
+  let q = rigQuat(&s.xr);
+  hs.active = true;
+  hs.gripValid = hd.grip.valid;
+  hs.gripPos = s.xr.feet + q * hd.grip.position;
+  hs.gripRot = q * hd.grip.orientation;
+  hs.aimValid = hd.aim.valid;
+  hs.aimPos = s.xr.feet + q * hd.aim.position;
+  hs.aimRot = q * hd.aim.orientation;
+  hs.aimDir = (q * hd.aim.forward()).normalize();
+  hs.trigger = hd.trigger;
+  hs.squeeze = hd.squeeze;
+  hs.stickX = hd.stickX;
+  hs.stickY = hd.stickY;
+  hs.primaryPressed = hd.primary.pressed;
+  hs.secondaryPressed = hd.secondary.pressed;
+  hs
+}
+
+// The simulator has no controllers: the right hand held at the hip, pointed at the page (or where the page would be), and its
+// trigger pulled on the frame PEGASUS_XR_FAKE_CLICK names
+fn xrFakeHand(s: &Shell) XrHandNow {
+  var hs = XrHandNow();
+  let q = rigQuat(&s.xr);
+  let head = s.xr.feet + q * s.xr.head;
+  let facing = q * s.xr.headForward;
+  let flat = Vec3(facing.x, 0., facing.z).normalize();
+  let side = Vec3(0. - flat.z, 0., flat.x);
+  let aimAt = if s.wh.on { s.wh.pageModel() * Vec3(0., f32.from(DOC_CENTRE_Y), 0.) } else { Vec3(0., f32.from(DOC_CENTRE_Y), 0.) };
+  hs.active = true;
+  hs.gripValid = true;
+  hs.aimValid = true;
+  hs.aimPos = head + flat * 0.35 + side * 0.2 + Vec3(0., -0.45, 0.);
+  hs.aimDir = (aimAt - hs.aimPos).normalize();
+  hs.aimRot = Quat.look(hs.aimDir);
+  hs.gripPos = hs.aimPos;
+  hs.gripRot = hs.aimRot;
+  if s.xr.fakeClickAt > 0u64 && s.xr.frames >= s.xr.fakeClickAt && s.xr.frames < s.xr.fakeClickAt + 4u64 { hs.trigger = 1.; }
+  hs
+}
+
+// The rig under the visitor the first time, and after that whatever moved the visitor since we set it (a glide, a key) taken into the rig
+fn absorb(s: &mut Shell) {
+  let v = s.visitor.position;
+  if !s.xr.started {
+    s.xr.started = true;
+    s.xr.floorSpace = s.xr.head.y > 0.8;
+    s.xr.yaw = s.visitor.yaw;
+    let q = rigQuat(&s.xr);
+    let h = q * s.xr.head;
+    s.xr.feet = Vec3(v.x - h.x, if s.xr.floorSpace { 0. } else { v.y }, v.z - h.z);
+    print <- "xr: the visitor stands at "; print <- v.x; print <- ", "; print <- v.z; print <- " facing "; print <- s.visitor.yaw;
+    print <- " radians; the head is "; print <- s.xr.head.y; print <- " m up in a "; print <- if s.xr.floorSpace { "floor" } else { "seated" };
+    print <- " space\n";
+    return;
+  }
+  let d = v - s.xr.lastVisitor;
+  s.xr.feet = Vec3(s.xr.feet.x + d.x, s.xr.feet.y, s.xr.feet.z + d.z);
+  if s.visitor.yaw != s.xr.lastVisitorYaw {
+    let turn = s.visitor.yaw - s.xr.lastVisitorYaw;
+    turnAboutHead(&mut s.xr, s.xr.yaw + turn);
+  }
+}
+
+// The left stick walks, the right stick snap-turns
+fn xrLocomote(s: &mut Shell, dt: f32) {
+  let q = rigQuat(&s.xr);
+  let fw = q * s.xr.headForward;
+  var flat = Vec3(fw.x, 0., fw.z);
+  if flat.length() < 0.05 { flat = q * Vec3(0., 0., -1.); }
+  flat = flat.normalize();
+  let right = Vec3(0. - flat.z, 0., flat.x);
+  let m = xrDeadZone(s.xr.left.stickX, s.xr.left.stickY);
+  if m.x != 0. || m.y != 0. {
+    let go = (flat * m.y + right * m.x) * (f32.from(WALK_SPEED) * dt);
+    s.xr.feet = Vec3(s.xr.feet.x + go.x, s.xr.feet.y, s.xr.feet.z + go.z);
+  }
+  let sx = s.xr.right.stickX;
+  if s.xr.snapArmed && (sx > XR_SNAP_PUSH || sx < 0. - XR_SNAP_PUSH) {
+    s.xr.snapArmed = false;
+    turnAboutHead(&mut s.xr, s.xr.yaw + (if sx > 0. { 0. - XR_SNAP_RADIANS } else { XR_SNAP_RADIANS }));
+  }
+  if !s.xr.snapArmed && sx < XR_SNAP_REARM && sx > 0. - XR_SNAP_REARM { s.xr.snapArmed = true; }
+}
+
+// The visitor is the head: where it is and which way it faces, as the desktop's eye is
+fn xrVisitor(s: &mut Shell) {
+  let q = rigQuat(&s.xr);
+  s.visitor.position = s.xr.feet + q * s.xr.head;
+  s.visitor.yaw = xrYawOf(q * s.xr.headForward);
+  s.visitor.pitch = 0.;
+  s.xr.lastVisitor = s.visitor.position;
+  s.xr.lastVisitorYaw = s.visitor.yaw;
+}
+
+// How far a pointing ray goes before it meets what a click would take; XR_BEAM_MAX, and 'hit' false, if it meets nothing
+fn xrReach(s: &mut Shell, eye: Vec3, dir: Vec3, hit: &mut bool) f32 {
+  var best = XR_BEAM_MAX;
+  *hit = false;
+  var t = -1.f;
+  if s.wh.on { t = s.wh.reach(eye, dir, &s.panel); }
+  else { match &s.panel { case let Some(p) { t = p.reach(eye, dir); } else {} } }
+  if t > 0. && t < best { best = t - XR_BEAM_SHORT; *hit = true; }
+  var d = 0.f;
+  let slot = nearestPartAt(&mut s.scene.parts, eye, dir, &mut d);
+  if slot != NO_CLICK && d > 0. && d < best { best = d; *hit = true; }
+  best
+}
+
+// The frame's hands, the walk and the turn, the buttons, the beams and the triggers
+fn xrControl(s: &mut Shell, frame: &HeadsetFrame, dt: f32) {
+  let a = frame.views[0usize].pose;
+  let b = frame.views[1usize].pose;
+  s.xr.head = Vec3((a.position.x + b.position.x) * 0.5, (a.position.y + b.position.y) * 0.5, (a.position.z + b.position.z) * 0.5);
+  s.xr.headForward = Quat(a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w) * Vec3(0., 0., -1.);
+  absorb(s);
+  s.xr.left = xrHandOf(s, frame, 0usize);
+  s.xr.right = xrHandOf(s, frame, 1usize);
+  if s.xr.fake { s.xr.right = xrFakeHand(s); }
+  xrLocomote(s, dt);
+  // (the hands again, now on the rig as it stands)
+  s.xr.left = xrHandOf(s, frame, 0usize);
+  s.xr.right = xrHandOf(s, frame, 1usize);
+  if s.xr.fake { s.xr.right = xrFakeHand(s); }
+  xrVisitor(s);
+}
+
+// After prepareScene: the beams' lengths, the triggers' clicks and the buttons (they act on the warehouse as it now stands)
+fn xrPoint(s: &mut Shell) {
+  var h = 0usize;
+  while h < 2usize {
+    let hs = if h == 0usize { s.xr.left } else { s.xr.right };
+    var len = 0.f;
+    var hit = false;
+    if hs.active && hs.aimValid {
+      len = xrReach(s, hs.aimPos, hs.aimDir, &mut hit);
+      let was = if h == 0usize { s.xr.trigger0 } else { s.xr.trigger1 };
+      let down = hs.trigger > XR_TRIGGER_DOWN || (was && hs.trigger > XR_TRIGGER_UP);
+      if down && !was {
+        s.xr.clicks = s.xr.clicks + 1u32;
+        clickRay(s, hs.aimPos, hs.aimDir, 0., 0., true, s.xr.frames);
+        if hit && !s.xr.fake { s.headset.vibrate(h, XR_BUZZ_SECONDS, XR_BUZZ_AMPLITUDE); }
+      }
+      if h == 0usize { s.xr.trigger0 = down; } else { s.xr.trigger1 = down; }
+    }
+    if h == 0usize { s.xr.beam0 = len; s.xr.hit0 = hit; } else { s.xr.beam1 = len; s.xr.hit1 = hit; }
+    // The grip opens the file browser
+    let gripDown = hs.active && hs.squeeze > XR_GRIP_DOWN;
+    let gripWas = if h == 0usize { s.xr.grip0 } else { s.xr.grip1 };
+    if gripDown && !gripWas { browseAct(s, 8u32); }
+    if h == 0usize { s.xr.grip0 = gripDown; } else { s.xr.grip1 = gripDown; }
+    // A opens it too; B and X go back, Y forward
+    if h == 1usize && hs.primaryPressed { browseAct(s, 8u32); }
+    if h == 1usize && hs.secondaryPressed { browseAct(s, 6u32); }
+    if h == 0usize && hs.primaryPressed { browseAct(s, 6u32); }
+    if h == 0usize && hs.secondaryPressed { browseAct(s, 7u32); }
+    h = h + 1usize;
+  }
+}
+
+// The controllers and their beams in the draw list: a small box at each grip, a thin beam from the aim pose, a dot where it ends.
+// They glow, as the brightness the exposure turns into (the studio's is set by the world; the beam is about as bright as the page).
+fn xrDrawHands(s: &mut Shell) {
+  if !s.xr.artMade {
+    s.xr.artMade = true;
+    let cube = Mesh.cube(0.5);
+    let ball = Mesh.sphere(0.5, 12);
+    s.xr.cube = s.renderer.addMesh(&mut s.device, &cube);
+    s.xr.ball = s.renderer.addMesh(&mut s.device, &ball);
+    let any = Material.plain(Color(1., 1., 1., 1.));
+    s.xr.leftBody = s.renderer.addMaterial(&mut s.device, &any);
+    s.xr.rightBody = s.renderer.addMaterial(&mut s.device, &any);
+    s.xr.beam = s.renderer.addMaterial(&mut s.device, &any);
+    s.xr.dot = s.renderer.addMaterial(&mut s.device, &any);
+    s.xr.glowFor = -1.;
+  }
+  let e = s.renderer.exposure;
+  if e > 0.0000001 && (s.xr.glowFor < 0. || (e - s.xr.glowFor).abs() > 0.02 * s.xr.glowFor) {
+    s.xr.glowFor = e;
+    let leftM = Material.plain(Color(0.15, 0.35, 0.9, 1.)).glowing(Color(0.15, 0.35, 0.9, 1.), 0.25 / e);
+    let rightM = Material.plain(Color(0.9, 0.4, 0.12, 1.)).glowing(Color(0.9, 0.4, 0.12, 1.), 0.25 / e);
+    let beamM = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 1.2 / e);
+    let dotM = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 3.0 / e);
+    s.renderer.setMaterial(&mut s.device, s.xr.leftBody, &leftM);
+    s.renderer.setMaterial(&mut s.device, s.xr.rightBody, &rightM);
+    s.renderer.setMaterial(&mut s.device, s.xr.beam, &beamM);
+    s.renderer.setMaterial(&mut s.device, s.xr.dot, &dotM);
+  }
+  var h = 0usize;
+  while h < 2usize {
+    let hs = if h == 0usize { s.xr.left } else { s.xr.right };
+    if hs.active {
+      if hs.gripValid {
+        s.list.add(s.xr.cube, if h == 0usize { s.xr.leftBody } else { s.xr.rightBody }, Mat4.fromTrs(hs.gripPos, hs.gripRot, Vec3(0.05, 0.05, 0.12)));
+        s.list.dontCastShadow();
+      }
+      if hs.aimValid {
+        let len = if h == 0usize { s.xr.beam0 } else { s.xr.beam1 };
+        let middle = hs.aimPos + hs.aimDir * (len * 0.5);
+        s.list.add(s.xr.cube, s.xr.beam, Mat4.fromTrs(middle, hs.aimRot, Vec3(0.004, 0.004, len)));
+        s.list.dontCastShadow();
+        if if h == 0usize { s.xr.hit0 } else { s.xr.hit1 } {
+          s.list.add(s.xr.ball, s.xr.dot, Mat4.fromTrs(hs.aimPos + hs.aimDir * len, Quat(0., 0., 0., 1.), Vec3(0.02, 0.02, 0.02)));
+          s.list.dontCastShadow();
+        }
+      }
+    }
+    h = h + 1usize;
+  }
+}
+
+// One eye: the scene into the eye's image (the plain path: render into the HDR frame, then the tone map into the image), then the
+// document panel and the warehouse's labels over it in this eye's projection, tested against the eye's depth
+fn xrDrawEye(s: &mut Shell, eye: usize) {
+  var encoder = s.device.createCommandEncoder();
+  s.headset.eyeStart(&mut encoder, eye);
+  s.post.resize(&mut s.device, s.target.texture.width, s.target.texture.height);
+  let rated = s.xr.fovea.level != FoveationLevel.Off && s.xr.fovea.ready(eye);
+  if rated { s.renderer.setShadingRate(&s.device, s.xr.fovea.rate(eye), s.xr.fovea.texelWidth, s.xr.fovea.texelHeight); }
+  // (the ray-traced structure is built from the first eye's view and kept for the second)
+  s.renderer.rtShare = if eye == 0usize { EyeShare.Build } else { EyeShare.Reuse };
+  s.renderer.keepDepth = true;
+  s.renderer.render(&mut s.device, &mut encoder, &s.post.hdr, &s.target.depth, &s.camera, &s.light, &s.list);
+  s.renderer.rtShare = EyeShare.Own;
+  if rated { s.renderer.clearShadingRate(); }
+  s.post.apply(&mut encoder, &s.target.texture);
+  let aspect = f32.from(s.target.texture.width) / f32.from(s.target.texture.height);
+  let vp = s.camera.projectionMatrix(aspect) * s.camera.viewMatrix();
+  if s.wh.on {
+    s.wh.draw(&mut s.device, &mut encoder, &s.target.texture, &s.target.depth, vp, s.camera.origin, &mut s.panel);
+  } else {
+    match &mut s.panel {
+      case var &mut Some(p) { p.drawPage(&mut s.device, &mut encoder, &s.target.texture, vp); }
+      else {}
+    }
+  }
+  s.headset.eyeEnd(&mut encoder, eye, &s.target.texture);
+  s.device.queue.submit(encoder.finish());
+}
+
+// The headset's frame: the runtime's frame loop sets the pace ('beginFrame' waits until the runtime wants a frame and says where the
+// eyes will be when it is shown). False once the session is over.
+fn drawXr(s: &mut Shell, alpha: f32) bool {
+  if !s.headset.pollEvents() { return false; }
+  let frame = s.headset.beginFrame(&mut s.device);
+  if !frame.active { sdl.Delay(5u32); }
+  var shotNow = false;
+  if frame.active && frame.shouldRender && frame.located {
+    let now = sdl.GetPerformanceCounter();
+    var dt = 0.f;
+    if s.xr.lastTick != 0u64 { dt = f32.from(f64.from(now - s.xr.lastTick) / f64.from(sdl.GetPerformanceFrequency())); }
+    if dt > 0.1 { dt = 0.1; }
+    s.xr.lastTick = now;
+    if s.xr.frames == 30u64 { s.xr.firstTick = now; }
+    if !s.xr.foveaTold && s.xr.fovea.level != FoveationLevel.Off {
+      if !s.headset.foveated { s.xr.fovea = Foveation.make(FoveationLevel.Off); }
+      else if s.xr.fovea.prepare(&mut s.device, &frame, s.headset.eyeWidth, s.headset.eyeHeight) {
+        s.xr.foveaTold = true;
+        print <- "Foveation: tiles "; print <- u64.from(s.xr.fovea.texelWidth); print <- " x "; print <- u64.from(s.xr.fovea.texelHeight);
+        print <- " pixels; the left eye is shaded 1x1 on "; print <- s.xr.fovea.fullPercent; print <- "%, 2x2 on "; print <- s.xr.fovea.halfPercent;
+        print <- "%, "; print <- u64.from(s.xr.fovea.coarseWidth); print <- "x"; print <- u64.from(s.xr.fovea.coarseHeight); print <- " on ";
+        print <- s.xr.fovea.coarsePercent; print <- "% of its pixels\n";
+      }
+    }
+    xrControl(s, &frame, dt);
+    prepareScene(s, alpha);
+    xrPoint(s);
+    xrDrawHands(s);
+    // --xr-shots: the left eye's picture (and the window's) on this frame, the right eye's on the next
+    shotNow = xrShotsArg != null && s.xr.frames >= u64.from(xrShotAt) && s.xr.shotsDone < 2u32;
+    if shotNow {
+      s.headset.captureEye(usize.from(s.xr.shotsDone));
+      if s.xr.shotsDone == 0u32 && s.headset.hasMirror() { s.headset.captureMirror(); s.xr.mirrorShot = true; }
+    }
+    let q = rigQuat(&s.xr);
+    var eye = 0usize;
+    while eye < 2usize {
+      if s.headset.acquireEye(&frame, eye) {
+        let v = frame.views[eye];
+        s.camera.origin = s.xr.feet + q * Vec3(v.pose.position.x, v.pose.position.y, v.pose.position.z);
+        s.camera.orientation = q * Quat(v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w);
+        s.camera.setFovAngles(v.fov.angleLeft, v.fov.angleRight, v.fov.angleUp, v.fov.angleDown);
+        let started = sdl.GetPerformanceCounter();
+        s.headset.swapEye(eye, &mut s.target);
+        xrDrawEye(s, eye);
+        s.headset.swapEye(eye, &mut s.target);
+        let seconds = f64.from(sdl.GetPerformanceCounter() - started) / f64.from(sdl.GetPerformanceFrequency());
+        s.headset.eyeSubmitted(&s.device, eye, seconds);
+      }
+      eye = eye + 1usize;
+    }
+    if s.headset.hasMirror() { s.headset.mirrorEye(&mut s.device, 0usize); }
+    s.headset.releaseEye(0usize);
+    s.headset.releaseEye(1usize);
+    s.xr.frames = s.xr.frames + 1u64;
+    drawn = drawn + 1;
+    if s.xr.frames == 30u64 { s.headset.resetTimes(); }
+  }
+  s.headset.endFrame(&mut s.device, &frame);
+  if shotNow {
+    s.device.waitIdle();
+    var name = String.from(cstr.fromPtr(xrShotsArg).view());
+    name <- if s.xr.shotsDone == 0u32 { "-left.bmp" } else { "-right.bmp" };
+    let bgra = s.headset.colorFormat == TEXTURE_FORMAT_BGRA8_UNORM_SRGB || s.headset.colorFormat == TEXTURE_FORMAT_BGRA8_UNORM;
+    writeBmp(name.view(), s.headset.capturedBytes(), s.headset.eyeWidth, s.headset.eyeHeight, bgra);
+    s.xr.shotsDone = s.xr.shotsDone + 1u32;
+  }
+  if s.xr.mirrorShot && !s.headset.mirrorCapturePending() {
+    s.device.waitIdle();
+    var name = String.from(cstr.fromPtr(xrShotsArg).view());
+    name <- "-mirror.bmp";
+    let bgra = s.headset.mirrorFormat() == TEXTURE_FORMAT_BGRA8_UNORM_SRGB || s.headset.mirrorFormat() == TEXTURE_FORMAT_BGRA8_UNORM;
+    writeBmp(name.view(), s.headset.capturedMirror(), s.headset.mirrorCaptureWidth(), s.headset.mirrorCaptureHeight(), bgra);
+    s.xr.mirrorShot = false;
+  }
+  true
+}
+
+// A picture as a 24-bit BMP (rows top down in, bottom up out)
+fn writeBmp(path: &str, pixels: *u8, w: u32, h: u32, bgra: bool) {
+  let row = (w * 3u32 + 3u32) / 4u32 * 4u32;
+  var out = List[u8]();
+  out.push('B'); out.push('M');
+  push32(&mut out, 54u32 + row * h); push32(&mut out, 0u32); push32(&mut out, 54u32);
+  push32(&mut out, 40u32); push32(&mut out, w); push32(&mut out, h);
+  out.push(1u8); out.push(0u8); out.push(24u8); out.push(0u8);
+  push32(&mut out, 0u32); push32(&mut out, row * h); push32(&mut out, 2835u32); push32(&mut out, 2835u32);
+  push32(&mut out, 0u32); push32(&mut out, 0u32);
+  var y = h;
+  while y > 0u32 {
+    y = y - 1u32;
+    var x = 0u32;
+    while x < w {
+      let p = pixels + usize.from((y * w + x) * 4u32);
+      out.push(*(p + (if bgra {0usize} else {2usize})));
+      out.push(*(p + 1usize));
+      out.push(*(p + (if bgra {2usize} else {0usize})));
+      x = x + 1u32;
+    }
+    var pad = w * 3u32;
+    while pad < row { out.push(0u8); pad = pad + 1u32; }
+  }
+  match fs.writeFile(&Path.from(path), out.view()) {
+    case let Ok(v) { print <- "Screenshot: "; printStr(path); print <- "\n"; }
+    case let Err(e) { print <- "Screenshot "; printStr(path); print <- " could NOT be written: "; print <- e; print <- "\n"; }
+  }
+}
+
+// The end of a headset run: the frames shown, the triggers pulled, and what an eye cost on each side (the CPU's: everything the eye's
+// frame did; the GPU's: its main pass between two timestamps; both means over the frames after the first 30)
+fn reportXr(s: &Shell) {
+  print <- "Headset: "; printStr(s.headset.runtimeName.view()); print <- ", "; printStr(s.headset.systemName.view());
+  print <- ", each eye "; print <- u64.from(s.headset.eyeWidth); print <- " x "; print <- u64.from(s.headset.eyeHeight); print <- "\n";
+  print <- "XR frames shown: "; print <- s.xr.frames; print <- "; triggers pulled: "; print <- u64.from(s.xr.clicks); print <- "\n";
+  print <- "Command buffers: most in a frame "; print <- u64.from(s.device.commandBuffersUsed()); print <- "; refused: ";
+  print <- u64.from(s.device.commandBuffersDropped()); print <- "\n";
+  if s.xr.frames > 30u64 && s.xr.firstTick != 0u64 {
+    let seconds = f64.from(sdl.GetPerformanceCounter() - s.xr.firstTick) / f64.from(sdl.GetPerformanceFrequency());
+    print <- "Frame interval: "; print <- seconds * 1000.0f64 / f64.from(s.xr.frames - 30u64); print <- " ms (mean over "; print <- s.xr.frames - 30u64; print <- " frames)\n";
+  }
+  var e = 0usize;
+  while e < 2usize {
+    printStr(if e == 0usize { "Left eye" } else { "Right eye" });
+    print <- ": CPU "; print <- s.headset.cpuMeanMs(e); print <- " ms ("; print <- u64.from(s.headset.cpuSamples(e));
+    print <- " frames), GPU "; print <- s.headset.gpuMeanMs(e); print <- " ms ("; print <- u64.from(s.headset.gpuSamples(e));
+    print <- " frames)\n";
+    e = e + 1usize;
+  }
+  print <- "Foveation: "; printStr(s.xr.fovea.level.name()); print <- "\n";
+}
