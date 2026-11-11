@@ -345,8 +345,14 @@ pub struct Warehouse {
   grabIt: i32;             // its number (marker or item)
   zones: List[Zone];                  // the boards at the back (zones.cone)
   dimPass: Option[PagePass];          // the veil over the room while a pane is at the workbench
+  addrBuf: String;                    // what is typed into the general browser's address strip
+  addrShown: String;                  // what the strip's picture says now
   zoneSeen: bool = false;
   benchN: u32 = 0u32;                 // pages opened from a board's tree so far (where the next stands on the workbench)
+  tabCur: u32 = 0u32;                 // the general browser: the number of the tab shown (0: no tabs)
+  tabSerial: u32 = 0u32;
+  tabNext: bool = false;              // the next page opened is a tab
+  addrEdit: bool = false;             // the address strip is being typed into
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -357,7 +363,7 @@ pub struct Warehouse {
       List[String](), String(), String(), false, String.from(LINE_FILE), String.from(DEFAULT_ROOT_BROWSE), List[String](), String(),
       None, 0u32, 0u32, false,
       Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
-      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, List[Zone](), None)
+      false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, List[Zone](), None, String(), String())
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Warehouse {
@@ -830,7 +836,7 @@ pub struct Warehouse {
     var best = -1;
     var bestT: f32 = 1000.;
     var c = 0usize;
-    while c < cards.len() {
+    while c < cards.len() && OLD_LINE {
       let m = Mat4.fromTrs(self.cardPlace(c), Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
       let inv = m.inverse();
       let e = inv * eye;
@@ -1935,6 +1941,186 @@ pub struct Warehouse {
   fn ensureChips(self: &mut, device: &mut Device) {
     if pgChips.len() > 0usize { return; }
     pgChips.push(self.mkLabel(device, "park", 0xc08a20ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    // the general browser's: new tab, close tab, the address strip
+    pgChips.push(self.mkLabel(device, "+", 0x3a8a58ffu32, 0xffffffffu32, 96., 0.2, 0.1));
+    pgChips.push(self.mkLabel(device, "x", 0xb3261effu32, 0xffffffffu32, 96., 0.2, 0.1));
+    pgChips.push(self.mkLabel(device, "address", 0xf6f6f0ffu32, 0x1c1c1cffu32, 40., 1.0, 0.2));
+  }
+
+  // ---- the general browser: tabs (Jon, 11 Nov), an address strip, http links opening as tabs ----
+
+  // The tab pages, by number
+  fn tabList(self: &) List[usize] {
+    var order = List[usize]();
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].tab && !pgs[i].gone {
+        var at = order.len();
+        while at > 0usize && pgs[*order[at - 1usize]].tabNo > pgs[i].tabNo { at = at - 1usize; }
+        order.insert(at, i);
+      }
+      i = i + 1usize;
+    }
+    order
+  }
+
+  fn tabHidden(self: &, i: usize) bool { pgs[i].tab && pgs[i].tabNo != tabCur }
+
+  // The tab shown, or the number of pages if none
+  fn tabVisible(self: &) usize {
+    var i = 0usize;
+    while i < pgs.len() { if pgs[i].tab && !pgs[i].gone && pgs[i].tabNo == tabCur { return i; } i = i + 1usize; }
+    pgs.len()
+  }
+
+  // Tab page 'to' takes the place of the shown tab and becomes the shown one
+  fn showTab(self: &mut, to: usize) {
+    let from = self.tabVisible();
+    if from < pgs.len() && from != to {
+      let p = pgs[from].pos; let y = pgs[from].yaw; let s = pgs[from].sc;
+      (&mut pgs[to]).pos = p; (&mut pgs[to]).toPos = p; (&mut pgs[to]).fromPos = p;
+      (&mut pgs[to]).yaw = y; (&mut pgs[to]).toYaw = y; (&mut pgs[to]).fromYaw = y;
+      (&mut pgs[to]).sc = s; (&mut pgs[to]).toSc = s; (&mut pgs[to]).fromSc = s;
+      (&mut pgs[to]).fly = 1.; (&mut pgs[to]).free = true; (&mut pgs[to]).shelved = false;
+    }
+    self.blurWeb();
+    addrEdit = false;
+    tabCur = pgs[to].tabNo;
+    print <- "tabs: showing "; printStr(pgs[to].src.view()); print <- "\n";
+  }
+
+  fn switchTab(self: &mut, slot: usize) {
+    let order = self.tabList();
+    if slot < order.len() { self.showTab(*order[slot]); }
+  }
+
+  // A web address wanted as a tab (a link of a document, the "+" tab, a test hook): a new tab, shown
+  fn openTab(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str) {
+    var pos = Vec3(2.0, 0., 0. - 2.0);
+    var yaw = Warehouse.faceOrigin(pos);
+    var sc: f32 = 1.;
+    let vi = self.tabVisible();
+    if vi < pgs.len() { pos = pgs[vi].pos; yaw = pgs[vi].yaw; sc = pgs[vi].sc; }
+    self.tabNext = true;
+    let n = self.openPageAs(device, renderer, src, "", false);
+    self.tabNext = false;
+    if n < 0 { return; }
+    let u = usize.from(u32.from(n));
+    self.blurWeb();
+    (&mut pgs[u]).pos = pos; (&mut pgs[u]).toPos = pos; (&mut pgs[u]).fromPos = pos;
+    (&mut pgs[u]).yaw = yaw; (&mut pgs[u]).toYaw = yaw; (&mut pgs[u]).fromYaw = yaw;
+    (&mut pgs[u]).sc = sc; (&mut pgs[u]).toSc = sc; (&mut pgs[u]).fromSc = sc;
+    (&mut pgs[u]).fly = 1.; (&mut pgs[u]).free = true;
+    tabCur = pgs[u].tabNo;
+    addrEdit = false;
+    print <- "tabs: opened "; printStr(src); print <- " as tab "; print <- pgs[u].tabNo; print <- ", "; print <- self.tabList().len(); print <- " tabs\n";
+  }
+
+  fn closeTab(self: &mut) {
+    let vi = self.tabVisible();
+    if vi < pgs.len() { self.closePage(vi); }
+  }
+
+  // Where the shown tab's chrome stands in its page's frame: the tab row above the page, the address strip below
+  fn tabRect(self: &, slot: usize, count: usize) Vec4 {
+    let hw = pgHalfW(true);
+    let top = pgTop(true);
+    let pitch = fminf(0.42, 1.5 / f32.from(u32.from(count)));
+    let x0 = 0. - hw + pitch * f32.from(u32.from(slot));
+    Vec4(x0, top + 0.1, x0 + pitch - 0.02, top + 0.1 + (pitch - 0.02) * 0.25)
+  }
+  fn tabPlusRect(self: &, count: usize) Vec4 {
+    let hw = pgHalfW(true);
+    let top = pgTop(true);
+    let pitch = fminf(0.42, 1.5 / f32.from(u32.from(count)));
+    let x0 = 0. - hw + pitch * f32.from(u32.from(count)) + 0.02;
+    Vec4(x0, top + 0.1, x0 + 0.2, top + 0.2)
+  }
+  fn tabCloseRect(self: &, count: usize) Vec4 {
+    let p = self.tabPlusRect(count);
+    Vec4(p.z + 0.03, p.y, p.z + 0.23, p.w)
+  }
+  fn addrRect(self: &) Vec4 {
+    let hw = pgHalfW(true);
+    let b = pgBottom(true);
+    Vec4(0. - hw, b - 0.22, 0. - hw + 1.1, b - 0.02)
+  }
+
+  // The address strip's and tab titles' pictures follow the shown tab (a few times a second)
+  fn refreshTabs(self: &mut) {
+    let vi = self.tabVisible();
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].tab && !pgs[i].gone {
+        let want: u32 = if i == vi { 0xffffffffu32 } else { 0xc9ccd4ffu32 };
+        if pgs[i].title.bg != want { (&mut pgs[i].title).bg = want; (&mut pgs[i].title).ok = false; }
+        let sz = fitSize(pgs[i].title.text.len() + pgs[i].title.text.len() / 3usize, 56.);
+        if (pgs[i].title.size - sz).abs() > 0.5 { (&mut pgs[i].title).size = sz; (&mut pgs[i].title).ok = false; }
+      }
+      i = i + 1usize;
+    }
+    if vi >= pgs.len() || pgChips.len() < 4usize { return; }
+    var want = String();
+    if addrEdit { want = addrBuf.clone(); want.append("|"); }
+    else {
+      var a = String();
+      if ticks % 12u32 == 0u32 || pgs[vi].title.text.len() == 0usize {
+        match &pgs[vi].wp { case let Some(w) { a = w.address(); } else {} }
+        if a.len() > 0usize {
+          var sh = pageTitle(a.view());
+          if sh.len() > 1usize && sh.view()[sh.len() - 1usize] == '/' { sh = String.from(sh.view().slice(0usize, sh.len() - 1usize)); }
+          if sh.view() != pgs[vi].title.text.view() {
+            (&mut pgs[vi]).title.text = sh.clone(); (&mut pgs[vi]).title.size = fitSize(sh.len(), 56.); (&mut pgs[vi]).title.ok = false;
+            (&mut pgs[vi]).src = a.clone();
+          }
+        }
+      }
+      want = pgs[vi].src.clone();
+      if want.len() > 1usize && want.view()[want.len() - 1usize] == '/' { want = String.from(want.view().slice(0usize, want.len() - 1usize)); }
+      if startsWithText(want.view(), "https://") { want = String.from(want.view().sliceFrom(8usize)); }
+      else if startsWithText(want.view(), "http://") { want = String.from(want.view().sliceFrom(7usize)); }
+    }
+    if want.view() != addrShown.view() {
+      addrShown = want.clone();
+      (&mut pgChips[3usize]).text = want.clone();
+      (&mut pgChips[3usize]).size = fitSize(want.len() + want.len() / 4usize, 52.);
+      (&mut pgChips[3usize]).ok = false;
+    }
+  }
+
+  fn addrKey(self: &mut, vk: i32) {
+    if vk == 27i32 { addrEdit = false; return; }
+    if vk == 8i32 {
+      var k = addrBuf.len();
+      while k > 0usize { k = k - 1usize; if (addrBuf.view()[k] & 0xC0u8) != 0x80u8 { break; } }
+      addrBuf = String.from(addrBuf.view().slice(0usize, k));
+      return;
+    }
+    if vk == 13i32 {
+      var u = String.from(trimmedText(addrBuf.view()));
+      addrEdit = false;
+      if u.len() == 0usize { return; }
+      if !startsWithText(u.view(), "http://") && !startsWithText(u.view(), "https://") { var h = String.from("https://"); h.append(u.view()); u = h; }
+      let vi = self.tabVisible();
+      if vi < pgs.len() {
+        match &mut pgs[vi].wp { case var &mut Some(w) { w.open(u.view()); } else {} }
+        (&mut pgs[vi]).src = u.clone();
+      }
+      print <- "tabs: address entered "; printStr(u.view()); print <- "\n";
+    }
+  }
+
+  // A click on the shown tab's chrome (kind 20+slot a tab, 30 "+", 31 "x", 32 the address strip)
+  fn tabClick(self: &mut, pu: usize, kind: u32) {
+    if kind >= 20u32 && kind < 30u32 { self.switchTab(usize.from(kind - 20u32)); return; }
+    if kind == 30u32 { self.wantPage("https://jondgoodwin.com"); return; }
+    if kind == 31u32 { self.closeTab(); return; }
+    if kind == 32u32 {
+      self.blurWeb();
+      addrEdit = true;
+      addrBuf = String();
+      print <- "tabs: address strip active\n";
+    }
   }
 
   // A page's own chips (a pass has one set of uniforms, so each page needs its own pictures): close, shelve, grab
@@ -2148,7 +2334,7 @@ pub struct Warehouse {
   fn standing(self: &) usize {
     var n = 0usize;
     var i = 0usize;
-    while i < pgs.len() { if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 { n = n + 1usize; } i = i + 1usize; }
+    while i < pgs.len() { if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 && !pgs[i].tab { n = n + 1usize; } i = i + 1usize; }
     n
   }
 
@@ -2223,7 +2409,7 @@ pub struct Warehouse {
       var old = pgs.len();
       var i = 0usize;
       while i < pgs.len() {
-        if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 && (old == pgs.len() || pgs[i].born < pgs[old].born) { old = i; }
+        if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 && !pgs[i].tab && (old == pgs.len() || pgs[i].born < pgs[old].born) { old = i; }
         i = i + 1usize;
       }
       if old == pgs.len() { return; }
@@ -2249,7 +2435,7 @@ pub struct Warehouse {
     var order = List[usize]();
     var i = 0usize;
     while i < pgs.len() {
-      if !pgs[i].gone && !pgs[i].proj && pgs[i].zone < 0 {
+      if !pgs[i].gone && !pgs[i].proj && pgs[i].zone < 0 && !pgs[i].tab {
         var at = order.len();
         while at > 0usize && pgs[*order[at - 1usize]].born > pgs[i].born { at = at - 1usize; }
         order.insert(at, i);
@@ -2274,7 +2460,8 @@ pub struct Warehouse {
 
   // A file or an address becomes a new page, at the near end of the arc. Returns its number, or -1.
   pub fn openPage(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str) {
-    _ = self.openPageAs(device, renderer, src, "", false);
+    if isWebSrc(src) { self.openTab(device, renderer, src); return; }
+    _ =self.openPageAs(device, renderer, src, "", false);
   }
 
   fn openPageAs(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str, id: &str, proj: bool) i32 {
@@ -2307,6 +2494,10 @@ pub struct Warehouse {
     pgs.push(Pg(pid, String.from(src), web, doc, wp, tl, chips, born, from, yaw0, 0.3, from, yaw0, 0.3, from, yaw0, 1., String()));
     let n = pgs.len() - 1usize;
     (&mut pgs[n]).proj = proj;
+    if tabNext && web {
+      tabSerial = tabSerial + 1u32;
+      (&mut pgs[n]).tab = true; (&mut pgs[n]).tabNo = tabSerial; (&mut pgs[n]).free = true;
+    }
     self.enforceLimit();
     self.retarget();
     if !proj { self.syncRoom(); }
@@ -2318,6 +2509,13 @@ pub struct Warehouse {
   fn closePage(self: &mut, i: usize) {
     if i >= pgs.len() || pgs[i].gone || pgs[i].zone >= 0 { return; }
     print <- "pages: closed "; printStr(pgs[i].title.text.view()); print <- "\n";
+    if pgs[i].tab && pgs[i].tabNo == tabCur {
+      // the shown tab closes: the newest of the others takes its place
+      var best = pgs.len();
+      var j = 0usize;
+      while j < pgs.len() { if j != i && pgs[j].tab && !pgs[j].gone && (best == pgs.len() || pgs[j].tabNo > pgs[best].tabNo) { best = j; } j = j + 1usize; }
+      if best < pgs.len() { self.showTab(best); } else { tabCur = 0u32; addrEdit = false; }
+    }
     (&mut pgs[i]).gone = true;
     if grabIx == i32.from(i) { grabIx = -1; }
     self.retarget();
@@ -2326,7 +2524,7 @@ pub struct Warehouse {
 
   // Shelve a standing page; bring a shelved one back as the newest
   fn toggleShelve(self: &mut, i: usize) {
-    if i >= pgs.len() || pgs[i].gone || pgs[i].zone >= 0 { return; }
+    if i >= pgs.len() || pgs[i].gone || pgs[i].zone >= 0 || pgs[i].tab { return; }
     if pgs[i].shelved {
       (&mut pgs[i]).shelved = false;
       (&mut pgs[i]).free = false;
@@ -2421,9 +2619,10 @@ pub struct Warehouse {
       if !pgs[i].gone {
         if pgs[i].web {
           let up = pgs[i].webUp;
+          let idle = self.tabHidden(i);      // only the tab shown paints
           match &mut pgs[i].wp {
             case var &mut Some(w) {
-              w.tick(device);
+              if !idle { w.tick(device); }
               if up > 0i32 {
                 if up == 1i32 { w.button(w.lastX, w.lastY, true); }
               }
@@ -2452,6 +2651,7 @@ pub struct Warehouse {
     }
     var w = 0usize;
     while w < openWant.len() { self.openPage(device, renderer, openWant[w].view()); w = w + 1usize; }
+    self.refreshTabs();
     // a file clicked in a board's tree opens as a page on the workbench: near the start spot, ahead and to the sides in turn
     w = 0usize;
     while w < benchWant.len() {
@@ -2527,6 +2727,29 @@ pub struct Warehouse {
     else if kind == 2i32 { self.startGrab(i); }
     else if kind == 3i32 { self.dropGrab(); }
     else if kind == 4i32 { self.parkBrowser(device); }
+    // the general browser (test hooks): 10 switch to tab slot n, 11 close the shown tab, 12 type address n into the strip and press Enter,
+    // 13 click the "+" chip, 14 report the tabs
+    else if kind == 10i32 { self.switchTab(i); }
+    else if kind == 11i32 { self.closeTab(); }
+    else if kind == 12i32 {
+      let urls = ["https://web3d.jondgoodwin.com", "https://cone.jondgoodwin.com", "jondgoodwin.com"];
+      addrEdit = true; addrBuf = String();
+      self.webTyped(urls[i % 3usize]);
+      self.addrKey(13i32);
+    }
+    else if kind == 13i32 { self.tabClick(0usize, 30u32); }
+    else if kind == 15i32 { self.openPlanCard(i / 100usize, i % 100usize); }   // click plan card n%100 of board n/100
+    else if kind == 14i32 {
+      let order = self.tabList();
+      var s = 0usize;
+      while s < order.len() {
+        let k = *order[s];
+        print <- "tabs: slot "; print <- s; print <- (if pgs[k].tabNo == tabCur { " SHOWN " } else { " hidden " }); printStr(pgs[k].src.view());
+        match &pgs[k].wp { case let Some(w) { print <- " uploads "; print <- w.uploaded; } else {} }
+        print <- "\n";
+        s = s + 1usize;
+      }
+    }
     // zones: 6 focus the pane zone*8+kind (n), 7 release every pane, 8 follow link n%100 of the pane n/100 (a tree row), 9 scroll the pane n/100 by n%100 notches down
     else if kind == 6i32 {
       let pg = self.paneIndex(i / 8usize, u32.from(i % 8usize));
@@ -2554,10 +2777,25 @@ pub struct Warehouse {
   // The page under a ray and what of it: 0 nothing, 1 the page, 2 close, 3 shelve, 4 grab; the distance along the ray, or -1
   fn pgHit(self: &, i: usize, eye: Vec3, dir: Vec3, kind: &mut u32) f32 {
     *kind = 0u32;
-    if pgs[i].gone { return -1.; }
+    if pgs[i].gone || self.tabHidden(i) { return -1.; }
     let m = self.pgModel(i);
     var best: f32 = -1.;
     let web = pgs[i].web;
+    if pgs[i].tab {
+      let order = self.tabList();
+      var s = 0usize;
+      while s < order.len() {
+        let t = quadHit(m, self.tabRect(s, order.len()), eye, dir);
+        if t > 0. && (best < 0. || t < best) { best = t; *kind = 20u32 + u32.from(s); }
+        s = s + 1usize;
+      }
+      var t2 = quadHit(m, self.tabPlusRect(order.len()), eye, dir);
+      if t2 > 0. && (best < 0. || t2 < best) { best = t2; *kind = 30u32; }
+      t2 = quadHit(m, self.tabCloseRect(order.len()), eye, dir);
+      if t2 > 0. && (best < 0. || t2 < best) { best = t2; *kind = 31u32; }
+      t2 = quadHit(m, self.addrRect(), eye, dir);
+      if t2 > 0. && (best < 0. || t2 < best) { best = t2; *kind = 32u32; }
+    }
     if !pgs[i].shelved {
       let hw = pgHalfW(web);
       let cy = pgTop(web) + 0.05;
@@ -2628,6 +2866,7 @@ pub struct Warehouse {
     if self.clickZones(eye, dir, bt) { return true; }
     if bi < 0 { self.blurWeb(); return false; }
     let pu = usize.from(u32.from(bi));
+    if bk >= 20u32 { self.tabClick(pu, bk); return true; }
     if bk == 2u32 && pgs[pu].zone >= 0 { self.focusPane(pu); return true; }
     if bk == 2u32 { self.closePage(pu); return true; }
     if bk == 3u32 { self.toggleShelve(pu); return true; }
@@ -2671,6 +2910,7 @@ pub struct Warehouse {
 
   // Keys and text for the web page that holds the focus
   pub fn webFocused(self: &) bool {
+    if addrEdit { return true; }
     var i = 0usize;
     while i < pgs.len() {
       match &pgs[i].wp { case let Some(w) { if w.focus { return true; } } else {} }
@@ -2680,6 +2920,7 @@ pub struct Warehouse {
   }
 
   pub fn webTyped(self: &mut, text: &str) {
+    if addrEdit { addrBuf.append(text); return; }
     var i = 0usize;
     while i < pgs.len() {
       match &mut pgs[i].wp { case var &mut Some(w) { if w.focus { w.typed(text); } } else {} }
@@ -2688,6 +2929,7 @@ pub struct Warehouse {
   }
 
   pub fn webKeyed(self: &mut, vk: i32, down: bool, mods: i32, back: bool, forward: bool) {
+    if addrEdit { if down { self.addrKey(vk); } return; }
     var i = 0usize;
     while i < pgs.len() {
       match &mut pgs[i].wp {
@@ -2708,7 +2950,7 @@ pub struct Warehouse {
   pub fn webWheelRay(self: &mut, eye: Vec3, dir: Vec3, notches: f32) bool {
     var i = 0usize;
     while i < pgs.len() {
-      if pgs[i].web && !pgs[i].shelved && !pgs[i].gone {
+      if pgs[i].web && !pgs[i].shelved && !pgs[i].gone && !self.tabHidden(i) {
         let inv = self.pgModel(i).inverse();
         let le = inv * eye;
         let ld = inv.transformVector(dir);
@@ -2916,7 +3158,7 @@ pub struct Warehouse {
   pub fn reach(self: &, eye: Vec3, dir: Vec3, view: Vec3, page: &Option[DocPanel]) f32 {
     var best: f32 = -1.;
     var c = 0usize;
-    while c < cards.len() {
+    while c < cards.len() && OLD_LINE {
       let m = Mat4.fromTrs(self.cardPlace(c), Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
       let inv = m.inverse();
       let e = inv * eye;
@@ -3056,13 +3298,13 @@ pub struct Warehouse {
       k = k + 1usize;
     }
     var s = 0usize;
-    while s < stages.len() {
+    while s < stages.len() && OLD_LINE {
       codes.push(Warehouse.sortKey(2u32, u32.from(s)));
       dists.push((Vec3(-4.74, 0.45, 3.2 - 1.6 * f32.from(s)) - eye).length());
       s = s + 1usize;
     }
     var c = 0usize;
-    while c < cards.len() {
+    while c < cards.len() && OLD_LINE {
       codes.push(Warehouse.sortKey(3u32, u32.from(c)));
       dists.push((self.cardPlace(c) - eye).length());
       c = c + 1usize;
@@ -3077,7 +3319,7 @@ pub struct Warehouse {
     }
     var pq = 0usize;
     while pq < pgs.len() {
-      if !pgs[pq].gone {
+      if !pgs[pq].gone && !self.tabHidden(pq) {
         codes.push(Warehouse.sortKey(7u32, u32.from(pq)));
         // a pane on its board is drawn just after the board's face (and before anything nearer than the board)
         if pgs[pq].zone >= 0 && pgs[pq].foc < 0.02 { dists.push((zones[usize.from(u32.from(pgs[pq].zone))].pos - eye).length() + 1.); }
@@ -3212,7 +3454,22 @@ pub struct Warehouse {
               Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), 1.);
             c = c + 1usize;
           }
-          Warehouse.faded(&mut pgs[idx].title, device, encoder, target, depth, vp * pm, Vec4(0. - hw, top + 0.1, 0. - hw + 0.8, top + 0.3), 1.);
+          if pgs[idx].tab {
+            let order = self.tabList();
+            var s = 0usize;
+            while s < order.len() {
+              let rc = self.tabRect(s, order.len());
+              Warehouse.faded(&mut pgs[*order[s]].title, device, encoder, target, depth, vp * pm, rc, 1.);
+              s = s + 1usize;
+            }
+            if pgChips.len() >= 4usize {
+              Warehouse.faded(&mut pgChips[1usize], device, encoder, target, depth, vp * pm, self.tabPlusRect(order.len()), 1.);
+              Warehouse.faded(&mut pgChips[2usize], device, encoder, target, depth, vp * pm, self.tabCloseRect(order.len()), 1.);
+              Warehouse.faded(&mut pgChips[3usize], device, encoder, target, depth, vp * pm, self.addrRect(), 1.);
+            }
+          } else {
+            Warehouse.faded(&mut pgs[idx].title, device, encoder, target, depth, vp * pm, Vec4(0. - hw, top + 0.1, 0. - hw + 0.8, top + 0.3), 1.);
+          }
         } else {
           Warehouse.faded(&mut pgs[idx].title, device, encoder, target, depth, vp * pm, Vec4(0. - hw, top + 0.05, 0. - hw + 1.6, top + 0.45), 1.);
         }
@@ -3383,7 +3640,15 @@ pub struct Warehouse {
   fn paneSrc(self: &, zi: usize, kind: u32) String {
     let z = &zones[zi];
     if kind == ZP_SITE { return z.site.clone(); }
-    if kind == ZP_DIAGRAM { return z.diagram.clone(); }
+    if kind == ZP_DIAGRAM {
+      // the board's Diagrams folder, listed (a file named here stands for its folder); a click on a diagram opens it rendered
+      if z.diagram.len() == 0usize { return String(); }
+      var dir = normalizePath(z.diagram.view());
+      if !fs.isDir(&Path.from(dir.view())) { dir = dirOf(dir.view()); }
+      var s = String.from(TREE_PREFIX);
+      s.append(dir.view());
+      return s;
+    }
     let root = if kind == ZP_REPO { z.repo.view() } else { z.incubator.view() };
     if root.len() == 0usize { return String(); }
     var s = String.from(TREE_PREFIX);
@@ -3503,20 +3768,25 @@ pub struct Warehouse {
   }
 
   // The projects pane's cell j, and the line strip's slot s, as rectangles in the board's design frame
+  // four columns of 4:1 cards, five rows
   fn projRect(self: &, zi: usize, j: usize) Vec4 {
     let r = *zones[zi].rects[3usize];
-    let cw = r.z / 2.;
-    let cx = r.x - ZN_DW * 0.5 + cw * (f32.from(u32.from(j % 2usize)) + 0.5);
-    let cy = r.y + r.w - 0.32 * (f32.from(u32.from(j / 2usize)) + 0.5);
-    Vec4(cx - 0.6, cy - 0.15, cx + 0.6, cy + 0.15)
+    let cw = r.z / 4.;
+    let hw = (cw - 0.04) * 0.5;
+    let cx = r.x - ZN_DW * 0.5 + cw * (f32.from(u32.from(j % 4usize)) + 0.5);
+    let cy = r.y + r.w - (r.w / 5.) * (f32.from(u32.from(j / 4usize)) + 0.5);
+    Vec4(cx - hw, cy - hw * 0.25, cx + hw, cy + hw * 0.25)
   }
+
+  fn projCount(self: &, zi: usize) usize { zones[zi].projLabels.len() + zones[zi].planLabels.len() }
 
   fn stripRect(self: &, zi: usize, s: usize) Vec4 {
     let r = *zones[zi].rects[4usize];
-    let cw = r.z / 3.;
-    let cx = r.x - ZN_DW * 0.5 + cw * (f32.from(u32.from(s % 3usize)) + 0.5);
-    let cy = r.y + r.w - 0.32 * (f32.from(u32.from(s / 3usize)) + 0.5);
-    Vec4(cx - 0.55, cy - 0.1375, cx + 0.55, cy + 0.1375)
+    let cw = r.z / 2.;
+    let hw = (cw - 0.1) * 0.5;
+    let cx = r.x - ZN_DW * 0.5 + cw * (f32.from(u32.from(s % 2usize)) + 0.5);
+    let cy = r.y + r.w - (r.w / 4.) * (f32.from(u32.from(s / 2usize)) + 0.5);
+    Vec4(cx - hw, cy - hw * 0.25, cx + hw, cy + hw * 0.25)
   }
 
   // What a ray meets of the boards' own labels: kind 1 a project (ix), 2 a line card (ix); the distance, or -1
@@ -3527,7 +3797,7 @@ pub struct Warehouse {
     while zi < zones.len() {
       let m = self.zoneModel(zi);
       var j = 0usize;
-      while j < zones[zi].projLabels.len() {
+      while j < self.projCount(zi) {
         let t = quadHit(m, self.projRect(zi, j), eye, dir);
         if t > 0. && (best < 0. || t < best) { best = t; *kind = 1u32; *zo = zi; *ix = j; }
         j = j + 1usize;
@@ -3547,12 +3817,24 @@ pub struct Warehouse {
     quadHit(self.zoneModel(zi), Vec4(0. - ZN_DW * 0.5, ZN_BASE, ZN_DW * 0.5, ZN_BASE + ZN_DH), eye, dir)
   }
 
+  fn openPlanCard(self: &mut, zi: usize, pj: usize) {
+    if zi >= zones.len() || pj >= zones[zi].planFiles.len() { return; }
+    let f = zones[zi].planFiles[pj].clone();
+    print <- "zones: plan card "; printStr(zones[zi].planLabels[pj].text.view()); print <- " opens "; printStr(f.view()); print <- "\n";
+    if f.len() > 0usize { self.wantPage(f.view()); }
+  }
+
   fn clickZones(self: &mut, eye: Vec3, dir: Vec3, limit: f32) bool {
     var k = 0u32;
     var zi = 0usize;
     var ix = 0usize;
     let t = self.zoneHit(eye, dir, &mut k, &mut zi, &mut ix);
     if t < 0. || (limit > 0. && t > limit) { return false; }
+    if k == 1u32 && ix >= zones[zi].projLabels.len() {
+      // a skein card of the plan: its first file opens as a page on the workbench
+      self.openPlanCard(zi, ix - zones[zi].projLabels.len());
+      return true;
+    }
     if k == 1u32 {
       let it = *zones[zi].projItem[ix];
       if it >= 0 {
@@ -3592,7 +3874,8 @@ pub struct Warehouse {
     let count = self.mkLabel(device, "-", 0x2a3340ffu32, 0xffffffffu32, 44., 1.1, 0.275);
     Zone(c.id.clone(), nm, Vec3(0., 0., 0. - 6.), 0., 7.2, Vec3(0., 0., 0. - 6.), 0., 7.2, String(), String(), String(), String(),
       String.from(c.id.view()), List[String](), rects, 0u32, nowMs() + 2500u64, title, makeBoardPass(device, format),
-      List[Label](), List[i32](), List[bool](), none, List[StripCard](), count, Vec4(0., 0., 0., 0.))
+      List[Label](), List[i32](), List[bool](), none, List[StripCard](), count, Vec4(0., 0., 0., 0.),
+      String(), 0i64, 0i64, 0u64, List[Label](), List[String]())
   }
 
   // studio.toml's boards (or the built-in two if the file has none), under room.toml's moves; what changed is applied, flying
@@ -3734,7 +4017,7 @@ pub struct Warehouse {
       }
       var strip = List[StripCard]();
       var shown = 0usize;
-      while shown < live.len() && shown < 8usize {
+      while shown < live.len() && shown < 7usize {
         let cd = &fresh[*live[shown]];
         let calm = cardLabel(l, device, format, cd.calm.text.view(), cd.calm.progress, cd.hot, false);
         let glow = cardLabel(l, device, format, cd.calm.text.view(), cd.calm.progress, cd.hot, true);
@@ -3744,12 +4027,67 @@ pub struct Warehouse {
       var ct = String.from(numText(i64.from(done)).view());
       ct.append(" done");
       if queued > 0u32 { ct.append(", "); ct.append(numText(i64.from(queued)).view()); ct.append(" queued"); }
-      if live.len() > 8usize { ct.append(", +"); ct.append(numText(i64.from(live.len() - 8usize)).view()); ct.append(" live"); }
+      if live.len() > 7usize { ct.append(", +"); ct.append(numText(i64.from(live.len() - 7usize)).view()); ct.append(" live"); }
       (&mut zones[zi]).strip = strip;
       (&mut zones[zi]).count.text = ct.clone();
       (&mut zones[zi]).count.size = fitSize(ct.len(), 48.);
       (&mut zones[zi]).count.ok = false;
       zi = zi + 1usize;
+    }
+  }
+
+  // The projects strip from the board's plan: one card per Active and Design skein, then "+N more" and the Backlog count; read again
+  // when the plan's file changes
+  fn pollPlan(self: &mut, device: &mut Device, zi: usize, now: u64) {
+    if now < zones[zi].planNext { return; }
+    (&mut zones[zi]).planNext = now + 1500u64;
+    let inc = normalizePath(zones[zi].incubator.view());
+    if zones[zi].planPath.len() == 0usize || dirOf(zones[zi].planPath.view()).view() != inc.view() {
+      (&mut zones[zi]).planPath = findPlanFile(inc.view());
+      (&mut zones[zi]).planStamp = 0i64; (&mut zones[zi]).planSize = 0i64;
+      if zones[zi].planPath.len() == 0usize { (&mut zones[zi]).planNext = now + 5000u64; return; }
+    }
+    match fs.stat(&Path.from(zones[zi].planPath.view())) {
+      case let Ok(info) {
+        let m = info.modified.unixSeconds();
+        if m == zones[zi].planStamp && info.size == zones[zi].planSize { return; }
+        (&mut zones[zi]).planStamp = m;
+        (&mut zones[zi]).planSize = info.size;
+      }
+      case let Err(e) { return; }
+    }
+    match fs.readFile(&Path.from(zones[zi].planPath.view())) {
+      case let Ok(txt) {
+        let pr = parsePlan(txt.view(), zones[zi].planPath.view());
+        var labels = List[Label]();
+        var files = List[String]();
+        let room = if zones[zi].projLabels.len() < 20usize { 20usize - zones[zi].projLabels.len() } else { 1usize };
+        var show = pr.cards.len();
+        let more = if pr.cards.len() + 1usize > room { pr.cards.len() + 2usize - room } else { 0usize };
+        if more > 0usize { show = pr.cards.len() - more; }
+        var c = 0usize;
+        while c < show {
+          let pc = &pr.cards[c];
+          labels.push(self.mkLabel(device, pc.title.view(), if pc.design { 0xdfe9f3ffu32 } else { 0xf8f5eeffu32 }, 0x1c1c1cffu32, fitSize(pc.title.len(), 56.), 1.0, 0.25));
+          files.push(pc.file.clone());
+          c = c + 1usize;
+        }
+        if more > 0usize {
+          var mt = String.from("+");
+          mt.append(numText(i64.from(more)).view());
+          mt.append(" more skeins");
+          labels.push(self.mkLabel(device, mt.view(), 0xe9e4d8ffu32, 0x333333ffu32, fitSize(mt.len(), 56.), 1.0, 0.25));
+          files.push(zones[zi].planPath.clone());
+        }
+        var bt = String.from("Backlog: ");
+        bt.append(numText(i64.from(pr.backlog)).view());
+        labels.push(self.mkLabel(device, bt.view(), 0x2a3340ffu32, 0xffffffffu32, fitSize(bt.len(), 56.), 1.0, 0.25));
+        files.push(zones[zi].planPath.clone());
+        print <- "zones: plan "; printStr(zones[zi].planPath.view()); print <- ": "; print <- pr.cards.len(); print <- " skeins, backlog "; print <- pr.backlog; print <- "\n";
+        (&mut zones[zi]).planLabels = labels;
+        (&mut zones[zi]).planFiles = files;
+      }
+      case let Err(e) {}
     }
   }
 
@@ -3781,6 +4119,7 @@ pub struct Warehouse {
           o = o + 1usize;
         }
       }
+      if ticks > 4u32 { self.pollPlan(device, zi, now); }
       var j = 0usize;
       while j < zones[zi].projLabels.len() {
         let ik = *zones[zi].projItem[j];
@@ -3804,7 +4143,12 @@ pub struct Warehouse {
     while zi < zones.len() {
       if *made < most && !zones[zi].title.ok { fillLabel(l, device, &mut zones[zi].title); *made = *made + 1; }
       if *made < most && !zones[zi].count.ok { fillLabel(l, device, &mut zones[zi].count); *made = *made + 1; }
-      if zones[zi].projLabels.len() == 0usize && *made < most && !zones[zi].none.ok { fillLabel(l, device, &mut zones[zi].none); *made = *made + 1; }
+      var pl = 0usize;
+      while pl < zones[zi].planLabels.len() && *made < most {
+        if !zones[zi].planLabels[pl].ok { fillLabel(l, device, &mut zones[zi].planLabels[pl]); *made = *made + 1; }
+        pl = pl + 1usize;
+      }
+      if self.projCount(zi) == 0usize && *made < most && !zones[zi].none.ok { fillLabel(l, device, &mut zones[zi].none); *made = *made + 1; }
       var j = 0usize;
       while j < zones[zi].projLabels.len() && *made < most {
         if !zones[zi].projLabels[j].ok { fillLabel(l, device, &mut zones[zi].projLabels[j]); *made = *made + 1; }
@@ -3825,7 +4169,7 @@ pub struct Warehouse {
     let m = vp * self.zoneModel(zi);
     (&mut zones[zi]).back.drawFaded(device, encoder, target, depth, m, Vec4(0. - ZN_DW * 0.5, ZN_BASE, ZN_DW * 0.5, ZN_BASE + ZN_DH), 1.);
     Warehouse.faded(&mut zones[zi].title, device, encoder, target, depth, m, Vec4(0. - 3.6, 3.98, 0. - 2.0, 4.38), 1.);
-    if zones[zi].projLabels.len() == 0usize {
+    if self.projCount(zi) == 0usize {
       let r = *zones[zi].rects[3usize];
       let cx = r.x - ZN_DW * 0.5 + r.z * 0.5;
       let cy = r.y + r.w * 0.5;
@@ -3836,6 +4180,12 @@ pub struct Warehouse {
       let rc = self.projRect(zi, j);
       Warehouse.faded(&mut zones[zi].projLabels[j], device, encoder, target, depth, m, rc, 1.);
       j = j + 1usize;
+    }
+    var pj = 0usize;
+    while pj < zones[zi].planLabels.len() {
+      let rc = self.projRect(zi, zones[zi].projLabels.len() + pj);
+      Warehouse.faded(&mut zones[zi].planLabels[pj], device, encoder, target, depth, m, rc, 1.);
+      pj = pj + 1usize;
     }
     let cr = self.stripRect(zi, 0usize);
     Warehouse.faded(&mut zones[zi].count, device, encoder, target, depth, m, cr, 1.);
