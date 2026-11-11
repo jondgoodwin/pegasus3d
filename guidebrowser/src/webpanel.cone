@@ -1,0 +1,395 @@
+// The web panel: a real web page, drawn by the Chromium Embedded Framework in windowless (off-screen) mode into a
+// texture on a panel beside the document panel. cefshim.dll (guidebrowser/cef/src/cefshim.cc) is the flat C API over
+// CEF; cefhelper.exe is the program CEF starts for its other processes.
+//
+//   - Once a frame: web_pump runs CEF's message loop work, then web_frame copies the latest paint (RGBA, only if
+//     there is a new one) into 'buf', which PagePass uploads (the same unlit page pass the document panel uses).
+//   - A pointer ray that meets the panel gives page pixels, as the document panel's click does: mouse moves, clicks
+//     and the wheel go to the page by them. Typed text and keys go to it while it holds the focus (a click on it).
+//   - Everything CEF writes (cache, cookies, log) is under the 'cache' folder of the working directory.
+//   - Audio is off (--mute-audio, in the shim).
+
+extern {
+  fn @c("web_init") webInit(cacheDir: cstr, helper: cstr) i32;
+  fn @c("web_open") webOpen(url: cstr, w: i32, h: i32) i32;
+  fn @c("web_pump") webPump();
+  fn @c("web_frame") webFrame(view: i32, dst: *u8, cap: i32, w: &mut i32, h: &mut i32) i32;
+  fn @c("web_paints") webPaints(view: i32) u32;
+  fn @c("web_loading") webLoading(view: i32) i32;
+  fn @c("web_mouse_move") webMouseMove(view: i32, x: i32, y: i32, leave: i32);
+  fn @c("web_mouse_button") webMouseButton(view: i32, x: i32, y: i32, button: i32, up: i32, clicks: i32);
+  fn @c("web_wheel") webWheel(view: i32, x: i32, y: i32, dx: i32, dy: i32);
+  fn @c("web_key") webKey(view: i32, vk: i32, down: i32, mods: i32);
+  fn @c("web_char") webChar(view: i32, ch: i32, mods: i32);
+  fn @c("web_text_input") webTextInput(on: i32);
+  fn @c("web_go") webGo(view: i32, url: cstr);
+  fn @c("web_back") webBack(view: i32);
+  fn @c("web_forward") webForward(view: i32);
+  fn @c("web_can_back") webCanBack(view: i32) i32;
+  fn @c("web_can_forward") webCanForward(view: i32) i32;
+  fn @c("web_url") webUrl(view: i32, out: *u8, cap: i32) i32;
+  fn @c("web_close") webClose(view: i32);
+  fn @c("web_shutdown") webShutdown();
+}
+
+const WEB_TEX_W = 1280u32;       // the page's size in pixels
+const WEB_TEX_H = 800u32;
+const WEB_WORLD_W = 1.8;         // meters across
+const WEB_GAP = 0.12;            // between the document panel's right edge and this panel's left
+
+var @threadlocal webStarted = false;      // CEF initialised
+// What a frame costs, in performance-counter ticks
+var @threadlocal webPumpTicks = 0u64;
+var @threadlocal webPumps = 0u64;
+var @threadlocal webPumpMax = 0u64;
+var @threadlocal webUploadTicks = 0u64;
+var @threadlocal webUploads = 0u64;
+var @threadlocal webUploadMax = 0u64;
+
+fn ticksToMs(t: u64) f64 { f64.from(t) * 1000.0f64 / f64.from(sdl.GetPerformanceFrequency()) }
+
+// The folder the program's exe is in, with a trailing slash
+fn exeFolder() String {
+  var folder = String();
+  if programPath != null {
+    let p = cstr.fromPtr(programPath).view();
+    var cut = 0usize;
+    var i = 0usize;
+    while i < p.len() {
+      if p[i] == '\\' || p[i] == '/' { cut = i + 1usize; }
+      i = i + 1usize;
+    }
+    folder.append(&p[0usize..<cut]);
+  }
+  folder
+}
+
+// Start CEF once. False if it would not start.
+fn webStart() bool {
+  if webStarted { return true; }
+  var helper = exeFolder();
+  helper.append("cefhelper.exe");
+  let ok = webInit("cache", helper.cstr());
+  if ok == 1i32 { webStarted = true; }
+  else { print <- "webpanel: CEF would not initialise\n"; }
+  webStarted
+}
+
+// Run CEF's work once; to be called once a frame
+fn webPumpFrame() {
+  if !webStarted { return; }
+  let t0 = sdl.GetPerformanceCounter();
+  webPump();
+  let d = sdl.GetPerformanceCounter() - t0;
+  webPumpTicks = webPumpTicks + d;
+  webPumps = webPumps + 1u64;
+  if d > webPumpMax { webPumpMax = d; }
+}
+
+fn webReport() {
+  if webPumps > 0u64 {
+    print <- "web: pump "; print <- ticksToMs(webPumpTicks) / f64.from(webPumps); print <- " ms avg, "; print <- ticksToMs(webPumpMax);
+    print <- " ms max over "; print <- webPumps; print <- " frames; upload "; print <- webUploads; print <- " frames, ";
+    if webUploads > 0u64 {
+      print <- ticksToMs(webUploadTicks) / f64.from(webUploads); print <- " ms avg, "; print <- ticksToMs(webUploadMax); print <- " ms max";
+    }
+    print <- "\n";
+  }
+}
+
+// Windows virtual-key codes for the keys that are not text (0 if the key is not one)
+fn virtualKey(scancode: u32) i32 {
+  if scancode == 40u32 { return 13i32; }      // Return
+  if scancode == 41u32 { return 27i32; }      // Escape
+  if scancode == 42u32 { return 8i32; }       // Backspace
+  if scancode == 43u32 { return 9i32; }       // Tab
+  if scancode == 76u32 { return 46i32; }      // Delete
+  if scancode == 79u32 { return 39i32; }      // Right
+  if scancode == 80u32 { return 37i32; }      // Left
+  if scancode == 81u32 { return 40i32; }      // Down
+  if scancode == 82u32 { return 38i32; }      // Up
+  if scancode == 74u32 { return 36i32; }      // Home
+  if scancode == 77u32 { return 35i32; }      // End
+  if scancode == 75u32 { return 33i32; }      // Page up
+  if scancode == 78u32 { return 34i32; }      // Page down
+  0i32
+}
+
+pub struct WebPanel {
+  page: PagePass;                // draws the page unlit, as the document panel's does
+  view: i32;                     // the shim's number for the browser
+  buf: List[u8];                 // the latest frame, RGBA
+  url: String;                   // the address last asked for or shown
+  focus: bool = false;           // keys and text go to the page
+  hover: bool = false;
+  wasLoading: bool = false;
+  lastX: i32 = 0i32;             // the pointer on the page, in page pixels, as last seen
+  lastY: i32 = 0i32;
+  uploaded: u32 = 0u32;
+
+  // None if CEF would not start or the browser could not be made
+  pub fn create(device: &mut Device, outFormat: u32, url: &str) Option[WebPanel] {
+    if !webStart() { return None; }
+    var u = String.from(url);
+    let view = webOpen(u.cstr(), i32.from(WEB_TEX_W), i32.from(WEB_TEX_H));
+    if view < 0i32 { print <- "webpanel: the browser could not be made\n"; return None; }
+    var buf = List[u8].withCapacity(usize.from(WEB_TEX_W * WEB_TEX_H * 4u32));
+    buf.resize(usize.from(WEB_TEX_W * WEB_TEX_H * 4u32), 0u8);
+    print <- "webpanel: opened "; printStr(url); print <- "\n";
+    Some[WebPanel](WebPanel(PagePass.create(device, outFormat), view, buf, u))
+  }
+
+  pub fn open(self: &mut, url: &str) {
+    self.url = String.from(url);
+    webGo(view, self.url.cstr());
+    print <- "webpanel: loading "; printStr(url); print <- "\n";
+  }
+
+  // Once a frame: a new paint goes up to the texture
+  pub fn tick(self: &mut, device: &mut Device) {
+    var w = 0i32;
+    var h = 0i32;
+    let busy = webLoading(view) != 0i32;
+    if wasLoading && !busy {
+      print <- "webpanel: loaded "; printStr(self.address().view()); print <- "\n";
+    }
+    wasLoading = busy;
+    let t0 = sdl.GetPerformanceCounter();
+    let n = webFrame(view, &buf[0] as *u8, i32.from(buf.len()), &mut w, &mut h);
+    if n > 0i32 {
+      page.uploadRgbaFlat(device, u32.from(w), u32.from(h), &buf);
+      uploaded = uploaded + 1u32;
+      let d = sdl.GetPerformanceCounter() - t0;
+      webUploadTicks = webUploadTicks + d;
+      webUploads = webUploads + 1u64;
+      if d > webUploadMax { webUploadMax = d; }
+    }
+  }
+
+  // The address the page is at
+  pub fn address(self: &) String {
+    var bytes = List[u8]();
+    bytes.resize(1024usize, 0u8);
+    let n = webUrl(view, &bytes[0] as *u8, 1024i32);
+    String.fromBytes(&bytes.view()[0usize..<usize.from(n)])
+  }
+
+  // Where the panel stands in the panel frame the document panel's page is in: z = 0
+  fn rect() Vec4 {
+    let x0 = f32.from(DOC_WORLD_W) * 0.5 + f32.from(WEB_GAP);
+    let w = f32.from(WEB_WORLD_W);
+    let h = w * f32.from(WEB_TEX_H) / f32.from(WEB_TEX_W);
+    let y = f32.from(DOC_CENTRE_Y);
+    Vec4(x0, y - h * 0.5, x0 + w, y + h * 0.5)
+  }
+
+  pub fn drawPage(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4) {
+    page.draw(device, encoder, target, viewProjection, WebPanel.rect());
+  }
+
+  // A ray (in the panel frame): the page pixel it meets, as (x, y, 1), or z = 0 if it misses the panel
+  pub fn pick(self: &, eye: Vec3, direction: Vec3) Vec3 {
+    if direction.z > -0.00001 && direction.z < 0.00001 { return Vec3(0., 0., 0.); }
+    let t = (0. - eye.z) / direction.z;
+    if t < 0. { return Vec3(0., 0., 0.); }
+    let hit = eye + direction * t;
+    let r = WebPanel.rect();
+    let u = (hit.x - r.x) / (r.z - r.x);
+    let v = (hit.y - r.y) / (r.w - r.y);
+    if u < 0. || u > 1. || v < 0. || v > 1. { return Vec3(0., 0., 0.); }
+    Vec3(u * f32.from(WEB_TEX_W), (1. - v) * f32.from(WEB_TEX_H), 1.)
+  }
+
+  pub fn moved(self: &mut, px: i32, py: i32) {
+    lastX = px; lastY = py; hover = true;
+    webMouseMove(view, px, py, 0i32);
+  }
+  pub fn left(self: &mut) {
+    if hover { webMouseMove(view, lastX, lastY, 1i32); hover = false; }
+  }
+  pub fn button(self: &mut, px: i32, py: i32, up: bool) {
+    lastX = px; lastY = py;
+    webMouseButton(view, px, py, 1i32, if up { 1i32 } else { 0i32 }, 1i32);
+  }
+  pub fn wheel(self: &mut, px: i32, py: i32, notches: f32) {
+    webWheel(view, px, py, 0i32, i32.from(notches * 120.));
+  }
+  pub fn setFocus(self: &mut, on: bool) {
+    if on != focus {
+      focus = on;
+      webTextInput(if on { 1i32 } else { 0i32 });
+    }
+  }
+  pub fn key(self: &mut, vk: i32, down: bool, mods: i32) {
+    webKey(view, vk, if down { 1i32 } else { 0i32 }, mods);
+    if down && vk == 13i32 { webChar(view, 13i32, mods); }
+  }
+  // UTF-8 text typed: each code point (those past the first plane are not sent)
+  pub fn typed(self: &mut, text: &str) {
+    var i = 0usize;
+    while i < text.len() {
+      let b = i32.from(text[i]);
+      var cp = b;
+      var more = 0usize;
+      if b >= 240i32 { cp = b & 7i32; more = 3usize; }
+      else if b >= 224i32 { cp = b & 15i32; more = 2usize; }
+      else if b >= 192i32 { cp = b & 31i32; more = 1usize; }
+      var k = 0usize;
+      while k < more && i + 1usize + k < text.len() {
+        cp = (cp << 6i32) | (i32.from(text[i + 1usize + k]) & 63i32);
+        k = k + 1usize;
+      }
+      i = i + 1usize + more;
+      if cp < 65536i32 { webChar(view, cp, 0i32); }
+    }
+  }
+  pub fn back(self: &mut) { webBack(view); }
+  pub fn forward(self: &mut) { webForward(view); }
+}
+
+// ---- the web panel in the studio (Shell's side) ----
+
+fn webFocused(s: &Shell) bool {
+  match &s.web { case let Some(w) { return w.focus; } else {} }
+  false
+}
+
+// The direction of the ray through the window's point x, y (the eye is the camera's)
+fn rayDir(s: &Shell, x: f32, y: f32, w: f32, h: f32) Vec3 {
+  let tw = f32.from(s.target.texture.width);
+  let th = f32.from(s.target.texture.height);
+  let inverse = (s.camera.projectionMatrix(tw / th) * s.camera.viewMatrix()).inverse();
+  let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
+  (p.xyz() * (1. / p.w) - s.camera.origin).normalize()
+}
+
+// The page pixel under the window's point x, y as (px, py, 1), or z = 0 if the point is not on the web panel
+fn webPick(s: &Shell, x: f32, y: f32, w: f32, h: f32) Vec3 {
+  if w <= 0. || h <= 0. || f32.from(s.target.texture.height) <= 0. { return Vec3(0., 0., 0.); }
+  let dir = rayDir(s, x, y, w, h);
+  var le = s.camera.origin;
+  var ld = dir;
+  if s.wh.on {
+    let inv = s.wh.pageModel().inverse();
+    le = inv * s.camera.origin;
+    ld = inv.transformVector(dir);
+  }
+  match &s.web { case let Some(wp) { return wp.pick(le, ld); } else {} }
+  Vec3(0., 0., 0.)
+}
+
+fn webPointer(s: &mut Shell, x: f32, y: f32, w: f32, h: f32) {
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if !has { return; }
+  let hit = webPick(&*s, x, y, w, h);
+  match &mut s.web {
+    case var &mut Some(wp) {
+      if hit.z > 0.5 { wp.moved(i32.from(hit.x), i32.from(hit.y)); } else { wp.left(); }
+    }
+    else {}
+  }
+}
+
+// A left press: on the web panel it is the page's, and takes the focus. False if it was not on the panel.
+fn webPress(s: &mut Shell, x: f32, y: f32, w: f32, h: f32) bool {
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if !has { return false; }
+  let hit = webPick(&*s, x, y, w, h);
+  var onPanel = false;
+  match &mut s.web {
+    case var &mut Some(wp) {
+      if hit.z > 0.5 {
+        onPanel = true;
+        wp.setFocus(true);
+        wp.button(i32.from(hit.x), i32.from(hit.y), false);
+      }
+      else { wp.setFocus(false); }
+    }
+    else {}
+  }
+  onPanel
+}
+
+fn webRelease(s: &mut Shell) {
+  match &mut s.web {
+    case var &mut Some(wp) { if wp.focus { wp.button(wp.lastX, wp.lastY, true); } }
+    else {}
+  }
+}
+
+// The wheel over the web panel scrolls the page; false if the pointer is not on it
+fn webWheelOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, notches: f32) bool {
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if !has { return false; }
+  let hit = webPick(&*s, x, y, w, h);
+  if hit.z < 0.5 { return false; }
+  match &mut s.web { case var &mut Some(wp) { wp.wheel(i32.from(hit.x), i32.from(hit.y), notches); } else {} }
+  true
+}
+
+// A key or text while the page holds the focus. Alt+Left and Alt+Right are back and forward in the page's history.
+fn webKeys(s: &mut Shell, e: &imm sdl.Event) {
+  if e.type == sdl.EVENT_TEXT_INPUT {
+    let t = e as &sdl.TextInputEvent;
+    match &mut s.web { case var &mut Some(wp) { wp.typed(cstr.fromPtr(t.text).view()); } else {} }
+    return;
+  }
+  let key = e as &sdl.KeyboardEvent;
+  let down = e.type == sdl.EVENT_KEY_DOWN;
+  var mods = 0i32;
+  if (key.keymod & 0x0003u16) != 0u16 { mods = mods | 1i32; }
+  if (key.keymod & 0x00C0u16) != 0u16 { mods = mods | 2i32; }
+  if (key.keymod & 0x0300u16) != 0u16 { mods = mods | 4i32; }
+  let vk = virtualKey(key.scancode);
+  match &mut s.web {
+    case var &mut Some(wp) {
+      if (mods & 4i32) != 0i32 && key.scancode == KEY_LEFT { if down && !key.repeat { wp.back(); } return; }
+      if (mods & 4i32) != 0i32 && key.scancode == KEY_RIGHT { if down && !key.repeat { wp.forward(); } return; }
+      if vk != 0i32 { wp.key(vk, down, mods); }
+    }
+    else {}
+  }
+}
+
+// Show 'url' in the web panel, making the panel if there is none yet
+fn openWeb(s: &mut Shell, url: &str) {
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if has { match &mut s.web { case var &mut Some(wp) { wp.open(url); } else {} } }
+  else { s.web = WebPanel.create(&mut s.device, s.swapchain.format, url); }
+}
+
+// Once a frame, before the scene is drawn: the test flags' events, then CEF's work, then the new paint up to the
+// texture, then any web link the document panel was asked to follow
+fn webFrameTick(s: &mut Shell) {
+  if webLinkAt != 0 && drawn == webLinkAt && webLinkArg != null {
+    match &mut s.panel { case var &mut Some(p) { p.requestLink(cstr.fromPtr(webLinkArg).view()); } else {} }
+  }
+  match &mut s.web {
+    case var &mut Some(wp) {
+      let px = i32.from(webClickX);
+      let py = i32.from(webClickY);
+      if webClickAt != 0 && drawn == webClickAt { wp.moved(px, py); wp.setFocus(true); wp.button(px, py, false); }
+      if webClickAt != 0 && drawn == webClickAt + 3 { wp.button(px, py, true); }
+      if webWheelAt != 0 && drawn == webWheelAt {
+        wp.wheel(i32.from(WEB_TEX_W / 2u32), i32.from(WEB_TEX_H / 2u32), f32.from(webWheelY));
+        print <- "webpanel: wheel "; print <- webWheelY; print <- "\n";
+      }
+      if webTypeAt != 0 && drawn == webTypeAt && webTypeArg != null { wp.typed(cstr.fromPtr(webTypeArg).view()); }
+      if webBackAt != 0 && drawn == webBackAt { wp.back(); }
+      if webForwardAt != 0 && drawn == webForwardAt { wp.forward(); }
+    }
+    else {}
+  }
+  webPumpFrame();
+  match &mut s.web { case var &mut Some(wp) { wp.tick(&mut s.device); } else {} }
+  var link = String();
+  match &mut s.panel {
+    case var &mut Some(p) { if p.outWeb.len() > 0usize { link = p.outWeb.clone(); p.outWeb = String(); } }
+    else {}
+  }
+  if link.len() > 0usize { openWeb(s, link.view()); }
+}

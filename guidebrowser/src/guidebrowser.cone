@@ -103,6 +103,7 @@ fn noView() PartView {
 struct Shell {
   pub scene: Scene;
   pub panel: Option[DocPanel];    // '--doc FILE.md': the document panel (docpanel.cone)
+  pub web: Option[WebPanel];      // a web page beside it (webpanel.cone): '--web URL', or an http(s) link followed in the document
   pub wh: Warehouse;              // '--world warehouse': the ring, the shelves and the line (warehouse.cone)
   pub ready: Receiver[Arrival];   // what the loader has built
   pub arrivedAt: u64;             // when the home world was asked for (performance counter)
@@ -190,6 +191,21 @@ var @threadlocal whKind = Array[i32, 12]() <- fill 0;
 var @threadlocal whArg = Array[i32, 12]() <- fill 0;
 var @threadlocal whFrame = Array[i32, 12]() <- fill 0;
 var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D degrees further up (down if negative)
+// The web panel (webpanel.cone). Test flags act on page pixels and need no real mouse or keys.
+var @threadlocal webArg: *u8 = null;      // '--web URL': a web panel opens on this address at the start
+var @threadlocal webClickX = 0.;          // '--web-click PX PY N': on frame N, a click at page pixel PX, PY
+var @threadlocal webClickY = 0.;
+var @threadlocal webClickAt = 0;
+var @threadlocal webWheelY = 0.;          // '--web-wheel NOTCHES N': on frame N, the wheel over the page's middle
+var @threadlocal webWheelAt = 0;
+var @threadlocal webTypeArg: *u8 = null;  // '--web-type TEXT N': on frame N, TEXT typed into the page
+var @threadlocal webTypeAt = 0;
+var @threadlocal webSdlArg: *u8 = null;   // '--web-sdl-type TEXT N': on frame N, TEXT pushed through SDL's queue as a text event
+var @threadlocal webSdlAt = 0;
+var @threadlocal webBackAt = 0;          // '--web-back N': on frame N, back in the web panel
+var @threadlocal webForwardAt = 0;        // '--web-forward N'
+var @threadlocal webLinkArg: *u8 = null;  // '--web-link URL N': on frame N, the document panel follows this link
+var @threadlocal webLinkAt = 0;
 
 // Frames drawn, and the colour at the middle of the window on the shot frame
 var @threadlocal drawn = 0;
@@ -320,7 +336,9 @@ pub fn start(host: &mut Host) bool {
     wh.prepareBrowser(&mut device, &mut renderer);
     if startYaw == 0. { startYaw = 72.; }
   }
-  var made = Shell(Scene.empty(), panel, wh, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
+  var web: Option[WebPanel] = None;
+  if webArg != null { web = WebPanel.create(&mut device, format, cstr.fromPtr(webArg).view()); }
+  var made = Shell(Scene.empty(), panel, web, wh, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
     List[PartView](), 0u64, NO_CLICK, Input(), actions, walk, look, true,
     Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), XrRig.make(xrOn), target, fx, post, renderer, swapchain, Headset.none(), device,
     adapter, surface, instance, DrawList(), camera, light, None, bridge, format);
@@ -346,12 +364,30 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
           (*some).post.resize(&mut (*some).device, u32.from(size.w), u32.from(size.h));
         }
       }
-      (*some).input.handle(e);
+      // While the web page holds the focus its keys and text are the page's, and not the studio's
+      var eaten = false;
+      if webFocused(&*some) && (e.type == sdl.EVENT_KEY_DOWN || e.type == sdl.EVENT_KEY_UP || e.type == sdl.EVENT_TEXT_INPUT) {
+        eaten = true;
+        webKeys(&mut *some, e);
+      }
+      if !eaten { (*some).input.handle(e); }
+      if e.type == sdl.EVENT_MOUSE_MOTION {
+        let m = e as &sdl.MouseMotionEvent;
+        let w = host.window().windowSize();
+        webPointer(&mut *some, m.x, m.y, f32.from(w.w), f32.from(w.h));
+      }
+      if e.type == sdl.EVENT_MOUSE_BUTTON_UP {
+        let b = e as &sdl.MouseButtonEvent;
+        if b.button == sdl.BUTTON_LEFT { webRelease(&mut *some); }
+      }
       if e.type == sdl.EVENT_MOUSE_WHEEL {
         let wheel = e as &sdl.MouseWheelEvent;
-        match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} }
+        let w = host.window().windowSize();
+        if !webWheelOn(&mut *some, wheel.mouse_x, wheel.mouse_y, f32.from(w.w), f32.from(w.h), wheel.y) {
+          match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} }
+        }
       }
-      if e.type == sdl.EVENT_KEY_DOWN {
+      if e.type == sdl.EVENT_KEY_DOWN && !eaten {
         let key = e as &sdl.KeyboardEvent;
         if key.scancode == sdl.SCANCODE_C && !key.repeat {
           match &mut (*some).panel { case var &mut Some(p) { p.clearMarks(); } else {} }
@@ -376,7 +412,9 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
         let b = e as &sdl.MouseButtonEvent;
         if b.button == sdl.BUTTON_LEFT {
           let w = host.window().windowSize();
-          clickOn(&mut *some, b.x, b.y, f32.from(w.w), f32.from(w.h), host.stats.frames);
+          if !webPress(&mut *some, b.x, b.y, f32.from(w.w), f32.from(w.h)) {
+            clickOn(&mut *some, b.x, b.y, f32.from(w.w), f32.from(w.h), host.stats.frames);
+          }
         }
       }
     }
@@ -927,6 +965,7 @@ fn drawScene(s: &mut Shell, alpha: f32) {
 fn prepareScene(s: &mut Shell, alpha: f32) {
   match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
   match &mut s.other { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
+  webFrameTick(s);
   bridgeTick(s);
   if shotReply > 0 && repliesShown == shotReply && shotAt == 0 { shotAt = drawn + 30; }
   if pressRetCount > 0 && repliesShown == pressRetCount && pressRetAt == 0 { pressRetAt = drawn + 20; }
@@ -1016,6 +1055,14 @@ fn drawDesktop(s: &mut Shell) {
       else {}
     }
   }
+  match &mut s.web {
+    case var &mut Some(wp) {
+      var vp = s.camera.projectionMatrix(aspect) * s.camera.viewMatrix();
+      if s.wh.on { vp = vp * s.wh.pageModel(); }
+      wp.drawPage(&mut s.device, &mut encoder, &s.target.texture, vp);
+    }
+    else {}
+  }
   drawn = drawn + 1;
   // the interval between frames, for the p50 and p95 printed on the shot frame
   let nowT = sdl.GetPerformanceCounter();
@@ -1059,8 +1106,11 @@ pub fn present(host: &mut Host) {
           let w = host.window().windowSize();
           let ww = f32.from(w.w);
           let wh = f32.from(w.h);
-          clickOn(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh, host.stats.frames);
+          if !webPress(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh) {
+            clickOn(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh, host.stats.frames);
+          }
         }
+        if drawn == clickFrames[usize.from(c)] + 3 { webRelease(&mut *some); }
         c = c + 1;
       }
       // '--wheel' and '--press-c': events a person's hand would make, put into SDL's own queue
@@ -1071,6 +1121,13 @@ pub fn present(host: &mut Host) {
         w.y = f32.from(wheelY);
         w.integer_y = i32.from(wheelY);
         if !sdl.PushEvent(&mut ev) { print <- "could not push the wheel event\n"; }
+      }
+      if webSdlAt != 0 && drawn == webSdlAt && webSdlArg != null {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_TEXT_INPUT;
+        let t = &mut ev as &mut sdl.TextInputEvent;
+        t.text = webSdlArg;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the text event\n"; }
       }
       if pressRetAt != 0 && drawn == pressRetAt {
         var ev = sdl.Event();
@@ -1188,6 +1245,8 @@ pub fn quit(host: &mut Host) i32 {
     else {}
   }
   g = None;      // the GPU's objects go before the window does
+  webReport();
+  webShutdown();
   print <- "Frames drawn: "; print <- drawn; print <- "\n";
   print <- "Middle of the window on frame "; print <- shotAt; print <- ": ";
   print <- centre[0]; print <- " "; print <- centre[1]; print <- " "; print <- centre[2]; print <- "\n";
@@ -1284,6 +1343,24 @@ fn main(argc: i32, argv: **u8) i32 {
     }
     if libc.strcmp(arg, "--tilt") == 0i32 && more { tilt = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--approach") == 0i32 && more { approach = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--web") == 0i32 && more { webArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--web-click") == 0i32 && a + 3i32 < argc {
+      webClickX = argNumber(argv, a + 1i32); webClickY = argNumber(argv, a + 2i32); webClickAt = i32.from(argNumber(argv, a + 3i32));
+    }
+    if libc.strcmp(arg, "--web-wheel") == 0i32 && a + 2i32 < argc {
+      webWheelY = argNumber(argv, a + 1i32); webWheelAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--web-type") == 0i32 && a + 2i32 < argc {
+      webTypeArg = *(argv + usize.from(a + 1i32)); webTypeAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--web-sdl-type") == 0i32 && a + 2i32 < argc {
+      webSdlArg = *(argv + usize.from(a + 1i32)); webSdlAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--web-back") == 0i32 && more { webBackAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--web-forward") == 0i32 && more { webForwardAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--web-link") == 0i32 && a + 2i32 < argc {
+      webLinkArg = *(argv + usize.from(a + 1i32)); webLinkAt = i32.from(argNumber(argv, a + 2i32));
+    }
     a = a + 1i32;
   }
   var config = Config.fromArgs(argc, argv);
