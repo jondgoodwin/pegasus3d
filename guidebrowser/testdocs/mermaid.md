@@ -1,6 +1,6 @@
 # Mermaid test page
 
-Three real diagrams of how the studio works, drawn natively. The text before and after each one is ordinary page text.
+Three real diagrams of how the incubator works, drawn natively. The text before and after each one is ordinary page text.
 
 ## How a page arrives
 
@@ -55,8 +55,8 @@ And a short one after it:
 
 ```mermaid
 sequenceDiagram
-    Jon->>Studio: open the page
-    Studio-->>Jon: the diagram
+    Jon->>Incubator: open the page
+    Incubator-->>Jon: the diagram
 ```
 
 The end of the page.

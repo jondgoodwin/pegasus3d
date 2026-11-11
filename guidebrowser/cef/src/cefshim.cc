@@ -1,5 +1,5 @@
 // cefshim.dll: a flat C API over the Chromium Embedded Framework's windowless (off-screen) browser, for the
-// Cone studio's web panel (guidebrowser/src/webpanel.cone). One thread (the studio's main thread) calls it all;
+// Cone incubator's web panel (guidebrowser/src/webpanel.cone). One thread (the incubator's main thread) calls it all;
 // web_pump() runs CEF's message loop work once per frame.
 #include <windows.h>
 #include <string>
@@ -176,7 +176,7 @@ API int web_frame(int view, unsigned char* dst, int cap, int* w, int* h) {
   if (!v || !v->dirty) return 0;
   size_t n = (size_t)v->fw * v->fh * 4;
   if ((int)n > cap) return 0;
-  // BGRA to RGBA, and rows bottom to top: the studio's page pass has v = 0 at the bottom
+  // BGRA to RGBA, and rows bottom to top: the incubator's page pass has v = 0 at the bottom
   const unsigned char* base = v->bgra.data();
   size_t row = (size_t)v->fw * 4;
   for (int y = 0; y < v->fh; y++) {
@@ -212,7 +212,7 @@ API int web_frame_rect(int view, unsigned char* dst, int cap, int* x, int* y, in
 }
 
 // SDL only sends text events while text input is on for the window with the keyboard focus (SDL3.dll is the
-// studio's own; found at run time so the shim does not link it)
+// incubator's own; found at run time so the shim does not link it)
 API void web_text_input(int on) {
   HMODULE m = GetModuleHandleA("SDL3.dll");
   if (!m) return;

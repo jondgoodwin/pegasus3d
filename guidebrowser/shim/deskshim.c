@@ -1,4 +1,4 @@
-// deskshim.dll: the laptop's primary screen for the studio's desk panel (DXGI Desktop Duplication), and the real pointer
+// deskshim.dll: the laptop's primary screen for the incubator's desk panel (DXGI Desktop Duplication), and the real pointer
 // (SendInput) when the panel is allowed to control it. A flat C API for Cone: ints and a byte pointer only.
 //
 //   desk_open(output)        1 on success; output -1 = the output holding the desktop's origin (the primary), else the nth
@@ -395,7 +395,7 @@ DESK_API void desk_close(void) {
   shapeCap = 0;
 }
 
-// ---- small helpers of the page editor (studio notes) ----
+// ---- small helpers of the page editor (incubator notes) ----
 // desk_local_part(k): the local time's year (0), month (1), day (2), hour (3) or minute (4)
 DESK_API int desk_local_part(int k) {
   SYSTEMTIME t; GetLocalTime(&t);
