@@ -1,28 +1,43 @@
-// The warehouse: the studio as a place (WI\studio-warehouse.md), desktop version.
+// The warehouse: the studio as a place (WI\studio-warehouse.md), desktop version, draft 2.
 //
 // The world file (worlds\warehouse.ddd) holds the building and each project as a part standing at its own
-// origin. THIS file, run on the loop, decides where those parts are each frame: three turntables, sixteen shelf
-// slots, the flights between them, the chips beside the selected project, and the production line's cards.
-// Everything with writing on it (names, chips, cards) is a small page, drawn by the document panel's PagePass
-// as an unlit quad on top of the finished picture, far to near. (The page pass has no depth test and no
-// blending, so labels show through things, and "fade" is a pop-in; see the lane report.)
+// origin. THIS file, run on the loop, decides where those parts are each frame: five slots of a ring around the
+// start spot (projects float at waist height over a soft ring of light, with a contact shadow beneath), 24 shelf
+// slots, the flights between them, zoom by levels, the chips beside the selected project, and the production
+// line's cards (a click on one opens its report beside it).
+// Everything with writing on it (names, chips, cards) is a small page, drawn by the document panel's PagePass as
+// an unlit quad on top of the finished picture, far to near. Draft 2's page pass blends (so things fade) and,
+// for the labels, tests against the scene's depth (kept by ImageFx), so they hide behind what stands in front.
 
 const LINE_FILE = "C:/src/studio-work/warehouse/line.json";
 const LAB_W = 512u32;
 const LAB_H = 128u32;
 const FLIGHT_MS = 500.0f;
 const CHIP_DELAY_MS = 300.0f;
-const CHIP_POP_MS = 150.0f;
-const TABLE_TOP = 0.92f;
+const FADE_S = 0.2f;
+const FLOAT_Y = 0.95f;           // projects float at waist height
+const RING_N = 5;
+const RING_R = 2.5f;
+const ZOOM1_H = 2.4f;            // "the project fills the ring": its height, meters
+const ZOOM2_H = 7.0f;            // "fills the room"
 const NO_ITEM = -1;
 const PI = 3.14159265f;
+
+fn fminf(a: f32, b: f32) f32 { if a < b { a } else { b } }
+fn fmaxf(a: f32, b: f32) f32 { if a > b { a } else { b } }
+
+// Move 'a' toward 'want' so that a full change takes FADE_S
+fn fadeToward(a: f32, want: f32, dt: f32) f32 {
+  let step = dt / FADE_S;
+  if a < want { fminf(a + step, want) } else { fmaxf(a - step, want) }
+}
 
 // A small page with writing on it: its quad is w x h meters at scale 1
 struct Label {
   pass: PagePass;
   w: f32;
   h: f32;
-  ok: bool;             // its picture made (a few a frame: every picture is a command buffer, and a frame may record 16)
+  ok: bool;             // its picture made (a few a frame: every picture is a command buffer, and a frame may record 128)
   text: String;
   bg: u32;
   ink: u32;
@@ -32,6 +47,7 @@ struct Label {
   progress: f32;
   hot: bool;
   strong: bool;
+  alpha: f32;           // how visible it is now (fades toward what it should be, over FADE_S)
 }
 
 // Draws short texts into images (the document panel's fonts and renderer, in a small texture)
@@ -125,15 +141,54 @@ fn paint(img: &mut Image, x0: i32, y0: i32, x1: i32, y1: i32, rgb: u32) {
   }
 }
 
-// A plain name or chip (its picture is made later, by fill)
+// A plain name or chip (its picture is made later, by fill); depth tested
 fn textLabel(l: &mut Labeller, device: &mut Device, format: u32, text: &str, bg: u32, ink: u32, size: f32, w: f32) Label {
-  Label(PagePass.create(device, format), w, w / 4., false, String.from(text), bg, ink, size, 22., false, 0., false, false)
+  Label(PagePass.createDepth(device, format), w, w / 4., false, String.from(text), bg, ink, size, 22., false, 0., false, false, 0.)
+}
+
+// The level readout at the foot of the view: no depth test (it is part of the view, not of the room)
+fn readoutLabel(device: &mut Device, format: u32) Label {
+  Label(PagePass.create(device, format), 0.36, 0.09, false, String.from("warehouse"), 0x202833ffu32, 0xffffffffu32, 50., 22.,
+    false, 0., false, false, 0.)
 }
 
 // A card of the line: title, a bar, and an amber frame if it needs Jon (strong or soft)
 fn cardLabel(l: &mut Labeller, device: &mut Device, format: u32, title: &str, progress: f32, hot: bool, strong: bool) Label {
-  Label(PagePass.create(device, format), 1.1, 0.275, false, String.from(title), 0xf8f5eeffu32, 0x1c1c1cffu32, 32., 6., true,
-    progress, hot, strong)
+  Label(PagePass.createDepth(device, format), 1.1, 0.275, false, String.from(title), 0xf8f5eeffu32, 0x1c1c1cffu32, 32., 6., true,
+    progress, hot, strong, 1.)       // its own alpha stays 1: the card's (Card.alpha) fades both frames together
+}
+
+// A soft disc of alpha, 128 px square, for the floor: the ring of light (a pale band with a faint glow inside it) or
+// the contact shadow (black, strongest in the middle)
+fn makeDecal(device: &mut Device, format: u32, ring: bool) PagePass {
+  var pass = PagePass.createDepth(device, format);
+  let n = 128u32;
+  var px = List[u8].withCapacity(usize.from(n * n * 4u32));
+  var y = 0u32;
+  while y < n {
+    var x = 0u32;
+    while x < n {
+      let fx = (f32.from(x) + 0.5) / f32.from(n) * 2. - 1.;
+      let fy = (f32.from(y) + 0.5) / f32.from(n) * 2. - 1.;
+      let r = (fx * fx + fy * fy).sqrt();
+      var a: f32 = 0.;
+      if ring {
+        let d = (r - 0.78).abs() / 0.14;
+        if d < 1. { a = (1. - d) * (1. - d) * 0.9; }
+        if r < 0.78 { a = fmaxf(a, 0.14 * (1. - r / 0.78)); }
+      } else {
+        if r < 1. { a = 0.6 * (1. - r) * (1. - r); }
+      }
+      px.push(if ring { 255u8 } else { 0u8 });
+      px.push(if ring { 244u8 } else { 0u8 });
+      px.push(if ring { 214u8 } else { 0u8 });
+      px.push(u8.from(u32.from(a * 255.)));
+      x = x + 1u32;
+    }
+    y = y + 1u32;
+  }
+  pass.uploadRgba(device, n, n, &px);
+  pass
 }
 
 struct Card {
@@ -142,6 +197,8 @@ struct Card {
   hot: bool;
   calm: Label;
   glow: Label;          // the strong frame; shown in turns with 'calm' when hot
+  report: String;       // a file path, or empty
+  alpha: f32;
 }
 
 // A project: a part of the world (or the document page), and where it stands
@@ -150,8 +207,8 @@ struct Item {
   part: String;         // the part's name in the world; empty for the document page
   page: bool;
   home: u32;            // its shelf slot when shelved
-  onTable: bool;
-  idx: u32;             // table number or shelf slot
+  onTable: bool;        // in the ring (no table now: it floats)
+  idx: u32;             // ring slot or shelf slot
   pos: Vec3;
   scale: f32;
   yaw: f32;
@@ -166,6 +223,9 @@ struct Item {
   radius: f32;          // half its width at scale 1
   yawShelf: f32;
   label: Label;
+  zlevel: u32;          // 0 in the ring, 1 fills the ring, 2 fills the room
+  zf: f32;              // the zoom factor now (follows the level's)
+  shade: f32;           // the contact shadow's strength now
 }
 
 // The visitor gliding to look at something
@@ -184,7 +244,7 @@ pub struct Warehouse {
   pub on: bool;
   labeller: Option[Labeller];
   items: List[Item];
-  tableItem: List[i32];
+  tableItem: List[i32];    // the ring's slots
   shelfItem: List[i32];
   chips: List[Label];      // shelve, bring, zoom, open, talk
   stages: List[Label];
@@ -197,13 +257,25 @@ pub struct Warehouse {
   lastMs: u64;
   startMs: u64;
   glide: Glide;
-  pub sHeld: bool;
   format: u32;
   ticks: u32;
+  decals: List[PagePass];  // [0] the ring of light, [1] the contact shadow
+  slotGlow: List[f32];
+  chipAnchor: i32;         // the item the chips stand beside (kept while they fade out)
+  chipKinds: List[u32];
+  readout: List[Label];
+  readKey: i32;
+  reportPanel: Option[DocPanel];
+  reportWant: String;      // a report to open, asked for by a click and served in 'update'
+  reportCard: i32;         // the card whose report is open, or -1
+  reportOpen: bool;
+  reportPos: Vec3;
 
   pub fn empty() Warehouse {
     Warehouse(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
-      NO_ITEM, 0u64, 0u64, 0u64, Glide(false, 0., Vec3(0., 0., 0.), Vec3(0., 0., 0.), 0., 0., 0., 0.), false, 0u32, 0u32)
+      NO_ITEM, 0u64, 0u64, 0u64, Glide(false, 0., Vec3(0., 0., 0.), Vec3(0., 0., 0.), 0., 0., 0., 0.), 0u32, 0u32,
+      List[PagePass](), List[f32](), NO_ITEM, List[u32](), List[Label](), -1, None, String(), -1, false,
+      Vec3(0., 0., 0.))
   }
 
   pub fn create(device: &mut Device, format: u32) Warehouse {
@@ -214,10 +286,17 @@ pub struct Warehouse {
       case var &mut Some(l) {
         w.on = true;
         var i = 0;
-        while i < 3 { w.tableItem.push(NO_ITEM); i = i + 1; }
+        while i < RING_N { w.tableItem.push(NO_ITEM); w.slotGlow.push(0.); i = i + 1; }
         i = 0;
-        while i < 16 { w.shelfItem.push(NO_ITEM); i = i + 1; }
-        // knight, page, amphora on the tables; six boxes on the shelf
+        while i < 24 { w.shelfItem.push(NO_ITEM); i = i + 1; }
+        // one pass for each thing drawn (a pass has one set of uniforms, written when the draw is recorded):
+        // [0..5) the rings of the slots, [5..14) the shadows of the nine items
+        i = 0;
+        while i < RING_N { w.decals.push(makeDecal(device, format, true)); i = i + 1; }
+        i = 0;
+        while i < 9 { w.decals.push(makeDecal(device, format, false)); i = i + 1; }
+        w.readout.push(readoutLabel(device, format));
+        // knight, page, amphora in the ring; six boxes on the shelf
         w.addItem(l, device, "Knight", "knight", false, 8u32, 1.0, 0.45, 0.61, 0.2, PI * 0.5);
         w.addItem(l, device, "Design page", "", true, 9u32, 0.5, 0.2, 1.903, 0.67, 0.);
         w.addItem(l, device, "Amphora", "amphora", false, 10u32, 1.0, 0.6, 0.52, 0.17, 0.);
@@ -227,15 +306,15 @@ pub struct Warehouse {
         w.addItem(l, device, "Cottage", "box_cottage", false, 3u32, 1.6, 1.0, 0.30, 0.15, 0.);
         w.addItem(l, device, "Chess", "box_chess", false, 4u32, 1.6, 1.0, 0.30, 0.15, 0.);
         w.addItem(l, device, "Horse", "box_horse", false, 5u32, 1.6, 1.0, 0.30, 0.15, 0.);
-        // who stands where at the start: items 0..2 on tables 0, 1, 2; the rest on their home slots
-        w.settle(0, true, 0u32);
-        w.settle(1, true, 1u32);
-        w.settle(2, true, 2u32);
+        // who stands where at the start: the page dead ahead (slot 0), the amphora to its right (1), the knight on the left (4)
+        w.settle(0, true, 4u32);
+        w.settle(1, true, 0u32);
+        w.settle(2, true, 1u32);
         i = 3;
         while i < 9 { w.settle(i, false, w.items[usize.from(u32.from(i))].home); i = i + 1; }
         let blue = 0x2a5d9fffu32;
         let white = 0xffffffffu32;
-        w.chips.push(textLabel(l, device, format, "shelve (S)", blue, white, 46., 0.30));
+        w.chips.push(textLabel(l, device, format, "shelve (X)", blue, white, 46., 0.30));
         w.chips.push(textLabel(l, device, format, "bring (B)", 0x2f8a4fffu32, white, 46., 0.30));
         w.chips.push(textLabel(l, device, format, "zoom (Z)", blue, white, 46., 0.30));
         w.chips.push(textLabel(l, device, format, "open (O)", blue, white, 46., 0.30));
@@ -260,7 +339,7 @@ pub struct Warehouse {
              tableScale: f32, shelfScale: f32, height: f32, radius: f32, yawShelf: f32) {
     let label = textLabel(l, device, format, name, 0xf8f5eeffu32, 0x1c1c1cffu32, 50., 0.56);
     items.push(Item(String.from(name), String.from(part), page, home, false, 0u32, Vec3(0., 0., 0.), 1., 0.,
-      Vec3(0., 0., 0.), 1., 1., 0u64, NO_SLOT, tableScale, shelfScale, height, radius, yawShelf, label));
+      Vec3(0., 0., 0.), 1., 1., 0u64, NO_SLOT, tableScale, shelfScale, height, radius, yawShelf, label, 0u32, 1., 0.));
   }
 
   // Put item i where it stands, with no flight
@@ -272,25 +351,50 @@ pub struct Warehouse {
     let d = self.dest(k);
     (&mut items[k]).pos = d;
     (&mut items[k]).scale = self.destScale(k);
-    (&mut items[k]).yaw = if onTable { 0. } else { items[k].yawShelf };
+    (&mut items[k]).yaw = if onTable { self.slotYaw(idx) } else { items[k].yawShelf };
     (&mut items[k]).flight = 1.;
+    (&mut items[k]).shade = if onTable { 1. } else { 0. };
   }
 
-  fn tableCentre(t: u32) Vec3 {
-    if t == 0u32 { Vec3(-1.5, TABLE_TOP, -2.0) } else if t == 1u32 { Vec3(0., TABLE_TOP, -2.5) } else { Vec3(1.5, TABLE_TOP, -2.0) }
+  // Slot t of the ring: evenly around the start spot, slot 0 straight ahead (-z), going round to the right
+  fn slotPos(t: u32) Vec3 {
+    let a = f32.from(t) * 2. * PI / f32.from(RING_N);
+    Vec3(RING_R * sin(a), FLOAT_Y, 0. - RING_R * cos(a))
   }
+
+  // The yaw that turns a page at slot t to face the start spot
+  fn slotYaw(self: &, t: u32) f32 { 0. - f32.from(t) * 2. * PI / f32.from(RING_N) }
 
   fn shelfPos(j: u32) Vec3 {
-    let col = f32.from(j % 8u32);
-    Vec3((col - 3.5) * 1.4, if j / 8u32 == 0u32 { 0.30 } else { 1.20 }, -11.0)
+    if j < 16u32 {
+      let col = f32.from(j % 8u32);
+      Vec3((col - 3.5) * 1.4, if j / 8u32 == 0u32 { 0.30 } else { 1.20 }, -11.0)
+    } else {
+      let q = j - 16u32;
+      Vec3(11.0, if q / 4u32 == 0u32 { 0.30 } else { 1.20 }, (f32.from(q % 4u32) - 1.5) * 1.4)
+    }
   }
 
   fn dest(self: &, k: usize) Vec3 {
-    if items[k].onTable { Warehouse.tableCentre(items[k].idx) } else { Warehouse.shelfPos(items[k].idx) }
+    if items[k].onTable { Warehouse.slotPos(items[k].idx) } else { Warehouse.shelfPos(items[k].idx) }
   }
 
   fn destScale(self: &, k: usize) f32 {
     if items[k].onTable { items[k].tableScale } else { items[k].shelfScale }
+  }
+
+  // Where item k is now once zoom is counted: x, y (its foot), z and the scale. Zoom scales it about its centre,
+  // not lower than the floor.
+  fn eff(self: &, k: usize) Vec4 {
+    let it = &items[k];
+    let s = it.scale * it.zf;
+    var y = it.pos.y + 0.5 * it.height * it.scale - 0.5 * it.height * s;
+    if y < 0. { y = 0.; }
+    Vec4(it.pos.x, y, it.pos.z, s)
+  }
+
+  fn zoomHeight(level: u32) f32 {
+    if level == 1u32 { ZOOM1_H } else { ZOOM2_H }
   }
 
   fn startFlight(self: &mut, k: usize) {
@@ -299,8 +403,8 @@ pub struct Warehouse {
     (&mut items[k]).flight = 0.;
   }
 
-  // Per frame: the clock, the flights, the turning, the line's file
-  pub fn update(self: &mut, device: &mut Device) {
+  // Per frame: the clock, the flights, the turning, the zoom, the fades, the line's file, the report
+  pub fn update(self: &mut, device: &mut Device, renderer: &mut Renderer) {
     let now = nowMs();
     var dt = f32.from(now - lastMs) / 1000.;
     if dt > 0.1 { dt = 0.1; }
@@ -312,7 +416,7 @@ pub struct Warehouse {
       let ds = self.destScale(k);
       var want: f32 = 0.;
       if items[k].onTable {
-        want = if items[k].page { 0.5 * sin(clock * 0.5) } else { clock * 0.4 };
+        want = if items[k].page { self.slotYaw(items[k].idx) + 0.5 * sin(clock * 0.5) } else { clock * 0.4 };
         if !items[k].page { want = items[k].yawShelf + clock * 0.4; }
       } else { want = items[k].yawShelf; }
       // turn the short way, quickly after a flight so that the swap does not pop
@@ -335,17 +439,70 @@ pub struct Warehouse {
         (&mut items[k]).pos = d;
         (&mut items[k]).scale = ds;
       }
+      // zoom: the factor follows the level's
+      var tz: f32 = 1.;
+      if items[k].zlevel > 0u32 { tz = Warehouse.zoomHeight(items[k].zlevel) / (items[k].height * ds); }
+      var zstep = 5. * dt;
+      if zstep > 1. { zstep = 1.; }
+      (&mut items[k]).zf = items[k].zf + (tz - items[k].zf) * zstep;
+      (&mut items[k]).shade = fadeToward(items[k].shade, if items[k].onTable { 1. } else { 0. }, dt);
+      (&mut items[k]).label.alpha = fadeToward(items[k].label.alpha, if items[k].zlevel > 0u32 { 0. } else { 1. }, dt);
       k = k + 1usize;
     }
+    // the ring's slots glow: a filled slot fully, an empty one faintly
+    var t = 0usize;
+    while t < usize.from(u32.from(RING_N)) {
+      slotGlow.set(t, fadeToward(*slotGlow[t], if *tableItem[t] == NO_ITEM { 0.3 } else { 1. }, dt));
+      t = t + 1usize;
+    }
+    // the chips: shown a moment after a selection settles; fade by kind
+    let shown = self.chipsShown(now);
+    if shown {
+      chipAnchor = sel;
+      chipKinds = self.chipList();
+    }
+    var c = 0usize;
+    while c < 5usize {
+      var has = false;
+      var q = 0usize;
+      while q < chipKinds.len() { if usize.from(*chipKinds[q]) == c { has = true; } q = q + 1usize; }
+      (&mut chips[c]).alpha = fadeToward(chips[c].alpha, if shown && has { 1. } else { 0. }, dt);
+      c = c + 1usize;
+    }
+    var si = 0usize;
+    while si < stages.len() { (&mut stages[si]).alpha = fadeToward(stages[si].alpha, 1., dt); si = si + 1usize; }
+    var ci = 0usize;
+    while ci < cards.len() { (&mut cards[ci]).alpha = fadeToward(cards[ci].alpha, 1., dt); ci = ci + 1usize; }
+    self.updateReadout(dt);
     if now >= linePoll + 250u64 {
       linePoll = now;
       self.readLine(device);
     }
+    self.serveReport(device, renderer);
     ticks = ticks + 1u32;
     if ticks > 4u32 { self.fillSome(device, 2); }
   }
 
-  // A few pictures a frame: names, chips, stage boards, then cards
+  // The level readout: "Knight, room" while something is selected, fading out when nothing is
+  fn updateReadout(self: &mut, dt: f32) {
+    var key = -1;
+    var text = String.from("warehouse");
+    if sel >= 0 {
+      let it = &items[usize.from(u32.from(sel))];
+      key = sel * 4 + i32.from(it.zlevel);
+      text = String.from(it.name.view());
+      text.append(", ");
+      text.append(if it.zlevel == 0u32 { "warehouse" } else if it.zlevel == 1u32 { "ring" } else { "room" });
+    }
+    if key >= 0 && key != readKey {
+      readKey = key;
+      (&mut readout[0usize]).text = text;
+      (&mut readout[0usize]).ok = false;
+    }
+    (&mut readout[0usize]).alpha = fadeToward(readout[0usize].alpha, if sel >= 0 { 1. } else { 0. }, dt);
+  }
+
+  // A few pictures a frame: names, readout, chips, stage boards, then cards
   fn fillSome(self: &mut, device: &mut Device, most: i32) {
     var lab: Option[Labeller] = None;
     lab <-> labeller;
@@ -357,6 +514,7 @@ pub struct Warehouse {
           if !items[k].label.ok { fillLabel(l, device, &mut items[k].label); made = made + 1; }
           k = k + 1usize;
         }
+        if made < most && !readout[0usize].ok { fillLabel(l, device, &mut readout[0usize]); made = made + 1; }
         k = 0usize;
         while k < chips.len() && made < most {
           if !chips[k].ok { fillLabel(l, device, &mut chips[k]); made = made + 1; }
@@ -400,6 +558,8 @@ pub struct Warehouse {
                       match c.getText("title") { case let Some(t) { title.append(t); } else {} }
                       var id = String();
                       match c.getText("id") { case let Some(t) { id.append(t); } else {} }
+                      var report = String();
+                      match c.getText("report") { case let Some(t) { report.append(t); } else {} }
                       var stage = 0u32;
                       match c.getText("stage") {
                         case let Some(t) {
@@ -414,7 +574,11 @@ pub struct Warehouse {
                       let hot = c.boolOr("needs_jon", false);
                       let calm = cardLabel(l, device, format, title.view(), progress, hot, false);
                       let glow = cardLabel(l, device, format, title.view(), progress, hot, true);
-                      fresh.push(Card(id, stage, hot, calm, glow));
+                      // a card that was there keeps how visible it was, so a changed file does not blink the line
+                      var was: f32 = 0.;
+                      var o = 0usize;
+                      while o < cards.len() { if sameText(cards[o].id.view(), id.view()) { was = cards[o].alpha; } o = o + 1usize; }
+                      fresh.push(Card(id, stage, hot, calm, glow, report, was));
                     }
                     else {}
                   }
@@ -425,17 +589,107 @@ pub struct Warehouse {
             }
             labeller <-> lab;
             cards = fresh;
+            reportCard = -1;
             linesRead = linesRead + 1u32;
             print <- "warehouse: line.json read: "; print <- cards.len(); print <- " cards\n";
           }
           case let Err(e) {
-            if linesRead == 0u32 || true { print <- "warehouse: line.json does not parse; keeping the last cards\n"; }
+            print <- "warehouse: line.json does not parse; keeping the last cards\n";
             lineText = String.from(s.view());
           }
         }
       }
       case is Err {}
     }
+  }
+
+  // ---- the report page beside a card ----
+
+  // Serve a click's request: open the file in the report panel (made on first use), keep it live
+  fn serveReport(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if reportWant.len() > 0usize {
+      match &mut reportPanel {
+        case var &mut Some(p) { p.open(device, renderer, reportWant.view()); }
+        case is None { reportPanel = DocPanel.create(device, renderer, format, reportWant.view(), 0.); }
+      }
+      print <- "warehouse: report opened: "; printStr(reportWant.view()); print <- "\n";
+      reportWant = String();
+      reportOpen = true;
+    }
+    if reportOpen {
+      match &mut reportPanel {
+        case var &mut Some(p) { p.tick(device, renderer); }
+        else {}
+      }
+    }
+  }
+
+  // The card c's place on the line: its station's column, stacked upward among the cards of the same stage
+  fn cardPlace(self: &, c: usize) Vec3 {
+    var n = 0u32;
+    var o = 0usize;
+    while o < c { if cards[o].stage == cards[c].stage { n = n + 1u32; } o = o + 1usize; }
+    self.cardPos(usize.from(cards[c].stage), n)
+  }
+
+  // Open (or close, if it is open) the report of card c, standing beside it, toward the room
+  pub fn openCard(self: &mut, c: i32) bool {
+    if c < 0 || usize.from(u32.from(c)) >= cards.len() { return false; }
+    let cu = usize.from(u32.from(c));
+    if cards[cu].report.len() == 0usize {
+      print <- "warehouse: card "; printStr(cards[cu].id.view()); print <- " has no report\n";
+      return true;
+    }
+    if reportOpen && reportCard == c { reportOpen = false; reportCard = -1; print <- "warehouse: report closed\n"; return true; }
+    let p = self.cardPlace(cu);
+    reportPos = Vec3(-3.5, 0., p.z + (if p.z > 0. { -1.2 } else { 1.2 }));
+    reportWant = String.from(cards[cu].report.view());
+    reportCard = c;
+    true
+  }
+
+  fn reportModel(self: &) Mat4 {
+    Mat4.fromTrs(reportPos, Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.))
+  }
+
+  // A click's ray: the open report page (taken, nothing more) or a card (opens its report)
+  pub fn clickCard(self: &mut, eye: Vec3, dir: Vec3) bool {
+    var best = -1;
+    var bestT: f32 = 1000.;
+    var c = 0usize;
+    while c < cards.len() {
+      let m = Mat4.fromTrs(self.cardPlace(c), Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
+      let inv = m.inverse();
+      let e = inv * eye;
+      let d = inv.transformVector(dir);
+      if d.z > 0.00001 || d.z < -0.00001 {
+        let t = (0. - e.z) / d.z;
+        if t > 0. && t < bestT {
+          let p = e + d * t;
+          if p.x >= -0.55 && p.x <= 0.55 && p.y >= -0.1375 && p.y <= 0.1375 && cards[c].alpha > 0.3 {
+            best = i32.from(c);
+            bestT = t;
+          }
+        }
+      }
+      c = c + 1usize;
+    }
+    if best >= 0 {
+      print <- "warehouse: card clicked: "; printStr(cards[usize.from(u32.from(best))].id.view()); print <- "\n";
+      return self.openCard(best);
+    }
+    if reportOpen {
+      var hit = false;
+      match &mut reportPanel {
+        case var &mut Some(p) {
+          let inv = self.reportModel().inverse();
+          hit = p.click(inv * eye, inv.transformVector(dir));
+        }
+        else {}
+      }
+      if hit { return true; }
+    }
+    false
   }
 
   // ---- selection and actions ----
@@ -465,8 +719,9 @@ pub struct Warehouse {
   pub fn placeOf(self: &mut, parts: &List[Live], pi: usize) Option[Mat4] {
     let k = self.itemOfSlot(parts, pi);
     if k < 0 { return None; }
-    let it = &items[usize.from(u32.from(k))];
-    Some[Mat4](Mat4.fromTrs(it.pos, Quat.angleAxis(it.yaw, Vec3(0., 1., 0.)), Vec3(it.scale, it.scale, it.scale)))
+    let ku = usize.from(u32.from(k));
+    let e = self.eff(ku);
+    Some[Mat4](Mat4.fromTrs(Vec3(e.x, e.y, e.z), Quat.angleAxis(items[ku].yaw, Vec3(0., 1., 0.)), Vec3(e.w, e.w, e.w)))
   }
 
   fn pageIndex(self: &) i32 {
@@ -479,14 +734,17 @@ pub struct Warehouse {
   pub fn pageModel(self: &) Mat4 {
     let k = self.pageIndex();
     if k < 0 { return Mat4.identity(); }
-    let it = &items[usize.from(u32.from(k))];
+    let ku = usize.from(u32.from(k));
+    let e = self.eff(ku);
     let bottom = f32.from(DOC_CENTRE_Y) - 0.5 * f32.from(DOC_WORLD_W) * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
-    Mat4.fromTrs(it.pos, Quat.angleAxis(it.yaw, Vec3(0., 1., 0.)), Vec3(it.scale, it.scale, it.scale))
+    Mat4.fromTrs(Vec3(e.x, e.y, e.z), Quat.angleAxis(items[ku].yaw, Vec3(0., 1., 0.)), Vec3(e.w, e.w, e.w))
       * Mat4.fromTranslation(Vec3(0., 0. - bottom, 0.))
   }
 
   pub fn select(self: &mut, k: i32) {
     if k == sel { return; }
+    var o = 0usize;
+    while o < items.len() { if i32.from(o) != k { (&mut items[o]).zlevel = 0u32; } o = o + 1usize; }
     sel = k;
     selAt = nowMs();
     if k >= 0 {
@@ -528,7 +786,7 @@ pub struct Warehouse {
     NO_ITEM
   }
 
-  // A table item to its shelf, in flight
+  // A ring item to its shelf, in flight
   pub fn shelve(self: &mut, k: usize) bool {
     if !items[k].onTable { return false; }
     let j = self.freeShelf(k);
@@ -537,19 +795,20 @@ pub struct Warehouse {
     tableItem.set(usize.from(items[k].idx), NO_ITEM);
     (&mut items[k]).onTable = false;
     (&mut items[k]).idx = u32.from(j);
+    (&mut items[k]).zlevel = 0u32;
     shelfItem.set(usize.from(u32.from(j)), i32.from(k));
     (&mut items[k]).touched = nowMs();
     print <- "warehouse: "; printStr(items[k].name.view()); print <- " to shelf slot "; print <- j; print <- "\n";
     true
   }
 
-  // A shelved item to a free turntable (the oldest-untouched one goes back to its shelf if all are full)
+  // A shelved item to a free slot of the ring (the oldest-untouched one goes back to its shelf if all are full)
   pub fn bring(self: &mut, k: usize) bool {
     if items[k].onTable { return false; }
     var t = -1;
-    let order = [1, 0, 2];
+    let order = [0, 1, 4, 2, 3];
     var o = 0usize;
-    while o < 3usize && t < 0 {
+    while o < 5usize && t < 0 {
       if *tableItem[usize.from(u32.from(order[o]))] == NO_ITEM { t = order[o]; }
       o = o + 1usize;
     }
@@ -557,7 +816,7 @@ pub struct Warehouse {
       var oldest = 0usize;
       var best = 18446744073709551615u64;
       var q = 0usize;
-      while q < 3usize {
+      while q < 5usize {
         let who = usize.from(u32.from(*tableItem[q]));
         if items[who].touched < best { best = items[who].touched; oldest = who; }
         q = q + 1usize;
@@ -572,7 +831,7 @@ pub struct Warehouse {
     (&mut items[k]).idx = u32.from(t);
     tableItem.set(usize.from(u32.from(t)), i32.from(k));
     (&mut items[k]).touched = nowMs();
-    print <- "warehouse: "; printStr(items[k].name.view()); print <- " to table "; print <- t; print <- "\n";
+    print <- "warehouse: "; printStr(items[k].name.view()); print <- " to ring slot "; print <- t; print <- "\n";
     true
   }
 
@@ -590,6 +849,47 @@ pub struct Warehouse {
     glide = Glide(true, 0., eye, to, yaw, atan2(0. - look.x, 0. - look.z), pitch, asin(look.y / len));
   }
 
+  // The view for zoom level 'level' of ring item k: standing on the line from the item through the start spot,
+  // 2.5 m from it (at the start spot) for the ring, 9 m for the room, looking at its centre
+  fn glideView(self: &mut, k: usize, level: u32, eye: Vec3, yaw: f32, pitch: f32) {
+    let c = self.dest(k);
+    let ds = self.destScale(k);
+    let h = items[k].height * ds;
+    var zt: f32 = 1.;
+    if level > 0u32 { zt = Warehouse.zoomHeight(level) / h; }
+    var baseY = c.y + 0.5 * h - 0.5 * h * zt;
+    if baseY < 0. { baseY = 0.; }
+    let cy = baseY + 0.5 * h * zt;
+    var flat = Vec3(0. - c.x, 0., 0. - c.z);
+    if flat.length() < 0.01 { flat = Vec3(0., 0., 1.); }
+    flat = flat.normalize();
+    let dist = if level == 2u32 { 9.0 } else { RING_R };
+    let to = Vec3(c.x + flat.x * dist, 1.6, c.z + flat.z * dist);
+    let look = Vec3(c.x, cy, c.z) - to;
+    let len = look.length();
+    glide = Glide(true, 0., eye, to, yaw, atan2(0. - look.x, 0. - look.z), pitch, asin(look.y / len));
+  }
+
+  // Z (dir 1) or Shift+Z (dir -1): the selected project one level up or down; the project scales about its centre
+  // and the view steps to suit
+  pub fn zoom(self: &mut, dir: i32, v: &Fly) bool {
+    if sel < 0 { return false; }
+    let k = usize.from(u32.from(sel));
+    if !items[k].onTable {
+      if dir < 0 { return false; }
+      self.bring(k);
+    }
+    var lv = i32.from(items[k].zlevel) + dir;
+    if lv < 0 { lv = 0; }
+    if lv > 2 { lv = 2; }
+    if lv == i32.from(items[k].zlevel) { return false; }
+    (&mut items[k]).zlevel = u32.from(lv);
+    (&mut items[k]).touched = nowMs();
+    self.glideView(k, u32.from(lv), v.position, v.yaw, v.pitch);
+    print <- "warehouse: "; printStr(items[k].name.view()); print <- " zoom level "; print <- lv; print <- "\n";
+    true
+  }
+
   // The glide, one fixed step: moves the visitor
   pub fn glideStep(self: &mut, v: &mut Fly, dt: f32) {
     if !glide.active { return; }
@@ -605,19 +905,18 @@ pub struct Warehouse {
     v.pitch = glide.fromPitch + (glide.toPitch - glide.fromPitch) * e;
   }
 
-  // An action on the selection: 0 shelve, 1 bring, 2 zoom, 3 open, 4 talk. Returns true if it did something.
+  // An action on the selection: 0 shelve, 1 bring, 2 zoom in, 3 open, 4 talk, 5 zoom out. True if it did something.
   pub fn act(self: &mut, a: u32, v: &Fly) bool {
     if sel < 0 { return false; }
     let k = usize.from(u32.from(sel));
     (&mut items[k]).touched = nowMs();
     if a == 0u32 { return self.shelve(k); }
     if a == 1u32 { return self.bring(k); }
-    var d: f32 = if items[k].page { 1.7 } else { 1.4 };
+    if a == 2u32 { return self.zoom(1, v); }
+    if a == 5u32 { return self.zoom(-1, v); }
     if a == 3u32 {
-      d = d * 0.65;
+      let d: f32 = if items[k].page { 1.1 } else { 0.9 };
       if !items[k].onTable { self.bring(k); }
-    }
-    if a == 2u32 || a == 3u32 {
       self.glideTo(k, v.position, v.yaw, v.pitch, d);
       return true;
     }
@@ -638,30 +937,28 @@ pub struct Warehouse {
     s
   }
 
-  // An item's name label: the model and the half sizes
+  // An item's name label: its middle and the label's scale
   fn labelFrame(self: &, k: usize, eye: Vec3) Vec4 {
     let it = &items[k];
-    let d = (it.pos - eye).length();
+    let e = self.eff(k);
+    let d = (Vec3(e.x, e.y, e.z) - eye).length();
     let ls = Warehouse.clampScale(d, 3.5, 2.6);
-    let hw = it.label.w * ls * 0.5;
     let hh = it.label.h * ls * 0.5;
-    let top = it.pos.y + it.height * it.scale + hh + 0.06;
-    Vec4(it.pos.x, top, it.pos.z, ls)
+    let top = e.y + it.height * e.w + hh + 0.06;
+    Vec4(e.x, top, e.z, ls)
   }
 
-  // The chip k of n beside the selection: its model and its half size
-  fn chipFrame(self: &, k: usize, n: usize, eye: Vec3, now: u64) Vec4 {
-    let it = &items[usize.from(u32.from(sel))];
-    let centre = Vec3(it.pos.x, it.pos.y + it.height * it.scale * 0.5, it.pos.z);
+  // The chip k of n beside the anchor item: its middle and scale
+  fn chipFrame(self: &, k: usize, n: usize, eye: Vec3) Vec4 {
+    let ai = usize.from(u32.from(chipAnchor));
+    let it = &items[ai];
+    let e = self.eff(ai);
+    let centre = Vec3(e.x, e.y + it.height * e.w * 0.5, e.z);
     let d = (centre - eye).length();
-    var cs = Warehouse.clampScale(d, 2.5, 3.);
-    var g = (f32.from(now - selAt) - CHIP_DELAY_MS) / CHIP_POP_MS;
-    if g < 0. { g = 0.; }
-    if g > 1. { g = 1.; }
-    cs = cs * (0.3 + 0.7 * g);
+    let cs = Warehouse.clampScale(d, 2.5, 3.);
     let th = atan2(eye.x - centre.x, eye.z - centre.z);
     let right = Vec3(cos(th), 0., 0. - sin(th));
-    let side = it.radius * it.scale + 0.2 * cs;
+    let side = it.radius * e.w + 0.2 * cs;
     let up = ((f32.from(n) - 1.) * 0.5 - f32.from(k)) * 0.095 * cs;
     Vec4(centre.x + right.x * side, centre.y + up, centre.z + right.z * side, cs)
   }
@@ -673,26 +970,28 @@ pub struct Warehouse {
   // A click's ray against the chips: true if one was taken
   pub fn clickChip(self: &mut, eye: Vec3, dir: Vec3, v: &Fly) bool {
     let now = nowMs();
-    if !self.chipsShown(now) { return false; }
+    if !self.chipsShown(now) || chipAnchor != sel { return false; }
     let list = self.chipList();
     var k = 0usize;
     while k < list.len() {
-      let f = self.chipFrame(k, list.len(), eye, now);
       let c = *list[k];
-      let w = chips[usize.from(c)].w * f.w * 0.5;
-      let h = chips[usize.from(c)].h * f.w * 0.5;
-      let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
-      let inv = m.inverse();
-      let e = inv * eye;
-      let d = inv.transformVector(dir);
-      if d.z > 0.00001 || d.z < -0.00001 {
-        let t = (0. - e.z) / d.z;
-        if t > 0. {
-          let p = e + d * t;
-          if p.x >= 0. - w && p.x <= w && p.y >= 0. - h && p.y <= h {
-            print <- "warehouse: chip "; print <- c; print <- "\n";
-            self.act(c, v);
-            return true;
+      if chips[usize.from(c)].alpha > 0.5 {
+        let f = self.chipFrame(k, list.len(), eye);
+        let w = chips[usize.from(c)].w * f.w * 0.5;
+        let h = chips[usize.from(c)].h * f.w * 0.5;
+        let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
+        let inv = m.inverse();
+        let e = inv * eye;
+        let d = inv.transformVector(dir);
+        if d.z > 0.00001 || d.z < -0.00001 {
+          let t = (0. - e.z) / d.z;
+          if t > 0. {
+            let p = e + d * t;
+            if p.x >= 0. - w && p.x <= w && p.y >= 0. - h && p.y <= h {
+              print <- "warehouse: chip "; print <- c; print <- "\n";
+              self.act(c, v);
+              return true;
+            }
           }
         }
       }
@@ -705,19 +1004,52 @@ pub struct Warehouse {
 
   fn sortKey(kind: u32, i: u32) u32 { kind * 1000u32 + i }
 
-  pub fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, vp: Mat4, eye: Vec3,
-              panel: &mut Option[DocPanel]) {
+  fn faded(lab: &mut Label, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture,
+           vp: Mat4, rect: Vec4, extra: f32) {
+    let a = lab.alpha * extra;
+    if lab.ok && a > 0.01 { lab.pass.drawFaded(device, encoder, target, depth, vp, rect, a); }
+  }
+
+  pub fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4,
+              eye: Vec3, panel: &mut Option[DocPanel]) {
     let now = nowMs();
+    let flat = Quat.angleAxis(0. - PI * 0.5, Vec3(1., 0., 0.));
+    // the floor first: rings of light under the ring's slots, contact shadows under what floats
+    var t = 0usize;
+    while t < usize.from(u32.from(RING_N)) {
+      let g = *slotGlow[t];
+      if g > 0.01 {
+        var zf: f32 = 1.;
+        if *tableItem[t] != NO_ITEM { zf = items[usize.from(u32.from(*tableItem[t]))].zf; }
+        let sp = Warehouse.slotPos(u32.from(t));
+        let m = Mat4.fromTrs(Vec3(sp.x, 0.015, sp.z), flat, Vec3(zf, zf, zf));
+        (&mut decals[t]).drawFaded(device, encoder, target, depth, vp * m, Vec4(-0.65, -0.65, 0.65, 0.65), g);
+      }
+      t = t + 1usize;
+    }
+    var k = 0usize;
+    while k < items.len() {
+      if items[k].shade > 0.01 {
+        let e = self.eff(k);
+        let hs = fmaxf(0.3, 2.5 * items[k].radius * e.w);
+        let m = Mat4.fromTrs(Vec3(e.x, 0.012, e.z), flat, Vec3(1., 1., 1.));
+        (&mut decals[5usize + k]).drawFaded(device, encoder, target, depth, vp * m, Vec4(0. - hs, 0. - hs, hs, hs),
+          items[k].shade * items[k].flight);
+      }
+      k = k + 1usize;
+    }
+    // the writing and the pages, far to near
     var codes = List[u32]();
     var dists = List[f32]();
-    var k = 0usize;
+    k = 0usize;
     while k < items.len() {
       let f = self.labelFrame(k, eye);
       codes.push(Warehouse.sortKey(0u32, u32.from(k)));
       dists.push((Vec3(f.x, f.y, f.z) - eye).length());
       if items[k].page {
+        let e = self.eff(k);
         codes.push(Warehouse.sortKey(4u32, 0u32));
-        dists.push((items[k].pos - eye).length() - 0.01);
+        dists.push((Vec3(e.x, e.y, e.z) - eye).length() - 0.01);
       }
       k = k + 1usize;
     }
@@ -728,27 +1060,29 @@ pub struct Warehouse {
       s = s + 1usize;
     }
     var c = 0usize;
-    var inStage = List[u32]();
-    while inStage.len() < 5usize { inStage.push(0u32); }
     while c < cards.len() {
-      let st = usize.from(cards[c].stage);
-      let n = *inStage[st];
-      inStage.set(st, n + 1u32);
-      codes.push(Warehouse.sortKey(3u32, u32.from(c)) + 100000u32 * n);
-      dists.push((self.cardPos(st, n) - eye).length());
+      codes.push(Warehouse.sortKey(3u32, u32.from(c)));
+      dists.push((self.cardPlace(c) - eye).length());
       c = c + 1usize;
     }
-    let list = self.chipList();
-    if self.chipsShown(now) {
+    if reportOpen {
+      codes.push(Warehouse.sortKey(5u32, 0u32));
+      dists.push((self.reportPos - eye).length() - 0.5);
+    }
+    var list = List[u32]();
+    var lq = 0usize;
+    while lq < chipKinds.len() { list.push(*chipKinds[lq]); lq = lq + 1usize; }
+    if chipAnchor >= 0 {
       var q = 0usize;
       while q < list.len() {
-        let f = self.chipFrame(q, list.len(), eye, now);
-        codes.push(Warehouse.sortKey(1u32, u32.from(q)));
-        dists.push((Vec3(f.x, f.y, f.z) - eye).length() - 0.02);
+        if chips[usize.from(*list[q])].alpha > 0.01 {
+          let f = self.chipFrame(q, list.len(), eye);
+          codes.push(Warehouse.sortKey(1u32, u32.from(q)));
+          dists.push((Vec3(f.x, f.y, f.z) - eye).length() - 0.02);
+        }
         q = q + 1usize;
       }
     }
-    // far to near: nearer ones are drawn over the farther
     var i = 1usize;
     while i < codes.len() {
       var j = i;
@@ -762,8 +1096,7 @@ pub struct Warehouse {
     let hotPhase = (now / 600u64) % 2u64 == 0u64;
     var n = 0usize;
     while n < codes.len() {
-      let code = *codes[n] % 100000u32;
-      let extra = *codes[n] / 100000u32;
+      let code = *codes[n];
       let kind = code / 1000u32;
       let idx = usize.from(code % 1000u32);
       if kind == 0u32 {
@@ -771,28 +1104,33 @@ pub struct Warehouse {
         let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
         let hw = items[idx].label.w * f.w * 0.5;
         let hh = items[idx].label.h * f.w * 0.5;
-        if items[idx].label.ok { (&mut items[idx]).label.pass.draw(device, encoder, target, vp * m, Vec4(0. - hw, 0. - hh, hw, hh)); }
+        Warehouse.faded(&mut items[idx].label, device, encoder, target, depth, vp * m, Vec4(0. - hw, 0. - hh, hw, hh), 1.);
       }
       else if kind == 1u32 {
-        let f = self.chipFrame(idx, list.len(), eye, now);
+        let f = self.chipFrame(idx, list.len(), eye);
         let m = Warehouse.faceModel(Vec3(f.x, f.y, f.z), eye);
         let which = usize.from(*list[idx]);
         let hw = chips[which].w * f.w * 0.5;
         let hh = chips[which].h * f.w * 0.5;
-        if chips[which].ok { (&mut chips[which]).pass.draw(device, encoder, target, vp * m, Vec4(0. - hw, 0. - hh, hw, hh)); }
+        Warehouse.faded(&mut chips[which], device, encoder, target, depth, vp * m, Vec4(0. - hw, 0. - hh, hw, hh), 1.);
       }
       else if kind == 2u32 {
         let m = Mat4.fromTrs(Vec3(-4.74, 0.45, 3.2 - 1.6 * f32.from(idx)), Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
-        if stages[idx].ok { (&mut stages[idx]).pass.draw(device, encoder, target, vp * m, Vec4(-0.45, -0.1125, 0.45, 0.1125)); }
+        Warehouse.faded(&mut stages[idx], device, encoder, target, depth, vp * m, Vec4(-0.45, -0.1125, 0.45, 0.1125), 1.);
       }
       else if kind == 3u32 {
-        let st = usize.from(cards[idx].stage);
-        let pos = self.cardPos(st, extra);
-        let m = Mat4.fromTrs(pos, Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
+        let m = Mat4.fromTrs(self.cardPlace(idx), Quat.angleAxis(PI * 0.5, Vec3(0., 1., 0.)), Vec3(1., 1., 1.));
+        let a = cards[idx].alpha;
         if cards[idx].hot && hotPhase {
-          if cards[idx].glow.ok { (&mut cards[idx]).glow.pass.draw(device, encoder, target, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375)); }
+          Warehouse.faded(&mut cards[idx].glow, device, encoder, target, depth, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375), a);
         } else {
-          if cards[idx].calm.ok { (&mut cards[idx]).calm.pass.draw(device, encoder, target, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375)); }
+          Warehouse.faded(&mut cards[idx].calm, device, encoder, target, depth, vp * m, Vec4(-0.55, -0.1375, 0.55, 0.1375), a);
+        }
+      }
+      else if kind == 5u32 {
+        match &mut reportPanel {
+          case var &mut Some(p) { p.drawPage(device, encoder, target, vp * self.reportModel()); }
+          else {}
         }
       }
       else {
@@ -803,10 +1141,25 @@ pub struct Warehouse {
       }
       n = n + 1usize;
     }
+    // the level readout at the foot of the view, 0.8 m from the eye along the ray through the bottom of the screen
+    if readout[0usize].alpha > 0.01 {
+      let inv = vp.inverse();
+      let p0 = inv * Vec4(0., -0.86, 0., 1.);
+      let p1 = inv * Vec4(0., -0.86, 1., 1.);
+      let a = p0.xyz() * (1. / p0.w);
+      let b = p1.xyz() * (1. / p1.w);
+      let dir = (b - a).normalize();
+      let at = eye + dir * 0.8;
+      let m = Warehouse.faceModel(at, eye);
+      let hw = readout[0usize].w * 0.5 * 0.5;
+      let hh = readout[0usize].h * 0.5 * 0.5;
+      let r = &mut readout[0usize];
+      if r.ok { r.pass.drawFaded(device, encoder, target, depth, vp * m, Vec4(0. - hw, 0. - hh, hw, hh), r.alpha); }
+    }
   }
 
   fn cardPos(self: &, stage: usize, n: u32) Vec3 {
-    Vec3(-4.62, 1.11 + 0.32 * f32.from(n), 3.2 - 1.6 * f32.from(stage))
+    Vec3(-4.62, 1.11 + 0.30 * f32.from(n), 3.2 - 1.6 * f32.from(stage))
   }
 }
 

@@ -862,8 +862,14 @@ struct PagePass {
   layout: PipelineLayout;
   groupLayout: BindGroupLayout;
   shader: ShaderModule;
+  depthed: bool;                // drawn against the scene's depth (createDepth), for labels that hide behind things
 
-  fn create(device: &mut Device, format: u32) PagePass {
+  fn create(device: &mut Device, format: u32) PagePass { PagePass.build(device, format, false) }
+
+  // The same, depth tested (not written) against the scene's depth kept by ImageFx
+  fn createDepth(device: &mut Device, format: u32) PagePass { PagePass.build(device, format, true) }
+
+  fn build(device: &mut Device, format: u32, depthed: bool) PagePass {
     var shader = device.createShaderModule(&DOCPAGE_SPIRV);
     let entries = [BindGroupLayoutEntry(binding: 0u32, visibility: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT),
       BindGroupLayoutEntry(binding: 1u32, visibility: SHADER_STAGE_FRAGMENT, kind: BINDING_KIND_TEXTURE),
@@ -874,7 +880,10 @@ struct PagePass {
     let attributes = [VertexAttribute(VERTEX_FORMAT_FLOAT32, 0u64, 0u32)];
     let buffers = [VertexBufferLayout(arrayStride: 4u64, attributes: &attributes)];
     let desc = RenderPipelineDescriptor(layout: &layout, vertexModule: &shader, vertexEntryPoint: "vertexMain",
-      buffers: &buffers[..<0], fragmentModule: &shader, fragmentEntryPoint: "fragmentMain", colorFormat: format);
+      buffers: &buffers[..<0], fragmentModule: &shader, fragmentEntryPoint: "fragmentMain", colorFormat: format,
+      depthFormat: if depthed { TEXTURE_FORMAT_DEPTH32_FLOAT } else { TEXTURE_FORMAT_UNDEFINED },
+      depthCompare: COMPARE_FUNCTION_LESS_EQUAL, blendEnabled: true, colorSrcFactor: BLEND_FACTOR_SRC_ALPHA,
+      colorDstFactor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
     var pipeline = device.createRenderPipeline(&desc);
     let samplerDesc = SamplerDescriptor(addressModeU: ADDRESS_MODE_CLAMP_TO_EDGE, addressModeV: ADDRESS_MODE_CLAMP_TO_EDGE,
       addressModeW: ADDRESS_MODE_CLAMP_TO_EDGE, mipmapFilter: FILTER_MODE_LINEAR, maxAnisotropy: 16u32);
@@ -885,7 +894,7 @@ struct PagePass {
     let view = texture.createView();
     let group = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
       BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
-    PagePass(group, texture, uniforms, sampler, pipeline, layout, groupLayout, shader)
+    PagePass(group, texture, uniforms, sampler, pipeline, layout, groupLayout, shader, depthed)
   }
 
   // The page's new picture: a texture of it with its mip chain (averaged in linear light, as the renderer's own sRGB
@@ -903,7 +912,12 @@ struct PagePass {
       rgba.push(255u8);
       p = p + 1usize;
     }
-    let chain = buildMips(&rgba, w, h, MIP_COLOUR);
+    self.uploadRgba(device, w, h, &rgba);
+  }
+
+  // The same from bytes already RGBA (a soft ring or shadow has an alpha of its own)
+  fn uploadRgba(self: &mut, device: &mut Device, w: u32, h: u32, rgba: &List[u8]) {
+    let chain = buildMips(rgba, w, h, MIP_COLOUR);
     let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
       mipLevelCount(w, h));
     var fresh = device.createTexture(&desc);
@@ -919,7 +933,7 @@ struct PagePass {
   }
 
   fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4, rect: Vec4) {
-    let params = PageParams(viewProjection, rect, Vec4(pageBias, 0., 0., 0.));
+    let params = PageParams(viewProjection, rect, Vec4(pageBias, 1., 0., 0.));
     device.queue.writeBuffer(&uniforms, 0u64, &params as *u8, 96u64);
     let color = RenderPassColorAttachment(view: target.createView(), loadOp: LOAD_OP_LOAD,
       clearValue: Color(0., 0., 0., 0.));
@@ -928,5 +942,28 @@ struct PagePass {
     pass.setBindGroup(0u32, &group);
     pass.draw(6u32, 1u32, 0u32, 0u32);
     pass.end();
+  }
+
+  // Into 'target' with 'opacity', hidden where 'depth' (the scene's) is nearer if this pass was made by createDepth
+  fn drawFaded(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture,
+               viewProjection: Mat4, rect: Vec4, opacity: f32) {
+    let params = PageParams(viewProjection, rect, Vec4(pageBias, opacity, 0., 0.));
+    device.queue.writeBuffer(&uniforms, 0u64, &params as *u8, 96u64);
+    let color = RenderPassColorAttachment(view: target.createView(), loadOp: LOAD_OP_LOAD,
+      clearValue: Color(0., 0., 0., 0.));
+    if depthed {
+      let da = RenderPassDepthStencilAttachment(view: depth.createView(), depthLoadOp: LOAD_OP_LOAD);
+      var pass = encoder.beginRenderPassWithDepth(&color, &da);
+      pass.setPipeline(&pipeline);
+      pass.setBindGroup(0u32, &group);
+      pass.draw(6u32, 1u32, 0u32, 0u32);
+      pass.end();
+    } else {
+      var pass = encoder.beginRenderPass(&color);
+      pass.setPipeline(&pipeline);
+      pass.setBindGroup(0u32, &group);
+      pass.draw(6u32, 1u32, 0u32, 0u32);
+      pass.end();
+    }
   }
 }

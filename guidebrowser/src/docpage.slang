@@ -38,5 +38,6 @@ VertexOutput vertexMain(uint vid : SV_VulkanVertexID) {
 
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target {
-    return float4(pageTexture.SampleBias(pageSampler, input.uv, page.extra.x).rgb, 1.0);
+    float4 t = pageTexture.SampleBias(pageSampler, input.uv, page.extra.x);
+    return float4(t.rgb, t.a * page.extra.y);       // extra.y: opacity (1 = as drawn)
 }
