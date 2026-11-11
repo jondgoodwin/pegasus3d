@@ -1,0 +1,460 @@
+// The document panel: a Markdown file (markdown.cone) shown on a lit page standing in the world, read again
+// whenever the file changes.
+//
+//   - The page is laid out and drawn by the richtext package onto a texture (DOC_TEX_W wide), which the
+//     renderer then shows on a quad. Scrolling moves the window of the page the texture shows.
+//   - Every 250 ms the file's modification time and size are looked at (one stat). When either changes, and
+//     for 2 s after any change (the C runtime's time is whole seconds, so an edit in the same second and of the
+//     same length would otherwise be missed), the file's text is read and compared with the last text.
+//   - A changed text is parsed, and each block is compared with the old tree by heading chain, kind and text.
+//     Blocks the old tree has no match for get a bar in the margin (green: no block of that path before;
+//     blue: the path was there with other text) that fades over FADE_SECONDS. The block at the top of the view
+//     stays where it was.
+//   - A click on the page names the block: its path and the first 60 characters, printed and appended to
+//     C:\src\studio-work\pointer.log. This is the hook the voice bridge will use.
+//
+// Sizes, for the headset later: the texture and text are chosen for about 25 pixels a degree (Quest 3) and the
+// panel for about 41 degrees across at 1.8 m. Change them here.
+
+const DOC_TEX_W = 1280u32;       // texture width, pixels
+const DOC_TEXT_PX = 22.;         // body text, pixels of em (about 1 degree at the headset's 25 pixels a degree)
+const DOC_TEX_H = 1810u32;       // A-series proportions (1 : 1.414)
+const DOC_WORLD_W = 1.346;       // meters across: 41 degrees at 1.8 m
+const DOC_CENTRE_Y = 1.45;       // meters up, the panel's middle: a little below the eye
+const FADE_SECONDS = 10.;
+const FADE_HOLD_SECONDS = 1.;    // full strength for this long first
+const POLL_MS = 250u64;
+const HOT_MS = 2000u64;
+const POINTER_LOG = "C:/src/studio-work/pointer.log";
+
+const PAPER = 0xf8f5eeffu32;     // dark text on it: well over 7 : 1
+const INK = 0x1c1c1cffu32;
+const QUOTE_INK = 0x474747ffu32;
+const CODE_INK = 0x7a2a0effu32;
+
+fn nowMs() u64 {
+  sdl.GetPerformanceCounter() * 1000u64 / sdl.GetPerformanceFrequency()
+}
+
+fn sameText(a: &str, b: &str) bool {
+  if a.len() != b.len() { return false; }
+  var i = 0usize;
+  while i < a.len() {
+    if a[i] != b[i] { return false; }
+    i = i + 1usize;
+  }
+  true
+}
+
+fn loadFont(file: &str) Option[Font] {
+  var out: Option[Font] = None;
+  match fs.readFile(&Path.from(file)) {
+    case let Ok(bytes) {
+      match Font.load(bytes.view()) {
+        case let Ok(f) { out = Some[Font](f); }
+        case is Err {}
+      }
+    }
+    case is Err {}
+  }
+  out
+}
+
+// Georgia for the text and Consolas for code, if they are installed. Faces has four slots; the bold-italic
+// one holds the monospace face, so code is asked for as bold and italic, and text that is both is drawn bold.
+fn makeFaces() Option[Faces] {
+  var out: Option[Faces] = None;
+  match loadFont("C:/Windows/Fonts/georgia.ttf") {
+    case let Some(reg) {
+      var f = Faces.make(reg);
+      match loadFont("C:/Windows/Fonts/georgiab.ttf") { case let Some(b) { f.setBold(b); } case is None {} }
+      match loadFont("C:/Windows/Fonts/georgiai.ttf") { case let Some(i) { f.setItalic(i); } case is None {} }
+      match loadFont("C:/Windows/Fonts/consola.ttf") { case let Some(m) { f.setBoldItalic(m); } case is None {} }
+      out = Some[Faces](f);
+    }
+    case is None {}
+  }
+  out
+}
+
+pub struct DocPanel {
+  file: String;
+  doc: Doc;
+  text: String;                  // the text last read
+  blocks: List[Block];           // richtext's, made from the doc
+  owner: List[usize];            // for each richtext block, the doc block it came from
+  images: List[ImageInfo];
+  layout: RichLayout;
+  faces: Faces;
+  rr: RichRenderer;
+  target: Texture;
+  readback: Buffer;
+  mesh: MeshHandle;
+  tex: TextureHandle;
+  material: MaterialHandle;
+  born: List[u64];               // for each doc block: when it was marked (ms), 0 if not
+  kinds: List[u32];              // 1 new, 2 changed
+  err: String;
+  scrollY: f32 = 0.;
+  dirty: bool = false;
+  lastPoll: u64 = 0u64;
+  lastDraw: u64 = 0u64;
+  lastMtime: i64 = 0i64;
+  lastSize: i64 = 0i64;
+  hotUntil: u64 = 0u64;
+  reloads: u32 = 0u32;
+  firstReloadShot: bool = false;
+
+  // Check that it came out: None if no font is installed or the renderer failed
+  pub fn create(device: &mut Device, renderer: &mut Renderer, file: &str, initialScroll: f32) Option[DocPanel] {
+    var made: Option[DocPanel] = None;
+    match makeFaces() {
+      case let Some(faces) {
+        var rr = RichRenderer.create(device, &faces, TEXTURE_FORMAT_RGBA8_UNORM);
+        if rr.isValid() {
+          let desc = TextureDescriptor(DOC_TEX_W, DOC_TEX_H, TEXTURE_FORMAT_RGBA8_UNORM,
+            TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+          var target = device.createTexture(&desc);
+          var readback = device.createBuffer(u64.from(DOC_TEX_W * DOC_TEX_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+          let mesh = renderer.addMesh(device, &quad());
+          var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
+            emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, mesh, TextureHandle.none(), MaterialHandle.none(),
+            List[u64](), List[u32](), String());
+          p.scrollY = initialScroll;
+          p.reload(device, renderer, true);
+          made = Some[DocPanel](p);
+        }
+      }
+      case is None { print <- "docpanel: no font found (C:/Windows/Fonts/georgia.ttf)\n"; }
+    }
+    made
+  }
+
+  // Look at the file every POLL_MS, read it again when it has changed, and redraw what has to be
+  pub fn tick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    let now = nowMs();
+    if now >= lastPoll + POLL_MS {
+      lastPoll = now;
+      var again = false;
+      match fs.stat(&Path.from(file.view())) {
+        case let Ok(info) {
+          let m = info.modified.unixSeconds();
+          if m != lastMtime || info.size != lastSize {
+            lastMtime = m;
+            lastSize = info.size;
+            hotUntil = now + HOT_MS;
+            again = true;
+          }
+          else if now < hotUntil { again = true; }
+        }
+        case let Err(e) { setError(device, renderer, "cannot read the file (it is gone, or locked)"); }
+      }
+      if again { self.reload(device, renderer, false); }
+    }
+    // the bars fade: redraw while any shows, then once more with none
+    if now >= lastDraw + POLL_MS && self.anyMark(now) {
+      self.redraw(device, renderer);
+    }
+    else if dirty { self.redraw(device, renderer); }
+  }
+
+  fn anyMark(self: &, now: u64) bool {
+    var i = 0usize;
+    while i < born.len() {
+      if *born[i] != 0u64 && f64.from(now - *born[i]) < (FADE_SECONDS + 0.3) * 1000. { return true; }
+      i = i + 1usize;
+    }
+    false
+  }
+
+  fn setError(self: &mut, device: &mut Device, renderer: &mut Renderer, message: &str) {
+    if sameText(err.view(), message) { return; }
+    err = String.from(message);
+    print <- "docpanel: "; printStr(message); print <- "\n";
+    self.relayout();
+    dirty = true;
+  }
+
+  // Read the file; if its text differs from the last (or this is the first time), parse, compare, lay out, draw
+  fn reload(self: &mut, device: &mut Device, renderer: &mut Renderer, first: bool) {
+    let began = sdl.GetPerformanceCounter();
+    match fs.readFile(&Path.from(file.view())) {
+      case let Ok(s) {
+        if !first && sameText(s.view(), text.view()) && err.len() == 0usize { return; }
+        text = String.from(s.view());
+        if err.len() > 0usize { err = String(); }
+        let fresh = parseMarkdown(text.view());
+        // where the top of the view is, to put it back
+        let topDoc = self.topDocBlock();
+        var keepChain = String();
+        var keepText = String();
+        var keepOffset = 0.;
+        if topDoc < doc.blocks.len() {
+          keepChain = String.from(doc.blocks[topDoc].chain.view());
+          keepText = String.from(doc.blocks[topDoc].text.view());
+          keepOffset = f64.from(scrollY - self.firstLineTop(topDoc));
+        }
+        // mark what is new or changed
+        let now = nowMs();
+        var used = List[bool]();
+        var u = 0usize;
+        while u < doc.blocks.len() { used.push(false); u = u + 1usize; }
+        var nBorn = List[u64]();
+        var nKinds = List[u32]();
+        var marked = 0u32;
+        var b = 0usize;
+        while b < fresh.blocks.len() {
+          var found = false;
+          var pathSeen = false;
+          var o = 0usize;
+          while o < doc.blocks.len() && !found {
+            if !*used[o] {
+              let old = &doc.blocks[o];
+              let nb = &fresh.blocks[b];
+              if old.kind == nb.kind && sameText(old.chain.view(), nb.chain.view()) {
+                if sameText(old.text.view(), nb.text.view()) { found = true; used.set(o, true); }
+                else if sameText(old.path.view(), nb.path.view()) { pathSeen = true; }
+              }
+            }
+            o = o + 1usize;
+          }
+          if found || first { nBorn.push(0u64); nKinds.push(0u32); }
+          else { nBorn.push(now); nKinds.push(if pathSeen { 2u32 } else { 1u32 }); marked = marked + 1u32; }
+          b = b + 1usize;
+        }
+        doc = fresh;
+        born = nBorn;
+        kinds = nKinds;
+        self.relayout();
+        // the same block at the top of the view
+        var at = doc.blocks.len();
+        var d = 0usize;
+        while d < doc.blocks.len() && at == doc.blocks.len() {
+          if sameText(doc.blocks[d].chain.view(), keepChain.view()) && sameText(doc.blocks[d].text.view(), keepText.view()) { at = d; }
+          d = d + 1usize;
+        }
+        if at < doc.blocks.len() { scrollY = self.firstLineTop(at) + f32.from(keepOffset); }
+        self.clampScroll();
+        self.redraw(device, renderer);
+        self.reloads = self.reloads + 1u32;
+        print <- "docpanel: reload "; print <- self.reloads; print <- ": "; print <- doc.blocks.len(); print <- " blocks, ";
+        print <- marked; print <- " marked; read, parse, compare, layout, draw and upload took ";
+        print <- micros(began, sdl.GetPerformanceCounter()) / 1000.; print <- " ms; redrawn at unix_ms ";
+        print <- Timestamp.now().unixNanos() / 1000000i64; print <- "\n";
+      }
+      case let Err(e) {
+        setError(device, renderer, "cannot read the file (it is gone, or locked)");
+        self.redraw(device, renderer);
+      }
+    }
+  }
+
+  // The richtext blocks from the doc, and their layout
+  fn relayout(self: &mut) {
+    blocks = List[Block]();
+    owner = List[usize]();
+    var i = 0usize;
+    while i < doc.blocks.len() {
+      blocks.push(toBlock(&doc.blocks[i]));
+      owner.push(i);
+      i = i + 1usize;
+    }
+    if err.len() > 0usize {
+      var e = Block.fromText(err.view(), Style(true, false, false, 0., 0xb00020ffu32, 0u32, 0u32));
+      blocks.push(e);
+      owner.push(doc.blocks.len());      // past the doc: not pointable
+    }
+    if blocks.len() == 0usize {
+      blocks.push(Block.fromText("(empty)", Style.plain()));
+      owner.push(0usize);
+    }
+    var cfg = LayoutConfig.standard(f32.from(DOC_TEX_W));
+    cfg.margin = 64.;
+    cfg.marginTop = 48.;
+    cfg.baseSize = f32.from(DOC_TEXT_PX);
+    cfg.lineHeight = 1.3;
+    cfg.textColor = INK;
+    layout = layoutRich(&blocks, &images, &faces, &cfg);
+  }
+
+  // The y of the first line of doc block d (the current scroll if it has none)
+  fn firstLineTop(self: &, d: usize) f32 {
+    var i = 0usize;
+    while i < layout.lines.len() {
+      let ob = usize.from(layout.lines[i].block);
+      if ob < owner.len() && *owner[ob] == d { return layout.lines[i].top; }
+      i = i + 1usize;
+    }
+    scrollY
+  }
+
+  // The doc block at the top of the view (past the end if there is none)
+  fn topDocBlock(self: &) usize {
+    var i = 0usize;
+    while i < layout.lines.len() {
+      if layout.lines[i].top + layout.lines[i].height > scrollY {
+        let ob = usize.from(layout.lines[i].block);
+        if ob < owner.len() { return *owner[ob]; }
+      }
+      i = i + 1usize;
+    }
+    doc.blocks.len()
+  }
+
+  fn clampScroll(self: &mut) {
+    let most = layout.height - f32.from(DOC_TEX_H);
+    if scrollY > most { scrollY = most; }
+    if scrollY < 0. { scrollY = 0.; }
+  }
+
+  // The wheel: 'notches' (positive: away from the user, which is up the page)
+  pub fn scroll(self: &mut, notches: f32) {
+    scrollY = scrollY - notches * 110.;
+    self.clampScroll();
+    dirty = true;
+  }
+
+  // Draw the page (with the margin bars) into the texture and give the renderer a texture and material of it
+  fn redraw(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    dirty = false;
+    let now = nowMs();
+    lastDraw = now;
+    // the bars, as underline-style rectangles that belong to the layout for this one draw
+    let keep = layout.rects.len();
+    var i = 0usize;
+    while i < layout.lines.len() {
+      let ln = layout.lines[i];
+      let ob = usize.from(ln.block);
+      if ob < owner.len() && *owner[ob] < born.len() && *born[*owner[ob]] != 0u64 {
+        let d = *owner[ob];
+        let age = f64.from(now - *born[d]) / 1000.;
+        if age < FADE_SECONDS {
+          var strength = 1.;
+          if age > FADE_HOLD_SECONDS { strength = 1. - (age - FADE_HOLD_SECONDS) / (FADE_SECONDS - FADE_HOLD_SECONDS); }
+          let a = u32.from(255. * strength);
+          let rgb = if *kinds[d] == 1u32 { 0x2e9e4f00u32 } else { 0x2f6fd800u32 };
+          layout.rects.push(RectP(16., ln.top, 12., ln.height, rgb | a, RK_UNDERLINE));
+        }
+      }
+      i = i + 1usize;
+    }
+    let view = RichView(f32.from(DOC_TEX_W), f32.from(DOC_TEX_H), 0., scrollY, PAPER, PAPER, 0u32, 0u32,
+      f32.from(DOC_TEX_W), false);
+    let sel = List[RectP]();
+    let caret = CaretRect(0., 0., 0.);
+    var encoder = device.createCommandEncoder();
+    rr.draw(device, &mut encoder, &target, &view, &faces, &layout, &images, &sel, &caret);
+    encoder.copyTextureToBuffer(&target, &readback);
+    device.queue.submit(encoder.finish());
+    device.waitIdle();
+    while layout.rects.len() > keep { layout.rects.pop(); }
+    let img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
+    let t = renderer.addTexture(device, &img);
+    let m = renderer.addMaterial(device, &Material.textured(Color(1., 1., 1., 1.), t));
+    if renderer.removeMaterial(device, material) {}
+    if renderer.removeTexture(device, tex) {}
+    tex = t;
+    material = m;
+  }
+
+  pub fn drawInto(self: &, list: &mut DrawList) {
+    list.addTinted(mesh, material, Mat4.identity(), Color(1., 1., 1., 1.));
+  }
+
+  // A ray from the eye: does it meet the page? If so, name the block there.
+  pub fn click(self: &, eye: Vec3, direction: Vec3) bool {
+    if direction.z > -0.00001 && direction.z < 0.00001 { return false; }
+    let t = (0. - eye.z) / direction.z;
+    if t < 0. { return false; }
+    let hit = eye + direction * t;
+    let w = f32.from(DOC_WORLD_W);
+    let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    let u = (hit.x + w * 0.5) / w;
+    let v = (hit.y - (f32.from(DOC_CENTRE_Y) - h * 0.5)) / h;
+    if u < 0. || u > 1. || v < 0. || v > 1. { return false; }
+    let px = u * f32.from(DOC_TEX_W);
+    let py = (1. - v) * f32.from(DOC_TEX_H) + scrollY;
+    if layout.lines.len() == 0usize { return true; }
+    let p = posAt(&layout, px, py);
+    var line = String();
+    if p.block < owner.len() && *owner[p.block] < doc.blocks.len() {
+      let b = &doc.blocks[*owner[p.block]];
+      line.append(b.path.view());
+      line.append(" | ");
+      var cut = b.text.len();
+      if cut > 60usize {
+        cut = 60usize;
+        while cut > 0usize && isContByte(b.text.view()[cut]) { cut = cut - 1usize; }
+      }
+      line.append(b.text.view().slice(0usize, cut));
+    }
+    else { line.append("(no block here)"); }
+    print <- "panel click: "; printStr(line.view()); print <- "\n";
+    line.append("\n");
+    var bytes = List[u8]();
+    var k = 0usize;
+    while k < line.len() { bytes.push(line.view()[k]); k = k + 1usize; }
+    if let Err(e) = fs.appendFile(&Path.from(POINTER_LOG), bytes.view()) { print <- "pointer log: "; print <- e; print <- "\n"; }
+    true
+  }
+}
+
+// A doc block as richtext's block: its kind, and its spans as styled runs
+fn toBlock(b: &DocBlock) Block {
+  var blk = Block();
+  if b.kind == DK_HEAD {
+    blk.kind = if b.depth <= 1u32 { BK_H1 } else if b.depth == 2u32 { BK_H2 } else { BK_H3 };
+  }
+  else if b.kind == DK_BULLET { blk.kind = BK_BULLET; blk.depth = b.depth; }
+  else if b.kind == DK_NUMBER { blk.kind = BK_NUMBER; blk.depth = b.depth; }
+  var text = String();
+  let quote = b.kind == DK_QUOTE;
+  let wholeCode = b.kind == DK_CODE;
+  if quote {
+    // an indented paragraph: richtext has no quote kind (a package follow-up)
+    text.append("      ");
+    blk.runs.push(Run(6usize, quoteStyle(false)));
+  }
+  text.append(b.text.view());
+  var i = 0usize;
+  while i < b.spans.len() {
+    let sp = &b.spans[i];
+    var st = Style.plain();
+    if sp.code || wholeCode { st = Style(true, true, false, 0., CODE_INK, 0u32, 0u32); }       // bold + italic: the monospace slot
+    else if quote { st = quoteStyle(sp.bold); }
+    else { st.bold = sp.bold; st.italic = sp.italic && !sp.bold; }
+    pushRun(&mut blk.runs, sp.len, st);
+    i = i + 1usize;
+  }
+  blk.text = text;
+  blk
+}
+
+fn quoteStyle(bold: bool) Style {
+  Style(bold, !bold, false, 0., QUOTE_INK, 0u32, 0u32)
+}
+
+fn pushRun(runs: &mut List[Run], len: usize, st: Style) {
+  let n = runs.len();
+  if n > 0usize && sameStyle(&runs[n - 1usize].style, &st) {
+    (&mut runs[n - 1usize]).len = runs[n - 1usize].len + len;
+  }
+  else { runs.push(Run(len, st)); }
+}
+
+// The page: DOC_WORLD_W across, standing at z = 0 facing +z, its middle DOC_CENTRE_Y up. uv (0, 0) is its lower left.
+fn quad() Mesh {
+  var m = Mesh();
+  let w = f32.from(DOC_WORLD_W) * 0.5;
+  let h = w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+  let y = f32.from(DOC_CENTRE_Y);
+  m.positions.push(Vec3(0. - w, y - h, 0.)); m.uvs.push(Vec2(0., 0.));
+  m.positions.push(Vec3(w, y - h, 0.)); m.uvs.push(Vec2(1., 0.));
+  m.positions.push(Vec3(w, y + h, 0.)); m.uvs.push(Vec2(1., 1.));
+  m.positions.push(Vec3(0. - w, y + h, 0.)); m.uvs.push(Vec2(0., 1.));
+  var k = 0;
+  while k < 4 { m.normals.push(Vec3(0., 0., 1.)); k = k + 1; }
+  m.indices.push(0u32); m.indices.push(1u32); m.indices.push(2u32);
+  m.indices.push(0u32); m.indices.push(2u32); m.indices.push(3u32);
+  m
+}
