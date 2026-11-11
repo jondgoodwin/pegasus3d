@@ -43,7 +43,7 @@ static void release_all(void) {
   if (dev) { ID3D11Device_Release(dev); dev = 0; }
 }
 
-DESK_API int desk_open(int output) {
+static int open_dup(int output) {
   SetProcessDPIAware();
   QueryPerformanceFrequency(&freq);
   release_all();
@@ -149,10 +149,11 @@ static void compose_cursor(void) {
   }
 }
 
-DESK_API int desk_update(int timeout_ms) {
+// One turn of the capture thread's work: wait up to timeout_ms for the screen to change, and copy what changed into 'outbuf'
+static int step(int timeout_ms) {
   LARGE_INTEGER t0, t1;
   QueryPerformanceCounter(&t0);
-  if (!dupl && !desk_open(curOutput)) return -1;
+  if (!dupl && !open_dup(curOutput)) return -1;
   DXGI_OUTDUPL_FRAME_INFO info;
   IDXGIResource *res = 0;
   HRESULT hr = IDXGIOutputDuplication_AcquireNextFrame(dupl, (UINT)timeout_ms, &info, &res);
@@ -227,15 +228,118 @@ DESK_API int desk_update(int timeout_ms) {
   return changed && haveFrame;
 }
 
-DESK_API const unsigned char *desk_pixels(void) { return outbuf; }
-DESK_API int desk_width(void) { return W; }
-DESK_API int desk_height(void) { return H; }
+// ---- the capture thread and the hand-over ----
+// The thread waits for the screen, copies it, and at most 30 times a second publishes a finished picture with its mip chain
+// (level 0 first, each level half the one before, tightly packed: what the GPU upload wants). Three buffers move by swap
+// under a lock: 'spare' (the thread's), 'pubbuf' (the latest finished) and 'held' (the render loop's, until its next update).
+typedef struct { unsigned char *p; size_t cap; } Buf;
+static Buf spare, pubbuf, held;
+static int pubW, pubH, heldW, heldH, fresh, pubUs, heldUs, pubLevels, heldLevels;
+static CRITICAL_SECTION cs;
+static HANDLE thr;
+static volatile LONG stopping;
+static int csReady;
+#define MIN_INTERVAL_MS 33
+
+static int levels_of(int w, int h) { int n = 1; while (w > 1 || h > 1) { w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1; n++; } return n; }
+
+static size_t chain_bytes(int w, int h) {
+  size_t t = 0;
+  for (;;) { t += (size_t)w * h * 4; if (w <= 1 && h <= 1) break; w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1; }
+  return t;
+}
+
+// Each level from the one before: the mean of 2x2 texels (in the stored sRGB values, which is cheap and close enough)
+static void build_chain(unsigned char *dst, const unsigned char *src, int w, int h) {
+  memcpy(dst, src, (size_t)w * h * 4);
+  const unsigned char *prev = dst;
+  unsigned char *cur = dst + (size_t)w * h * 4;
+  while (w > 1 || h > 1) {
+    int nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
+    for (int y = 0; y < nh; y++) {
+      int y0 = y * 2, y1 = y0 + 1 < h ? y0 + 1 : y0;
+      for (int x = 0; x < nw; x++) {
+        int x0 = x * 2, x1 = x0 + 1 < w ? x0 + 1 : x0;
+        const unsigned char *a = prev + ((size_t)y0 * w + x0) * 4, *b = prev + ((size_t)y0 * w + x1) * 4;
+        const unsigned char *c = prev + ((size_t)y1 * w + x0) * 4, *d = prev + ((size_t)y1 * w + x1) * 4;
+        unsigned char *o = cur + ((size_t)y * nw + x) * 4;
+        for (int k = 0; k < 4; k++) o[k] = (unsigned char)((a[k] + b[k] + c[k] + d[k] + 2) >> 2);
+      }
+    }
+    prev = cur; cur += (size_t)nw * nh * 4; w = nw; h = nh;
+  }
+}
+
+static void publish(double stepUs) {
+  LARGE_INTEGER t0, t1;
+  QueryPerformanceCounter(&t0);
+  int w = W, h = H;
+  size_t need = chain_bytes(w, h);
+  if (spare.cap < need) { free(spare.p); spare.p = (unsigned char *)malloc(need); spare.cap = spare.p ? need : 0; }
+  if (!spare.p) return;
+  build_chain(spare.p, outbuf, w, h);
+  QueryPerformanceCounter(&t1);
+  EnterCriticalSection(&cs);
+  Buf t = spare; spare = pubbuf; pubbuf = t;
+  pubW = w; pubH = h; pubLevels = levels_of(w, h); fresh = 1;
+  pubUs = (int)(stepUs + (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)freq.QuadPart);
+  LeaveCriticalSection(&cs);
+}
+
+static DWORD WINAPI capture_loop(LPVOID unused) {
+  LARGE_INTEGER last, now;
+  last.QuadPart = 0;
+  int pending = 0;
+  double stepUs = 0;
+  (void)unused;
+  while (!stopping) {
+    int r = step(MIN_INTERVAL_MS);
+    if (r < 0) { Sleep(100); continue; }
+    if (r == 1) { pending = 1; stepUs += lastUs; }
+    if (pending) {
+      QueryPerformanceCounter(&now);
+      if (last.QuadPart == 0 || (now.QuadPart - last.QuadPart) * 1000 / freq.QuadPart >= MIN_INTERVAL_MS) {
+        publish(stepUs);
+        pending = 0; stepUs = 0; last = now;
+      }
+    }
+  }
+  return 0;
+}
+
+DESK_API int desk_open(int output) {
+  if (thr) return 1;
+  if (!open_dup(output)) return 0;
+  if (!csReady) { InitializeCriticalSection(&cs); csReady = 1; }
+  stopping = 0;
+  thr = CreateThread(0, 0, capture_loop, 0, 0, 0);
+  return thr != 0;
+}
+
+// The render loop's call: 1 if a finished picture was waiting (now in desk_pixels), else 0. Never waits for the screen.
+DESK_API int desk_update(int timeout_ms) {
+  int r = 0;
+  (void)timeout_ms;
+  if (!thr) return -1;
+  EnterCriticalSection(&cs);
+  if (fresh) {
+    Buf t = held; held = pubbuf; pubbuf = t;
+    heldW = pubW; heldH = pubH; heldLevels = pubLevels; heldUs = pubUs; fresh = 0; r = 1;
+  }
+  LeaveCriticalSection(&cs);
+  return r;
+}
+
+DESK_API const unsigned char *desk_pixels(void) { return held.p; }
+DESK_API int desk_levels(void) { return heldLevels; }
+DESK_API int desk_width(void) { return heldW; }
+DESK_API int desk_height(void) { return heldH; }
 DESK_API int desk_origin_x(void) { return OX; }
 DESK_API int desk_origin_y(void) { return OY; }
 DESK_API int desk_cursor_x(void) { return curX; }
 DESK_API int desk_cursor_y(void) { return curY; }
 DESK_API int desk_cursor_visible(void) { return curVis; }
-DESK_API int desk_update_us(void) { return (int)lastUs; }
+DESK_API int desk_update_us(void) { return heldUs; }   // the capture thread's work for the picture last taken (copy and mip chain)
 DESK_API void desk_set_dry_run(int on) { dryRun = on; }
 
 DESK_API void desk_move(int px, int py) {
@@ -281,6 +385,9 @@ DESK_API void desk_wheel(int notches) {
 }
 
 DESK_API void desk_close(void) {
+  if (thr) { stopping = 1; WaitForSingleObject(thr, 2000); CloseHandle(thr); thr = 0; }
+  free(spare.p); free(pubbuf.p); free(held.p);
+  spare.p = pubbuf.p = held.p = 0; spare.cap = pubbuf.cap = held.cap = 0; fresh = 0;
   release_all();
   free(outbuf); free(shape); free(meta); free(under);
   outbuf = shape = meta = under = 0;
