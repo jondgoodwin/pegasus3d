@@ -71,7 +71,7 @@ import tweenstack use Anim, Animators, Value as AnimValue;
 import input use Input, Context, Binding, Action, AXIS2;
 import controls use Fly, Pose;
 import analyticdaylight use PreethamSky;
-import richtext use Faces, Block, Run, Style, sameStyle, LayoutConfig, layoutRich, emptyLayout, RichLayout, RichRenderer, RichView, ImageInfo, RectP, CaretRect, posAt, BK_H1, BK_H2, BK_H3, BK_BULLET, BK_NUMBER, RK_UNDERLINE, isContByte;
+import richtext use Faces, Block, Run, Style, sameStyle, LayoutConfig, layoutRich, emptyLayout, RichLayout, RichRenderer, RichView, ImageInfo, RectP, CaretRect, posAt, BK_H1, BK_H2, BK_H3, BK_BULLET, BK_NUMBER, RK_UNDERLINE, GF_SPACE, isContByte;
 import msdftext use Font;
 
 // How fast a visitor walks, in meters a second (mine: a brisk walk)
@@ -150,7 +150,13 @@ var @threadlocal clickXs = Array[f32, 4]() <- fill 0.;
 var @threadlocal clickYs = Array[f32, 4]() <- fill 0.;
 var @threadlocal docArg: *u8 = null;       // '--doc FILE.md': a live document panel in the world (docpanel.cone)
 var @threadlocal shotReload = 0;           // '--shot-after-reload K': the shot is taken 20 frames after the panel's Kth reading (1 is the first)
-var @threadlocal docScroll = 0.;          // '--doc-scroll PX': where the page starts
+var @threadlocal shotDelay = 20;           // '--shot-delay N': frames after that reading ('--shot-after-reload')
+var @threadlocal wheelAt = 0;              // '--wheel Y N': on frame N, a mouse wheel event of Y notches is pushed through SDL's queue
+var @threadlocal wheelY = 0.;
+var @threadlocal shotError = false;        // '--shot-on-error': the shot is taken shotDelay frames after the panel shows an error line
+var @threadlocal pressCReload = 0;         // '--press-c-after-reload K': the C key is pushed 40 frames after the panel's Kth reading
+var @threadlocal pressCAt = 0;            // '--press-c N': on frame N, the C key (clear the marks) is pushed through SDL's queue
+var @threadlocal docScroll = 0.;         // '--doc-scroll PX': where the page starts
 var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D degrees further up (down if negative)
 
 // Frames drawn, and the colour at the middle of the window on the shot frame
@@ -194,6 +200,7 @@ pub fn start(host: &mut Host) bool {
     print <- "The renderer could not be made\n";
     return false;
   }
+  if docArg != null { post.bloom = 0.; }      // a bright page must not glow over its own text
   var fx = ImageFx.create(&mut device, &renderer, &mut post);
   fx.configure(&FxSettings.high());        // until a world's arrival says how its picture is taken
   print <- "Rendering: high dynamic range, image quality high, "; print <- (if rays { "ray tracing on" } else { "no ray tracing" }); print <- "\n";
@@ -262,6 +269,12 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
       if e.type == sdl.EVENT_MOUSE_WHEEL {
         let wheel = e as &sdl.MouseWheelEvent;
         match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} }
+      }
+      if e.type == sdl.EVENT_KEY_DOWN {
+        let key = e as &sdl.KeyboardEvent;
+        if key.scancode == sdl.SCANCODE_C && !key.repeat {
+          match &mut (*some).panel { case var &mut Some(p) { p.clearMarks(); } else {} }
+        }
       }
       if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
         let b = e as &sdl.MouseButtonEvent;
@@ -599,7 +612,13 @@ fn drawScene(s: &mut Shell, alpha: f32) {
   if !s.target.ok() { return; }
   match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
   if shotReload > 0 {
-    match &s.panel { case let Some(p) { if i32.from(p.reloads) == shotReload && shotAt < drawn { shotAt = drawn + 20; } } else {} }
+    match &s.panel { case let Some(p) { if i32.from(p.reloads) == shotReload && shotAt == 0 { shotAt = drawn + shotDelay; } } else {} }
+  }
+  if shotError {
+    match &s.panel { case let Some(p) { if p.err.len() > 0usize && shotAt == 0 { shotAt = drawn + shotDelay; } } else {} }
+  }
+  if pressCReload > 0 {
+    match &s.panel { case let Some(p) { if i32.from(p.reloads) == pressCReload && pressCAt == 0 { pressCAt = drawn + 40; } } else {} }
   }
   // The visitor's view, as late as it can be
   let pose = s.visitor.pose();
@@ -660,6 +679,23 @@ pub fn present(host: &mut Host) {
           clickOn(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh, host.stats.frames);
         }
         c = c + 1;
+      }
+      // '--wheel' and '--press-c': events a person's hand would make, put into SDL's own queue
+      if wheelAt != 0 && drawn == wheelAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_MOUSE_WHEEL;
+        let w = &mut ev as &mut sdl.MouseWheelEvent;
+        w.y = f32.from(wheelY);
+        w.integer_y = i32.from(wheelY);
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the wheel event\n"; }
+      }
+      if pressCAt != 0 && drawn == pressCAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_KEY_DOWN;
+        let k = &mut ev as &mut sdl.KeyboardEvent;
+        k.scancode = sdl.SCANCODE_C;
+        k.down = true;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
       }
       // The next frame's input starts here: its events come next
       (*some).input.beginFrame();
@@ -822,6 +858,14 @@ fn main(argc: i32, argv: **u8) i32 {
     }
     if libc.strcmp(arg, "--doc") == 0i32 && more { docArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--shot-after-reload") == 0i32 && more { shotReload = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
+    if libc.strcmp(arg, "--shot-delay") == 0i32 && more { shotDelay = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--wheel") == 0i32 && a + 2i32 < argc {
+      wheelY = argNumber(argv, a + 1i32);
+      wheelAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--shot-on-error") == 0i32 { shotError = true; shotAt = 0; }
+    if libc.strcmp(arg, "--press-c-after-reload") == 0i32 && more { pressCReload = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--press-c") == 0i32 && more { pressCAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--doc-scroll") == 0i32 && more { docScroll = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--tilt") == 0i32 && more { tilt = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--approach") == 0i32 && more { approach = argNumber(argv, a + 1i32); }

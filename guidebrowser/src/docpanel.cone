@@ -6,12 +6,16 @@
 //   - Every 250 ms the file's modification time and size are looked at (one stat). When either changes, and
 //     for 2 s after any change (the C runtime's time is whole seconds, so an edit in the same second and of the
 //     same length would otherwise be missed), the file's text is read and compared with the last text.
-//   - A changed text is parsed, and each block is compared with the old tree by heading chain, kind and text.
-//     Blocks the old tree has no match for get a bar in the margin (green: no block of that path before;
-//     blue: the path was there with other text) that fades over FADE_SECONDS. The block at the top of the view
-//     stays where it was.
+//   - A changed text is parsed and compared with the old tree. A block is the same if a block with the same
+//     heading chain, kind and text stands in the old tree (wherever); else it is a changed one if a block under
+//     the same heading chain and of the same kind is at least half the same words (blue bar), else a new one
+//     (green). A block that went has a thin red line in the margin where it stood. The bars and lines stay until
+//     the marks are cleared (C): they begin strong, fade over FADE_SECONDS to a steady low level, so that after
+//     several edits everything changed since the last look still shows. The block at the top of the view stays
+//     where it was across a reload.
 //   - A click on the page names the block: its path and the first 60 characters, printed and appended to
 //     C:\src\studio-work\pointer.log. This is the hook the voice bridge will use.
+//   - A file that cannot be read keeps the old page, with one line in red at the page's foot.
 //
 // Sizes, for the headset later: the texture and text are chosen for about 25 pixels a degree (Quest 3) and the
 // panel for about 41 degrees across at 1.8 m. Change them here.
@@ -21,16 +25,24 @@ const DOC_TEXT_PX = 22.;         // body text, pixels of em (about 1 degree at t
 const DOC_TEX_H = 1810u32;       // A-series proportions (1 : 1.414)
 const DOC_WORLD_W = 1.346;       // meters across: 41 degrees at 1.8 m
 const DOC_CENTRE_Y = 1.45;       // meters up, the panel's middle: a little below the eye
+const DOC_GAIN = 1.5;            // the page's brightness, a multiplier on its lit colour (text and paper alike)
 const FADE_SECONDS = 10.;
 const FADE_HOLD_SECONDS = 1.;    // full strength for this long first
+const FADE_LOW = 110.;           // the steady strength of an old mark, of 255
+const STRIP_H = 64u32;           // the error line's height at the page's foot
+const STEM_POWER: f32 = 0.4;     // stem darkening (darkenStems): below 1 darkens partly covered pixels
 const POLL_MS = 250u64;
 const HOT_MS = 2000u64;
 const POINTER_LOG = "C:/src/studio-work/pointer.log";
+const NOMATCH = 1000000000usize;
 
 const PAPER = 0xf8f5eeffu32;     // dark text on it: well over 7 : 1
 const INK = 0x1c1c1cffu32;
 const QUOTE_INK = 0x474747ffu32;
 const CODE_INK = 0x7a2a0effu32;
+
+// The first face that is only a fallback for characters the text fonts lack (set by makeFaces)
+var @threadlocal fallbackFrom = 0u32;
 
 fn nowMs() u64 {
   sdl.GetPerformanceCounter() * 1000u64 / sdl.GetPerformanceFrequency()
@@ -44,6 +56,48 @@ fn sameText(a: &str, b: &str) bool {
     i = i + 1usize;
   }
   true
+}
+
+// The words of 's' as start, end pairs
+fn wordRanges(s: &str) List[usize] {
+  var out = List[usize]();
+  var i = 0usize;
+  while i < s.len() {
+    while i < s.len() && (s[i] == ' ' || s[i] == '\t') { i = i + 1usize; }
+    let start = i;
+    while i < s.len() && s[i] != ' ' && s[i] != '\t' { i = i + 1usize; }
+    if i > start { out.push(start); out.push(i); }
+  }
+  out
+}
+
+// How much of the longer text's words the two share, 0 to 1
+fn similarity(a: &str, b: &str) f32 {
+  let wa = wordRanges(a);
+  let wb = wordRanges(b);
+  let na = wa.len() / 2usize;
+  let nb = wb.len() / 2usize;
+  if na == 0usize || nb == 0usize { return 0.; }
+  var taken = List[bool]();
+  var k = 0usize;
+  while k < nb { taken.push(false); k = k + 1usize; }
+  var shared = 0usize;
+  var i = 0usize;
+  while i < na {
+    let w = a.slice(*wa[i * 2usize], *wa[i * 2usize + 1usize]);
+    var j = 0usize;
+    var done = false;
+    while j < nb && !done {
+      if !*taken[j] && sameText(w, b.slice(*wb[j * 2usize], *wb[j * 2usize + 1usize])) {
+        taken.set(j, true);
+        shared = shared + 1usize;
+        done = true;
+      }
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+  f32.from(shared) / f32.from(if na > nb { na } else { nb })
 }
 
 fn loadFont(file: &str) Option[Font] {
@@ -62,6 +116,8 @@ fn loadFont(file: &str) Option[Font] {
 
 // Georgia for the text and Consolas for code, if they are installed. Faces has four slots; the bold-italic
 // one holds the monospace face, so code is asked for as bold and italic, and text that is both is drawn bold.
+// After them come fallback faces (Segoe UI Symbol, Arial) for characters those lack: richtext picks a glyph from
+// one face only, so after layout, each missing glyph is given to the first fallback that has it (fixGlyphs).
 fn makeFaces() Option[Faces] {
   var out: Option[Faces] = None;
   match loadFont("C:/Windows/Fonts/georgia.ttf") {
@@ -70,11 +126,38 @@ fn makeFaces() Option[Faces] {
       match loadFont("C:/Windows/Fonts/georgiab.ttf") { case let Some(b) { f.setBold(b); } case is None {} }
       match loadFont("C:/Windows/Fonts/georgiai.ttf") { case let Some(i) { f.setItalic(i); } case is None {} }
       match loadFont("C:/Windows/Fonts/consola.ttf") { case let Some(m) { f.setBoldItalic(m); } case is None {} }
+      fallbackFrom = u32.from(f.count());
+      match loadFont("C:/Windows/Fonts/seguisym.ttf") { case let Some(s) { f.fonts.push(s); } case is None {} }
+      match loadFont("C:/Windows/Fonts/arial.ttf") { case let Some(s) { f.fonts.push(s); } case is None {} }
       out = Some[Faces](f);
     }
     case is None {}
   }
   out
+}
+
+// The code point at byte 'o' of 't'
+fn codePointAt(t: &str, o: usize) u32 {
+  let c = u32.from(t[o]);
+  if c < 128u32 { return c; }
+  var n = 0usize;
+  var cp = 0u32;
+  if c >= 240u32 { n = 3usize; cp = c & 7u32; }
+  else if c >= 224u32 { n = 2usize; cp = c & 15u32; }
+  else { n = 1usize; cp = c & 31u32; }
+  var k = 1usize;
+  while k <= n && o + k < t.len() {
+    cp = cp * 64u32 + (u32.from(t[o + k]) & 63u32);
+    k = k + 1usize;
+  }
+  cp
+}
+
+// A mark where a block was taken away: the margin line stands at the top of block 'before' (the new index of the next
+// block that stayed; the block count if none did)
+struct Del {
+  before: usize;
+  born: u64;
 }
 
 pub struct DocPanel {
@@ -89,11 +172,14 @@ pub struct DocPanel {
   rr: RichRenderer;
   target: Texture;
   readback: Buffer;
+  stripTarget: Texture;
+  stripBuf: Buffer;
   mesh: MeshHandle;
   tex: TextureHandle;
   material: MaterialHandle;
   born: List[u64];               // for each doc block: when it was marked (ms), 0 if not
   kinds: List[u32];              // 1 new, 2 changed
+  dels: List[Del];
   err: String;
   scrollY: f32 = 0.;
   dirty: bool = false;
@@ -103,7 +189,7 @@ pub struct DocPanel {
   lastSize: i64 = 0i64;
   hotUntil: u64 = 0u64;
   reloads: u32 = 0u32;
-  firstReloadShot: bool = false;
+  glyphsSwapped: u32 = 0u32;
 
   // Check that it came out: None if no font is installed or the renderer failed
   pub fn create(device: &mut Device, renderer: &mut Renderer, file: &str, initialScroll: f32) Option[DocPanel] {
@@ -116,10 +202,14 @@ pub struct DocPanel {
             TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
           var target = device.createTexture(&desc);
           var readback = device.createBuffer(u64.from(DOC_TEX_W * DOC_TEX_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+          let sdesc = TextureDescriptor(DOC_TEX_W, STRIP_H, TEXTURE_FORMAT_RGBA8_UNORM,
+            TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+          var stripTarget = device.createTexture(&sdesc);
+          var stripBuf = device.createBuffer(u64.from(DOC_TEX_W * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
           let mesh = renderer.addMesh(device, &quad());
           var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
-            emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, mesh, TextureHandle.none(), MaterialHandle.none(),
-            List[u64](), List[u32](), String());
+            emptyLayout(f32.from(DOC_TEX_W)), faces, rr, target, readback, stripTarget, stripBuf, mesh,
+            TextureHandle.none(), MaterialHandle.none(), List[u64](), List[u32](), List[Del](), String());
           p.scrollY = initialScroll;
           p.reload(device, renderer, true);
           made = Some[DocPanel](p);
@@ -145,34 +235,47 @@ pub struct DocPanel {
             hotUntil = now + HOT_MS;
             again = true;
           }
-          else if now < hotUntil { again = true; }
+          else if now < hotUntil || err.len() > 0usize { again = true; }
         }
-        case let Err(e) { setError(device, renderer, "cannot read the file (it is gone, or locked)"); }
+        case let Err(e) { self.setError("gone or locked"); }
       }
       if again { self.reload(device, renderer, false); }
     }
-    // the bars fade: redraw while any shows, then once more with none
-    if now >= lastDraw + POLL_MS && self.anyMark(now) {
+    // the bars fade: redraw while any is still fading, then once more at rest
+    if now >= lastDraw + POLL_MS && self.fading(now) {
       self.redraw(device, renderer);
     }
     else if dirty { self.redraw(device, renderer); }
   }
 
-  fn anyMark(self: &, now: u64) bool {
+  fn fading(self: &, now: u64) bool {
     var i = 0usize;
     while i < born.len() {
       if *born[i] != 0u64 && f64.from(now - *born[i]) < (FADE_SECONDS + 0.3) * 1000. { return true; }
       i = i + 1usize;
     }
+    i = 0usize;
+    while i < dels.len() {
+      if f64.from(now - dels[i].born) < (FADE_SECONDS + 0.3) * 1000. { return true; }
+      i = i + 1usize;
+    }
     false
   }
 
-  fn setError(self: &mut, device: &mut Device, renderer: &mut Renderer, message: &str) {
+  fn setError(self: &mut, message: &str) {
     if sameText(err.view(), message) { return; }
     err = String.from(message);
-    print <- "docpanel: "; printStr(message); print <- "\n";
-    self.relayout();
+    print <- "docpanel: error line shown: "; printStr(message); print <- "\n";
     dirty = true;
+  }
+
+  // The marks cleared (C)
+  pub fn clearMarks(self: &mut) {
+    var i = 0usize;
+    while i < born.len() { born.set(i, 0u64); kinds.set(i, 0u32); i = i + 1usize; }
+    dels = List[Del]();
+    dirty = true;
+    print <- "docpanel: marks cleared\n";
   }
 
   // Read the file; if its text differs from the last (or this is the first time), parse, compare, lay out, draw
@@ -181,50 +284,114 @@ pub struct DocPanel {
     match fs.readFile(&Path.from(file.view())) {
       case let Ok(s) {
         if !first && sameText(s.view(), text.view()) && err.len() == 0usize { return; }
+        let hadError = err.len() > 0usize;
         text = String.from(s.view());
-        if err.len() > 0usize { err = String(); }
+        if hadError { err = String(); dirty = true; print <- "docpanel: error line cleared\n"; }
         let fresh = parseMarkdown(text.view());
         // where the top of the view is, to put it back
         let topDoc = self.topDocBlock();
         var keepChain = String();
         var keepText = String();
+        var keepPath = String();
         var keepOffset = 0.;
         if topDoc < doc.blocks.len() {
           keepChain = String.from(doc.blocks[topDoc].chain.view());
           keepText = String.from(doc.blocks[topDoc].text.view());
+          keepPath = String.from(doc.blocks[topDoc].path.view());
           keepOffset = f64.from(scrollY - self.firstLineTop(topDoc));
         }
-        // mark what is new or changed
+        let scrolledFrom = scrollY;
         let now = nowMs();
-        var used = List[bool]();
+        let nOld = doc.blocks.len();
+        let nNew = fresh.blocks.len();
+        // match: first the same text, then the most similar (half the words) under the same heading chain and kind
+        var oldTo = List[usize]();          // for each old block, the new one it became, or NOMATCH
+        var newFrom = List[usize]();
+        var changedBy = List[bool]();       // matched by similarity (so changed)
         var u = 0usize;
-        while u < doc.blocks.len() { used.push(false); u = u + 1usize; }
+        while u < nOld { oldTo.push(NOMATCH); u = u + 1usize; }
+        u = 0usize;
+        while u < nNew { newFrom.push(NOMATCH); changedBy.push(false); u = u + 1usize; }
+        if !first {
+          var b = 0usize;
+          while b < nNew {
+            var o = 0usize;
+            while o < nOld && *newFrom[b] == NOMATCH {
+              if *oldTo[o] == NOMATCH {
+                let old = &doc.blocks[o];
+                let nb = &fresh.blocks[b];
+                if old.kind == nb.kind && sameText(old.text.view(), nb.text.view()) && sameText(old.chain.view(), nb.chain.view()) {
+                  oldTo.set(o, b);
+                  newFrom.set(b, o);
+                }
+              }
+              o = o + 1usize;
+            }
+            b = b + 1usize;
+          }
+          b = 0usize;
+          while b < nNew {
+            if *newFrom[b] == NOMATCH {
+              var best = 0.5 - 0.0001;
+              var bestO = NOMATCH;
+              var o = 0usize;
+              while o < nOld {
+                if *oldTo[o] == NOMATCH {
+                  let old = &doc.blocks[o];
+                  let nb = &fresh.blocks[b];
+                  if old.kind == nb.kind && sameText(old.chain.view(), nb.chain.view()) {
+                    let sc = f64.from(similarity(old.text.view(), nb.text.view()));
+                    if sc > best { best = sc; bestO = o; }
+                  }
+                }
+                o = o + 1usize;
+              }
+              if bestO != NOMATCH { oldTo.set(bestO, b); newFrom.set(b, bestO); changedBy.set(b, true); }
+            }
+            b = b + 1usize;
+          }
+        }
+        // the marks: carried across, new ones made
         var nBorn = List[u64]();
         var nKinds = List[u32]();
         var marked = 0u32;
-        var b = 0usize;
-        while b < fresh.blocks.len() {
-          var found = false;
-          var pathSeen = false;
-          var o = 0usize;
-          while o < doc.blocks.len() && !found {
-            if !*used[o] {
-              let old = &doc.blocks[o];
-              let nb = &fresh.blocks[b];
-              if old.kind == nb.kind && sameText(old.chain.view(), nb.chain.view()) {
-                if sameText(old.text.view(), nb.text.view()) { found = true; used.set(o, true); }
-                else if sameText(old.path.view(), nb.path.view()) { pathSeen = true; }
-              }
-            }
-            o = o + 1usize;
+        var b2 = 0usize;
+        while b2 < nNew {
+          let from = *newFrom[b2];
+          if first { nBorn.push(0u64); nKinds.push(0u32); }
+          else if from == NOMATCH { nBorn.push(now); nKinds.push(1u32); marked = marked + 1u32; }
+          else if *changedBy[b2] {
+            nBorn.push(now);
+            nKinds.push(if *kinds[from] == 1u32 { 1u32 } else { 2u32 });
+            marked = marked + 1u32;
           }
-          if found || first { nBorn.push(0u64); nKinds.push(0u32); }
-          else { nBorn.push(now); nKinds.push(if pathSeen { 2u32 } else { 1u32 }); marked = marked + 1u32; }
-          b = b + 1usize;
+          else { nBorn.push(*born[from]); nKinds.push(*kinds[from]); }
+          b2 = b2 + 1usize;
+        }
+        // the lines for what went, and the older ones moved to where their next block went
+        var nDels = List[Del]();
+        var d0 = 0usize;
+        while d0 < dels.len() {
+          var a = dels[d0].before;
+          while a < nOld && *oldTo[a] == NOMATCH { a = a + 1usize; }
+          nDels.push(Del(if a >= nOld { nNew } else { *oldTo[a] }, dels[d0].born));
+          d0 = d0 + 1usize;
+        }
+        var removed = 0u32;
+        var o2 = 0usize;
+        while o2 < nOld && !first {
+          if *oldTo[o2] == NOMATCH {
+            var a = o2;
+            while a < nOld && *oldTo[a] == NOMATCH { a = a + 1usize; }
+            nDels.push(Del(if a >= nOld { nNew } else { *oldTo[a] }, now));
+            removed = removed + 1u32;
+          }
+          o2 = o2 + 1usize;
         }
         doc = fresh;
         born = nBorn;
         kinds = nKinds;
+        dels = nDels;
         self.relayout();
         // the same block at the top of the view
         var at = doc.blocks.len();
@@ -235,21 +402,26 @@ pub struct DocPanel {
         }
         if at < doc.blocks.len() { scrollY = self.firstLineTop(at) + f32.from(keepOffset); }
         self.clampScroll();
+        let topAfter = self.topDocBlock();
         self.redraw(device, renderer);
         self.reloads = self.reloads + 1u32;
         print <- "docpanel: reload "; print <- self.reloads; print <- ": "; print <- doc.blocks.len(); print <- " blocks, ";
-        print <- marked; print <- " marked; read, parse, compare, layout, draw and upload took ";
+        print <- marked; print <- " marked, "; print <- removed; print <- " removed; read, parse, compare, layout, draw and upload took ";
         print <- micros(began, sdl.GetPerformanceCounter()) / 1000.; print <- " ms; redrawn at unix_ms ";
         print <- Timestamp.now().unixNanos() / 1000000i64; print <- "\n";
+        if topDoc < doc.blocks.len() || keepPath.len() > 0usize {
+          print <- "docpanel: top of view was ["; printStr(keepPath.view()); print <- "] at scroll "; print <- scrolledFrom;
+          print <- ", is ["; if topAfter < doc.blocks.len() { printStr(doc.blocks[topAfter].path.view()); }
+          print <- "] at scroll "; print <- scrollY; print <- "\n";
+        }
       }
       case let Err(e) {
-        setError(device, renderer, "cannot read the file (it is gone, or locked)");
-        self.redraw(device, renderer);
+        self.setError("gone or locked");
       }
     }
   }
 
-  // The richtext blocks from the doc, and their layout
+  // The richtext blocks from the doc, and their layout; the glyphs a face lacks given to a fallback face
   fn relayout(self: &mut) {
     blocks = List[Block]();
     owner = List[usize]();
@@ -259,22 +431,66 @@ pub struct DocPanel {
       owner.push(i);
       i = i + 1usize;
     }
-    if err.len() > 0usize {
-      var e = Block.fromText(err.view(), Style(true, false, false, 0., 0xb00020ffu32, 0u32, 0u32));
-      blocks.push(e);
-      owner.push(doc.blocks.len());      // past the doc: not pointable
-    }
     if blocks.len() == 0usize {
       blocks.push(Block.fromText("(empty)", Style.plain()));
       owner.push(0usize);
     }
+    layout = layoutRich(&blocks, &images, &faces, &self.config());
+    self.fixGlyphs();
+  }
+
+  fn config(self: &) LayoutConfig {
     var cfg = LayoutConfig.standard(f32.from(DOC_TEX_W));
     cfg.margin = 64.;
     cfg.marginTop = 48.;
     cfg.baseSize = f32.from(DOC_TEXT_PX);
     cfg.lineHeight = 1.3;
     cfg.textColor = INK;
-    layout = layoutRich(&blocks, &images, &faces, &cfg);
+    cfg
+  }
+
+  // richtext takes each character's glyph from the one face its style names; where that face has none (glyph 0), the
+  // glyph and its width come from the first fallback face that has the character, and the rest of the line moves over
+  fn fixGlyphs(self: &mut) {
+    glyphsSwapped = 0u32;
+    if u32.from(faces.count()) <= fallbackFrom { return; }
+    var li = 0usize;
+    while li < layout.lines.len() {
+      let g0 = usize.from(layout.lines[li].g0);
+      let gn = usize.from(layout.lines[li].gn);
+      var shift: f32 = 0.;
+      var gi = g0;
+      while gi < g0 + gn {
+        let g = layout.glyphs[gi];
+        if shift != 0. { (&mut layout.glyphs[gi]).x = g.x + shift; }
+        if g.glyph == 0u32 && usize.from(g.block) < blocks.len() && g.flags & GF_SPACE == 0u32 {
+          let t = blocks[usize.from(g.block)].text.view();
+          if usize.from(g.off) < t.len() {
+            let cp = codePointAt(t, usize.from(g.off));
+            if cp > 32u32 {
+              var f = fallbackFrom;
+              var found = false;
+              while f < u32.from(faces.count()) && !found {
+                let gl = faces.font(f).glyphOf(cp);
+                if gl != 0u32 {
+                  let font = faces.font(f);
+                  let adv = f32.from(font.advance(gl)) * g.size / f32.from(font.unitsPerEm);
+                  (&mut layout.glyphs[gi]).face = f;
+                  (&mut layout.glyphs[gi]).glyph = gl;
+                  (&mut layout.glyphs[gi]).adv = adv;
+                  shift = shift + (adv - g.adv);
+                  glyphsSwapped = glyphsSwapped + 1u32;
+                  found = true;
+                }
+                f = f + 1u32;
+              }
+            }
+          }
+        }
+        gi = gi + 1usize;
+      }
+      li = li + 1usize;
+    }
   }
 
   // The y of the first line of doc block d (the current scroll if it has none)
@@ -312,6 +528,18 @@ pub struct DocPanel {
     scrollY = scrollY - notches * 110.;
     self.clampScroll();
     dirty = true;
+    print <- "docpanel: wheel "; print <- notches; print <- ": scroll "; print <- scrollY; print <- " of "; print <- layout.height; print <- "\n";
+  }
+
+  // A mark's strength, 0 to 255: strong for a while, then down to FADE_LOW and staying there
+  fn strength(now: u64, born: u64) u32 {
+    let age = f64.from(now - born) / 1000.;
+    var s = 255.;
+    if age > FADE_HOLD_SECONDS {
+      let f = if age > FADE_SECONDS { 1. } else { (age - FADE_HOLD_SECONDS) / (FADE_SECONDS - FADE_HOLD_SECONDS) };
+      s = 255. - (255. - FADE_LOW) * f;
+    }
+    u32.from(s)
   }
 
   // Draw the page (with the margin bars) into the texture and give the renderer a texture and material of it
@@ -319,7 +547,7 @@ pub struct DocPanel {
     dirty = false;
     let now = nowMs();
     lastDraw = now;
-    // the bars, as underline-style rectangles that belong to the layout for this one draw
+    // the bars and lines, as underline-style rectangles that belong to the layout for this one draw
     let keep = layout.rects.len();
     var i = 0usize;
     while i < layout.lines.len() {
@@ -327,16 +555,21 @@ pub struct DocPanel {
       let ob = usize.from(ln.block);
       if ob < owner.len() && *owner[ob] < born.len() && *born[*owner[ob]] != 0u64 {
         let d = *owner[ob];
-        let age = f64.from(now - *born[d]) / 1000.;
-        if age < FADE_SECONDS {
-          var strength = 1.;
-          if age > FADE_HOLD_SECONDS { strength = 1. - (age - FADE_HOLD_SECONDS) / (FADE_SECONDS - FADE_HOLD_SECONDS); }
-          let a = u32.from(255. * strength);
-          let rgb = if *kinds[d] == 1u32 { 0x2e9e4f00u32 } else { 0x2f6fd800u32 };
-          layout.rects.push(RectP(16., ln.top, 12., ln.height, rgb | a, RK_UNDERLINE));
-        }
+        let rgb = if *kinds[d] == 1u32 { 0x2e9e4f00u32 } else { 0x2f6fd800u32 };
+        layout.rects.push(RectP(16., ln.top, 12., ln.height, rgb | DocPanel.strength(now, *born[d]), RK_UNDERLINE));
       }
       i = i + 1usize;
+    }
+    var k = 0usize;
+    while k < dels.len() {
+      let before = dels[k].before;
+      var y: f32 = 0.;
+      if before >= doc.blocks.len() {
+        if layout.lines.len() > 0usize { y = layout.lines[layout.lines.len() - 1usize].top + layout.lines[layout.lines.len() - 1usize].height + 2.; }
+      }
+      else { y = self.firstLineTop(before) - 4.; }
+      layout.rects.push(RectP(10., y - 1.5, 26., 3., 0xd0203000u32 | DocPanel.strength(now, dels[k].born), RK_UNDERLINE));
+      k = k + 1usize;
     }
     let view = RichView(f32.from(DOC_TEX_W), f32.from(DOC_TEX_H), 0., scrollY, PAPER, PAPER, 0u32, 0u32,
       f32.from(DOC_TEX_W), false);
@@ -348,7 +581,8 @@ pub struct DocPanel {
     device.queue.submit(encoder.finish());
     device.waitIdle();
     while layout.rects.len() > keep { layout.rects.pop(); }
-    let img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
+    var img = Image.fromTexels(readback.mappedRange(), i32.from(DOC_TEX_W), i32.from(DOC_TEX_H), false);
+    darkenStems(&mut img);    if err.len() > 0usize { self.errorStrip(device, &mut img); }
     let t = renderer.addTexture(device, &img);
     let m = renderer.addMaterial(device, &Material.textured(Color(1., 1., 1., 1.), t));
     if renderer.removeMaterial(device, material) {}
@@ -357,8 +591,36 @@ pub struct DocPanel {
     material = m;
   }
 
+  // The error as one red line at the foot of the page: laid out and drawn apart (richtext draws only a document),
+  // then its rows written over the page's last rows
+  fn errorStrip(self: &mut, device: &mut Device, img: &mut Image) {
+    var line = String.from("File error: ");
+    line.append(err.view());
+    line.append(". Showing the last good version.");
+    var eb = List[Block]();
+    eb.push(Block.fromText(line.view(), Style(true, false, false, 0., 0x600010ffu32, 0u32, 0u32)));
+    var cfg = self.config();
+    cfg.marginTop = 14.;
+    cfg.baseSize = 30.;
+    let el = layoutRich(&eb, &images, &faces, &cfg);
+    let view = RichView(f32.from(DOC_TEX_W), f32.from(STRIP_H), 0., 0., 0xf2a8b0ffu32, 0xf2a8b0ffu32, 0u32, 0u32,
+      f32.from(DOC_TEX_W), false);
+    let sel = List[RectP]();
+    let caret = CaretRect(0., 0., 0.);
+    var encoder = device.createCommandEncoder();
+    rr.draw(device, &mut encoder, &stripTarget, &view, &faces, &el, &images, &sel, &caret);
+    encoder.copyTextureToBuffer(&stripTarget, &stripBuf);
+    device.queue.submit(encoder.finish());
+    device.waitIdle();
+    let strip = Image.fromTexels(stripBuf.mappedRange(), i32.from(DOC_TEX_W), i32.from(STRIP_H), false);
+    // both are bottom row first: the strip's rows 0.. go over the page's rows 0..
+    let n = usize.from(DOC_TEX_W * STRIP_H * 3u32);
+    var p = 0usize;
+    while p < n { img.pixels.set(p, *strip.pixels[p]); p = p + 1usize; }
+  }
+
   pub fn drawInto(self: &, list: &mut DrawList) {
-    list.addTinted(mesh, material, Mat4.identity(), Color(1., 1., 1., 1.));
+    list.addTinted(mesh, material, Mat4.identity(), Color(f32.from(DOC_GAIN), f32.from(DOC_GAIN), f32.from(DOC_GAIN), 1.));
   }
 
   // A ray from the eye: does it meet the page? If so, name the block there.
@@ -396,6 +658,36 @@ pub struct DocPanel {
     while k < line.len() { bytes.push(line.view()[k]); k = k + 1usize; }
     if let Err(e) = fs.appendFile(&Path.from(POINTER_LOG), bytes.view()) { print <- "pointer log: "; print <- e; print <- "\n"; }
     true
+  }
+}
+
+// Stem darkening. Thin strokes of 22-pixel text are partly covered pixels, which look pale once the page is
+// drawn small on the wall (the mip chain averages in linear light). Each channel's distance from the paper's is
+// raised to a power below one, so a half-covered pixel is darker than half: text keeps its contrast at a distance.
+// The paper itself and full ink are unchanged.
+fn darkenStems(img: &mut Image) {
+  var tables = List[u8]();
+  var c = 0usize;
+  while c < 3usize {
+    let paper = f32.from(u32.from(if c == 0usize { PAPER >> 24u32 } else if c == 1usize { (PAPER >> 16u32) & 255u32 } else { (PAPER >> 8u32) & 255u32 }));
+    var v = 0usize;
+    while v < 256usize {
+      let ink = (paper - f32.from(v)) / paper;
+      var out = f32.from(v);
+      if ink > 0. { out = paper * (1. - libc.powf(ink, STEM_POWER)); }
+      if out < 0. { out = 0.; }
+      tables.push(u8.from(u32.from(out + 0.5)));
+      v = v + 1usize;
+    }
+    c = c + 1usize;
+  }
+  let n = img.pixels.len();
+  var p = 0usize;
+  while p + 2usize < n {
+    img.pixels.set(p, *tables[usize.from(*img.pixels[p])]);
+    img.pixels.set(p + 1usize, *tables[256usize + usize.from(*img.pixels[p + 1usize])]);
+    img.pixels.set(p + 2usize, *tables[512usize + usize.from(*img.pixels[p + 2usize])]);
+    p = p + 3usize;
   }
 }
 
