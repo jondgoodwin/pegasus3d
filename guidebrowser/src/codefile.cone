@@ -1,0 +1,155 @@
+// A source file as a document: one DK_CODE block per line, a line number in front, and a colour class (TONE_...) on
+// keywords, strings, comments and numbers. One word list serves every language (cone, python, rust, js, c, powershell);
+// the file's extension chooses only the comment marker. Not a parser: a line is read left to right, nothing is
+// remembered from the line before (a block comment's later lines show plain).
+
+
+const KEYWORDS = " fn pub struct enum impl trait alias const var let if else while for in match case is return break continue use import from as mut self true false null None Some Ok Err def class lambda function export async await try except finally raise with pass yield and or not elif switch default static void int char float double bool string type interface package namespace where loop mod crate unsafe extern Set-Location param foreach begin process end ";
+const TYPES = " u8 u16 u32 u64 usize i8 i16 i32 i64 isize f32 f64 str String List Option Result Vec3 Vec4 Mat4 Quat Dict Self ";
+
+fn isWordByte(c: u8) bool {
+  (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 128u8
+}
+
+fn inWords(list: &str, word: &str) bool {
+  var probe = String.from(" ");
+  probe.append(word);
+  probe.append(" ");
+  match list.findFrom(probe.view(), 0usize) { case let Some(k) { true } else { false } }
+}
+
+fn numberText(n: usize) String {
+  var digits = List[u8]();
+  var v = n;
+  if v == 0usize { digits.push('0'); }
+  while v > 0usize {
+    digits.push(u8.from(usize.from('0') + v % 10usize));
+    v = v / 10usize;
+  }
+  var out = String();
+  var i = digits.len();
+  while i > 0usize {
+    i = i - 1usize;
+    let d = usize.from(*digits[i]) - usize.from('0');
+    out.append("0123456789".slice(d, d + 1usize));
+  }
+  out
+}
+
+// Whether a '#' starts a comment in a file with this extension
+fn hashComments(ext: &str) bool {
+  inWords(" py ps1 sh toml yml yaml ini cfg bat cmd rb pl mk txt ", ext)
+}
+
+pub fn extensionOf(file: &str) String {
+  var dot = file.len();
+  var i = file.len();
+  while i > 0usize {
+    i = i - 1usize;
+    if file[i] == '.' { dot = i; i = 0usize; }
+    else if file[i] == '/' || file[i] == '\\' { i = 0usize; }
+  }
+  var out = String();
+  if dot < file.len() {
+    var k = dot + 1usize;
+    while k < file.len() {
+      out.append(file.slice(k, k + 1usize));
+      k = k + 1usize;
+    }
+  }
+  out
+}
+
+fn baseName(file: &str) String {
+  var from = 0usize;
+  var i = 0usize;
+  while i < file.len() { if file[i] == '/' || file[i] == '\\' { from = i + 1usize; } i = i + 1usize; }
+  String.from(file.sliceFrom(from))
+}
+
+// The tokens of one line, added to 'text' and 'spans' with their tones
+fn colourLine(line: &str, hash: bool, text: &mut String, spans: &mut List[Span]) {
+  let n = line.len();
+  var i = 0usize;
+  while i < n {
+    let c = line[i];
+    if (c == '/' && i + 1usize < n && line[i + 1usize] == '/' && !hash) || (c == '#' && hash) {
+      addToned(text, spans, line.sliceFrom(i), false, false, true, 0u32, TONE_COMMENT);
+      i = n;
+    }
+    else if c == '"' || c == '\'' {
+      var j = i + 1usize;
+      while j < n && line[j] != c {
+        if line[j] == '\\' && j + 1usize < n { j = j + 1usize; }
+        j = j + 1usize;
+      }
+      if j < n { j = j + 1usize; }
+      // an apostrophe inside a comment-less prose line is rare in code; a lone quote runs to the line's end
+      addToned(text, spans, line.slice(i, j), false, false, true, 0u32, TONE_STRING);
+      i = j;
+    }
+    else if c >= '0' && c <= '9' {
+      var j = i;
+      while j < n && (isWordByte(line[j]) || line[j] == '.') { j = j + 1usize; }
+      addToned(text, spans, line.slice(i, j), false, false, true, 0u32, TONE_NUMBER);
+      i = j;
+    }
+    else if isWordByte(c) {
+      var j = i;
+      while j < n && (isWordByte(line[j]) || (line[j] == '-' && j + 1usize < n && isWordByte(line[j + 1usize]) && hash)) { j = j + 1usize; }
+      let w = line.slice(i, j);
+      var tone = 0u32;
+      if inWords(KEYWORDS, w) { tone = TONE_KEYWORD; }
+      else if inWords(TYPES, w) { tone = TONE_TYPE; }
+      addToned(text, spans, w, false, false, true, 0u32, tone);
+      i = j;
+    }
+    else {
+      var j = i + 1usize;
+      while j < n && !isWordByte(line[j]) && line[j] != '"' && line[j] != '\'' && line[j] != '/' && line[j] != '#' { j = j + 1usize; }
+      addToned(text, spans, line.slice(i, j), false, false, true, 0u32, 0u32);
+      i = j;
+    }
+  }
+}
+
+pub fn parseCode(src: &str, file: &str) Doc {
+  var doc = Doc(List[DocBlock]());
+  let ext = extensionOf(file);
+  let hash = hashComments(ext.view());
+  let name = baseName(file);
+  let n = src.len();
+  var pos = 0usize;
+  var lineNo = 1usize;
+  while pos < n || (pos == 0usize && n == 0usize) {
+    var end = pos;
+    while end < n && src[end] != '\n' { end = end + 1usize; }
+    var stop = end;
+    if stop > pos && src[stop - 1usize] == '\r' { stop = stop - 1usize; }
+    // tabs become two spaces; the line number goes in front
+    var flat = String();
+    var q = pos;
+    while q < stop {
+      if src[q] == '\t' { flat.append("  "); } else { flat.append(src.slice(q, q + 1usize)); }
+      q = q + 1usize;
+    }
+    var text = String();
+    var spans = List[Span]();
+    var num = numberText(lineNo);
+    var padded = String();
+    var pad = num.len();
+    while pad < 4usize { padded.append(" "); pad = pad + 1usize; }
+    padded.append(num.view());
+    padded.append("  ");
+    addToned(&mut text, &mut spans, padded.view(), false, false, true, 0u32, TONE_LINENO);
+    colourLine(flat.view(), hash, &mut text, &mut spans);
+    var path = String.from(name.view());
+    path.append(" » line ");
+    path.append(num.view());
+    doc.blocks.push(DocBlock(DK_CODE, 0u32, text, spans, String.from(name.view()), path, lineNo == 1usize, List[String](), String()));
+    lineNo = lineNo + 1usize;
+    pos = end + 1usize;
+    if n == 0usize { pos = 1usize; }
+  }
+  doc
+}

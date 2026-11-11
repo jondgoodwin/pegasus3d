@@ -63,7 +63,7 @@ import json;
 import aio use File, IoLimits;
 import iobuf use IoBuf;
 import iocore use Access;
-import time use Instant, Duration;
+import time use Instant, Duration, Timestamp;
 import httpclient use Timing;
 import actorhttp use Client;
 import keyframetracks use * but Binding;
@@ -71,6 +71,8 @@ import tweenstack use Anim, Animators, Value as AnimValue;
 import input use Input, Context, Binding, Action, AXIS2;
 import controls use Fly, Pose;
 import analyticdaylight use PreethamSky;
+import richtext use Faces, Block, Run, Style, sameStyle, LayoutConfig, layoutRich, emptyLayout, RichLayout, RichRenderer, RichView, ImageInfo, RectP, CaretRect, posAt, BK_H1, BK_H2, BK_H3, BK_BULLET, BK_NUMBER, RK_UNDERLINE, GF_SPACE, isContByte;
+import msdftext use Font;
 
 // How fast a visitor walks, in meters a second (mine: a brisk walk)
 const WALK_SPEED = 2.;
@@ -97,6 +99,8 @@ fn noView() PartView {
 // that made them, the device after what it made, the instance last.
 struct Shell {
   pub scene: Scene;
+  pub panel: Option[DocPanel];    // '--doc FILE.md': the document panel (docpanel.cone)
+  pub wh: Warehouse;              // '--world warehouse': the ring, the shelves and the line (warehouse.cone)
   pub ready: Receiver[Arrival];   // what the loader has built
   pub arrivedAt: u64;             // when the home world was asked for (performance counter)
   pub activated: u64;             // parts made live so far
@@ -125,6 +129,8 @@ struct Shell {
   pub list: DrawList;
   pub camera: Camera;
   pub light: Light;
+  pub other: Option[DocPanel];    // the panel not shown: the document while a reply is read, or the last reply while the document is
+  pub bridge: Option[Bridge];     // '--bridge DIR': the studio bridge (bridge.cone)
 }
 
 // Made in start. (A global Option cannot be matched in place, only a borrow
@@ -145,7 +151,35 @@ var @threadlocal clicks = 0;
 var @threadlocal clickFrames = Array[i32, 4]() <- fill 0;
 var @threadlocal clickXs = Array[f32, 4]() <- fill 0.;
 var @threadlocal clickYs = Array[f32, 4]() <- fill 0.;
-var @threadlocal tilt = 0.;                // '--tilt D': once arrived, look D degrees further up (down if negative)
+var @threadlocal docArg: *u8 = null;       // '--doc FILE.md': a live document panel in the world (docpanel.cone)
+var @threadlocal shotReload = 0;           // '--shot-after-reload K': the shot is taken 20 frames after the panel's Kth reading (1 is the first)
+var @threadlocal shotDelay = 20;           // '--shot-delay N': frames after that reading ('--shot-after-reload')
+var @threadlocal wheelAt = 0;              // '--wheel Y N': on frame N, a mouse wheel event of Y notches is pushed through SDL's queue
+var @threadlocal wheelY = 0.;
+var @threadlocal shotError = false;        // '--shot-on-error': the shot is taken shotDelay frames after the panel shows an error line
+var @threadlocal pressCReload = 0;         // '--press-c-after-reload K': the C key is pushed 40 frames after the panel's Kth reading
+var @threadlocal pressCAt = 0;            // '--press-c N': on frame N, the C key (clear the marks) is pushed through SDL's queue
+var @threadlocal bridgeArg: *u8 = null;    // '--bridge DIR': the studio bridge's folder (bridge.cone). Return sends the draft, B goes back
+var @threadlocal autoTurns = 0;            // '--auto-turns K': send K test turns, each GAP frames after the last reply (a stand-in for the key)
+var @threadlocal autoGap = 30;             // '--auto-gap F'
+var @threadlocal autoSent = 0;
+var @threadlocal autoNext = 120;
+var @threadlocal shotReply = 0;            // '--shot-after-reply K': the shot is taken 30 frames after the Kth reply is shown
+var @threadlocal backAfterShot = false;    // '--back-after-shot': 15 frames after the shot, B is pressed (the document), and a second shot follows 25 frames later
+var @threadlocal pressRetAt = 0;          // '--press-return N': on frame N, the Return key is pushed through SDL's queue
+var @threadlocal pressRetCount = 0;        // '--press-return-after-reply K': the Return key is pushed 20 frames after the Kth reply is shown
+var @threadlocal repliesShown = 0;
+var @threadlocal docScroll = 0.;         // '--doc-scroll PX': where the page starts
+var @threadlocal startYaw = 0.;           // '--yaw D': once arrived, turn D degrees left (right if negative)
+var @threadlocal atSet = false;           // '--at X Z': once arrived, stand at X, Z
+var @threadlocal atX = 0.;
+var @threadlocal atZ = 0.;
+// '--wh-ev KIND ARG FRAME' (up to six): on frame FRAME, KIND 1 selects item ARG, KIND 2 does action ARG on the selection
+var @threadlocal whEvs = 0;
+var @threadlocal whKind = Array[i32, 12]() <- fill 0;
+var @threadlocal whArg = Array[i32, 12]() <- fill 0;
+var @threadlocal whFrame = Array[i32, 12]() <- fill 0;
+var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D degrees further up (down if negative)
 
 // Frames drawn, and the colour at the middle of the window on the shot frame
 var @threadlocal drawn = 0;
@@ -188,6 +222,7 @@ pub fn start(host: &mut Host) bool {
     print <- "The renderer could not be made\n";
     return false;
   }
+  if docArg != null { post.bloom = 0.; }      // a bright page must not glow over its own text
   var fx = ImageFx.create(&mut device, &renderer, &mut post);
   fx.configure(&FxSettings.high());        // until a world's arrival says how its picture is taken
   print <- "Rendering: high dynamic range, image quality high, "; print <- (if rays { "ray tracing on" } else { "no ray tracing" }); print <- "\n";
@@ -223,14 +258,23 @@ pub fn start(host: &mut Host) bool {
   publishedTx, publishedRx = Channel[Published].make();
   let arrivedAt = sdl.GetPerformanceCounter();
   let loader = Loader(readyTx);
-  let world = if worldArg == null { String.from("home") } else { String.from(cstr.fromPtr(worldArg).view()) };
+  var panel: Option[DocPanel] = None;
+  if docArg != null {
+    panel = DocPanel.create(&mut device, &mut renderer, swapchain.format, cstr.fromPtr(docArg).view(), f32.from(docScroll));
+    match &panel { case is None { print <- "The document panel could not be made\n"; } else {} }
+  }
+  var bridge: Option[Bridge] = None;
+  if bridgeArg != null { bridge = Some[Bridge](Bridge.create(cstr.fromPtr(bridgeArg).view(), POINTER_LOG)); }
+  let world = if worldArg == null { String.from(if docArg != null { "doc" } else { "home" }) } else { String.from(cstr.fromPtr(worldArg).view()) };
   loader.arrive(world, worldsFolder(), arrivedAt, testPart, show);
 
   let target = swapchain.getCurrentTexture(&mut device);
-  shell = Some[Shell](Shell(Scene.empty(), readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
+  var wh = Warehouse.empty();
+  if worldArg != null && libc.strcmp(cstr.fromPtr(worldArg), "warehouse") == 0i32 { wh = Warehouse.create(&mut device, swapchain.format); if startYaw == 0. { startYaw = 72.; } }
+  shell = Some[Shell](Shell(Scene.empty(), panel, wh, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
     List[PartView](), 0u64, NO_CLICK, Input(), actions, walk, look, true,
     Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), target, fx, post, renderer, swapchain, device,
-    adapter, surface, instance, DrawList(), camera, light));
+    adapter, surface, instance, DrawList(), camera, light, None, bridge));
   true
 }
 
@@ -248,6 +292,31 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
         (*some).post.resize(&mut (*some).device, u32.from(size.w), u32.from(size.h));
       }
       (*some).input.handle(e);
+      if e.type == sdl.EVENT_MOUSE_WHEEL {
+        let wheel = e as &sdl.MouseWheelEvent;
+        match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); } else {} }
+      }
+      if e.type == sdl.EVENT_KEY_DOWN {
+        let key = e as &sdl.KeyboardEvent;
+        if key.scancode == sdl.SCANCODE_C && !key.repeat {
+          match &mut (*some).panel { case var &mut Some(p) { p.clearMarks(); } else {} }
+        }
+        if key.scancode == KEY_RETURN && !key.repeat { sendTurn(&mut *some); }
+        if (*some).wh.on && !key.repeat && (*some).wh.sel >= 0 {
+          if key.scancode == KEY_X { whAct(&mut *some, 0u32); }
+          if key.scancode == KEY_B { whAct(&mut *some, 1u32); }
+          if key.scancode == KEY_Z { whAct(&mut *some, if (key.keymod & sdl.KMOD_SHIFT) != 0u16 { 5u32 } else { 2u32 }); }
+          if key.scancode == KEY_O { whAct(&mut *some, 3u32); }
+          if key.scancode == KEY_T { whAct(&mut *some, 4u32); }
+        }
+        if key.scancode == KEY_B && !key.repeat && !(*some).wh.on { toggleBack(&mut *some); }
+        if !key.repeat {
+          let alt = (key.keymod & 0x0300u16) != 0u16;
+          if key.scancode == KEY_LBRACKET || (alt && key.scancode == KEY_LEFT) { browseAct(&mut *some, 6u32); }
+          if key.scancode == KEY_RBRACKET || (alt && key.scancode == KEY_RIGHT) { browseAct(&mut *some, 7u32); }
+          if key.scancode == KEY_F && (*some).wh.on { browseAct(&mut *some, 8u32); }
+        }
+      }
       if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
         let b = e as &sdl.MouseButtonEvent;
         if b.button == sdl.BUTTON_LEFT {
@@ -261,8 +330,72 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
   shell = g;
 }
 
+// The slot of the nearest part whose drawn surface the ray from 'eye' along 'direction' meets (NO_CLICK if none). A part's box is only
+// the first, cheap test: a ray that enters it is then tested against the part's triangles, so a tall piece's empty box (the air
+// beside a chess queen, say) takes no click meant for a pawn behind it.
+fn nearestPart(parts: &mut List[Live], eye: Vec3, direction: Vec3) u32 {
+  var best = 1.0e30f;
+  var hit = NO_CLICK;
+  var k = 0usize;
+  while k < parts.len() {
+    let part = &mut parts[k];
+    let back = part.place.inverse();
+    let ray = Ray3(back * eye, back.transformVector(direction));
+    var enters = false;
+    match ray.intersectAabb(Aabb3(part.low, part.high)) {
+      case let Some(t) { enters = t < best; }
+      case is None {}
+    }
+    if enters {
+      var t = 0usize;
+      while t + 2usize < part.indices.len() {
+        let a = *part.positions[usize.from(*part.indices[t])];
+        let b = *part.positions[usize.from(*part.indices[t + 1usize])];
+        let c = *part.positions[usize.from(*part.indices[t + 2usize])];
+        match ray.intersectTriangle(a, b, c) {
+          case let Some(d) { if d >= 0. && d < best { best = d; hit = part.slot; } }
+          case is None {}
+        }
+        t = t + 3usize;
+      }
+    }
+    k = k + 1usize;
+  }
+  hit
+}
+
+// --check-pick: a click on a piece behind another's bounding box picks the right one (no window, no GPU)
+fn checkPick() bool {
+  var parts = List[Live]();
+  // A: a thin triangle in z = 0 covering the lower left of its 4 x 4 box (x + y <= 4). B: a square at z = -2 around (3, 3).
+  var pa = List[Vec3]();
+  pa.push(Vec3(0., 0., 0.)); pa.push(Vec3(4., 0., 0.)); pa.push(Vec3(0., 4., 0.));
+  var ia = List[u32]();
+  ia.push(0u32); ia.push(1u32); ia.push(2u32);
+  parts.push(Live(1u32, String.from("front piece"), MeshHandle.none(), MaterialHandle.none(), Vec3(0., 0., 0.), Vec3(4., 4., 0.01),
+    Mat4.identity(), pa, ia));
+  var pb = List[Vec3]();
+  pb.push(Vec3(2.5, 2.5, 0. - 2.)); pb.push(Vec3(3.5, 2.5, 0. - 2.)); pb.push(Vec3(3.5, 3.5, 0. - 2.)); pb.push(Vec3(2.5, 3.5, 0. - 2.));
+  var ib = List[u32]();
+  ib.push(0u32); ib.push(1u32); ib.push(2u32); ib.push(0u32); ib.push(2u32); ib.push(3u32);
+  parts.push(Live(2u32, String.from("piece behind"), MeshHandle.none(), MaterialHandle.none(), Vec3(2.5, 2.5, 0. - 2.01), Vec3(3.5, 3.5, 0. - 1.99),
+    Mat4.identity(), pb, ib));
+  var ok = true;
+  let down = Vec3(0., 0., 0. - 1.);
+  let through = nearestPart(&mut parts, Vec3(3., 3., 5.), down);
+  print <- "check-pick: through the front piece's empty box corner, the piece behind: "; print <- through; print <- if through == 2u32 { " ok\n" } else { " WRONG\n" };
+  ok = ok && through == 2u32;
+  let onFront = nearestPart(&mut parts, Vec3(1., 1., 5.), down);
+  print <- "check-pick: through the front piece's own triangle, the front piece: "; print <- onFront; print <- if onFront == 1u32 { " ok\n" } else { " WRONG\n" };
+  ok = ok && onFront == 1u32;
+  let missed = nearestPart(&mut parts, Vec3(3.5, 0.8, 5.), down);
+  print <- "check-pick: through the box corner above both, nothing: "; print <- missed; print <- if missed == NO_CLICK { " ok\n" } else { " WRONG\n" };
+  ok = ok && missed == NO_CLICK;
+  ok
+}
+
 // The part drawn under (x, y), in the window's units, clicked: the nearest
-// whose box the ray from the eye through that point meets
+// whose triangles the ray from the eye through that point meets
 fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   let tw = f32.from(s.target.texture.width);
   let th = f32.from(s.target.texture.height);
@@ -271,24 +404,30 @@ fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
   let eye = s.camera.origin;
   let direction = (p.xyz() * (1. / p.w) - eye).normalize();
-  var best = 1.0e30f;
-  var hit = NO_CLICK;
-  var k = 0usize;
-  while k < s.scene.parts.len() {
-    let part = &s.scene.parts[k];
-    let back = part.place.inverse();
-    let ray = Ray3(back * eye, back.transformVector(direction));
-    match ray.intersectAabb(Aabb3(part.low, part.high)) {
-      case let Some(t) { if t < best { best = t; hit = part.slot; } }
-      case is None {}
-    }
-    k = k + 1usize;
+  var onPanel = false;
+  if s.wh.on {
+    if s.wh.clickChip(eye, direction, &s.visitor) { return; }
+    if s.wh.clickCard(eye, direction) { return; }
+    let inv = s.wh.pageModel().inverse();
+    let le = inv * eye;
+    let ld = inv.transformVector(direction);
+    match &mut s.panel { case var &mut Some(p) { onPanel = p.click(le, ld); } else {} }
+    if onPanel { s.wh.selectPage(); return; }
   }
+  else {
+    match &mut s.panel { case var &mut Some(p) { onPanel = p.click(eye, direction); } else {} }
+    if onPanel { return; }
+  }
+  let hit = nearestPart(&mut s.scene.parts, eye, direction);
+  var k = 0usize;
   print <- "loop: frame "; print <- frame; print <- ", a click at ("; print <- x; print <- ", "; print <- y; print <- "): ";
-  if hit == NO_CLICK { print <- "nothing\n"; return; }
+  if hit == NO_CLICK { print <- "nothing\n"; if s.wh.on { s.wh.select(-1); } return; }
   k = 0usize;
   while k < s.scene.parts.len() {
-    if s.scene.parts[k].slot == hit { printStr(s.scene.parts[k].name.view()); }
+    if s.scene.parts[k].slot == hit {
+      printStr(s.scene.parts[k].name.view());
+      if s.wh.on { s.wh.selectSlot(&s.scene.parts, k); }
+    }
     k = k + 1usize;
   }
   print <- "\n";
@@ -315,6 +454,7 @@ fn stepWorld(s: &mut Shell, step: &Step) {
   }
   // Walking stays level: ahead is where the visitor faces, flattened
   let m = s.actions.axis2(s.walk);
+  s.wh.glideStep(&mut s.visitor, step.dt);
   if m.x != 0. || m.y != 0. {
     let yaw = s.visitor.yaw;
     let ahead = Vec3(0. - sin(yaw), 0., 0. - cos(yaw));
@@ -410,7 +550,13 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
         if look.covers < 1. { plain = plain.translucent(look.covers); }
         material = s.renderer.addMaterial(&mut s.device, &plain);
       }
-      s.scene.parts.push(Live(p.built.slot, p.built.name.clone(), mesh, material, p.built.low, p.built.high, p.built.place));
+      var ps = List[Vec3].withCapacity(p.built.mesh.positions.len());
+      var pi = 0usize;
+      while pi < p.built.mesh.positions.len() { ps.push(*p.built.mesh.positions[pi]); pi = pi + 1usize; }
+      var ix = List[u32].withCapacity(p.built.mesh.indices.len());
+      pi = 0usize;
+      while pi < p.built.mesh.indices.len() { ix.push(*p.built.mesh.indices[pi]); pi = pi + 1usize; }
+      s.scene.parts.push(Live(p.built.slot, p.built.name.clone(), mesh, material, p.built.low, p.built.high, p.built.place, ps, ix));
       s.activated = s.activated + 1u64;
       print <- "loop: frame "; print <- frame; print <- ", "; printStr(p.built.name.view());
       print <- " live: mesh and material to the GPU in "; print <- micros(began, sdl.GetPerformanceCounter()); print <- " us\n";
@@ -455,7 +601,8 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
       s.fx.configure(&settings);
       let level = Vec3(f.x, 0., f.z);
       if approach != 0. && level.length() > 0. { eye = eye + level.normalize() * f32.from(approach); }
-      s.visitor = Fly.make(eye, atan2(0. - f.x, 0. - f.z), asin(f.y) + f32.from(tilt) * 0.0174533);
+      if atSet { eye = Vec3(f32.from(atX), eye.y, f32.from(atZ)); }
+      s.visitor = Fly.make(eye, atan2(0. - f.x, 0. - f.z) + f32.from(startYaw) * 0.0174533, asin(f.y) + f32.from(tilt) * 0.0174533);
     }
     case var &mut Behaviors(b) {
       var program = Program(List[SlotFrame](), List[FieldRt](), List[AreaRt](),
@@ -518,8 +665,194 @@ pub fn draw(host: &mut Host, alpha: f32, scratch: &mut Arena) {
   shell = g;
 }
 
+// ---- the studio bridge (bridge.cone) ----
+const KEY_RETURN = 40u;      // SDL scancodes (the sdl binding names only some)
+const KEY_B = 5u;
+const KEY_O = 18u;
+const KEY_T = 23u;
+const KEY_Z = 29u;
+const KEY_F = 9u;
+const KEY_LBRACKET = 47u;
+const KEY_RBRACKET = 48u;
+const KEY_RIGHT = 79u;
+const KEY_LEFT = 80u;
+const KEY_X = 27u;           // shelve (S would stop the walk backward)
+
+// An action on the selected project (S, B, Z, O, T and the chips): 0 shelve, 1 bring, 2 zoom, 3 open, 4 talk
+fn whAct(s: &mut Shell, a: u32) {
+  if a >= 6u32 { browseAct(s, a); return; }
+  if !s.wh.act(a, &s.visitor) { return; }
+  if a == 4u32 {
+    print <- "warehouse: talk about the page: write the words in draft.txt and press Return\n";
+    match &mut s.panel { case var &mut Some(p) { p.setNote("Talking about this page: write draft.txt, then press Return"); } else {} }
+  }
+}
+
+// Browsing: 6 back and 7 forward in the document panel's history, 8 the file browser (put away if it is out)
+fn browseAct(s: &mut Shell, a: u32) {
+  if a == 6u32 { match &mut s.panel { case var &mut Some(p) { p.requestNav(-1i32); } else {} } }
+  if a == 7u32 { match &mut s.panel { case var &mut Some(p) { p.requestNav(1i32); } else {} } }
+  if a == 8u32 { s.wh.toggleBrowser("", s.visitor.position, s.visitor.yaw); }
+}
+
+// The file browser and the document panel hand each other work: a folder asked for, a file chosen, the history to list
+fn whBrowse(s: &mut Shell) {
+  var dir = String();
+  match &mut s.panel {
+    case var &mut Some(p) { if p.outBrowse.len() > 0usize { dir = String.from(p.outBrowse.view()); p.outBrowse = String(); } }
+    else {}
+  }
+  if dir.len() > 0usize { s.wh.toggleBrowser(dir.view(), s.visitor.position, s.visitor.yaw); }
+  if s.wh.browserIsOpen() {
+    var hf = List[String]();
+    var ser = 0u32;
+    match &s.panel { case let Some(p) { hf = p.historyFiles(); ser = p.histSerial; } else {} }
+    let open = s.wh.syncBrowser(&mut s.device, &mut s.renderer, &hf, ser);
+    if open.len() > 0usize {
+      let ov = open.view();
+      match &mut s.panel { case var &mut Some(p) { p.go(&mut s.device, &mut s.renderer, ov, ""); } else {} }
+    }
+  }
+}
+
+// Return: the draft goes as the next turn
+fn sendTurn(s: &mut Shell) {
+  var one = String();
+  var two = String();
+  match &s.panel { case let Some(p) { one = p.describe(true); } else {} }
+  match &s.other { case let Some(p) { two = p.describe(false); } else {} }
+  var docs = String.from("[");
+  docs.append(one.view());
+  if one.len() > 0usize && two.len() > 0usize { docs.append(", "); }
+  docs.append(two.view());
+  docs.append("]");
+  var sent = 0u32;
+  let dv = docs.view();
+  match &mut s.bridge {
+    case var &mut Some(b) { if b.send(dv) { sent = b.turn; } }
+    else { print <- "bridge: not started (give --bridge DIR)\n"; }
+  }
+  if sent > 0u32 {
+    var note = String.from("Sent turn ");
+    note.append(numText(i64.from(sent)).view());
+    note.append(". Waiting for the reply...");
+    let noteView = note.view();
+    match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); } else {} }
+  }
+}
+
+// A reply has come: read it as a panel of its own. The document goes behind it (B brings it back).
+fn showReply(s: &mut Shell, n: u32) {
+  var summary = String();
+  var path = String();
+  var showing = false;
+  match &s.bridge {
+    case let Some(b) { summary = b.summary(n); path = b.replyPath(n, ".md"); showing = b.showingReply; }
+    else { return; }
+  }
+  s.device.waitIdle();
+  // The reply panel is made once and reopened on each later reply (making one loads the fonts, about 2 s)
+  let pv = path.view();
+  if showing {
+    match &mut s.panel { case var &mut Some(p) { p.open(&mut s.device, &mut s.renderer, pv); } else {} }
+  }
+  else {
+    var have = false;
+    match &s.other { case let Some(o) { have = true; } else {} }
+    if have {
+      match &mut s.other { case var &mut Some(p) { p.open(&mut s.device, &mut s.renderer, pv); } else {} }
+      s.panel <-> s.other;
+    }
+    else {
+      s.panel <-> s.other;
+      s.panel = DocPanel.create(&mut s.device, &mut s.renderer, s.swapchain.format, pv, 0.);
+    }
+  }
+  var note = String();
+  if summary.len() > 0usize { note.append(summary.view()); } else { note.append("Reply "); note.append(numText(i64.from(n)).view()); }
+  note.append("   [B: back to the document]");
+  let noteView = note.view();
+  match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); p.tick(&mut s.device, &mut s.renderer); } else {} }
+  match &mut s.other { case var &mut Some(p) { p.setNote(""); } else {} }
+  var took = 0i64;
+  match &mut s.bridge {
+    case var &mut Some(b) { b.showingReply = true; b.shown = n; took = unixMs() - b.sentMs; }
+    else {}
+  }
+  repliesShown = repliesShown + 1;
+  print <- "bridge: reply "; print <- n; print <- " on screen at "; print <- unixMs(); print <- " ms, "; print <- took; print <- " ms after the turn was sent\n";
+}
+
+// B: back to the document being read (and again to the reply)
+fn toggleBack(s: &mut Shell) {
+  var have = false;
+  match &s.other { case let Some(o) { have = true; } else {} }
+  if !have { return; }
+  var showing = false;
+  match &s.bridge { case let Some(b) { showing = b.showingReply; } else {} }
+  s.panel <-> s.other;
+  match &mut s.bridge { case var &mut Some(b) { b.showingReply = !showing; } else {} }
+  print <- "bridge: showing the "; print <- (if showing { "document" } else { "reply" }); print <- "\n";
+}
+
+fn bridgeTick(s: &mut Shell) {
+  var n = 0u32;
+  var pending = false;
+  match &mut s.bridge {
+    case var &mut Some(b) { n = b.poll(); pending = b.pending(); }
+    else { return; }
+  }
+  if backAfterShot && shotAt > 0 && drawn == shotAt + 15 { backAfterShot = false; toggleBack(s); shotAt = drawn + 25; }
+  if n > 0u32 { showReply(s, n); autoNext = drawn + autoGap; return; }
+  if autoSent < autoTurns && !pending && drawn >= autoNext {
+    autoSent = autoSent + 1;
+    var folder = String();
+    match &s.bridge { case let Some(b) { folder = String.from(b.dir.view()); } else {} }
+    var text = String.from("Automated test turn ");
+    text.append(numText(i64.from(autoSent)).view());
+    text.append(": please reply.");
+    writeAtomic(folder.view(), "draft.txt", text.view());
+    sendTurn(s);
+  }
+}
+
 fn drawScene(s: &mut Shell, alpha: f32) {
   if !s.target.ok() { return; }
+  match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
+  match &mut s.other { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
+  bridgeTick(s);
+  if shotReply > 0 && repliesShown == shotReply && shotAt == 0 { shotAt = drawn + 30; }
+  if pressRetCount > 0 && repliesShown == pressRetCount && pressRetAt == 0 { pressRetAt = drawn + 20; }
+  if shotReload > 0 {
+    match &s.panel { case let Some(p) { if i32.from(p.reloads) == shotReload && shotAt == 0 { shotAt = drawn + shotDelay; } } else {} }
+  }
+  if shotError {
+    match &s.panel { case let Some(p) { if p.err.len() > 0usize && shotAt == 0 { shotAt = drawn + shotDelay; } } else {} }
+  }
+  if pressCReload > 0 {
+    match &s.panel { case let Some(p) { if i32.from(p.reloads) == pressCReload && pressCAt == 0 { pressCAt = drawn + 40; } } else {} }
+  }
+  if s.wh.on {
+    s.renderer.keepDepth = true;      // the labels hide behind what stands in front of them
+    s.wh.update(&mut s.device, &mut s.renderer);
+    let nav = s.wh.takeNav();
+    if nav != 0u32 { browseAct(s, nav); }
+    whBrowse(s);
+    var e = 0;
+    while e < whEvs {
+      if drawn == whFrame[usize.from(e)] {
+        if whKind[usize.from(e)] == 1 { s.wh.select(whArg[usize.from(e)]); }
+        else if whKind[usize.from(e)] == 3 { s.wh.openCard(whArg[usize.from(e)]); }
+        else if whKind[usize.from(e)] == 4 {
+          match &mut s.panel { case var &mut Some(p) { p.requestNth(usize.from(whArg[usize.from(e)])); } else {} }
+        }
+        else if whKind[usize.from(e)] == 5 { browseAct(s, u32.from(whArg[usize.from(e)])); }
+        else if whKind[usize.from(e)] == 6 { s.wh.browserLink(usize.from(whArg[usize.from(e)])); }
+        else { whAct(s, u32.from(whArg[usize.from(e)])); }
+      }
+      e = e + 1;
+    }
+  }
   // The visitor's view, as late as it can be
   let pose = s.visitor.pose();
   s.camera.origin = pose.origin;
@@ -543,11 +876,33 @@ fn drawScene(s: &mut Shell, alpha: f32) {
         Vec3(1., 1., 1.));
       tint = v.tint;
     }
-    s.list.addTinted(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place, Color(tint, tint, tint, 1.));
+    var glowR = tint; var glowG = tint; var glowB = tint;
+    if s.wh.on {
+      match s.wh.placeOf(&s.scene.parts, k) {
+        case let Some(m) { (&mut s.scene.parts[k]).place = m; }
+        case is None {}
+      }
+      if s.wh.isSelectedPart(&s.scene.parts, k) { glowR = tint * 1.45; glowG = tint * 1.2; glowB = tint * 0.8; }
+    }
+    s.list.addTinted(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place, Color(glowR, glowG, glowB, 1.));
     k = k + 1usize;
   }
   var encoder = s.device.createCommandEncoder();
   s.fx.render(&mut s.device, &mut encoder, &mut s.renderer, &mut s.post, &s.camera, &s.light, &s.list, &s.target.texture);
+  // The document page goes on top of the finished picture, unlit (docpanel.cone, PagePass)
+  let aspect = f32.from(s.target.texture.width) / f32.from(s.target.texture.height);
+  if s.wh.on {
+    s.wh.draw(&mut s.device, &mut encoder, &s.target.texture, &s.fx.depth,
+      s.camera.projectionMatrix(aspect) * s.camera.viewMatrix(), s.camera.origin, &mut s.panel);
+  }
+  else {
+    match &mut s.panel {
+      case var &mut Some(p) {
+        p.drawPage(&mut s.device, &mut encoder, &s.target.texture, s.camera.projectionMatrix(aspect) * s.camera.viewMatrix());
+      }
+      else {}
+    }
+  }
   drawn = drawn + 1;
 
   // What was drawn at the middle of the window on the shot frame: copied
@@ -578,6 +933,31 @@ pub fn present(host: &mut Host) {
           clickOn(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh, host.stats.frames);
         }
         c = c + 1;
+      }
+      // '--wheel' and '--press-c': events a person's hand would make, put into SDL's own queue
+      if wheelAt != 0 && drawn == wheelAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_MOUSE_WHEEL;
+        let w = &mut ev as &mut sdl.MouseWheelEvent;
+        w.y = f32.from(wheelY);
+        w.integer_y = i32.from(wheelY);
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the wheel event\n"; }
+      }
+      if pressRetAt != 0 && drawn == pressRetAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_KEY_DOWN;
+        let k = &mut ev as &mut sdl.KeyboardEvent;
+        k.scancode = KEY_RETURN;
+        k.down = true;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
+      }
+      if pressCAt != 0 && drawn == pressCAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_KEY_DOWN;
+        let k = &mut ev as &mut sdl.KeyboardEvent;
+        k.scancode = sdl.SCANCODE_C;
+        k.down = true;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
       }
       // The next frame's input starts here: its events come next
       (*some).input.beginFrame();
@@ -717,6 +1097,9 @@ fn argNumber(argv: **u8, a: i32) f64 {
 }
 
 fn main(argc: i32, argv: **u8) i32 {
+  if argc > 1i32 && libc.strcmp(cstr.fromPtr(*(argv + 1usize)), "--check-pick") == 0i32 {
+    return if checkPick() { 0i32 } else { 1i32 };
+  }
   initAll();
   programPath = *argv;
   var a = 1i32;
@@ -734,6 +1117,34 @@ fn main(argc: i32, argv: **u8) i32 {
       clickYs[usize.from(clicks)] = f32.from(argNumber(argv, a + 2i32));
       clickFrames[usize.from(clicks)] = i32.from(argNumber(argv, a + 3i32));
       clicks = clicks + 1;
+    }
+    if libc.strcmp(arg, "--doc") == 0i32 && more { docArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--bridge") == 0i32 && more { bridgeArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--auto-turns") == 0i32 && more { autoTurns = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--auto-gap") == 0i32 && more { autoGap = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--shot-after-reply") == 0i32 && more { shotReply = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
+    if libc.strcmp(arg, "--back-after-shot") == 0i32 { backAfterShot = true; }
+    if libc.strcmp(arg, "--press-return") == 0i32 && more { pressRetAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--press-return-after-reply") == 0i32 && more { pressRetCount = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--shot-after-reload") == 0i32 && more { shotReload = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
+    if libc.strcmp(arg, "--stem") == 0i32 && more { stemPower = f32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--page-bias") == 0i32 && more { pageBias = f32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--shot-delay") == 0i32 && more { shotDelay = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--wheel") == 0i32 && a + 2i32 < argc {
+      wheelY = argNumber(argv, a + 1i32);
+      wheelAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--shot-on-error") == 0i32 { shotError = true; shotAt = 0; }
+    if libc.strcmp(arg, "--press-c-after-reload") == 0i32 && more { pressCReload = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--press-c") == 0i32 && more { pressCAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--doc-scroll") == 0i32 && more { docScroll = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--yaw") == 0i32 && more { startYaw = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--at") == 0i32 && a + 2i32 < argc { atSet = true; atX = argNumber(argv, a + 1i32); atZ = argNumber(argv, a + 2i32); }
+    if libc.strcmp(arg, "--wh-ev") == 0i32 && a + 3i32 < argc && whEvs < 12 {
+      whKind[usize.from(whEvs)] = i32.from(argNumber(argv, a + 1i32));
+      whArg[usize.from(whEvs)] = i32.from(argNumber(argv, a + 2i32));
+      whFrame[usize.from(whEvs)] = i32.from(argNumber(argv, a + 3i32));
+      whEvs = whEvs + 1;
     }
     if libc.strcmp(arg, "--tilt") == 0i32 && more { tilt = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--approach") == 0i32 && more { approach = argNumber(argv, a + 1i32); }
