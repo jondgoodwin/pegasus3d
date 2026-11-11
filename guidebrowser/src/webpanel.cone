@@ -127,6 +127,69 @@ fn avg4(a: u32, b: u32, c: u32, d: u32) u32 {
   (((a & m) >> 2u32) + ((b & m) >> 2u32) + ((c & m) >> 2u32) + ((d & m) >> 2u32) + 0x03030303u32) | 0xFF000000u32
 }
 
+// Scrolling a web page (Jon, 11 Nov: the picture moves on the very next frame). The wheel goes to the page, but CEF's paint of the scrolled
+// page comes a frame or three later, so the panel shows the picture it has moved by the step it expects (WEB_NOTCH_PX a notch) at once,
+// and takes the real paint when it arrives (a whole paint at once while scrolling, not a band a frame). The step is measured from the paints
+// (measureShift), so a page that moves otherwise, or not at all, corrects the guess.
+const WEB_NOTCH_PX = 100.f;      // the first guess at how far a wheel notch moves the page
+const WEB_SHIFT_MAX = 360.f;     // the most the shown picture is moved ahead of the paints
+const WEB_SCROLL_MS = 400u64;    // after a wheel event the panel takes every paint whole
+const WEB_GIVE_UP_MS = 250u64;   // a guess nothing has borne out by now is dropped
+const SHIFT_COLS = 8usize;     // columns of the picture compared
+var @threadlocal webOld = false;        // '--web-old': the old way (no moving ahead of the paints, 30 a second, a band of rows a frame), to compare with
+
+// How many rows the page moved down between 'old' (level 0 of the chain, rows from the bottom) and 'fresh' (a whole paint, RGBA, rows from
+// the bottom): searched from 'lo' to 'hi', 0 if the picture did not change or no shift matches. The green of SHIFT_COLS columns, every third row.
+fn measureShift(old: &Texels, fresh: &List[u8], lo: i32, hi: i32) i32 {
+  let ov = old.view();
+  let fv = fresh.view();
+  let w = usize.from(WEB_TEX_W);
+  let h = i32.from(WEB_TEX_H);
+  var bestD = 0i32;
+  var bestS = 4000000000u64;
+  var s0 = 0u64;
+  var d = 0i32;
+  var first = true;
+  var again = true;
+  // 0 first, then the rest of the range
+  var dd = lo;
+  while again {
+    d = if first { 0i32 } else { dd };
+    if !first && d == 0i32 { d = 0i32; }
+    var r = if d < 0i32 { 0i32 - d } else { 0i32 };
+    let r1 = if d > 0i32 { h - d } else { h };
+    var sad = 0u64;
+    var n = 0u64;
+    while r < r1 {
+      var c = 0usize;
+      while c < SHIFT_COLS {
+        let x = (c * 2usize + 1usize) * w / (SHIFT_COLS * 2usize);
+        let a = (ov[usize.from(u32.from(r + d)) * w + x] >> 8u32) & 255u32;
+        let b = u32.from(fv[(usize.from(u32.from(r)) * w + x) * 4usize + 1usize]);
+        sad = sad + u64.from(if a > b { a - b } else { b - a });
+        n = n + 1u64;
+        c = c + 1usize;
+      }
+      r = r + 7i32;
+    }
+    if n > 30u64 {
+      let score = sad * 1024u64 / n;
+      if first { s0 = score; bestS = score; }
+      else if score < bestS { bestS = score; bestD = d; }
+    }
+    if first {
+      first = false;
+      if s0 < 48u64 { again = false; }          // the same picture
+    }
+    else {
+      dd = dd + 1i32;
+      if dd > hi { again = false; }
+    }
+  }
+  // a shift is believed only if it explains the change much better than none
+  if bestD != 0i32 && bestS * 10u64 < s0 * 6u64 { bestD } else { 0i32 }
+}
+
 fn maxu(a: u32, b: u32) u32 { if a > b { a } else { b } }
 fn minu(a: u32, b: u32) u32 { if a < b { a } else { b } }
 
@@ -197,6 +260,15 @@ pub struct WebPanel {
   mipX0: u32 = 0u32; mipY0: u32 = 0u32; mipX1: u32 = 0u32; mipY1: u32 = 0u32;
   lastPaint: u64 = 0u64;         // when the last paint came (counter ticks)
   firstMip: u64 = 0u64;          // when the levels first went stale (counter ticks)
+  // scrolling: the picture is shown moved by 'pend' rows (down: positive) ahead of the paints (see measureShift)
+  pend: f32 = 0.;                // rows the wheel has moved the page that no paint has shown yet
+  pendN: f32 = 0.;               // the wheel notches behind them
+  notchPx: f32 = 100.;           // rows a notch moves this page (learnt from the paints)
+  lastWheelAt: u64 = 0u64;       // when the wheel last turned (ms)
+  wantTotal: f32 = 0.;           // for the trace: all the rows the wheel has asked for, and all the paints have shown
+  texTotal: f32 = 0.;
+  traceT: f32 = -1.;
+  traceS: f32 = -1.;
 
   // None if CEF would not start or the browser could not be made
   pub fn create(device: &mut Device, outFormat: u32, url: &str) Option[WebPanel] {
@@ -225,6 +297,7 @@ pub struct WebPanel {
   // As a page in the room: hidden where the scene's depth is nearer
   pub fn drawLocal(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4) {
     if !textured { return; }
+    self.applyShift();
     page.drawDepthed(device, encoder, target, depth, vp, WebPanel.localRect());
   }
 
@@ -263,10 +336,38 @@ pub struct WebPanel {
     let t0 = sdl.GetPerformanceCounter();
     let freq = sdl.GetPerformanceFrequency();
     var worked = false;
+    let nowM = nowMs();
+    let scrolling = nowM < lastWheelAt + WEB_SCROLL_MS;
+    // a guess about the page's scroll that no paint has borne out is dropped
+    if pend != 0. && nowM > lastWheelAt + WEB_GIVE_UP_MS { pend = 0.; pendN = 0.; wantTotal = texTotal; }
     if t0 >= nextAt {
       var rx = 0i32; var ry = 0i32; var rw = 0i32; var rh = 0i32;
       let n = webFrameRect(view, &buf[0] as *u8, i32.from(buf.len()), &mut rx, &mut ry, &mut rw, &mut rh, &mut w, &mut h);
       if n > 0i32 && u32.from(w) == WEB_TEX_W && u32.from(h) == WEB_TEX_H {
+        // a whole paint while the wheel is turning: how far did the page move since the picture we hold? (before it is overwritten)
+        if textured && scrolling && rw == w && rh == h {
+          let pi = i32.from(pend);
+          var lo = (if pi < 0i32 { pi } else { 0i32 }) - 30i32;
+          var hi = (if pi > 0i32 { pi } else { 0i32 }) + 30i32;
+          if lo < 0i32 - 400i32 { lo = 0i32 - 400i32; }
+          if hi > 400i32 { hi = 400i32; }
+          let ms0 = sdl.GetPerformanceCounter();
+          let sd = measureShift(&chain, &buf, lo, hi);
+          if sd != 0i32 {
+            texTotal = texTotal + f32.from(sd);
+            if nowM > lastWheelAt + 100u64 {
+              // everything asked for has arrived: this is what the notches came to
+              if pendN > 0.5 || pendN < -0.5 {
+                var k = f32.from(sd) / pendN;
+                if k < 0. { k = 0. - k; }
+                if k > 20. && k < 300. { notchPx = k; }
+              }
+              pend = 0.; pendN = 0.;
+            }
+            else { pend = pend - f32.from(sd); pendN = pendN - f32.from(sd) / notchPx; }
+          }
+          else if nowM > lastWheelAt + 120u64 { pend = 0.; pendN = 0.; wantTotal = texTotal; }
+        }
         // the rectangle into level 0 of the CPU copy (a memcpy of its rows); the texture gets it band by band over the next frames
         var j = 0i32;
         while j < rh {
@@ -289,19 +390,19 @@ pub struct WebPanel {
         }
         lastPaint = t0;
         uploaded = uploaded + 1u32;
-        nextAt = t0 + freq / 30u64;
+        nextAt = if scrolling && !webOld { t0 } else { t0 + freq / 30u64 };
       }
     }
-    // one band of rows a frame to level 0 (about 0.2 MB), whatever the size of the paint
+    // one band of rows a frame to level 0 (about 0.2 MB), whatever the size of the paint; the whole paint at once while the page is moving
     if textured && pendY0 < pendY1 {
       var rows = pendY1 - pendY0;
-      if rows > WEB_BAND_ROWS { rows = WEB_BAND_ROWS; }
+      if rows > WEB_BAND_ROWS && (webOld || (!scrolling && pend == 0.)) { rows = WEB_BAND_ROWS; }
       page.refreshRows(device, &chain[usize.from(pendY0 * WEB_TEX_W)] as *u8, WEB_TEX_W, pendY0, rows);
       pendY0 = pendY0 + rows;
       worked = true;
     }
     // the levels below: redone and written whole once the rows are all in and the page has been quiet 125 ms (or busy for 700 ms)
-    else if textured && mipDirty && ((t0 > lastPaint + freq / 8u64) || (t0 > firstMip + freq * 7u64 / 10u64)) {
+    else if textured && mipDirty && !scrolling && ((t0 > lastPaint + freq / 8u64) || (t0 > firstMip + freq * 7u64 / 10u64)) {
       mipRect(&mut chain, WEB_TEX_W, WEB_TEX_H, levels, mipX0, mipY0, mipX1 - mipX0, mipY1 - mipY0);
       page.refreshChain(device, &chain);
       mipDirty = false;
@@ -334,6 +435,7 @@ pub struct WebPanel {
   }
 
   pub fn drawPage(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4) {
+    self.applyShift();
     page.draw(device, encoder, target, viewProjection, WebPanel.rect());
   }
 
@@ -363,6 +465,28 @@ pub struct WebPanel {
   }
   pub fn wheel(self: &mut, px: i32, py: i32, notches: f32) {
     webWheel(view, px, py, 0i32, i32.from(notches * 120.));
+    lastWheelAt = nowMs();
+    pend = pend + notches * notchPx;
+    pendN = pendN + notches;
+    wantTotal = wantTotal + notches * notchPx;
+  }
+
+  // The picture moved ahead of the paints, as a fraction of its height (for the page pass), set for each draw; with the trace, a line when it changes
+  fn applyShift(self: &mut) {
+    var d = if webOld { 0. } else { pend };
+    if d > WEB_SHIFT_MAX { d = WEB_SHIFT_MAX; }
+    if d < 0. - WEB_SHIFT_MAX { d = 0. - WEB_SHIFT_MAX; }
+    page.vOff = d / f32.from(WEB_TEX_H);
+    page.vScale = 0.;
+    if scrollTrace {
+      let sh = texTotal + d;
+      if wantTotal != traceT || sh != traceS {
+        traceT = wantTotal;
+        traceS = sh;
+        print <- "strace: frame "; print <- traceFrame; print <- " web target "; print <- wantTotal; print <- " shown "; print <- sh;
+        print <- " (paints "; print <- texTotal; print <- ", ahead "; print <- d; print <- ")\n";
+      }
+    }
   }
   pub fn setFocus(self: &mut, on: bool) {
     if on != focus {

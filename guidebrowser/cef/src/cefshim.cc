@@ -42,6 +42,7 @@ class App : public CefApp, public CefBrowserProcessHandler {
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
   void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> cl) override {
     cl->AppendSwitch("mute-audio");
+    cl->AppendSwitch("disable-smooth-scrolling");   // a wheel notch moves the page at once, by a known step: the panel shows that step before the paint (webpanel.cone)
     cl->AppendSwitch("disable-background-networking");
     cl->AppendSwitch("no-first-run");
     cl->AppendSwitch("disable-extensions");
@@ -159,7 +160,7 @@ API int web_open(const char* url, int w, int h) {
   CefWindowInfo wi;
   wi.SetAsWindowless(nullptr);
   CefBrowserSettings bs;
-  bs.windowless_frame_rate = 30;
+  bs.windowless_frame_rate = 60;
   v->browser = CefBrowserHost::CreateBrowserSync(wi, v->client, url, bs, nullptr, nullptr);
   if (!v->browser) { delete v; return -1; }
   v->browser->GetHost()->SetFocus(true);

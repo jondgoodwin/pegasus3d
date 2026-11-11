@@ -8,7 +8,8 @@
 struct PageParams {
     float4x4 transform;            // world to clip space (the camera's projection times its view)
     float4 rect;                   // the page in the world (z = 0): x0, y0 (bottom), x1, y1 (top)
-    float4 extra;                  // x: the mip level bias (negative: sharper)
+    float4 extra;                  // x: the mip level bias (negative: sharper); y: opacity; z, w: the part of the texture shown, vertically
+                                   // (uv.y = c.y * (1 + w) + z; 0, 0 shows all of it: a page scrolled on the GPU shows a window of a taller texture)
 };
 
 [[vk::binding(0, 0)]] ConstantBuffer<PageParams> page;
@@ -32,7 +33,7 @@ VertexOutput vertexMain(uint vid : SV_VulkanVertexID) {
     VertexOutput output;
     float3 p = float3(lerp(page.rect.x, page.rect.z, c.x), lerp(page.rect.y, page.rect.w, c.y), 0.0);
     output.position = mul(page.transform, float4(p, 1.0));
-    output.uv = c;
+    output.uv = float2(c.x, c.y * (1.0 + page.extra.w) + page.extra.z);
     return output;
 }
 
