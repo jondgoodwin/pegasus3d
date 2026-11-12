@@ -402,6 +402,7 @@ pub struct Incubator {
   rackItems: List[RackCard];                 // one per mf.items
   rackSecs: List[Label];                     // one per distinct section, in order
   rackSecNames: List[String];
+  rackOpenName: String;                      // the rack's one open section (by name; empty: all folded)
   wsBase: List[String];                      // 3-D items already out when the workspace opened (or dropped): they do not join by themselves
   zoneSeen: bool = false;
   benchN: u32 = 0u32;                 // pages opened from a board's tree so far (where the next stands on the workbench)
@@ -423,6 +424,9 @@ pub struct Incubator {
   wsSerial: u32 = 0u32;
   mfPoll: u64 = 0u64;
   wsBaseReady: bool = false;
+  rackHovSec: i32 = -1;                      // the header the gaze rests on, since rackHovAt
+  rackHovAt: u64 = 0u64;
+  rackGazeOpen: Vec3 = Vec3(0., 0., 0.);     // where the gaze was when a section last opened by pointing
   cmdPoll: u64 = 0u64;
 
   pub fn empty() Incubator {
@@ -437,7 +441,7 @@ pub struct Incubator {
       false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, Palette.empty(), -1, false, List[Zone](), None, String(), String(), String(), String(),
       List[Mark](), 0u32, false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., false,
       List[WsCfg](), String(), List[String](), List[WsItemCfg](), String(), String(),
-      Manifest(String(), List[MfItem]()), String(), List[RackCard](), List[Label](), List[String](), List[String]())
+      Manifest(String(), List[MfItem]()), String(), List[RackCard](), List[Label](), List[String](), String(), List[String]())
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Incubator {
@@ -2808,8 +2812,47 @@ pub struct Incubator {
     if !pgs[i].proj { self.syncRoom(); }
   }
 
+  // A page of the open manifest workspace (it has a rack to go back to)
+  fn isMfMember(self: &, i: usize) bool {
+    if i >= pgs.len() || !pgs[i].ws || pgs[i].gone || wsOpen.len() == 0usize { return false; }
+    let wi = self.wsIndex(wsOpen.view());
+    wi >= 0 && wsList[usize.from(u32.from(wi))].manifest.len() > 0usize
+  }
+
+  // Close a page; a member of a manifest workspace goes back to the rack instead (remembered there, still listed; only Drop removes it)
+  fn closeOrBack(self: &mut, i: usize) {
+    if !self.isMfMember(i) { self.closePage(i); return; }
+    let id = wsOpen.clone();
+    let key = Incubator.srcKey(pgs[i].src.view());
+    var pt = String.from("at:");
+    pt.append(floatText(pgs[i].toPos.x).view()); pt.append(","); pt.append(floatText(pgs[i].toPos.y).view()); pt.append(","); pt.append(floatText(pgs[i].toPos.z).view());
+    self.memPut(id.view(), key.view(), "out", pt.view(), Incubator.degText(pgs[i].toYaw), i64.from(i32.from(pgs[i].toSc * 100. + 0.5)));
+    self.memPut(id.view(), key.view(), "rack", "", 0i64, 100i64);
+    print <- "ws: "; printStr(pgs[i].title.text.view()); print <- " back to the rack\n";
+    if focusPg == i32.from(i) { focusPg = -1; }
+    self.closePage(i);
+  }
+
+  // The work area holds at most 5 member pages: a sixth sends the one left untouched longest back to the rack
+  fn wsCapTick(self: &mut, now: u64) {
+    if wsOpen.len() == 0usize || wsPending.len() > 0usize || !applied { return; }
+    var n = 0usize;
+    var old = pgs.len();
+    var k = 0usize;
+    while k < pgs.len() {
+      if self.isMfMember(k) {
+        if pgs[k].used == 0u64 || i32.from(k) == focusPg || i32.from(k) == grabIx { (&mut pgs[k]).used = now; }
+        n = n + 1usize;
+        if old == pgs.len() || pgs[k].used < pgs[old].used || (pgs[k].used == pgs[old].used && pgs[k].born < pgs[old].born) { old = k; }
+      }
+      k = k + 1usize;
+    }
+    if n > 5usize && old < pgs.len() { self.closeOrBack(old); }
+  }
+
   // Shelve a standing page; bring a shelved one back as the newest
   fn toggleShelve(self: &mut, device: &mut Device, i: usize) {
+    if i < pgs.len() && self.isMfMember(i) { self.closeOrBack(i); return; }
     self.shelvePage(device, i);
   }
 
@@ -2984,7 +3027,7 @@ pub struct Incubator {
   // The test hooks: close (0), shelve or bring (1), grab (2) page n; drop (3); park the browser's folder (4)
   pub fn actPage(self: &mut, device: &mut Device, kind: i32, n: i32) {
     let i = if n >= 0 { usize.from(u32.from(n)) } else { 0usize };
-    if kind == 0i32 { self.closePage(i); }
+    if kind == 0i32 { self.closeOrBack(i); }
     else if kind == 1i32 { self.toggleShelve(device, i); }
     else if kind == 2i32 { self.startGrab(i); }
     else if kind == 3i32 { self.dropGrab(); }
@@ -3175,7 +3218,7 @@ pub struct Incubator {
     deskFocus = false;
     if focusPg != bi { focusPg = bi; palFocused = false; print <- "palette: focus on page "; printStr(pgs[pu].title.text.view()); print <- "\n"; }
     if bk == 2u32 && pgs[pu].zone >= 0 { self.focusPane(pu); return true; }
-    if bk == 2u32 { self.closePage(pu); return true; }
+    if bk == 2u32 { self.closeOrBack(pu); return true; }
     if bk == 3u32 { self.toggleShelve(device, pu); return true; }
     if bk == 4u32 { self.startGrab(pu); return true; }
     if bk == 5u32 || bk == 6u32 {
@@ -4872,9 +4915,14 @@ pub struct Incubator {
       else if startsWithText(a.view(), "ws-new") { _ = self.wsNewNow(device, if a.len() > 7usize { a.slice(7usize, a.len()) } else { "" }); }
       else { print <- "workspaces: unknown action\n"; }
     }
+    if wsOpen.len() > 0usize {
+      self.wsCapTick(now);
+      if rackSecs.len() > 0usize { self.rackHover(gazeEye, gazeDir, false, now); }
+    }
     if wsOpen.len() > 0usize && now >= mfPoll + 500u64 {
       mfPoll = now;
       self.mfLoad(device, false);
+      self.rackRefresh();
       self.wsJoinScan(now);
     }
     if wsPending.len() > 0usize && now >= wsPendAt {
@@ -5003,6 +5051,7 @@ pub struct Incubator {
     rackItems = List[RackCard]();
     rackSecs = List[Label]();
     rackSecNames = List[String]();
+    rackOpenName = String();
   }
 
   fn rackText(name: &str, line: &str) String {
@@ -5055,6 +5104,7 @@ pub struct Incubator {
           rackItems.push(RackCard(si, lb, ans));
           i = i + 1usize;
         }
+        self.rackRefresh();
         print <- "workspaces: manifest "; printStr(path.view()); print <- ": "; print <- mf.items.len(); print <- " items, "; print <- rackSecNames.len(); print <- " sections\n";
       }
       case is Err {}
@@ -5181,24 +5231,41 @@ pub struct Incubator {
 
   // ---- the rack: cells on an arc of 3 m round the seat, to the right of the work area ----
 
-  fn rackRows(counts: &List[usize], cols: usize) usize {
+  // Cells of the sections' headers: a folded header takes one cell (they pack along a row); an open section starts a row and holds its
+  // cards after the header, and the next section starts a row. Returns the rows.
+  fn rackPlace(counts: &List[usize], open: &List[bool], cols: usize, cells: &mut List[i32]) usize {
     var cur = 0usize;
     var s = 0usize;
     while s < counts.len() {
       if *counts[s] > 0usize {
-        cur = ((cur + cols - 1usize) / cols) * cols;
-        cur = cur + 1usize + *counts[s];
-      }
+        if *open[s] {
+          cur = ((cur + cols - 1usize) / cols) * cols;
+          cells.push(i32.from(cur));
+          cur = cur + 1usize + *counts[s];
+          cur = ((cur + cols - 1usize) / cols) * cols;
+        } else { cells.push(i32.from(cur)); cur = cur + 1usize; }
+      } else { cells.push(-1i32); }
       s = s + 1usize;
     }
     (cur + cols - 1usize) / cols
   }
 
-  fn rackLayout(self: &) RackLay {
+  // A section of nothing but child workstreams, 6 or fewer, is always open
+  fn rackAuto(self: &, s: usize, count: usize) bool {
+    if count == 0usize || count > 6usize { return false; }
+    var i = 0usize;
+    while i < rackItems.len() {
+      if rackItems[i].sec == s && mf.items[i].child.len() == 0usize { return false; }
+      i = i + 1usize;
+    }
+    true
+  }
+
+  // How many cards each section has on the rack now
+  fn rackCounts(self: &, shown: &mut List[bool]) List[usize] {
     var counts = List[usize]();
     var s = 0usize;
     while s < rackSecNames.len() { counts.push(0usize); s = s + 1usize; }
-    var shown = List[bool]();
     var i = 0usize;
     while i < rackItems.len() {
       let vis = mf.items[i].child.len() > 0usize || !self.mfIsOutKey(mf.items[i].path.view());
@@ -5206,32 +5273,116 @@ pub struct Incubator {
       if vis { counts.set(rackItems[i].sec, *counts[rackItems[i].sec] + 1usize); }
       i = i + 1usize;
     }
+    counts
+  }
+
+  fn rackLayout(self: &) RackLay {
+    var shown = List[bool]();
+    let counts = self.rackCounts(&mut shown);
+    var open = List[bool]();
+    var s = 0usize;
+    while s < rackSecNames.len() {
+      open.push((rackOpenName.len() > 0usize && rackSecNames[s].view() == rackOpenName.view()) || self.rackAuto(s, *counts[s]));
+      s = s + 1usize;
+    }
     var cols = 3usize;
     var sc: f32 = 1.;
-    var rows = Incubator.rackRows(&counts, cols);
+    var cells = List[i32]();
+    var rows = Incubator.rackPlace(&counts, &open, cols, &mut cells);
     while f32.from(u32.from(rows)) * 0.375 * sc > 2.4 && (cols < 8usize || sc > 0.55) {
       if cols < 8usize { cols = cols + 1usize; } else { sc = sc * 0.92; }
-      rows = Incubator.rackRows(&counts, cols);
+      cells = List[i32]();
+      rows = Incubator.rackPlace(&counts, &open, cols, &mut cells);
     }
-    var lay = RackLay(List[i32](), List[i32](), cols, rows, sc);
-    i = 0usize;
+    var lay = RackLay(List[i32](), cells, cols, rows, sc);
+    var i = 0usize;
     while i < rackItems.len() { lay.items.push(-1i32); i = i + 1usize; }
-    var cur = 0usize;
     s = 0usize;
     while s < rackSecNames.len() {
-      if *counts[s] > 0usize {
-        cur = ((cur + cols - 1usize) / cols) * cols;
-        lay.secs.push(i32.from(cur));
-        cur = cur + 1usize;
+      if *counts[s] > 0usize && *open[s] {
+        var cur = usize.from(u32.from(*lay.secs[s])) + 1usize;
         i = 0usize;
         while i < rackItems.len() {
           if rackItems[i].sec == s && *shown[i] { lay.items.set(i, i32.from(cur)); cur = cur + 1usize; }
           i = i + 1usize;
         }
-      } else { lay.secs.push(-1i32); }
+      }
       s = s + 1usize;
     }
     lay
+  }
+
+  // Header texts carry the count of cards on the rack (a changed one is made again)
+  fn rackRefresh(self: &mut) {
+    var shown = List[bool]();
+    let counts = self.rackCounts(&mut shown);
+    var s = 0usize;
+    while s < rackSecs.len() {
+      var t = if rackSecNames[s].len() > 0usize { rackSecNames[s].clone() } else { String.from("(no section)") };
+      t.append("  ("); t.append(numText(i64.from(*counts[s])).view()); t.append(")");
+      if rackSecs[s].text.view() != t.view() { (&mut rackSecs[s]).text = t; (&mut rackSecs[s]).ok = false; }
+      s = s + 1usize;
+    }
+  }
+
+  fn rackSecHit(self: &, eye: Vec3, dir: Vec3, ix: &mut usize) f32 {
+    var best: f32 = -1.;
+    if rackSecs.len() == 0usize { return best; }
+    let lay = self.rackLayout();
+    var i = 0usize;
+    while i < rackSecs.len() {
+      let c = *lay.secs[i];
+      if c >= 0i32 {
+        let cu = usize.from(u32.from(c));
+        let t = quadHit(Incubator.rackCellModel(cu % lay.cols, lay.cols, lay.sc), Incubator.rackRect(cu / lay.cols, lay.rows, lay.sc), eye, dir);
+        if t > 0. && (best < 0. || t < best) { best = t; *ix = i; }
+      }
+      i = i + 1usize;
+    }
+    best
+  }
+
+  fn rackToggle(self: &mut, s: usize) {
+    if s >= rackSecNames.len() { return; }
+    if rackOpenName.len() > 0usize && rackOpenName.view() == rackSecNames[s].view() { rackOpenName = String(); }
+    else { rackOpenName = rackSecNames[s].clone(); }
+    print <- "rack: open section "; printStr(rackOpenName.view()); print <- "\n";
+  }
+
+  // Pointing at a header (rested on 300 ms, and moved since the last opening, so a header sliding under a still gaze does not open) opens it
+  fn rackHover(self: &mut, eye: Vec3, dir: Vec3, instant: bool, now: u64) {
+    var ix = 0usize;
+    let t = self.rackSecHit(eye, dir, &mut ix);
+    if t < 0. { rackHovSec = -1; return; }
+    let s = i32.from(u32.from(ix));
+    if s != rackHovSec { rackHovSec = s; rackHovAt = now; }
+    if rackOpenName.len() > 0usize && rackSecNames[ix].view() == rackOpenName.view() { return; }
+    if !instant && (now < rackHovAt + 300u64 || (dir - rackGazeOpen).length() < 0.02) { return; }
+    rackOpenName = rackSecNames[ix].clone();
+    rackGazeOpen = dir;
+    print <- "rack: open section "; printStr(rackOpenName.view()); print <- "\n";
+  }
+
+  pub fn testRackHover(self: &mut, part: &str) {
+    var i = 0usize;
+    while i < rackSecNames.len() {
+      var at = 0usize;
+      let nm = rackSecNames[i].view();
+      var hit = false;
+      while at + part.len() <= nm.len() { if nm.slice(at, at + part.len()) == part { hit = true; break; } at = at + 1usize; }
+      if hit {
+        let lay = self.rackLayout();
+        if *lay.secs[i] < 0i32 { print <- "rack: header not shown\n"; return; }
+        let cu = usize.from(u32.from(*lay.secs[i]));
+        let rc = Incubator.rackRect(cu / lay.cols, lay.rows, lay.sc);
+        let w = Incubator.rackCellModel(cu % lay.cols, lay.cols, lay.sc) * Vec3(0., (rc.y + rc.w) * 0.5, 0.);
+        let eye = gazeEye;
+        self.rackHover(eye, (w - eye).normalize(), true, nowMs());
+        return;
+      }
+      i = i + 1usize;
+    }
+    print <- "rack: no header with "; printStr(part); print <- "\n";
   }
 
   // Column 'col' of a rack 'cols' wide: a plane standing 3 m from the seat on the arc, turned to face it; the block begins at 1.35 rad
@@ -5292,7 +5443,10 @@ pub struct Incubator {
 
   fn clickRack(self: &mut, eye: Vec3, dir: Vec3, limit: f32) bool {
     var ix = 0usize;
+    var sx = 0usize;
     let t = self.rackHit(eye, dir, &mut ix);
+    let ts = self.rackSecHit(eye, dir, &mut sx);
+    if ts > 0. && (t < 0. || ts < t) && (limit <= 0. || ts <= limit) { self.rackToggle(sx); return true; }
     if t < 0. || (limit > 0. && t > limit) { return false; }
     self.rackPull(ix);
     true
@@ -5313,7 +5467,18 @@ pub struct Incubator {
     var live = 0usize;
     var k = 0usize;
     while k < pgs.len() { if pgs[k].ws && !pgs[k].gone { live = live + 1usize; } k = k + 1usize; }
-    let pl = if has && mem.place.len() > 0usize { mem.place.clone() } else { Incubator.slotPlace(live + wsPending.len()) };
+    // (a free arc spot: the first none of the standing members occupies, since members go back to the rack from any spot)
+    var rank = 0usize;
+    while rank < 12usize {
+      let sp = Incubator.arcSpot(rank);
+      var taken = false;
+      k = 0usize;
+      while k < pgs.len() { if pgs[k].ws && !pgs[k].gone && (pgs[k].toPos - sp).length() < 0.6 { taken = true; } k = k + 1usize; }
+      if !taken { break; }
+      rank = rank + 1usize;
+    }
+    if rank >= 12usize { rank = live + wsPending.len(); }
+    let pl = if has && mem.place.len() > 0usize { mem.place.clone() } else { Incubator.slotPlace(rank) };
     var src = String.from(if fs.isDir(&Path.from(path.view())) { "tree:" } else { "doc:" });
     src.append(path.view());
     wsPending.push(WsItemCfg(i64.from(i + 1usize), src, pl, 0i64, false, 100i64, false));
@@ -5968,6 +6133,7 @@ pub struct Incubator {
         || (kind == "laptop" && ((e.action.view() == "laptopon" && deskOnNow) || (e.action.view() == "laptopoff" && !deskOnNow)));
       if !hide {
         if dictOn && e.action.view() == "dictate" { out.push(String.from("mic-off|Stop dictating|dictate")); }
+        else if e.action.view() == "shelve" && focusPg >= 0 && self.isMfMember(usize.from(u32.from(focusPg))) { out.push(String.from("archive|Back to the rack|shelve")); }
         else { out.push(set[i].clone()); }
       }
       i = i + 1usize;
@@ -6320,7 +6486,7 @@ pub struct Incubator {
     else if action == "laptopon" || action == "laptopoff" {
       match &mut desk { case var &mut Some(dk) { dk.setControl(action == "laptopon"); r = 1u32; } else { r = 0u32; } }
     }
-    else if action == "close" { if pgOk { let i = usize.from(u32.from(focusPg)); focusPg = -1; self.closePage(i); r = 1u32; } }
+    else if action == "close" { if pgOk { let i = usize.from(u32.from(focusPg)); focusPg = -1; self.closeOrBack(i); r = 1u32; } }
     else if action == "shelve" {
       if pgOk { self.toggleShelve(device, usize.from(u32.from(focusPg))); r = 1u32; }
       else if sel >= 0 && self.act(0u32, v) { r = 1u32; }
