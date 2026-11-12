@@ -1,15 +1,22 @@
 // The model of the walkthrough: blocks, the state of a scenario (replayed from its first step), the animation of the current step,
 // and the 3-D scene it makes. A file of the archwalk module (the imports are the root's).
 
-const NB: usize = 10usize;             // blocks: 0 Display 1 Render 2 Audio 3 Host 4 Presenter 5 Link 6 Authority 7 World 8 Arrival 9 Library
+// Blocks (the scenarios' numbers; names as proposed 12 Nov): 0 GPU and display (a device) 1 Render 2 Audio 3 Input 4 Player 5 Link 6 Sim 7 Script 8 Loader 9 Library
+// (a shared store, not an actor). Devices that no scenario names: 10 headset 11 hands 12 ears and voice 13 disk 14 the internet.
+// The server group (shown in server mode): 15 its Link, 16 its small Loader; Sim and Script slide there.
+const NB: usize = 10usize;
 const SLOTS: usize = 9usize;
 const CELLS: usize = 90usize;
-const R_ARC: f32 = 5.0;
+const R_ARC: f32 = 3.9;                // the actors' arc (stands are 1.4 m wide, 24 degrees apart)
+const R_DEV: f32 = 5.9;                // the device blocks stand behind their owners
+const R_SRV: f32 = 8.0;                // the remote server group: off to the right of the arc, where the room is open
+const SRV_ANGLE: f32 = 1.745;          // (100 degrees)
+const SV_SECS: f32 = 1.2;              // the client/server change takes this long
 const CZ: f32 = 1.2;                   // where you start: 1.2 m behind the table, on the open side
 const ANIM: f32 = 0.7;                 // a flight takes this long
 const STEP_CAP: usize = 64usize;
-const LINE_BASE: f32 = 2.8;            // the first arrow's height; each next 0.3 m higher
-const LINE_STEP: f32 = 0.3;
+const LINE_BASE: f32 = 2.55;           // the first arrow's height; each next 0.2 m higher
+const LINE_STEP: f32 = 0.2;
 const NONE: i32 = -1i32;
 const TIME_SLOW: f32 = 0.5;            // true timing: seconds per millisecond (500 times slower)
 
@@ -131,27 +138,84 @@ struct AwLook {
 }
 
 // ---- The blocks ----
+var @threadlocal awSv: f32 = 0.;        // 0 all on the client, 1 Sim and Script on the server (eased; set once a frame from the app)
+
 fn blockName(b: i32) &str {
-  let n: Array[&str, 10] = ["Display", "Render", "Audio", "Host", "Presenter", "Link", "Authority", "World program", "Arrival", "Library"];
+  let n: Array[&str, 17] = ["GPU and display", "Render", "Audio", "Input", "Player", "Link", "Sim", "Script", "Loader", "Library",
+    "You: headset", "You: hands", "You: ears and voice", "Disk", "The internet", "Link (server)", "Loader (server)"];
   n[usize.from(b)]
 }
 
 fn blockTier(b: i32) usize {
   let t: Array[usize, 10] = [0usize, 0usize, 0usize, 5usize, 1usize, 5usize, 2usize, 3usize, 4usize, 6usize];
+  if b >= 10i32 { return t[usize.from(deviceOwner(b))]; }
   t[usize.from(b)]
 }
 
+// The job, in one line
 fn tierLine(b: i32) &str {
-  let n: Array[&str, 10] = ["The runtime, not a component", "Hard: each display frame", "Hard: audio samples", "Posts input; starts nothing",
-    "Frame: each display frame, small budget", "Three channels, so none stalls another", "Shared: 60 Hz steps", "Script: events and steps, under a budget",
-    "No clock: seconds, by nearness", "Not an actor: built once, shared, freed with its world"];
+  let n: Array[&str, 17] = ["The GPU draws; the display shows", "Puts the picture on the display, on time, every time", "Sound out, on time",
+    "Everything the person does reaches the system here", "Stands for you: moves your body at once, decides what you see",
+    "Moves bytes between machines, on three channels", "Steps the shared world at 60 Hz; its word is what happened",
+    "Runs the world author's code, under a budget", "Gets content, decodes and builds it, nearest first",
+    "Finished meshes, textures and shapes: built once, shared; not an actor",
+    "Screens and head tracking", "Controllers, keyboard and mouse", "Speakers and microphone", "Files and the bake cache", "Other machines and servers",
+    "Moves the server's bytes", "Fetches collision shapes only"];
   n[usize.from(b)]
+}
+
+// Whether the name is settled
+fn blockTag(b: i32) &str {
+  if b == 6i32 { return "agreed"; }
+  if b == 3i32 || b == 4i32 || b == 7i32 || b == 8i32 || b == 16i32 { return "proposed"; }
+  if b == 9i32 { return "proposed"; }
+  if b == 1i32 || b == 2i32 || b == 5i32 || b == 15i32 { return "existing name"; }
+  ""
+}
+
+// The one actor that owns a device
+fn deviceOwner(b: i32) i32 {
+  if b == 0i32 || b == 10i32 { return 1i32; }
+  if b == 11i32 { return 3i32; }
+  if b == 12i32 { return 2i32; }
+  if b == 13i32 { return 8i32; }
+  if b == 14i32 || b == 15i32 { return 5i32; }
+  if b == 16i32 { return 8i32; }
+  b
+}
+
+// The place of an actor on the arc, left to right: the neighbours are the ones that talk most
+fn arcIndex(b: i32) usize {
+  let n: Array[usize, 9] = [0usize, 2usize, 5usize, 0usize, 1usize, 4usize, 6usize, 7usize, 3usize];
+  n[usize.from(b)]
+}
+
+fn arcAngle(i: usize) f32 { radians(-84. + 24. * f32.from(i)) }
+
+fn polar(r: f32, a: f32) Vec3 { Vec3(r * sin(a), 0., 0. - r * cos(a)) }
+
+// The server group stands in a row beyond the internet, behind the Link; Script, Sim, Link, Loader from one end
+fn serverPos(b: i32) Vec3 {
+  let a = SRV_ANGLE;
+  let c = polar(R_SRV, a);
+  let ax = Vec3(cos(a), 0., sin(a));
+  var o: f32 = 2.5;
+  if b == 16i32 { o = -2.2; } else if b == 15i32 { o = -0.7; } else if b == 6i32 { o = 0.9; }
+  c + ax * o
 }
 
 fn blockPos(b: i32) Vec3 {
   if b == 9i32 { return Vec3(0., 0., 0.); }
-  let a = radians(-100. + 25. * f32.from(b));
-  Vec3(R_ARC * sin(a), 0., 0. - R_ARC * cos(a))
+  if b == 0i32 { return polar(R_DEV, arcAngle(2usize) - 0.175); }
+  if b == 10i32 { return polar(R_DEV, arcAngle(2usize) + 0.175); }
+  if b == 11i32 { return polar(R_DEV, arcAngle(0usize)); }
+  if b == 12i32 { return polar(R_DEV, arcAngle(5usize)); }
+  if b == 13i32 { return polar(R_DEV, arcAngle(3usize)); }
+  if b == 14i32 { return polar(R_DEV, arcAngle(4usize)); }
+  if b == 15i32 || b == 16i32 { return serverPos(b); }
+  let c = polar(R_ARC, arcAngle(arcIndex(b)));
+  if b == 6i32 || b == 7i32 { return c + (serverPos(b) - c) * awSv; }
+  c
 }
 
 fn blockYaw(b: i32) f32 {
@@ -163,8 +227,13 @@ fn blockM(b: i32) Mat4 {
   Mat4.fromTrs(blockPos(b), Quat.angleAxis(blockYaw(b), Vec3(0., 1., 0.)), Vec3(1., 1., 1.))
 }
 
-// Top of the header plate (name, tier) above the block's floor
-fn headTop(b: i32) f32 { if b == 0i32 { 2.1 } else if b == 9i32 { 2.9 } else { 2.85 } }
+// Top of the header plate above the block's floor (for a device: where its lifeline starts)
+fn headTop(b: i32) f32 {
+  if b == 9i32 { return 2.9; }
+  if b == 0i32 || (b >= 10i32 && b <= 14i32) { return 2.9; }
+  if b == 15i32 || b == 16i32 { return 1.3; }
+  2.15
+}
 
 fn slotLocal(b: i32, s: usize) Vec3 {
   if b == 9i32 {
@@ -177,10 +246,10 @@ fn slotLocal(b: i32, s: usize) Vec3 {
   let row = s / 3usize;
   let shelf = 2usize - row;
   let col = s - row * 3usize;
-  Vec3((f32.from(col) - 1.) * 0.52, 0.12 + 0.65 * f32.from(shelf) + 0.19, 0.0)
+  Vec3((f32.from(col) - 1.) * 0.46, 0.12 + 0.42 * f32.from(shelf) + 0.19, 0.0)
 }
 
-fn slotSize(b: i32) Vec3 { if b == 9i32 { Vec3(0.40, 0.30, 0.2) } else { Vec3(0.46, 0.30, 0.2) } }
+fn slotSize(b: i32) Vec3 { if b == 9i32 { Vec3(0.40, 0.30, 0.2) } else { Vec3(0.42, 0.30, 0.2) } }
 
 fn slotWorld(b: i32, s: usize) Vec3 { blockM(b) * slotLocal(b, s) }
 
@@ -329,11 +398,13 @@ struct App {
   blink: f32;                // the black blink of a move
   centre: bool;              // asked: back to the centre
   quit: bool;
+  server: bool;              // the switch: Sim and Script on a remote server
+  svT: f32;                  // the change's progress, 0 (client) to 1 (server)
 }
 
 fn newApp() App {
   var s = Array[f32, 64]() <- fill -100.0;
-  App(0usize, 0usize, scCount(0usize), false, false, false, false, 0., 0., 0., s, NONE, 0., false, false)
+  App(0usize, 0usize, scCount(0usize), false, false, false, false, 0., 0., 0., s, NONE, 0., false, false, false, 0.)
 }
 
 fn appStart(app: &App, j: usize) usize { scFirst(app.sc) + j }
@@ -378,6 +449,7 @@ fn setScenario(app: &mut App, sc: usize) {
   app.sc = sc;
   if !SC_TIMED[sc] { app.trueT = false; }
   app.count = scCount(sc);
+  app.server = SC_SERVER[sc];
   restart(app);
 }
 
@@ -407,6 +479,9 @@ fn totalMs(app: &App) f32 {
 fn tick(app: &mut App, dt: f32) {
   app.clock = app.clock + dt;
   if app.blink > 0. { app.blink = app.blink - dt; }
+  let want: f32 = if app.server { 1. } else { 0. };
+  if app.svT < want { app.svT = minf(want, app.svT + dt / SV_SECS); }
+  else if app.svT > want { app.svT = maxf(want, app.svT - dt / SV_SECS); }
   if !app.playing { return; }
   if app.trueT {
     app.ttime = app.ttime + dt;
@@ -522,49 +597,61 @@ fn facing(head: Vec3, p: Vec3) Mat4 {
 }
 
 // ---- The scene ----
-fn drawBlock(out: &mut Out, look: &AwLook, tc: &mut TextCtx, b: i32, st: &State, bright: bool, server: bool, hide: &Array[i32, 90], pulse: &Array[f32, 90]) {
+
+// A bookcase: two uprights, the top, the back, and 'shelves' shelves (3 for an actor, 1 for the server's small ones)
+fn drawCase(out: &mut Out, look: &AwLook, frame: usize, m: Mat4, shelves: usize) {
+  let top = 0.10 + 0.42 * f32.from(shelves - 1usize) + 0.43;
+  boxAt(out, look, frame, m, Vec3(-0.7, top * 0.5, 0.), Vec3(0.07, top, 0.5));
+  boxAt(out, look, frame, m, Vec3(0.7, top * 0.5, 0.), Vec3(0.07, top, 0.5));
+  boxAt(out, look, frame, m, Vec3(0., top - 0.035, 0.), Vec3(1.47, 0.07, 0.5));
+  boxAt(out, look, M_BACK, m, Vec3(0., top * 0.5, -0.23), Vec3(1.4, top, 0.03));
+  var sh = 0usize;
+  while sh < shelves {
+    boxAt(out, look, M_SHELF, m, Vec3(0., 0.10 + 0.42 * f32.from(sh), 0.), Vec3(1.4, 0.04, 0.5));
+    sh = sh + 1usize;
+  }
+}
+
+fn tagStyle(b: i32) usize {
+  if b == 6i32 { return S_GREEN; }
+  if b == 1i32 || b == 2i32 || b == 5i32 || b == 15i32 { return S_GRAY; }
+  S_AMBER
+}
+
+// The name plate of a stand: name, its one-line job, and the small tag that says whether the name is settled
+fn drawHeader(out: &mut Out, look: &AwLook, tc: &mut TextCtx, b: i32, m: Mat4) {
+  let tier = blockTier(b);
+  let top = headTop(b);
+  let hy = top - 0.35;
+  boxAt(out, look, M_PLATE, m, Vec3(0., hy, 0.), Vec3(1.5, 0.7, 0.06));
+  awAddText(out, tc, blockName(b), 0.18, 1.45, S_TIER + tier, m * Mat4.fromTranslation(Vec3(0., hy + 0.2, 0.04)), 0.5, 0.5);
+  awAddText(out, tc, tierLine(b), 0.07, 1.4, S_GRAY, m * Mat4.fromTranslation(Vec3(0., hy + 0.05, 0.04)), 0.5, 0.0);
+  let tag = blockTag(b);
+  if tag.len() > 0usize { plated(out, look, tc, tag, 0.07, 0.9, tagStyle(b), m * Mat4.fromTranslation(Vec3(0.42, top + 0.1, 0.03))); }
+}
+
+fn drawBlock(out: &mut Out, look: &AwLook, tc: &mut TextCtx, b: i32, st: &State, bright: bool, hide: &Array[i32, 90], pulse: &Array[f32, 90]) {
   let m = blockM(b);
   let tier = blockTier(b);
   let frame = if bright { M_TIERHI + tier } else { M_TIERDIM + tier };
-  let top = headTop(b);
-  if b == 0i32 {
-    // the display: a small post, the runtime
-    boxAt(out, look, frame, m, Vec3(0., 0.55, 0.), Vec3(0.28, 1.1, 0.28));
-    boxAt(out, look, frame, m, Vec3(0., 1.15, 0.), Vec3(0.5, 0.08, 0.08));
-  } else if b == 9i32 {
+  if b == 9i32 {
     boxAt(out, look, M_SHELF, m, Vec3(0., 0.35, 0.), Vec3(0.3, 0.7, 0.3));
     out.list.add(look.disc, mat(look, M_TABLE), out.base * m * Mat4.fromTrs(Vec3(0., 0.715, 0.), Quat.identity(), Vec3(1.6, 0.07, 1.6)));
+    // the library's plate lies tilted on the table's near edge, so that it hides nothing behind the table
+    let hm = m * Mat4.fromTrs(Vec3(0., 1.01, 0.53), Quat.angleAxis(-0.8, Vec3(1., 0., 0.)), Vec3(1., 1., 1.));
+    boxAt(out, look, M_PLATE, hm, Vec3(0., 0., 0.), Vec3(1.6, 0.7, 0.06));
+    awAddText(out, tc, "Library (shared store)", 0.13, 1.5, S_TIER + tier, hm * Mat4.fromTranslation(Vec3(0., 0.23, 0.04)), 0.5, 0.5);
+    awAddText(out, tc, tierLine(b), 0.07, 1.5, S_GRAY, hm * Mat4.fromTranslation(Vec3(0., 0.1, 0.04)), 0.5, 0.0);
+    plated(out, look, tc, "proposed", 0.07, 0.9, S_AMBER, hm * Mat4.fromTranslation(Vec3(0.55, 0.42, 0.03)));
   } else {
-    // two uprights, the top, the back, three shelves
-    boxAt(out, look, frame, m, Vec3(-0.8, 1.1, 0.), Vec3(0.07, 2.2, 0.5));
-    boxAt(out, look, frame, m, Vec3(0.8, 1.1, 0.), Vec3(0.07, 2.2, 0.5));
-    boxAt(out, look, frame, m, Vec3(0., 2.17, 0.), Vec3(1.67, 0.07, 0.5));
-    boxAt(out, look, M_BACK, m, Vec3(0., 1.1, -0.23), Vec3(1.6, 2.2, 0.03));
-    var sh = 0usize;
-    while sh < 3usize {
-      boxAt(out, look, M_SHELF, m, Vec3(0., 0.10 + 0.65 * f32.from(sh), 0.), Vec3(1.6, 0.04, 0.5));
-      sh = sh + 1usize;
-    }
-  }
-  // the header: name, tier line
-  // (the library's plate lies tilted on the table's near edge, so that it hides nothing behind the table)
-  let hm = if b == 9i32 { m * Mat4.fromTrs(Vec3(0., 1.01, 0.53), Quat.angleAxis(-0.8, Vec3(1., 0., 0.)), Vec3(1., 1., 1.)) } else { m };
-  let hy: f32 = if b == 9i32 { 0. } else { top - 0.33 };
-  let nameY = if b == 9i32 { 0.23 } else { hy + 0.17 };
-  let pw: f32 = if b == 9i32 { 1.6 } else { 1.8 };
-  let ph: f32 = if b == 9i32 { 0.7 } else { 0.66 };
-  let nem: f32 = if b == 9i32 { 0.14 } else { 0.195 };
-  boxAt(out, look, M_PLATE, hm, Vec3(0., hy, 0.), Vec3(pw, ph, 0.06));
-  awAddText(out, tc, blockName(b), nem, 0., S_TIER + tier, hm * Mat4.fromTranslation(Vec3(0., nameY, 0.04)), 0.5, 0.5);
-  awAddText(out, tc, tierLine(b), 0.084, pw - 0.1, S_GRAY, hm * Mat4.fromTranslation(Vec3(0., if b == 9i32 { 0.11 } else { hy - 0.02 }, 0.04)), 0.5, 0.0);
-  if server && (b == 6i32 || b == 7i32) {
-    plated(out, look, tc, "On the server", 0.1, 1.4, S_CAPTION, m * Mat4.fromTranslation(Vec3(0., 1.99, 0.3)));
+    drawCase(out, look, frame, m, 3usize);
+    drawHeader(out, look, tc, b, m);
   }
   // the items
   var s = 0usize;
   while s < SLOTS {
     let c = cellOf(b, s);
-    if st.occ[c] >= 0i32 && b != 0i32 && hide[c] == 0i32 {
+    if st.occ[c] >= 0i32 && hide[c] == 0i32 {
       let sz = slotSize(b);
       let lp = slotLocal(b, s);
       let k = 1. + pulse[c] * 0.22;
@@ -575,16 +662,131 @@ fn drawBlock(out: &mut Out, look: &AwLook, tc: &mut TextCtx, b: i32, st: &State,
     s = s + 1usize;
   }
   // the band of a block that waits, and what for
-  if st.waits[usize.from(b)] >= 0i32 && b != 0i32 {
+  if st.waits[usize.from(b)] >= 0i32 {
     let g = usize.from(st.waits[usize.from(b)]);
+    let lib = b == 9i32;
     var i = 0usize;
     while i < 8usize {
-      boxAt(out, look, if i - (i / 2usize) * 2usize == 0usize { M_HAZY } else { M_HAZK }, m, Vec3(-0.7 + 0.2 * f32.from(i), if b == 9i32 { 1.35 } else { 1.19 }, if b == 9i32 { 0. } else { 0.33 }), Vec3(0.2, 0.1, 0.05));
+      boxAt(out, look, if i - (i / 2usize) * 2usize == 0usize { M_HAZY } else { M_HAZK }, m, Vec3(-0.7 + 0.2 * f32.from(i), if lib { 1.35 } else { 2.26 }, if lib { 0. } else { 0.3 }), Vec3(0.2, 0.1, 0.05));
       i = i + 1usize;
     }
     var w = String.from("Waiting for ");
     w <- ST_LABEL[g];
-    plated(out, look, tc, w.view(), 0.085, 1.5, S_CAPTION, m * Mat4.fromTranslation(Vec3(0., if b == 9i32 { 1.55 } else { 1.38 }, if b == 9i32 { 0.03 } else { 0.36 })));
+    plated(out, look, tc, w.view(), 0.085, 1.5, S_CAPTION, m * Mat4.fromTranslation(Vec3(0., if lib { 1.55 } else { 2.4 }, if lib { 0.03 } else { 0.33 })));
+  }
+}
+
+fn isDevice(b: i32) bool { b == 0i32 || (b >= 10i32 && b <= 14i32) }
+
+// A device: a pillar with a plate that stands over the stands in front of it; the plate says which actor owns it
+fn drawDevice(out: &mut Out, look: &AwLook, tc: &mut TextCtx, b: i32, bright: bool) {
+  let m = blockM(b);
+  let tier = blockTier(b);
+  let frame = if bright { M_TIERHI + tier } else { M_TIERDIM + tier };
+  boxAt(out, look, frame, m, Vec3(0., 1.1, 0.), Vec3(0.95, 2.2, 0.5));
+  boxAt(out, look, M_PLATE, m, Vec3(0., 2.55, 0.), Vec3(1.7, 0.72, 0.06));
+  awAddText(out, tc, blockName(b), 0.14, 1.6, S_WHITE, m * Mat4.fromTranslation(Vec3(0., 2.75, 0.04)), 0.5, 0.5);
+  awAddText(out, tc, tierLine(b), 0.07, 1.6, S_GRAY, m * Mat4.fromTranslation(Vec3(0., 2.62, 0.04)), 0.5, 0.0);
+  var o = String.from("owned by ");
+  o <- blockName(deviceOwner(b));
+  awAddText(out, tc, o.view(), 0.075, 1.6, S_TIER + tier, m * Mat4.fromTranslation(Vec3(0., 2.28, 0.04)), 0.5, 0.5);
+}
+
+// The remote server: a slab to stand on, a sign, and its Link and small Loader (Sim and Script are the same stands that left the client)
+fn drawServer(out: &mut Out, look: &AwLook, tc: &mut TextCtx, head: Vec3) {
+  let a = SRV_ANGLE;
+  let c = polar(R_SRV, a);
+  let ax = Vec3(cos(a), 0., sin(a));
+  let yaw = atan2(0. - c.x, 0. - c.z);
+  out.list.add(look.box, mat(look, M_ITEM), out.base * Mat4.fromTrs(c + ax * 0.15 + Vec3(0., 0.01, 0.), Quat.angleAxis(yaw, Vec3(0., 1., 0.)), Vec3(6.2, 0.03, 2.2)));
+  plated(out, look, tc, "Remote server", 0.22, 3.0, S_CAPTION, facing(head, c + ax * 0.15 + Vec3(0., 3.2, 0.)));
+  var b = 15i32;
+  while b <= 16i32 {
+    let m = blockM(b);
+    drawCase(out, look, M_TIERDIM + blockTier(b), m, 1usize);
+    drawHeader(out, look, tc, b, m);
+    b = b + 1i32;
+  }
+}
+
+// ---- Who talks to whom: wires (the definitions page) ----
+const WIRE_N: usize = 25usize;
+
+fn wireA(i: usize) i32 {
+  let n: Array[i32, 25] = [10i32, 0i32, 11i32, 12i32, 13i32, 14i32, 3i32, 4i32, 4i32, 8i32, 8i32, 8i32, 2i32, 4i32, 1i32, 6i32, 4i32, 6i32, 5i32, 9i32, 4i32, 15i32, 16i32, 15i32, 14i32];
+  n[i]
+}
+
+fn wireB(i: usize) i32 {
+  let n: Array[i32, 25] = [1i32, 1i32, 3i32, 2i32, 8i32, 5i32, 4i32, 1i32, 2i32, 5i32, 1i32, 9i32, 5i32, 9i32, 9i32, 7i32, 6i32, 2i32, 6i32, 6i32, 5i32, 6i32, 6i32, 16i32, 15i32];
+  n[i]
+}
+
+// 0 always, 1 only on one machine, 2 only with the server
+fn wireMode(i: usize) i32 {
+  let n: Array[i32, 25] = [0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 0i32, 1i32, 1i32, 1i32, 1i32, 2i32, 2i32, 2i32, 2i32, 2i32];
+  n[i]
+}
+
+fn wireLabel(i: usize) &str {
+  let n: Array[&str, 25] = ["head pose, picture", "frames", "input", "sound", "files", "the net", "input", "scene", "sounds", "fetch", "uploads", "built things", "voice",
+    "shapes", "meshes", "mail, requests", "input, state", "sounds", "state, events", "shapes", "input, state", "state, events", "shapes", "fetch", "internet"];
+  n[i]
+}
+
+fn inwardOf(p: Vec3) Vec3 {
+  let len = p.length();
+  if len < 0.01 { return Vec3(0., 0., 0.); }
+  Vec3(0. - p.x / len, 0., 0. - p.z / len)
+}
+
+// Where a stand's wires meet, on the floor in front of it
+fn portOf(b: i32) Vec3 {
+  let p = blockPos(b);
+  if b == 9i32 { return p; }
+  p + inwardOf(p) * 0.75
+}
+
+fn drawWires(out: &mut Out, look: &AwLook, tc: &mut TextCtx, head: Vec3) {
+  var i = 0usize;
+  while i < WIRE_N {
+    let mode = wireMode(i);
+    var on = mode == 0i32;
+    if mode == 1i32 && awSv < 0.5 { on = true; }
+    if mode == 2i32 && awSv >= 0.5 { on = true; }
+    if on {
+      let a = wireA(i);
+      let b = wireB(i);
+      var mid = Vec3(0., 0., 0.);
+      if isDevice(a) || isDevice(b) {
+        // a device and its owner: from under the device's plate to the middle of the owner's name plate
+        let d = if isDevice(a) { a } else { b };
+        let o = if isDevice(a) { b } else { a };
+        let pd = blockPos(d);
+        let pa = pd + inwardOf(pd) * 0.3 + Vec3(0., 2.1, 0.);
+        let pb = blockPos(o) + Vec3(0., if o >= 15i32 { 0.95 } else { 1.8 }, 0.);
+        beamBox(out, look, M_BEAD, pa, pb, 0.05);
+        mid = (pa + pb) * 0.5;
+      } else {
+        let y = 0.03 + 0.012 * f32.from(i);
+        let pa = portOf(a) + Vec3(0., y, 0.);
+        let pb = portOf(b) + Vec3(0., y, 0.);
+        beamBox(out, look, if mode == 2i32 { M_DART } else { M_BEAM }, pa, pb, 0.035);
+        mid = (pa + pb) * 0.5 + Vec3(0., 0.1, 0.);
+      }
+      awAddText(out, tc, wireLabel(i), 0.065, 0., S_GRAY, facing(head, mid), 0.5, 0.5);
+    }
+    i = i + 1usize;
+  }
+  // the meeting points
+  var b = 1i32;
+  while b <= 8i32 {
+    boxAt(out, look, M_BEAD, Mat4.identity(), portOf(b) + Vec3(0., 0.05, 0.), Vec3(0.12, 0.1, 0.12));
+    b = b + 1i32;
+  }
+  if awSv >= 0.5 {
+    boxAt(out, look, M_BEAD, Mat4.identity(), portOf(15i32) + Vec3(0., 0.05, 0.), Vec3(0.12, 0.1, 0.12));
+    boxAt(out, look, M_BEAD, Mat4.identity(), portOf(16i32) + Vec3(0., 0.05, 0.), Vec3(0.12, 0.1, 0.12));
   }
 }
 
@@ -680,6 +882,7 @@ fn actingBlock(app: &App) i32 {
 
 // Everything but the wrist menu
 fn drawWorld(out: &mut Out, look: &AwLook, tc: &mut TextCtx, app: &App, head: Vec3) {
+  awSv = easeT(app.svT);
   let first = scFirst(app.sc);
   let st = replay(app.sc, app.cur);
   var hide = Array[i32, 90]() <- fill 0i32;
@@ -775,9 +978,14 @@ fn drawWorld(out: &mut Out, look: &AwLook, tc: &mut TextCtx, app: &App, head: Ve
   // the blocks
   var b = 0i32;
   while b < 10i32 {
-    drawBlock(out, look, tc, b, &st, glowing[usize.from(b)] == 1i32, SC_SERVER[app.sc], &hide, &pulse);
+    if b == 0i32 { drawDevice(out, look, tc, 0i32, glowing[0usize] == 1i32); }
+    else { drawBlock(out, look, tc, b, &st, glowing[usize.from(b)] == 1i32, &hide, &pulse); }
     b = b + 1i32;
   }
+  b = 10i32;
+  while b <= 14i32 { drawDevice(out, look, tc, b, false); b = b + 1i32; }
+  if awSv >= 0.5 { drawServer(out, look, tc, head); }
+  drawWires(out, look, tc, head);
   // lifelines, arrows
   b = 0i32;
   let lineTop = LINE_BASE + LINE_STEP * f32.from(app.count) + 0.2;
@@ -950,7 +1158,7 @@ fn awSetJobs(t: &mut TextRenderer, device: &mut Device, tc: &TextCtx, styles: &L
   *shown = n;
 }
 
-const AW_TEXT_CAP: usize = 520usize;
+const AW_TEXT_CAP: usize = 640usize;
 
 // The walk inside the incubator: its model, its words and its two text renderers (one for each eye, as in the walk itself)
 struct Aw {
