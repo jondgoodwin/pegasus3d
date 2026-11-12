@@ -420,7 +420,8 @@ pub struct Incubator {
   // (wsList, wsOpen, wsItems, wsPending, wsWant, wsAutoAdd stand after browserMade: they have no constant default)
   wsPendAt: u64 = 0u64;
   wsMaking: bool = false;                    // pages being opened now are members
-  wsReseed: bool = false;                    // the open workspace's table changed in incubator.toml: not captured over, applied at the next open
+  mfForce: bool = false;                     // the manifest's list is made again at the next tick (a joined page now has a card)
+  wsReseed: bool = false;                   // the open workspace's table changed in incubator.toml: not captured over, applied at the next open
   wsSerial: u32 = 0u32;
   mfPoll: u64 = 0u64;
   wsBaseReady: bool = false;
@@ -2615,6 +2616,56 @@ pub struct Incubator {
 
 
 
+  // The workspace's spots: slot 0 is the centre (the work item, larger); slots 1.. fill the arc round it, 6 to a row, right and left in
+  // turn (4 to a row), then a second row farther back (staggered between the first), a third, and so on. No limit.
+  fn wsSpot(slot: usize) Vec3 {
+    var b: f32 = 0.;
+    var rowF: f32 = 1.;
+    if slot > 0usize {
+      let i = slot - 1usize;
+      let row = i / 4usize;
+      let j = i % 4usize;
+      let sgn: f32 = if j % 2usize == 0usize { 1. } else { -1. };
+      let k = f32.from(u32.from(j / 2usize));
+      let off: f32 = if row % 2usize == 0usize { 0.72 } else { 0.45 };
+      b = sgn * (off + 0.45 * k);
+      rowF = 1. + 0.42 * f32.from(u32.from(row));
+    }
+    let lx = PG_R * rowF * sin(b);
+    let lz = 0. - PG_RZ * rowF * cos(b);
+    Vec3(lx * cos(workBear) - lz * sin(workBear), 0., lx * sin(workBear) + lz * cos(workBear))
+  }
+
+  // The first spot (from 'from') no member stands on or waits for
+  fn wsFreeSlot(self: &, from: usize) usize {
+    var slot = from;
+    while slot < 400usize {
+      let sp = Incubator.wsSpot(slot);
+      var taken = false;
+      var k = 0usize;
+      while k < pgs.len() { if pgs[k].ws && !pgs[k].gone && (pgs[k].toPos - sp).length() < 0.6 { taken = true; } k = k + 1usize; }
+      var q = 0usize;
+      while q < wsPending.len() {
+        var pl = Place(0u32, 0u32, 0., 0., 0.);
+        if parsePlace(wsPending[q].place.view(), &mut pl) && pl.kind == 3u32 && (Vec3(pl.x, pl.y, pl.z) - sp).length() < 0.6 { taken = true; }
+        q = q + 1usize;
+      }
+      if !taken { return slot; }
+      slot = slot + 1usize;
+    }
+    slot
+  }
+
+  // A page brought in while a workspace is open joins it, standing on the first free spot
+  fn wsJoinPage(self: &mut, n: usize) {
+    (&mut pgs[n]).ws = true;
+    (&mut pgs[n]).free = true;
+    let sp = Incubator.wsSpot(self.wsFreeSlot(1usize));
+    (&mut pgs[n]).toPos = sp;
+    writeAt = nowMs() + 1000u64;
+    mfForce = true;
+  }
+
   // Every page set off toward the place it should stand now: the arc's (newest nearest), a shelf, or where it was put
   fn retarget(self: &mut) {
     var i = 0usize;
@@ -2622,7 +2673,7 @@ pub struct Incubator {
       if !pgs[i].gone && pgs[i].zone < 0 {
         var np = pgs[i].toPos;
         var ny = pgs[i].toYaw;
-        var ns: f32 = 1.;
+        var ns: f32 = if pgs[i].big { 1.3 } else { 1. };
         if pgs[i].free {
           ny = if pgs[i].tab && brwCfg { brwYaw } else { Incubator.faceOrigin(np) };
         } else {
@@ -2788,6 +2839,10 @@ pub struct Incubator {
       tabSerial = tabSerial + 1u32;
       (&mut pgs[n]).tab = true; (&mut pgs[n]).tabNo = tabSerial; (&mut pgs[n]).free = true;
     }
+    if !wsMaking && !proj && !pgs[n].tab && wsOpen.len() > 0usize && !pgs[n].ws {
+      self.wsJoinPage(n);
+      print <- "workspaces: "; printStr(src); print <- " joined\n";
+    }
     self.enforceLimit(device);
     self.retarget();
     if !proj { self.syncRoom(); }
@@ -2828,6 +2883,7 @@ pub struct Incubator {
     pt.append(floatText(pgs[i].toPos.x).view()); pt.append(","); pt.append(floatText(pgs[i].toPos.y).view()); pt.append(","); pt.append(floatText(pgs[i].toPos.z).view());
     self.memPut(id.view(), key.view(), "out", pt.view(), Incubator.degText(pgs[i].toYaw), i64.from(i32.from(pgs[i].toSc * 100. + 0.5)));
     self.memPut(id.view(), key.view(), "rack", "", 0i64, 100i64);
+    mfForce = true;
     print <- "ws: "; printStr(pgs[i].title.text.view()); print <- " back to the rack\n";
     if focusPg == i32.from(i) { focusPg = -1; }
     self.closePage(i);
@@ -4841,6 +4897,8 @@ pub struct Incubator {
       let i = usize.from(u32.from(focusPg));
       if pgs[i].ws && !pgs[i].gone {
         (&mut pgs[i]).ws = false;
+        (&mut pgs[i]).big = false;
+        if wsOpen.len() > 0usize { let dk = Incubator.srcKey(pgs[i].src.view()); self.memForget(wsOpen.view(), dk.view()); }
         self.retarget();
         self.syncRoom();
         print <- "workspaces: dropped "; printStr(pgs[i].title.text.view()); print <- "\n";
@@ -4916,7 +4974,6 @@ pub struct Incubator {
       else { print <- "workspaces: unknown action\n"; }
     }
     if wsOpen.len() > 0usize {
-      self.wsCapTick(now);
       if rackSecs.len() > 0usize { self.rackHover(gazeEye, gazeDir, false, now); }
     }
     if wsOpen.len() > 0usize && now >= mfPoll + 500u64 {
@@ -4942,6 +4999,7 @@ pub struct Incubator {
         if it.place.len() > 0usize && parsePlace(it.place.view(), &mut pl) && pl.kind == 3u32 { (&mut pgs[nu]).toPos = Vec3(pl.x, pl.y, pl.z); }
         else { (&mut pgs[nu]).toPos = Incubator.arcSpot(nu); }
         let apath = srcKey(it.source.view());
+        if it.n >= 1i64 && wsOpen.len() > 0usize && i64.from(self.mfWorkIdx()) == it.n - 1i64 { (&mut pgs[nu]).big = true; }
         if Incubator.isAnswered(apath.view()) {
           var tt = String.from("(answered) ");
           tt.append(pageTitle(pgs[nu].src.view()).view());
@@ -4990,6 +5048,31 @@ pub struct Incubator {
     found
   }
 
+  // The sections whose items stand open when the workspace opens
+  fn isStand(section: &str) bool { section == "Start here" || section == "Work item" }
+
+  // The work item: the first item under "Work item", else the first Start here item (a child workstream never is). -1: none
+  fn mfWorkIdx(self: &) i32 {
+    var i = 0usize;
+    while i < mf.items.len() { if mf.items[i].section.view() == "Work item" && mf.items[i].child.len() == 0usize { return i32.from(i); } i = i + 1usize; }
+    i = 0usize;
+    while i < mf.items.len() { if mf.items[i].section.view() == "Start here" && mf.items[i].child.len() == 0usize { return i32.from(i); } i = i + 1usize; }
+    -1
+  }
+
+  // Drop takes a page out of the workspace entirely: its memory goes
+  fn memForget(self: &mut, ws: &str, path: &str) {
+    var keep = List[WsMemCfg]();
+    var i = 0usize;
+    while i < roomGood.wsMems.len() {
+      if !(roomGood.wsMems[i].ws.view() == ws && roomGood.wsMems[i].path.view() == path) { keep.push(copyWsMem(&roomGood.wsMems[i])); }
+      i = i + 1usize;
+    }
+    roomGood.wsMems = keep;
+    writeAt = nowMs() + 1000u64;
+    mfForce = true;
+  }
+
   fn memNew() WsMemCfg { WsMemCfg(String(), String(), String(), String(), 0i64, 100i64, String(), String()) }
 
   // The manifest section of the item at this path ("" if the manifest does not list it)
@@ -5003,9 +5086,9 @@ pub struct Incubator {
   // closes the item again, which writes a fresh memory with the new section). An old memory without a section is stale only if it
   // left a Start here item on the rack.
   fn memStale(m: &WsMemCfg, section: &str) bool {
-    let nowStart = section == "Start here";
+    let nowStart = Incubator.isStand(section);
     if m.sect.len() == 0usize { return nowStart && m.state.view() == "rack"; }
-    (m.sect.view() == "Start here") != nowStart
+    Incubator.isStand(m.sect.view()) != nowStart
   }
 
   // Remember an item; a "rack" keeps the last place, yaw and scale. Nothing is written when nothing changed.
@@ -5028,7 +5111,7 @@ pub struct Incubator {
   }
 
   fn slotPlace(rank: usize) String {
-    let v = Incubator.arcSpot(rank);
+    let v = Incubator.wsSpot(rank);
     var pt = String.from("at:");
     pt.append(floatText(v.x).view()); pt.append(","); pt.append(floatText(v.y).view()); pt.append(","); pt.append(floatText(v.z).view());
     pt
@@ -5075,7 +5158,8 @@ pub struct Incubator {
     match fs.readFile(&Path.from(path.view())) {
       case let Ok(t) {
         let text = String.from(t.view());
-        if !force && text.view() == mfText.view() { return; }
+        if !force && !mfForce && text.view() == mfText.view() { return; }
+        mfForce = false;
         mfText = text.clone();
         mf = mfParse(text.view());
         rackItems = List[RackCard]();
@@ -5104,6 +5188,34 @@ pub struct Incubator {
           rackItems.push(RackCard(si, lb, ans));
           i = i + 1usize;
         }
+        // pages that joined from elsewhere and went back to the list stay members: they stand on it under "Joined"
+        let wid = wsOpen.clone();
+        var jm = 0usize;
+        while jm < roomGood.wsMems.len() {
+          let wm = &roomGood.wsMems[jm];
+          jm = jm + 1usize;
+          if wm.ws.view() != wid.view() { continue; }
+          var inMf = false;
+          var q = 0usize;
+          while q < mf.items.len() { if mf.items[q].path.view() == wm.path.view() { inMf = true; } q = q + 1usize; }
+          if inMf || !fs.exists(&Path.from(wm.path.view())) { continue; }
+          let jp = wm.path.clone();
+          var nm = jp.clone();
+          var cut = 0usize;
+          while cut < jp.len() { if jp[cut] == '/' { nm = String.from(jp.slice(cut + 1usize, jp.len())); } cut = cut + 1usize; }
+          mf.items.push(MfItem(String.from("Joined"), nm.clone(), jp.clone(), String(), String()));
+          var si = 0usize;
+          while si < rackSecNames.len() && rackSecNames[si].view() != "Joined" { si = si + 1usize; }
+          if si == rackSecNames.len() {
+            rackSecNames.push(String.from("Joined"));
+            var sl = self.mkLabel(device, "Joined", 0x2a3340ffu32, 0xffffffffu32, 34., 1.3, 0.325);
+            sl.top = 10.;
+            rackSecs.push(sl);
+          }
+          var lb = self.mkLabel(device, Incubator.rackText(nm.view(), "").view(), 0xf8f5eeffu32, 0x1c1c1cffu32, 24., 1.3, 0.325);
+          lb.top = 8.;
+          rackItems.push(RackCard(si, lb, false));
+        }
         self.rackRefresh();
         print <- "workspaces: manifest "; printStr(path.view()); print <- ": "; print <- mf.items.len(); print <- " items, "; print <- rackSecNames.len(); print <- " sections\n";
       }
@@ -5115,8 +5227,9 @@ pub struct Incubator {
   fn wsOpenManifest(self: &mut, device: &mut Device, wu: usize) {
     self.mfLoad(device, true);
     let id = wsList[wu].id.clone();
-    var rank = 0usize;
+    var rank = 1usize;
     var startN = 0usize;
+    let wk = self.mfWorkIdx();
     var i = 0usize;
     while i < mf.items.len() {
       let path = mf.items[i].path.clone();
@@ -5129,10 +5242,12 @@ pub struct Incubator {
         }
         var out = false;
         if has { out = mem.state.view() == "out"; }
-        else if mf.items[i].section.view() == "Start here" && startN < 5usize { out = true; startN = startN + 1usize; }
+        else if Incubator.isStand(mf.items[i].section.view()) { out = true; startN = startN + 1usize; }
         if out {
           var pl = String();
-          if has && mem.place.len() > 0usize { pl = mem.place.clone(); } else { pl = Incubator.slotPlace(rank); rank = rank + 1usize; }
+          if has && mem.place.len() > 0usize { pl = mem.place.clone(); }
+          else if i32.from(i) == wk { pl = Incubator.slotPlace(0usize); }
+          else { pl = Incubator.slotPlace(rank); rank = rank + 1usize; }
           var src = String.from(if fs.isDir(&Path.from(path.view())) { "tree:" } else { "doc:" });
           src.append(path.view());
           wsPending.push(WsItemCfg(i64.from(i + 1usize), src, pl, mem.yaw, has, mem.scale, has));
@@ -5464,21 +5579,16 @@ pub struct Incubator {
     if self.mfIsOutKey(path.view()) { return; }
     var mem = Incubator.memNew();
     let has = self.memGet(wsOpen.view(), path.view(), &mut mem);
-    var live = 0usize;
-    var k = 0usize;
-    while k < pgs.len() { if pgs[k].ws && !pgs[k].gone { live = live + 1usize; } k = k + 1usize; }
-    // (a free arc spot: the first none of the standing members occupies, since members go back to the rack from any spot)
-    var rank = 0usize;
-    while rank < 12usize {
-      let sp = Incubator.arcSpot(rank);
-      var taken = false;
-      k = 0usize;
-      while k < pgs.len() { if pgs[k].ws && !pgs[k].gone && (pgs[k].toPos - sp).length() < 0.6 { taken = true; } k = k + 1usize; }
-      if !taken { break; }
-      rank = rank + 1usize;
+    // (the work item returns to the centre; any other card to the first free spot round it, no limit)
+    let rank = if i32.from(i) == self.mfWorkIdx() { 0usize } else { self.wsFreeSlot(1usize) };
+    var memFree = false;
+    var mpl = Place(0u32, 0u32, 0., 0., 0.);
+    if has && mem.place.len() > 0usize && parsePlace(mem.place.view(), &mut mpl) && mpl.kind == 3u32 {
+      memFree = true;
+      var k = 0usize;
+      while k < pgs.len() { if pgs[k].ws && !pgs[k].gone && (pgs[k].toPos - Vec3(mpl.x, mpl.y, mpl.z)).length() < 0.6 { memFree = false; } k = k + 1usize; }
     }
-    if rank >= 12usize { rank = live + wsPending.len(); }
-    let pl = if has && mem.place.len() > 0usize { mem.place.clone() } else { Incubator.slotPlace(rank) };
+    let pl = if memFree { mem.place.clone() } else { Incubator.slotPlace(rank) };
     var src = String.from(if fs.isDir(&Path.from(path.view())) { "tree:" } else { "doc:" });
     src.append(path.view());
     wsPending.push(WsItemCfg(i64.from(i + 1usize), src, pl, 0i64, false, 100i64, false));
