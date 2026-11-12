@@ -32,6 +32,7 @@ struct View {
   int dx0 = 0, dy0 = 0, dx1 = 0, dy1 = 0;   // the union of the rectangles painted since the last read (empty: dx1 <= dx0)
   bool closed = false;
   bool loading = false;
+  bool wantsText = false;            // a text field holds the page's focus (OnVirtualKeyboardRequested says so)
   unsigned long paints = 0;
   std::string url;
   std::string title;
@@ -104,6 +105,8 @@ class Client : public CefClient, public CefRenderHandler, public CefLifeSpanHand
     browser->GetMainFrame()->LoadURL(target_url);
     return true;
   }
+  // a text field took the focus (any input mode but none) or lost it: the virtual keyboard follows (webpanel.cone, vkeys.cone)
+  void OnVirtualKeyboardRequested(CefRefPtr<CefBrowser>, TextInputMode mode) override { v_->wantsText = (mode != CEF_TEXT_INPUT_MODE_NONE); }
   void OnBeforeClose(CefRefPtr<CefBrowser>) override { v_->closed = true; }
   void OnLoadingStateChange(CefRefPtr<CefBrowser>, bool isLoading, bool, bool) override { v_->loading = isLoading; }
   void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, const CefString& url) override {
@@ -225,6 +228,7 @@ API void web_text_input(int on) {
 }
 
 API unsigned long web_paints(int view) { View* v = get(view); return v ? v->paints : 0; }
+API int web_wants_text(int view) { View* v = get(view); return v && v->wantsText ? 1 : 0; }
 API int web_loading(int view) { View* v = get(view); return v && v->loading ? 1 : 0; }
 
 static int mods_to_cef(int m) {
@@ -246,6 +250,8 @@ API void web_mouse_button(int view, int x, int y, int button, int up, int clicks
   CefMouseEvent e; e.x = x; e.y = y; e.modifiers = 0;
   CefBrowserHost::MouseButtonType t = button == 3 ? MBT_RIGHT : button == 2 ? MBT_MIDDLE : MBT_LEFT;
   h->SetFocus(true);
+  // (CEF says when a text field wants the keyboard, never when it stops: each press clears it, and a press on a field says it again)
+  if (!up) { View* v = get(view); if (v) v->wantsText = false; }
   h->SendMouseClickEvent(e, t, up != 0, clicks);
 }
 API void web_wheel(int view, int x, int y, int dx, int dy) {

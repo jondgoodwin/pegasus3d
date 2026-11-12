@@ -1,0 +1,276 @@
+// The virtual keyboard (Jon, 11 Nov: "doesn't need to be a very complicated keyboard"): a QWERTY panel of 13 x 5 units, a unit 7 cm
+// across with a 6.5 cm key in it, so the beam at about a metre hits a key. Letters, digits, space, backspace, enter, shift, tab, the
+// arrows and the symbols . , / - : @ ? _  (Shift on a digit gives its symbol and on a letter its capital; it lasts for one key).
+//
+// It is one picture (the keys' legends drawn by the label font, centred, into a 1560 x 600 image a few keys a frame after the start),
+// one quad, tipped back like a laptop's keyboard, standing in front of and below the screen that takes the text. A key pressed flashes
+// (a white overlay that fades). What a key does is the incubator's (incubator.cone, kbType): this file knows the keys and where they are.
+
+const KB_CELL = 120u32;           // pixels a unit across in the picture
+const KB_UNIT = 0.07f;            // metres a unit across (the key itself 6.5 cm)
+const KB_COLS = 13u32;
+const KB_ROWS = 5u32;
+const KB_TILT = 0.95f;            // the plane is tipped back this far from standing upright (radians, about 54 degrees)
+const KB_AHEAD = 0.85f;           // metres from the eye toward the screen it types into
+const KB_BELOW = 0.62f;           // metres under the eye
+const KB_FLASH_MS = 260u64;
+
+struct VKey {
+  label: String;      // what the key says
+  low: String;        // the text it types ("" for a key that is not text)
+  up: String;         // the text with Shift
+  sc: u32;            // an SDL scancode, for a key that is not text (0 for text; 225 is Shift)
+  x: f32;             // units from the left and from the top; w wide
+  y: f32;
+  w: f32;
+}
+
+alias VKeyList = List[VKey];
+
+fn kbAdd(keys: &mut VKeyList, label: &str, low: &str, up: &str, sc: u32, x: f32, y: f32, w: f32) {
+  keys.push(VKey(String.from(label), String.from(low), String.from(up), sc, x, y, w));
+}
+
+// The lower and upper case of an ASCII letter as one-character strings
+fn kbLowerOf(c: u8) String {
+  var s = String();
+  s.appendByte(if c >= 65u8 && c <= 90u8 { c + 32u8 } else { c });
+  s
+}
+fn kbUpperOf(c: u8) String {
+  var s = String();
+  s.appendByte(if c >= 97u8 && c <= 122u8 { c - 32u8 } else { c });
+  s
+}
+
+// A row of single characters from x, one unit each; 'ups' (if not empty) gives the shifted text of each, else the capital
+fn kbRow(keys: &mut VKeyList, chars: &str, ups: &str, x0: f32, y: f32) f32 {
+  var x = x0;
+  var i = 0usize;
+  while i < chars.len() {
+    let c = chars[i];
+    let lowS = kbLowerOf(c);
+    let upS = if ups.len() > i { kbUpperOf(ups[i]) } else { kbUpperOf(c) };
+    let isLetter = (c >= 97u8 && c <= 122u8);
+    kbAdd(keys, if isLetter { upS.view() } else { lowS.view() }, lowS.view(), upS.view(), 0u32, x, y, 1.);
+    x = x + 1.;
+    i = i + 1usize;
+  }
+  x
+}
+
+fn kbLayout() VKeyList {
+  var k = VKeyList();
+  var x = kbRow(&mut k, "1234567890", "!@#$%^&*()", 0., 0.);
+  kbAdd(&mut k, "Bksp", "", "", 42u32, x, 0., 3.);
+  x = kbRow(&mut k, "qwertyuiop", "", 0., 1.);
+  x = kbRow(&mut k, "-_@", "", x, 1.);
+  x = kbRow(&mut k, "asdfghjkl", "", 0., 2.);
+  x = kbRow(&mut k, ":", "", x, 2.);
+  kbAdd(&mut k, "Enter", "", "", 40u32, x, 2., 3.);
+  kbAdd(&mut k, "Shift", "", "", 225u32, 0., 3., 2.);
+  x = kbRow(&mut k, "zxcvbnm", "", 2., 3.);
+  x = kbRow(&mut k, ",.?/", "", x, 3.);
+  kbAdd(&mut k, "Tab", "", "", 43u32, 0., 4., 2.);
+  kbAdd(&mut k, "Space", " ", " ", 0u32, 2., 4., 7.);
+  kbAdd(&mut k, "<", "", "", 80u32, 9., 4., 1.);
+  kbAdd(&mut k, "^", "", "", 82u32, 10., 4., 1.);
+  kbAdd(&mut k, "v", "", "", 81u32, 11., 4., 1.);
+  kbAdd(&mut k, ">", "", "", 79u32, 12., 4., 1.);
+  k
+}
+
+struct VKeys {
+  pass: PagePass;                 // the keyboard's picture, depth tested
+  mark: PagePass;                 // a white 2 x 2 for the flash and the Shift light
+  keys: VKeyList;
+  img: Image;                     // the picture, put together a few keys a frame
+  built: usize;                   // keys drawn into it so far
+  ready: bool;                    // uploaded
+  alpha: f32;                     // how visible it is (fades with 'want')
+  want: bool;
+  placed: bool;
+  pos: Vec3;
+  yaw: f32;
+  shift: bool;
+  flashIdx: i32;
+  flashAt: u64;
+  mode: u32;                      // 0 follows the focus, 1 shown by the palette's keyboard icon, 2 hidden by it
+  sig: u32;                       // what the keyboard was last placed for (0 nothing, 1 the laptop, 2 + a page)
+
+  fn create(device: &mut Device, format: u32) VKeys {
+    var mark = PagePass.create(device, format);
+    var px = List[u8].withCapacity(16usize);
+    var i = 0;
+    while i < 4 { px.push(255u8); px.push(255u8); px.push(255u8); px.push(255u8); i = i + 1; }
+    mark.uploadRgba(device, 2u32, 2u32, &px);
+    let w = KB_COLS * KB_CELL;
+    let h = KB_ROWS * KB_CELL;
+    var img = Image(i32.from(w), i32.from(h), 3, List[u8].withCapacity(usize.from(w * h * 3u32)));
+    var n = usize.from(w * h);
+    var p = 0usize;
+    while p < n { img.pixels.push(14u8); img.pixels.push(18u8); img.pixels.push(26u8); p = p + 1usize; }
+    VKeys(PagePass.createDepth(device, format), mark, kbLayout(), img, 0usize, false, 0., false, false, Vec3(0., 0., 0.), 0., false, -1i32, 0u64, 0u32, 0u32)
+  }
+
+  fn halfW(self: &) f32 { f32.from(KB_COLS) * KB_UNIT * 0.5 }
+  fn halfH(self: &) f32 { f32.from(KB_ROWS) * KB_UNIT * 0.5 }
+
+  // A key's rectangle in the keyboard's own frame (x0, y0, x1, y1; y up)
+  fn keyRect(self: &, i: usize) Vec4 {
+    let k = &keys[i];
+    let x0 = 0. - self.halfW() + k.x * KB_UNIT;
+    let y1 = self.halfH() - k.y * KB_UNIT;
+    Vec4(x0, y1 - KB_UNIT, x0 + k.w * KB_UNIT, y1)
+  }
+
+  fn model(self: &) Mat4 {
+    Mat4.fromTrs(pos, Quat.angleAxis(yaw, Vec3(0., 1., 0.)) * Quat.angleAxis(0. - KB_TILT, Vec3(1., 0., 0.)), Vec3(1., 1., 1.))
+  }
+
+  // In front of the eye toward 'target' (a screen's middle), below it, turned to face the eye
+  pub fn place(self: &mut, eye: Vec3, target: Vec3) {
+    var f = Vec3(target.x - eye.x, 0., target.z - eye.z);
+    if f.length() < 0.01 { f = Vec3(0., 0., -1.); }
+    f = f.normalize();
+    pos = Vec3(eye.x + f.x * KB_AHEAD, eye.y - KB_BELOW, eye.z + f.z * KB_AHEAD);
+    yaw = atan2(0. - f.x, 0. - f.z);
+    placed = true;
+  }
+
+  // A few keys of the picture a frame: each legend by the label font, centred in its cell
+  pub fn step(self: &mut, device: &mut Device, lab: &mut Labeller, most: usize) usize {
+    var done = 0usize;
+    while !ready && built < keys.len() && done < most {
+      let k = &keys[built];
+      let special = k.sc != 0u32 && k.sc != 225u32;
+      let isText = k.low.len() > 0usize;
+      let bg = if k.sc == 225u32 || special { 0x4a3a78u32 } else { 0x2c3a52u32 };
+      let x0 = i32.from(u32.from(k.x * f32.from(KB_CELL))) + 4;
+      let y0 = i32.from(u32.from(k.y * f32.from(KB_CELL))) + 4;
+      let x1 = i32.from(u32.from((k.x + k.w) * f32.from(KB_CELL))) - 4;
+      let y1 = i32.from(u32.from((k.y + 1.) * f32.from(KB_CELL))) - 4;
+      paint(&mut img, x0, y0, x1, y1, bg);
+      let size: f32 = if k.label.len() > 1usize { 50. } else { 84. };
+      let src = lab.image(device, k.label.view(), (bg << 8u32) | 255u32, 0xf2f6ffffu32, size, 22.);
+      kbBlit(&mut img, &src, bg, (x0 + x1) / 2, (y0 + y1) / 2);
+      built = built + 1usize;
+      done = done + 1usize;
+    }
+    if !ready && built >= keys.len() {
+      pass.upload(device, &img);
+      ready = true;
+      img = Image(0, 0, 3, List[u8]());
+      print <- "keyboard: picture made ("; print <- built; print <- " keys)\n";
+    }
+    done
+  }
+
+  // Which key a ray meets (-1: none). Only while the keyboard is shown.
+  pub fn hit(self: &, eye: Vec3, dir: Vec3) i32 {
+    if !ready || alpha < 0.5 || !placed { return -1i32; }
+    let inv = self.model().inverse();
+    let e = inv * eye;
+    let d = inv.transformVector(dir);
+    if d.z > -0.00001 && d.z < 0.00001 { return -1i32; }
+    let t = (0. - e.z) / d.z;
+    if t <= 0. { return -1i32; }
+    let p = e + d * t;
+    var i = 0usize;
+    while i < keys.len() {
+      let r = self.keyRect(i);
+      // (the whole 7 cm unit counts: the gap between two keys goes to the nearer of them rather than to nothing)
+      if p.x >= r.x - 0.0035 && p.x <= r.z + 0.0035 && p.y >= r.y - 0.0035 && p.y <= r.w + 0.0035 { return i32.from(u32.from(i)); }
+      i = i + 1usize;
+    }
+    -1i32
+  }
+
+  // How far along the ray the keyboard's plate is met, or -1
+  pub fn reach(self: &, eye: Vec3, dir: Vec3) f32 {
+    if !ready || alpha < 0.5 || !placed { return -1.; }
+    let inv = self.model().inverse();
+    let e = inv * eye;
+    let d = inv.transformVector(dir);
+    if d.z > -0.00001 && d.z < 0.00001 { return -1.; }
+    let t = (0. - e.z) / d.z;
+    if t <= 0. { return -1.; }
+    let p = e + d * t;
+    if p.x >= 0. - self.halfW() && p.x <= self.halfW() && p.y >= 0. - self.halfH() && p.y <= self.halfH() { t } else { -1. }
+  }
+
+  pub fn flash(self: &mut, i: i32) { flashIdx = i; flashAt = nowMs(); }
+
+  pub fn fade(self: &mut, dt: f32) {
+    alpha = fadeToward(alpha, if want { 1. } else { 0. }, dt);
+  }
+
+  pub fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4) {
+    if !ready || alpha < 0.01 || !placed { return; }
+    let m = vp * self.model();
+    let hw = self.halfW();
+    let hh = self.halfH();
+    pass.drawFaded(device, encoder, target, depth, m, Vec4(0. - hw, 0. - hh, hw, hh), alpha);
+    // Shift lit while it waits for a key
+    if shift {
+      var i = 0usize;
+      while i < keys.len() {
+        if keys[i].sc == 225u32 { let r = self.keyRect(i); mark.drawFaded(device, encoder, target, depth, m, Vec4(r.x + 0.002, r.y + 0.002, r.z - 0.002, r.w - 0.002), 0.4 * alpha); }
+        i = i + 1usize;
+      }
+    }
+    if flashIdx >= 0 {
+      let age = nowMs() - flashAt;
+      if age < KB_FLASH_MS {
+        let r = self.keyRect(usize.from(u32.from(flashIdx)));
+        mark.drawFaded(device, encoder, target, depth, m, Vec4(r.x + 0.002, r.y + 0.002, r.z - 0.002, r.w - 0.002), 0.75 * alpha * (1. - f32.from(age) / f32.from(KB_FLASH_MS)));
+      } else { flashIdx = -1i32; }
+    }
+  }
+}
+
+// A legend's pixels, cropped to the part that differs from the key's colour, into 'dst' centred on (cx, cy) (rows from the top)
+fn kbBlit(dst: &mut Image, src: &Image, bg: u32, cx: i32, cy: i32) {
+  let br = i32.from((bg >> 16u32) & 255u32);
+  let bgn = i32.from((bg >> 8u32) & 255u32);
+  let bb = i32.from(bg & 255u32);
+  var minX = src.width; var minY = src.height; var maxX = -1; var maxY = -1;
+  var y = 0;
+  while y < src.height {
+    var x = 0;
+    while x < src.width {
+      let o = usize.from(u32.from((src.height - 1 - y) * src.width + x) * 3u32);
+      let dr = i32.from(*src.pixels[o]) - br;
+      let dg = i32.from(*src.pixels[o + 1usize]) - bgn;
+      let db = i32.from(*src.pixels[o + 2usize]) - bb;
+      if dr * dr + dg * dg + db * db > 600 {
+        if x < minX { minX = x; }
+        if x > maxX { maxX = x; }
+        if y < minY { minY = y; }
+        if y > maxY { maxY = y; }
+      }
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  if maxX < 0 { return; }
+  let bw = maxX - minX + 1;
+  let bh = maxY - minY + 1;
+  y = 0;
+  while y < bh {
+    var x = 0;
+    while x < bw {
+      let tx = cx - bw / 2 + x;
+      let ty = cy - bh / 2 + y;
+      if tx >= 0 && tx < dst.width && ty >= 0 && ty < dst.height {
+        let so = usize.from(u32.from((src.height - 1 - (minY + y)) * src.width + minX + x) * 3u32);
+        let d = usize.from(u32.from((dst.height - 1 - ty) * dst.width + tx) * 3u32);
+        dst.pixels.set(d, *src.pixels[so]);
+        dst.pixels.set(d + 1usize, *src.pixels[so + 1usize]);
+        dst.pixels.set(d + 2usize, *src.pixels[so + 2usize]);
+      }
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+}
