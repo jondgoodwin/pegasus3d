@@ -131,6 +131,53 @@ struct PalSetCfg {
   icons: List[String];
 }
 
+// [workspace.ID] and [workspace.ID.item.N]: a work item's whole set (WI\incubator-world.md, "Workspaces"). Each item: source (doc: url: tree:
+// mermaid: world: app:), place ("at:x,y,z", or ring:N for a 3-D item), yaw_deg and scale_pct (3-D items). The workspace: name, place
+// ("shelf:Q", the slot its spine takes on the shelf of 'zone' when folded), zone ("cone" / "web3d"; empty: 3D Web), at.
+struct WsItemCfg {
+  n: i64;
+  source: String;
+  place: String;
+  yaw: i64;
+  hasYaw: bool;
+  scale: i64;
+  hasScale: bool;
+}
+
+struct WsCfg {
+  id: String;
+  name: String;
+  place: String;
+  zone: String;
+  at: String;
+  items: List[WsItemCfg];
+}
+
+fn newWs(id: &str) WsCfg {
+  WsCfg(String.from(id), String(), String(), String(), String(), List[WsItemCfg]())
+}
+
+fn copyWsItem(t: &WsItemCfg) WsItemCfg {
+  WsItemCfg(t.n, String.from(t.source.view()), String.from(t.place.view()), t.yaw, t.hasYaw, t.scale, t.hasScale)
+}
+
+fn copyWs(w: &WsCfg) WsCfg {
+  var o = newWs(w.id.view());
+  o.name = String.from(w.name.view()); o.place = String.from(w.place.view()); o.zone = String.from(w.zone.view()); o.at = String.from(w.at.view());
+  var i = 0usize;
+  while i < w.items.len() {
+    let t = &w.items[i];
+    o.items.push(WsItemCfg(t.n, String.from(t.source.view()), String.from(t.place.view()), t.yaw, t.hasYaw, t.scale, t.hasScale));
+    i = i + 1usize;
+  }
+  o
+}
+
+fn wsSourceOk(s: &str) bool {
+  startsWithText(s, "doc:") || startsWithText(s, "url:") || startsWithText(s, "tree:") || startsWithText(s, "mermaid:")
+    || startsWithText(s, "world:") || startsWithText(s, "app:")
+}
+
 alias Folders = List[FolderCfg];
 alias PageCfgs = List[PageCfg];
 
@@ -155,11 +202,13 @@ struct Parsed {
   trees: List[TreeCfg];  // [tree.ID] (room.toml)
   marks: List[MarkCfg];  // [mark.ID] (room.toml): what is on the shelves, place "shelf:Q" (slot Q of its domain's shelf)
   seeded: List[String];  // [seeded] zones = [..] (room.toml): the shelves already seeded from their plans
+  workspaces: List[WsCfg];  // [workspace.ID] (both files)
+  wsOpen: String;           // [workspaces] open = "ID" (room.toml): the workspace open when the room was left
 }
 
 fn newParsed() Parsed {
   Parsed(true, String(), List[ProjCfg](), 0i64, 0i64, 0i64, String(), List[String](), List[String](), Folders(), PageCfgs(),
-    List[PanelCfg](), List[ShelfCfg](), List[PalSetCfg](), String(), List[ZoneCfg](), List[TreeCfg](), List[MarkCfg](), List[String]())
+    List[PanelCfg](), List[ShelfCfg](), List[PalSetCfg](), String(), List[ZoneCfg](), List[TreeCfg](), List[MarkCfg](), List[String](), List[WsCfg](), String())
 }
 
 // A place, parsed
@@ -263,6 +312,7 @@ fn knownAction(a: &str) bool {
   if a == "zoom" || a == "zoomout" || a == "shelve" || a == "bring" || a == "open" || a == "talk" || a == "back" || a == "forward" { return true; }
   if a == "files" || a == "reload" || a == "play" || a == "restart" || a == "legend" || a == "follow" || a == "timing" || a == "server" { return true; }
   if a == "step:+1" || a == "step:-1" || a == "scenario:+1" || a == "scenario:-1" { return true; }
+  if a.len() > 3usize && a.slice(0usize, 3usize) == "ws-" { return true; }
   if a.len() > 5usize && a.slice(0usize, 5usize) == "link:" { return true; }
   if a.len() > 4usize && a.slice(0usize, 4usize) == "say:" { return true; }
   if a.len() > 9usize && a.slice(0usize, 9usize) == "scenario:" {
@@ -297,6 +347,9 @@ fn checkKeys(p: &mut Parsed, file: &str, t: &toml.Table, kind: u32, tname: &str)
       }
       else if kind == 12u32 { k == "open" }
       else if kind == 13u32 { k == "zones" }
+      else if kind == 15u32 { k == "name" || k == "place" || k == "zone" || k == "at" }
+      else if kind == 16u32 { k == "source" || k == "place" || k == "yaw_deg" || k == "scale_pct" }
+      else if kind == 17u32 { k == "open" }
       else if kind == 14u32 { k == "src" || k == "name" || k == "place" || k == "at" }
       else { k == "place" || k == "yaw_deg" || k == "width_cm" };
     if !good {
@@ -327,6 +380,13 @@ fn tableInt(p: &mut Parsed, file: &str, t: &toml.Table, key: &str, has: &mut boo
       cfgFail(p, file, t.lineOf(key), m.view());
     }
   }
+}
+
+fn findWs(p: &mut Parsed, id: &str) usize {
+  var i = 0usize;
+  while i < p.workspaces.len() { if p.workspaces[i].id.view() == id { return i; } i = i + 1usize; }
+  p.workspaces.push(newWs(id));
+  p.workspaces.len() - 1usize
 }
 
 fn findProj(p: &mut Parsed, id: &str) usize {
@@ -468,6 +528,44 @@ fn parseConfig(text: &str, file: &str) Parsed {
           if src.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a mark needs a src (a file or an address)"); }
           p.marks.push(MarkCfg(String.from(seg[1usize].view()), src, tableText(&doc[nm], "name"), tableText(&doc[nm], "place"), tableText(&doc[nm], "at")));
         }
+        else if seg[0usize].view() == "workspace" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 15u32, nm);
+          let wi = findWs(&mut p, seg[1usize].view());
+          p.workspaces[wi].name = tableText(&doc[nm], "name");
+          p.workspaces[wi].place = tableText(&doc[nm], "place");
+          p.workspaces[wi].zone = tableText(&doc[nm], "zone");
+          p.workspaces[wi].at = tableText(&doc[nm], "at");
+          let wp = p.workspaces[wi].place.clone();
+          var wsq = 0u32;
+          if wp.len() > 0usize && (!startsWithText(wp.view(), "shelf:") || !cfgDigits(wp.slice(6usize, wp.len()), &mut wsq)) {
+            cfgFail(&mut p, file, doc[nm].lineOf("place"), "a workspace's place is shelf:Q (a slot of its zone's shelf)");
+          }
+        }
+        else if seg[0usize].view() == "workspace" && seg.len() == 4usize && seg[2usize].view() == "item" {
+          checkKeys(&mut p, file, &doc[nm], 16u32, nm);
+          let wi = findWs(&mut p, seg[1usize].view());
+          var num = 0u32;
+          if !cfgDigits(seg[3usize].view(), &mut num) { cfgFail(&mut p, file, doc[nm].line, "a workspace item is [workspace.ID.item.N] with N a number"); }
+          let src = tableText(&doc[nm], "source");
+          if !wsSourceOk(src.view()) { cfgFail(&mut p, file, doc[nm].line, "a workspace item needs a source: doc: url: tree: mermaid: world: or app:"); }
+          let ipl = tableText(&doc[nm], "place");
+          if ipl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(ipl.view(), &mut pp) { cfgFail(&mut p, file, doc[nm].lineOf("place"), "an item's place is at:x,y,z (or ring:N for a 3-D item)"); }
+          }
+          var hy = false; var yy = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          var hs = false; var ss = 100i64;
+          tableInt(&mut p, file, &doc[nm], "scale_pct", &mut hs, &mut ss);
+          if hs && (ss < 10i64 || ss > 1000i64) { cfgFail(&mut p, file, doc[nm].lineOf("scale_pct"), "scale_pct must be from 10 to 1000"); }
+          var at = p.workspaces[wi].items.len();
+          while at > 0usize && p.workspaces[wi].items[at - 1usize].n > i64.from(num) { at = at - 1usize; }
+          p.workspaces[wi].items.insert(at, WsItemCfg(i64.from(num), src, ipl, yy, hy, ss, hs));
+        }
+        else if nm == "workspaces" {
+          checkKeys(&mut p, file, &doc[nm], 17u32, nm);
+          p.wsOpen = tableText(&doc[nm], "open");
+        }
         else if nm == "seeded" {
           checkKeys(&mut p, file, &doc[nm], 13u32, nm);
           match doc[nm].getStrings("zones") { case let Some(r) { p.seeded = r; } else {} }
@@ -527,7 +625,7 @@ fn parseConfig(text: &str, file: &str) Parsed {
           match doc[nm].getStrings("open") { case let Some(r) { open = r; } else {} }
           p.trees.push(TreeCfg(String.from(seg[1usize].view()), open));
         }
-        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, screens, folder, page, mark, seeded, palette, line, browser, zone, tree)"); }
+        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, screens, folder, page, mark, workspace, workspaces, seeded, palette, line, browser, zone, tree)"); }
         n = n + 1usize;
       }
     }
@@ -655,6 +753,12 @@ fn extrasText(r: &Parsed) String {
     s.append("at = "); s.append(tomlStr(g.at.view()).view()); s.append("\n");
     i = i + 1usize;
   }
+  i = 0usize;
+  while i < r.workspaces.len() {
+    s.append(wsText(&r.workspaces[i]).view());
+    i = i + 1usize;
+  }
+  if r.wsOpen.len() > 0usize { s.append("\n[workspaces]\nopen = "); s.append(tomlStr(r.wsOpen.view()).view()); s.append("\n"); }
   if r.seeded.len() > 0usize {
     s.append("\n[seeded]\nzones = [");
     var q0 = 0usize;
@@ -683,6 +787,25 @@ fn extrasText(r: &Parsed) String {
       q = q + 1usize;
     }
     s.append("]\n");
+    i = i + 1usize;
+  }
+  s
+}
+
+fn wsText(w: &WsCfg) String {
+  var s = String.from("\n[workspace."); s.append(w.id.view()); s.append("]\n");
+  s.append("name = "); s.append(tomlStr(w.name.view()).view()); s.append("\n");
+  if w.place.len() > 0usize { s.append("place = "); s.append(tomlStr(w.place.view()).view()); s.append("\n"); }
+  if w.zone.len() > 0usize { s.append("zone = "); s.append(tomlStr(w.zone.view()).view()); s.append("\n"); }
+  s.append("at = "); s.append(tomlStr(w.at.view()).view()); s.append("\n");
+  var i = 0usize;
+  while i < w.items.len() {
+    let t = &w.items[i];
+    s.append("\n[workspace."); s.append(w.id.view()); s.append(".item."); s.append(numText(i64.from(i + 1usize)).view()); s.append("]\n");
+    s.append("source = "); s.append(tomlStr(t.source.view()).view()); s.append("\n");
+    if t.place.len() > 0usize { s.append("place = "); s.append(tomlStr(t.place.view()).view()); s.append("\n"); }
+    if t.hasYaw { s.append("yaw_deg = "); s.append(intText(t.yaw).view()); s.append("\n"); }
+    if t.hasScale { s.append("scale_pct = "); s.append(intText(t.scale).view()); s.append("\n"); }
     i = i + 1usize;
   }
   s

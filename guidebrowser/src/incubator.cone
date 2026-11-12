@@ -375,6 +375,12 @@ pub struct Incubator {
   brwPos: Vec3;
   brwYaw: f32;
   browserMade: bool;
+  wsList: List[WsCfg];                       // workspaces: the effective list (incubator.toml overlaid by room.toml, the newer 'at' of a whole workspace winning)
+  wsOpen: String;                            // the open workspace's id, or empty
+  wsItems: List[String];                     // ids of the 3-D items that are members of the open one
+  wsPending: List[WsItemCfg];                // pages of the open one yet to be opened (one every 300 ms)
+  wsWant: String;                            // an action asked for ("ws-open:ID", "ws-fold", "ws-add", "ws-drop", "ws-new:NAME"), served in update
+  wsAutoAdd: String;                         // a new note made while a workspace is open joins it
   zoneSeen: bool = false;
   benchN: u32 = 0u32;                 // pages opened from a board's tree so far (where the next stands on the workbench)
   tabCur: u32 = 0u32;                 // the general browser: the number of the tab shown (0: no tabs)
@@ -387,6 +393,13 @@ pub struct Incubator {
   notesMade: u32 = 0u32;
   voiceWant: u32 = 0u32;              // the palette's voice icons asked for this act (1 record / pause, 2 send, 3 clear); the shell serves it
   kb: Option[VKeys] = None;           // the virtual keyboard (vkeys.cone, input.cone)
+  // workspaces (WI\incubator-world.md): the effective list (incubator.toml overlaid by room.toml, the newer 'at' of a whole workspace winning)
+  // (wsList, wsOpen, wsItems, wsPending, wsWant, wsAutoAdd stand after browserMade: they have no constant default)
+  wsPendAt: u64 = 0u64;
+  wsMaking: bool = false;                    // pages being opened now are members
+  wsReseed: bool = false;                    // the open workspace's table changed in incubator.toml: not captured over, applied at the next open
+  wsSerial: u32 = 0u32;
+  cmdPoll: u64 = 0u64;
 
   pub fn empty() Incubator {
     Incubator(false, None, List[Item](), List[i32](), List[i32](), List[Label](), List[Label](), List[Card](), String(), 0u64, 0u32,
@@ -398,7 +411,8 @@ pub struct Incubator {
       None, 0u32, 0u32, false,
       Pgs(), List[Label](), FolderPosts(), -1, 3., Vec3(0., 0., 0.), Vec3(0., 0., 0. - 1.), 0u32, 0u64, PageCfgs(), 0u64, String(),
       false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., 16u32, 8u32, false, None, 0u32, -1, Palette.empty(), -1, false, List[Zone](), None, String(), String(), String(), String(),
-      List[Mark](), 0u32, false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., false)
+      List[Mark](), 0u32, false, Vec3(0., 0., 0.), 0., false, Vec3(0., 0., 0.), 0., false,
+      List[WsCfg](), String(), List[String](), List[WsItemCfg](), String(), String())
   }
 
   pub fn create(device: &mut Device, renderer: &mut Renderer, format: u32, cfgDir: &str, docPath: &str) Incubator {
@@ -644,6 +658,7 @@ pub struct Incubator {
     self.serveReport(device, renderer);
     self.tickBrowser(device, renderer);
     self.cfgTick(device, renderer, now);
+    self.wsTick(device, renderer, now);
     self.tickZones(device, renderer, dt, now);
     self.tickPages(device, renderer, dt);
     self.palTick(device, dt, now);
@@ -1383,6 +1398,10 @@ pub struct Incubator {
     self.applyZones(device);
     self.syncMarkers(device);
     if first { self.loadMarks(device); }
+    self.wsRefresh(device);
+    if first && roomGood.wsOpen.len() > 0usize {
+      wsWant = String.from("ws-open:"); wsWant.append(roomGood.wsOpen.view());
+    }
     if first {
       // the pages the room had open, to be opened one at a time (each costs a document panel)
       var r = 0usize;
@@ -1740,6 +1759,8 @@ pub struct Incubator {
 
   fn writeRoom(self: &mut) {
     writeAt = 0u64;
+    self.wsCapture();
+    self.wsMarkPlaces();
     let text = roomText(&roomGood);
     if writeAtomic(cfgDir.view(), "room.toml", text.view()) {
       roomSeen = String.from(text.view());
@@ -2533,7 +2554,7 @@ pub struct Incubator {
   fn standing(self: &) usize {
     var n = 0usize;
     var i = 0usize;
-    while i < pgs.len() { if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 && !pgs[i].tab { n = n + 1usize; } i = i + 1usize; }
+    while i < pgs.len() { if !pgs[i].shelved && !pgs[i].gone && pgs[i].zone < 0 && !pgs[i].tab && !pgs[i].ws { n = n + 1usize; } i = i + 1usize; }
     n
   }
 
@@ -2596,7 +2617,7 @@ pub struct Incubator {
       var old = pgs.len();
       var i = 0usize;
       while i < pgs.len() {
-        if !pgs[i].gone && pgs[i].zone < 0 && !pgs[i].tab && (old == pgs.len() || pgs[i].born < pgs[old].born) { old = i; }
+        if !pgs[i].gone && pgs[i].zone < 0 && !pgs[i].tab && !pgs[i].ws && (old == pgs.len() || pgs[i].born < pgs[old].born) { old = i; }
         i = i + 1usize;
       }
       if old == pgs.len() { return; }
@@ -2623,7 +2644,7 @@ pub struct Incubator {
     var order = List[usize]();
     var i = 0usize;
     while i < pgs.len() {
-      if !pgs[i].gone && !pgs[i].proj && pgs[i].zone < 0 && !pgs[i].tab {
+      if !pgs[i].gone && !pgs[i].proj && pgs[i].zone < 0 && !pgs[i].tab && !pgs[i].ws {
         var at = order.len();
         while at > 0usize && pgs[*order[at - 1usize]].born > pgs[i].born { at = at - 1usize; }
         order.insert(at, i);
@@ -2680,6 +2701,13 @@ pub struct Incubator {
       palFocused = false;
       webPanelText(true);
     }
+    if n >= 0 && wsAutoAdd.view() == src {
+      // a new note made while a workspace is open joins it
+      wsAutoAdd = String();
+      (&mut pgs[usize.from(u32.from(n))]).ws = true;
+      (&mut pgs[usize.from(u32.from(n))]).free = true;
+      writeAt = nowMs() + 1000u64;
+    }
     if n >= 0 {
       // it stands in the work area's arc (openPageAs set it going there); the room remembers it
       self.retarget();
@@ -2717,6 +2745,8 @@ pub struct Incubator {
     pgs.push(Pg(pid, String.from(src), web, doc, wp, tl, chips, born, from, yaw0, 0.3, from, yaw0, 0.3, from, yaw0, 1., String()));
     let n = pgs.len() - 1usize;
     (&mut pgs[n]).proj = proj;
+    (&mut pgs[n]).ws = wsMaking;
+    if wsMaking { (&mut pgs[n]).free = true; }
     if tabNext && web {
       tabSerial = tabSerial + 1u32;
       (&mut pgs[n]).tab = true; (&mut pgs[n]).tabNo = tabSerial; (&mut pgs[n]).free = true;
@@ -4199,6 +4229,7 @@ pub struct Incubator {
 
   // 0 a document, 1 a web page, 2 a diagram, 3 a code file
   fn markKindOf(src: &str) u32 {
+    if startsWithText(src, "ws:") { return 4u32; }
     if isWebSrc(src) { return 1u32; }
     let l = Incubator.lowerText(src);
     if findText(l.view(), "/diagrams/") < l.len() || Incubator.endsWithText(l.view(), ".mmd") { return 2u32; }
@@ -4210,7 +4241,7 @@ pub struct Incubator {
 
   fn mkMark(self: &mut, device: &mut Device, id: &str, src: &str, name: &str, zi: i32, q: i32) {
     let kind = Incubator.markKindOf(src);
-    let bgs = [0xf8f5eeffu32, 0xdcebf8ffu32, 0xe6dcf2ffu32, 0xdcefd9ffu32];
+    let bgs = [0xf8f5eeffu32, 0xdcebf8ffu32, 0xe6dcf2ffu32, 0xdcefd9ffu32, 0xf6cf7aFFu32];
     let lab = self.mkCard(device, name, bgs[usize.from(kind)], 0x1c1c1cffu32, SH_LABEL_W, SH_LABEL_W * 0.25);
     marks.push(Mark(String.from(id), String.from(src), String.from(name), zi, q, kind, lab, 0., false));
   }
@@ -4228,6 +4259,7 @@ pub struct Incubator {
     let now = isoUtc(unixMs());
     var m = 0usize;
     while m < marks.len() {
+      if startsWithText(marks[m].src.view(), "ws:") { m = m + 1usize; continue; }
       var pl = String.from("shelf:");
       pl.append(numText(i64.from(marks[m].q)).view());
       list.push(MarkCfg(marks[m].id.clone(), marks[m].src.clone(), marks[m].name.clone(), pl, String.from(now.view())));
@@ -4308,6 +4340,12 @@ pub struct Incubator {
   // A spine is taken off its shelf and its page opens in the work area; or, if 'close', it is just removed
   fn takeMark(self: &mut, m: usize, open: bool) {
     if m >= marks.len() { return; }
+    if startsWithText(marks[m].src.view(), "ws:") {
+      // a workspace's spine: taking it opens the workspace (which folds the open one); it is not removed by its close button
+      if open { wsWant = String.from("ws-open:"); wsWant.append(marks[m].src.slice(3usize, marks[m].src.len())); }
+      else { print <- "workspaces: a workspace's spine goes only when its table is removed from the file\n"; }
+      return;
+    }
     print <- "shelf: "; printStr(marks[m].name.view()); print <- (if open { " restored to the work area\n" } else { " removed\n" });
     if open {
       // (Jon, 11 Nov; hard-coded for now) a spine about the knight, the amphora or the architecture walk brings the thing itself
@@ -4320,6 +4358,457 @@ pub struct Incubator {
     }
     var dead = marks.swapRemove(m);
     self.syncMarks();
+  }
+
+  // ---- workspaces (WI\incubator-world.md, "Workspaces: the work area holds one work item's whole set") ----
+  // One is open at a time. Its members are free-standing pages (Pg.ws) and the 3-D items named in wsItems. Folding records each member's
+  // place into the workspace's table (room.toml), closes the pages, shelves the items and leaves ONE spine on the shelf; opening
+  // puts every member back where it stood. The standing stations (boards, laptop, Files) are never members.
+
+  fn wsIndex(self: &, id: &str) i32 {
+    var i = 0usize;
+    while i < wsList.len() { if wsList[i].id.view() == id { return i32.from(i); } i = i + 1usize; }
+    -1
+  }
+
+  fn wsName(self: &, wu: usize) String {
+    if wsList[wu].name.len() > 0usize { wsList[wu].name.clone() } else { wsList[wu].id.clone() }
+  }
+
+  // The effective list: each workspace from the file whose table has the newer 'at' (the room's, if equal); room-only ones too
+  fn wsRefresh(self: &mut, device: &mut Device) {
+    var out = List[WsCfg]();
+    var i = 0usize;
+    while i < incubatorGood.workspaces.len() {
+      var pick = copyWs(&incubatorGood.workspaces[i]);
+      var r = 0usize;
+      while r < roomGood.workspaces.len() {
+        if roomGood.workspaces[r].id.view() == pick.id.view() && roomGood.workspaces[r].at.view() >= incubatorGood.workspaces[i].at.view() { pick = copyWs(&roomGood.workspaces[r]); }
+        r = r + 1usize;
+      }
+      out.push(pick);
+      i = i + 1usize;
+    }
+    var r = 0usize;
+    while r < roomGood.workspaces.len() {
+      var have = false;
+      var q = 0usize;
+      while q < out.len() { if out[q].id.view() == roomGood.workspaces[r].id.view() { have = true; } q = q + 1usize; }
+      if !have { out.push(copyWs(&roomGood.workspaces[r])); }
+      r = r + 1usize;
+    }
+    if wsOpen.len() > 0usize {
+      // the open one: a changed table is noted, and applied at the next open (what is standing is the truth until it is folded)
+      let wi = self.wsIndex(wsOpen.view());
+      var q = 0usize;
+      while q < out.len() {
+        if out[q].id.view() == wsOpen.view() {
+          if wi >= 0 && wsText(&out[q]).view() != wsText(&wsList[usize.from(u32.from(wi))]).view() {
+            wsReseed = true;
+            print <- "workspaces: "; printStr(wsOpen.view()); print <- " changed in a file while open; it applies when next opened\n";
+          }
+          if wi >= 0 && !wsReseed { out.set(q, copyWs(&wsList[usize.from(u32.from(wi))])); }
+        }
+        q = q + 1usize;
+      }
+    }
+    // keep the open one's live table (a refresh must not undo captured moves)
+    wsList = out;
+    // spines: one for each folded workspace; none for a workspace that is gone
+    var m = marks.len();
+    while m > 0usize {
+      m = m - 1usize;
+      if startsWithText(marks[m].src.view(), "ws:") {
+        let id = marks[m].src.slice(3usize, marks[m].src.len());
+        let wi = self.wsIndex(id);
+        if wi < 0 || id == wsOpen.view() { var dead = marks.swapRemove(m); }
+        else if marks[m].name.view() != self.wsName(usize.from(u32.from(wi))).view() { (&mut marks[m]).name = self.wsName(usize.from(u32.from(wi))); (&mut marks[m]).label.text = marks[m].name.clone(); (&mut marks[m]).label.ok = false; }
+      }
+    }
+    var w = 0usize;
+    while w < wsList.len() { if wsList[w].id.view() != wsOpen.view() { self.wsMakeMark(device, w); } w = w + 1usize; }
+  }
+
+  // A folded workspace's spine, at its remembered slot (or the first free one) on its zone's shelf
+  fn wsMakeMark(self: &mut, device: &mut Device, wu: usize) {
+    var src = String.from("ws:");
+    src.append(wsList[wu].id.view());
+    var mi = 0usize;
+    while mi < marks.len() { if marks[mi].src.view() == src.view() { return; } mi = mi + 1usize; }
+    var zi = -1;
+    if wsList[wu].zone.len() > 0usize {
+      var z = 0usize;
+      while z < zones.len() { if zones[z].id.view() == wsList[wu].zone.view() || zones[z].lineKey.view() == wsList[wu].zone.view() { zi = i32.from(z); } z = z + 1usize; }
+    }
+    if zi < 0 { zi = self.webZone(); }
+    if zi < 0 { return; }
+    let zu = usize.from(u32.from(zi));
+    var q = -1;
+    var want = 0u32;
+    let pl = wsList[wu].place.clone();
+    if startsWithText(pl.view(), "shelf:") && cfgDigits(pl.slice(6usize, pl.len()), &mut want) {
+      let qi = i32.from(want);
+      if qi < 3i32 * self.shelfCols(zu) && self.markAt(zu, qi) < 0 { q = qi; }
+    }
+    if q < 0 { q = self.freeSlot(zu); }
+    if q < 0 {
+      print <- "workspaces: "; printStr(zones[zu].name.view()); print <- "'s shelf is full; no spine for "; printStr(wsList[wu].id.view()); print <- "\n";
+      return;
+    }
+    let id = self.newMarkId();
+    let nm = self.wsName(wu);
+    self.mkMark(device, id.view(), src.view(), nm.view(), zi, q);
+  }
+
+  fn wsMirror(self: &mut, wu: usize) {
+    let w = copyWs(&wsList[wu]);
+    var i = 0usize;
+    while i < roomGood.workspaces.len() {
+      if roomGood.workspaces[i].id.view() == w.id.view() { roomGood.workspaces.set(i, w); writeAt = nowMs() + 1000u64; return; }
+      i = i + 1usize;
+    }
+    roomGood.workspaces.push(w);
+    writeAt = nowMs() + 1000u64;
+  }
+
+  // A spine moved on its shelf: the workspace remembers the slot (its 'at' does not change)
+  fn wsMarkPlaces(self: &mut) {
+    var m = 0usize;
+    while m < marks.len() {
+      if startsWithText(marks[m].src.view(), "ws:") {
+        let wi = self.wsIndex(marks[m].src.slice(3usize, marks[m].src.len()));
+        if wi >= 0 && marks[m].dom >= 0 {
+          let wu = usize.from(u32.from(wi));
+          var pl = String.from("shelf:");
+          pl.append(numText(i64.from(marks[m].q)).view());
+          let zid = zones[usize.from(u32.from(marks[m].dom))].id.clone();
+          if pl.view() != wsList[wu].place.view() || zid.view() != wsList[wu].zone.view() {
+            (&mut wsList[wu]).place = pl; (&mut wsList[wu]).zone = zid;
+            self.wsMirror(wu);
+          }
+        }
+      }
+      m = m + 1usize;
+    }
+  }
+
+  fn wsItemOfSource(self: &, src: &str) i32 {
+    if startsWithText(src, "app:") { return self.itemById(src.slice(4usize, src.len())); }
+    if startsWithText(src, "world:") {
+      var h = 0usize;
+      while h < src.len() && src[h] != '#' { h = h + 1usize; }
+      if h < src.len() {
+        let part = src.slice(h + 1usize, src.len());
+        var k = 0usize;
+        while k < items.len() { if items[k].part.view() == part && !items[k].isApp { return i32.from(k); } k = k + 1usize; }
+      }
+    }
+    NO_ITEM
+  }
+
+  fn wsSourceOfItem(self: &, k: usize) String {
+    var s = String();
+    if items[k].isApp { s.append("app:"); s.append(items[k].id.view()); }
+    else { s.append("world:incubator.ddd#"); s.append(items[k].part.view()); }
+    s
+  }
+
+  fn wsSourceOfPage(self: &, i: usize) String {
+    let s = pgs[i].src.view();
+    if startsWithText(s, TREE_PREFIX) { return String.from(s); }
+    var o = String.from(if pgs[i].web { "url:" } else { "doc:" });
+    o.append(s);
+    o
+  }
+
+  // what a page is opened from, given a member's source
+  fn wsPageTarget(src: &str) String {
+    if startsWithText(src, "tree:") { return String.from(src); }
+    if startsWithText(src, "mermaid:") { return String.from(src.slice(8usize, src.len())); }
+    String.from(src.slice(4usize, src.len()))
+  }
+
+  fn degText(rad: f32) i64 {
+    let d = rad * 180. / PI;
+    i64.from(i32.from(if d >= 0. { d + 0.5 } else { d - 0.5 }))
+  }
+
+  // The open workspace's table, re-read from what stands (called before room.toml is written and before folding)
+  fn wsCapture(self: &mut) {
+    if wsOpen.len() == 0usize || wsPending.len() > 0usize || wsReseed { return; }
+    let wi = self.wsIndex(wsOpen.view());
+    if wi < 0 { return; }
+    let wu = usize.from(u32.from(wi));
+    var fresh = copyWs(&wsList[wu]);
+    fresh.items = List[WsItemCfg]();
+    var keep = List[String]();
+    var n = 1i64;
+    var q = 0usize;
+    while q < wsItems.len() {
+      let k = self.itemById(wsItems[q].view());
+      if k >= 0 {
+        let ku = usize.from(u32.from(k));
+        // an item put back on its shelf has left the workspace
+        if items[ku].onTable || items[ku].free {
+          keep.push(wsItems[q].clone());
+          let sc = i64.from(i32.from(items[ku].mul * 100. + 0.5));
+          fresh.items.push(WsItemCfg(n, self.wsSourceOfItem(ku), self.placeText(ku), Incubator.degText(items[ku].yawShelf), true, sc, true));
+          n = n + 1i64;
+        }
+      }
+      q = q + 1usize;
+    }
+    wsItems = keep;
+    var order = List[usize]();
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].ws && !pgs[i].gone {
+        var at = order.len();
+        while at > 0usize && pgs[*order[at - 1usize]].born > pgs[i].born { at = at - 1usize; }
+        order.insert(at, i);
+      }
+      i = i + 1usize;
+    }
+    var o = 0usize;
+    while o < order.len() {
+      let k = *order[o];
+      var pt = String.from("at:");
+      pt.append(floatText(pgs[k].toPos.x).view()); pt.append(","); pt.append(floatText(pgs[k].toPos.y).view()); pt.append(","); pt.append(floatText(pgs[k].toPos.z).view());
+      fresh.items.push(WsItemCfg(n, self.wsSourceOfPage(k), pt, Incubator.degText(pgs[k].toYaw), true, i64.from(i32.from(pgs[k].toSc * 100. + 0.5)), true));
+      n = n + 1i64;
+      o = o + 1usize;
+    }
+    if wsText(&fresh).view() != wsText(&wsList[wu]).view() {
+      fresh.at = isoUtc(unixMs());
+      wsList.set(wu, fresh);
+      self.wsMirror(wu);
+    }
+  }
+
+  // Take workspace 'id' off the shelf. The open one folds first, by itself.
+  fn wsOpenNow(self: &mut, device: &mut Device, id: &str) bool {
+    let wi = self.wsIndex(id);
+    if wi < 0 { print <- "workspaces: no workspace '"; printStr(id); print <- "'\n"; return false; }
+    if wsOpen.view() == id { return true; }
+    if wsOpen.len() > 0usize { _ = self.wsFoldNow(device); }
+    let wu = usize.from(u32.from(wi));
+    var m = marks.len();
+    while m > 0usize {
+      m = m - 1usize;
+      if startsWithText(marks[m].src.view(), "ws:") && marks[m].src.slice(3usize, marks[m].src.len()) == id { var dead = marks.swapRemove(m); }
+    }
+    wsOpen = String.from(id);
+    roomGood.wsOpen = String.from(id);
+    wsReseed = false;
+    wsItems = List[String]();
+    wsPending = List[WsItemCfg]();
+    var i = 0usize;
+    while i < wsList[wu].items.len() {
+      let it = &wsList[wu].items[i];
+      let k = self.wsItemOfSource(it.source.view());
+      if startsWithText(it.source.view(), "world:") || startsWithText(it.source.view(), "app:") {
+        if k >= 0 {
+          let ku = usize.from(u32.from(k));
+          var pl = Place(0u32, 0u32, 0., 0., 0.);
+          applying = true;
+          if it.place.len() > 0usize && parsePlace(it.place.view(), &mut pl) { self.moveItem(ku, &pl, true); }
+          else if !items[ku].onTable && !items[ku].free { _ = self.bring(ku); }
+          if it.hasYaw { (&mut items[ku]).yawShelf = f32.from(i32.from(it.yaw)) * PI / 180.; }
+          if it.hasScale { (&mut items[ku]).mul = f32.from(i32.from(it.scale)) / 100.; }
+          applying = false;
+          wsItems.push(items[ku].id.clone());
+        } else { print <- "workspaces: "; printStr(it.source.view()); print <- " is not in this building (skipped)\n"; }
+      } else {
+        wsPending.push(WsItemCfg(it.n, it.source.clone(), it.place.clone(), it.yaw, it.hasYaw, it.scale, it.hasScale));
+      }
+      i = i + 1usize;
+    }
+    wsPendAt = nowMs();
+    writeAt = nowMs() + 1000u64;
+    print <- "workspaces: opened "; printStr(self.wsName(wu).view()); print <- " ("; print <- wsList[wu].items.len(); print <- " members)\n";
+    true
+  }
+
+  // Put the open workspace away as one spine on the shelf
+  fn wsFoldNow(self: &mut, device: &mut Device) bool {
+    if wsOpen.len() == 0usize { return false; }
+    let wi = self.wsIndex(wsOpen.view());
+    self.wsCapture();
+    if wi >= 0 && wsPending.len() == 0usize {
+      // (while pages were still opening, the table stays as it was)
+    }
+    wsPending = List[WsItemCfg]();
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].ws && !pgs[i].gone {
+        if focusPg == i32.from(i) { focusPg = -1; }
+        self.closePage(i);
+      }
+      i = i + 1usize;
+    }
+    var q = 0usize;
+    while q < wsItems.len() {
+      let k = self.itemById(wsItems[q].view());
+      if k >= 0 { _ = self.shelve(usize.from(u32.from(k))); }
+      q = q + 1usize;
+    }
+    let was = wsOpen.clone();
+    wsItems = List[String]();
+    wsOpen = String();
+    roomGood.wsOpen = String();
+    wsReseed = false;
+    if wi >= 0 {
+      self.wsMakeMark(device, usize.from(u32.from(wi)));
+      print <- "workspaces: folded "; printStr(self.wsName(usize.from(u32.from(wi))).view()); print <- "\n";
+    }
+    writeAt = nowMs() + 1000u64;
+    true
+  }
+
+  // "Add this": the focused page, else the selected item, else the newest page standing in the work area
+  fn wsAddNow(self: &mut) bool {
+    if wsOpen.len() == 0usize { print <- "workspaces: no workspace is open to add to\n"; return false; }
+    var pi = -1;
+    if focusPg >= 0 && usize.from(u32.from(focusPg)) < pgs.len() { pi = focusPg; }
+    var ok = false;
+    if pi >= 0 {
+      let i = usize.from(u32.from(pi));
+      if pgs[i].zone < 0 && !pgs[i].tab && !pgs[i].gone && !pgs[i].shelved { ok = true; } else { pi = -1; }
+    }
+    if pi < 0 && sel >= 0 {
+      let k = usize.from(u32.from(sel));
+      if !self.wsHasItem(items[k].id.view()) && !items[k].page {
+        if !items[k].onTable && !items[k].free { _ = self.bring(k); }
+        wsItems.push(items[k].id.clone());
+        print <- "workspaces: added "; printStr(items[k].name.view()); print <- "\n";
+        writeAt = nowMs() + 1000u64;
+        return true;
+      }
+    }
+    if pi < 0 {
+      var q = 0usize;
+      var best = pgs.len();
+      while q < pgs.len() { if !pgs[q].gone && !pgs[q].ws && pgs[q].zone < 0 && !pgs[q].tab && !pgs[q].shelved && (best == pgs.len() || pgs[q].born > pgs[best].born) { best = q; } q = q + 1usize; }
+      if best < pgs.len() { pi = i32.from(best); }
+    }
+    if pi < 0 { print <- "workspaces: nothing to add (focus a page or select an item)\n"; return false; }
+    let i = usize.from(u32.from(pi));
+    if pgs[i].ws { print <- "workspaces: "; printStr(pgs[i].title.text.view()); print <- " is already in it\n"; return false; }
+    (&mut pgs[i]).ws = true;
+    (&mut pgs[i]).free = true;
+    self.retarget();
+    self.syncRoom();
+    print <- "workspaces: added "; printStr(pgs[i].title.text.view()); print <- "\n";
+    writeAt = nowMs() + 1000u64;
+    true
+  }
+
+  fn wsHasItem(self: &, id: &str) bool {
+    var q = 0usize;
+    while q < wsItems.len() { if wsItems[q].view() == id { return true; } q = q + 1usize; }
+    false
+  }
+
+  // "Drop that": the focused page, else the selected item, leaves the workspace and stays where it stands
+  fn wsDropNow(self: &mut) bool {
+    if wsOpen.len() == 0usize { return false; }
+    if focusPg >= 0 && usize.from(u32.from(focusPg)) < pgs.len() {
+      let i = usize.from(u32.from(focusPg));
+      if pgs[i].ws && !pgs[i].gone {
+        (&mut pgs[i]).ws = false;
+        self.retarget();
+        self.syncRoom();
+        print <- "workspaces: dropped "; printStr(pgs[i].title.text.view()); print <- "\n";
+        writeAt = nowMs() + 1000u64;
+        return true;
+      }
+    }
+    if sel >= 0 {
+      let k = usize.from(u32.from(sel));
+      if self.wsHasItem(items[k].id.view()) {
+        var keep = List[String]();
+        var q = 0usize;
+        while q < wsItems.len() { if wsItems[q].view() != items[k].id.view() { keep.push(wsItems[q].clone()); } q = q + 1usize; }
+        wsItems = keep;
+        self.noteMoved(k);
+        print <- "workspaces: dropped "; printStr(items[k].name.view()); print <- "\n";
+        writeAt = nowMs() + 1000u64;
+        return true;
+      }
+    }
+    print <- "workspaces: nothing focused that is in the open workspace\n";
+    false
+  }
+
+  // A new, empty workspace (named, or "Workspace N"), opened; whatever is focused joins it
+  fn wsNewNow(self: &mut, device: &mut Device, name: &str) bool {
+    var id = String();
+    while true {
+      wsSerial = wsSerial + 1u32;
+      id = String.from("w"); id.append(numText(i64.from(wsSerial)).view());
+      if self.wsIndex(id.view()) < 0 { break; }
+    }
+    var w = newWs(id.view());
+    if name.len() > 0usize { w.name = String.from(name); }
+    else { w.name = String.from("Workspace "); w.name.append(numText(i64.from(wsSerial)).view()); }
+    w.at = isoUtc(unixMs());
+    wsList.push(w);
+    let wu = wsList.len() - 1usize;
+    self.wsMirror(wu);
+    _ = self.wsOpenNow(device, id.view());
+    _ = self.wsAddNow();
+    true
+  }
+
+  // Once a frame: the asked-for action, the pages of an opening workspace (one every 300 ms), and the command file
+  fn wsTick(self: &mut, device: &mut Device, renderer: &mut Renderer, now: u64) {
+    if now >= cmdPoll + 400u64 {
+      cmdPoll = now;
+      let cp = self.cfgPath("command.txt");
+      if fs.exists(&Path.from(cp.view())) {
+        match fs.readFile(&Path.from(cp.view())) {
+          case let Ok(t) {
+            var line = String.from(t.view());
+            var e = line.len();
+            while e > 0usize && (line[e - 1usize] == '\n' || line[e - 1usize] == '\r' || line[e - 1usize] == ' ') { e = e - 1usize; }
+            if e > 0usize && wsWant.len() == 0usize { wsWant = String.from(line.slice(0usize, e)); }
+          }
+          case is Err {}
+        }
+        _ = fs.removeFile(&Path.from(cp.view()));
+      }
+    }
+    if wsWant.len() > 0usize && applied {
+      let a = wsWant.clone();
+      wsWant = String();
+      print <- "workspaces: action "; printStr(a.view()); print <- "\n";
+      if startsWithText(a.view(), "ws-open:") { _ = self.wsOpenNow(device, a.slice(8usize, a.len())); }
+      else if a.view() == "ws-fold" { if !self.wsFoldNow(device) { print <- "workspaces: nothing is open\n"; } }
+      else if a.view() == "ws-add" { _ = self.wsAddNow(); }
+      else if a.view() == "ws-drop" { _ = self.wsDropNow(); }
+      else if startsWithText(a.view(), "ws-new") { _ = self.wsNewNow(device, if a.len() > 7usize { a.slice(7usize, a.len()) } else { "" }); }
+      else { print <- "workspaces: unknown action\n"; }
+    }
+    if wsPending.len() > 0usize && now >= wsPendAt {
+      let it = copyWsItem(&wsPending[0usize]);
+      var rest = List[WsItemCfg]();
+      var r = 1usize;
+      while r < wsPending.len() { rest.push(copyWsItem(&wsPending[r])); r = r + 1usize; }
+      wsPending = rest;
+      wsPendAt = now + 300u64;
+      wsMaking = true;
+      let target = Incubator.wsPageTarget(it.source.view());
+      let n = self.openPageAs(device, renderer, target.view(), "", false);
+      wsMaking = false;
+      if n >= 0 {
+        let nu = usize.from(u32.from(n));
+        var pl = Place(0u32, 0u32, 0., 0., 0.);
+        if it.place.len() > 0usize && parsePlace(it.place.view(), &mut pl) && pl.kind == 3u32 { (&mut pgs[nu]).toPos = Vec3(pl.x, pl.y, pl.z); }
+        else { (&mut pgs[nu]).toPos = Incubator.arcSpot(nu); }
+        self.retarget();
+        self.syncRoom();
+      }
+    }
   }
 
   // The metrics panel is hinged at the partition's outer edge and turned to the wall behind it. Its frame: x outward from the hinge
@@ -4924,6 +5413,31 @@ pub struct Incubator {
       }
       i = i + 1usize;
     }
+    // workspaces: Open for each folded one (on the room's set), and Add / Drop / Fold while one is open
+    if kind == "room" {
+      var w = 0usize;
+      while w < wsList.len() {
+        if wsList[w].id.view() != wsOpen.view() {
+          var line = String.from("layout-dashboard|Open: ");
+          line.append(wsList[w].name.view()); line.append("|ws-open:"); line.append(wsList[w].id.view());
+          out.push(line);
+        }
+        w = w + 1usize;
+      }
+    }
+    if wsOpen.len() > 0usize {
+      let member = (focusPg >= 0 && usize.from(u32.from(focusPg)) < pgs.len() && pgs[usize.from(u32.from(focusPg))].ws)
+        || (focusPg < 0 && sel >= 0 && self.wsHasItem(items[usize.from(u32.from(sel))].id.view()));
+      if member { out.push(String.from("trash|Drop from workspace|ws-drop")); }
+      else if kind != "room" { out.push(String.from("folder-plus|Add to workspace|ws-add")); }
+      out.push(String.from("archive|Fold workspace|ws-fold"));
+    } else if kind != "room" && (focusPg >= 0 || sel >= 0) {
+      out.push(String.from("layout-dashboard|New workspace|ws-new"));
+    }
+    let wsOpenCopy = wsOpen.clone();
+    let wsCount = numText(i64.from(wsList.len()));
+    sig.append("|ws:"); sig.append(wsOpenCopy.view()); sig.append(wsCount.view());
+    sig.append(if wsOpen.len() > 0usize && focusPg >= 0 && usize.from(u32.from(focusPg)) < pgs.len() && pgs[usize.from(u32.from(focusPg))].ws { "|m" } else { "|n" });
     if kind == "project" && sel >= 0 {
       let id = items[usize.from(u32.from(sel))].id.view();
       var pi = 0usize;
@@ -5017,6 +5531,7 @@ pub struct Incubator {
     var none = List[u8]();
     if let Err(e) = fs.writeFile(&Path.from(path.view()), none.view()) { print <- "notes: could not write "; printStr(path.view()); print <- ": "; print <- e; print <- "\n"; return false; }
     editOnOpen = path.clone();
+    if wsOpen.len() > 0usize { wsAutoAdd = path.clone(); }
     pageWant = String.from("bench:");
     pageWant.append(path.view());
     notesMade = notesMade + 1u32;
@@ -5097,6 +5612,53 @@ pub struct Incubator {
   pub fn testSrc(self: &, i: usize) String { if i < pgs.len() { pgs[i].src.clone() } else { String() } }
 
   // The page whose file name ends as given (the last such), or the page count if none
+  // Test hooks for workspaces: move a page (by the end of its source) or a 3-D item (by id) as the hand would, centimeters offset by 1000
+  pub fn testMovePage(self: &mut, suffix: &str, xc: usize, zc: usize) {
+    let i = self.testPageIdx(suffix);
+    if i >= pgs.len() { print <- "test: no page ending "; printStr(suffix); print <- "\n"; return; }
+    let p = Vec3((f32.from(u32.from(xc)) - 1000.) / 100., 0., (f32.from(u32.from(zc)) - 1000.) / 100.);
+    (&mut pgs[i]).free = true;
+    (&mut pgs[i]).toPos = p; (&mut pgs[i]).pos = p; (&mut pgs[i]).fromPos = p;
+    self.retarget();
+    if !pgs[i].proj { self.syncRoom(); }
+    print <- "test: page "; printStr(suffix); print <- " moved\n";
+  }
+
+  pub fn testMoveItem(self: &mut, id: &str, xc: usize, yc: usize, zc: usize, yawDeg: usize) {
+    let k = self.itemById(id);
+    if k < 0 { print <- "test: no item "; printStr(id); print <- "\n"; return; }
+    let ku = usize.from(u32.from(k));
+    let p = Vec3((f32.from(u32.from(xc)) - 1000.) / 100., (f32.from(u32.from(yc)) - 1000.) / 100., (f32.from(u32.from(zc)) - 1000.) / 100.);
+    var pl = Place(3u32, 0u32, p.x, p.y, p.z);
+    self.moveItem(ku, &pl, true);
+    (&mut items[ku]).yawShelf = f32.from(u32.from(yawDeg)) * PI / 180.;
+    self.noteMoved(ku);
+    print <- "test: item "; printStr(id); print <- " moved\n";
+  }
+
+  pub fn testFocus(self: &mut, suffix: &str) {
+    let i = self.testPageIdx(suffix);
+    if i < pgs.len() { focusPg = i32.from(i); sel = NO_ITEM; }
+  }
+
+  pub fn testWsReport(self: &) {
+    print <- "ws: open='"; printStr(wsOpen.view()); print <- "' pending="; print <- wsPending.len(); print <- " items="; print <- wsItems.len(); print <- " marks:";
+    var m = 0usize;
+    while m < marks.len() { if startsWithText(marks[m].src.view(), "ws:") { print <- " "; printStr(marks[m].src.view()); print <- "@"; print <- marks[m].dom; print <- "/"; print <- marks[m].q; } m = m + 1usize; }
+    var i = 0usize;
+    while i < pgs.len() {
+      if pgs[i].ws && !pgs[i].gone { print <- " | page "; printStr(pgs[i].title.text.view()); print <- " ("; print <- pgs[i].toPos.x; print <- ","; print <- pgs[i].toPos.z; print <- ")"; }
+      i = i + 1usize;
+    }
+    var q = 0usize;
+    while q < wsItems.len() {
+      let k = self.itemById(wsItems[q].view());
+      if k >= 0 { print <- " | item "; printStr(wsItems[q].view()); print <- " "; printStr(self.placeText(usize.from(u32.from(k))).view()); print <- " yaw "; print <- items[usize.from(u32.from(k))].yawShelf; }
+      q = q + 1usize;
+    }
+    print <- "\n";
+  }
+
   pub fn testPageIdx(self: &, suffix: &str) usize {
     var found = pgs.len();
     var i = 0usize;
@@ -5204,6 +5766,7 @@ pub struct Incubator {
       if pgOk { self.toggleShelve(device, usize.from(u32.from(focusPg))); r = 1u32; }
       else if sel >= 0 && self.act(0u32, v) { r = 1u32; }
     }
+    else if startsWithText(action, "ws-") { wsWant = String.from(action); r = 1u32; }
     else if action == "keyboard" { kbToggle(self); r = 1u32; }
     else if action == "voicerec" { voiceWant = 1u32; r = 1u32; }
     else if action == "voicesend" { voiceWant = 2u32; r = 1u32; }
