@@ -991,6 +991,11 @@ pub struct Incubator {
   pub fn selectSlot(self: &mut, parts: &List[Live], pi: usize) {
     let k = self.itemOfSlot(parts, pi);
     self.select(k);
+    // one click on a 3-D item on its shelf opens it in the work area (Jon, 11 Nov)
+    if k >= 0 {
+      let ku = usize.from(u32.from(k));
+      if !items[ku].onTable && !items[ku].free && !items[ku].page { let tid = items[ku].id.clone(); _ = self.openThing(tid.view()); }
+    }
   }
 
   pub fn selectedIsPage(self: &) bool {
@@ -2550,10 +2555,11 @@ pub struct Incubator {
         i = i + 1usize;
       }
       if old == pgs.len() { return; }
-      print <- "pages: "; printStr(pgs[old].title.text.view()); print <- " goes to its shelf (more than "; print <- PG_MAX; print <- " standing)\n";
-      let before = pgs.len();
-      self.shelvePage(device, old);
-      if !pgs[old].gone { return; }      // the shelf was full: the page stays, and nothing more is done
+      // Jon, 11 Nov: opening something never puts a spine on a shelf behind his back (the shelf is for what he shelves);
+      // the oldest standing page closes, and the tree opens it again with one click
+      print <- "pages: "; printStr(pgs[old].title.text.view()); print <- " closes (more than "; print <- PG_MAX; print <- " standing); not shelved\n";
+      self.closePage(old);
+      if !pgs[old].gone { return; }
     }
   }
 
@@ -2604,6 +2610,21 @@ pub struct Incubator {
 
   // A page opened at the workbench, 1.4 m from the start spot (as far as a focused pane): ahead, then to the left and right in turn
   fn openOnBench(self: &mut, device: &mut Device, renderer: &mut Renderer, src: &str) {
+    // a file already standing in the work area comes to the front instead of being opened twice
+    var same = pgs.len();
+    var q = 0usize;
+    while q < pgs.len() {
+      if !pgs[q].gone && !pgs[q].shelved && pgs[q].zone < 0 && !pgs[q].tab && !pgs[q].proj && !pgs[q].web && pgs[q].src.view() == src { same = q; }
+      q = q + 1usize;
+    }
+    if same < pgs.len() {
+      (&mut pgs[same]).born = self.newBorn();
+      (&mut pgs[same]).free = false;
+      self.retarget();
+      self.syncRoom();
+      print <- "pages: "; printStr(src); print <- " already stands; brought to the front of the work area\n";
+      return;
+    }
     let n = self.openPageAs(device, renderer, src, "", false);
     if n >= 0 && self.editOnOpen.view() == src {
       // a new note: it opens empty with the caret in it
@@ -2885,6 +2906,26 @@ pub struct Incubator {
       if best < pgs.len() { self.shelvePage(device, best); }
     }
     else if kind == 8i32 { self.moveMarkTo(i / 100usize, i32.from(i % 100usize)); self.syncMarks(); }
+    // 30 a real click (a ray through the panel, the whole click path) on the middle of link row n%100 of the pane n/100 (pane = zone*8+kind);
+    // 31 the same, but 0.35 m to the right of the row's text, on the empty part of the row
+    else if kind == 30i32 || kind == 31i32 {
+      let q = i / 100usize;
+      let pg = self.paneIndex(q / 8usize, u32.from(q % 8usize));
+      if pg >= 0 {
+        let pu = usize.from(u32.from(pg));
+        var lp = Vec4(0., 0., 0., 0.);
+        match &pgs[pu].doc { case let Some(p) { lp = p.linkPoint(i % 100usize); } else {} }
+        if lp.w > 0.5 {
+          let m = self.pgModel(pu);
+          let at = m * Vec3(lp.x + (if kind == 31i32 { 0.35 } else { 0. }), lp.y, 0.);
+          let near = m * Vec3(lp.x + (if kind == 31i32 { 0.35 } else { 0. }), lp.y, 2.5);
+          let d = (at - near).normalize();
+          print <- "zones: test click on row "; print <- i % 100usize; print <- " of pane "; printStr(pgs[pu].id.view()); print <- "\n";
+          _ = self.clickPages(device, near, d, near, false);
+        }
+        else { print <- "zones: test click: no row "; print <- i % 100usize; print <- "\n"; }
+      }
+    }
     else if kind == 14i32 {
       let order = self.tabList();
       var s = 0usize;
@@ -4178,11 +4219,41 @@ pub struct Incubator {
     self.syncMarks();
   }
 
+  // Which of the three 3-D things a file is about (hard-coded for now), by its path: the item id, or empty
+  fn thing3dOf(src: &str) String {
+    let l = Incubator.lowerText(src);
+    let v = l.view();
+    if v.contains("arch-walk") { return String.from("archwalk"); }
+    if v.contains("knight") { return String.from("knight"); }
+    if v.contains("amphora") { return String.from("amphora"); }
+    String()
+  }
+
+  // A 3-D item opens in the work area, never on a shelf: from its shelf it comes to the work area's 3-D places (slot 2, dead
+  // ahead, first; it turns slowly over its ring of light; zoom, step and shelve are on the palette) and is selected
+  fn openThing(self: &mut, id: &str) bool {
+    let k = self.itemById(id);
+    if k < 0 { return false; }
+    let ku = usize.from(u32.from(k));
+    if !items[ku].onTable && !items[ku].free { _ = self.bring(ku); }
+    self.select(k);
+    print <- "incubator: "; printStr(items[ku].name.view()); print <- " opened in the work area\n";
+    true
+  }
+
   // A spine is taken off its shelf and its page opens in the work area; or, if 'close', it is just removed
   fn takeMark(self: &mut, m: usize, open: bool) {
     if m >= marks.len() { return; }
     print <- "shelf: "; printStr(marks[m].name.view()); print <- (if open { " restored to the work area\n" } else { " removed\n" });
-    if open { var b = String.from("bench:"); b.append(marks[m].src.view()); self.wantPage(b.view()); }
+    if open {
+      // (Jon, 11 Nov; hard-coded for now) a spine about the knight, the amphora or the architecture walk brings the thing itself
+      let thing = Incubator.thing3dOf(marks[m].src.view());
+      if thing.len() > 0usize && self.openThing(thing.view()) {
+        print <- "shelf: it is a 3-D thing ("; printStr(thing.view()); print <- "): opened as itself\n";
+      } else {
+        var b = String.from("bench:"); b.append(marks[m].src.view()); self.wantPage(b.view());
+      }
+    }
     var dead = marks.swapRemove(m);
     self.syncMarks();
   }
