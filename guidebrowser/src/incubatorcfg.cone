@@ -150,11 +150,12 @@ struct WsCfg {
   place: String;
   zone: String;
   at: String;
+  manifest: String;     // an absolute .md path: the members come from that workstream manifest (no [item] tables)
   items: List[WsItemCfg];
 }
 
 fn newWs(id: &str) WsCfg {
-  WsCfg(String.from(id), String(), String(), String(), String(), List[WsItemCfg]())
+  WsCfg(String.from(id), String(), String(), String(), String(), String(), List[WsItemCfg]())
 }
 
 fn copyWsItem(t: &WsItemCfg) WsItemCfg {
@@ -163,7 +164,7 @@ fn copyWsItem(t: &WsItemCfg) WsItemCfg {
 
 fn copyWs(w: &WsCfg) WsCfg {
   var o = newWs(w.id.view());
-  o.name = String.from(w.name.view()); o.place = String.from(w.place.view()); o.zone = String.from(w.zone.view()); o.at = String.from(w.at.view());
+  o.name = String.from(w.name.view()); o.place = String.from(w.place.view()); o.zone = String.from(w.zone.view()); o.at = String.from(w.at.view()); o.manifest = String.from(w.manifest.view());
   var i = 0usize;
   while i < w.items.len() {
     let t = &w.items[i];
@@ -171,6 +172,129 @@ fn copyWs(w: &WsCfg) WsCfg {
     i = i + 1usize;
   }
   o
+}
+
+// [wsmem.N] (room.toml, or a seed in incubator.toml): what is remembered of a manifest item, keyed by its resolved path.
+// state "out" (in the work area) or "rack"; place at:x,y,z; yaw and scale as for an item; the newer 'at' wins per item.
+struct WsMemCfg {
+  ws: String;           // the workspace it was remembered in: an item standing in two workspaces has two memories
+  path: String;
+  state: String;
+  place: String;
+  yaw: i64;
+  scale: i64;
+  at: String;
+}
+
+fn copyWsMem(m: &WsMemCfg) WsMemCfg {
+  WsMemCfg(String.from(m.ws.view()), String.from(m.path.view()), String.from(m.state.view()), String.from(m.place.view()), m.yaw, m.scale, String.from(m.at.view()))
+}
+
+fn wsMemText(m: &WsMemCfg, n: usize) String {
+  var s = String.from("\n[wsmem."); s.append(numText(i64.from(n)).view()); s.append("]\n");
+  s.append("ws = "); s.append(tomlStr(m.ws.view()).view()); s.append("\n");
+  s.append("path = "); s.append(tomlStr(m.path.view()).view()); s.append("\n");
+  s.append("state = "); s.append(tomlStr(m.state.view()).view()); s.append("\n");
+  if m.place.len() > 0usize { s.append("place = "); s.append(tomlStr(m.place.view()).view()); s.append("\n"); }
+  s.append("yaw_deg = "); s.append(intText(m.yaw).view()); s.append("\n");
+  s.append("scale_pct = "); s.append(intText(m.scale).view()); s.append("\n");
+  s.append("at = "); s.append(tomlStr(m.at.view()).view()); s.append("\n");
+  s
+}
+
+// ---- workstream manifests (WI\incubator-world.md, "Workspaces from design chat's workstream manifests") ----
+const CONE_DIR = "C:/Users/jondg/MyDrive/Incubator/Cone/";
+
+struct MfItem {
+  section: String;      // the heading it stands under
+  name: String;
+  path: String;         // resolved, forward slashes
+  line: String;
+  child: String;        // the workspace id when the link is Workstreams/<id>.md, else empty
+}
+
+struct Manifest {
+  title: String;
+  items: List[MfItem];
+}
+
+fn slashes(s: &str) String {
+  var o = String();
+  var i = 0usize;
+  while i < s.len() { o.append(if s[i] == '\\' { "/" } else { s.slice(i, i + 1usize) }); i = i + 1usize; }
+  o
+}
+
+fn mfResolve(p: &str) String {
+  let n = slashes(p);
+  let v = n.view();
+  if v.len() >= 2usize && v[1usize] == ':' { return n.clone(); }
+  if v.len() >= 1usize && v[0usize] == '/' { return n.clone(); }
+  var o = String.from(CONE_DIR);
+  o.append(v);
+  o
+}
+
+fn noTrailSlash(s: &str) String {
+  var e = s.len();
+  while e > 3usize && s[e - 1usize] == '/' { e = e - 1usize; }
+  String.from(s.slice(0usize, e))
+}
+
+// Workstreams/<id>.md: the id, else empty
+fn mfChildId(path: &str) String {
+  let n = path.len();
+  if n < 4usize || path[n - 3usize] != '.' || path[n - 2usize] != 'm' || path[n - 1usize] != 'd' { return String(); }
+  var j = n - 3usize;
+  while j > 0usize && path[j - 1usize] != '/' { j = j - 1usize; }
+  if j < 12usize { return String(); }
+  let w = "Workstreams/";
+  var q = 0usize;
+  while q < 12usize { if path[j - 12usize + q] != w[q] { return String(); } q = q + 1usize; }
+  String.from(path.slice(j, n - 3usize))
+}
+
+fn trimText(s: &str) String {
+  var a = 0usize; var b = s.len();
+  while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r') { a = a + 1usize; }
+  while b > a && (s[b - 1usize] == ' ' || s[b - 1usize] == '\t' || s[b - 1usize] == '\r') { b = b - 1usize; }
+  String.from(s.slice(a, b))
+}
+
+// Line 1 "# Name"; "## Section" headings; items "- [Display](path) - one line". Lines without a link are skipped.
+fn mfParse(text: &str) Manifest {
+  var m = Manifest(String(), List[MfItem]());
+  var section = String();
+  var first = true;
+  var a = 0usize;
+  while a <= text.len() {
+    var b = a;
+    while b < text.len() && text[b] != '\n' { b = b + 1usize; }
+    let ln = trimText(text.slice(a, b));
+    let l = ln.view();
+    if first {
+      first = false;
+      if startsWithText(l, "# ") { m.title = trimText(l.slice(2usize, l.len())); }
+    } else if startsWithText(l, "## ") { section = trimText(l.slice(3usize, l.len())); }
+    else if startsWithText(l, "- [") {
+      var c = 3usize;
+      while c < l.len() && l[c] != ']' { c = c + 1usize; }
+      if c + 1usize < l.len() && l[c + 1usize] == '(' {
+        var d = c + 2usize;
+        while d < l.len() && l[d] != ')' { d = d + 1usize; }
+        if d < l.len() {
+          let path = noTrailSlash(mfResolve(trimText(l.slice(c + 2usize, d)).view()).view());
+          var rest = trimText(l.slice(d + 1usize, l.len()));
+          // the separator: an em dash (3 bytes) or a hyphen
+          if startsWithText(rest.view(), "—") { rest = trimText(rest.slice(3usize, rest.len())); }
+          else if startsWithText(rest.view(), "-") { rest = trimText(rest.slice(1usize, rest.len())); }
+          m.items.push(MfItem(section.clone(), String.from(l.slice(3usize, c)), path.clone(), rest, mfChildId(path.view())));
+        }
+      }
+    }
+    a = b + 1usize;
+  }
+  m
 }
 
 fn wsSourceOk(s: &str) bool {
@@ -203,12 +327,13 @@ struct Parsed {
   marks: List[MarkCfg];  // [mark.ID] (room.toml): what is on the shelves, place "shelf:Q" (slot Q of its domain's shelf)
   seeded: List[String];  // [seeded] zones = [..] (room.toml): the shelves already seeded from their plans
   workspaces: List[WsCfg];  // [workspace.ID] (both files)
+  wsMems: List[WsMemCfg];   // [wsmem.N]
   wsOpen: String;           // [workspaces] open = "ID" (room.toml): the workspace open when the room was left
 }
 
 fn newParsed() Parsed {
   Parsed(true, String(), List[ProjCfg](), 0i64, 0i64, 0i64, String(), List[String](), List[String](), Folders(), PageCfgs(),
-    List[PanelCfg](), List[ShelfCfg](), List[PalSetCfg](), String(), List[ZoneCfg](), List[TreeCfg](), List[MarkCfg](), List[String](), List[WsCfg](), String())
+    List[PanelCfg](), List[ShelfCfg](), List[PalSetCfg](), String(), List[ZoneCfg](), List[TreeCfg](), List[MarkCfg](), List[String](), List[WsCfg](), List[WsMemCfg](), String())
 }
 
 // A place, parsed
@@ -347,7 +472,8 @@ fn checkKeys(p: &mut Parsed, file: &str, t: &toml.Table, kind: u32, tname: &str)
       }
       else if kind == 12u32 { k == "open" }
       else if kind == 13u32 { k == "zones" }
-      else if kind == 15u32 { k == "name" || k == "place" || k == "zone" || k == "at" }
+      else if kind == 15u32 { k == "name" || k == "place" || k == "zone" || k == "at" || k == "manifest" }
+      else if kind == 18u32 { k == "ws" || k == "path" || k == "state" || k == "place" || k == "yaw_deg" || k == "scale_pct" || k == "at" }
       else if kind == 16u32 { k == "source" || k == "place" || k == "yaw_deg" || k == "scale_pct" }
       else if kind == 17u32 { k == "open" }
       else if kind == 14u32 { k == "src" || k == "name" || k == "place" || k == "at" }
@@ -535,6 +661,7 @@ fn parseConfig(text: &str, file: &str) Parsed {
           p.workspaces[wi].place = tableText(&doc[nm], "place");
           p.workspaces[wi].zone = tableText(&doc[nm], "zone");
           p.workspaces[wi].at = tableText(&doc[nm], "at");
+          p.workspaces[wi].manifest = slashes(tableText(&doc[nm], "manifest").view());
           let wp = p.workspaces[wi].place.clone();
           var wsq = 0u32;
           if wp.len() > 0usize && (!startsWithText(wp.view(), "shelf:") || !cfgDigits(wp.slice(6usize, wp.len()), &mut wsq)) {
@@ -561,6 +688,13 @@ fn parseConfig(text: &str, file: &str) Parsed {
           var at = p.workspaces[wi].items.len();
           while at > 0usize && p.workspaces[wi].items[at - 1usize].n > i64.from(num) { at = at - 1usize; }
           p.workspaces[wi].items.insert(at, WsItemCfg(i64.from(num), src, ipl, yy, hy, ss, hs));
+        }
+        else if seg[0usize].view() == "wsmem" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 18u32, nm);
+          var hy = false; var yy = 0i64; var hs = false; var ss = 100i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          tableInt(&mut p, file, &doc[nm], "scale_pct", &mut hs, &mut ss);
+          p.wsMems.push(WsMemCfg(tableText(&doc[nm], "ws"), tableText(&doc[nm], "path"), tableText(&doc[nm], "state"), tableText(&doc[nm], "place"), yy, ss, tableText(&doc[nm], "at")));
         }
         else if nm == "workspaces" {
           checkKeys(&mut p, file, &doc[nm], 17u32, nm);
@@ -625,7 +759,7 @@ fn parseConfig(text: &str, file: &str) Parsed {
           match doc[nm].getStrings("open") { case let Some(r) { open = r; } else {} }
           p.trees.push(TreeCfg(String.from(seg[1usize].view()), open));
         }
-        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, screens, folder, page, mark, workspace, workspaces, seeded, palette, line, browser, zone, tree)"); }
+        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, screens, folder, page, mark, workspace, workspaces, wsmem, seeded, palette, line, browser, zone, tree)"); }
         n = n + 1usize;
       }
     }
@@ -758,6 +892,8 @@ fn extrasText(r: &Parsed) String {
     s.append(wsText(&r.workspaces[i]).view());
     i = i + 1usize;
   }
+  i = 0usize;
+  while i < r.wsMems.len() { s.append(wsMemText(&r.wsMems[i], i + 1usize).view()); i = i + 1usize; }
   if r.wsOpen.len() > 0usize { s.append("\n[workspaces]\nopen = "); s.append(tomlStr(r.wsOpen.view()).view()); s.append("\n"); }
   if r.seeded.len() > 0usize {
     s.append("\n[seeded]\nzones = [");
@@ -797,6 +933,7 @@ fn wsText(w: &WsCfg) String {
   s.append("name = "); s.append(tomlStr(w.name.view()).view()); s.append("\n");
   if w.place.len() > 0usize { s.append("place = "); s.append(tomlStr(w.place.view()).view()); s.append("\n"); }
   if w.zone.len() > 0usize { s.append("zone = "); s.append(tomlStr(w.zone.view()).view()); s.append("\n"); }
+  if w.manifest.len() > 0usize { s.append("manifest = "); s.append(tomlStr(w.manifest.view()).view()); s.append("\n"); }
   s.append("at = "); s.append(tomlStr(w.at.view()).view()); s.append("\n");
   var i = 0usize;
   while i < w.items.len() {
