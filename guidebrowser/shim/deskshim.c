@@ -384,6 +384,29 @@ DESK_API void desk_wheel(int notches) {
   SendInput(1, &in, sizeof(INPUT));
 }
 
+// A key of the keyboard (virtual-key code vk), pressed or released. The arrows and the keys beside them are the extended ones.
+DESK_API void desk_key(int vk, int down) {
+  if (dryRun) { printf("deskshim: dry-run key vk %d %s\n", vk, down ? "down" : "up"); fflush(stdout); return; }
+  INPUT in;
+  memset(&in, 0, sizeof in);
+  in.type = INPUT_KEYBOARD;
+  in.ki.wVk = (WORD)vk;
+  in.ki.wScan = (WORD)MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
+  in.ki.dwFlags = (down ? 0 : KEYEVENTF_KEYUP);
+  if ((vk >= 33 && vk <= 40) || vk == 45 || vk == 46) in.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
+  SendInput(1, &in, sizeof(INPUT));
+}
+
+// One character (a UTF-16 unit), typed whatever the layout: down then up as a Unicode key
+DESK_API void desk_put(int cp) {
+  if (dryRun) { printf("deskshim: dry-run char U+%04X\n", cp); fflush(stdout); return; }
+  INPUT in[2];
+  memset(in, 0, sizeof in);
+  in[0].type = INPUT_KEYBOARD; in[0].ki.wScan = (WORD)cp; in[0].ki.dwFlags = KEYEVENTF_UNICODE;
+  in[1].type = INPUT_KEYBOARD; in[1].ki.wScan = (WORD)cp; in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+  SendInput(2, in, sizeof(INPUT));
+}
+
 DESK_API void desk_close(void) {
   if (thr) { stopping = 1; WaitForSingleObject(thr, 2000); CloseHandle(thr); thr = 0; }
   free(spare.p); free(pubbuf.p); free(held.p);

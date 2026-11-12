@@ -356,7 +356,8 @@ pub fn start(host: &mut Host) bool {
     inc.prepareBrowser(&mut device, &mut renderer);
     if startYaw == 0. { startYaw = f64.from(inc.startFacingDeg()); }   // faces the V between the boards (was a fixed 72, which stood 72 degrees off)
   }
-  if deskOn && inc.on { inc.initDesk(&mut device); if deskControl { inc.deskToggle(); } }
+  // (Jon, 11 Nov: in the headset the laptop is controlled from the start, with a red frame and a palette icon to let go; --desk-no-control keeps it off)
+  if deskOn && inc.on { inc.initDesk(&mut device); if deskControl || (xrOn && !deskNoControl) { inc.deskToggle(); } }
   var web: Option[WebPanel] = None;
   if webArg != null { web = WebPanel.create(&mut device, format, cstr.fromPtr(webArg).view()); }
   var made = Shell(Scene.empty(), panel, web, inc, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
@@ -576,7 +577,9 @@ fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: boo
   var onPanel = false;
   if s.inc.on {
     if s.inc.palClick(&mut s.device, eye, direction, &s.visitor) { return; }
-    if s.inc.deskClick(eye, direction) { return; }
+    if kbClick(&mut s.inc, eye, direction) { return; }
+    // (a headset's trigger waits to see how long it is held: a left click on a quick release, a right click on a hold; the mouse clicks at once)
+    if (if beam { deskPressRay(&mut s.inc, eye, direction) } else { s.inc.deskClick(eye, direction) }) { return; }
     // (a hand's beam starts at the hand; the chips stand for the head)
     if s.inc.clickChip(eye, direction, &s.visitor, if beam { s.visitor.position } else { eye }) { return; }
     if s.inc.clickApp(eye, direction) { return; }
@@ -949,6 +952,14 @@ fn sendTurn(s: &mut Shell) {
     let noteView = note.view();
     match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); } else {} }
   }
+  else {
+    // (said on the note strip, not only in the log: B with nothing heard looked like B doing nothing)
+    var hasBridge = false;
+    match &s.bridge { case let Some(b) { hasBridge = true; } else {} }
+    if hasBridge {
+      match &mut s.panel { case var &mut Some(p) { p.setNote("Nothing to send: no words in the draft (was anything heard?)"); } else {} }
+    }
+  }
 }
 
 // A reply has come: read it as a panel of its own. The document goes behind it (B brings it back).
@@ -1069,17 +1080,19 @@ fn bridgeTick(s: &mut Shell) {
   var dn = String();
   var seen = String();
   var have = false;
+  var sendWait = false;
   match &s.bridge {
     case let Some(b) {
       have = true;
-      rec = b.recording; busyNow = b.busy; pend = b.pending(); turnNo = b.turn;
+      rec = b.recording; busyNow = b.busy; pend = b.pending(); turnNo = b.turn; sendWait = b.sendWaiting();
       dn = String.from(b.draftNote.view());
       seen = String.from(b.statusSeen.view());
     }
     else {}
   }
   if pend { status.append("Sent turn "); status.append(numText(i64.from(turnNo)).view()); status.append(". Waiting for the reply...   "); }
-  if rec { status.append("RECORDING - F2 pauses, F3 sends"); }
+  if rec { status.append("RECORDING - A pauses, B sends"); }
+  else if sendWait { status.append("Sending... (writing down what you said, then the turn goes)"); }
   else if busyNow { status.append("Transcribing..."); }
   else { status.append("F2 record, F3 send"); }
   if hasWord(dn.view()) {
@@ -1090,6 +1103,7 @@ fn bridgeTick(s: &mut Shell) {
     var ns = String.from(status.view());
     match &mut s.bridge { case var &mut Some(b) { b.statusSeen <-> ns; } else {} }
     let sv = status.view();
+    print <- "bridge: note strip: "; printStr(sv); print <- "\n";
     match &mut s.panel { case var &mut Some(p) { p.setNote(sv); } else {} }
   }
   match &mut s.panel { case var &mut Some(p) { p.setRec(rec); } else {} }
@@ -1561,7 +1575,30 @@ fn runEditScript(s: &mut Shell, frame: i32) {
     if f.len() < 2usize || i32.from(scriptNum(f[0].view())) != frame { continue; }
     let cmd = f[1].view();
     print <- "script: frame "; print <- frame; print <- ": "; printStr(cmd); print <- "\n";
-    if cmd == "pal" && f.len() > 2usize { s.inc.testAct(&mut s.device, f[2].view(), &s.visitor); }
+    if cmd == "kbkey" && f.len() > 2usize {
+      // the beam on a key of the virtual keyboard and the trigger (label "Space", "Enter", "a" ...), by the real click path
+      var keyEye = Vec3(0., 0., 0.);
+      var keyDir = Vec3(0., 0., 0.);
+      if testKeyRay(&s.inc, f[2].view(), &mut keyEye, &mut keyDir) { clickRay(s, keyEye, keyDir, 0., 0., true, 0u64); }
+      else { print <- "script: kbkey: no such key shown\n"; }
+    }
+    else if cmd == "addrclick" { testAddrStrip(&mut s.inc); }
+    else if cmd == "webclick" && f.len() > 3usize {
+      var wEye = Vec3(0., 0., 0.);
+      var wDir = Vec3(0., 0., 0.);
+      if testWebRay(&s.inc, i32.from(scriptNum(f[2].view())), i32.from(scriptNum(f[3].view())), &mut wEye, &mut wDir) { clickRay(s, wEye, wDir, 0., 0., true, 0u64); }
+      else { print <- "script: webclick: no browser tab shown\n"; }
+    }
+    else if cmd == "kbicon" { s.inc.testAct(&mut s.device, "keyboard", &s.visitor); }
+    else if cmd == "deskclick" && f.len() > 3usize {
+      // the trigger goes down on pixel X Y of the laptop's screen (the beam from the eye to it); 'deskrelease' lets it go
+      let pt = testDeskPoint(&s.inc, i32.from(scriptNum(f[2].view())), i32.from(scriptNum(f[3].view())));
+      let eye0 = s.inc.gazeEye;
+      clickRay(s, eye0, (pt - eye0).normalize(), 0., 0., true, 0u64);
+    }
+    else if cmd == "deskrelease" { deskReleaseTrigger(&mut s.inc); }
+    else if cmd == "deskhold" { deskHoldTick(&mut s.inc); }
+    else if cmd == "pal" && f.len() > 2usize { s.inc.testAct(&mut s.device, f[2].view(), &s.visitor); }
     else if cmd == "click" && f.len() > 4usize {
       let ok = s.inc.testClickPage(s.inc.testPageIdx(f[2].view()), scriptNum(f[3].view()), scriptNum(f[4].view()));
       print <- "script: click "; print <- (if ok { "landed" } else { "missed" }); print <- "\n";
@@ -1650,6 +1687,7 @@ fn main(argc: i32, argv: **u8) i32 {
     if libc.strcmp(arg, "--desk") == 0i32 { deskOn = true; }
     if libc.strcmp(arg, "--desk-dry-run") == 0i32 { deskOn = true; deskDryRun = true; }
     if libc.strcmp(arg, "--desk-probe") == 0i32 { deskOn = true; deskProbe = true; }
+    if libc.strcmp(arg, "--desk-no-control") == 0i32 { deskNoControl = true; }
     if libc.strcmp(arg, "--desk-control") == 0i32 { deskOn = true; deskControl = true; }   // control on from the start (with --desk-dry-run, for a picture of the frame)
     if libc.strcmp(arg, "--xr-shots") == 0i32 && more { xrShotsArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--xr-shot-at") == 0i32 && more { xrShotAt = i32.from(argNumber(argv, a + 1i32)); }

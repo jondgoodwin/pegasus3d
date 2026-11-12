@@ -1,0 +1,176 @@
+// Input routing for the incubator's screens (Jon, 11 Nov): what the virtual keyboard (vkeys.cone) is for and where its keys go.
+//
+// The keyboard stands when a screen that takes text has the focus: the laptop's desktop (clicked, and in control), the general browser's
+// address strip, or a web page whose form field holds the focus (CEF says so, cefshim.cc OnVirtualKeyboardRequested). The palette's keyboard
+// icon shows or hides it. A key pressed by the trigger types into that screen: into the laptop by SendInput (deskshim.dll: Unicode characters
+// for text, virtual-key codes for the others), into the address strip and into a web page by the same calls a physical keyboard's events
+// make (webTyped, webKeyed). These are free functions over the Incubator so the keyboard stays out of incubator.cone's way.
+
+// What takes the text now: 0 nothing, 1 the laptop, 2 a web screen. 'centre' is the middle of that screen; 'sig' tells one target from another.
+fn kbTarget(inc: &Incubator, centre: &mut Vec3, sig: &mut u32) bool {
+  if deskFocus {
+    match &inc.desk {
+      case let Some(d) {
+        if d.open && d.control {
+          *centre = d.pos + Vec3(0., DESK_CENTRE_Y, 0.);
+          *sig = 1u32;
+          return true;
+        }
+      }
+      else {}
+    }
+  }
+  if inc.addrEdit {
+    let v = inc.tabVisible();
+    if v < inc.pgs.len() {
+      *centre = inc.pgModel(v) * Vec3(0., f32.from(DOC_CENTRE_Y), 0.);
+      *sig = 2u32 + u32.from(v);
+      return true;
+    }
+  }
+  var i = 0usize;
+  while i < inc.pgs.len() {
+    match &inc.pgs[i].wp {
+      case let Some(w) {
+        if w.wantsText() {
+          *centre = inc.pgModel(i) * Vec3(0., f32.from(DOC_CENTRE_Y), 0.);
+          *sig = 2u32 + u32.from(i);
+          return true;
+        }
+      }
+      else {}
+    }
+    i = i + 1usize;
+  }
+  false
+}
+
+// Once the labels' fonts are ready: make the keyboard and put its picture together a few keys a frame. Returns what it used of 'most'.
+fn kbFill(inc: &mut Incubator, device: &mut Device, l: &mut Labeller, most: i32) i32 {
+  var none = false;
+  match &inc.kb { case is None { none = true; } else {} }
+  if none { inc.kb = Some[VKeys](VKeys.create(device, inc.format)); }
+  var n = 0usize;
+  match &mut inc.kb { case var &mut Some(k) { n = k.step(device, l, usize.from(u32.from(most))); } else {} }
+  i32.from(u32.from(n))
+}
+
+// Each frame: does a text screen have the focus, is the keyboard to stand, where does it stand
+fn kbTick(inc: &mut Incubator, dt: f32) {
+  var has = false;
+  var centre = Vec3(0., 0., 0.);
+  var sig = 0u32;
+  has = kbTarget(&*inc, &mut centre, &mut sig);
+  let eye = inc.gazeEye;
+  let ahead = inc.gazeDir;
+  match &mut inc.kb {
+    case var &mut Some(k) {
+      if sig != k.sig { k.mode = 0u32; k.sig = sig; k.placed = false; }
+      var want = (has && k.mode != 2u32) || k.mode == 1u32;
+      if want && !k.placed {
+        if has { k.place(eye, centre); } else { k.place(eye, eye + Vec3(ahead.x, 0., ahead.z) * 3.); }
+        print <- "keyboard: shown at ("; print <- k.pos.x; print <- ", "; print <- k.pos.y; print <- ", "; print <- k.pos.z; print <- ") for ";
+        printStr(if sig == 1u32 { "the laptop" } else if sig >= 2u32 { "a web screen" } else { "no screen (the palette icon)" }); print <- "\n";
+      }
+      if !want && k.placed { print <- "keyboard: put away\n"; }
+      if !want { k.placed = false; }
+      k.want = want;
+      palKb = want;
+      k.fade(dt);
+    }
+    else {}
+  }
+}
+
+fn kbDraw(inc: &mut Incubator, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4) {
+  match &mut inc.kb { case var &mut Some(k) { k.draw(device, encoder, target, depth, vp); } else {} }
+}
+
+// The palette's keyboard icon: show it, or hide it if it stands
+fn kbToggle(inc: &mut Incubator) {
+  match &mut inc.kb {
+    case var &mut Some(k) {
+      k.mode = if k.want { 2u32 } else { 1u32 };
+      print <- "keyboard: "; printStr(if k.mode == 1u32 { "shown" } else { "hidden" }); print <- " by the palette icon\n";
+    }
+    else {}
+  }
+}
+
+// A click along a ray on a key: true if it was one (taken either way)
+fn kbClick(inc: &mut Incubator, eye: Vec3, dir: Vec3) bool {
+  var idx = -1i32;
+  match &inc.kb { case let Some(k) { idx = k.hit(eye, dir); } else {} }
+  if idx < 0i32 { return false; }
+  kbType(inc, usize.from(u32.from(idx)));
+  true
+}
+
+// A key typed: Shift lights, any other key goes to the screen that has the focus
+fn kbType(inc: &mut Incubator, idx: usize) {
+  var label = String();
+  var text = String();
+  var sc = 0u32;
+  var shifted = false;
+  // (the keyboard is taken out of the incubator while its key is read, and put back after: the incubator is reachable from a global)
+  var held: Option[VKeys] = None;
+  held <-> inc.kb;
+  var found = false;
+  var wasShift = false;
+  match &mut held {
+    case var &mut Some(k) {
+      found = true;
+      k.flash(i32.from(u32.from(idx)));
+      label = k.keys[idx].label.clone();
+      sc = k.keys[idx].sc;
+      shifted = k.shift;
+      text = if shifted { k.keys[idx].up.clone() } else { k.keys[idx].low.clone() };
+      if sc == 225u32 { k.shift = !k.shift; wasShift = true; print <- "keyboard: Shift "; printStr(if k.shift { "on" } else { "off" }); print <- "\n"; }
+      else { k.shift = false; }
+    }
+    else {}
+  }
+  held <-> inc.kb;
+  if !found || wasShift { return; }
+  var vk = 0i32;
+  if sc != 0u32 { vk = virtualKey(sc); }
+  var toLaptop = false;
+  match &inc.desk { case let Some(d) { toLaptop = deskFocus && d.open && d.control; } else {} }
+  if toLaptop {
+    print <- "keyboard: "; printStr(label.view()); print <- " -> the laptop\n";
+    var dk: Option[DeskPanel] = None;
+    dk <-> inc.desk;
+    match &mut dk {
+      case var &mut Some(d) { if sc != 0u32 { d.typeKey(vk); } else { d.typeText(text.view()); } }
+      else {}
+    }
+    dk <-> inc.desk;
+    return;
+  }
+  if inc.webFocused() {
+    print <- "keyboard: "; printStr(label.view()); print <- " -> a web screen\n";
+    if sc != 0u32 {
+      inc.webKeyed(vk, true, 0i32, false, false);
+      inc.webKeyed(vk, false, 0i32, false, false);
+    } else {
+      inc.webTyped(text.view());
+    }
+    return;
+  }
+  print <- "keyboard: "; printStr(label.view()); print <- " has no screen to type into\n";
+}
+
+// ---- the laptop, by the headset's trigger (a left click on a quick release, a right click on a hold) ----
+
+fn deskPressRay(inc: &mut Incubator, eye: Vec3, dir: Vec3) bool {
+  match &mut inc.desk { case var &mut Some(d) { return d.press(eye, dir); } else {} }
+  false
+}
+
+fn deskHoldTick(inc: &mut Incubator) {
+  match &mut inc.desk { case var &mut Some(d) { d.hold(); } else {} }
+}
+
+fn deskReleaseTrigger(inc: &mut Incubator) {
+  match &mut inc.desk { case var &mut Some(d) { d.release(); } else {} }
+}
