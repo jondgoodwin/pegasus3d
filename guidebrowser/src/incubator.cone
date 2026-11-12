@@ -1021,7 +1021,8 @@ pub struct Incubator {
     var e = 0usize;
     while e < items[k].menu.len() {
       let a = items[k].menu[e].action.view();
-      let hide = (a == "shelve" && !items[k].onTable) || (a == "bring" && items[k].onTable);
+      let out3 = items[k].onTable || items[k].free;      // (a picked-up item stands in the work area, too)
+      let hide = (a == "shelve" && !out3) || (a == "bring" && out3);
       if !hide { out.push(e); }
       e = e + 1usize;
     }
@@ -1042,11 +1043,12 @@ pub struct Incubator {
 
   // A ring item to its shelf, in flight
   pub fn shelve(self: &mut, k: usize) bool {
-    if !items[k].onTable { return false; }
+    if !items[k].onTable && !items[k].free { return false; }
     let j = self.freeShelf(k);
-    if j < 0 { return false; }
+    if j < 0 { print <- "incubator: "; printStr(items[k].name.view()); print <- " cannot shelve: no free shelf slot\n"; return false; }
     self.startFlight(k);
-    tableItem.set(usize.from(items[k].idx), NO_ITEM);
+    if items[k].onTable { tableItem.set(usize.from(items[k].idx), NO_ITEM); }
+    (&mut items[k]).free = false;
     (&mut items[k]).onTable = false;
     (&mut items[k]).idx = u32.from(j);
     (&mut items[k]).zlevel = 0u32;
@@ -1061,6 +1063,7 @@ pub struct Incubator {
   pub fn bring(self: &mut, k: usize) bool {
     if items[k].onTable { return false; }
     var t = -1;
+    let wasFree = items[k].free;
     let order = [2, 1, 3, 0, 4];
     var o = 0usize;
     while o < 5usize && t < 0 {
@@ -1081,7 +1084,8 @@ pub struct Incubator {
       self.shelve(oldest);
     }
     self.startFlight(k);
-    shelfItem.set(usize.from(items[k].idx), NO_ITEM);
+    if !wasFree && *shelfItem[usize.from(items[k].idx)] == i32.from(k) { shelfItem.set(usize.from(items[k].idx), NO_ITEM); }
+    (&mut items[k]).free = false;
     (&mut items[k]).onTable = true;
     (&mut items[k]).idx = u32.from(t);
     tableItem.set(usize.from(u32.from(t)), i32.from(k));
@@ -1810,7 +1814,7 @@ pub struct Incubator {
     let live = items[usize.from(u32.from(k))].onTable || items[usize.from(u32.from(k))].free;
     match &mut aw {
       case var &mut Some(x) {
-        x.live = live;
+        x.live = true;      // (it is drawn on its shelf too, as a small model: nobody could see or pick it there before)
         if live { tick(&mut x.app, dt); x.app.pend = NONE; x.app.blink = 0.; }
       }
       else {}
@@ -1861,9 +1865,9 @@ pub struct Incubator {
     let k = self.itemById("archwalk");
     if k < 0 { return false; }
     let ku = usize.from(u32.from(k));
-    if !items[ku].onTable && !items[ku].free { return false; }
     let e = self.eff(ku);
-    let r = 4.0 * e.w;
+    var r = 4.0 * e.w;
+    if r < 0.3 { r = 0.3; }     // (on its shelf it is small: a generous target)
     let c = Vec3(e.x, e.y + 1.5 * e.w, e.z);
     let oc = eye - c;
     let b = oc.dot(dir);
@@ -2122,7 +2126,43 @@ pub struct Incubator {
   fn addrRect(self: &) Vec4 {
     let hw = pgHalfW(true);
     let b = pgBottom(true);
-    Vec4(0. - hw, b - 0.33, 0. - hw + 1.65, b - 0.03)
+    Vec4(0. - hw + 0.72, b - 0.33, hw, b - 0.03)
+  }
+  // Back and forward chips of a web page, at the left of the bottom row (the address strip follows them)
+  fn navRect(self: &, forward: bool) Vec4 {
+    let hw = pgHalfW(true);
+    let b = pgBottom(true);
+    let x0 = 0. - hw + (if forward { 0.36 } else { 0. });
+    Vec4(x0, b - 0.33, x0 + 0.32, b - 0.03)
+  }
+  // Which chip of page i is back (forward is the next); the page lists end with them
+  fn backChip(self: &, i: usize) usize { pgs[i].chips.len() - 2usize }
+
+  // Back or forward in web page pu's history; false if there is none
+  fn webNav(self: &mut, pu: usize, forward: bool) bool {
+    if pu >= pgs.len() { return false; }
+    var did = false;
+    match &mut pgs[pu].wp {
+      case var &mut Some(w) {
+        let can = if forward { w.canForward() } else { w.canBack() };
+        if can { if forward { w.forward(); } else { w.back(); } did = true; }
+        print <- "web: "; print <- (if forward { "forward" } else { "back" }); print <- (if did { " done" } else { ": no history, nothing done" }); print <- "\n";
+      }
+      else {}
+    }
+    did
+  }
+
+  // The back and forward chips of web page pu take their grey when there is no history that way
+  fn tintNav(self: &mut, pu: usize) {
+    var cb = false;
+    var cf = false;
+    match &pgs[pu].wp { case let Some(w) { cb = w.canBack(); cf = w.canForward(); } else {} }
+    let b = self.backChip(pu);
+    let wb: u32 = if cb { 0x5a6a78ffu32 } else { 0xb8bcc2ffu32 };
+    let wf: u32 = if cf { 0x5a6a78ffu32 } else { 0xb8bcc2ffu32 };
+    if pgs[pu].chips[b].bg != wb { (&mut pgs[pu].chips[b]).bg = wb; (&mut pgs[pu].chips[b]).ok = false; }
+    if pgs[pu].chips[b + 1usize].bg != wf { (&mut pgs[pu].chips[b + 1usize]).bg = wf; (&mut pgs[pu].chips[b + 1usize]).ok = false; }
   }
 
   // The address strip's and tab titles' pictures follow the shown tab (a few times a second)
@@ -2191,6 +2231,7 @@ pub struct Incubator {
 
   // A click on the shown tab's chrome (kind 20+slot a tab, 30 "+", 31 "x", 32 the address strip)
   fn tabClick(self: &mut, pu: usize, kind: u32) {
+    if kind == 33u32 || kind == 34u32 { _ = self.webNav(pu, kind == 34u32); return; }
     if kind >= 20u32 && kind < 30u32 { self.switchTab(usize.from(kind - 20u32)); return; }
     if kind == 30u32 { self.wantPage("https://jondgoodwin.com"); return; }
     if kind == 31u32 { self.closeTab(); return; }
@@ -2949,6 +2990,8 @@ pub struct Incubator {
     else if kind == 8i32 || kind == 9i32 {
       let q = i / 100usize;
       let pg = self.paneIndex(q / 8usize, u32.from(q % 8usize));
+      print <- "test hook: "; print <- (if kind == 8i32 { "link " } else { "scroll " }); print <- (i % 100usize); print <- " of board "; print <- (q / 8usize); print <- " pane "; print <- (q % 8usize);
+      print <- (if pg >= 0 { " found\n" } else { ": no such pane\n" });
       if pg >= 0 {
         let pu = usize.from(u32.from(pg));
         if focusPg != pg { focusPg = pg; palFocused = false; }   // as a click on the pane does
@@ -2986,6 +3029,12 @@ pub struct Incubator {
       if t2 > 0. && (best < 0. || t2 < best) { best = t2; *kind = 31u32; }
       t2 = quadHit(m, self.addrRect(), eye, dir);
       if t2 > 0. && (best < 0. || t2 < best) { best = t2; *kind = 32u32; }
+    }
+    if web && !pgs[i].shelved && !pgs[i].gone {
+      var t3 = quadHit(m, self.navRect(false), eye, dir);
+      if t3 > 0. && (best < 0. || t3 < best) { best = t3; *kind = 33u32; }
+      t3 = quadHit(m, self.navRect(true), eye, dir);
+      if t3 > 0. && (best < 0. || t3 < best) { best = t3; *kind = 34u32; }
     }
     if !pgs[i].shelved {
       let hw = pgHalfW(web);
@@ -3718,6 +3767,12 @@ pub struct Incubator {
               Vec4(cx - PG_CHIP_W * 0.5, cy - PG_CHIP_H * 0.5, cx + PG_CHIP_W * 0.5, cy + PG_CHIP_H * 0.5), 1.);
             c = c + 1usize;
           }
+          if web {
+            self.tintNav(idx);
+            let nb = self.backChip(idx);
+            Incubator.faded(&mut pgs[idx].chips[nb], device, encoder, target, depth, vp * pm, self.navRect(false), 1.);
+            Incubator.faded(&mut pgs[idx].chips[nb + 1usize], device, encoder, target, depth, vp * pm, self.navRect(true), 1.);
+          }
           if pgs[idx].tab {
             let order = self.tabList();
             var s = 0usize;
@@ -3950,6 +4005,8 @@ pub struct Incubator {
     var chips = List[Label]();
     chips.push(self.mkLabel(device, "focus", 0x3a78b0ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
     chips.push(self.mkLabel(device, "release", 0xc08a20ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    chips.push(self.mkLabel(device, "back", 0xb8bcc2ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
+    chips.push(self.mkLabel(device, "forward", 0xb8bcc2ffu32, 0xffffffffu32, 56., PG_CHIP_W, PG_CHIP_H));
     let born = self.newBorn();
     let at = Vec3(0., 0., 0.);
     pgs.push(Pg(pid.clone(), src.clone(), web, doc, wp, tl, chips, born, at, 0., 1., at, 0., 1., at, 0., 1., String()));
@@ -4852,7 +4909,7 @@ pub struct Incubator {
       q = q + 1usize;
     }
     var onTable = true;
-    if kind == "project" && sel >= 0 { onTable = items[usize.from(u32.from(sel))].onTable; }
+    if kind == "project" && sel >= 0 { onTable = items[usize.from(u32.from(sel))].onTable || items[usize.from(u32.from(sel))].free; }
     var i = 0usize;
     while i < set.len() {
       let e = palEntryOf(set[i].view());
@@ -5131,7 +5188,10 @@ pub struct Incubator {
     else if action == "back" || action == "forward" {
       if pgOk {
         let i = usize.from(u32.from(focusPg));
+        if pgs[i].web { r = if self.webNav(i, action == "forward") { 1u32 } else { 0u32 }; }
+        else {
         match &mut pgs[i].doc { case var &mut Some(p) { p.requestNav(if action == "back" { -1i32 } else { 1i32 }); r = 1u32; } else { r = 2u32; } }
+        }
       } else { navWant = if action == "back" { 6u32 } else { 7u32 }; r = 1u32; }
     }
     else if action == "files" { navWant = 8u32; r = 1u32; }
