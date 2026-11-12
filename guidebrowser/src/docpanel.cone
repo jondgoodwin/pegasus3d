@@ -429,7 +429,9 @@ pub struct DocPanel {
     }
     // (the mip chain waits until the scroll has rested, too)
     if up.busy && up.holdUntil < scrolledAt + 300u64 { up.holdUntil = scrolledAt + 300u64; }
+    let u0 = sdl.GetPerformanceCounter();
     if up.busy { up.step(device, &mut page, now); }
+    if scrollTrace && up.busy { print <- "docpanel: upload step "; print <- micros(u0, sdl.GetPerformanceCounter()) / 1000.; print <- " ms\n"; }
     // a band that has reached the GPU: the window is shown over it from the next draw on
     if up.landed != seenLanded {
       seenLanded = up.landed;
@@ -1194,7 +1196,16 @@ pub struct DocPanel {
         while u < nNew { newFrom.push(NOMATCH); changedBy.push(false); u = u + 1usize; }
         if !first {
           var b = 0usize;
+          var hint = 0usize;          // the old block after the last one matched: an unchanged file matches in step, so look there first (the scan from 0 grows with the position)
           while b < nNew {
+            if hint < nOld && *oldTo[hint] == NOMATCH {
+              let old = &doc.blocks[hint];
+              let nb = &fresh.blocks[b];
+              if old.kind == nb.kind && sameText(old.text.view(), nb.text.view()) && sameText(old.chain.view(), nb.chain.view()) {
+                oldTo.set(hint, b);
+                newFrom.set(b, hint);
+              }
+            }
             var o = 0usize;
             while o < nOld && *newFrom[b] == NOMATCH {
               if *oldTo[o] == NOMATCH {
@@ -1207,6 +1218,7 @@ pub struct DocPanel {
               }
               o = o + 1usize;
             }
+            if *newFrom[b] != NOMATCH { hint = *newFrom[b] + 1usize; }
             b = b + 1usize;
           }
           b = 0usize;
@@ -1485,6 +1497,14 @@ pub struct DocPanel {
     print <- "docpanel: wheel "; print <- notches; print <- ": scroll "; print <- scrollY; print <- " of "; print <- layout.height; print <- "\n";
   }
 
+  pub fn testJump(self: &mut, frac: f32) {
+    let oy = scrollY;
+    let most = if layout.height > f32.from(texH) { layout.height - f32.from(texH) } else { 0. };
+    scrollY = most * frac;
+    self.clampScroll();
+    self.scrolled(oy);
+  }
+
   // The one way every kind of panel is scrolled (the document pages, the browser, the report, the main panel; the trees of the zones
   // build use it too): 'dx' and 'dy' are wheel notches, positive meaning right and up the page (so a stick's push up or right is positive).
   // A page redraws at most every REDRAW_GAP_MS while it is scrolled; the log is left to the caller.
@@ -1614,6 +1634,7 @@ pub struct DocPanel {
     dirty = false;
     let now = nowMs();
     lastDraw = now;
+    let sP = sdl.GetPerformanceCounter();
     self.pickBand(device);
     // the bars and lines, as underline-style rectangles that belong to the layout for this one draw
     let keep = layout.rects.len();
@@ -1674,9 +1695,11 @@ pub struct DocPanel {
     var encoder = device.createCommandEncoder();
     if richMade { let r = richRef(); r.rr.draw(device, &mut encoder, &target, &view, &r.faces, &layout, &images, &sel, &caret); }
     encoder.copyTextureToBuffer(&target, &readback);
+    let sE = sdl.GetPerformanceCounter();
     device.queue.submit(encoder.finish());
     device.waitIdle();
     let s1 = sdl.GetPerformanceCounter();
+    if scrollTrace { print <- "docpanel: redraw split: prelude "; print <- micros(sP, s0) / 1000.; print <- " ms, encode "; print <- micros(s0, sE) / 1000.; print <- " ms, submit+wait "; print <- micros(sE, s1) / 1000.; print <- " ms\n"; }
     while layout.rects.len() > keep { layout.rects.pop(); }
     // (the rest, next frame: the readback, the stems and the upload are each a frame's work of their own)
     drawScrollY = bandTop;
@@ -1733,7 +1756,7 @@ pub struct DocPanel {
     }
     let us = PageUp.usSince(t0);
     upSpentUs = upSpentUs + us;
-    if us > 8000u64 { print <- "docpanel: finish step "; print <- fin; print <- " took "; print <- us / 1000u64; print <- " ms\n"; }
+    if us > 8000u64 || scrollTrace { print <- "docpanel: finish step "; print <- fin; print <- " took "; print <- us / 1000u64; print <- " ms\n"; }
   }
 
   // The error as one red line at the foot of the page: laid out and drawn apart (richtext draws only a document),
