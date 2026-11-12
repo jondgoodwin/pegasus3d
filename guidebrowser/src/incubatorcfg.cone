@@ -91,6 +91,20 @@ struct ZoneCfg {
   line: String;
   at: String;
   rects: List[String];     // site, repo, incubator, projects, line, diagram
+  tint: String;            // the portraits' backing colour, "RRGGBB"
+  side: i64;               // which edge carries the factory metrics: -1 the left, 1 the right
+  hasSide: bool;
+  mYaw: i64;               // the metrics panel's own yaw, degrees (the wall behind it)
+  hasMYaw: bool;
+}
+
+// [mark.ID] (room.toml): one spine on a shelf: what it opens, the name it wears, and its slot ("shelf:Q") on its domain's shelf
+struct MarkCfg {
+  id: String;
+  src: String;
+  name: String;
+  place: String;
+  at: String;
 }
 
 // [tree.ID] (room.toml): the folders a tree pane has open
@@ -103,7 +117,7 @@ fn newZoneCfg(id: &str) ZoneCfg {
   var r = List[String]();
   var i = 0;
   while i < 6 { r.push(String()); i = i + 1; }
-  ZoneCfg(String.from(id), String(), String(), 0i64, false, 0i64, false, String(), String(), String(), String(), String(), String(), String(), r)
+  ZoneCfg(String.from(id), String(), String(), 0i64, false, 0i64, false, String(), String(), String(), String(), String(), String(), String(), r, String(), 1i64, false, 0i64, false)
 }
 
 fn zoneRectKey(i: usize) &str {
@@ -139,11 +153,13 @@ struct Parsed {
   palPlace: String;           // [palette] place = "at:x,y,z" (room.toml): where the palette was left floating; empty: on the hand
   zones: List[ZoneCfg];  // [zone.ID]
   trees: List[TreeCfg];  // [tree.ID] (room.toml)
+  marks: List[MarkCfg];  // [mark.ID] (room.toml): what is on the shelves, place "shelf:Q" (slot Q of its domain's shelf)
+  seeded: List[String];  // [seeded] zones = [..] (room.toml): the shelves already seeded from their plans
 }
 
 fn newParsed() Parsed {
   Parsed(true, String(), List[ProjCfg](), 0i64, 0i64, 0i64, String(), List[String](), List[String](), Folders(), PageCfgs(),
-    List[PanelCfg](), List[ShelfCfg](), List[PalSetCfg](), String(), List[ZoneCfg](), List[TreeCfg]())
+    List[PanelCfg](), List[ShelfCfg](), List[PalSetCfg](), String(), List[ZoneCfg](), List[TreeCfg](), List[MarkCfg](), List[String]())
 }
 
 // A place, parsed
@@ -277,9 +293,11 @@ fn checkKeys(p: &mut Parsed, file: &str, t: &toml.Table, kind: u32, tname: &str)
       else if kind == 8u32 { k == "src" || k == "place" || k == "at" }
       else if kind == 11u32 {
         k == "name" || k == "place" || k == "yaw_deg" || k == "width_cm" || k == "site" || k == "repo" || k == "incubator" || k == "diagram"
-          || k == "projects" || k == "line" || k == "at" || startsWithText(k, "layout_")
+          || k == "projects" || k == "line" || k == "at" || k == "tint" || k == "metrics_side" || k == "metrics_yaw_deg" || startsWithText(k, "layout_")
       }
       else if kind == 12u32 { k == "open" }
+      else if kind == 13u32 { k == "zones" }
+      else if kind == 14u32 { k == "src" || k == "name" || k == "place" || k == "at" }
       else { k == "place" || k == "yaw_deg" || k == "width_cm" };
     if !good {
       var m = String.from("unknown key '");
@@ -444,6 +462,27 @@ fn parseConfig(text: &str, file: &str) Parsed {
           if src.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a page needs a src (a file or an address)"); }
           p.pages.push(PageCfg(String.from(seg[1usize].view()), src, tableText(&doc[nm], "place"), tableText(&doc[nm], "at")));
         }
+        else if seg[0usize].view() == "mark" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 14u32, nm);
+          let src = tableText(&doc[nm], "src");
+          if src.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a mark needs a src (a file or an address)"); }
+          p.marks.push(MarkCfg(String.from(seg[1usize].view()), src, tableText(&doc[nm], "name"), tableText(&doc[nm], "place"), tableText(&doc[nm], "at")));
+        }
+        else if nm == "seeded" {
+          checkKeys(&mut p, file, &doc[nm], 13u32, nm);
+          match doc[nm].getStrings("zones") { case let Some(r) { p.seeded = r; } else {} }
+        }
+        else if nm == "screens" {
+          checkKeys(&mut p, file, &doc[nm], 6u32, nm);
+          var hy = false; var yy = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          let pl = tableText(&doc[nm], "place");
+          if pl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(pl.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a screen's place is at:x,y,z"); }
+          }
+          p.panels.push(PanelCfg(String.from("screen-both"), pl, yy, hy, 0i64, false));
+        }
         else if seg[0usize].view() == "zone" && seg.len() == 2usize {
           checkKeys(&mut p, file, &doc[nm], 11u32, nm);
           var z = newZoneCfg(seg[1usize].view());
@@ -472,6 +511,14 @@ fn parseConfig(text: &str, file: &str) Parsed {
             z.rects.set(ri, tableText(&doc[nm], zoneRectKey(ri)));
             ri = ri + 1usize;
           }
+          z.tint = tableText(&doc[nm], "tint");
+          var hsd = false; var sdv = 1i64;
+          tableInt(&mut p, file, &doc[nm], "metrics_side", &mut hsd, &mut sdv);
+          z.hasSide = hsd; z.side = sdv;
+          if hsd && sdv != 1i64 && sdv != -1i64 { cfgFail(&mut p, file, doc[nm].lineOf("metrics_side"), "metrics_side is -1 (left edge) or 1 (right edge)"); }
+          var hmy = false; var myv = 0i64;
+          tableInt(&mut p, file, &doc[nm], "metrics_yaw_deg", &mut hmy, &mut myv);
+          z.hasMYaw = hmy; z.mYaw = myv;
           p.zones.push(z);
         }
         else if seg[0usize].view() == "tree" && seg.len() == 2usize {
@@ -480,7 +527,7 @@ fn parseConfig(text: &str, file: &str) Parsed {
           match doc[nm].getStrings("open") { case let Some(r) { open = r; } else {} }
           p.trees.push(TreeCfg(String.from(seg[1usize].view()), open));
         }
-        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, folder, page, palette, line, browser, zone, tree)"); }
+        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, screens, folder, page, mark, seeded, palette, line, browser, zone, tree)"); }
         n = n + 1usize;
       }
     }
@@ -535,7 +582,7 @@ fn tomlStr(s: &str) String {
   while i < s.len() {
     if s[i] == '"' { o.append("\\\""); }
     else if s[i] == '\\' { o.append("\\\\"); }
-    else { o.append(s.slice(i, i + 1usize)); }
+    else { o.appendByte(s[i]); }
     i = i + 1usize;
   }
   o.append("\"");
@@ -597,6 +644,22 @@ fn extrasText(r: &Parsed) String {
     s.append("place = "); s.append(tomlStr(g.place.view()).view()); s.append("\n");
     s.append("at = "); s.append(tomlStr(g.at.view()).view()); s.append("\n");
     i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.marks.len() {
+    let g = &r.marks[i];
+    s.append("\n[mark."); s.append(g.id.view()); s.append("]\n");
+    s.append("src = "); s.append(tomlStr(g.src.view()).view()); s.append("\n");
+    s.append("name = "); s.append(tomlStr(g.name.view()).view()); s.append("\n");
+    s.append("place = "); s.append(tomlStr(g.place.view()).view()); s.append("\n");
+    s.append("at = "); s.append(tomlStr(g.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  if r.seeded.len() > 0usize {
+    s.append("\n[seeded]\nzones = [");
+    var q0 = 0usize;
+    while q0 < r.seeded.len() { if q0 > 0usize { s.append(", "); } s.append(tomlStr(r.seeded[q0].view()).view()); q0 = q0 + 1usize; }
+    s.append("]\n");
   }
   i = 0usize;
   while i < r.zones.len() {

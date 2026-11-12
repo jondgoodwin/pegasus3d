@@ -13,9 +13,17 @@ const ZP_PROJECTS = 3u32;
 const ZP_LINE = 4u32;
 const ZP_DIAGRAM = 5u32;
 const ZN_PANES = 6usize;
-const ZN_DW = 7.2f;               // a board's design width, meters (a zone's width_cm scales it)
-const ZN_DH = 3.5f;               // its design height
-const ZN_BASE = 0.4f;             // the height of its foot above the floor
+const ZN_DW = 5.4f;               // a partition's design width, meters (a zone's width_cm scales it: 540 is as designed)
+const ZN_DH = 2.5f;               // its design height
+const ZN_BASE = 0.76f;            // its lower edge: 2.5 ft above the floor, over the shelf system
+const SH_DEPTH = 0.45f;           // the shelf system's depth, in front of the partition
+const SH_PITCH = 0.25f;           // the levels' spacing; the board tops are at 0.05, 0.30 and 0.55
+const SH_SLOT = 0.84f;            // one spine's slot
+const SH_LABEL_W = 0.64f;         // a spine's picture (4:1)
+const MP_W = 1.2f;                // the metrics panel: a square, 1.2 m
+const MP_Y0 = 0.86f;              // its foot above the floor
+const FV_W = 3.3f;                // the factory view slid out beside it
+const FV_H = 1.7f;
 const OLD_LINE = false;           // the production line on the left wall (stations and cards): gone, the boards' strips replace it
 const FOCUS_D = 1.4f;            // the workbench: a focused pane stands this far ahead of the start spot (reading distance)
 const FOCUS_DIM = 0.42f;          // how dark the veil gets
@@ -27,6 +35,34 @@ struct StripCard {
   hot: bool;
   calm: Label;
   glow: Label;
+  col: u32 = 0u32;         // the factory view's column: 0 queued, 1 building, 2 testing, 3 review, 4 done
+}
+
+// What is on a shelf: a document, a web page, a diagram, a code file, shown by its name on a spine. 'q' is its slot of its domain's shelf
+// (levels of cols(domain) slots each, the lowest first); 'dom' the zone number.
+struct Mark {
+  id: String;
+  src: String;
+  name: String;
+  dom: i32;
+  q: i32;
+  kind: u32;
+  label: Label;
+  at: f32;                 // along the shelf while it is held by the grip (design meters); else unused
+  held: bool;
+}
+
+// The plain coloured faces and small pictures one partition and its shelf are made of. A pass holds one set of uniforms, written when
+// a draw is recorded, so every thing drawn in a frame needs a pass of its own.
+struct Looks {
+  face: PagePass;          // the partition's face
+  tintL: PagePass;         // the colour behind the left portrait, and the right
+  tintR: PagePass;
+  wood: List[PagePass];    // the shelf's back, boards, lips and sides (nine)
+  slate: List[PagePass];   // the metrics panel's back and the factory view's
+  xs: List[PagePass];      // a spine's close button, one for each slot of a shelf
+  arrowR: PagePass;        // the arrowhead pointing right (local +x), and left
+  arrowL: PagePass;
 }
 
 struct Zone {
@@ -60,18 +96,114 @@ struct Zone {
   planStamp: i64;          // its modified time and size when last read
   planSize: i64;
   planNext: u64;           // when it is next looked at
-  planLabels: List[Label]; // one card per skein, then "+N more" and the Backlog count
-  planFiles: List[String]; // the file a click on each opens
+  planLabels: List[Label]; // (no longer drawn) one card per skein
+  planFiles: List[String];
+  tint: u32;               // the portraits' backing colour
+  side: i32;               // the edge that carries the factory metrics: -1 left, 1 right
+  mYaw: f32;               // the metrics panel's own yaw
+  mHas: bool;
+  counts: List[i32];       // queued, building, testing, review, question, held, done
+  cells: List[Label];      // their eight cells (seven statuses and the total)
+  hdrs: List[Label];       // the factory view's column heads
+  fvOpen: bool;            // the factory view is out (or sliding out)
+  fvT: f32;                // how far: 0 in, 1 out
+  looks: Looks;
+  lblProject: Label;
+  lblWeb: Label;
+  lblRepo: Label;
+  mTitle: Label;
+  seeded: bool;
 }
 
 fn defaultRect(i: usize) Vec4 {
-  // top row: site, repo, incubator, diagram; bottom row: projects, line
-  if i == 0usize { Vec4(0.1, 2.05, 2.8, 1.4) }
-  else if i == 1usize { Vec4(3.0, 2.05, 1.3, 1.4) }
-  else if i == 2usize { Vec4(4.35, 2.05, 1.3, 1.4) }
-  else if i == 3usize { Vec4(0.1, 0.45, 4.3, 1.5) }
-  else if i == 4usize { Vec4(4.5, 0.45, 2.6, 1.5) }
-  else { Vec4(5.7, 2.05, 1.4, 1.4) }
+  // the three screens, centred 1.45 m up: the landscape web view in the middle, the tall folder trees either side (x from the left edge)
+  if i == 0usize { Vec4(1.5, 0.95, 2.4, 1.5) }        // site: Web, 2.4 m wide
+  else if i == 1usize { Vec4(4.05, 0.82, 1.2, 1.8) }   // repo: Repo, right, 1.2 m by 1.8 m
+  else if i == 2usize { Vec4(0.15, 0.82, 1.2, 1.8) }   // incubator: Project, left
+  else { Vec4(0.1, 0.45, 0.1, 0.1) }                  // (unused slots: projects, line, diagram)
+}
+
+// "RRGGBB" to an opaque colour; the given default if it does not read
+fn parseTint(s: &str, dflt: u32) u32 {
+  if s.len() != 6usize { return dflt; }
+  var v = 0u32;
+  var i = 0usize;
+  while i < 6usize {
+    let c = s[i];
+    var d = 0u32;
+    if c >= '0' && c <= '9' { d = u32.from(c - '0'); }
+    else if c >= 'a' && c <= 'f' { d = u32.from(c - 'a') + 10u32; }
+    else if c >= 'A' && c <= 'F' { d = u32.from(c - 'A') + 10u32; }
+    else { return dflt; }
+    v = v * 16u32 + d;
+    i = i + 1usize;
+  }
+  v * 256u32 + 255u32
+}
+
+// A plain colour (a 2 x 2 texel picture), hidden behind what stands in front of it
+fn makeSolidPass(device: &mut Device, format: u32, rgba: u32) PagePass {
+  var pass = PagePass.createDepth(device, format);
+  var px = List[u8].withCapacity(16usize);
+  var i = 0;
+  while i < 4 {
+    px.push(u8.from((rgba >> 24u32) & 255u32)); px.push(u8.from((rgba >> 16u32) & 255u32));
+    px.push(u8.from((rgba >> 8u32) & 255u32)); px.push(255u8);
+    i = i + 1;
+  }
+  pass.uploadRgba(device, 2u32, 2u32, &px);
+  pass
+}
+
+// A small tile drawn in pixels: kind 0 an arrowhead pointing right, 1 pointing left, 2 a cross (close). 64 x 64, opaque.
+fn makeTilePass(device: &mut Device, format: u32, kind: u32) PagePass {
+  var pass = PagePass.createDepth(device, format);
+  let n = 64u32;
+  var px = List[u8].withCapacity(usize.from(n * n * 4u32));
+  var y = 0u32;
+  while y < n {
+    var x = 0u32;
+    while x < n {
+      let fx = f32.from(x) / 63.;
+      let fy = f32.from(y) / 63.;
+      var r = 42u8; var g = 51u8; var b = 64u8;               // slate ground
+      let edge = x < 2u32 || y < 2u32 || x >= n - 2u32 || y >= n - 2u32;
+      if edge { r = 222u8; g = 186u8; b = 108u8; }            // brass rim
+      var on = false;
+      if kind < 2u32 {
+        // a chevron: two strokes meeting at the point, 'tip' on the pointing side
+        let u = if kind == 0u32 { fx } else { 1. - fx };       // 0 at the tail, 1 at the point
+        let ay = (fy - 0.5).abs();
+        let d = (ay - (0.82 - u) * 0.9).abs();
+        if u > 0.5 && u < 0.84 && d < 0.075 { on = true; }
+        let d2 = (ay - (0.52 - u) * 0.9).abs();
+        if u > 0.16 && u < 0.54 && d2 < 0.075 { on = true; }
+      } else {
+        let d = fminf((fx - fy).abs(), (fx + fy - 1.).abs());
+        if fx > 0.2 && fx < 0.8 && fy > 0.2 && fy < 0.8 && d < 0.07 { on = true; }
+        if !edge { r = 150u8; g = 50u8; b = 44u8; }
+      }
+      if on { r = 236u8; g = 214u8; b = 150u8; if kind == 2u32 { r = 250u8; g = 240u8; b = 235u8; g = 240u8; } }
+      px.push(r); px.push(g); px.push(b); px.push(255u8);
+      x = x + 1u32;
+    }
+    y = y + 1u32;
+  }
+  pass.uploadRgba(device, n, n, &px);
+  pass
+}
+
+fn makeLooks(device: &mut Device, format: u32, tint: u32) Looks {
+  var wood = List[PagePass]();
+  var i = 0;
+  while i < 9 { wood.push(makeSolidPass(device, format, 0xc8a878ffu32)); i = i + 1; }
+  var slate = List[PagePass]();
+  slate.push(makeSolidPass(device, format, 0x2a3340ffu32)); slate.push(makeSolidPass(device, format, 0x2a3340ffu32));
+  var xs = List[PagePass]();
+  i = 0;
+  while i < 18 { xs.push(makeTilePass(device, format, 2u32)); i = i + 1; }
+  Looks(makeSolidPass(device, format, 0xf0e8d4ffu32), makeSolidPass(device, format, tint), makeSolidPass(device, format, tint),
+    wood, slate, xs, makeTilePass(device, format, 0u32), makeTilePass(device, format, 1u32))
 }
 
 // "x,y,w,h" (meters) to a rectangle; false if it does not read
