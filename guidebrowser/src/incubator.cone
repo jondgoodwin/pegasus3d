@@ -418,8 +418,22 @@ pub struct Incubator {
   kb: Option[VKeys] = None;           // the virtual keyboard (vkeys.cone, input.cone)
   // workspaces (WI\incubator-world.md): the effective list (incubator.toml overlaid by room.toml, the newer 'at' of a whole workspace winning)
   // (wsList, wsOpen, wsItems, wsPending, wsWant, wsAutoAdd stand after browserMade: they have no constant default)
+  // placing things (WI\incubator-world.md, "Placing things: one standard set of controls"): what a grip holds keeps its height and takes turns and sizes
+  grabDy: f32 = 0.;                          // the held thing's height over where the hand's beam points at that distance (kept, so it does not jump)
+  holdHand: i32 = -1;                        // the hand (0 left, 1 right) whose grip holds the thing, or -1
+  grabScSet: bool = false;                   // the held thing was sized by hand during this grip
+  grabYawSet: bool = false;                 // the held thing was turned by hand during this grip (its own yaw, not facing the middle)
+  grabTurn: f32 = 0.;                        // the held thing's yaw while held (pages: the stick and two hands turn it; kept while it is held)
+  grabSc: f32 = 1.;                          // its size while held
+  stickArmed: bool = true;                   // the thumbstick's snap turn is armed again (it went back under 0.3)
+  twoOn: bool = false;                       // a second grip is down: the hands' distance sizes and their angle turns
+  twoHand: Vec3 = Vec3(0., 0., 0.);          // the second hand's position
+  twoD0: f32 = 0.;                           // the hands' distance and angle when the second grip came down, and the held thing's turn and size then
+  twoA0: f32 = 0.;
+  twoYaw0: f32 = 0.;
+  twoSc0: f32 = 1.;
   wsPendAt: u64 = 0u64;
-  wsMaking: bool = false;                    // pages being opened now are members
+  wsMaking: bool = false;                   // pages being opened now are members
   mfForce: bool = false;                     // the manifest's list is made again at the next tick (a joined page now has a card)
   wsReseed: bool = false;                   // the open workspace's table changed in incubator.toml: not captured over, applied at the next open
   wsSerial: u32 = 0u32;
@@ -2420,6 +2434,9 @@ pub struct Incubator {
         let ku = usize.from(u32.from(oi));
         let here = items[ku].pos;
         self.moveItem(ku, &Place(3u32, 0u32, here.x, here.y, here.z), false);
+        grabDy = here.y - self.beamHeight(d);
+        grabTurn = items[ku].yawShelf; grabYawSet = false;
+        grabSc = items[ku].mul; grabScSet = false; twoOn = false;
       }
       print <- "incubator: grabbed "; print <- (if ok == 1u32 { "the file browser" } else if ok == 2u32 { "the report" } else if ok == 3u32 { "a folder post" } else if ok == 5u32 { "the palette" } else if ok == 6u32 { "a board" } else if ok == 7u32 { "a spine" } else { "a project" }); print <- "\n";
       return;
@@ -2485,10 +2502,14 @@ pub struct Incubator {
     else if grabKind == 4u32 {
       let k = usize.from(u32.from(grabIt));
       if k < items.len() {
-        let y = items[k].freePos.y;
+        var y = self.beamHeight(grabDist) + grabDy;      // height follows the hand, and stays where it is let go
+        if y < 0. { y = 0.; }
+        if y > 3.5 { y = 3.5; }
         (&mut items[k]).freePos = Vec3(p.x, y, p.z);
         (&mut items[k]).pos = Vec3(p.x, y, p.z);
         (&mut items[k]).flight = 1.;
+        if grabYawSet { (&mut items[k]).yawShelf = grabTurn; }
+        if grabScSet { (&mut items[k]).mul = grabSc; (&mut items[k]).scale = self.destScale(k); }
       }
     }
   }
@@ -2511,7 +2532,30 @@ pub struct Incubator {
     if kind == 1u32 { pos = browserPos; yawDeg = i64.from(i32.from(browserYaw * 180. / PI)); }
     else if kind == 2u32 { pos = reportPos; yawDeg = i64.from(i32.from(reportCfgYaw * 180. / PI)); }
     else if kind == 3u32 { let q = usize.from(u32.from(it)); if q < markers.len() { pos = markers[q].pos; } }
-    else if kind == 4u32 { let k = usize.from(u32.from(it)); if k < items.len() { self.noteMoved(k); print <- "incubator: dropped a project\n"; } return; }
+    else if kind == 4u32 {
+      let k = usize.from(u32.from(it));
+      if k < items.len() {
+        if grabYawSet { (&mut items[k]).yawShelf = Incubator.snapYaw(grabTurn); }
+        if grabScSet {
+          var m = grabSc;
+          if m > 0.95 && m < 1.05 { m = 1.; }
+          (&mut items[k]).mul = m; (&mut items[k]).scale = self.destScale(k);
+        }
+        twoOn = false;
+        self.noteMoved(k);
+        // its turn and size are remembered with its place (project tables: yaw_deg, scale_pct)
+        var pi = 0usize;
+        while pi < roomGood.projects.len() {
+          if roomGood.projects[pi].id.view() == items[k].id.view() {
+            if grabYawSet { roomGood.projects[pi].yaw = Incubator.degText(items[k].yawShelf); roomGood.projects[pi].hasYaw = true; }
+            if grabScSet { roomGood.projects[pi].scale = i64.from(i32.from(items[k].mul * 100. + 0.5)); roomGood.projects[pi].hasScale = true; }
+          }
+          pi = pi + 1usize;
+        }
+        print <- "incubator: dropped a project (height "; print <- items[k].freePos.y; print <- ", turn "; print <- items[k].yawShelf * 180. / PI; print <- " degrees, size "; print <- items[k].mul; print <- ")\n";
+      }
+      return;
+    }
     else if kind == 6u32 {
       let q = usize.from(u32.from(it));
       if q >= zones.len() { return; }
@@ -2673,9 +2717,9 @@ pub struct Incubator {
       if !pgs[i].gone && pgs[i].zone < 0 {
         var np = pgs[i].toPos;
         var ny = pgs[i].toYaw;
-        var ns: f32 = if pgs[i].big { 1.3 } else { 1. };
+        var ns: f32 = if pgs[i].manSc { pgs[i].toSc } else if pgs[i].big { 1.3 } else { 1. };
         if pgs[i].free {
-          ny = if pgs[i].tab && brwCfg { brwYaw } else { Incubator.faceOrigin(np) };
+          ny = if pgs[i].tab && brwCfg { brwYaw } else if pgs[i].manYaw { pgs[i].toYaw } else { Incubator.faceOrigin(np) };
         } else {
           np = Incubator.arcSpot(self.arcRank(i));
           ny = Incubator.faceOrigin(np);
@@ -2714,7 +2758,7 @@ pub struct Incubator {
     if pgs[i].shelved { var s = String.from("shelf:"); s.append(numText(i64.from(pgs[i].shelfAt)).view()); return s; }
     if pgs[i].free {
       var s = String.from("at:");
-      s.append(floatText(pgs[i].toPos.x).view()); s.append(",0,"); s.append(floatText(pgs[i].toPos.z).view());
+      s.append(floatText(pgs[i].toPos.x).view()); s.append(","); s.append(floatText(pgs[i].toPos.y).view()); s.append(","); s.append(floatText(pgs[i].toPos.z).view());
       return s;
     }
     String.from("arc")
@@ -2921,9 +2965,127 @@ pub struct Incubator {
     grabIx = i32.from(i);
     (&mut pgs[i]).shelved = false;
     (&mut pgs[i]).free = true;
-    (&mut pgs[i]).sc = 1.;
-    print <- "pages: grabbed "; printStr(pgs[i].title.text.view()); print <- "\n";
+    // (it keeps its own size and turn; its height is kept where the hand holds it, by the offset from the beam, so it does not jump)
+    if pgs[i].fly < 1. { (&mut pgs[i]).sc = pgs[i].toSc; }
+    grabSc = pgs[i].sc; grabTurn = pgs[i].yaw; grabYawSet = pgs[i].manYaw; grabScSet = pgs[i].manSc; twoOn = false;
+    grabDy = pgs[i].pos.y - self.beamHeight(d);
+    print <- "pages: grabbed "; printStr(pgs[i].title.text.view()); print <- " (height "; print <- pgs[i].pos.y; print <- ")\n";
     self.retarget();
+  }
+
+  // The height the held beam reaches at horizontal distance d (the gaze's slope); a flat gaze gives its own height
+  fn beamHeight(self: &, d: f32) f32 {
+    let h = Vec3(gazeDir.x, 0., gazeDir.z).length();
+    if h < 0.05 { return gazeEye.y; }
+    gazeEye.y + gazeDir.y / h * d
+  }
+
+  // ---- placing things: one standard set of controls (WI\incubator-world.md): grip moves (height kept), the stick turns in 15 degree
+  // snaps and pushes or pulls, two hands size and turn, and a level snap on letting go ----
+
+  pub fn holding(self: &) bool { grabIx >= 0 || grabKind == 4u32 }
+
+  pub fn holdingHand(self: &) i32 { holdHand }
+
+  // A grip went down on hand h at (pos, dir): the first one picks up what its beam is on; a second, while one holds, sizes and turns
+  pub fn gripDownHand(self: &mut, device: &mut Device, h: i32, pos: Vec3, dir: Vec3) {
+    if self.holding() && holdHand >= 0 && holdHand != h { self.twoStart(pos); return; }
+    self.gripGrab(device, pos, dir);
+    if self.holding() { holdHand = h; } else if grabKind > 0u32 { holdHand = h; }
+  }
+
+  pub fn gripMoveHand(self: &mut, h: i32, pos: Vec3, dir: Vec3) {
+    if holdHand == h || holdHand < 0 { self.setHand(pos, dir); }
+    else if twoOn { self.twoMove(pos); }
+  }
+
+  pub fn gripUpHand(self: &mut, h: i32) {
+    if h == holdHand || holdHand < 0 { self.dropGrab(); self.setHand(Vec3(0., 0., 0.), Vec3(0., 0., 0.)); holdHand = -1; }
+    twoOn = false;
+  }
+
+  // The holding hand's thumbstick: x turns the thing about the up axis (15 degree snaps, or smoothly with the other grip held), y pushes
+  // it away (up) or pulls it in (down)
+  pub fn holdStick(self: &mut, x: f32, y: f32, dt: f32) {
+    if !self.holding() { stickArmed = true; return; }
+    if y > 0.3 || y < -0.3 {
+      grabDist = grabDist + y * 2. * dt;
+      if grabDist < 0.6 { grabDist = 0.6; }
+      if grabDist > 8. { grabDist = 8.; }
+    }
+    if twoOn {
+      if x > 0.2 || x < -0.2 { self.turnHeld(0. - x * 1.5 * dt); }
+      return;
+    }
+    if stickArmed && (x > 0.7 || x < -0.7) {
+      stickArmed = false;
+      self.turnHeld(if x > 0. { 0. - PI / 12. } else { PI / 12. });
+    }
+    if !stickArmed && x < 0.3 && x > -0.3 { stickArmed = true; }
+  }
+
+  // Turn the held thing about the up axis by 'a' radians
+  fn turnHeld(self: &mut, a: f32) {
+    if grabIx >= 0 || grabKind == 4u32 { grabTurn = grabTurn + a; grabYawSet = true; }
+  }
+
+  // Size the held thing by a factor (the desktop's stand-in for two hands)
+  fn sizeHeld(self: &mut, f: f32) {
+    if !self.holding() { return; }
+    var s = grabSc * f;
+    if s < 0.4 { s = 0.4; }
+    if s > 3. { s = 3.; }
+    grabSc = s; grabScSet = true;
+  }
+
+  // The desktop's stand-ins for the controller: turn n steps of 15 degrees (left positive), push (n > 0) or pull the held thing by n tenths of
+  // a metre, size it by n percent
+  pub fn heldTurnSteps(self: &mut, n: i32) { self.turnHeld(f32.from(n) * PI / 12.); print <- "place: turned, now "; print <- grabTurn * 180. / PI; print <- " degrees\n"; }
+  pub fn heldPush(self: &mut, n: i32) {
+    if !self.holding() { return; }
+    grabDist = grabDist + f32.from(n) * 0.1;
+    if grabDist < 0.6 { grabDist = 0.6; }
+    if grabDist > 8. { grabDist = 8.; }
+    print <- "place: distance now "; print <- grabDist; print <- " m\n";
+  }
+  pub fn heldSize(self: &mut, pct: i32) { self.sizeHeld(1. + f32.from(pct) / 100.); print <- "place: size now "; print <- grabSc; print <- "\n"; }
+
+  fn twoStart(self: &mut, pos: Vec3) {
+    if !self.holding() { return; }
+    twoOn = true; twoHand = pos;
+    let v = pos - gazeEye;
+    twoD0 = Vec3(v.x, 0., v.z).length();
+    twoA0 = atan2(v.x, v.z);
+    twoYaw0 = grabTurn; twoSc0 = grabSc;
+    print <- "place: second grip, hands "; print <- twoD0; print <- " m apart\n";
+  }
+
+  fn twoMove(self: &mut, pos: Vec3) {
+    if !twoOn || !self.holding() { return; }
+    twoHand = pos;
+    let v = pos - gazeEye;
+    let d = Vec3(v.x, 0., v.z).length();
+    if twoD0 > 0.05 {
+      var s = twoSc0 * d / twoD0;
+      if s < 0.4 { s = 0.4; }
+      if s > 3. { s = 3.; }
+      if (s - grabSc) > 0.01 || (grabSc - s) > 0.01 { grabSc = s; grabScSet = true; }
+    }
+    if d > 0.05 {
+      let a = atan2(v.x, v.z);
+      let ny = twoYaw0 + turnBetween(twoA0, a);
+      if (ny - grabTurn) > 0.01 || (grabTurn - ny) > 0.01 { grabTurn = ny; grabYawSet = true; }
+    }
+  }
+
+  // Let go near upright and it squares itself: a turn within 4 degrees of a 15 degree step snaps to it, a size within 5 percent of its
+  // standard size to that (pages have no tilt: the level snap is the turn and the size)
+  fn snapYaw(y: f32) f32 {
+    let step = PI / 12.;
+    let n = f32.from(i32.from(y / step + (if y >= 0. { 0.5 } else { -0.5 })));
+    let near = n * step;
+    let d = y - near;
+    if d < 4. * PI / 180. && d > -4. * PI / 180. { near } else { y }
   }
 
   pub fn dropGrab(self: &mut) {
@@ -2931,7 +3093,19 @@ pub struct Incubator {
     if grabIx < 0 { return; }
     let i = usize.from(u32.from(grabIx));
     grabIx = -1;
+    twoOn = false;
     if i >= pgs.len() { return; }
+    if grabYawSet {
+      let ny = Incubator.snapYaw(grabTurn);
+      (&mut pgs[i]).yaw = grabTurn; (&mut pgs[i]).toYaw = ny; (&mut pgs[i]).manYaw = true;
+    }
+    if grabScSet {
+      var ns = grabSc;
+      let std: f32 = if pgs[i].big { 1.3 } else { 1. };
+      if ns > std * 0.95 && ns < std * 1.05 { ns = std; }
+      (&mut pgs[i]).toSc = ns; (&mut pgs[i]).manSc = true;
+    }
+    print <- "pages: placed height "; print <- pgs[i].pos.y; print <- ", turn "; print <- pgs[i].toYaw * 180. / PI; print <- " degrees, size "; print <- (if grabScSet { pgs[i].toSc } else { pgs[i].sc }); print <- "\n";
     print <- "pages: dropped "; printStr(pgs[i].title.text.view()); print <- " at ("; print <- pgs[i].toPos.x; print <- ", "; print <- pgs[i].toPos.z; print <- ")\n";
     self.retarget();
     if !pgs[i].proj { self.syncRoom(); } else { self.noteProjPage(i); }
@@ -2977,14 +3151,18 @@ pub struct Incubator {
         let h = Vec3(gazeDir.x, 0., gazeDir.z);
         if h.length() > 0.05 {
           let hn = h.normalize();
-          let p = Vec3(gazeEye.x + hn.x * grabDist, 0., gazeEye.z + hn.z * grabDist);
+          var gy = self.beamHeight(grabDist) + grabDy;
+          if gy < 0. { gy = 0.; }
+          if gy > 3.5 { gy = 3.5; }
+          let p = Vec3(gazeEye.x + hn.x * grabDist, gy, gazeEye.z + hn.z * grabDist);
           (&mut pgs[i]).pos = p;
           (&mut pgs[i]).toPos = p;
           (&mut pgs[i]).fromPos = p;
-          (&mut pgs[i]).yaw = Incubator.faceOrigin(p);
+          if !grabYawSet { grabTurn = Incubator.faceOrigin(p); }
+          (&mut pgs[i]).yaw = grabTurn;
           (&mut pgs[i]).toYaw = pgs[i].yaw;
           (&mut pgs[i]).fromYaw = pgs[i].yaw;
-          (&mut pgs[i]).sc = 1.; (&mut pgs[i]).toSc = 1.; (&mut pgs[i]).fromSc = 1.;
+          (&mut pgs[i]).sc = grabSc; (&mut pgs[i]).toSc = grabSc; (&mut pgs[i]).fromSc = grabSc;
           (&mut pgs[i]).fly = 1.;
         }
       }
@@ -3088,6 +3266,14 @@ pub struct Incubator {
     else if kind == 2i32 { self.startGrab(i); }
     else if kind == 3i32 { self.dropGrab(); }
     else if kind == 4i32 { self.parkBrowser(device); }
+    // placing (desktop stand-ins for the controller): 5 turn n steps of 15 degrees left, 6 right, 7 push n tenths of a metre, 8 pull,
+    // 15 size up n percent, 16 down, 17 report the held thing
+    else if kind == 5i32 { self.heldTurnSteps(n); }
+    else if kind == 6i32 { self.heldTurnSteps(0i32 - n); }
+    else if kind == 7i32 { self.heldPush(n); }
+    else if kind == 8i32 { self.heldPush(0i32 - n); }
+    else if kind == 15i32 { self.heldSize(n); }
+    else if kind == 16i32 { self.heldSize(0i32 - n); }
     // the general browser (test hooks): 10 switch to tab slot n, 11 close the shown tab, 12 type address n into the strip and press Enter,
     // 13 click the "+" chip, 14 report the tabs
     else if kind == 10i32 { self.switchTab(i); }
@@ -5021,6 +5207,15 @@ pub struct Incubator {
         var pl = Place(0u32, 0u32, 0., 0., 0.);
         if it.place.len() > 0usize && parsePlace(it.place.view(), &mut pl) && pl.kind == 3u32 { (&mut pgs[nu]).toPos = Vec3(pl.x, pl.y, pl.z); }
         else { (&mut pgs[nu]).toPos = Incubator.arcSpot(nu); }
+        // (a member remembers its turn and size as well as its place: they come back as they were left)
+        if it.hasYaw {
+          let ry = f32.from(i32.from(it.yaw)) * PI / 180.;
+          (&mut pgs[nu]).toYaw = ry; (&mut pgs[nu]).yaw = ry; (&mut pgs[nu]).fromYaw = ry; (&mut pgs[nu]).manYaw = true;
+        }
+        if it.hasScale && it.scale >= 20i64 && it.scale <= 400i64 {
+          let rs = f32.from(i32.from(it.scale)) / 100.;
+          (&mut pgs[nu]).toSc = rs; (&mut pgs[nu]).sc = rs; (&mut pgs[nu]).fromSc = rs; (&mut pgs[nu]).manSc = true;
+        }
         let apath = srcKey(it.source.view());
         if it.n >= 1i64 && wsOpen.len() > 0usize && i64.from(self.mfWorkIdx()) == it.n - 1i64 { (&mut pgs[nu]).big = true; }
         if Incubator.isAnswered(apath.view()) {
@@ -5614,7 +5809,7 @@ pub struct Incubator {
     let pl = if memFree { mem.place.clone() } else { Incubator.slotPlace(rank) };
     var src = String.from(if fs.isDir(&Path.from(path.view())) { "tree:" } else { "doc:" });
     src.append(path.view());
-    wsPending.push(WsItemCfg(i64.from(i + 1usize), src, pl, 0i64, false, 100i64, false));
+    wsPending.push(WsItemCfg(i64.from(i + 1usize), src, pl, mem.yaw, memFree, mem.scale, memFree));
     wsPendAt = nowMs();
     print <- "rack: pulled "; printStr(mf.items[i].name.view()); print <- "\n";
   }
