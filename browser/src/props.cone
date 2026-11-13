@@ -40,7 +40,6 @@ const GLIDE_LIFT: f32 = 0.7;
 // The props' own layer in the physics world: the ground and the solids see it, the characters and the ragdolls do not
 pub const LAYER_PROP = 16u32;
 const PROP_MASK = 21u32;           // the ground (4), the world's solids (1) and each other (16)
-const NO_PROP_BODY = 0xffffffffu32;
 
 const PM_HOME = 0u32;
 const PM_LIVE = 1u32;
@@ -59,7 +58,7 @@ pub struct PropState {
 
 // A prop's bookkeeping
 struct Prop {
-  body: u32;                 // its body in the physics world, or NO_PROP_BODY while it glides
+  body: rigiddynamics.BodyId;  // its body in the physics world, or BodyId.none() while it glides
   mode: u32;
   home: Vec3;                // where it stands at home (the part's origin)
   homeRot: Quat;
@@ -117,7 +116,7 @@ pub fn propsEnsure(phys: &mut Phys, p: &mut Props) {
   p.ballShape = phys.w.addShape(rigidcollide.Shape.single(rigidcollide.Prim.sphere(BALL_RADIUS)));
   p.pinShape = phys.w.addShape(rigidcollide.Shape.single(pinHull()));
   let bh = ballHomeSpot();
-  p.props.push(Prop(NO_PROP_BODY, PM_HOME, Vec3(bh.x, groundHeight(&phys.island, bh.x, bh.y) + BALL_RADIUS, bh.y), Quat.identity(),
+  p.props.push(Prop(rigiddynamics.BodyId.none(), PM_HOME, Vec3(bh.x, groundHeight(&phys.island, bh.x, bh.y) + BALL_RADIUS, bh.y), Quat.identity(),
     Vec3(0., 0., 0.), Quat.identity(), 0., 0., 0u32));
   var k = 0usize;
   while k < PIN_COUNT {
@@ -130,7 +129,7 @@ pub fn propsEnsure(phys: &mut Phys, p: &mut Props) {
 }
 
 // A pin's body at 'at' turned 'rot', asleep
-fn makePin(phys: &mut Phys, p: &Props, at: Vec3, rot: Quat) u32 {
+fn makePin(phys: &mut Phys, p: &Props, at: Vec3, rot: Quat) rigiddynamics.BodyId {
   var def = rigiddynamics.BodyDef.dynamicAt(p.pinShape, at);
   def.rot = rot;
   def.mass = PIN_MASS;
@@ -153,7 +152,7 @@ pub fn propsLive(phys: &Phys, p: &Props) bool {
   while i < p.props.len() {
     let q = p.props[i];
     if q.mode == PM_GLIDE { return true; }
-    if q.body != NO_PROP_BODY && !phys.w.isAsleep(q.body) { return true; }
+    if !q.body.isNone() && !phys.w.isAsleep(q.body) { return true; }
     i = i + 1usize;
   }
   false
@@ -165,7 +164,7 @@ pub fn propsAwake(phys: &Phys, p: &Props) bool {
   var i = 0usize;
   while i < p.props.len() {
     let q = p.props[i];
-    if q.body != NO_PROP_BODY && !phys.w.isAsleep(q.body) { return true; }
+    if !q.body.isNone() && !phys.w.isAsleep(q.body) { return true; }
     i = i + 1usize;
   }
   false
@@ -180,7 +179,7 @@ pub fn propsStep(phys: &mut Phys, p: &mut Props, dt: f32) {
   var i = 0usize;
   while i < p.props.len() {
     let q = &mut p.props[i];
-    if q.mode == PM_HOME && q.body != NO_PROP_BODY && !phys.w.isAsleep(q.body) {
+    if q.mode == PM_HOME && !q.body.isNone() && !phys.w.isAsleep(q.body) {
       q.mode = PM_LIVE;
       p.moved = true;
     }
@@ -230,7 +229,7 @@ pub fn propsStep(phys: &mut Phys, p: &mut Props, dt: f32) {
           q.from = xf.pos;
           q.fromRot = xf.rot;
           phys.w.destroyBody(q.body);
-          q.body = NO_PROP_BODY;
+          q.body = rigiddynamics.BodyId.none();
           q.mode = PM_GLIDE;
           q.t = 0.;
           // Its progress, 0 to 1 over GLIDE_SECONDS (smoothstep, as the glide's easing always was); the pose
@@ -289,7 +288,7 @@ pub fn propsStep(phys: &mut Phys, p: &mut Props, dt: f32) {
 pub fn propsBowl(phys: &mut Phys, p: &mut Props, feet: Vec3, aim: Vec3) {
   propsEnsure(phys, p);
   let q = &mut p.props[PROP_BALL];
-  if q.body != NO_PROP_BODY { phys.w.destroyBody(q.body); }
+  if !q.body.isNone() { phys.w.destroyBody(q.body); }
   var d = Vec3(aim.x - feet.x, 0., aim.z - feet.z);
   let len = libc.sqrtf(d.x * d.x + d.z * d.z);
   if len < 0.001 { d = laneDir(); } else { d = Vec3(d.x / len, 0., d.z / len); }
@@ -326,7 +325,7 @@ fn propPose(phys: &Phys, q: &Prop) rigidcollide.Rigid {
     rigidcollide.Rigid(Vec3(q.from.x + (q.home.x - q.from.x) * s, q.from.y + (q.home.y - q.from.y) * s + lift,
       q.from.z + (q.home.z - q.from.z) * s), q.fromRot.slerp(q.homeRot, s))
   } else {
-    if q.body != NO_PROP_BODY { return phys.w.transformOf(q.body); }
+    if !q.body.isNone() { return phys.w.transformOf(q.body); }
     rigidcollide.Rigid(q.home, q.homeRot)
   }
 }
@@ -361,7 +360,7 @@ pub fn propPoseOf(phys: &Phys, p: &Props, slot: usize) rigidcollide.Rigid { prop
 pub fn propHomeOf(p: &Props, slot: usize) Vec3 { p.props[slot].home }
 pub fn propAwakeOf(phys: &Phys, p: &Props, slot: usize) bool {
   let q = p.props[slot];
-  q.body != NO_PROP_BODY && !phys.w.isAsleep(q.body)
+  !q.body.isNone() && !phys.w.isAsleep(q.body)
 }
 pub fn propSpeedOf(phys: &Phys, p: &Props, slot: usize) f32 {
   let q = p.props[slot];
