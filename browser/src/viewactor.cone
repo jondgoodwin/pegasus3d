@@ -203,14 +203,14 @@ pub struct ViewState {
   ownReady: bool;              // its body has been set to the simulation's
   forceSnap: bool;             // the next snapshot of it is taken whole
   pub birds: Birds;            // this browser's flock
-  history: List[Predicted];
+  history: Deque[Predicted];
   corr: Vec3;                  // a correction being blended away: how far the body drawn is from the body
   pub late: u64;               // frames whose state did not arrive with the simulation's answer
   lateNow: bool;               // this frame's did not
   snapshot: Snapshot;          // the last published, handed back by render once drawn
   forRender: List[Request];    // render's share of this frame's requests, in order
   seq: u64;                    // the last input sequence number given
-  recent: List[InputSample];   // the last INPUT_KEPT ticks of intents
+  recent: Deque[InputSample];  // the last INPUT_KEPT ticks of intents
   testFixed: bool;             // a scripted run's, from the simulation
   testView: Pose;
   testFov: f32;
@@ -298,8 +298,8 @@ pub struct ViewState {
     let still = Pose.look(Vec3(0., 0., 0.), 0., 0.);
     ViewState(ViewScene.empty(), PickSystem.empty(), PartId.none(), PickHit(PartId.none(), 0., 0u32, 0u64),
       0u64, Vec2(HEADLESS_W, HEADLESS_H), NetSide.make(), Cast.client(land.share()), List[Puppet](), NO_ROW, NO_BEING, false,
-      false, birds, List[Predicted](), Vec3(0., 0., 0.), 0u64, false, Snapshot.empty(), List[Request](), 0u64,
-      List[InputSample](), false, still, FOV, String(), List[MaterialId](), lockstep, false, false,
+      false, birds, Deque[Predicted](), Vec3(0., 0., 0.), 0u64, false, Snapshot.empty(), List[Request](), 0u64,
+      Deque[InputSample](), false, still, FOV, String(), List[MaterialId](), lockstep, false, false,
       List[ToView](), List[WorldState](), List[TestView](), 0u64,
       WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]()), false, Weathering.fair(), List[PlatformMove](), List[PlatformNow](), 0.,
       List[Intents](), List[bool](), 0u64, 0.0, false, 0i64, 1u32, 0.0, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2.0, false, false, false, 0u64, 0u64,
@@ -457,10 +457,7 @@ pub struct ViewState {
     }
     // Those the simulation has not yet said it applied are kept (at least the last INPUT_KEPT, at most INPUT_MOST)
     while recent.len() > INPUT_MOST || (recent.len() > INPUT_KEPT && recent[0usize].seq <= lastState.appliedInput) {
-      var keep = List[InputSample]();
-      var q = 1usize;
-      while q < recent.len() { keep.push(*recent[q]); q = q + 1usize; }
-      recent <-> keep;
+      let gone = recent.popFront();
     }
     // The last INPUT_KEPT, every frame (a lost packet loses nothing); single player sends one only when there is a step
     if joined && recent.len() > 0usize && (input.steps.len() > 0usize || !lockstep) {
@@ -486,10 +483,7 @@ pub struct ViewState {
     }
     history.push(Predicted(sample.seq, sample.intents, sample.lookKeys, step.dt, done, pos, yaw, grounded, rigBefore));
     if history.len() > HISTORY_MAX {
-      var keep = List[Predicted]();
-      var q = history.len() - HISTORY_MAX;
-      while q < history.len() { keep.push(*history[q]); q = q + 1usize; }
-      history <-> keep;
+      while history.len() > HISTORY_MAX { let gone = history.popFront(); }
     }
   }
 
@@ -697,8 +691,9 @@ pub struct ViewState {
         let li = history.len() - 1usize;
         let lp = *history[li];
         if lp.stepped {
-          history.set(li, Predicted(lp.seq, lp.intents, lp.look, lp.dt, true, cast.beings[own].body.position,
-            cast.beings[own].body.yaw, lp.grounded, lp.rig));
+          let slot = &mut history[li];
+          *slot = Predicted(lp.seq, lp.intents, lp.look, lp.dt, true, cast.beings[own].body.position,
+            cast.beings[own].body.yaw, lp.grounded, lp.rig);
         }
       }
     }
@@ -922,8 +917,9 @@ pub struct ViewState {
       let hp = *history[i];
       self.stepBody(hp.intents, hp.look, hp.dt);
       let body = cast.beings[own].body;
-      history.set(i, Predicted(hp.seq, hp.intents, hp.look, hp.dt, true, body.position, body.yaw,
-        cast.beings[own].figure.grounded, hp.rig));
+      let slot = &mut history[i];
+      *slot = Predicted(hp.seq, hp.intents, hp.look, hp.dt, true, body.position, body.yaw,
+        cast.beings[own].figure.grounded, hp.rig);
       i = i + 1usize;
     }
     now = cast.beings[own].body.position;
@@ -950,13 +946,8 @@ pub struct ViewState {
 
   // History up to input 'applied' let go
   fn dropHistory(self: &mut, applied: u64) {
-    var keep = List[Predicted]();
-    var q = 0usize;
-    while q < history.len() {
-      if history[q].seq > applied { keep.push(*history[q]); }
-      q = q + 1usize;
-    }
-    history <-> keep;
+    // (history is in ascending input order: pushed as each is stepped)
+    while history.len() > 0usize && history[0usize].seq <= applied { let gone = history.popFront(); }
   }
 
   // The being this client drives, once it is told which and the being exists
