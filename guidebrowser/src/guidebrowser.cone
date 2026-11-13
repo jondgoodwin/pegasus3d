@@ -40,7 +40,7 @@
 // on the shot's frame, the Vulkan failures and frame's per-phase timings, and
 // fails if the GPU reported any failure.
 
-mod guidebrowser is World;
+mod guidebrowser;
 
 import stdio use *;
 import libc;
@@ -56,7 +56,7 @@ import window use *;
 import arena use Arena;
 import actors;
 import sync use Channel, Sender, Receiver;
-import frame use World, Config, Host, Step, NetQueues;
+import frame use worldOf, run, Config, Host, Step, NetQueues;
 import fs;
 import path use Path;
 import json;
@@ -127,9 +127,10 @@ struct Shell {
   pub light: Light;
 }
 
-// Made in start. (A global Option cannot be matched in place, only a borrow
-// of a local can, so each callback swaps it out into a local and back.)
-var shell: Option[Shell];
+// The world's state: made by start, held by frame's run, and lent to each callback
+struct State {
+  pub shell: Option[Shell];
+}
 
 // From the command line
 var @threadlocal testPart = false;
@@ -151,27 +152,17 @@ var @threadlocal tilt = 0.;                // '--tilt D': once arrived, look D d
 var @threadlocal drawn = 0;
 var @threadlocal centre = Array[i32, 3]() <- fill 0;
 
-fn @initpure init() {
-  shell = None;
-}
-
-fn takeShell() Option[Shell] {
-  var s: Option[Shell] = None;
-  s <-> shell;
-  s
-}
-
-pub fn start(host: &mut Host) bool {
+fn start(host: &mut Host) Option[State] {
   if !host.hasWindow() {
     print <- "The guide browser needs a window\n";
-    return false;
+    return None;
   }
   var instance = Instance.createWindowed("guidebrowser", false);
   var surface = instance.createSurface(host.window().sdlHandle());
   var adapter = instance.requestAdapter(&surface, POWER_PREFERENCE_HIGH_PERFORMANCE);
   if !adapter.isValid() {
     print <- "No GPU can draw to the window\n";
-    return false;
+    return None;
   }
   print <- "Adapter: "; printStr(adapter.name.view()); print <- "\n";
   var device = adapter.requestDevice();
@@ -186,7 +177,7 @@ pub fn start(host: &mut Host) bool {
   var post = Post.create(&mut device, swapchain.format, u32.from(size.w), u32.from(size.h));
   if !renderer.isValid() || !post.isValid() {
     print <- "The renderer could not be made\n";
-    return false;
+    return None;
   }
   var fx = ImageFx.create(&mut device, &renderer, &mut post);
   fx.configure(&FxSettings.high());        // until a world's arrival says how its picture is taken
@@ -227,20 +218,18 @@ pub fn start(host: &mut Host) bool {
   loader.arrive(world, worldsFolder(), arrivedAt, testPart, show);
 
   let target = swapchain.getCurrentTexture(&mut device);
-  shell = Some[Shell](Shell(Scene.empty(), readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
+  Some[State](State(Some[Shell](Shell(Scene.empty(), readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
     List[PartView](), 0u64, NO_CLICK, Input(), actions, walk, look, true,
     Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), target, fx, post, renderer, swapchain, device,
-    adapter, surface, instance, DrawList(), camera, light));
-  true
+    adapter, surface, instance, DrawList(), camera, light))))
 }
 
 // The window's own events are frame's; a resize is the swapchain's. The
 // keyboard's and the mouse's go to the input package, and a left click picks
 // the part under the pointer, for the next step.
-pub fn event(host: &mut Host, e: &imm sdl.Event) {
-  var g = takeShell();
-  match &mut g {
-    case var &mut Some(some) {
+fn event(host: &mut Host, st: &uni State, e: &imm sdl.Event) {
+  match &uni st.shell {
+    case var &uni Some(some) {
       if host.window().resized {
         host.window().resized = false;
         let size = host.window().size();
@@ -258,7 +247,6 @@ pub fn event(host: &mut Host, e: &imm sdl.Event) {
     }
     else {}
   }
-  shell = g;
 }
 
 // The part drawn under (x, y), in the window's units, clicked: the nearest
@@ -297,13 +285,11 @@ fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
 
 // One fixed step: the visitor walks, and the World is sent the step with what
 // came in for it
-pub fn simulate(host: &mut Host, step: &imm Step, scratch: &mut Arena) {
-  var g = takeShell();
-  match &mut g {
-    case var &mut Some(some) { stepWorld(&mut *some, step); }
+fn simulate(host: &mut Host, st: &uni State, step: &imm Step, scratch: &mut Arena) {
+  match &uni st.shell {
+    case var &uni Some(some) { stepWorld(&mut *some, step); }
     else {}
   }
-  shell = g;
 }
 
 fn stepWorld(s: &mut Shell, step: &Step) {
@@ -336,16 +322,14 @@ fn stepWorld(s: &mut Shell, step: &Step) {
 
 // The activation slice (in frame's network slot): what the loader has built,
 // made live, up to the budget; and what the World has published, taken in
-pub fn network(host: &mut Host, net: &mut NetQueues) {
-  var g = takeShell();
-  match &mut g {
-    case var &mut Some(some) {
+fn network(host: &mut Host, st: &uni State, net: &mut NetQueues) {
+  match &uni st.shell {
+    case var &uni Some(some) {
       activate(&mut *some, host.stats.frames);
       takePublished(&mut *some);
     }
     else {}
   }
-  shell = g;
 }
 
 fn activate(s: &mut Shell, frame: u64) {
@@ -509,13 +493,11 @@ fn takePublished(s: &mut Shell) {
 }
 
 // Record the frame: every live part, where the World last put it
-pub fn draw(host: &mut Host, alpha: f32, scratch: &mut Arena) {
-  var g = takeShell();
-  match &mut g {
-    case var &mut Some(some) { drawScene(&mut *some, alpha); }
+fn draw(host: &mut Host, st: &uni State, alpha: f32, scratch: &mut Arena) {
+  match &uni st.shell {
+    case var &uni Some(some) { drawScene(&mut *some, alpha); }
     else {}
   }
-  shell = g;
 }
 
 fn drawScene(s: &mut Shell, alpha: f32) {
@@ -562,10 +544,9 @@ fn drawScene(s: &mut Shell, alpha: f32) {
 }
 
 // Show the frame, and wait for the next texture to draw into: the present wait
-pub fn present(host: &mut Host) {
-  var g = takeShell();
-  match &mut g {
-    case var &mut Some(some) {
+fn present(host: &mut Host, st: &uni State) {
+  match &uni st.shell {
+    case var &uni Some(some) {
       showAndAcquire(&mut *some);
       // '--click-at N': a click where the last part is drawn, as a person's would come
       if clickAt != 0 && drawn == clickAt { clickLast(&mut *some, host); }
@@ -585,7 +566,6 @@ pub fn present(host: &mut Host) {
     }
     else {}
   }
-  shell = g;
 }
 
 fn clickLast(s: &mut Shell, host: &mut Host) {
@@ -665,17 +645,16 @@ fn push32(out: &mut List[u8], v: u32) {
   out.push(u8.from((v >> 16u32) & 0xFFu32)); out.push(u8.from(v >> 24u32));
 }
 
-pub fn quit(host: &mut Host) i32 {
+fn quit(host: &mut Host, st: &uni State) i32 {
   var code = 0i32;
-  var g = takeShell();
-  match &mut g {
-    case var &mut Some(some) {
+  match &uni st.shell {
+    case var &uni Some(some) {
       (*some).device.waitIdle();
       print <- "Parts live: "; print <- (*some).activated; print <- "\n";
     }
     else {}
   }
-  g = None;      // the GPU's objects go before the window does
+  st.shell = None;      // the GPU's objects go before the window does
   print <- "Frames drawn: "; print <- drawn; print <- "\n";
   print <- "Middle of the window on frame "; print <- shotAt; print <- ": ";
   print <- centre[0]; print <- " "; print <- centre[1]; print <- " "; print <- centre[2]; print <- "\n";
@@ -741,7 +720,10 @@ fn main(argc: i32, argv: **u8) i32 {
   }
   var config = Config.fromArgs(argc, argv);
   config.setTitle("Guide browser");
-  let code = run(config);
+  var world = worldOf(&start, &event, &simulate, &draw, &quit);
+  world.network = &network;
+  world.present = &present;
+  let code = run(config, &world);
   finalAll();
   code
 }
