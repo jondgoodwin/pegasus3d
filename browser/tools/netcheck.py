@@ -27,6 +27,15 @@ draws) is skipped.
 import argparse, os, re, subprocess, sys, time, threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# A's top speed, m/s: the movement code's ceiling for a being that runs, walk.cone's Walk (speed 3 m/s, runFactor 4); the script's A (server.cone's
+# autoIntents) was measured at 9 m/s (0.150 m a tick), under it. The server's step is 1/60 s (netchecks.cone's Step)
+V_MAX = 12.0
+TICK_S = 1.0 / 60.0
+# The most a frame may move the drawn A, per tick drawn on: twice the top speed. When a snapshot ends an extrapolation B re-times its draw
+# several ticks back and the point moves 0.2 to 0.37 m in one frame (measured over 10 impaired runs, 13 Nov), over 1.5 x V_MAX x TICK_S (0.3);
+# a snap or a teleport is metres
+STEP_MAX = 2.0 * V_MAX * TICK_S
+
 DEFAULT_EXE = os.path.join(HERE, '..', 'build', 'release', 'browser.exe')
 
 
@@ -95,6 +104,8 @@ def main():
     ap.add_argument('--settle', type=int, default=11, help='seconds to wait for a local server to build the world')
     ap.add_argument('--out', default=os.path.join(HERE, '..', '..', 'netcheck-out'))
     args = ap.parse_args()
+    # B prints a TD line beside each TV line (viewactor.cone's traceDiag) when this is set: how many ticks past its newest snapshot it drew
+    os.environ['PEGASUS_NETDIAG'] = '1'
     if args.predict_tolerance is None:
         args.predict_tolerance = 0.4 if args.creatures else 0.05
     if args.tolerance is None:
@@ -117,7 +128,7 @@ def main():
     if remote and args.reuse:
         pass    # the clients' logs and the server's are already there: only the checks are run
     elif remote:
-        common = [exe, '--headless', '--connect', args.connect, '--trace', '--run-for', str(args.seconds)]
+        common = [exe, '--headless', '--connect', args.connect, '--no-audio', '--trace', '--run-for', str(args.seconds)]
         try:
             b, f3 = start(common + ['--name', 'netcheck-b'], blog)
             procs.append((b, f3))
@@ -134,7 +145,7 @@ def main():
         if not wait_for(slog, r'Server: \d+ ticks', 300):
             print('FAIL: the server log is missing or has not ended'); return 1
     else:
-        server_cmd = [exe, '--serve', str(args.port), '--loopback', '--run-for', str(args.seconds + 50), '--trace']
+        server_cmd = [exe, '--serve', str(args.port), '--loopback', '--run-for', str(args.seconds + 50), '--no-audio', '--trace']
         if args.impair:
             server_cmd += ['--impair'] + [str(v) for v in args.impair]
         if args.lab or args.creatures:
@@ -152,7 +163,7 @@ def main():
                 port = int(m.group(1))
             # Let the server build the world before the clients ask for it
             time.sleep(args.settle)
-            common = [exe, '--headless', '--connect', f'127.0.0.1:{port}', '--trace', '--run-for', str(args.seconds)]
+            common = [exe, '--headless', '--connect', f'127.0.0.1:{port}', '--no-audio', '--trace', '--run-for', str(args.seconds)]
             b, f3 = start(common + ['--name', 'netcheck-b'], blog)
             procs.append((b, f3))
             a, f2 = start(common + ['--name', 'netcheck-a', walk_flag(args)], alog)
@@ -238,10 +249,15 @@ def main():
         if l.startswith('TV '):
             _, at, qpc, being, x, y, z = l.split()
             if int(being) == a_being:
-                tv.append((int(at) / 1000.0, int(qpc), (int(x) / 1000.0, int(y) / 1000.0, int(z) / 1000.0)))
+                tv.append([int(at) / 1000.0, int(qpc), (int(x) / 1000.0, int(y) / 1000.0, int(z) / 1000.0), 0.0])
+        elif l.startswith('TD ') and tv:
+            # TD at qpc n newest lo hi mode ahead gapMax lastArrival x z: the line after the TV it describes (same drawn tick)
+            f = l.split()
+            if len(f) >= 9 and int(f[1]) == int(round(tv[-1][0] * 1000.0)) and int(f[7]) == 1:
+                tv[-1][3] = int(f[8]) / 1000.0   # ticks past B's newest snapshot (mode 1 = extrapolating)
     check(len(tv) > 600, f'B drew A {len(tv)} times')
     if args.lab and tv:
-        ys = sorted(p[1] for _, _, p in tv)
+        ys = sorted(p[1] for _, _, p, _ in tv)
         check(ys[0] < -299.0 and ys[-1] < -298.0 and ys[len(ys) // 2] < -299.0,
               f'B drew A in the labyrinth: heights {ys[0]:.2f} to {ys[-1]:.2f} m, median {ys[len(ys) // 2]:.2f} (want about -300)')
     ticks, pos = path[a_being]
@@ -256,9 +272,15 @@ def main():
                 cfreq = float(l.split()[1])
     q0 = tv[0][1] + 3 * (cfreq or 10000000.0) if tv else 0
     errs = []
+    in_ex = []     # error of samples drawn beyond B's newest snapshot (extrapolating)
+    out_ex = []    # error of samples drawn at or behind it
+    over = []      # how far each sample is over its bound
+    steps = []     # distance between consecutive drawn samples of A
     lags = []
     moved = 0.0
     last = None
+    last_at = None
+    last_e = 0.0
     # A body that goes through a portal's gate jumps 300 m in one tick (the portal's whole point). B draws it a little late and takes the later
     # snapshot across the jump, so it and the server's path part company for a few ticks either side of it: those are not measured (and said)
     # (the creatures' walk sets A down at four places of the labyrinth, tens of metres apart: the same, with 10 m for a jump)
@@ -266,14 +288,27 @@ def main():
     jumps = [ticks[i] for i in range(1, len(ticks))
              if ((pos[i][0] - pos[i - 1][0]) ** 2 + (pos[i][1] - pos[i - 1][1]) ** 2 + (pos[i][2] - pos[i - 1][2]) ** 2) ** 0.5 > jump_min]
     skipped = 0
-    for at, qpc, p in tv:
+    for at, qpc, p, ahead in tv:
         if qpc < q0 or at < ticks[0] or at > ticks[-1]:
             continue
         if any(abs(at - j) < 8 for j in jumps):
             skipped += 1
             continue
         sp = interp(ticks, pos, at)
-        errs.append(((p[0] - sp[0]) ** 2 + (p[1] - sp[1]) ** 2 + (p[2] - sp[2]) ** 2) ** 0.5)
+        e = ((p[0] - sp[0]) ** 2 + (p[1] - sp[1]) ** 2 + (p[2] - sp[2]) ** 2) ** 0.5
+        errs.append(e)
+        (in_ex if ahead > 0.0 else out_ex).append(e)
+        # Beyond its newest snapshot B draws A on at A's last speed, and A may have started walking in the gap: the error may grow by
+        # V_MAX * TICK_S a tick of that overshoot, no more
+        over.append(e - (args.tolerance + ahead * V_MAX * TICK_S))
+        if last is not None and last_at is not None and at - last_at < 2.0:
+            # per tick drawn on (a frame may cover several ticks; a step back in time counts as one). When the next snapshot ends an
+            # extrapolation B draws earlier in A's path and the drawn point glides in to it; the part of the step that is the error
+            # shrinking is that convergence, not a snap (a step that grows the error is still counted whole)
+            d = ((p[0] - last[0]) ** 2 + (p[1] - last[1]) ** 2 + (p[2] - last[2]) ** 2) ** 0.5
+            steps.append(max(0.0, d - max(0.0, last_e - e)) / max(1.0, at - last_at))
+        last_at = at
+        last_e = e
         if not remote and freq and wall[0] and wall[0][0] <= qpc <= wall[0][-1]:
             tick_now = interp(wall[0], wall[1], qpc)[0]
             lags.append(tick_now - at)
@@ -286,7 +321,10 @@ def main():
     if errs:
         errs.sort()
         print(f'     B vs the server path of A: worst {errs[-1]:.3f} m, 95th percentile {errs[int(len(errs)*0.95)]:.3f} m, mean {sum(errs)/len(errs):.3f} m')
-        check(errs[-1] <= args.tolerance, f'B follows A\'s server path within {args.tolerance} m')
+        print(f'     worst error inside extrapolation {max(in_ex, default=0.0):.3f} m ({len(in_ex)} samples), outside it {max(out_ex, default=0.0):.3f} m ({len(out_ex)} samples), '
+              f'largest frame-to-frame step {max(steps, default=0.0):.3f} m (allowed {STEP_MAX:.3f})')
+        check(max(over) <= 0.0, f'B follows A\'s server path within {args.tolerance} m (plus {V_MAX} m/s x {TICK_S:.4f} s per tick drawn beyond its newest snapshot)')
+        check(max(steps, default=0.0) <= STEP_MAX, f'B\'s drawn A never steps more than {STEP_MAX:.3f} m between samples (no snap)')
     if lags:
         lags.sort()
         mean = sum(lags) / len(lags)
