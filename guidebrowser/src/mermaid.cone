@@ -5,7 +5,9 @@
 // Flowcharts ('graph' or 'flowchart', direction TD TB BT LR RL): nodes with a shape and a label
 //   A[rect]  A(round)  A([stadium])  A((circle))  A{diamond}  A{{hexagon}}  A[[sub]]  A[(db)]  A[/slant/]
 // edges  -->  ---  -.->  ==>  with a label  -->|text|  or  -- text -->  or  -. text .->, and chains  A --> B --> C.
-// Not read: subgraph (its lines are ignored, its nodes still show), style, classDef, class, click, 'A & B'.
+// subgraph ID["Title"] ... end  (or  subgraph Title) makes a group of the nodes first named inside it; groups nest.
+// <-->  <---  <-.->  have a head at both ends.
+// Not read: style, classDef, class, click, 'A & B' as a group.
 //
 // Sequence diagrams: 'participant X as Name', 'actor X', messages  ->>  -->>  ->  -->  -)  --)  -x  --x  (a + or -
 // after the arrow is ignored), 'Note over A,B: text', 'Note right of A: text', 'Note left of A: text'.
@@ -39,6 +41,13 @@ pub struct MNode {
   pub label: String;
   pub shape: u32;
   pub named: bool;               // has had a label given
+  pub group: i32;                // the innermost subgraph it was named in, or -1
+}
+
+pub struct MGroup {
+  pub key: String;
+  pub title: String;
+  pub parent: i32;               // the subgraph it sits in, or -1
 }
 
 pub struct MEdge {
@@ -47,6 +56,7 @@ pub struct MEdge {
   pub label: String;
   pub dotted: bool;
   pub arrow: bool;
+  pub back: bool;                // a head at the 'from' end too  (<-->)
 }
 
 pub struct MPart {
@@ -74,6 +84,8 @@ pub struct Mermaid {
   pub horizontal: bool;
   pub nodes: List[MNode];
   pub edges: List[MEdge];
+  pub groups: List[MGroup];
+  pub cur: i32;                  // the subgraph being read, or -1
   pub parts: List[MPart];
   pub msgs: List[MMsg];
   pub notes: List[MNote];
@@ -81,7 +93,7 @@ pub struct Mermaid {
 }
 
 fn emptyMermaid() Mermaid {
-  Mermaid(MM_NONE, false, List[MNode](), List[MEdge](), List[MPart](), List[MMsg](), List[MNote](), 0u32)
+  Mermaid(MM_NONE, false, List[MNode](), List[MEdge](), List[MGroup](), -1, List[MPart](), List[MMsg](), List[MNote](), 0u32)
 }
 
 fn isIdByte(c: u8) bool {
@@ -157,9 +169,10 @@ fn addFlowNode(m: &mut Mermaid, key: &str, label: &str, shape: u32, named: bool)
       m.nodes[at].shape = shape;
       m.nodes[at].named = true;
     }
+    if m.nodes[at].group < 0 && m.cur >= 0 { m.nodes[at].group = m.cur; }
     return at;
   }
-  m.nodes.push(MNode(String.from(key), String.from(if named { label } else { key }), shape, named));
+  m.nodes.push(MNode(String.from(key), String.from(if named { label } else { key }), shape, named, m.cur));
   m.nodes.len() - 1usize
 }
 
@@ -212,6 +225,7 @@ struct Conn {
   label: String;
   dotted: bool;
   arrow: bool;
+  back: bool;
 }
 
 fn isConnByte(c: u8) bool { c == '-' || c == '=' || c == '.' || c == '>' || c == '<' }
@@ -219,13 +233,13 @@ fn isConnByte(c: u8) bool { c == '-' || c == '=' || c == '.' || c == '>' || c ==
 // The connector at 'pos': the run of - = . > characters, with a label inside it or after it in | |
 fn parseConn(s: &str, pos: &mut usize) Conn {
   var i = skipSpaces(s, *pos);
-  var c = Conn(false, String(), false, false);
+  var c = Conn(false, String(), false, false, false);
   if i >= s.len() || !isConnByte(s[i]) { return c; }
   var j = i;
   while j < s.len() && isConnByte(s[j]) { j = j + 1usize; }
   let run = s.slice(i, j);
   // -- text -->   ==  text ==>   -. text .->
-  if (run == "--" || run == "==" || run == "-.") && j < s.len() && s[j] == ' ' {
+  if (run == "--" || run == "==" || run == "-." || run == "<--" || run == "<==" || run == "<-.") && j < s.len() && s[j] == ' ' {
     var stop = NOID;
     var k = j;
     while k + 1usize < s.len() && stop == NOID {
@@ -241,6 +255,7 @@ fn parseConn(s: &str, pos: &mut usize) Conn {
     let tail = s.slice(stop, e);
     c.dotted = run == "-." || tail.contains(".");
     c.arrow = tail.endsWith(">");
+    c.back = run.startsWith("<");
     c.ok = true;
     *pos = e;
     return c;
@@ -248,6 +263,8 @@ fn parseConn(s: &str, pos: &mut usize) Conn {
   if run.len() < 2usize { return c; }
   c.dotted = run.contains(".");
   c.arrow = run.endsWith(">");
+  c.back = run.startsWith("<") && run.len() >= 3usize;
+  if c.back { c.arrow = true; }
   c.ok = true;
   var after = skipSpaces(s, j);
   if after < s.len() && s[after] == '|' {
@@ -281,12 +298,43 @@ fn parseFlowLine(t: &str, m: &mut Mermaid) {
         let next = parseTerm(t, &mut pos, m);
         if next == NOID { m.skipped = m.skipped + 1u32; go = false; }
         else {
-          if next != prev { m.edges.push(MEdge(prev, next, c.label.clone(), c.dotted, c.arrow)); }
+          if next != prev { m.edges.push(MEdge(prev, next, c.label.clone(), c.dotted, c.arrow, c.back)); }
           prev = next;
         }
       }
     }
   }
+}
+
+// 'subgraph ID["Title"]', 'subgraph ID[Title]' or 'subgraph Title': opens a group
+fn openGroup(m: &mut Mermaid, rest: &str) {
+  let t = rest.trim();
+  var i = 0usize;
+  while i < t.len() && isIdByte(t[i]) { i = i + 1usize; }
+  var key = String.from(t.slice(0usize, i));
+  var title = String.from(key.view());
+  let after = skipSpaces(t, i);
+  if after < t.len() && t[after] == '[' {
+    var from = after + 1usize;
+    if from < t.len() && t[from] == '"' {
+      match t.findFrom("\"", from + 1usize) { case let Some(q) { from = q + 1usize; } else {} }
+    }
+    match t.findFrom("]", from) {
+      case let Some(c) { title = labelText(t.slice(after + 1usize, c)); }
+      else { title = labelText(t.sliceFrom(after + 1usize)); }
+    }
+  }
+  else if after < t.len() {
+    // 'subgraph Some title': the whole text is the title
+    title = labelText(t);
+    key = String.from(t);
+  }
+  m.groups.push(MGroup(key, title, m.cur));
+  m.cur = i32.from(m.groups.len() - 1usize);
+}
+
+fn closeGroup(m: &mut Mermaid) {
+  if m.cur >= 0 { m.cur = m.groups[usize.from(m.cur)].parent; }
 }
 
 fn partIndex(m: &mut Mermaid, key: &str) usize {
@@ -419,7 +467,9 @@ pub fn parseMermaid(src: &str) Mermaid {
     }
     if m.kind == MM_SEQ { parseSeqLine(t, &mut m); }
     else {
-      if wordAt(t, 0usize, "subgraph") || wordAt(t, 0usize, "end") || wordAt(t, 0usize, "style") || wordAt(t, 0usize, "classdef")
+      if wordAt(t, 0usize, "subgraph") { openGroup(&mut m, t.sliceFrom(8usize)); continue; }
+      if wordAt(t, 0usize, "end") { closeGroup(&mut m); continue; }
+      if wordAt(t, 0usize, "style") || wordAt(t, 0usize, "classdef")
         || wordAt(t, 0usize, "class") || wordAt(t, 0usize, "linkstyle") || wordAt(t, 0usize, "click") || wordAt(t, 0usize, "direction") { continue; }
       parseFlowLine(t, &mut m);
     }

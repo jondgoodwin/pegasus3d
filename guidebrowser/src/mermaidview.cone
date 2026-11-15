@@ -13,6 +13,10 @@ const MV_MAX_SCALE = 1.6f;
 const MV_MAX_H = 1650.0f;
 const MV_NOTE_H = 26.0f;
 const NONE_IDX = 1000000000usize;
+const MV_GPAD = 14.0f;           // a group box's padding round its nodes
+const MV_GHEAD = 24.0f;          // and the room for its title
+const MV_WRAP = 240.0f;          // a node label wider than this (at 14 px) is wrapped
+const MV_LINE = 17.0f;           // a wrapped label's line height
 
 pub struct Painter {
   renderer: VectorRenderer;
@@ -138,13 +142,92 @@ fn textWidth(p: &mut Painter, s: &str, size: f32) f32 {
   measureText(&p.font, &mut p.atlas, s, size, 0.).x
 }
 
-fn nodeSize(p: &mut Painter, mm: &Mermaid, i: usize) Vec2 {
-  let tw = textWidth(p, mm.nodes[i].label.view(), 14.);
+// 'label' cut at spaces into lines no wider than MV_WRAP, joined by newlines; "" when it fits on one line (or the shape
+// is a diamond or circle, whose labels are not wrapped)
+fn wrapLabel(p: &mut Painter, label: &str, shape: u32) String {
+  if shape == SH_DIAMOND || shape == SH_CIRCLE { return String(); }
+  if textWidth(p, label, 14.) <= MV_WRAP { return String(); }
+  var out = String();
+  var cur = String();
+  var i = 0usize;
+  while i <= label.len() {
+    var j = i;
+    while j < label.len() && label[j] != ' ' { j = j + 1usize; }
+    let word = label.slice(i, j);
+    if word.len() > 0usize {
+      if cur.len() == 0usize { cur.append(word); }
+      else {
+        var trial = String.from(cur.view());
+        trial.append(" ");
+        trial.append(word);
+        if textWidth(p, trial.view(), 14.) > MV_WRAP {
+          if out.len() > 0usize { out.append("\n"); }
+          out.append(cur.view());
+          cur = String.from(word);
+        }
+        else { cur = trial; }
+      }
+    }
+    i = j + 1usize;
+  }
+  if cur.len() > 0usize {
+    if out.len() > 0usize { out.append("\n"); }
+    out.append(cur.view());
+  }
+  out
+}
+
+fn splitLines(s: &str) List[String] {
+  var out = List[String]();
+  var i = 0usize;
+  while i <= s.len() {
+    var j = i;
+    while j < s.len() && s[j] != '\n' { j = j + 1usize; }
+    out.push(String.from(s.slice(i, j)));
+    i = j + 1usize;
+  }
+  out
+}
+
+fn nodeSize(p: &mut Painter, mm: &Mermaid, i: usize, wrapped: &str) Vec2 {
   let shape = mm.nodes[i].shape;
+  var tw = textWidth(p, mm.nodes[i].label.view(), 14.);
+  var rows = 1usize;
+  if wrapped.len() > 0usize {
+    let ls = splitLines(wrapped);
+    tw = 0.;
+    var k = 0usize;
+    while k < ls.len() {
+      let w = textWidth(p, ls[k].view(), 14.);
+      if w > tw { tw = w; }
+      k = k + 1usize;
+    }
+    rows = ls.len();
+  }
+  let extra = MV_LINE * f32.from(u32.from(rows - 1usize));
   if shape == SH_DIAMOND { return Vec2(tw * 1.8 + 30., 58.); }
   if shape == SH_CIRCLE { return Vec2(tw * 1.42 + 36., 50.); }
-  if shape == SH_STADIUM { return Vec2(tw + 44., 36.); }
-  Vec2(if tw + 28. < 46. { 46. } else { tw + 28. }, 36.)
+  if shape == SH_STADIUM { return Vec2(tw + 44., 36. + extra); }
+  Vec2(if tw + 28. < 46. { 46. } else { tw + 28. }, 36. + extra)
+}
+
+// The wrapped labels of the nodes that have them, over the boxes
+fn drawWrapped(c: &mut Canvas, g: &Graph, wrapped: &List[String], st: &DiagramStyle) {
+  var i = 0usize;
+  while i < g.nodes.len() {
+    if wrapped[i].len() > 0usize {
+      let nd = &g.nodes[i];
+      let ls = splitLines(wrapped[i].view());
+      var y = nd.y - MV_LINE * 0.5 * f32.from(u32.from(ls.len() - 1usize));
+      var k = 0usize;
+      while k < ls.len() {
+        c.text(ls[k].view(), nd.x, y, 0.5, 0.5, st.fontSize, st.textColor);
+        y = y + MV_LINE;
+        k = k + 1usize;
+      }
+    }
+    i = i + 1usize;
+  }
 }
 
 // The shapes drawGraph does not draw (it draws every node as a rounded box): painted over the box
@@ -182,45 +265,219 @@ fn drawShapes(c: &mut Canvas, g: &Graph, st: &DiagramStyle) {
   }
 }
 
-fn renderFlow(p: &mut Painter, device: &mut Device, mm: &Mermaid, maxW: u32, d: &mut Diagram) {
+// The outermost group that group 'gi' sits in
+fn topGroup(mm: &Mermaid, gi: i32) i32 {
+  var g = gi;
+  while g >= 0 && mm.groups[usize.from(g)].parent >= 0 { g = mm.groups[usize.from(g)].parent; }
+  g
+}
+
+// The nodes of one outermost group, laid out alone: its nodes' positions relative to the middle of their box, and
+// the box's size (padding and the title's room included). 'ids' are the members' indices in 'mm'.
+fn layoutInner(mm: &Mermaid, sizes: &List[Vec2], ids: &List[usize], horizontal: bool, offs: &mut List[Vec2]) Vec2 {
   var g = Graph.make();
   var i = 0usize;
-  while i < mm.nodes.len() {
-    let sz = nodeSize(p, mm, i);
-    let id = g.addNode(mm.nodes[i].key.view(), mm.nodes[i].label.view(), sz.x, sz.y);
-    g.nodes[usize.from(id)].kind = mm.nodes[i].shape;
+  while i < ids.len() {
+    let n = *ids[i];
+    g.addNode(mm.nodes[n].key.view(), "", sizes[n].x, sizes[n].y);
     i = i + 1usize;
   }
   i = 0usize;
   while i < mm.edges.len() {
     let e = &mm.edges[i];
-    let id = g.addEdge(u32.from(e.from), u32.from(e.to));
-    if e.label.len() > 0usize { g.edges[usize.from(id)].label = e.label.clone(); }
+    var a = NONE_IDX;
+    var b = NONE_IDX;
+    var k = 0usize;
+    while k < ids.len() {
+      if *ids[k] == e.from { a = k; }
+      if *ids[k] == e.to { b = k; }
+      k = k + 1usize;
+    }
+    if a != NONE_IDX && b != NONE_IDX && a != b { g.addEdge(u32.from(a), u32.from(b)); }
     i = i + 1usize;
   }
-  d.nodes = g.liveNodes();
-  d.edges = g.liveEdges();
   var lo = LayeredOptions.make();
   lo.routeEdges = false;
-  var routeOpt = RouteOptions.make();
-  if mm.horizontal { lo.direction = DIR_LR; routeOpt.flow = FLOW_HORIZONTAL; }
+  if horizontal { lo.direction = DIR_LR; }
   layoutLayered(&mut g, &lo);
+  let bb = g.bounds();
+  let cx = (bb.min.x + bb.max.x) * 0.5;
+  let cy = (bb.min.y + bb.max.y) * 0.5;
+  i = 0usize;
+  while i < g.nodes.len() {
+    offs.push(Vec2(g.nodes[i].x - cx, g.nodes[i].y - cy));
+    i = i + 1usize;
+  }
+  Vec2(bb.max.x - bb.min.x + MV_GPAD * 2., bb.max.y - bb.min.y + MV_GPAD * 2. + MV_GHEAD)
+}
+
+fn renderFlow(p: &mut Painter, device: &mut Device, mm: &Mermaid, maxW: u32, d: &mut Diagram) {
+  // each node's wrapped label and size
+  var wrapped = List[String]();
+  var sizes = List[Vec2]();
+  var i = 0usize;
+  while i < mm.nodes.len() {
+    let w = wrapLabel(p, mm.nodes[i].label.view(), mm.nodes[i].shape);
+    sizes.push(nodeSize(p, mm, i, w.view()));
+    wrapped.push(w);
+    i = i + 1usize;
+  }
+  // the layout: an outermost group is laid out alone and then stands as one box in the layout of the rest, so its
+  // members stay together; positions are the middle of each node
+  var px = List[f32]();
+  var py = List[f32]();
+  i = 0usize;
+  while i < mm.nodes.len() { px.push(0.); py.push(0.); i = i + 1usize; }
+  var outer = Graph.make();
+  var outerOf = List[usize]();            // a node's index in 'outer'
+  var innerOff = List[Vec2]();            // a node's offset in its group's box
+  i = 0usize;
+  while i < mm.nodes.len() { outerOf.push(NONE_IDX); innerOff.push(Vec2(0., 0.)); i = i + 1usize; }
+  var gi = 0usize;
+  while gi < mm.groups.len() {
+    if mm.groups[gi].parent < 0 {
+      var ids = List[usize]();
+      i = 0usize;
+      while i < mm.nodes.len() {
+        if mm.nodes[i].group >= 0 && topGroup(mm, mm.nodes[i].group) == i32.from(gi) { ids.push(i); }
+        i = i + 1usize;
+      }
+      if ids.len() > 0usize {
+        var offs = List[Vec2]();
+        let box = layoutInner(mm, &sizes, &ids, mm.horizontal, &mut offs);
+        let oid = outer.addNode(mm.groups[gi].key.view(), "", box.x, box.y);
+        var k = 0usize;
+        while k < ids.len() {
+          outerOf.set(*ids[k], usize.from(oid));
+          innerOff.set(*ids[k], *offs[k]);
+          k = k + 1usize;
+        }
+      }
+    }
+    gi = gi + 1usize;
+  }
+  i = 0usize;
+  while i < mm.nodes.len() {
+    if outerOf[i] == NONE_IDX {
+      let oid = outer.addNode(mm.nodes[i].key.view(), "", sizes[i].x, sizes[i].y);
+      outerOf.set(i, usize.from(oid));
+    }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < mm.edges.len() {
+    let a = outerOf[mm.edges[i].from];
+    let b = outerOf[mm.edges[i].to];
+    if a != b { outer.addEdge(u32.from(a), u32.from(b)); }
+    i = i + 1usize;
+  }
+  var lo = LayeredOptions.make();
+  lo.routeEdges = false;
+  if mm.horizontal { lo.direction = DIR_LR; }
+  layoutLayered(&mut outer, &lo);
+  // the real graph, with the positions the outer layout gave
+  var g = Graph.make();
+  i = 0usize;
+  while i < mm.nodes.len() {
+    let id = g.addNode(mm.nodes[i].key.view(), mm.nodes[i].label.view(), sizes[i].x, sizes[i].y);
+    let nd = &mut g.nodes[usize.from(id)];
+    nd.kind = mm.nodes[i].shape;
+    let o = &outer.nodes[outerOf[i]];
+    if mm.nodes[i].group >= 0 {
+      nd.x = o.x + innerOff[i].x;
+      nd.y = o.y + MV_GHEAD * 0.5 + innerOff[i].y;
+    }
+    else {
+      nd.x = o.x;
+      nd.y = o.y;
+    }
+    nd.pinned = true;
+    nd.placed = true;
+    i = i + 1usize;
+  }
+  gi = 0usize;
+  while gi < mm.groups.len() {
+    g.addGroup(mm.groups[gi].title.view(), mm.groups[gi].parent);
+    gi = gi + 1usize;
+  }
+  i = 0usize;
+  while i < mm.nodes.len() {
+    if mm.nodes[i].group >= 0 { g.setGroup(u32.from(i), mm.nodes[i].group); }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < mm.edges.len() {
+    let e = &mm.edges[i];
+    var style = LINK_ARROW;
+    if e.dotted { style = if e.arrow { LINK_DOTTED } else { LINK_DOTTED_PLAIN }; }
+    else if !e.arrow { style = LINK_PLAIN; }
+    var lw = 0.0f;
+    var lh = 0.0f;
+    if e.label.len() > 0usize { lw = textWidth(p, e.label.view(), 12.) + 8.; lh = 16.; }
+    g.addStyledEdge(u32.from(e.from), u32.from(e.to), style, e.label.view(), lw, lh);
+    i = i + 1usize;
+  }
+  g.fitGroups(MV_GPAD, MV_GHEAD);
+  d.nodes = g.liveNodes();
+  d.edges = g.liveEdges();
+  var routeOpt = RouteOptions.make();
+  if mm.horizontal { routeOpt.flow = FLOW_HORIZONTAL; }
   routeEdges(&mut g, &routeOpt);
   let b = g.bounds();
-  let f = frameFor(b.min.x, b.min.y, b.max.x, b.max.y, maxW);
+  var x0 = b.min.x;
+  var y0 = b.min.y;
+  var x1 = b.max.x;
+  var y1 = b.max.y;
+  gi = 0usize;
+  while gi < g.groups.len() {
+    let gr = &g.groups[gi];
+    if gr.w > 0. {
+      if gr.x < x0 { x0 = gr.x; }
+      if gr.y < y0 { y0 = gr.y; }
+      if gr.x + gr.w > x1 { x1 = gr.x + gr.w; }
+      if gr.y + gr.h > y1 { y1 = gr.y + gr.h; }
+    }
+    gi = gi + 1usize;
+  }
+  let f = frameFor(x0, y0, x1, y1, maxW);
   let st = DiagramStyle.light();
   var canvas = Canvas.make(f32.from(f.w), f32.from(f.h));
   canvas.fillRect(0., 0., f32.from(f.w), f32.from(f.h), st.background);
   canvas.save();
   canvas.translate(f.tx, f.ty);
   canvas.scale(f.s, f.s);
+  // a wrapped node's label is drawn by drawWrapped, so drawGraph is given none
+  i = 0usize;
+  while i < g.nodes.len() {
+    if wrapped[i].len() > 0usize { g.nodes[i].label = String(); }
+    i = i + 1usize;
+  }
   drawGraph(&mut canvas, &g, &st);
   drawShapes(&mut canvas, &g, &st);
+  drawWrapped(&mut canvas, &g, &wrapped, &st);
+  // the second head of a <--> edge: its first segment again, with a head at the start
+  i = 0usize;
+  while i < mm.edges.len() {
+    let ei = usize.from(g.addEdge(u32.from(mm.edges[i].from), u32.from(mm.edges[i].to)));
+    if mm.edges[i].back && g.edges[ei].route.len() >= 2usize {
+      var path = VectorPath.make();
+      path.moveTo(g.edges[ei].route[0usize].x, g.edges[ei].route[0usize].y);
+      path.lineTo(g.edges[ei].route[1usize].x, g.edges[ei].route[1usize].y);
+      var ss = StrokeStyle.make(st.edgeWidth);
+      if mm.edges[i].dotted {
+        ss = StrokeStyle.dashed(st.edgeWidth, st.edgeWidth * 1.5, st.edgeWidth * 2.5);
+        ss.cap = CAP_ROUND;
+      }
+      ss.join = JOIN_ROUND;
+      canvas.strokeArrows(&path, &Paint.solid(st.edgeColor), &ss, &st.arrow, &ArrowStyle.none());
+    }
+    i = i + 1usize;
+  }
   canvas.restore();
   i = 0usize;
   while i < g.nodes.len() {
     let nd = &g.nodes[i];
-    addKey(d, &f, nd.key.view(), nd.label.view(), nd.x - nd.w * 0.5, nd.y - nd.h * 0.5, nd.w, nd.h);
+    addKey(d, &f, nd.key.view(), mm.nodes[i].label.view(), nd.x - nd.w * 0.5, nd.y - nd.h * 0.5, nd.w, nd.h);
     i = i + 1usize;
   }
   d.w = f.w;
