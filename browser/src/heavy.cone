@@ -1,0 +1,227 @@
+// The heavy run: '--heavy' is one repeatable run for timing and for memory. A window (the GPU work is recorded and submitted
+// only with one: --headless skips it), frame's synthetic clock (one 1/60 s step a frame, so the simulation is the same every
+// time), real input ignored, --autowalk's walk repeated (a fixed camera path), a fixed number of frames in three phases:
+//
+//   load    frames 1 to LOAD_END      the island arrives (its objects and people, the shaders and pipelines), and the walk starts
+//   churn   the next CHURN_FRAMES     the island's own life as it is (the people, the creatures, the weather, the walker's particles
+//                                      and its requests: few parts are made or dropped by it, 65 in a whole scripted run) and, in
+//                                      addition, CHURN_PER_FRAME parts made a frame, each shown in one of a few meshes and
+//                                      materials (one with a texture) and placed round the walker by a fixed-seed generator,
+//                                      and the same number dropped once they are CHURN_LIFE frames old
+//   steady  the next STEADY_FRAMES    the churn stops, its last parts are dropped, and the island runs on its own
+//
+// Printed on stdout: a mark at each phase's start, "HEAVY mark NAME frame F at T ms" (T since main began), and at the end one
+// line, "HEAVY_JSON {...}": for each phase the frames, and the frame time's median, 99th percentile and worst (ms, wall time
+// from one present to the next), and the CPU's own work a frame (input, simulate, publish, render; not present) at the median;
+// the working set, commit (pagefile usage) and page faults of the process, in MiB and a count, at the middle of each phase and
+// at the end (GetProcessMemoryInfo; this is Windows' own, so a port wants its equivalent here); and the scene's counts.
+
+const LOAD_END = 240u64;
+const CHURN_FRAMES = 1800u64;
+const STEADY_FRAMES = 1200u64;
+const HEAVY_FRAMES = LOAD_END + CHURN_FRAMES + STEADY_FRAMES;
+const CHURN_PER_FRAME = 40usize;
+const CHURN_LIFE = 30usize;       // frames a part lives; also the groups of the ring
+const HEAVY_KINDS = 8usize;       // meshes and materials defined
+const HEAVY_WALK = 1100u64;       // steps of one round of the walk (autoIntents', 1010, and a pause)
+
+// The walk a heavy run takes: --autowalk's, over and over
+pub fn heavyIntents(n: u64) Intents { autoIntents(n % HEAVY_WALK) }
+
+fn heavyRand(run: &mut ScriptRun) u64 {
+  run.heavySeed = run.heavySeed * 6364136223846793005u64 + 1442695040888963407u64;
+  run.heavySeed >> 33u64
+}
+
+// The scene's requests of the churn, sent after frame 'f' is presented, in the scene actor
+pub fn heavyDrive(st: &mut SimState, f: u64, around: Vec3) {
+  let run = &mut st.run;
+  let door = &mut st.scene.door;
+  if f == 1u64 {
+    var k = 0usize;
+    while k < HEAVY_KINDS {
+      let mesh = if k % 2usize == 0usize { Mesh.cube(0.15 + 0.05 * f32.from(k)) } else { Mesh.sphere(0.12 + 0.04 * f32.from(k), 10i32) };
+      run.heavyMeshes.push(door.defineMesh(mesh));
+      var paint = Image();
+      if k == 0usize {
+        // a texture: 64 by 64, a checker
+        var pixels = List[u8]();
+        var y = 0usize;
+        while y < 64usize {
+          var x = 0usize;
+          while x < 64usize {
+            let on = ((x / 8usize) + (y / 8usize)) % 2usize == 0usize;
+            let v = if on { 230u8 } else { 60u8 };
+            pixels.push(v); pixels.push(v); pixels.push(v); pixels.push(255u8);
+            x = x + 1usize;
+          }
+          y = y + 1usize;
+        }
+        paint = Image(64i32, 64i32, 4i32, pixels);
+      }
+      let c = f32.from(k) / f32.from(HEAVY_KINDS);
+      run.heavyMats.push(door.defineMaterial(Look.plain(Color(0.3 + 0.7 * c, 0.9 - 0.6 * c, 0.4, 1.)), paint, Maps.none()));
+      k = k + 1usize;
+    }
+    var s = 0usize;
+    while s < CHURN_PER_FRAME * CHURN_LIFE { run.heavyLive.push(PartId.none()); s = s + 1usize; }
+  }
+  if f == HEAVY_FRAMES {
+    print <- "HEAVY scene: spawned "; print <- st.scene.spawned; print <- ", despawned "; print <- st.scene.despawned;
+    print <- ", resources defined "; print <- st.scene.defined; print <- ", live parts "; print <- st.scene.partCount(); print <- "\n";
+  }
+  if f <= LOAD_END { return; }
+  let g = usize.from((f - LOAD_END) % u64.from(CHURN_LIFE));   // the group of slots this frame replaces
+  let churning = f <= LOAD_END + CHURN_FRAMES;
+  var i = 0usize;
+  while i < CHURN_PER_FRAME {
+    let slot = g * CHURN_PER_FRAME + i;
+    let old = *run.heavyLive[slot];
+    if !old.isNone() {
+      st.scene.send(Request.Despawn(old));
+      run.heavyLive[slot] = PartId.none();
+    }
+    if churning {
+      let r = heavyRand(run);
+      let kind = usize.from(r % u64.from(HEAVY_KINDS));
+      let dx = f32.from(i32.from((r >> 8u64) % 41u64) - 20i32);
+      let dz = f32.from(i32.from((r >> 16u64) % 41u64) - 20i32);
+      let dy = f32.from(i32.from((r >> 24u64) % 6u64)) * 0.5;
+      let part = st.scene.door.newPart("churn");
+      st.scene.send(Request.Show(part, *run.heavyMeshes[kind], *run.heavyMats[kind], 0.));
+      st.scene.send(Request.Place(part, Transform3(Vec3(around.x + dx, around.y + 1. + dy, around.z + dz), Quat.identity(), Vec3(1., 1., 1.))));
+      run.heavyLive[slot] = part;
+    }
+    i = i + 1usize;
+  }
+}
+
+// ---- The main thread's side: the frame times and the process's memory ----
+
+extern {
+  fn @c("K32GetProcessMemoryInfo") processMemory(process: usize, counters: *u64, size: u32) i32;
+}
+
+// PROCESS_MEMORY_COUNTERS_EX as eleven 8-byte words: [0] the size (low) and the page fault count (high), [1] peak working set,
+// [2] working set, [8] pagefile usage (the commit), [10] private bytes
+struct MemSample {
+  workingMiB: f64;
+  commitMiB: f64;
+  faults: u64;
+}
+
+fn sampleMemory() MemSample {
+  var words = [88u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64];
+  let ok = processMemory(0xFFFFFFFFFFFFFFFFusize, &words[0usize] as *u64, 88u32);
+  if ok == 0i32 { return MemSample(0., 0., 0u64); }
+  MemSample(f64.from(words[2usize]) / 1048576.0, f64.from(words[8usize]) / 1048576.0, words[0usize] >> 32u64)
+}
+
+// A list of samples sorted (insertion: a phase has at most a few thousand)
+fn sortSamples(v: &mut List[u64]) {
+  var i = 1usize;
+  while i < v.len() {
+    let x = *v[i];
+    var j = i;
+    while j > 0usize && *v[j - 1usize] > x {
+      v[j] = *v[j - 1usize];
+      j = j - 1usize;
+    }
+    v[j] = x;
+    i = i + 1usize;
+  }
+}
+
+struct Heavy {
+  on: bool;
+  lastNs: u64;              // the last present's time
+  startedAt: u64;           // the performance counter when main began
+  frameNs: Array[List[u64], 3];
+  cpuNs: Array[List[u64], 3];
+  mid: Array[MemSample, 3];
+  end: MemSample;
+  start: MemSample;
+  cpuAt: Array[u64, 4];
+  firstFrameMs: f64;
+
+  fn make() Heavy {
+    Heavy(false, 0u64, 0u64, [List[u64](), List[u64](), List[u64]()], [List[u64](), List[u64](), List[u64]()],
+      [MemSample(0., 0., 0u64), MemSample(0., 0., 0u64), MemSample(0., 0., 0u64)], MemSample(0., 0., 0u64), MemSample(0., 0., 0u64),
+      [0u64, 0u64, 0u64, 0u64], 0.)
+  }
+
+  fn phaseOf(f: u64) usize {
+    if f <= LOAD_END { 0usize } else if f <= LOAD_END + CHURN_FRAMES { 1usize } else { 2usize }
+  }
+
+  fn phaseStart(p: usize) u64 { if p == 0usize { 1u64 } else if p == 1usize { LOAD_END + 1u64 } else { LOAD_END + CHURN_FRAMES + 1u64 } }
+  fn phaseLen(p: usize) u64 { if p == 0usize { LOAD_END } else if p == 1usize { CHURN_FRAMES } else { STEADY_FRAMES } }
+
+  fn mark(self: &, name: &str, frame: u64) {
+    print <- "HEAVY mark "; printStr(name); print <- " frame "; print <- frame; print <- " at "; print <- f64.from(sdl.GetTicksNS() / 1000u64) / 1000.0;
+    print <- " ms (ticks); "; print <- millisSince(startedAt); print <- " ms after main began\n";
+  }
+
+  // After frame 'f' is presented
+  fn tick(self: &mut, host: &mut Host) {
+    let f = host.frame;
+    let now = sdl.GetTicksNS();
+    if f == 1u64 {
+      start = sampleMemory();
+      firstFrameMs = millisSince(startedAt);
+      self.mark("load-start", 1u64);
+      lastNs = now;
+      cpuAt = [host.stats.phase(0u32).total, host.stats.phase(1u32).total, host.stats.phase(3u32).total, host.stats.phase(4u32).total];
+      return;
+    }
+    let p = Heavy.phaseOf(f);
+    let work = [host.stats.phase(0u32).total, host.stats.phase(1u32).total, host.stats.phase(3u32).total, host.stats.phase(4u32).total];
+    var sum = 0u64;
+    var k = 0usize;
+    while k < 4usize { sum = sum + (work[k] - cpuAt[k]); k = k + 1usize; }
+    cpuAt = work;
+    frameNs[p].push(now - lastNs);
+    cpuNs[p].push(sum);
+    lastNs = now;
+    if f == Heavy.phaseStart(p) + Heavy.phaseLen(p) / 2u64 { mid[p] = sampleMemory(); }
+    if f == LOAD_END { self.mark("churn-start", f + 1u64); }
+    if f == LOAD_END + CHURN_FRAMES { self.mark("steady-start", f + 1u64); }
+    if f == HEAVY_FRAMES { self.mark("end", f); }
+  }
+
+  fn finish(self: &mut) {
+    end = sampleMemory();
+  }
+
+  fn stat(self: &, v: &mut List[u64], q: f64) f64 {
+    if v.len() == 0usize { return 0.; }
+    let at = usize.from(f64.from(v.len() - 1usize) * q + 0.5);
+    f64.from(*v[at]) / 1000000.0
+  }
+
+  fn mem(self: &, m: &MemSample) {
+    print <- "{\"working_set_mib\":"; print <- m.workingMiB; print <- ",\"commit_mib\":"; print <- m.commitMiB;
+    print <- ",\"page_faults\":"; print <- m.faults; print <- "}";
+  }
+
+  fn report(self: &mut) {
+    let names = ["load", "churn", "steady"];
+    print <- "HEAVY_JSON {\"frames\":"; print <- HEAVY_FRAMES; print <- ",\"first_frame_ms\":"; print <- firstFrameMs;
+    print <- ",\"phases\":{";
+    var p = 0usize;
+    while p < 3usize {
+      sortSamples(&mut frameNs[p]);
+      sortSamples(&mut cpuNs[p]);
+      if p > 0usize { print <- ","; }
+      print <- "\""; printStr(names[p]); print <- "\":{\"frames\":"; print <- frameNs[p].len();
+      print <- ",\"frame_ms\":{\"median\":"; print <- self.stat(&mut frameNs[p], 0.5);
+      print <- ",\"p99\":"; print <- self.stat(&mut frameNs[p], 0.99);
+      print <- ",\"worst\":"; print <- self.stat(&mut frameNs[p], 1.0);
+      print <- "},\"cpu_ms_median\":"; print <- self.stat(&mut cpuNs[p], 0.5);
+      print <- ",\"mid\":"; self.mem(&mid[p]);
+      print <- "}";
+      p = p + 1usize;
+    }
+    print <- "},\"start\":"; self.mem(&start); print <- ",\"end\":"; self.mem(&end); print <- "}\n";
+  }
+}
