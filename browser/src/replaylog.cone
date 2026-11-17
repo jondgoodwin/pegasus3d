@@ -8,14 +8,20 @@
 
 struct LogEntry {
   key: u64;                    // what a later request of the same kind replaces; 0: nothing does
+  part: u64;                   // the part the request is about (partKey); 0: none, or one the log never lets go
   bytes: List[u8];
 }
 
 pub struct ReplayLog {
-  entries: List[LogEntry];     // in the order sent (replayed by position; never removed)
-  at: Dict[u64, usize];        // a replaceable request's key -> its entry's position (entries never move)
+  entries: List[LogEntry];     // in the order sent (replayed by position; entries of despawned parts are removed by 'compact')
+  at: Dict[u64, usize];        // a replaceable request's key -> its entry's position (rebuilt by 'compact')
+  pending: List[PartId];       // parts despawned this frame, not yet settled (their requests may still be on their way in)
+  dead: Dict[u64, bool];       // parts despawned since the last 'compact', whose entries are still in 'entries'
+  kept: Dict[u64, bool];       // parts the log never lets go: those a BeingAdded or an Object names (the view builds them itself)
 
-  pub fn empty() ReplayLog { ReplayLog(List[LogEntry](), Dict[u64, usize]()) }
+  pub fn empty() ReplayLog {
+    ReplayLog(List[LogEntry](), Dict[u64, usize](), List[PartId](), Dict[u64, bool](), Dict[u64, bool]())
+  }
 
   pub fn len(self: &) usize { entries.len() }
 
@@ -31,8 +37,73 @@ pub struct ReplayLog {
     out
   }
 
+  // A despawn has been applied, and these parts (its whole subtree) are over. A newcomer is to be told of them not at
+  // all: neither their Spawn, Show and the rest nor the Despawn. Their requests may not have been added yet, so
+  // 'settle' (once the frame's requests are added) does it.
+  pub fn despawned(self: &mut, gone: &List[PartId]) {
+    var i = 0usize;
+    while i < gone.len() {
+      pending.push(*gone[i]);
+      i = i + 1usize;
+    }
+  }
+
+  // Mark the parts despawned this frame dead; their entries go at the next 'compact', which runs once enough have
+  // piled up. If the log must keep any part of the frame's despawns (see 'kept'), it keeps all of them.
+  pub fn settle(self: &mut) {
+    // The frame's parts are taken as one group (the list does not say where one subtree ends): held if any is kept
+    var i = 0usize;
+    var hold = false;
+    while i < pending.len() {
+      if kept.contains(&partKey(*pending[i])) { hold = true; }
+      i = i + 1usize;
+    }
+    if !hold {
+      i = 0usize;
+      while i < pending.len() {
+        dead.insert(partKey(*pending[i]), true);
+        i = i + 1usize;
+      }
+      if dead.len() > entries.len() / 4usize + 64usize { self.compact(); }
+    }
+    pending.clear();
+  }
+
+  // Drop the entries about despawned parts, keeping the order of the rest
+  pub fn compact(self: &mut) {
+    if dead.len() == 0usize { return; }
+    var rest = List[LogEntry].withCapacity(entries.len());
+    var index = Dict[u64, usize]();
+    var i = 0usize;
+    while i < entries.len() {
+      var e = LogEntry(0u64, 0u64, List[u8]());
+      e <-> entries[i];
+      if e.part == 0u64 || !dead.contains(&e.part) {
+        if e.key != 0u64 { index.insert(e.key, rest.len()); }
+        rest.push(e);
+      }
+      i = i + 1usize;
+    }
+    entries = rest;
+    at = index;
+    dead = Dict[u64, bool]();
+  }
+
   // Request 'r', which was encoded as 'one', is kept
   pub fn add(self: &mut, r: &Request, one: List[u8]) {
+    var part = partOf(r);
+    match r {
+      case let BeingAdded(b) { kept.insert(partKey(b.part), true); part = 0u64; }
+      case let Object(o) {
+        var k = 0usize;
+        while k < o.ids.len() {
+          kept.insert(partKey(*o.ids[k]), true);
+          k = k + 1usize;
+        }
+      }
+      else {}
+    }
+    if part != 0u64 && kept.contains(&part) { part = 0u64; }
     let key = replaceKey(r);
     if key != 0u64 {
       var found = entries.len();
@@ -41,13 +112,43 @@ pub struct ReplayLog {
         else {}
       }
       if found < entries.len() {
-        entries.set(found, LogEntry(key, one));
+        entries.set(found, LogEntry(key, part, one));
         return;
       }
       at.insert(key, entries.len());
     }
-    entries.push(LogEntry(key, one));
+    entries.push(LogEntry(key, part, one));
   }
+}
+
+// A number for a part that is never 0: its slot and which occupant of it
+fn partKey(id: PartId) u64 {
+  ((u64.from(id.key.generation()) << 32u64) | u64.from(id.key.slot())) + 1u64
+}
+
+// The part a request is about, as partKey; 0: none
+fn partOf(r: &Request) u64 {
+  match r {
+    case let Spawn(s) { return partKey(s.id); }
+    case let Despawn(d) { return partKey(d.id); }
+    case let Place(p) { return partKey(p.id); }
+    case let Parent(pa) { return partKey(pa.id); }
+    case let Show(s) { return partKey(s.id); }
+    case let Effect(e) { return partKey(e.id); }
+    case let Fire(f) { return partKey(f.id); }
+    case let Highlight(h) { return partKey(h.id); }
+    case let Cull(c) { return partKey(c.id); }
+    case let Sky(k) { return partKey(k.id); }
+    case let Bones(b) { return partKey(b.id); }
+    case let Tint(t) { return partKey(t.id); }
+    case let LightSource(ls) { return partKey(ls.id); }
+    case let CastsShadow(cs) { return partKey(cs.id); }
+    case let Seat(sa) { return partKey(sa.id); }
+    case let Platform(pl) { return partKey(pl.id); }
+    case let Area(ar) { return partKey(ar.id); }
+    else {}
+  }
+  0u64
 }
 
 // What identifies the request among those a later one replaces: a different number for each kind and part. 0: none
