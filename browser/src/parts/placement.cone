@@ -29,10 +29,21 @@ pub struct Placements {
   index: List[u32];            // a slot's row plus one; 0 where it has none
   firstDirty: usize;           // no row before this one has changed; the row count when none has
   pub recomputed: u64;         // world matrices recomputed, ever
+  // Kept between rebuilds, so a despawn's rebuild reuses room instead of allocating it again: the spare columns 'reorder'
+  // fills (the old ones become the next spares) and the lists the row-removing walk builds
+  spIds: List[PartId];
+  spLocals: List[Transform3];
+  spParent: List[u32];
+  spWorld: List[Mat4];
+  spDirty: List[bool];
+  scOrder: List[u32];
+  scNewRow: List[u32];
+  scInSub: List[bool];
 
   pub fn empty() Placements {
     Placements(List[PartId](), List[Transform3](), List[u32](), List[Mat4](),
-      List[bool](), List[u32](), 0usize, 0u64)
+      List[bool](), List[u32](), 0usize, 0u64,
+      List[PartId](), List[Transform3](), List[u32](), List[Mat4](), List[bool](), List[u32](), List[u32](), List[bool]())
   }
 
   pub fn len(self: &) usize { ids.len() }
@@ -151,8 +162,14 @@ pub struct Placements {
   pub fn removeSubtree(self: &mut, id: PartId, gone: &mut List[PartId]) {
     let row = self.find(id);
     if row == NO_ROW { return; }
-    var order = List[u32].withCapacity(ids.len());
-    var inSub = List[bool].withCapacity(ids.len());
+    var order = List[u32]();
+    order <-> scOrder;
+    order.clear();
+    order.reserve(ids.len());
+    var inSub = List[bool]();
+    inSub <-> scInSub;
+    inSub.clear();
+    inSub.reserve(ids.len());
     var i = 0usize;
     while i < ids.len() {
       var sub = i == row;
@@ -171,22 +188,44 @@ pub struct Placements {
       i = i + 1usize;
     }
     self.reorder(&order, row);
+    order <-> scOrder;
+    inSub <-> scInSub;
   }
 
   // The rows rebuilt in 'order' (old rows; any left out are dropped),
   // parents remapped; every row from 'from' on may have moved
   fn reorder(self: &mut, order: &List[u32], from: usize) {
     let n = ids.len();
-    var newRow = List[u32].withCapacity(n);
+    var newRow = List[u32]();
+    newRow <-> scNewRow;
+    newRow.clear();
+    newRow.reserve(n);
     var i = 0usize;
     while i < n { newRow.push(NO_PARENT); i = i + 1usize; }
     i = 0usize;
     while i < order.len() { newRow.set(usize.from(*order[i]), u32.from(i)); i = i + 1usize; }
-    var nIds = List[PartId].withCapacity(order.len());
-    var nLocal = List[Transform3].withCapacity(order.len());
-    var nParent = List[u32].withCapacity(order.len());
-    var nWorld = List[Mat4].withCapacity(order.len());
-    var nDirty = List[bool].withCapacity(order.len());
+    // (a little room beyond the rows, so the next append does not move the whole column)
+    let room = order.len() + order.len() / 8usize + 16usize;
+    var nIds = List[PartId]();
+    nIds <-> spIds;
+    nIds.clear();
+    nIds.reserve(room);
+    var nLocal = List[Transform3]();
+    nLocal <-> spLocals;
+    nLocal.clear();
+    nLocal.reserve(room);
+    var nParent = List[u32]();
+    nParent <-> spParent;
+    nParent.clear();
+    nParent.reserve(room);
+    var nWorld = List[Mat4]();
+    nWorld <-> spWorld;
+    nWorld.clear();
+    nWorld.reserve(room);
+    var nDirty = List[bool]();
+    nDirty <-> spDirty;
+    nDirty.clear();
+    nDirty.reserve(room);
     i = 0usize;
     while i < order.len() {
       let old = usize.from(*order[i]);
@@ -204,6 +243,12 @@ pub struct Placements {
     parent <-> nParent;
     world <-> nWorld;
     dirty <-> nDirty;
+    spIds <-> nIds;
+    spLocals <-> nLocal;
+    spParent <-> nParent;
+    spWorld <-> nWorld;
+    spDirty <-> nDirty;
+    scNewRow <-> newRow;
     if from < firstDirty { firstDirty = from; }
     if firstDirty > ids.len() { firstDirty = ids.len(); }
   }
