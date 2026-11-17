@@ -224,6 +224,7 @@ pub struct RenderSystem {
   pub morpher: Morpher;           // the face morphs' compute pre-pass (render's morph.cone): a person's body is a morphed copy
   pub morphs: Table[MorphRow];    // keyed by a morphable mesh's id (DefineMorphed)
   unmade: List[MeshId];           // the morphable meshes whose copies the next pre-pass makes
+  skyOrder: List[PartId];         // the parts that are skies, in the order they were applied (the last is drawn)
   pub sceneEye: Vec3 = Vec3(0., 0., 0.);   // the eye at the last 'syncScene': a jump of it is a cut, with no fade
   pub sceneNow: f64 = 0.0;    // the snapshot time of the last 'syncScene', for the fades' step
   pub morphPending: bool = false;   // a Morph has come since the pre-pass last ran
@@ -247,7 +248,7 @@ pub struct RenderSystem {
       List[Mat4](), 0usize, List[u32](), List[u32](), List[EmitterHandle](),
       Table[LampRow].empty(), Table[u32].empty(), MotionList(), Table[PrevRow].empty(), List[Mat4](),
       List[Mat4](), Table[SceneRow].empty(), ViewSurfaces.make(), ThreadDraw.make(), CreatureDraw.make(), List[TextureHandle](),
-      Morpher.create(device), Table[MorphRow].empty(), List[MeshId]());
+      Morpher.create(device), Table[MorphRow].empty(), List[MeshId](), List[PartId]());
     sys.cullMode = cullMode;
     sys
   }
@@ -919,8 +920,27 @@ pub struct RenderSystem {
 
   // Apply a Sky: the part becomes the sky (the last one applied is the sky drawn)
   pub fn sky(self: &mut, id: PartId, look: SkyLook) {
+    self.unorder(id);
+    skyOrder.push(id);
     skies.remove(id);
     skies.put(id, look);
+  }
+
+  // Part 'id' is no longer in the order skies were applied in
+  fn unorder(self: &mut, id: PartId) {
+    var kept = List[PartId]();
+    var i = 0usize;
+    while i < skyOrder.len() {
+      if !(*skyOrder[i] == id) { kept.push(*skyOrder[i]); }
+      i = i + 1usize;
+    }
+    skyOrder = kept;
+  }
+
+  // The morphable meshes whose copies the pre-pass was to make are no more (a reset)
+  pub fn clearUnmade(self: &mut) {
+    unmade.clear();
+    morphPending = false;
   }
 
   // A despawned part that is a light: the light goes from render's set
@@ -946,17 +966,18 @@ pub struct RenderSystem {
       self.still(device, *effects.rows[e]);
       effects.remove(id);
     }
-    skies.remove(id);
+    if skies.remove(id) { self.unorder(id); }
   }
 
   // The sky drawn: the last applied, or a plain grey if no part is the sky
   // (in physical units: a grey overcast, the light from straight up)
   pub fn currentSky(self: &) SkyLook {
-    let n = skies.len();
-    if n == 0usize {
-      return SkyLook(Color.gray(8000.), Vec3(0., 1., 0.), Color.gray(20000.), Color.gray(8000.));
+    // (skies' rows do not keep the order: a removal moves the last row into the gap)
+    if skyOrder.len() > 0usize {
+      let row = skies.find(*skyOrder[skyOrder.len() - 1usize]);
+      if row != NO_ROW { return *skies.rows[row]; }
     }
-    *skies.rows[n - 1usize]
+    SkyLook(Color.gray(8000.), Vec3(0., 1., 0.), Color.gray(20000.), Color.gray(8000.))
   }
 
   // The frame's draw list, batch by batch, from the snapshot's world
