@@ -33,7 +33,7 @@ const REQUESTS_BYTES = 1100usize;
 // (4: a headset's controllers: the input's flag bit 16 and the sideways walk, snap turns and pivot that follow the look keys)
 // (5: and the input's flag bit 32: the headset's head, its way against the body's and its place, 6 bytes after the controllers' block)
 // (6: the snapshot's beings count and its spells count are 16 bits (were 8), and a spell's being is a varint (was a byte))
-pub const PROTOCOL_VERSION = 6u32;
+pub const PROTOCOL_VERSION = 7u32;
 
 pub const POS_ORIGIN_XZ: f32 = -2048.;
 pub const POS_ORIGIN_Y: f32 = -512.;    // (was -256: the labyrinth's floor at -300 would have been clamped to -256 for every other player)
@@ -910,13 +910,13 @@ pub fn decodeToView(bytes: Bytes) ToView {
 
 // ---- simulation -> view: the state ----
 
-// The state of a tick for one client: the same bodies for every client, with this client's last input applied
-pub fn encodeState(w: &WorldState) List[u8] {
+// A region's state at a tick: the same bytes for every client (every being quantised, the props, the spells). The island
+// is one region (id 0) for now. Each client's own being, exact, with its input applied, is the personal part (encodePersonal).
+pub fn encodeRegion(w: &RegionState) List[u8] {
   var out = List[u8]();
+  w8(&mut out, w.region);
   w32(&mut out, u32.from(w.tick & 0xFFFFFFFFu64));
-  wF64(&mut out, w.now);
-  w8(&mut out, w.rate);
-  w32(&mut out, u32.from(w.appliedInput & 0xFFFFFFFFu64));
+  wF64(&mut out, w.writtenAt);
   w16(&mut out, u32.from(w.beings.len()));   // (a u16: a byte wrapped past 255; MAX_LATEST caps a real snapshot far lower)
   // The props and spells after the beings take their room first
   let tail = 2usize + 14usize * w.props.len() + 9usize * w.fx.len();
@@ -1131,13 +1131,12 @@ fn rBeing(r: &mut Rd) BeingState {
   bs
 }
 
-// A snapshot decoded into 'out' (whose beings are added to); false if malformed
-pub fn decodeState(bytes: Bytes, out: &mut WorldState) bool {
+// A region's state decoded into 'out'; false if malformed
+pub fn decodeRegion(bytes: Bytes, out: &mut RegionState) bool {
   var r = Rd.make(bytes);
+  let region = r.r8();
   let tick = u64.from(r.r32());
-  let now = r.rF64();
-  let rate = r.r8();
-  let applied = u64.from(r.r32());
+  let writtenAt = r.rF64();
   let n = usize.from(r.r16());
   var beings = List[BeingState]();
   var i = 0usize;
@@ -1169,13 +1168,46 @@ pub fn decodeState(bytes: Bytes, out: &mut WorldState) bool {
     i = i + 1usize;
   }
   if !r.ok { return false; }
+  out.region = region;
+  out.tick = tick;
+  out.writtenAt = writtenAt;
+  out.beings <-> beings;
+  out.props <-> props;
+  out.fx <-> fx;
+  true
+}
+
+// The personal part of a tick, for one client alone: the tick, the scene's time and clock rate, the last input applied, and the
+// client's own being exact (a ragdoll's rotations too). It stands alone: the view needs no region beside it.
+pub const PERSONAL_MAX = 128usize;
+
+pub fn encodePersonal(p: &PersonalState) List[u8] {
+  var out = List[u8]();
+  w32(&mut out, u32.from(p.tick & 0xFFFFFFFFu64));
+  wF64(&mut out, p.now);
+  w8(&mut out, p.rate);
+  w32(&mut out, u32.from(p.appliedInput & 0xFFFFFFFFu64));
+  w8(&mut out, if p.hasBeing { 1u32 } else { 0u32 });
+  if p.hasBeing { wBeing(&mut out, &p.being, true); }
+  out
+}
+
+pub fn decodePersonal(bytes: Bytes, out: &mut PersonalState) bool {
+  var r = Rd.make(bytes);
+  let tick = u64.from(r.r32());
+  let now = r.rF64();
+  let rate = r.r8();
+  let applied = u64.from(r.r32());
+  let has = r.r8() != 0u32;
+  var being = out.being;
+  if has { being = rBeing(&mut r); }
+  if !r.ok { return false; }
   out.tick = tick;
   out.now = now;
   out.rate = rate;
   out.appliedInput = applied;
-  out.beings <-> beings;
-  out.props <-> props;
-  out.fx <-> fx;
+  out.hasBeing = has;
+  out.being = being;
   true
 }
 

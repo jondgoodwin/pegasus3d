@@ -283,6 +283,13 @@ pub struct SimState {
   pub creatures: CreatureSim;  // the labyrinth's guards, Worm and Minotaur (creatures.cone)
   pub gallery: GalleryPlan;    // a gallery run's shots (gallery.cone)
   pub people: People;          // humanbody's people, shared with the views (personasset.cone)
+  clientRow: Dict[u32, usize]; // a client's id -> its row in 'clients' (kept by admit and the leave)
+  pub regionEncodes: u64;      // the region's snapshot, encoded: once a publish, however many clients
+  pub regionBytes: u64;
+  pub regionMax: usize;
+  pub personalEncodes: u64;    // each client's personal part
+  pub personalBytes: u64;
+  pub personalMax: usize;
 
   pub fn make(opts: RunOptions, birds: Birds, serve: bool, land: Island) SimState {
     let scripted = opts.scripted;
@@ -293,7 +300,8 @@ pub struct SimState {
       0u64, Weathering.fair(), Weathering.fair(), false, 0u64, ReplayLog.empty(), List[Intents](), List[bool](),
       0u64, 0u64, 0u64, 0u32, 0u64, 0u64, 0u64, 0u64, false, 0u64, List[Step](), false, 0u64, 0u64, Village.empty(),
       Route.make(), List[f32](), Assembly.make(), Ride.make(), ScriptRun.make(), FallRun.make(), true, true, true, PlaySim.empty(),
-      List[Pending](), List[HangUp](), land, opts, PortalSim.make(), true, CreatureSim.make(), GalleryPlan.none(), People.empty())
+      List[Pending](), List[HangUp](), land, opts, PortalSim.make(), true, CreatureSim.make(), GalleryPlan.none(), People.empty(),
+      Dict[u32, usize](), 0u64, 0u64, 0usize, 0u64, 0u64, 0usize)
   }
 
   // The possessed being's body: where the user is (single player)
@@ -519,12 +527,21 @@ pub struct SimState {
   // ---- the connections ----
 
   fn clientAt(self: &, id: u32) usize {
-    var i = 0usize;
-    while i < clients.len() {
-      if clients[i].id == id { return i; }
-      i = i + 1usize;
+    match clientRow.get(&id) {
+      case let Some(k) { return *k; }
+      else {}
     }
     NO_ROW
+  }
+
+  // 'clientRow' rebuilt from 'clients' (after a removal moves the rows after it)
+  fn reindexClients(self: &mut) {
+    clientRow = Dict[u32, usize]();
+    var i = 0usize;
+    while i < clients.len() {
+      clientRow.insert(clients[i].id, i);
+      i = i + 1usize;
+    }
   }
 
   // A client has joined: it is told what has been sent so far and which being is its own. Single player's one client
@@ -550,6 +567,7 @@ pub struct SimState {
     }
     var client = Client.make(id, being);
     client.name = String.from(name);
+    clientRow.insert(client.id, clients.len());
     clients.push(client);
     joinedNow = true;
     print <- "Client "; print <- id; print <- " joined: being "; print <- being;
@@ -698,6 +716,7 @@ pub struct SimState {
     // Removed in order, not swapped with the last: the first client stays the first of those still here
     // (appliedInput, firstClient and the frame-done message read position 0)
     clients.remove(k);
+    self.reindexClients();
   }
 
   // What the clients have been sent, to a client that has just joined: the log, in messages that fit
@@ -1165,22 +1184,43 @@ pub struct SimState {
     test.width = capW;
     test.height = capH;
     if opts.gallery { galleryBirds(self, frameNo, &mut test); }
+    // The region (the whole island) is encoded once, and the one Bytes goes to every client; each client's own being, exact, with
+    // its input applied, is its personal part
+    let region = RegionState(0u32, tick, scene.now(), copyBeings(&beings), copyProps(&propsNow), copyFx(&play.fx));
+    let regionBytes1 = toBytes(&encodeRegion(&region));
+    regionEncodes = regionEncodes + 1u64;
+    regionBytes = regionBytes + u64.from(regionBytes1.len());
+    if regionBytes1.len() > regionMax { regionMax = regionBytes1.len(); }
+    let rate = u32.from(scene.clock.rate());
+    var testBytes = toBytes(&List[u8]());
+    if scripted { testBytes = toBytes(&encodeTest(&test)); }
     var c = 0usize;
     while c < clients.len() {
       let cl = &clients[c];
-      var w = WorldState(tick, scene.now(), u32.from(scene.clock.rate()), cl.applied, copyBeings(&beings), copyProps(&propsNow),
-        copyFx(&play.fx));
-      // The being the client drives crosses whole: it is compared with the client's own prediction
+      var ps = PersonalState(tick, region.writtenAt, rate, cl.applied, false, BeingState(0u32, false, Vec3(0., 0., 0.), 0., 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32, 0u32, 0., FIG_WALK, 0., false, noRots()));
+      ps.hasBeing = false;
       var k = 0usize;
-      while k < w.beings.len() {
-        if u32.from(cl.being) == w.beings[k].being { w.beings.set(k, exactly(*w.beings[k])); }
+      while k < beings.len() {
+        if u32.from(cl.being) == beings[k].being {
+          ps.being = exactly(*beings[k]);
+          ps.hasBeing = true;
+        }
         k = k + 1usize;
       }
-      let bytes = encodeState(&w);
-      stateBytes = stateBytes + u64.from(bytes.len());
+      let own = encodePersonal(&ps);
+      if own.len() > PERSONAL_MAX {
+        // (the check in netchecks measures the worst case; this is the live guard)
+        notices = notices + 1u64;
+        print <- "PERSONAL PART OVER ITS LIMIT: "; print <- own.len(); print <- " bytes (the limit "; print <- PERSONAL_MAX; print <- ")\n";
+      }
+      personalEncodes = personalEncodes + 1u64;
+      personalBytes = personalBytes + u64.from(own.len());
+      if own.len() > personalMax { personalMax = own.len(); }
+      stateBytes = stateBytes + u64.from(regionBytes1.len() + own.len());
       snapshotsSent = snapshotsSent + 1u64;
-      if scripted { net.sendLatest(cl.id, STREAM_TEST, encodeTest(&test)); }
-      net.sendLatest(cl.id, STREAM_STATE, bytes);
+      if scripted { net.sendLatestBytes(cl.id, STREAM_TEST, testBytes); }
+      net.sendLatestBytes(cl.id, STREAM_STATE, regionBytes1);
+      net.sendLatest(cl.id, STREAM_SELF, own);
       c = c + 1usize;
     }
   }
@@ -1394,7 +1434,11 @@ pub struct SimState {
     print <- "Server: "; print <- tick; print <- " ticks, "; print <- snapshotsSent; print <- " snapshots, "; print <- clients.len();
     print <- " clients now; "; print <- skippedRequests; print <- " requests did not cross, "; print <- net.refused; print <- " sends refused\n";
     if snapshotsSent > 0u64 {
-      print <- "  a snapshot averages "; print <- stateBytes / snapshotsSent; print <- " bytes\n";
+      print <- "  a snapshot (region and personal part) averages "; print <- stateBytes / snapshotsSent; print <- " bytes\n";
+      print <- "  region encodes "; print <- regionEncodes; print <- " (a publish each: "; print <- snapshotsSent; print <- " sent to clients), averaging ";
+      print <- regionBytes / (if regionEncodes > 0u64 { regionEncodes } else { 1u64 }); print <- " bytes, the largest "; print <- regionMax; print <- "\n";
+      print <- "  personal encodes "; print <- personalEncodes; print <- ", averaging "; print <- personalBytes / (if personalEncodes > 0u64 { personalEncodes } else { 1u64 });
+      print <- " bytes, the largest "; print <- personalMax; print <- " (the limit "; print <- PERSONAL_MAX; print <- ")\n";
     }
     print <- "  the largest reliable message "; print <- net.maxReliable; print <- " bytes (the limit "; print <- MAX_RELIABLE; print <- "), the largest request ";
     print <- net.maxItem; print <- ", the largest snapshot "; print <- net.maxLatest; print <- " (the limit "; print <- MAX_LATEST; print <- ")\n";

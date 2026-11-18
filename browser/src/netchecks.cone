@@ -128,16 +128,42 @@ fn checkNet() bool {
   propList.push(PropState(7u32, Vec3(-22.001, 5.1234, 300.5), Quat.angleAxis(2.9, Vec3(1., 0., 0.))));
   var fxList = List[FxState]();
   fxList.push(FxState(1u32, FX_ZAP, 123456u64));
-  var w = WorldState(4294967295u64, 1234.567, 10u32, 987654u64, beings, propList, fxList);
-  let bytes = encodeState(&w);
-  var back = WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]());
-  let decoded = decodeState(toBytes(&bytes), &mut back);
+  var w = RegionState(0u32, 4294967295u64, 1234.567, beings, propList, fxList);
+  let bytes = encodeRegion(&w);
+  var back = RegionState(0u32, 0u64, 0.0, List[BeingState](), List[PropState](), List[FxState]());
+  let decoded = decodeRegion(toBytes(&bytes), &mut back);
   ok = expect("a snapshot decodes", decoded && back.beings.len() == 2usize) && ok;
   if decoded && back.beings.len() == 2usize {
     let a = back.beings[0usize];
     let b = back.beings[1usize];
-    ok = expect("its tick, scene time, clock rate and input sequence number", back.tick == 4294967295u64 && back.now == 1234.567
-      && back.rate == 10u32 && back.appliedInput == 987654u64) && ok;
+    ok = expect("its region, tick and the scene time it was written at", back.region == 0u32 && back.tick == 4294967295u64 && back.writtenAt == 1234.567) && ok;
+    // The personal part: tick, scene time, clock rate, the input applied, and the own being whole (the worst case, a ragdoll with
+    // its rotations on a platform, is measured against the limit)
+    {
+      var spin = noRots();
+      var q = 0u32;
+      while q < 14u32 {
+        spin[usize.from(q)] = Quat.angleAxis(0.3 * f32.from(q) - 1.7, Vec3(0.3, 0.9, -0.2).normalize());
+        q = q + 1u32;
+      }
+      var worst = BeingState(70000u32, true, Vec3(-10.123456, 33.5, 301.987654), -2.5, -1.8, -4.2, 1.1, -0.9, false, Intents(1., -1., true, true),
+        idOf(21u32), 0.75, 255u32, 255u32, 9., FIG_RAG, 1.234, true, spin);
+      worst.hail = 1.2;
+      let own = PersonalState(4294967295u64, 1234.567, 10u32, 987654u64, true, worst);
+      let ownBytes = encodePersonal(&own);
+      var ownBack = PersonalState(0u64, 0.0, 1u32, 0u64, false, b);
+      let ownOk = decodePersonal(toBytes(&ownBytes), &mut ownBack);
+      print <- "  a personal part, the worst case (a ragdoll with its rotations): "; print <- ownBytes.len(); print <- " bytes (the limit "; print <- PERSONAL_MAX; print <- ")\n";
+      ok = expect("a personal part decodes: its tick, scene time, clock rate, applied input and the own being whole", ownOk
+        && ownBack.tick == 4294967295u64 && ownBack.now == 1234.567 && ownBack.rate == 10u32 && ownBack.appliedInput == 987654u64
+        && ownBack.hasBeing && ownBack.being.exact && ownBack.being.being == 70000u32 && ownBack.being.position.x == -10.123456
+        && ownBack.being.hasRots && ownBack.being.mode == FIG_RAG && ownBack.being.platform == idOf(21u32)) && ok;
+      ok = expect("the worst-case personal part fits its 128 bytes", ownBytes.len() <= PERSONAL_MAX) && ok;
+      var none = own;
+      none.hasBeing = false;
+      var noneBack = PersonalState(0u64, 0.0, 1u32, 0u64, true, b);
+      ok = expect("a personal part with no being (not yet given one) decodes", decodePersonal(toBytes(&encodePersonal(&none)), &mut noneBack) && !noneBack.hasBeing) && ok;
+    }
     ok = expect("a quantised position is within a millimetre", libc.fabsf(a.position.x + 23.4567) <= 0.0006 && libc.fabsf(a.position.y - 12.7891) <= 0.0006
       && libc.fabsf(a.position.z - 499.1234) <= 0.0006) && ok;
     ok = expect("its heading within 0.0001 radians, its speed within a millimetre a second", libc.fabsf(wrapPi(a.yaw - 3.0)) <= 0.0001
@@ -196,10 +222,10 @@ fn checkNet() bool {
     hailer.hail = 1.2;
     posedBeings.push(hailer);
     posedBeings.push(BeingState(3u32, false, Vec3(-20., 4., 345.), 0.5, 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots()));
-    var posedState = WorldState(7u64, 1.0, 1u32, 1u64, posedBeings, List[PropState](), List[FxState]());
-    let posedBytes = encodeState(&posedState);
-    var posedBack = WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]());
-    let posedOk = decodeState(toBytes(&posedBytes), &mut posedBack) && posedBack.beings.len() == 4usize;
+    var posedState = RegionState(0u32, 7u64, 1.0, posedBeings, List[PropState](), List[FxState]());
+    let posedBytes = encodeRegion(&posedState);
+    var posedBack = RegionState(0u32, 0u64, 0.0, List[BeingState](), List[PropState](), List[FxState]());
+    let posedOk = decodeRegion(toBytes(&posedBytes), &mut posedBack) && posedBack.beings.len() == 4usize;
     ok = expect("a snapshot with a sitter, a person standing up, a hailer and a walker decodes", posedOk) && ok;
     if posedOk {
       let s0 = posedBack.beings[0usize];
@@ -214,13 +240,13 @@ fn checkNet() bool {
     // (the walker's bytes are what they were: a person doing neither costs nothing)
     var plain = List[BeingState]();
     plain.push(*posedBack.beings[3usize]);
-    var plainState = WorldState(7u64, 1.0, 1u32, 1u64, plain, List[PropState](), List[FxState]());
+    var plainState = RegionState(0u32, 7u64, 1.0, plain, List[PropState](), List[FxState]());
     var sittingOnly = List[BeingState]();
     sittingOnly.push(*posedBack.beings[0usize]);
-    var sittingState = WorldState(7u64, 1.0, 1u32, 1u64, sittingOnly, List[PropState](), List[FxState]());
-    print <- "  a being: "; print <- encodeState(&plainState).len(); print <- " bytes of a snapshot; sitting: "; print <- encodeState(&sittingState).len(); print <- "\n";
+    var sittingState = RegionState(0u32, 7u64, 1.0, sittingOnly, List[PropState](), List[FxState]());
+    print <- "  a being: "; print <- encodeRegion(&plainState).len(); print <- " bytes of a snapshot; sitting: "; print <- encodeRegion(&sittingState).len(); print <- "\n";
     ok = expect("sitting costs a pose byte, the seat and the progress (three bytes) and a person standing or walking nothing",
-      encodeState(&sittingState).len() == encodeState(&plainState).len() + 3usize) && ok;
+      encodeRegion(&sittingState).len() == encodeRegion(&plainState).len() + 3usize) && ok;
   }
   // The input's sit and hail bits
   {
@@ -262,8 +288,8 @@ fn checkNet() bool {
       PartId.none(), 1., 0u32, 0u32, 0., 0u32, 0., false, noRots()));
     k = k + 1u32;
   }
-  var manyState = WorldState(1u64, 1.0, 1u32, 1u64, many, List[PropState](), List[FxState]());
-  let big = encodeState(&manyState);
+  var manyState = RegionState(0u32, 1u64, 1.0, many, List[PropState](), List[FxState]());
+  let big = encodeRegion(&manyState);
   print <- "  a snapshot of forty beings: "; print <- big.len(); print <- " bytes (the limit "; print <- MAX_LATEST; print <- ")\n";
   ok = expect("a snapshot of forty beings fits a packet", big.len() <= MAX_LATEST) && ok;
   // More than 255 beings and spells (the count was a byte and wrapped), and a spell's being past a byte
@@ -277,10 +303,10 @@ fn checkNet() bool {
   var crowdFx = List[FxState]();
   k = 0u32;
   while k < 260u32 { crowdFx.push(FxState(k + 70000u32, FX_ZAP, 1000u64 + u64.from(k))); k = k + 1u32; }
-  var crowdState = WorldState(1u64, 1.0, 1u32, 1u64, crowd, List[PropState](), crowdFx);
-  let crowdBytes = encodeState(&crowdState);
-  var crowdBack = WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]());
-  let crowdOk = decodeState(toBytes(&crowdBytes), &mut crowdBack);
+  var crowdState = RegionState(0u32, 1u64, 1.0, crowd, List[PropState](), crowdFx);
+  let crowdBytes = encodeRegion(&crowdState);
+  var crowdBack = RegionState(0u32, 0u64, 0.0, List[BeingState](), List[PropState](), List[FxState]());
+  let crowdOk = decodeRegion(toBytes(&crowdBytes), &mut crowdBack);
   ok = expect("a snapshot of 300 beings and 260 spells round-trips whole (counts are 16 bits)", crowdOk && crowdBack.beings.len() == 300usize
     && crowdBack.fx.len() == 260usize && crowdBack.beings[299usize].being == 70299u32 && crowdBack.fx[259usize].being == 70259u32
     && crowdBack.fx[259usize].start == 1259u64) && ok;
@@ -295,9 +321,9 @@ fn checkNet() bool {
   var rag = List[BeingState]();
   rag.push(BeingState(0u32, false, Vec3(5., 3., 7.), 0.5, 0., -3., 0., 0., false, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 1u32, 0., true, spun));
   rag.push(BeingState(1u32, false, Vec3(6., 0., 8.), 1.5, 0., 0., 0., 0., true, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 2u32, 1.234, false, noRots()));
-  let ragBytes = encodeState(&WorldState(5u64, 1.0, 1u32, 1u64, rag, List[PropState](), List[FxState]()));
-  var ragBack = WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]());
-  let ragOk = decodeState(toBytes(&ragBytes), &mut ragBack) && ragBack.beings.len() == 2usize;
+  let ragBytes = encodeRegion(&RegionState(0u32, 5u64, 1.0, rag, List[PropState](), List[FxState]()));
+  var ragBack = RegionState(0u32, 0u64, 0.0, List[BeingState](), List[PropState](), List[FxState]());
+  let ragOk = decodeRegion(toBytes(&ragBytes), &mut ragBack) && ragBack.beings.len() == 2usize;
   var spinErr = 0.f;
   if ragOk && ragBack.beings[0usize].hasRots {
     k = 0u32;
@@ -321,7 +347,7 @@ fn checkNet() bool {
     limp.push(BeingState(k, false, Vec3(5., 3., 7.), 0.5, 0., -3., 0., 0., false, Intents.none(), PartId.none(), 0.75, 0u32, 1u32, 9., 1u32, 0., true, spun));
     k = k + 1u32;
   }
-  let limpBytes = encodeState(&WorldState(5u64, 1.0, 1u32, 1u64, limp, List[PropState](), List[FxState]()));
+  let limpBytes = encodeRegion(&RegionState(0u32, 5u64, 1.0, limp, List[PropState](), List[FxState]()));
   print <- "  a snapshot of forty ragdolls: "; print <- limpBytes.len(); print <- " bytes\n";
   ok = expect("a snapshot of forty ragdolls still fits a packet", limpBytes.len() <= MAX_LATEST) && ok;
 
@@ -387,8 +413,8 @@ fn checkNet() bool {
   garbage.push(0u8);
   garbage.push(5u8);
   garbage.push(10u8);
-  var state = WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]());
-  ok = expect("a short or corrupt message is refused", !decodeState(toBytes(&garbage), &mut state)
+  var state = RegionState(0u32, 0u64, 0.0, List[BeingState](), List[PropState](), List[FxState]());
+  ok = expect("a short or corrupt message is refused", !decodeRegion(toBytes(&garbage), &mut state)
     && !decodeInput(toBytes(&garbage), &mut inputBack)) && ok;
   match decodeToView(toBytes(&garbage)) {
     case let Requests(q) { ok = expect("a corrupt batch of requests is refused", false) && ok; }

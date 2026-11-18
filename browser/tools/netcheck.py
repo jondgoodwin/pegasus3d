@@ -463,7 +463,7 @@ def main():
             if l.startswith('Link:'):
                 print(f'     client {name}: {l}')
     for l in S:
-        if l.startswith('Server:') or l.startswith('  a snapshot averages'):
+        if l.startswith('Server:') or l.startswith('  a snapshot') or l.startswith('  region encodes') or l.startswith('  personal encodes'):
             print('     ' + l.strip())
     print('PASS' if ok else 'FAIL')
     return 0 if ok else 1

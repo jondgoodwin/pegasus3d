@@ -220,7 +220,8 @@ pub struct ViewState {
   joined: bool;                // the connection is open
   closed: bool;                // and it has ended
   inbox: List[ToView];         // reliable messages received, not yet applied
-  states: List[WorldState];    // snapshots received, not yet taken (oldest first)
+  states: List[RegionState];   // regions received, not yet taken (oldest first)
+  selfs: List[PersonalState];  // personal parts received, not yet taken (oldest first)
   testIn: List[TestView];      // scripted runs' own, received
   reliableGot: u64;
   lastState: WorldState;       // the newest snapshot taken
@@ -283,6 +284,8 @@ pub struct ViewState {
   pub shotFrame: u64 = 0u64;   // the test hook's (--switch-at): the frame the "switch-after" view is saved at
   pub testW: u32 = 0u32;       // a gallery run's: the size the frame is drawn at (0: the window's)
   pub testH: u32 = 0u32;
+  selfTick: u64 = 0u64;        // the tick of the newest personal part taken
+  hasSelf: bool = false;
   testBirdsDone: u32 = 0u32;   // a gallery run's: the last flock gather applied here, by its serial
   testLookBirds: bool = false; // and the eye turned to this flock's middle
   notes: u32 = 0u32;           // the camera sections G has printed
@@ -302,7 +305,7 @@ pub struct ViewState {
       0u64, Vec2(HEADLESS_W, HEADLESS_H), NetSide.make(), Cast.client(land.share()), List[Puppet](), NO_ROW, NO_BEING, false,
       false, birds, Deque[Predicted](), Vec3(0., 0., 0.), 0u64, false, Snapshot.empty(), List[Request](), 0u64,
       Deque[InputSample](), false, still, FOV, String(), List[MaterialId](), lockstep, false, false,
-      List[ToView](), List[WorldState](), List[TestView](), 0u64,
+      List[ToView](), List[RegionState](), List[PersonalState](), List[TestView](), 0u64,
       WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]()), false, Weathering.fair(), List[PlatformMove](), List[PlatformNow](), 0.,
       List[Intents](), List[bool](), 0u64, 0.0, false, 0i64, 1u32, 0.0, 0u64, 0u64, 0., 0u64, 0., 0u64, false, 0u32, 0u64, 0u64, 0u64, 0u64, 0i64, 2.0, false, false, false, 0u64, 0u64,
       PlayView.make(), HudView.make(hudStartsShown(opts.scripted)), audio, PortalView.make(), playerName, String(), false, List[NameTag](),
@@ -368,8 +371,12 @@ pub struct ViewState {
       case var Update(u) {
         let data = u.data;
         if u32.from(u.stream) == STREAM_STATE {
-          var w = WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]());
-          if decodeState(data, &mut w) { states.push(w); }
+          var w = RegionState(0u32, 0u64, 0.0, List[BeingState](), List[PropState](), List[FxState]());
+          if decodeRegion(data, &mut w) { states.push(w); }
+        } else if u32.from(u.stream) == STREAM_SELF {
+          var ps = PersonalState(0u64, 0.0, 1u32, 0u64, false, BeingState(0u32, false, Vec3(0., 0., 0.), 0., 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32,
+            0u32, 0., FIG_WALK, 0., false, noRots()));
+          if decodePersonal(data, &mut ps) { selfs.push(ps); }
         } else if u32.from(u.stream) == STREAM_TEST {
           var t = TestView(false, Pose.look(Vec3(0., 0., 0.), 0., 0.), FOV, String());
           if decodeTest(data, &mut t) { testIn.push(t); }
@@ -699,16 +706,15 @@ pub struct ViewState {
         }
       }
     }
-    // The snapshots
-    var got = states.len() > 0usize;
+    // The regions, then the personal parts (each stands alone: neither waits for the other)
+    var got = states.len() > 0usize || selfs.len() > 0usize;
     let ss = states.viewMut();
     var s = 0usize;
     while s < ss.len {
-      var w = WorldState(0u64, 0.0, 1u32, 0u64, List[BeingState](), List[PropState](), List[FxState]());
+      var w = RegionState(0u32, 0u64, 0.0, List[BeingState](), List[PropState](), List[FxState]());
+      w.region = ss[s].region;
       w.tick = ss[s].tick;
-      w.now = ss[s].now;
-      w.rate = ss[s].rate;
-      w.appliedInput = ss[s].appliedInput;
+      w.writtenAt = ss[s].writtenAt;
       w.beings <-> ss[s].beings;
       w.props <-> ss[s].props;
       w.fx <-> ss[s].fx;
@@ -716,6 +722,13 @@ pub struct ViewState {
       s = s + 1usize;
     }
     states.clear();
+    let pp = selfs.viewMut();
+    s = 0usize;
+    while s < pp.len {
+      self.takePersonal(PersonalState(pp[s].tick, pp[s].now, pp[s].rate, pp[s].appliedInput, pp[s].hasBeing, pp[s].being));
+      s = s + 1usize;
+    }
+    selfs.clear();
     if got || (lockstep && hasState && frameTick <= lastState.tick) { lateNow = false; }
     if lateNow && lockstep { late = late + 1u64; }
     // A scripted run's camera and file name
@@ -739,9 +752,9 @@ pub struct ViewState {
     testIn.clear();
   }
 
-  // A snapshot taken: each being's state kept to draw from, the user's body compared with the prediction, the clock
-  // estimated
-  fn takeState(self: &mut, w: WorldState) {
+  // A region taken: each other being's state kept to draw from, the props and spells, the clock estimated. The user's own being is
+  // not taken from here (its quantised copy is ignored): it comes in the personal part
+  fn takeState(self: &mut, w: RegionState) {
     if hasState && w.tick <= lastState.tick {
       stale = stale + 1u64;
       return;
@@ -755,34 +768,52 @@ pub struct ViewState {
       print <- "TA "; print <- st.tick; print <- " "; print <- sdl.GetPerformanceCounter(); print <- " "; print <- rttMs; print <- " "; print <- localTick;
       print <- "\n";
     }
-    rate = st.rate;
     var k = 0usize;
-    var ownState = BeingState(0u32, false, Vec3(0., 0., 0.), 0., 0., 0., 0., 0., true, Intents.none(), PartId.none(), 1., 0u32,
-      0u32, 0., FIG_WALK, 0., false, noRots());
-    var hasOwn = false;
     while k < st.beings.len() {
       let b = *st.beings[k];
       let idx = usize.from(b.being);
-      if idx < cast.beings.len() {
-        let p = &mut puppets[idx];
-        p.samples.push(Sample(st.tick, b));
-        while p.samples.len() > 8usize {
-          var keep = List[Sample]();
-          var q = 1usize;
-          while q < p.samples.len() { keep.push(*p.samples[q]); q = q + 1usize; }
-          p.samples <-> keep;
-        }
-        if idx == own { ownState = b; hasOwn = true; }
+      if idx < cast.beings.len() && idx != own {
+        self.addSample(idx, st.tick, b);
       }
       k = k + 1usize;
     }
     playTakeState(&mut play, st.tick, &mut st.props, &st.fx, &mut cast);
     lastState.tick = st.tick;
-    lastState.now = st.now;
-    lastState.rate = st.rate;
-    lastState.appliedInput = st.appliedInput;
+    lastState.now = st.writtenAt;
     hasState = true;
-    if hasOwn { self.reconcile(ownState, st.appliedInput); }
+  }
+
+  // A being's state at a tick, kept to draw from (the last eight)
+  fn addSample(self: &mut, idx: usize, tick: u64, b: BeingState) {
+    let p = &mut puppets[idx];
+    p.samples.push(Sample(tick, b));
+    while p.samples.len() > 8usize {
+      var keep = List[Sample]();
+      var q = 1usize;
+      while q < p.samples.len() { keep.push(*p.samples[q]); q = q + 1usize; }
+      p.samples <-> keep;
+    }
+  }
+
+  // A personal part taken: the clock's rate, the input the simulation has applied, and the user's own being, exact, compared with
+  // its prediction
+  fn takePersonal(self: &mut, p: PersonalState) {
+    if hasSelf && p.tick <= selfTick {
+      stale = stale + 1u64;
+      return;
+    }
+    selfTick = p.tick;
+    hasSelf = true;
+    rate = p.rate;
+    lastState.rate = p.rate;
+    lastState.appliedInput = p.appliedInput;
+    if p.hasBeing {
+      let idx = usize.from(p.being.being);
+      if idx < cast.beings.len() && idx == own {
+        self.addSample(idx, p.tick, p.being);
+        self.reconcile(p.being, p.appliedInput);
+      }
+    }
   }
 
   // This machine's clock in the simulation's ticks (1/60 s): the clock the estimate of the simulation's is made against.
