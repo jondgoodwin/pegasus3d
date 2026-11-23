@@ -1,0 +1,147 @@
+// Pages and parked folders in the incubator incubator (WI\incubator-world.md, "Pages and parked folders"). A page is a document
+// panel or a web panel standing in an arc beside the file browser, newest nearest; a parked folder is a slim post with its name at
+// eye height. The Incubator (incubator.cone) owns both lists and does the work; this file holds what they are made of.
+
+const PG_MAX = 5usize;           // pages standing in the arc before the oldest goes to its shelf
+const PG_R = 2.8f;               // the work area's arc, a shallow ellipse 2-4 m in front of the seat: half its width, meters
+const PG_RZ = 3.4f;              // and how far ahead its middle stands
+const PG_STEP = 0.55f;           // radians between neighbours on the arc
+const PG_CHIP_W = 0.34f;         // the chips above a page
+const PG_CHIP_H = 0.085f;
+const NAV_SZ = 0.16f;            // a web page's back and forward arrows, above its top-left corner
+const NAV_ROOM = 0.4f;           // what they take of the row above the page
+const PG_SHELVED_SCALE = 0.25f;
+
+struct Pg {
+  id: String;                    // its key in room.toml ("p3"), or the project's id
+  src: String;                   // a file or an address
+  web: bool;
+  doc: Option[DocPanel];
+  wp: Option[WebPanel];
+  title: Label;                  // the file's name, above the page
+  chips: List[Label];            // close, shelve, grab
+  born: u64;                     // when it was opened: the newest stands nearest the browser
+  pos: Vec3;                     // where its own frame's origin stands (the floor under the page's middle)
+  yaw: f32;
+  sc: f32;
+  fromPos: Vec3;
+  fromYaw: f32;
+  fromSc: f32;
+  toPos: Vec3;
+  toYaw: f32;
+  toSc: f32;
+  placeKey: String;              // the place text last applied from a file (a project's page)
+  fly: f32 = 1.;                 // 0 just set off, 1 arrived
+  shelved: bool = false;
+  shelfAt: i32 = -1;             // its slot on the side wall while shelved
+  free: bool = false;            // placed by hand or by the file (at:x,y,z), not in the arc
+  proj: bool = false;            // made by a [project.ID] of incubator.toml (so not written to room.toml as a page)
+  gone: bool = false;            // closed: removed at the end of the tick
+  webUp: i32 = 0i32;             // frames until the mouse button goes up on a web page that was pressed
+  zone: i32 = -1i32;             // a pane of a zone's board (zones.cone): the zone's number, or -1 for an ordinary page
+  pane: u32 = 0u32;              // which pane of the board (ZP_SITE ...)
+  foc: f32 = 0.;                 // 0 in its place on the board, 1 at the workbench
+  wantFoc: bool = false;
+  tab: bool = false;             // a tab of the general browser (Jon, 11 Nov): only the tab numbered Incubator.tabCur is shown, ticked and hit
+  tabNo: u32 = 0u32;
+  used: u64 = 0u64;              // when a member page was last focused or grabbed (the one untouched longest goes back to the rack past 5)
+  manYaw: bool = false;          // turned by hand (or remembered so): it keeps its own yaw, not facing the middle
+  manSc: bool = false;           // sized by hand (or remembered so): it keeps its own size
+  big: bool = false;             // the work item of the open workspace: stands in the centre, larger
+  ws: bool = false;              // a member of the open workspace: free-standing, not counted in the arc's limit, kept in the workspace (not room.toml's pages)
+}
+
+// A parked folder: a post in the room that opens a browser rooted at 'path'
+struct FolderPost {
+  id: String;
+  name: String;
+  path: String;
+  place: String;                 // "at:x,y,z" or empty (the next free spot of the row)
+  pos: Vec3;
+  label: Label;                  // the name, at eye height
+  post: Label;                   // the slim post
+  room: bool;                    // parked in the room (room.toml), not by the file
+  proj: bool;                    // made by a [project.ID] with source "folder:PATH"
+}
+
+alias Pgs = List[Pg];
+alias FolderPosts = List[FolderPost];
+
+// A page's half-width and the height of its top edge, in its own frame (z = 0, middle at DOC_CENTRE_Y)
+fn pgHalfW(web: bool) f32 { if web { f32.from(WEBPG_W) * 0.5 } else { f32.from(DOC_WORLD_W) * 0.5 } }
+fn pgTop(web: bool) f32 {
+  let w = if web { f32.from(WEBPG_W) } else { f32.from(DOC_WORLD_W) };
+  let h = if web { w * f32.from(WEB_TEX_H) / f32.from(WEB_TEX_W) } else { w * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W) };
+  f32.from(DOC_CENTRE_Y) + h * 0.5
+}
+fn pgBottom(web: bool) f32 { 2. * f32.from(DOC_CENTRE_Y) - pgTop(web) }
+
+// Where a ray meets a rectangle of a model's own plane (z = 0): the distance along it, or -1
+fn quadHit(model: Mat4, rect: Vec4, eye: Vec3, dir: Vec3) f32 {
+  let inv = model.inverse();
+  let e = inv * eye;
+  let d = inv.transformVector(dir);
+  if d.z > -0.00001 && d.z < 0.00001 { return -1.; }
+  let t = (0. - e.z) / d.z;
+  if t <= 0. { return -1.; }
+  let p = e + d * t;
+  if p.x >= rect.x && p.x <= rect.z && p.y >= rect.y && p.y <= rect.w { t } else { -1. }
+}
+
+// The turn that takes yaw 'from' to 'to' the short way, as a number to add to 'from'
+fn turnBetween(from: f32, to: f32) f32 {
+  var d = to - from;
+  while d > PI { d = d - 2. * PI; }
+  while d < 0. - PI { d = d + 2. * PI; }
+  d
+}
+
+// (compared byte by byte: slicing 's' at the prefix length can fall inside a multi-byte character, and that panics)
+fn startsWithText(s: &str, prefix: &str) bool {
+  if s.len() < prefix.len() { return false; }
+  var i = 0usize;
+  while i < prefix.len() { if s[i] != prefix[i] { return false; } i = i + 1usize; }
+  true
+}
+
+fn isWebSrc(s: &str) bool { startsWithText(s, "http://") || startsWithText(s, "https://") }
+
+// The name a page wears over it: a file's own name, or an address without its scheme
+fn pageTitle(src: &str) String {
+  if isWebSrc(src) {
+    var rest = if startsWithText(src, "https://") { src.slice(8usize, src.len()) } else { src.slice(7usize, src.len()) };
+    if rest.len() > 34usize { rest = rest.slice(0usize, 34usize); }
+    return String.from(rest);
+  }
+  baseName(src)
+}
+
+// The last part of a folder path
+fn folderName(path: &str) String {
+  var end = path.len();
+  while end > 0usize && (path[end - 1usize] == '/' || path[end - 1usize] == '\\') { end = end - 1usize; }
+  var from = end;
+  while from > 0usize && path[from - 1usize] != '/' && path[from - 1usize] != '\\' { from = from - 1usize; }
+  String.from(path.slice(from, end))
+}
+
+// A text's size in a 512-pixel label so that it fits: 'big' for a short one, smaller as it lengthens
+fn fitSize(len: usize, big: f32) f32 {
+  let fit = 470. / (0.52 * f32.from(u32.from(len + 1usize)));
+  if fit < big { if fit < 20. { 20. } else { fit } } else { big }
+}
+
+// A board strip card's text (11 Nov, 1.5x of the old 56 so it reads at 6 m): one line up to 84 px, else two lines at up to 46 px
+fn cardSize(len: usize) f32 {
+  let one = 470. / (0.6 * f32.from(u32.from(len + 1usize)));
+  if one >= 44. { return if one < 84. { one } else { 84. }; }
+  let two = 2. * 0.85 * 470. / (0.6 * f32.from(u32.from(len + 1usize)));
+  if two < 22. { 22. } else if two < 46. { two } else { 46. }
+}
+
+// Where the text starts, so that one or two lines stand in the middle of the 128 px label
+fn cardTop(len: usize, size: f32) f32 {
+  let lines: f32 = if 0.6 * size * f32.from(u32.from(len + 1usize)) > 470. { 2. } else { 1. };
+  let t: f32 = (128. - lines * size * 1.15) * 0.5 - size * 0.12;
+  if t < 2. { 2. } else { t }
+}

@@ -1,0 +1,664 @@
+// Mermaid diagrams drawn natively: mermaid.cone reads the text; this lays the result out with diagramlayout (a Graph
+// for a flowchart, a SequenceDiagram for a sequence diagram), draws it with vector2d + msdftext into a small
+// texture, and keeps the pixels (bottom row first, 3 bytes a pixel, ready to be copied into the document panel's
+// page) with a rectangle for each named thing, so a click can point at a node or a message by its key.
+//
+// Notes in a sequence diagram are drawn here: diagramlayout has none ("Not built: notes"). The layout is run
+// without them; each note then pushes the rows below it down and is drawn as a yellow box in the space it made.
+//
+// The caller (docpanel.cone) makes one Painter and caches the Diagram by its text and width.
+
+const MV_MARGIN = 22.0f;
+const MV_MAX_SCALE = 1.6f;
+const MV_MAX_H = 1650.0f;
+const MV_NOTE_H = 26.0f;
+const NONE_IDX = 1000000000usize;
+const MV_GPAD = 14.0f;           // a group box's padding round its nodes
+const MV_GHEAD = 24.0f;          // and the room for its title
+const MV_WRAP = 240.0f;          // a node label wider than this (at 14 px) is wrapped
+const MV_LINE = 17.0f;           // a wrapped label's line height
+
+pub struct Painter {
+  renderer: VectorRenderer;
+  atlas: Atlas;
+  font: Font;
+}
+
+pub struct Diagram {
+  pub text: String;              // the source (the cache key, with 'maxW')
+  pub maxW: u32;
+  pub w: u32;
+  pub h: u32;
+  pub pending: bool;             // laid out and sized, its pixels not yet drawn (one diagram a frame: a frame may record 16 command buffers)
+  pub canvas: Canvas;            // what is to be drawn, until it is
+  pub pixels: List[u8];          // w x h, bottom row first, RGB
+  pub keys: List[String];        // what can be pointed at: node keys, "msg N", "note N", participant keys
+  pub labels: List[String];
+  pub rects: List[f32];          // four a key: x, y (top), w, h in the picture's pixels
+  pub kind: u32;                 // MM_...
+  pub nodes: usize;              // nodes (or participants)
+  pub edges: usize;              // edges (or messages)
+  pub notes: usize;
+  pub skipped: u32;              // lines the reader could not use
+  pub micros: f64;               // time to read, lay out, draw and read back
+}
+
+pub fn emptyDiagram(text: &str, maxW: u32) Diagram {
+  Diagram(String.from(text), maxW, 0u32, 0u32, false, Canvas.make(1., 1.), List[u8](), List[String](), List[String](), List[f32](), MM_NONE, 0usize, 0usize, 0usize, 0u32, 0.)
+}
+
+fn diagramFont() Option[Font] {
+  var out: Option[Font] = None;
+  match loadFont("C:/Windows/Fonts/arial.ttf") {
+    case let Some(f) { out = Some[Font](f); }
+    else {
+      match Font.load(&DEMO_FONT) {
+        case let Ok(f) { out = Some[Font](f); }
+        case is Err {}
+      }
+    }
+  }
+  out
+}
+
+pub fn makePainter(device: &mut Device) Option[Painter] {
+  var out: Option[Painter] = None;
+  match diagramFont() {
+    case let Some(font) {
+      var atlas = Atlas.create(AtlasConfig.standard());
+      var renderer = VectorRenderer.create(device, &atlas, TEXTURE_FORMAT_RGBA8_UNORM);
+      if renderer.isValid() { out = Some[Painter](Painter(renderer, atlas, font)); }
+      else { print <- "mermaid: the vector renderer is not valid\n"; }
+    }
+    else { print <- "mermaid: no font\n"; }
+  }
+  out
+}
+
+// ---- the picture's frame ----
+
+struct Frame {
+  s: f32;
+  tx: f32;
+  ty: f32;
+  w: u32;
+  h: u32;
+}
+
+fn frameFor(x0: f32, y0: f32, x1: f32, y1: f32, maxW: u32) Frame {
+  let cw = x1 - x0 + MV_MARGIN * 2.;
+  let ch = y1 - y0 + MV_MARGIN * 2.;
+  var s = f32.from(maxW) / cw;
+  if s > MV_MAX_SCALE { s = MV_MAX_SCALE; }
+  if ch * s > MV_MAX_H { s = MV_MAX_H / ch; }
+  var w = u32.from(cw * s) + 1u32;
+  if w > maxW { w = maxW; }
+  let h = u32.from(ch * s) + 1u32;
+  Frame(s, (MV_MARGIN - x0) * s, (MV_MARGIN - y0) * s, w, h)
+}
+
+fn addKey(d: &mut Diagram, f: &Frame, key: &str, label: &str, x: f32, y: f32, w: f32, h: f32) {
+  d.keys.push(String.from(key));
+  d.labels.push(String.from(label));
+  d.rects.push(x * f.s + f.tx);
+  d.rects.push(y * f.s + f.ty);
+  d.rects.push(w * f.s);
+  d.rects.push(h * f.s);
+}
+
+// Draw 'canvas' into a w x h texture and keep its pixels in 'd'
+fn readBack(p: &mut Painter, device: &mut Device, d: &mut Diagram) {
+  let fw = d.w;
+  let fh = d.h;
+  let desc = TextureDescriptor(fw, fh, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+  var target = device.createTexture(&desc);
+  var readback = device.createBuffer(u64.from(fw * fh * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+  var encoder = device.createCommandEncoder();
+  p.renderer.render(device, &mut encoder, &target, &d.canvas, &p.font, &mut p.atlas, true, Color(1., 1., 1., 1.));
+  encoder.copyTextureToBuffer(&target, &readback);
+  device.queue.submit(encoder.finish());
+  device.waitIdle();
+  let src = readback.mappedRange();
+  d.pixels = List[u8].withCapacity(usize.from(fw * fh * 3u32));
+  var r = 0u32;
+  while r < fh {
+    // output row r is r rows up from the bottom: texture row h-1-r
+    let row = fh - 1u32 - r;
+    var x = 0u32;
+    while x < fw {
+      let at = src + usize.from((row * fw + x) * 4u32);
+      d.pixels.push(*at);
+      d.pixels.push(*(at + 1usize));
+      d.pixels.push(*(at + 2usize));
+      x = x + 1u32;
+    }
+    r = r + 1u32;
+  }
+}
+
+// ---- flowcharts ----
+
+fn textWidth(p: &mut Painter, s: &str, size: f32) f32 {
+  measureText(&p.font, &mut p.atlas, s, size, 0.).x
+}
+
+// 'label' cut at spaces into lines no wider than MV_WRAP, joined by newlines; "" when it fits on one line (or the shape
+// is a diamond or circle, whose labels are not wrapped)
+fn wrapLabel(p: &mut Painter, label: &str, shape: u32) String {
+  if shape == SH_DIAMOND || shape == SH_CIRCLE { return String(); }
+  if textWidth(p, label, 14.) <= MV_WRAP { return String(); }
+  var out = String();
+  var cur = String();
+  var i = 0usize;
+  while i <= label.len() {
+    var j = i;
+    while j < label.len() && label[j] != ' ' { j = j + 1usize; }
+    let word = label.slice(i, j);
+    if word.len() > 0usize {
+      if cur.len() == 0usize { cur.append(word); }
+      else {
+        var trial = String.from(cur.view());
+        trial.append(" ");
+        trial.append(word);
+        if textWidth(p, trial.view(), 14.) > MV_WRAP {
+          if out.len() > 0usize { out.append("\n"); }
+          out.append(cur.view());
+          cur = String.from(word);
+        }
+        else { cur = trial; }
+      }
+    }
+    i = j + 1usize;
+  }
+  if cur.len() > 0usize {
+    if out.len() > 0usize { out.append("\n"); }
+    out.append(cur.view());
+  }
+  out
+}
+
+fn splitLines(s: &str) List[String] {
+  var out = List[String]();
+  var i = 0usize;
+  while i <= s.len() {
+    var j = i;
+    while j < s.len() && s[j] != '\n' { j = j + 1usize; }
+    out.push(String.from(s.slice(i, j)));
+    i = j + 1usize;
+  }
+  out
+}
+
+fn nodeSize(p: &mut Painter, mm: &Mermaid, i: usize, wrapped: &str) Vec2 {
+  let shape = mm.nodes[i].shape;
+  var tw = textWidth(p, mm.nodes[i].label.view(), 14.);
+  var rows = 1usize;
+  if wrapped.len() > 0usize {
+    let ls = splitLines(wrapped);
+    tw = 0.;
+    var k = 0usize;
+    while k < ls.len() {
+      let w = textWidth(p, ls[k].view(), 14.);
+      if w > tw { tw = w; }
+      k = k + 1usize;
+    }
+    rows = ls.len();
+  }
+  let extra = MV_LINE * f32.from(u32.from(rows - 1usize));
+  if shape == SH_DIAMOND { return Vec2(tw * 1.8 + 30., 58.); }
+  if shape == SH_CIRCLE { return Vec2(tw * 1.42 + 36., 50.); }
+  if shape == SH_STADIUM { return Vec2(tw + 44., 36. + extra); }
+  Vec2(if tw + 28. < 46. { 46. } else { tw + 28. }, 36. + extra)
+}
+
+// The wrapped labels of the nodes that have them, over the boxes
+fn drawWrapped(c: &mut Canvas, g: &Graph, wrapped: &List[String], st: &DiagramStyle) {
+  var i = 0usize;
+  while i < g.nodes.len() {
+    if wrapped[i].len() > 0usize {
+      let nd = &g.nodes[i];
+      let ls = splitLines(wrapped[i].view());
+      var y = nd.y - MV_LINE * 0.5 * f32.from(u32.from(ls.len() - 1usize));
+      var k = 0usize;
+      while k < ls.len() {
+        c.text(ls[k].view(), nd.x, y, 0.5, 0.5, st.fontSize, st.textColor);
+        y = y + MV_LINE;
+        k = k + 1usize;
+      }
+    }
+    i = i + 1usize;
+  }
+}
+
+// The shapes drawGraph does not draw (it draws every node as a rounded box): painted over the box
+fn drawShapes(c: &mut Canvas, g: &Graph, st: &DiagramStyle) {
+  var i = 0usize;
+  while i < g.nodes.len() {
+    let nd = &g.nodes[i];
+    if nd.alive && (nd.kind == SH_STADIUM || nd.kind == SH_DIAMOND || nd.kind == SH_CIRCLE) {
+      let fill = st.kindFills[usize.from(nd.kind) % st.kindFills.len()];
+      let stroke = st.kindStrokes[usize.from(nd.kind) % st.kindStrokes.len()];
+      let l = nd.x - nd.w * 0.5;
+      let t = nd.y - nd.h * 0.5;
+      c.fillRect(l - 1., t - 1., nd.w + 2., nd.h + 2., st.background);
+      if nd.kind == SH_STADIUM {
+        c.fillRoundRect(l, t, nd.w, nd.h, nd.h * 0.5, &Paint.solid(fill));
+        c.strokeRoundRect(l, t, nd.w, nd.h, nd.h * 0.5, &Paint.solid(stroke), &StrokeStyle.make(1.6));
+      }
+      else if nd.kind == SH_CIRCLE {
+        c.fillEllipse(nd.x, nd.y, nd.w * 0.5, nd.h * 0.5, &Paint.solid(fill));
+        c.strokeEllipse(nd.x, nd.y, nd.w * 0.5, nd.h * 0.5, &Paint.solid(stroke), &StrokeStyle.make(1.6));
+      }
+      else {
+        var path = VectorPath.make();
+        path.moveTo(nd.x, t);
+        path.lineTo(l + nd.w, nd.y);
+        path.lineTo(nd.x, t + nd.h);
+        path.lineTo(l, nd.y);
+        path.close();
+        c.fill(&path, &Paint.solid(fill));
+        c.stroke(&path, &Paint.solid(stroke), &StrokeStyle.make(1.6));
+      }
+      c.text(nd.label.view(), nd.x, nd.y, 0.5, 0.5, st.fontSize, st.textColor);
+    }
+    i = i + 1usize;
+  }
+}
+
+// The outermost group that group 'gi' sits in
+fn topGroup(mm: &Mermaid, gi: i32) i32 {
+  var g = gi;
+  while g >= 0 && mm.groups[usize.from(g)].parent >= 0 { g = mm.groups[usize.from(g)].parent; }
+  g
+}
+
+// The nodes of one outermost group, laid out alone: its nodes' positions relative to the middle of their box, and
+// the box's size (padding and the title's room included). 'ids' are the members' indices in 'mm'.
+fn layoutInner(mm: &Mermaid, sizes: &List[Vec2], ids: &List[usize], horizontal: bool, offs: &mut List[Vec2]) Vec2 {
+  var g = Graph.make();
+  var i = 0usize;
+  while i < ids.len() {
+    let n = *ids[i];
+    g.addNode(mm.nodes[n].key.view(), "", sizes[n].x, sizes[n].y);
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < mm.edges.len() {
+    let e = &mm.edges[i];
+    var a = NONE_IDX;
+    var b = NONE_IDX;
+    var k = 0usize;
+    while k < ids.len() {
+      if *ids[k] == e.from { a = k; }
+      if *ids[k] == e.to { b = k; }
+      k = k + 1usize;
+    }
+    if a != NONE_IDX && b != NONE_IDX && a != b { g.addEdge(u32.from(a), u32.from(b)); }
+    i = i + 1usize;
+  }
+  var lo = LayeredOptions.make();
+  lo.routeEdges = false;
+  if horizontal { lo.direction = DIR_LR; }
+  layoutLayered(&mut g, &lo);
+  let bb = g.bounds();
+  let cx = (bb.min.x + bb.max.x) * 0.5;
+  let cy = (bb.min.y + bb.max.y) * 0.5;
+  i = 0usize;
+  while i < g.nodes.len() {
+    offs.push(Vec2(g.nodes[i].x - cx, g.nodes[i].y - cy));
+    i = i + 1usize;
+  }
+  Vec2(bb.max.x - bb.min.x + MV_GPAD * 2., bb.max.y - bb.min.y + MV_GPAD * 2. + MV_GHEAD)
+}
+
+fn renderFlow(p: &mut Painter, device: &mut Device, mm: &Mermaid, maxW: u32, d: &mut Diagram) {
+  // each node's wrapped label and size
+  var wrapped = List[String]();
+  var sizes = List[Vec2]();
+  var i = 0usize;
+  while i < mm.nodes.len() {
+    let w = wrapLabel(p, mm.nodes[i].label.view(), mm.nodes[i].shape);
+    sizes.push(nodeSize(p, mm, i, w.view()));
+    wrapped.push(w);
+    i = i + 1usize;
+  }
+  // the layout: an outermost group is laid out alone and then stands as one box in the layout of the rest, so its
+  // members stay together; positions are the middle of each node
+  var px = List[f32]();
+  var py = List[f32]();
+  i = 0usize;
+  while i < mm.nodes.len() { px.push(0.); py.push(0.); i = i + 1usize; }
+  var outer = Graph.make();
+  var outerOf = List[usize]();            // a node's index in 'outer'
+  var innerOff = List[Vec2]();            // a node's offset in its group's box
+  i = 0usize;
+  while i < mm.nodes.len() { outerOf.push(NONE_IDX); innerOff.push(Vec2(0., 0.)); i = i + 1usize; }
+  var gi = 0usize;
+  while gi < mm.groups.len() {
+    if mm.groups[gi].parent < 0 {
+      var ids = List[usize]();
+      i = 0usize;
+      while i < mm.nodes.len() {
+        if mm.nodes[i].group >= 0 && topGroup(mm, mm.nodes[i].group) == i32.from(gi) { ids.push(i); }
+        i = i + 1usize;
+      }
+      if ids.len() > 0usize {
+        var offs = List[Vec2]();
+        let box = layoutInner(mm, &sizes, &ids, mm.horizontal, &mut offs);
+        let oid = outer.addNode(mm.groups[gi].key.view(), "", box.x, box.y);
+        var k = 0usize;
+        while k < ids.len() {
+          outerOf.set(*ids[k], usize.from(oid));
+          innerOff.set(*ids[k], *offs[k]);
+          k = k + 1usize;
+        }
+      }
+    }
+    gi = gi + 1usize;
+  }
+  i = 0usize;
+  while i < mm.nodes.len() {
+    if outerOf[i] == NONE_IDX {
+      let oid = outer.addNode(mm.nodes[i].key.view(), "", sizes[i].x, sizes[i].y);
+      outerOf.set(i, usize.from(oid));
+    }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < mm.edges.len() {
+    let a = outerOf[mm.edges[i].from];
+    let b = outerOf[mm.edges[i].to];
+    if a != b { outer.addEdge(u32.from(a), u32.from(b)); }
+    i = i + 1usize;
+  }
+  var lo = LayeredOptions.make();
+  lo.routeEdges = false;
+  if mm.horizontal { lo.direction = DIR_LR; }
+  layoutLayered(&mut outer, &lo);
+  // the real graph, with the positions the outer layout gave
+  var g = Graph.make();
+  i = 0usize;
+  while i < mm.nodes.len() {
+    let id = g.addNode(mm.nodes[i].key.view(), mm.nodes[i].label.view(), sizes[i].x, sizes[i].y);
+    let nd = &mut g.nodes[usize.from(id)];
+    nd.kind = mm.nodes[i].shape;
+    let o = &outer.nodes[outerOf[i]];
+    if mm.nodes[i].group >= 0 {
+      nd.x = o.x + innerOff[i].x;
+      nd.y = o.y + MV_GHEAD * 0.5 + innerOff[i].y;
+    }
+    else {
+      nd.x = o.x;
+      nd.y = o.y;
+    }
+    nd.pinned = true;
+    nd.placed = true;
+    i = i + 1usize;
+  }
+  gi = 0usize;
+  while gi < mm.groups.len() {
+    g.addGroup(mm.groups[gi].title.view(), mm.groups[gi].parent);
+    gi = gi + 1usize;
+  }
+  i = 0usize;
+  while i < mm.nodes.len() {
+    if mm.nodes[i].group >= 0 { g.setGroup(u32.from(i), mm.nodes[i].group); }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < mm.edges.len() {
+    let e = &mm.edges[i];
+    var style = LINK_ARROW;
+    if e.dotted { style = if e.arrow { LINK_DOTTED } else { LINK_DOTTED_PLAIN }; }
+    else if !e.arrow { style = LINK_PLAIN; }
+    var lw = 0.0f;
+    var lh = 0.0f;
+    if e.label.len() > 0usize { lw = textWidth(p, e.label.view(), 12.) + 8.; lh = 16.; }
+    g.addStyledEdge(u32.from(e.from), u32.from(e.to), style, e.label.view(), lw, lh);
+    i = i + 1usize;
+  }
+  g.fitGroups(MV_GPAD, MV_GHEAD);
+  d.nodes = g.liveNodes();
+  d.edges = g.liveEdges();
+  var routeOpt = RouteOptions.make();
+  if mm.horizontal { routeOpt.flow = FLOW_HORIZONTAL; }
+  routeEdges(&mut g, &routeOpt);
+  let b = g.bounds();
+  var x0 = b.min.x;
+  var y0 = b.min.y;
+  var x1 = b.max.x;
+  var y1 = b.max.y;
+  gi = 0usize;
+  while gi < g.groups.len() {
+    let gr = &g.groups[gi];
+    if gr.w > 0. {
+      if gr.x < x0 { x0 = gr.x; }
+      if gr.y < y0 { y0 = gr.y; }
+      if gr.x + gr.w > x1 { x1 = gr.x + gr.w; }
+      if gr.y + gr.h > y1 { y1 = gr.y + gr.h; }
+    }
+    gi = gi + 1usize;
+  }
+  let f = frameFor(x0, y0, x1, y1, maxW);
+  let st = DiagramStyle.light();
+  var canvas = Canvas.make(f32.from(f.w), f32.from(f.h));
+  canvas.fillRect(0., 0., f32.from(f.w), f32.from(f.h), st.background);
+  canvas.save();
+  canvas.translate(f.tx, f.ty);
+  canvas.scale(f.s, f.s);
+  // a wrapped node's label is drawn by drawWrapped, so drawGraph is given none
+  i = 0usize;
+  while i < g.nodes.len() {
+    if wrapped[i].len() > 0usize { g.nodes[i].label = String(); }
+    i = i + 1usize;
+  }
+  drawGraph(&mut canvas, &g, &st);
+  drawShapes(&mut canvas, &g, &st);
+  drawWrapped(&mut canvas, &g, &wrapped, &st);
+  // the second head of a <--> edge: its first segment again, with a head at the start
+  i = 0usize;
+  while i < mm.edges.len() {
+    let ei = usize.from(g.addEdge(u32.from(mm.edges[i].from), u32.from(mm.edges[i].to)));
+    if mm.edges[i].back && g.edges[ei].route.len() >= 2usize {
+      var path = VectorPath.make();
+      path.moveTo(g.edges[ei].route[0usize].x, g.edges[ei].route[0usize].y);
+      path.lineTo(g.edges[ei].route[1usize].x, g.edges[ei].route[1usize].y);
+      var ss = StrokeStyle.make(st.edgeWidth);
+      if mm.edges[i].dotted {
+        ss = StrokeStyle.dashed(st.edgeWidth, st.edgeWidth * 1.5, st.edgeWidth * 2.5);
+        ss.cap = CAP_ROUND;
+      }
+      ss.join = JOIN_ROUND;
+      canvas.strokeArrows(&path, &Paint.solid(st.edgeColor), &ss, &st.arrow, &ArrowStyle.none());
+    }
+    i = i + 1usize;
+  }
+  canvas.restore();
+  i = 0usize;
+  while i < g.nodes.len() {
+    let nd = &g.nodes[i];
+    addKey(d, &f, nd.key.view(), mm.nodes[i].label.view(), nd.x - nd.w * 0.5, nd.y - nd.h * 0.5, nd.w, nd.h);
+    i = i + 1usize;
+  }
+  d.w = f.w;
+  d.h = f.h;
+  d.canvas = canvas;
+  d.pending = true;
+}
+
+// ---- sequence diagrams ----
+
+fn renderSeq(p: &mut Painter, device: &mut Device, mm: &Mermaid, maxW: u32, d: &mut Diagram) {
+  var sd = SequenceDiagram.make();
+  var i = 0usize;
+  while i < mm.parts.len() {
+    let tw = textWidth(p, mm.parts[i].name.view(), 15.);
+    sd.addParticipant(mm.parts[i].name.view(), tw + 26., 32.);
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < mm.msgs.len() {
+    let m = &mm.msgs[i];
+    let lw = textWidth(p, m.label.view(), 13.5);
+    sd.addMessage(u32.from(m.from), u32.from(m.to), m.label.view(), lw, m.kind);
+    i = i + 1usize;
+  }
+  d.nodes = mm.parts.len();
+  d.edges = mm.msgs.len();
+  d.notes = mm.notes.len();
+  if mm.parts.len() == 0usize { return; }
+  layoutSequence(&mut sd, &SequenceOptions.make());
+  // the notes: make room, then remember where each box goes
+  var nx = List[f32]();
+  var ny = List[f32]();
+  var nw = List[f32]();
+  var minX = 0.0f;
+  var maxX = sd.width;
+  let dy = MV_NOTE_H + 24.;
+  i = 0usize;
+  while i < mm.notes.len() {
+    let nt = &mm.notes[i];
+    let tw = textWidth(p, nt.text.view(), 12.5);
+    var bw = tw + 22.;
+    let y = if nt.before < sd.messages.len() { sd.messages[nt.before].y } else { sd.lifelineBottom - 22. };
+    let thr = y - 12.;
+    var k = 0usize;
+    while k < sd.messages.len() {
+      if sd.messages[k].y >= thr { sd.messages[k].y = sd.messages[k].y + dy; }
+      k = k + 1usize;
+    }
+    k = 0usize;
+    while k < sd.activations.len() {
+      if sd.activations[k].y0 >= thr { sd.activations[k].y0 = sd.activations[k].y0 + dy; }
+      if sd.activations[k].y1 >= thr { sd.activations[k].y1 = sd.activations[k].y1 + dy; }
+      k = k + 1usize;
+    }
+    sd.lifelineBottom = sd.lifelineBottom + dy;
+    sd.height = sd.height + dy;
+    let xa = sd.participants[nt.first].x;
+    let xb = sd.participants[nt.last].x;
+    var x = 0.0f;
+    if nt.side == NOTE_RIGHT { x = xb + 14.; }
+    else if nt.side == NOTE_LEFT { x = xa - 14. - bw; }
+    else {
+      if bw < xb - xa + 28. { bw = xb - xa + 28.; }
+      x = (xa + xb) * 0.5 - bw * 0.5;
+    }
+    nx.push(x);
+    ny.push(y - 10.);
+    nw.push(bw);
+    if x < minX { minX = x; }
+    if x + bw > maxX { maxX = x + bw; }
+    i = i + 1usize;
+  }
+  let f = frameFor(minX, 0., maxX, sd.height, maxW);
+  let st = DiagramStyle.light();
+  var canvas = Canvas.make(f32.from(f.w), f32.from(f.h));
+  canvas.fillRect(0., 0., f32.from(f.w), f32.from(f.h), st.background);
+  canvas.save();
+  canvas.translate(f.tx, f.ty);
+  canvas.scale(f.s, f.s);
+  drawSequence(&mut canvas, &sd, &st);
+  i = 0usize;
+  while i < mm.notes.len() {
+    canvas.fillRoundRect(*nx[i], *ny[i], *nw[i], MV_NOTE_H, 4., &Paint.solid(Color(1., 0.96, 0.66, 1.)));
+    canvas.strokeRoundRect(*nx[i], *ny[i], *nw[i], MV_NOTE_H, 4., &Paint.solid(Color(0.80, 0.62, 0.15, 1.)), &StrokeStyle.make(1.2));
+    canvas.text(mm.notes[i].text.view(), *nx[i] + *nw[i] * 0.5, *ny[i] + MV_NOTE_H * 0.5, 0.5, 0.5, 12.5, Color(0.25, 0.18, 0.02, 1.));
+    i = i + 1usize;
+  }
+  canvas.restore();
+  // what can be pointed at: messages, notes, then the participants (heads and lifelines)
+  i = 0usize;
+  while i < sd.messages.len() {
+    let m = &sd.messages[i];
+    let xa = sd.participants[usize.from(m.from)].x;
+    let xb = sd.participants[usize.from(m.to)].x;
+    let lo = if xa < xb { xa } else { xb };
+    let hi = if xa < xb { xb } else { xa };
+    var key = String.from("msg ");
+    key.append(numberText(i + 1usize).view());
+    addKey(d, &f, key.view(), m.label.view(), lo - 4., m.y - 18., (hi - lo) + (if xa == xb { 80. } else { 8. }), 30.);
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < mm.notes.len() {
+    var key = String.from("note ");
+    key.append(numberText(i + 1usize).view());
+    addKey(d, &f, key.view(), mm.notes[i].text.view(), *nx[i], *ny[i], *nw[i], MV_NOTE_H);
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < sd.participants.len() {
+    let q = &sd.participants[i];
+    addKey(d, &f, mm.parts[i].key.view(), q.name.view(), q.x - q.w * 0.5, sd.lifelineTop - q.h, q.w, sd.lifelineBottom + q.h - (sd.lifelineTop - q.h));
+    i = i + 1usize;
+  }
+  d.w = f.w;
+  d.h = f.h;
+  d.canvas = canvas;
+  d.pending = true;
+}
+
+// ---- the entry point ----
+
+// Read, lay out, draw and read back a diagram of 'src', at most 'maxW' pixels wide
+pub fn renderMermaid(p: &mut Painter, device: &mut Device, src: &str, maxW: u32) Diagram {
+  let began = sdl.GetPerformanceCounter();
+  var d = emptyDiagram(src, maxW);
+  let mm = parseMermaid(src);
+  d.kind = mm.kind;
+  d.skipped = mm.skipped;
+  if mm.kind == MM_FLOW && mm.nodes.len() > 0usize { renderFlow(p, device, &mm, maxW, &mut d); }
+  else if mm.kind == MM_SEQ { renderSeq(p, device, &mm, maxW, &mut d); }
+  d.micros = micros(began, sdl.GetPerformanceCounter());
+  d
+}
+
+// The diagram for 'src' from the cache (drawn and added if new): its index, or 1000000000 if there is no painter
+pub fn diagramFor(painter: &mut Option[Painter], device: &mut Device, cache: &mut List[Diagram], src: &str, maxW: u32) usize {
+  var i = 0usize;
+  while i < cache.len() {
+    if cache[i].maxW == maxW && cache[i].text.view() == src { return i; }
+    i = i + 1usize;
+  }
+  var made = emptyDiagram(src, maxW);
+  var ok = false;
+  match painter {
+    case let Some(p) {
+      made = renderMermaid(p, device, src, maxW);
+      ok = true;
+      print <- "mermaid: "; print <- (if made.kind == MM_FLOW { "flowchart" } else if made.kind == MM_SEQ { "sequence diagram" } else { "unknown" });
+      print <- ", "; print <- made.nodes; print <- " nodes, "; print <- made.edges; print <- " edges, "; print <- made.notes; print <- " notes, ";
+      print <- made.skipped; print <- " lines skipped; "; print <- made.w; print <- "x"; print <- made.h; print <- " px in ";
+      print <- made.micros / 1000.; print <- " ms\n";
+    }
+    else {}
+  }
+  if !ok { return 1000000000usize; }
+  cache.push(made);
+  cache.len() - 1usize
+}
+
+// Draw the pixels of the first diagram in the cache that has none yet: one a call, because a frame may record only 16
+// command buffers (and the page's own redraw and the scene take most of them). True if one was drawn.
+pub fn paintOne(painter: &mut Option[Painter], device: &mut Device, cache: &mut List[Diagram]) bool {
+  var i = 0usize;
+  while i < cache.len() {
+    if cache[i].pending {
+      match painter {
+        case let Some(p) {
+          let began = sdl.GetPerformanceCounter();
+          readBack(p, device, &mut cache[i]);
+          cache[i].pending = false;
+          cache[i].canvas = Canvas.make(1., 1.);
+          cache[i].micros = cache[i].micros + micros(began, sdl.GetPerformanceCounter());
+          print <- "mermaid: diagram "; print <- i; print <- " drawn ("; print <- cache[i].w; print <- "x"; print <- cache[i].h; print <- ")\n";
+        }
+        else {}
+      }
+      return true;
+    }
+    i = i + 1usize;
+  }
+  false
+}

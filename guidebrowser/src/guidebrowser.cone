@@ -63,7 +63,7 @@ import json;
 import aio use File, IoLimits;
 import iobuf use IoBuf;
 import iocore use Access;
-import time use Instant, Duration;
+import time use Instant, Duration, Timestamp;
 import httpclient use Timing;
 import actorhttp use HttpClient;
 import keyframetracks use * but Binding;
@@ -71,6 +71,11 @@ import tweenstack use Anim, Animators, Value as AnimValue;
 import input use Input, Context, Binding, Action, AXIS2;
 import controls use Fly, Pose;
 import analyticdaylight use PreethamSky;
+import richtext use Faces, Block, Run, Style, sameStyle, LayoutConfig, layoutRich, emptyLayout, RichLayout, RichRenderer, RichView, ImageInfo, RectP, CaretRect, posAt, caretRect, pos, BK_H1, BK_H2, BK_H3, BK_BULLET, BK_NUMBER, RK_UNDERLINE, GF_SPACE, isContByte, PL_INLINE;
+import msdftext use Font, Atlas, AtlasConfig, DEMO_FONT, TextRenderer, TextStyle, TextHandle, TextLayout, LayoutOptions, layoutText, worldTransform, billboardPlacement, SPACE_WORLD;
+import toml;
+import vector2d use measureText, Canvas, VectorRenderer, Paint, StrokeStyle, VectorPath, CAP_ROUND, JOIN_ROUND, ArrowStyle;
+import diagramlayout use LINK_ARROW, LINK_PLAIN, LINK_DOTTED, LINK_DOTTED_PLAIN, Graph, LayeredOptions, RouteOptions, DiagramStyle, SequenceDiagram, SequenceOptions, layoutLayered, routeEdges, layoutSequence, drawGraph, drawSequence, DIR_LR, FLOW_HORIZONTAL;
 
 // How fast a visitor walks, in meters a second (mine: a brisk walk)
 const WALK_SPEED = 2.;
@@ -97,6 +102,9 @@ fn noView() PartView {
 // that made them, the device after what it made, the instance last.
 struct Shell {
   pub scene: Scene;
+  pub panel: Option[DocPanel];    // '--doc FILE.md': the document panel (docpanel.cone)
+  pub web: Option[WebPanel];      // a web page beside it (webpanel.cone): '--web URL', or an http(s) link followed in the document
+  pub inc: Incubator;              // '--world incubator': the ring, the shelves and the line (incubator.cone)
   pub ready: Receiver[Arrival];   // what the loader has built
   pub arrivedAt: u64;             // when the home world was asked for (performance counter)
   pub activated: u64;             // parts made live so far
@@ -113,11 +121,13 @@ struct Shell {
   pub fresh: bool;                // the frame's input not yet read
   pub visitor: Fly;               // the visitor's eye and which way it looks
   pub readback: Buffer;           // the shot frame's pixels, copied in render, read in present
-  pub target: SurfaceTexture;     // the swapchain's texture the next frame draws into
+  pub xr: XrRig;                  // --xr: the controllers, the rig the visitor stands on, the beams' art (xr.cone); its handles end before the renderer
+  pub target: SurfaceTexture;     // the swapchain's texture the next frame draws into (--xr: the eye's image, swapped in)
   pub fx: ImageFx;                // the image-quality passes round the renderer's frame
   pub post: Post;                 // bloom and the tone map, into the swapchain's texture
   pub renderer: Renderer;
   pub swapchain: SwapChain;
+  pub headset: Headset;           // --xr: the OpenXR session; ends before the device it draws on
   pub device: Device;
   pub adapter: Adapter;
   pub surface: Surface;
@@ -125,6 +135,9 @@ struct Shell {
   pub list: DrawList;
   pub camera: Camera;
   pub light: Light;
+  pub other: Option[DocPanel];    // the panel not shown: the document while a reply is read, or the last reply while the document is
+  pub bridge: Option[Bridge];     // '--bridge DIR': the incubator bridge (bridge.cone)
+  pub format: u32;                // the color format the pictures are drawn in: the swapchain's, or a headset's eye images'
 }
 
 // The world's state: made by start, held by frame's run, and lent to each callback
@@ -134,9 +147,14 @@ struct State {
 
 // From the command line
 var @threadlocal testPart = false;
-var @threadlocal worldArg: *u8 = null;     // '--world NAME': worlds\NAME.ddd, or a URL fetched; home if not given
+var @threadlocal xrOn = false;             // '--xr': drawn into an OpenXR headset (xr.cone); the window, if there is one, mirrors the left eye
+var @threadlocal xrShotsArg: *u8 = null;   // '--xr-shots PREFIX': each eye's picture to PREFIX-left.bmp and PREFIX-right.bmp (and PREFIX-mirror.bmp)
+var @threadlocal xrShotAt = 90;        // '--xr-shot-at N': on headset frame N (the left eye's; the right eye's is the next frame's)
+var @threadlocal configArg: *u8 = null;    // '--config DIR': the incubator's configuration folder (incubator.toml, room.toml)
+var @threadlocal worldArg: *u8 = null;    // '--world NAME': worlds\NAME.ddd, or a URL fetched; home if not given
 var @threadlocal programPath: *u8 = null;  // how the program was started: its worlds folder is found from it
 var @threadlocal shot = false;             // '--shot': the shot frame to build\shot.bmp
+var @threadlocal exitAt = 0;               // '--exit-at N': the program ends normally after frame N (so the exit summary prints)
 var @threadlocal shotAt = 10;              // '--shot-at N': which frame is read back (and shot)
 var @threadlocal show = false;             // '--show': the loader prints the tree and the understood slots
 var @threadlocal approach = 0.;            // '--approach M': meters walked ahead on arriving
@@ -146,39 +164,133 @@ var @threadlocal clicks = 0;
 var @threadlocal clickFrames = Array[i32, 4]() <- fill 0;
 var @threadlocal clickXs = Array[f32, 4]() <- fill 0.;
 var @threadlocal clickYs = Array[f32, 4]() <- fill 0.;
-var @threadlocal tilt = 0.;                // '--tilt D': once arrived, look D degrees further up (down if negative)
+var @threadlocal docArg: *u8 = null;       // '--doc FILE.md': a live document panel in the world (docpanel.cone)
+var @threadlocal shotReload = 0;           // '--shot-after-reload K': the shot is taken 20 frames after the panel's Kth reading (1 is the first)
+var @threadlocal shotDelay = 20;           // '--shot-delay N': frames after that reading ('--shot-after-reload')
+var @threadlocal wheelAt = 0;              // '--wheel Y N': on frame N, a mouse wheel event of Y notches is pushed through SDL's queue
+var @threadlocal wheelY = 0.;
+var @threadlocal wheelX = 0.;              // '--wheel-x X': the same event's sideways notches
+var @threadlocal shotError = false;        // '--shot-on-error': the shot is taken shotDelay frames after the panel shows an error line
+var @threadlocal pressCReload = 0;         // '--press-c-after-reload K': the C key is pushed 40 frames after the panel's Kth reading
+var @threadlocal pressCAt = 0;            // '--press-c N': on frame N, the C key (clear the marks) is pushed through SDL's queue
+var @threadlocal bridgeArg: *u8 = null;    // '--bridge DIR': the incubator bridge's folder (bridge.cone). Return sends the draft, B goes back
+var @threadlocal autoTurns = 0;            // '--auto-turns K': send K test turns, each GAP frames after the last reply (a stand-in for the key)
+var @threadlocal autoGap = 30;             // '--auto-gap F'
+var @threadlocal autoPtt = 0;              // '--auto-ptt F': record at frame F, then (autoPttLen frames later) send: a stand-in for F2 and F3
+var @threadlocal autoPttLen = 800;         // '--auto-ptt-len N'
+var @threadlocal autoSent = 0;
+var @threadlocal autoNext = 120;
+var @threadlocal shotReply = 0;            // '--shot-after-reply K': the shot is taken 30 frames after the Kth reply is shown
+var @threadlocal backAfterShot = false;    // '--back-after-shot': 15 frames after the shot, B is pressed (the document), and a second shot follows 25 frames later
+var @threadlocal pressRetAt = 0;          // '--press-return N': on frame N, the Return key is pushed through SDL's queue
+var @threadlocal pressRetCount = 0;        // '--press-return-after-reply K': the Return key is pushed 20 frames after the Kth reply is shown
+var @threadlocal repliesShown = 0;
+var @threadlocal docScroll = 0.;         // '--doc-scroll PX': where the page starts
+var @threadlocal startYaw = 0.;           // '--yaw D': once arrived, turn D degrees left (right if negative)
+var @threadlocal atSet = false;           // '--at X Z': once arrived, stand at X, Z
+var @threadlocal atX = 0.;
+var @threadlocal atZ = 0.;
+// '--inc-ev KIND ARG FRAME' (up to six): on frame FRAME, KIND 1 selects item ARG, KIND 2 does action ARG on the selection
+var @threadlocal incEvs = 0;
+var @threadlocal incKind = Array[i32, 32]() <- fill 0;
+var @threadlocal incArg = Array[i32, 32]() <- fill 0;
+var @threadlocal incFrame = Array[i32, 32]() <- fill 0;
+// '--inc-ev 20+K N F': page tests: K 0 closes page N, 1 shelves it (or brings it back), 2 starts moving it, 3 drops it, 4 parks the
+// browser's folder, 5 follows the first link of page N as a new page. '--open-page SRC F': on frame F a file or address opens as a page.
+var @threadlocal openPageN = 0;
+var @threadlocal openPageAt = Array[i32, 8]() <- fill 0;
+var @threadlocal openPageSrc = Array[*u8, 8]() <- fill null;
+var @threadlocal shiftHeld = false;       // Shift is down (a click opens a link as a new page)
+var @threadlocal gripUsed = false;        // the grip was held for a click, so releasing it does not open the browser
+var @threadlocal tilt = 0.;               // '--tilt D': once arrived, look D degrees further up (down if negative)
+// The web panel (webpanel.cone). Test flags act on page pixels and need no real mouse or keys.
+var @threadlocal webArg: *u8 = null;      // '--web URL': a web panel opens on this address at the start
+var @threadlocal webClickX = 0.;          // '--web-click PX PY N': on frame N, a click at page pixel PX, PY
+var @threadlocal webClickY = 0.;
+var @threadlocal webClickAt = 0;
+var @threadlocal webWheelY = 0.;          // '--web-wheel NOTCHES N': on frame N, the wheel over the page's middle
+var @threadlocal webWheelAt = 0;
+var @threadlocal webTypeArg: *u8 = null;  // '--web-type TEXT N': on frame N, TEXT typed into the page
+var @threadlocal webTypeAt = 0;
+var @threadlocal webSdlArg: *u8 = null;   // '--web-sdl-type TEXT N': on frame N, TEXT pushed through SDL's queue as a text event
+var @threadlocal webSdlAt = 0;
+var @threadlocal webBackAt = 0;          // '--web-back N': on frame N, back in the web panel
+var @threadlocal webForwardAt = 0;        // '--web-forward N'
+var @threadlocal webLinkArg: *u8 = null;  // '--web-link URL N': on frame N, the document panel follows this link
+var @threadlocal webLinkAt = 0;
 
 // Frames drawn, and the colour at the middle of the window on the shot frame
 var @threadlocal drawn = 0;
+var @threadlocal lastT = 0u64;
+var @threadlocal frameMs = Array[f32, 1024]() <- fill 0.;
+var @threadlocal frameN = 0usize;
+var @threadlocal worstFrom = 31;           // '--worst A B': the worst frame interval from frame A to B is printed on the shot frame
+var @threadlocal worstTo = 1000000;
+var @threadlocal worstMs: f32 = 0.;
+var @threadlocal runTenths = 0;          // '--scroll-run TENTHS A B' (see prepareScene)
+var @threadlocal runFrom = 0;
+var @threadlocal runWeb = false;         // '--scroll-run-web': the web panel (not the document) is the one scrolled when there is no warehouse
+var @threadlocal runTo = 0;
+var @threadlocal worstAt = 0;
 var @threadlocal centre = Array[i32, 3]() <- fill 0;
 
 fn start(host: &mut Host) Option[State] {
-  if !host.hasWindow() {
+  if !host.hasWindow() && !xrOn {
     print <- "The guide browser needs a window\n";
     return None;
   }
-  var instance = Instance.createWindowed("guidebrowser", false);
-  var surface = instance.createSurface(host.window().sdlHandle());
-  var adapter = instance.requestAdapter(&surface, POWER_PREFERENCE_HIGH_PERFORMANCE);
-  if !adapter.isValid() {
-    print <- "No GPU can draw to the window\n";
-    return None;
+  // (declared in this order, they end the other way: the headset before the GPU it draws on, the swapchain before the device, the
+  // instance last)
+  var instance = Instance.none();
+  var surface = Surface.none();
+  var adapter = Adapter.none();
+  var device = Device.none();
+  var swapchain = SwapChain.none();
+  var gpu = HeadsetGpu.none();
+  var headset = Headset.none();
+  var format = 0u32;
+  var winW = 0u32;
+  var winH = 0u32;
+  if xrOn {
+    // --xr: the runtime makes the Vulkan instance and device (xr.cone); the window, if there is one, is the mirror of the left eye
+    headset = openHeadset(host, &mut gpu);
+    if !headset.isValid() { return None; }
+    device <-> gpu.device;
+    adapter <-> gpu.adapter;
+    instance <-> gpu.instance;
+    winW = headset.eyeWidth;
+    winH = headset.eyeHeight;
+    format = headset.colorFormat;
+  } else {
+    instance = Instance.createWindowed("guidebrowser", false);
+    surface = instance.createSurface(host.window().sdlHandle());
+    adapter = instance.requestAdapter(&surface, POWER_PREFERENCE_HIGH_PERFORMANCE);
+    if !adapter.isValid() {
+      print <- "No GPU can draw to the window\n";
+      return None;
+    }
+    print <- "Adapter: "; printStr(adapter.name.view()); print <- "\n";
+    device = adapter.requestDevice();
+    let size = host.window().size();
+    winW = u32.from(size.w);
+    winH = u32.from(size.h);
+    swapchain = device.createSwapChain(&surface, winW, winH, TEXTURE_FORMAT_DEPTH32_FLOAT);
+    format = swapchain.format;
   }
-  print <- "Adapter: "; printStr(adapter.name.view()); print <- "\n";
-  var device = adapter.requestDevice();
-  let size = host.window().size();
-  var swapchain = device.createSwapChain(&surface, u32.from(size.w), u32.from(size.h), TEXTURE_FORMAT_DEPTH32_FLOAT);
   // The scene is drawn in high dynamic range, a half-float frame, which the
   // image-quality passes (ImageFx: temporal anti-aliasing, ambient occlusion,
   // auto-exposure) and the Post (bloom, the tone map) finish into the
   // swapchain's texture; glass and reflections by rays where the GPU has them
   var renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
-  let rays = renderer.setRayTracing(&mut device, true);
-  var post = Post.create(&mut device, swapchain.format, u32.from(size.w), u32.from(size.h));
+  // (a headset's device is the runtime's, made from the create-info the program handed it: it has ray queries only if asked for,
+  // PEGASUS_XR_RT=on; the glass is then the raster glass)
+  let rays = renderer.setRayTracing(&mut device, !xrOn || xrRayTraced());
+  var post = Post.create(&mut device, format, winW, winH);
   if !renderer.isValid() || !post.isValid() {
     print <- "The renderer could not be made\n";
     return None;
   }
+  if docArg != null { post.bloom = 0.; }      // a bright page must not glow over its own text
   var fx = ImageFx.create(&mut device, &renderer, &mut post);
   fx.configure(&FxSettings.high());        // until a world's arrival says how its picture is taken
   print <- "Rendering: high dynamic range, image quality high, "; print <- (if rays { "ray tracing on" } else { "no ray tracing" }); print <- "\n";
@@ -214,14 +326,37 @@ fn start(host: &mut Host) Option[State] {
   publishedTx, publishedRx = Channel[Published].make();
   let arrivedAt = sdl.GetPerformanceCounter();
   let loader = Loader(readyTx);
-  let world = if worldArg == null { String.from("home") } else { String.from(cstr.fromPtr(worldArg).view()) };
+  var panel: Option[DocPanel] = None;
+  if docArg != null {
+    panel = DocPanel.create(&mut device, &mut renderer, format, cstr.fromPtr(docArg).view(), f32.from(docScroll));
+    match &panel { case is None { print <- "The document panel could not be made\n"; } else {} }
+  }
+  var bridge: Option[Bridge] = None;
+  if bridgeArg != null { bridge = Some[Bridge](Bridge.create(cstr.fromPtr(bridgeArg).view(), POINTER_LOG)); }
+  let incWorld = worldArg != null && (libc.strcmp(cstr.fromPtr(worldArg), "incubator") == 0i32 || libc.strcmp(cstr.fromPtr(worldArg), "warehouse") == 0i32);   // 'warehouse' is the old name, kept as an alias
+  let world = if incWorld { String.from("incubator") } else if worldArg == null { String.from(if docArg != null { "doc" } else { "home" }) } else { String.from(cstr.fromPtr(worldArg).view()) };
   loader.arrive(world, worldsFolder(), arrivedAt, testPart, show);
 
-  let target = swapchain.getCurrentTexture(&mut device);
-  Some[State](State(Some[Shell](Shell(Scene.empty(), readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
+  // (a headset's eye images are swapped into the target while an eye is drawn; until then it is a stand-in of the eye's format)
+  let target = if xrOn { standInTarget(&mut device, headset.eyeWidth, headset.eyeHeight, format) } else { swapchain.getCurrentTexture(&mut device) };
+  var inc = Incubator.empty();
+  if incWorld {
+    let cdir = if configArg == null { CFG_DIR_DEFAULT } else { cstr.fromPtr(configArg).view() };
+    let dpath = if docArg == null { "" } else { cstr.fromPtr(docArg).view() };
+    inc = Incubator.create(&mut device, &mut renderer, format, cdir, dpath);
+    inc.prepareBrowser(&mut device, &mut renderer);
+    if startYaw == 0. { startYaw = f64.from(inc.startFacingDeg()); }   // faces the V between the boards (was a fixed 72, which stood 72 degrees off)
+  }
+  // (Jon, 11 Nov: in the headset the laptop is controlled from the start, with a red frame and a palette icon to let go; --desk-no-control keeps it off)
+  if deskOn && inc.on { inc.initDesk(&mut device); if deskControl || (xrOn && !deskNoControl) { inc.deskToggle(); } }
+  var web: Option[WebPanel] = None;
+  if webArg != null { web = WebPanel.create(&mut device, format, cstr.fromPtr(webArg).view()); }
+  var made = Shell(Scene.empty(), panel, web, inc, readyRx, arrivedAt, 0u64, None, publishedTx, publishedRx,
     List[PartView](), 0u64, NO_CLICK, Input(), actions, walk, look, true,
-    Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), target, fx, post, renderer, swapchain, device,
-    adapter, surface, instance, DrawList(), camera, light))))
+    Fly.make(Vec3(0., 1.6, 3.5), 0., 0.), Buffer.none(), XrRig.make(xrOn), target, fx, post, renderer, swapchain, Headset.none(), device,
+    adapter, surface, instance, DrawList(), camera, light, None, bridge, format);
+  made.headset <-> headset;
+  Some[State](State(Some[Shell](made)))
 }
 
 // The window's own events are frame's; a resize is the swapchain's. The
@@ -230,18 +365,113 @@ fn start(host: &mut Host) Option[State] {
 fn event(host: &mut Host, st: &uni State, e: &imm sdl.Event) {
   match &uni st.shell {
     case var &uni Some(some) {
-      if host.window().resized {
+      if host.hasWindow() && host.window().resized {
         host.window().resized = false;
         let size = host.window().size();
-        (*some).swapchain.resize(u32.from(size.w), u32.from(size.h));
-        (*some).post.resize(&mut (*some).device, u32.from(size.w), u32.from(size.h));
+        if (*some).xr.on {
+          (*some).headset.resizeMirror(u32.from(size.w), u32.from(size.h));
+        } else {
+          (*some).swapchain.resize(u32.from(size.w), u32.from(size.h));
+          (*some).post.resize(&mut (*some).device, u32.from(size.w), u32.from(size.h));
+        }
       }
-      (*some).input.handle(e);
+      // While the web page holds the focus its keys and text are the page's, and not the incubator's
+      var eaten = false;
+      if webFocused(&*some) && (e.type == sdl.EVENT_KEY_DOWN || e.type == sdl.EVENT_KEY_UP || e.type == sdl.EVENT_TEXT_INPUT) {
+        eaten = true;
+        webKeys(&mut *some, e);
+      }
+      // a page being edited takes the keys and the text (F2/F3, the voice keys, stay the incubator's)
+      if !eaten && (*some).inc.on && (*some).inc.editActive() {
+        if e.type == sdl.EVENT_TEXT_INPUT {
+          let t = e as &sdl.TextInputEvent;
+          (*some).inc.editTyped(&mut (*some).device, &mut (*some).renderer, cstr.fromPtr(t.text).view());
+          eaten = true;
+        }
+        else if e.type == sdl.EVENT_KEY_DOWN {
+          let ke = e as &sdl.KeyboardEvent;
+          if ke.scancode != KEY_F2 && ke.scancode != KEY_F3 {
+            _ = (*some).inc.editKeyed(&mut (*some).device, &mut (*some).renderer, u32.from(ke.scancode), ke.keymod);
+            eaten = true;
+          }
+        }
+      }
+      if !eaten { (*some).input.handle(e); }
+      if e.type == sdl.EVENT_MOUSE_MOTION {
+        let m = e as &sdl.MouseMotionEvent;
+        let w = host.window().windowSize();
+        webPointer(&mut *some, m.x, m.y, f32.from(w.w), f32.from(w.h));
+        if (*some).inc.on && !(*some).xr.on {
+          let d = mouseRay(&*some, m.x, m.y, f32.from(w.w), f32.from(w.h));
+          (*some).inc.palPoint(0u32, (*some).camera.origin, d);
+        }
+      }
+      if e.type == sdl.EVENT_MOUSE_BUTTON_UP {
+        let b = e as &sdl.MouseButtonEvent;
+        if b.button == sdl.BUTTON_LEFT { webRelease(&mut *some); }
+      }
+      if e.type == sdl.EVENT_MOUSE_WHEEL {
+        let wheel = e as &sdl.MouseWheelEvent;
+        let w = host.window().windowSize();
+        var onDesk = false;
+        var onPage = false;
+        if (*some).inc.on {
+          let ws = host.window().windowSize();
+          if ws.w > 0 && ws.h > 0 {
+            let dir = mouseRay(&*some, wheel.mouse_x, wheel.mouse_y, f32.from(ws.w), f32.from(ws.h));
+            onDesk = (*some).inc.deskWheel((*some).camera.origin, dir, wheel.y);
+            // the page, browser, report or web page under the pointer scrolls (sideways too, on a wide code page)
+            if !onDesk { onPage = (*some).inc.scrollRay((*some).camera.origin, dir, wheel.x, wheel.y, false, &mut (*some).panel); }
+          }
+        }
+        if !onDesk && !onPage && !webWheelOn(&mut *some, wheel.mouse_x, wheel.mouse_y, f32.from(w.w), f32.from(w.h), wheel.y) {
+          match &mut (*some).panel { case var &mut Some(p) { p.scroll(wheel.y); if wheel.x != 0. { p.scrollBy(wheel.x, 0.); } } else {} }
+        }
+      }
+      if e.type == sdl.EVENT_KEY_DOWN || e.type == sdl.EVENT_KEY_UP {
+        let sk = e as &sdl.KeyboardEvent;
+        shiftHeld = (sk.keymod & sdl.KMOD_SHIFT) != 0u16;
+      }
+      if e.type == sdl.EVENT_KEY_DOWN && !eaten {
+        let key = e as &sdl.KeyboardEvent;
+        if key.scancode == sdl.SCANCODE_C && !key.repeat {
+          match &mut (*some).panel { case var &mut Some(p) { p.clearMarks(); } else {} }
+        }
+        if key.scancode == KEY_RETURN && !key.repeat { sendTurn(&mut *some); }
+        // placing a held thing without a controller (desktop stand-ins): [ ] turn 15 degrees, - = pull and push, , . smaller and larger
+        if (*some).inc.on && (*some).inc.holding() {
+          if key.scancode == 47u { (*some).inc.heldTurnSteps(1i32); }
+          if key.scancode == 48u { (*some).inc.heldTurnSteps(-1i32); }
+          if key.scancode == 45u { (*some).inc.heldPush(-2i32); }
+          if key.scancode == 46u { (*some).inc.heldPush(2i32); }
+          if key.scancode == 54u { (*some).inc.heldSize(-10i32); }
+          if key.scancode == 55u { (*some).inc.heldSize(10i32); }
+        }
+        if key.scancode == KEY_F2 && !key.repeat { voiceAct(&mut *some, 1u32, "key F2"); }
+        if key.scancode == KEY_F3 && !key.repeat { voiceAct(&mut *some, 2u32, "key F3"); }
+        if (*some).inc.on && !key.repeat && (*some).inc.sel >= 0 {
+          if key.scancode == KEY_X { whAct(&mut *some, 0u32); }
+          if key.scancode == KEY_B { whAct(&mut *some, 1u32); }
+          if key.scancode == KEY_Z { whAct(&mut *some, if (key.keymod & sdl.KMOD_SHIFT) != 0u16 { 5u32 } else { 2u32 }); }
+          if key.scancode == KEY_O { whAct(&mut *some, 3u32); }
+          if key.scancode == KEY_T { whAct(&mut *some, 4u32); }
+        }
+        if key.scancode == KEY_B && !key.repeat && !(*some).inc.on { toggleBack(&mut *some); }
+        if !key.repeat {
+          let alt = (key.keymod & 0x0300u16) != 0u16;
+          if key.scancode == KEY_LBRACKET || (alt && key.scancode == KEY_LEFT) { browseAct(&mut *some, 6u32); }
+          if key.scancode == KEY_RBRACKET || (alt && key.scancode == KEY_RIGHT) { browseAct(&mut *some, 7u32); }
+          if key.scancode == KEY_F && (*some).inc.on { browseAct(&mut *some, 8u32); }
+          if key.scancode == KEY_L && (*some).inc.on { (*some).inc.deskToggle(); }
+        }
+      }
       if e.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
         let b = e as &sdl.MouseButtonEvent;
         if b.button == sdl.BUTTON_LEFT {
           let w = host.window().windowSize();
-          clickOn(&mut *some, b.x, b.y, f32.from(w.w), f32.from(w.h), host.stats.frames);
+          if !webPress(&mut *some, b.x, b.y, f32.from(w.w), f32.from(w.h)) {
+            clickOn(&mut *some, b.x, b.y, f32.from(w.w), f32.from(w.h), host.stats.frames);
+          }
         }
       }
     }
@@ -249,34 +479,135 @@ fn event(host: &mut Host, st: &uni State, e: &imm sdl.Event) {
   }
 }
 
+// The slot of the nearest part whose drawn surface the ray from 'eye' along 'direction' meets (NO_CLICK if none). A part's box is only
+// the first, cheap test: a ray that enters it is then tested against the part's triangles, so a tall piece's empty box (the air
+// beside a chess queen, say) takes no click meant for a pawn behind it.
+fn nearestPart(parts: &mut List[Live], eye: Vec3, direction: Vec3) u32 {
+  var distance = 0.f;
+  nearestPartAt(parts, eye, direction, &mut distance)
+}
+
+// The same, and how far along the ray (a unit vector) the surface is met (the headset's beam ends there)
+fn nearestPartAt(parts: &mut List[Live], eye: Vec3, direction: Vec3, distance: &mut f32) u32 {
+  var best = 1.0e30f;
+  var hit = NO_CLICK;
+  var k = 0usize;
+  while k < parts.len() {
+    let part = &mut parts[k];
+    let back = part.place.inverse();
+    let ray = Ray3(back * eye, back.transformVector(direction));
+    var enters = false;
+    match ray.intersectAabb(Aabb3(part.low, part.high)) {
+      case let Some(t) { enters = t < best; }
+      case is None {}
+    }
+    if enters {
+      var t = 0usize;
+      while t + 2usize < part.indices.len() {
+        let a = *part.positions[usize.from(*part.indices[t])];
+        let b = *part.positions[usize.from(*part.indices[t + 1usize])];
+        let c = *part.positions[usize.from(*part.indices[t + 2usize])];
+        match ray.intersectTriangle(a, b, c) {
+          case let Some(d) { if d >= 0. && d < best { best = d; hit = part.slot; } }
+          case is None {}
+        }
+        t = t + 3usize;
+      }
+    }
+    k = k + 1usize;
+  }
+  *distance = best;
+  hit
+}
+
+// --check-pick: a click on a piece behind another's bounding box picks the right one (no window, no GPU)
+fn checkPick() bool {
+  var parts = List[Live]();
+  // A: a thin triangle in z = 0 covering the lower left of its 4 x 4 box (x + y <= 4). B: a square at z = -2 around (3, 3).
+  var pa = List[Vec3]();
+  pa.push(Vec3(0., 0., 0.)); pa.push(Vec3(4., 0., 0.)); pa.push(Vec3(0., 4., 0.));
+  var ia = List[u32]();
+  ia.push(0u32); ia.push(1u32); ia.push(2u32);
+  parts.push(Live(1u32, String.from("front piece"), MeshHandle.none(), MaterialHandle.none(), Vec3(0., 0., 0.), Vec3(4., 4., 0.01),
+    Mat4.identity(), pa, ia));
+  var pb = List[Vec3]();
+  pb.push(Vec3(2.5, 2.5, 0. - 2.)); pb.push(Vec3(3.5, 2.5, 0. - 2.)); pb.push(Vec3(3.5, 3.5, 0. - 2.)); pb.push(Vec3(2.5, 3.5, 0. - 2.));
+  var ib = List[u32]();
+  ib.push(0u32); ib.push(1u32); ib.push(2u32); ib.push(0u32); ib.push(2u32); ib.push(3u32);
+  parts.push(Live(2u32, String.from("piece behind"), MeshHandle.none(), MaterialHandle.none(), Vec3(2.5, 2.5, 0. - 2.01), Vec3(3.5, 3.5, 0. - 1.99),
+    Mat4.identity(), pb, ib));
+  var ok = true;
+  let down = Vec3(0., 0., 0. - 1.);
+  let through = nearestPart(&mut parts, Vec3(3., 3., 5.), down);
+  print <- "check-pick: through the front piece's empty box corner, the piece behind: "; print <- through; print <- if through == 2u32 { " ok\n" } else { " WRONG\n" };
+  ok = ok && through == 2u32;
+  let onFront = nearestPart(&mut parts, Vec3(1., 1., 5.), down);
+  print <- "check-pick: through the front piece's own triangle, the front piece: "; print <- onFront; print <- if onFront == 1u32 { " ok\n" } else { " WRONG\n" };
+  ok = ok && onFront == 1u32;
+  let missed = nearestPart(&mut parts, Vec3(3.5, 0.8, 5.), down);
+  print <- "check-pick: through the box corner above both, nothing: "; print <- missed; print <- if missed == NO_CLICK { " ok\n" } else { " WRONG\n" };
+  ok = ok && missed == NO_CLICK;
+  ok
+}
+
 // The part drawn under (x, y), in the window's units, clicked: the nearest
-// whose box the ray from the eye through that point meets
+// whose triangles the ray from the eye through that point meets
 fn clickOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, frame: u64) {
   let tw = f32.from(s.target.texture.width);
   let th = f32.from(s.target.texture.height);
   if w <= 0. || h <= 0. || th <= 0. { return; }
+  clickRay(s, s.camera.origin, mouseRay(s, x, y, w, h), x, y, false, frame);
+}
+
+// The direction of the ray from the eye through the point x, y of the window (w x h, the window's units)
+fn mouseRay(s: &Shell, x: f32, y: f32, w: f32, h: f32) Vec3 {
+  let tw = f32.from(s.target.texture.width);
+  let th = f32.from(s.target.texture.height);
   let inverse = (s.camera.projectionMatrix(tw / th) * s.camera.viewMatrix()).inverse();
   let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
-  let eye = s.camera.origin;
-  let direction = (p.xyz() * (1. / p.w) - eye).normalize();
-  var best = 1.0e30f;
-  var hit = NO_CLICK;
-  var k = 0usize;
-  while k < s.scene.parts.len() {
-    let part = &s.scene.parts[k];
-    let back = part.place.inverse();
-    let ray = Ray3(back * eye, back.transformVector(direction));
-    match ray.intersectAabb(Aabb3(part.low, part.high)) {
-      case let Some(t) { if t < best { best = t; hit = part.slot; } }
-      case is None {}
-    }
-    k = k + 1usize;
+  (p.xyz() * (1. / p.w) - s.camera.origin).normalize()
+}
+
+// A click along a ray from 'eye': the mouse's (through the point x, y of the window) or a controller's beam (xr.cone, 'beam' true).
+// A chip, a card, a page, else the part the ray meets.
+fn clickRay(s: &mut Shell, eye: Vec3, direction: Vec3, x: f32, y: f32, beam: bool, frame: u64) {
+  var onPanel = false;
+  if s.inc.on {
+    if s.inc.palClick(&mut s.device, eye, direction, &s.visitor) { return; }
+    if kbClick(&mut s.inc, eye, direction) { return; }
+    // (a headset's trigger waits to see how long it is held: a left click on a quick release, a right click on a hold; the mouse clicks at once)
+    if (if beam { deskPressRay(&mut s.inc, eye, direction) } else { s.inc.deskClick(eye, direction) }) { return; }
+    // (a hand's beam starts at the hand; the chips stand for the head)
+    if s.inc.clickChip(eye, direction, &s.visitor, if beam { s.visitor.position } else { eye }) { return; }
+    if s.inc.clickApp(eye, direction) { return; }
+    // Shift on the desktop, the grip in a headset: a link clicked opens a new page
+    let gripOn = false;
+    if s.inc.clickPages(&mut s.device, eye, direction, if beam { s.visitor.position } else { eye }, shiftHeld || gripOn) { return; }
+    if s.inc.clickCard(eye, direction) { return; }
+    let inv = s.inc.pageModel().inverse();
+    let le = inv * eye;
+    let ld = inv.transformVector(direction);
+    match &mut s.panel { case var &mut Some(p) { p.openNew = shiftHeld || gripOn; onPanel = p.click(le, ld); } else {} }
+    chipAction(s);
+    if onPanel { s.inc.selectPage(); return; }
   }
-  print <- "loop: frame "; print <- frame; print <- ", a click at ("; print <- x; print <- ", "; print <- y; print <- "): ";
-  if hit == NO_CLICK { print <- "nothing\n"; return; }
+  else {
+    match &mut s.panel { case var &mut Some(p) { onPanel = p.click(eye, direction); } else {} }
+    chipAction(s);
+    if onPanel { return; }
+  }
+  let hit = nearestPart(&mut s.scene.parts, eye, direction);
+  var k = 0usize;
+  print <- "loop: frame "; print <- frame;
+  if beam { print <- ", a click by a controller's beam: "; }
+  else { print <- ", a click at ("; print <- x; print <- ", "; print <- y; print <- "): "; }
+  if hit == NO_CLICK { print <- "nothing\n"; if s.inc.on { s.inc.select(-1); } return; }
   k = 0usize;
   while k < s.scene.parts.len() {
-    if s.scene.parts[k].slot == hit { printStr(s.scene.parts[k].name.view()); }
+    if s.scene.parts[k].slot == hit {
+      printStr(s.scene.parts[k].name.view());
+      if s.inc.on { s.inc.selectSlot(&s.scene.parts, k); }
+    }
     k = k + 1usize;
   }
   print <- "\n";
@@ -301,6 +632,7 @@ fn stepWorld(s: &mut Shell, step: &Step) {
   }
   // Walking stays level: ahead is where the visitor faces, flattened
   let m = s.actions.axis2(s.walk);
+  s.inc.glideStep(&mut s.visitor, step.dt);
   if m.x != 0. || m.y != 0. {
     let yaw = s.visitor.yaw;
     let ahead = Vec3(0. - sin(yaw), 0., 0. - cos(yaw));
@@ -394,7 +726,13 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
         if look.covers < 1. { plain = plain.translucent(look.covers); }
         material = s.renderer.addMaterial(&mut s.device, &plain);
       }
-      s.scene.parts.push(Live(p.built.slot, p.built.name.clone(), mesh, material, p.built.low, p.built.high, p.built.place));
+      var ps = List[Vec3].withCapacity(p.built.mesh.positions.len());
+      var pi = 0usize;
+      while pi < p.built.mesh.positions.len() { ps.push(*p.built.mesh.positions[pi]); pi = pi + 1usize; }
+      var ix = List[u32].withCapacity(p.built.mesh.indices.len());
+      pi = 0usize;
+      while pi < p.built.mesh.indices.len() { ix.push(*p.built.mesh.indices[pi]); pi = pi + 1usize; }
+      s.scene.parts.push(Live(p.built.slot, p.built.name.clone(), mesh, material, p.built.low, p.built.high, p.built.place, ps, ix));
       s.activated = s.activated + 1u64;
       print <- "loop: frame "; print <- frame; print <- ", "; printStr(p.built.name.view());
       print <- " live: mesh and material to the GPU in "; print <- micros(began, sdl.GetPerformanceCounter()); print <- " us\n";
@@ -439,7 +777,8 @@ fn take(s: &mut Shell, a: Arrival, frame: u64) {
       s.fx.configure(&settings);
       let level = Vec3(f.x, 0., f.z);
       if approach != 0. && level.length() > 0. { eye = eye + level.normalize() * f32.from(approach); }
-      s.visitor = Fly.make(eye, atan2(0. - f.x, 0. - f.z), asin(f.y) + f32.from(tilt) * 0.0174533);
+      if atSet { eye = Vec3(f32.from(atX), eye.y, f32.from(atZ)); }
+      s.visitor = Fly.make(eye, atan2(0. - f.x, 0. - f.z) + f32.from(startYaw) * 0.0174533, asin(f.y) + f32.from(tilt) * 0.0174533);
     }
     case var &mut Behaviors(b) {
       var program = Program(List[SlotFrame](), List[FieldRt](), List[AreaRt](),
@@ -495,13 +834,397 @@ fn takePublished(s: &mut Shell) {
 // Record the frame: every live part, where the World last put it
 fn draw(host: &mut Host, st: &uni State, alpha: f32, scratch: &mut Arena) {
   match &uni st.shell {
-    case var &uni Some(some) { drawScene(&mut *some, alpha); }
+    case var &uni Some(some) {
+      if (*some).xr.on {
+        if !drawXr(&mut *some, alpha) { host.stop(); }      // the headset's session is over: so is the run
+      } else {
+        drawScene(&mut *some, alpha);
+      }
+    }
     else {}
+  }
+}
+
+// ---- the incubator bridge (bridge.cone) ----
+const KEY_RETURN = 40u;      // SDL scancodes (the sdl binding names only some)
+const KEY_B = 5u;
+const KEY_O = 18u;
+const KEY_T = 23u;
+const KEY_Z = 29u;
+const KEY_F = 9u;
+const KEY_L = 15u;           // control of the laptop from the desk panel, on or off
+const KEY_LBRACKET = 47u;
+const KEY_RBRACKET = 48u;
+const KEY_RIGHT = 79u;
+const KEY_LEFT = 80u;
+const KEY_X = 27u;           // shelve (S would stop the walk backward)
+
+// An action on the selected project (S, B, Z, O, T and the chips): 0 shelve, 1 bring, 2 zoom, 3 open, 4 talk
+fn whAct(s: &mut Shell, a: u32) {
+  if a >= 6u32 { browseAct(s, a); return; }
+  if !s.inc.act(a, &s.visitor) { return; }
+  if a == 4u32 {
+    print <- "incubator: talk about the page: write the words in draft.txt and press Return\n";
+    match &mut s.panel { case var &mut Some(p) { p.setNote("Talking about this page: write draft.txt, then press Return"); } else {} }
+  }
+}
+
+// Browsing: 6 back and 7 forward in the document panel's history, 8 the file browser (put away if it is out)
+fn browseAct(s: &mut Shell, a: u32) {
+  if a == 6u32 { match &mut s.panel { case var &mut Some(p) { p.requestNav(-1i32); } else {} } }
+  if a == 7u32 { match &mut s.panel { case var &mut Some(p) { p.requestNav(1i32); } else {} } }
+  if a == 8u32 { s.inc.toggleBrowser("", s.visitor.position, s.visitor.yaw); }
+}
+
+// The file browser and the document panel hand each other work: a folder asked for, a file chosen, the history to list
+fn whBrowse(s: &mut Shell) {
+  var dir = String();
+  match &mut s.panel {
+    case var &mut Some(p) { if p.outBrowse.len() > 0usize { dir = String.from(p.outBrowse.view()); p.outBrowse = String(); } }
+    else {}
+  }
+  if dir.len() > 0usize { s.inc.toggleBrowser(dir.view(), s.visitor.position, s.visitor.yaw); }
+  if s.inc.browserIsOpen() {
+    var hf = List[String]();
+    var ser = 0u32;
+    match &s.panel { case let Some(p) { hf = p.historyFiles(); ser = p.histSerial; } else {} }
+    let open = s.inc.syncBrowser(&mut s.device, &mut s.renderer, &hf, ser);
+    if open.len() > 0usize { s.inc.wantPage(open.view()); }
+  }
+}
+
+const KEY_F2 = 59u;
+const KEY_F3 = 60u;
+
+// Push to talk: 1 record / pause (F2), 2 send (F3: waits for the recording to be transcribed), 3 clear the draft
+fn voiceAct(s: &mut Shell, a: u32, source: &str) {
+  print <- "voice: act "; print <- a; print <- " ("; printStr(if a == 1u32 { "record/pause" } else if a == 2u32 { "send" } else { "clear" }); print <- ") from "; printStr(source); print <- "\n";
+  match &s.bridge { case let Some(b0) {} case is None { print <- "voice: no bridge (--bridge): nothing happens\n"; } }
+  // dictate mode: A records into the page, and B (send) is not Penny's
+  if (a == 2u32 || a == 3u32) && s.inc.on && s.inc.dictating() { print <- "bridge: send ignored (dictate mode)\n"; return; }
+  match &mut s.bridge {
+    case var &mut Some(b) {
+      if a == 1u32 { b.toggleRecord(); print <- "bridge: "; print <- (if b.recording { "recording (rec.flag written)" } else { "paused (rec.flag removed)" }); print <- "\n"; }
+      if a == 2u32 { b.requestSend(); print <- "bridge: send asked for\n"; }
+      if a == 3u32 { b.clearDraft(); print <- "bridge: draft cleared\n"; }
+    }
+    else {}
+  }
+}
+
+// A click on one of the note strip's chips (docpanel sets chipHit)
+fn chipAction(s: &mut Shell) {
+  var hit = 0u32;
+  match &mut s.panel { case var &mut Some(p) { hit = p.chipHit; p.chipHit = 0u32; } else {} }
+  if hit > 0u32 { voiceAct(s, hit, "note chip"); }
+}
+
+// Return: the draft goes as the next turn
+fn sendTurn(s: &mut Shell) {
+  var one = String();
+  var two = String();
+  match &s.panel { case let Some(p) { one = p.describe(true); } else {} }
+  match &s.other { case let Some(p) { two = p.describe(false); } else {} }
+  var docs = String.from("[");
+  docs.append(one.view());
+  if one.len() > 0usize && two.len() > 0usize { docs.append(", "); }
+  docs.append(two.view());
+  docs.append("]");
+  var sent = 0u32;
+  let dv = docs.view();
+  match &mut s.bridge {
+    case var &mut Some(b) { if b.send(dv) { sent = b.turn; } }
+    else { print <- "bridge: not started (give --bridge DIR)\n"; }
+  }
+  if sent > 0u32 {
+    var note = String.from("Sent turn ");
+    note.append(numText(i64.from(sent)).view());
+    note.append(". Waiting for the reply...");
+    let noteView = note.view();
+    match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); } else {} }
+  }
+  else {
+    // (said on the note strip, not only in the log: B with nothing heard looked like B doing nothing)
+    var hasBridge = false;
+    match &s.bridge { case let Some(b) { hasBridge = true; } else {} }
+    if hasBridge {
+      match &mut s.panel { case var &mut Some(p) { p.setNote("Nothing to send: no words in the draft (was anything heard?)"); } else {} }
+    }
+  }
+}
+
+// A reply has come: read it as a panel of its own. The document goes behind it (B brings it back).
+fn showReply(s: &mut Shell, n: u32, isNote: bool) {
+  var summary = String();
+  var path = String();
+  var showing = false;
+  match &s.bridge {
+    case let Some(b) {
+      if isNote { summary = b.noteSummary(n); path = b.notePath(n, ".md"); }
+      else { summary = b.summary(n); path = b.replyPath(n, ".md"); }
+      showing = b.showingReply;
+    }
+    else { return; }
+  }
+  s.device.waitIdle();
+  // The reply panel is made once and reopened on each later reply (making one loads the fonts, about 2 s)
+  let pv = path.view();
+  if showing {
+    match &mut s.panel { case var &mut Some(p) { p.open(&mut s.device, &mut s.renderer, pv); } else {} }
+  }
+  else {
+    var have = false;
+    match &s.other { case let Some(o) { have = true; } else {} }
+    if have {
+      match &mut s.other { case var &mut Some(p) { p.open(&mut s.device, &mut s.renderer, pv); } else {} }
+      s.panel <-> s.other;
+    }
+    else {
+      s.panel <-> s.other;
+      s.panel = DocPanel.create(&mut s.device, &mut s.renderer, s.format, pv, 0.);
+    }
+  }
+  var note = String();
+  if isNote { note.append("Note "); note.append(numText(i64.from(n)).view()); note.append(": "); }
+  if summary.len() > 0usize { note.append(summary.view()); } else if !isNote { note.append("Reply "); note.append(numText(i64.from(n)).view()); }
+  note.append("   [B: back to the document]");
+  let noteView = note.view();
+  match &mut s.panel { case var &mut Some(p) { p.setNote(noteView); p.tick(&mut s.device, &mut s.renderer); } else {} }
+  match &mut s.other { case var &mut Some(p) { p.setNote(""); } else {} }
+  var took = 0i64;
+  match &mut s.bridge {
+    case var &mut Some(b) { b.showingReply = true; if isNote { b.noteShown = n; } else { b.shown = n; } took = unixMs() - b.sentMs; }
+    else {}
+  }
+  if isNote { print <- "bridge: note "; print <- n; print <- " on screen at "; print <- unixMs(); print <- " ms\n"; return; }
+  repliesShown = repliesShown + 1;
+  print <- "bridge: reply "; print <- n; print <- " on screen at "; print <- unixMs(); print <- " ms, "; print <- took; print <- " ms after the turn was sent\n";
+}
+
+// B: back to the document being read (and again to the reply)
+fn toggleBack(s: &mut Shell) {
+  var have = false;
+  match &s.other { case let Some(o) { have = true; } else {} }
+  if !have { return; }
+  var showing = false;
+  match &s.bridge { case let Some(b) { showing = b.showingReply; } else {} }
+  s.panel <-> s.other;
+  match &mut s.bridge { case var &mut Some(b) { b.showingReply = !showing; } else {} }
+  print <- "bridge: showing the "; print <- (if showing { "document" } else { "reply" }); print <- "\n";
+}
+
+fn bridgeTick(s: &mut Shell) {
+  // the room's lines (a project moved) go to the session; a say: chip is a turn; a link: chip opens in the page
+  if s.inc.on {
+    let lines = s.inc.takeLines();
+    var li = 0usize;
+    while li < lines.len() {
+      print <- "incubator: bridge line: "; printStr(lines[li].view()); print <- "\n";
+      let lineTxt = lines[li].clone();
+      let lineView = lineTxt.view();
+      match &mut s.bridge { case var &mut Some(b) { b.postLine(lineView); } else {} }
+      li = li + 1usize;
+    }
+    let vw = s.inc.takeVoice();
+    if vw > 0u32 { voiceAct(s, vw, "palette"); }
+    match &s.bridge { case let Some(b) { palRec = b.recording; } case is None { palRec = false; } }
+    let say = s.inc.takeSay();
+    if say.len() > 0usize {
+      var bdir = String();
+      match &s.bridge { case let Some(b) { bdir = String.from(b.dir.view()); } else {} }
+      if bdir.len() > 0usize { writeAtomic(bdir.view(), "draft.txt", say.view()); sendTurn(s); } else { print <- "incubator: say: needs --bridge\n"; }
+    }
+    let link = s.inc.takeLink();
+    if link.len() > 0usize {
+      let linkView = link.view();
+      match &mut s.panel { case var &mut Some(p) { p.go(&mut s.device, &mut s.renderer, linkView, ""); } else {} }
+    }
+  }
+  // dictate mode (the page editor): the flag for studiovoice, and what it transcribed goes to the page's caret
+  if s.inc.on {
+    let df = s.inc.takeDictFlag();
+    if df > 0u32 {
+      let tgt = s.inc.dictTarget();
+      match &mut s.bridge { case var &mut Some(b) { b.setDictate(df == 1u32, tgt); } else { print <- "dictate: needs --bridge for the voice\n"; } }
+    }
+    if s.inc.dictating() {
+      var got = String();
+      match &mut s.bridge { case var &mut Some(b) { got = b.takeDictation(); } else {} }
+      if got.len() > 0usize { s.inc.dictated(&mut s.device, &mut s.renderer, got.view()); }
+    }
+  }
+  var n = 0u32;
+  var noteN = 0u32;
+  var pending = false;
+  var voiceSend = false;
+  var draftNow = String();
+  var draftMoved = false;
+  match &mut s.bridge {
+    case var &mut Some(b) {
+      n = b.poll(); pending = b.pending(); noteN = b.noteReady; b.noteReady = 0u32;
+      voiceSend = b.voiceSend; b.voiceSend = false;
+      draftMoved = b.draftChanged; b.draftChanged = false; draftNow = String.from(b.draftNote.view());
+    }
+    else { return; }
+  }
+  // the voice process: its send word works like Return, and the draft as it grows shows on the note strip
+  if voiceSend { sendTurn(s); }
+  // the note strip's status line (push to talk): changes only when its text does, so a reply's own note is not trampled
+  var status = String();
+  var rec = false;
+  var busyNow = false;
+  var pend = false;
+  var turnNo = 0u32;
+  var dn = String();
+  var seen = String();
+  var have = false;
+  var sendWait = false;
+  match &s.bridge {
+    case let Some(b) {
+      have = true;
+      rec = b.recording; busyNow = b.busy; pend = b.pending(); turnNo = b.turn; sendWait = b.sendWaiting();
+      dn = String.from(b.draftNote.view());
+      seen = String.from(b.statusSeen.view());
+    }
+    else {}
+  }
+  if pend { status.append("Sent turn "); status.append(numText(i64.from(turnNo)).view()); status.append(". Waiting for the reply...   "); }
+  if rec { status.append("RECORDING - A pauses, B sends"); }
+  else if sendWait { status.append("Sending... (writing down what you said, then the turn goes)"); }
+  else if busyNow { status.append("Transcribing..."); }
+  else { status.append("F2 record, F3 send"); }
+  if hasWord(dn.view()) {
+    status.append("   |   Draft: ");
+    if dn.len() > 160usize { status.append(dn.sub(dn.len() - 160usize, dn.len()).view()); } else { status.append(dn.view()); }
+  }
+  if have && seen.view() != status.view() {
+    var ns = String.from(status.view());
+    match &mut s.bridge { case var &mut Some(b) { b.statusSeen <-> ns; } else {} }
+    let sv = status.view();
+    print <- "bridge: note strip: "; printStr(sv); print <- "\n";
+    match &mut s.panel { case var &mut Some(p) { p.setNote(sv); } else {} }
+  }
+  match &mut s.panel { case var &mut Some(p) { p.setRec(rec); } else {} }
+  match &mut s.other { case var &mut Some(p) { p.setRec(rec); } else {} }
+  if backAfterShot && shotAt > 0 && drawn == shotAt + 15 { backAfterShot = false; toggleBack(s); shotAt = drawn + 25; }
+  if autoPtt > 0 && i32.from(drawn) == autoPtt { voiceAct(s, 1u32, "auto"); }
+  if autoPtt > 0 && i32.from(drawn) == autoPtt + autoPttLen { voiceAct(s, 2u32, "auto"); }
+  if n > 0u32 { showReply(s, n, false); autoNext = drawn + autoGap; return; }
+  if noteN > 0u32 { showReply(s, noteN, true); return; }
+  if autoSent < autoTurns && !pending && drawn >= autoNext {
+    autoSent = autoSent + 1;
+    var folder = String();
+    match &s.bridge { case let Some(b) { folder = String.from(b.dir.view()); } else {} }
+    var text = String.from("Automated test turn ");
+    text.append(numText(i64.from(autoSent)).view());
+    text.append(": please reply.");
+    writeAtomic(folder.view(), "draft.txt", text.view());
+    sendTurn(s);
   }
 }
 
 fn drawScene(s: &mut Shell, alpha: f32) {
   if !s.target.ok() { return; }
+  prepareScene(s, alpha);
+  drawDesktop(s);
+}
+
+// Everything a frame needs before a picture is taken: the panels ticked, the incubator updated, the visitor's pose (the camera's
+// origin and orientation) and the draw list. The window's frame (drawDesktop) and each of a headset's eyes (xr.cone) draw from it.
+fn prepareScene(s: &mut Shell, alpha: f32) {
+  upNewFrame();
+  traceFrame = drawn;
+  match &mut s.panel { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); p.openNew = false; } else {} }
+  match &mut s.other { case var &mut Some(p) { p.tick(&mut s.device, &mut s.renderer); } else {} }
+  webFrameTick(s);
+  bridgeTick(s);
+  if shotReply > 0 && repliesShown == shotReply && shotAt == 0 { shotAt = drawn + 30; }
+  if pressRetCount > 0 && repliesShown == pressRetCount && pressRetAt == 0 { pressRetAt = drawn + 20; }
+  if shotReload > 0 {
+    match &s.panel { case let Some(p) { if i32.from(p.reloads) == shotReload && shotAt == 0 { shotAt = drawn + shotDelay; } } else {} }
+  }
+  if shotError {
+    match &s.panel { case let Some(p) { if p.err.len() > 0usize && shotAt == 0 { shotAt = drawn + shotDelay; } } else {} }
+  }
+  if pressCReload > 0 {
+    match &s.panel { case let Some(p) { if i32.from(p.reloads) == pressCReload && pressCAt == 0 { pressCAt = drawn + 40; } } else {} }
+  }
+  // (without the incubator: the same scroll goes to the document panel, or the web panel with '--scroll-run-web')
+  if !s.inc.on && runTenths != 0 && drawn >= runFrom && drawn < runTo {
+    let amount = f32.from(runTenths) * 0.1;
+    if runWeb {
+      match &mut s.web { case var &mut Some(wp) { wp.wheel(i32.from(WEB_TEX_W / 2u32), i32.from(WEB_TEX_H / 2u32), amount); } else {} }
+    } else {
+      match &mut s.panel { case var &mut Some(p) { p.scrollBy(0., amount); } else {} }
+    }
+  }
+  if s.inc.on {
+    s.renderer.keepDepth = true;      // the labels hide behind what stands in front of them
+    // where the visitor looks (a page being moved follows it)
+    if s.xr.on { s.inc.setGaze(s.xr.head, s.xr.headForward); }
+    else { let gp = s.visitor.pose(); s.inc.setGaze(gp.origin, gp.orientation * Vec3(0., 0., -1.)); }
+    s.inc.update(&mut s.device, &mut s.renderer);
+    // a file or address wanted as a page: the browser's choice, a link of the main page, or a test flag
+    var pw = s.inc.takePageWant();
+    var pf = 0;
+    while pf < openPageN { if drawn == openPageAt[usize.from(pf)] { pw = String.from(cstr.fromPtr(openPageSrc[usize.from(pf)]).view()); } pf = pf + 1; }
+    if pw.len() > 0usize { s.inc.openPage(&mut s.device, &mut s.renderer, pw.view()); }
+    if deskProbe && drawn == 90 { s.inc.deskProbe(); }
+    let nav = s.inc.takeNav();
+    if nav != 0u32 { browseAct(s, nav); }
+    whBrowse(s);
+    // '--scroll-run TENTHS A B': on each frame from A up to B the view's middle scrolls TENTHS tenths of a notch (up the page), as a stick held over does
+    if runTenths != 0 && drawn >= runFrom && drawn < runTo {
+      let fwd = s.camera.orientation * Vec3(0., 0., -1.);
+      let took = s.inc.scrollRay(s.camera.origin, fwd, 0., f32.from(runTenths) * 0.1, false, &mut s.panel);
+      if !took && drawn == runFrom { print <- "scroll-run: nothing under the view's middle\n"; }
+    }
+    var e = 0;
+    while e < incEvs {
+      if drawn == incFrame[usize.from(e)] {
+        if incKind[usize.from(e)] == 1 { s.inc.select(incArg[usize.from(e)]); }
+        else if incKind[usize.from(e)] == 3 { s.inc.openCard(incArg[usize.from(e)]); }
+        else if incKind[usize.from(e)] == 4 {
+          match &mut s.panel { case var &mut Some(p) { p.requestNth(usize.from(incArg[usize.from(e)])); } else {} }
+        }
+        else if incKind[usize.from(e)] == 7 { s.inc.menuNth(usize.from(incArg[usize.from(e)]), &s.visitor); }
+        else if incKind[usize.from(e)] == 8 {
+          // test hook: walk N tenths of a meter along the view (as the stick does), to look at something close
+          let fw = s.camera.orientation * Vec3(0., 0., -1.);
+          let lv = Vec3(fw.x, 0., fw.z);
+          if lv.length() > 0.01 { s.visitor.position = s.visitor.position + lv.normalize() * (f32.from(incArg[usize.from(e)]) * 0.1); }
+        }
+        else if incKind[usize.from(e)] == 9 { s.visitor.yaw = s.visitor.yaw + f32.from(incArg[usize.from(e)]) * 0.0174533; }   // test hook: turn N degrees (left positive)
+        else if incKind[usize.from(e)] == 10 { s.visitor.pitch = s.visitor.pitch + f32.from(incArg[usize.from(e)]) * 0.0174533; }   // test hook: look up N degrees (the held thing's height follows the beam)
+        else if incKind[usize.from(e)] == 5 { browseAct(s, u32.from(incArg[usize.from(e)])); }
+        else if incKind[usize.from(e)] == 6 { s.inc.browserLink(usize.from(incArg[usize.from(e)])); }
+        else if incKind[usize.from(e)] >= 40 && incKind[usize.from(e)] < 50 {
+          // palette test hooks: 40 hover button N, 41 click button N (a ray from the eye to it), 42 lift, 43 dock (N >= 1000: a root icon)
+          let kk = incKind[usize.from(e)];
+          if kk == 42 { s.inc.palLift(); }
+          else if kk == 43 { s.inc.palDock(); }
+          else if kk == 44 || kk == 45 {
+            // scroll test hooks: what the view's middle looks at scrolls by N tenths of a notch (44 up the page, 45 to the right), as the stick does
+            let fwd = s.camera.orientation * Vec3(0., 0., -1.);
+            let amount = f32.from(incArg[usize.from(e)]) * 0.1;
+            let took = s.inc.scrollRay(s.camera.origin, fwd, if kk == 45 { amount } else { 0. }, if kk == 44 { amount } else { 0. }, false, &mut s.panel);
+            print <- "scroll: "; print <- (if kk == 45 { "sideways " } else { "vertical " }); print <- amount; print <- if took { " taken\n" } else { " nothing under the view's middle\n" };
+          }
+          else {
+            let sp = s.inc.palSpot(u32.from(incArg[usize.from(e)]), s.camera.origin);
+            if sp.w > 0.5 {
+              let d = (Vec3(sp.x, sp.y, sp.z) - s.camera.origin).normalize();
+              if kk == 40 { s.inc.palPoint(0u32, s.camera.origin, d); }
+              else { clickRay(s, s.camera.origin, d, 0., 0., false, u64.from(drawn)); }
+            } else { print <- "palette: no button "; print <- incArg[usize.from(e)]; print <- "\n"; }
+          }
+        }
+        else if incKind[usize.from(e)] >= 20 { s.inc.actPage(&mut s.device, incKind[usize.from(e)] - 20, incArg[usize.from(e)]); }
+        else { whAct(s, u32.from(incArg[usize.from(e)])); }
+      }
+      e = e + 1;
+    }
+  }
   // The visitor's view, as late as it can be
   let pose = s.visitor.pose();
   s.camera.origin = pose.origin;
@@ -525,12 +1248,71 @@ fn drawScene(s: &mut Shell, alpha: f32) {
         Vec3(1., 1., 1.));
       tint = v.tint;
     }
-    s.list.addTinted(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place, Color(tint, tint, tint, 1.));
+    var glowR = tint; var glowG = tint; var glowB = tint;
+    if s.inc.on {
+      match s.inc.placeOf(&s.scene.parts, k) {
+        case let Some(m) { (&mut s.scene.parts[k]).place = m; }
+        case is None {}
+      }
+      if s.inc.isSelectedPart(&s.scene.parts, k) { glowR = tint * 1.45; glowG = tint * 1.2; glowB = tint * 0.8; }
+    }
+    s.list.addTinted(s.scene.parts[k].mesh, s.scene.parts[k].material, s.scene.parts[k].place, Color(glowR, glowG, glowB, 1.));
     k = k + 1usize;
   }
+  if s.inc.on { s.inc.collectAw(&mut s.list, s.camera.origin); }
+}
+
+fn drawDesktop(s: &mut Shell) {
+  s.inc.eyeIx = 0u32;
   var encoder = s.device.createCommandEncoder();
   s.fx.render(&mut s.device, &mut encoder, &mut s.renderer, &mut s.post, &s.camera, &s.light, &s.list, &s.target.texture);
+  // The document page goes on top of the finished picture, unlit (docpanel.cone, PagePass)
+  let aspect = f32.from(s.target.texture.width) / f32.from(s.target.texture.height);
+  if s.inc.on {
+    s.inc.draw(&mut s.device, &mut encoder, &s.target.texture, &s.fx.depth,
+      s.camera.projectionMatrix(aspect) * s.camera.viewMatrix(), s.camera.origin, &mut s.panel);
+  }
+  else {
+    match &mut s.panel {
+      case var &mut Some(p) {
+        p.drawPage(&mut s.device, &mut encoder, &s.target.texture, s.camera.projectionMatrix(aspect) * s.camera.viewMatrix());
+      }
+      else {}
+    }
+  }
+  match &mut s.web {
+    case var &mut Some(wp) {
+      var vp = s.camera.projectionMatrix(aspect) * s.camera.viewMatrix();
+      if s.inc.on { vp = vp * s.inc.pageModel(); }
+      wp.drawPage(&mut s.device, &mut encoder, &s.target.texture, vp);
+    }
+    else {}
+  }
   drawn = drawn + 1;
+  // the interval between frames, for the p50 and p95 printed on the shot frame
+  let nowT = sdl.GetPerformanceCounter();
+  if lastT != 0u64 && drawn > 30 && frameN < 1024usize { frameMs[frameN] = f32.from(f64.from((nowT - lastT) * 1000000u64 / sdl.GetPerformanceFrequency()) / 1000.); frameN = frameN + 1usize; }
+  // the worst frame interval between '--worst A B' (frames A to B; the default is every frame after the 30th), for the page-open gate
+  if lastT != 0u64 && drawn >= worstFrom && drawn <= worstTo {
+    let iv = f32.from(f64.from((nowT - lastT) * 1000000u64 / sdl.GetPerformanceFrequency()) / 1000.);
+    if iv > worstMs { worstMs = iv; worstAt = drawn; }
+    if scrollTrace && (runTenths == 0 || (drawn >= runFrom && drawn <= runTo + 20)) { print <- "sframe "; print <- drawn; print <- " "; print <- iv; print <- " ms\n"; }
+    if iv > 25. { print <- "frame: "; print <- drawn; print <- " took "; print <- iv; print <- " ms\n"; }
+  }
+  if drawn == shotAt { print <- "Worst frame interval from frame "; print <- worstFrom; print <- " to "; print <- worstTo; print <- ": "; print <- worstMs; print <- " ms at frame "; print <- worstAt; print <- "\n"; }
+  lastT = nowT;
+  if drawn == shotAt && frameN > 10usize {
+    var v = List[f32]();
+    var c = 0usize;
+    while c < frameN { v.push(frameMs[c]); c = c + 1usize; }
+    var i = 1usize;
+    while i < v.len() {
+      var j = i;
+      while j > 0usize && *v[j - 1usize] > *v[j] { let t = *v[j]; v.set(j, *v[j - 1usize]); v.set(j - 1usize, t); j = j - 1usize; }
+      i = i + 1usize;
+    }
+    print <- "Frame interval over "; print <- v.len(); print <- " frames: p50 "; print <- *v[v.len() / 2usize]; print <- " ms, p95 "; print <- *v[v.len() * 95usize / 100usize]; print <- " ms\n";
+  }
 
   // What was drawn at the middle of the window on the shot frame: copied
   // now, read once presented
@@ -545,9 +1327,10 @@ fn drawScene(s: &mut Shell, alpha: f32) {
 
 // Show the frame, and wait for the next texture to draw into: the present wait
 fn present(host: &mut Host, st: &uni State) {
+  if exitAt > 0 && i32.from(drawn) >= exitAt { host.running = false; }
   match &uni st.shell {
     case var &uni Some(some) {
-      showAndAcquire(&mut *some);
+      if !(*some).xr.on { showAndAcquire(&mut *some); }
       // '--click-at N': a click where the last part is drawn, as a person's would come
       if clickAt != 0 && drawn == clickAt { clickLast(&mut *some, host); }
       var c = 0;
@@ -556,9 +1339,46 @@ fn present(host: &mut Host, st: &uni State) {
           let w = host.window().windowSize();
           let ww = f32.from(w.w);
           let wh = f32.from(w.h);
-          clickOn(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh, host.stats.frames);
+          if !webPress(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh) {
+            clickOn(&mut *some, clickXs[usize.from(c)] * ww, clickYs[usize.from(c)] * wh, ww, wh, host.stats.frames);
+          }
         }
+        if drawn == clickFrames[usize.from(c)] + 3 { webRelease(&mut *some); }
         c = c + 1;
+      }
+      if scriptArg != null { runEditScript(&mut *some, drawn); }
+      // '--wheel' and '--press-c': events a person's hand would make, put into SDL's own queue
+      if wheelAt != 0 && drawn == wheelAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_MOUSE_WHEEL;
+        let w = &mut ev as &mut sdl.MouseWheelEvent;
+        w.y = f32.from(wheelY);
+        w.x = f32.from(wheelX);
+        w.integer_y = i32.from(wheelY);
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the wheel event\n"; }
+      }
+      if webSdlAt != 0 && drawn == webSdlAt && webSdlArg != null {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_TEXT_INPUT;
+        let t = &mut ev as &mut sdl.TextInputEvent;
+        t.text = webSdlArg;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the text event\n"; }
+      }
+      if pressRetAt != 0 && drawn == pressRetAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_KEY_DOWN;
+        let k = &mut ev as &mut sdl.KeyboardEvent;
+        k.scancode = KEY_RETURN;
+        k.down = true;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
+      }
+      if pressCAt != 0 && drawn == pressCAt {
+        var ev = sdl.Event();
+        ev.type = sdl.EVENT_KEY_DOWN;
+        let k = &mut ev as &mut sdl.KeyboardEvent;
+        k.scancode = sdl.SCANCODE_C;
+        k.down = true;
+        if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
       }
       // The next frame's input starts here: its events come next
       (*some).input.beginFrame();
@@ -598,7 +1418,7 @@ fn showAndAcquire(s: &mut Shell) {
       centre[0] = i32.from(*(p + (if bgra {2usize} else {0usize})));
       centre[1] = i32.from(*(p + 1usize));
       centre[2] = i32.from(*(p + (if bgra {0usize} else {2usize})));
-      if shot { writeShot(s.readback.mappedRange(), w, h, bgra); }
+      if shot { writeShot(s.readback.mappedBytes(), w, h, bgra); }
       s.readback = Buffer.none();
     }
   } else {
@@ -611,38 +1431,11 @@ fn showAndAcquire(s: &mut Shell) {
 }
 
 // The shot frame as build\shot.bmp: 24 bits a pixel, its rows bottom up
-fn writeShot(pixels: *u8, w: u32, h: u32, bgra: bool) {
-  let row = (w * 3u32 + 3u32) / 4u32 * 4u32;
-  var out = List[u8]();
-  out.push('B'); out.push('M');
-  push32(&mut out, 54u32 + row * h); push32(&mut out, 0u32); push32(&mut out, 54u32);
-  push32(&mut out, 40u32); push32(&mut out, w); push32(&mut out, h);
-  out.push(1u8); out.push(0u8); out.push(24u8); out.push(0u8);
-  push32(&mut out, 0u32); push32(&mut out, row * h); push32(&mut out, 2835u32); push32(&mut out, 2835u32);
-  push32(&mut out, 0u32); push32(&mut out, 0u32);
-  var y = h;
-  while y > 0u32 {
-    y = y - 1u32;
-    var x = 0u32;
-    while x < w {
-      let p = pixels + usize.from((y * w + x) * 4u32);
-      out.push(*(p + (if bgra {0usize} else {2usize})));
-      out.push(*(p + 1usize));
-      out.push(*(p + (if bgra {2usize} else {0usize})));
-      x = x + 1u32;
-    }
-    var pad = w * 3u32;
-    while pad < row { out.push(0u8); pad = pad + 1u32; }
-  }
-  match fs.writeFile(&Path.from("build/shot.bmp"), out.view()) {
-    case let Ok(v) { print <- "Frame "; print <- shotAt; print <- " written to build/shot.bmp\n"; }
-    case let Err(e) { print <- e; print <- "\n"; }
-  }
-}
-
-fn push32(out: &mut List[u8], v: u32) {
-  out.push(u8.from(v & 0xFFu32)); out.push(u8.from((v >> 8u32) & 0xFFu32));
-  out.push(u8.from((v >> 16u32) & 0xFFu32)); out.push(u8.from(v >> 24u32));
+fn writeShot(pixels: &Array[u8], w: u32, h: u32, bgra: bool) {
+  // render's Image makes the pixels right way up (and swaps a BGRA read-back); its save is imagedecode.encodeBmp's 24-bit BMP
+  let img = Image.fromTexels(pixels, i32.from(w), i32.from(h), bgra);
+  if img.save(&Path.from("build/shot.bmp")) { print <- "Frame "; print <- shotAt; print <- " written to build/shot.bmp\n"; }
+  else { print <- "Frame "; print <- shotAt; print <- " could NOT be written to build/shot.bmp\n"; }
 }
 
 fn quit(host: &mut Host, st: &uni State) i32 {
@@ -650,11 +1443,18 @@ fn quit(host: &mut Host, st: &uni State) i32 {
   match &uni st.shell {
     case var &uni Some(some) {
       (*some).device.waitIdle();
-      print <- "Parts live: "; print <- (*some).activated; print <- "\n";
+      (*some).other = None;      // declared after the device: dropped after it, it segfaulted on exit (studio-voice 3f04dca)
+      (*some).panel = None;
+      richDrop();      // the shared fonts and text renderer hold GPU objects too
+      print <- "Parts live: ";print <- (*some).activated; print <- "\n";
+      if (*some).xr.on { reportXr(&*some); }
+      (*some).inc.deskReport();
     }
     else {}
   }
   st.shell = None;      // the GPU's objects go before the window does
+  webReport();
+  webShutdown();
   print <- "Frames drawn: "; print <- drawn; print <- "\n";
   print <- "Middle of the window on frame "; print <- shotAt; print <- ": ";
   print <- centre[0]; print <- " "; print <- centre[1]; print <- " "; print <- centre[2]; print <- "\n";
@@ -686,6 +1486,176 @@ fn worldsFolder() String {
   folder
 }
 
+// '--edit-script FILE': test steps for the page editor, one per line, fields separated by tabs: FRAME COMMAND [ARGS...].
+//   pal NAME             a palette action (newpage, dictate, edit)       click PAGE BLOCK OFFSET   the page's own click at that glyph
+//   text STRING          an SDL text event                               key NAME [ctrl]           an SDL key event (bksp del left right up down home end enter esc z)
+//   rec / send           F2 / F3 (voiceAct)                              dump PAGE                 print the editor's text of the page
+//   ext FILE FROM TO     another writer: FROM replaced by TO in FILE     cat FILE                  print a file
+//   append FILE TEXT     another writer appends TEXT to FILE
+var @threadlocal scriptArg: *u8 = null;
+
+// The script's lines (read each frame in test runs: the file is small)
+fn readScript() List[String] {
+  var out = List[String]();
+  if scriptArg == null { return out; }
+  match fs.readFile(&Path.from(cstr.fromPtr(scriptArg).view())) {
+    case let Ok(t) {
+      var cur = String();
+      var q = 0usize;
+      while q <= t.len() {
+        if q == t.len() || t.view()[q] == '\n' { if cur.len() > 0usize { out.push(cur.clone()); } cur = String(); }
+        else { cur.appendByte(t.view()[q]); }
+        q = q + 1usize;
+      }
+    }
+    case let Err(e) {}
+  }
+  out
+}
+
+fn scriptFields(line: &str) List[String] {
+  var out = List[String]();
+  var cur = String();
+  var i = 0usize;
+  while i < line.len() {
+    if line[i] == '\t' { out.push(cur.clone()); cur = String(); }
+    else if line[i] != '\r' { cur.appendByte(line[i]); }
+    i = i + 1usize;
+  }
+  out.push(cur.clone());
+  out
+}
+
+fn scriptNum(s: &str) usize {
+  var n = 0usize;
+  var i = 0usize;
+  while i < s.len() { if s[i] >= '0' && s[i] <= '9' { n = n * 10usize + (usize.from(s[i]) - usize.from('0')); } i = i + 1usize; }
+  n
+}
+
+fn pushKey(sc: u32, mods: u16) {
+  var ev = sdl.Event();
+  ev.type = sdl.EVENT_KEY_DOWN;
+  let k = &mut ev as &mut sdl.KeyboardEvent;
+  k.scancode = sc;
+  k.keymod = mods;
+  k.down = true;
+  if !sdl.PushEvent(&mut ev) { print <- "could not push the key event\n"; }
+}
+
+fn runEditScript(s: &mut Shell, frame: i32) {
+  let lines = readScript();
+  var li = 0usize;
+  while li < lines.len() {
+    let f = scriptFields(lines[li].view());
+    li = li + 1usize;
+    if f.len() < 2usize || i32.from(scriptNum(f[0].view())) != frame { continue; }
+    let cmd = f[1].view();
+    print <- "script: frame "; print <- frame; print <- ": "; printStr(cmd); print <- "\n";
+    if cmd == "kbkey" && f.len() > 2usize {
+      // the beam on a key of the virtual keyboard and the trigger (label "Space", "Enter", "a" ...), by the real click path
+      var keyEye = Vec3(0., 0., 0.);
+      var keyDir = Vec3(0., 0., 0.);
+      if testKeyRay(&s.inc, f[2].view(), &mut keyEye, &mut keyDir) { clickRay(s, keyEye, keyDir, 0., 0., true, 0u64); }
+      else { print <- "script: kbkey: no such key shown\n"; }
+    }
+    else if cmd == "addrclick" { testAddrStrip(&mut s.inc); }
+    else if cmd == "webclick" && f.len() > 3usize {
+      var wEye = Vec3(0., 0., 0.);
+      var wDir = Vec3(0., 0., 0.);
+      if testWebRay(&s.inc, i32.from(scriptNum(f[2].view())), i32.from(scriptNum(f[3].view())), &mut wEye, &mut wDir) { clickRay(s, wEye, wDir, 0., 0., true, 0u64); }
+      else { print <- "script: webclick: no browser tab shown\n"; }
+    }
+    else if cmd == "kbicon" { s.inc.testAct(&mut s.device, "keyboard", &s.visitor); }
+    else if cmd == "deskclick" && f.len() > 3usize {
+      // the trigger goes down on pixel X Y of the laptop's screen (the beam from the eye to it); 'deskrelease' lets it go
+      let pt = testDeskPoint(&s.inc, i32.from(scriptNum(f[2].view())), i32.from(scriptNum(f[3].view())));
+      let eye0 = s.inc.gazeEye;
+      clickRay(s, eye0, (pt - eye0).normalize(), 0., 0., true, 0u64);
+    }
+    else if cmd == "deskrelease" { deskReleaseTrigger(&mut s.inc); }
+    else if cmd == "deskhold" { deskHoldTick(&mut s.inc); }
+    else if cmd == "wspage" && f.len() > 4usize { s.inc.testMovePage(f[2].view(), scriptNum(f[3].view()), scriptNum(f[4].view())); }
+    else if cmd == "wsitem" && f.len() > 6usize { s.inc.testMoveItem(f[2].view(), scriptNum(f[3].view()), scriptNum(f[4].view()), scriptNum(f[5].view()), scriptNum(f[6].view())); }
+    else if cmd == "wsreport" { s.inc.testWsReport(); s.inc.testRackReport(); }
+    else if cmd == "rackclick" && f.len() > 2usize {
+      let eye0 = s.inc.gazeEye;
+      var rdir = Vec3(0., 0., 0.);
+      if s.inc.testRackRay(f[2].view(), eye0, &mut rdir) { clickRay(s, eye0, rdir, 0., 0., true, 0u64); }
+      else { print <- "script: rackclick: no such card shown\n"; }
+    }
+    else if cmd == "rackhover" && f.len() > 2usize { s.inc.testRackHover(f[2].view()); }
+    else if cmd == "rackpull" && f.len() > 2usize { s.inc.testRackPull(f[2].view()); }
+    else if cmd == "wsselect" && f.len() > 2usize { s.inc.select(i32.from(scriptNum(f[2].view()))); }
+    else if cmd == "open" && f.len() > 2usize { s.inc.openPage(&mut s.device, &mut s.renderer, f[2].view()); }
+    else if cmd == "pscroll" && f.len() > 3usize { s.inc.testPageScroll(f[2].view(), f32.from(i32.from(scriptNum(f[3].view()))), false, 0usize); }
+    else if cmd == "pjump" && f.len() > 3usize { s.inc.testPageScroll(f[2].view(), 0., true, scriptNum(f[3].view())); }
+    else if cmd == "wsfocus" && f.len() > 2usize { s.inc.testFocus(f[2].view()); }
+    else if cmd == "pal" && f.len() > 2usize { s.inc.testAct(&mut s.device, f[2].view(), &s.visitor); }
+    else if cmd == "click" && f.len() > 4usize {
+      let ok = s.inc.testClickPage(s.inc.testPageIdx(f[2].view()), scriptNum(f[3].view()), scriptNum(f[4].view()));
+      print <- "script: click "; print <- (if ok { "landed" } else { "missed" }); print <- "\n";
+    }
+    else if cmd == "text" && f.len() > 2usize {
+      var ev = sdl.Event();
+      ev.type = sdl.EVENT_TEXT_INPUT;
+      let t = &mut ev as &mut sdl.TextInputEvent;
+      // (a copy that stays: SDL keeps the pointer until the event is read; this is a test hook, the few bytes are not freed)
+      let keep = libc.malloc(f[2].len() + 1usize) as *u8;
+      var ci = 0usize;
+      while ci < f[2].len() { *(keep + ci) = f[2].view()[ci]; ci = ci + 1usize; }
+      *(keep + f[2].len()) = 0u8;
+      t.text = keep;
+      if !sdl.PushEvent(&mut ev) { print <- "could not push the text event\n"; }
+    }
+    else if cmd == "key" && f.len() > 2usize {
+      let name = f[2].view();
+      var sc = 0u32;
+      if name == "bksp" { sc = 42u32; } else if name == "del" { sc = 76u32; } else if name == "left" { sc = 80u32; }
+      else if name == "right" { sc = 79u32; } else if name == "up" { sc = 82u32; } else if name == "down" { sc = 81u32; }
+      else if name == "home" { sc = 74u32; } else if name == "end" { sc = 77u32; } else if name == "enter" { sc = 40u32; }
+      else if name == "esc" { sc = 41u32; } else if name == "z" { sc = 29u32; }
+      pushKey(sc, if f.len() > 3usize && f[3].view() == "ctrl" { 0x0040u16 } else { 0u16 });
+    }
+    else if cmd == "rec" { pushKey(KEY_F2, 0u16); }
+    else if cmd == "send" { pushKey(KEY_F3, 0u16); }
+    else if cmd == "dump" && f.len() > 2usize {
+      let t = s.inc.testText(s.inc.testPageIdx(f[2].view()));
+      print <- "script: page text ("; print <- t.len(); print <- " bytes) ---\n"; printStr(t.view()); print <- "\n--- end\n";
+    }
+    else if (cmd == "cat" || cmd == "catpage") && f.len() > 2usize {
+      var target = String.from(f[2].view());
+      if cmd == "catpage" { target = s.inc.testSrc(s.inc.testPageIdx(f[2].view())); }
+      match fs.readFile(&Path.from(target.view())) {
+        case let Ok(t) { print <- "script: file "; printStr(f[2].view()); print <- " ("; print <- t.len(); print <- " bytes) ---\n"; printStr(t.view()); print <- "\n--- end\n"; }
+        case let Err(e) { print <- "script: cannot read "; printStr(f[2].view()); print <- "\n"; }
+      }
+    }
+    else if (cmd == "ext" || cmd == "append") && f.len() > 3usize {
+      match fs.readFile(&Path.from(f[2].view())) {
+        case let Ok(t) {
+          var out = String();
+          if cmd == "append" { out = String.from(t.view()); out.append(f[3].view()); }
+          else {
+            match t.view().find(f[3].view()) {
+              case let Some(p) {
+                out = String.from(t.view().slice(0usize, p));
+                if f.len() > 4usize { out.append(f[4].view()); }
+                out.append(t.view().sliceFrom(p + f[3].len()));
+              }
+              else { out = String.from(t.view()); print <- "script: ext: text not found\n"; }
+            }
+          }
+          let bytes = toBytes(out.view());
+          if let Err(e) = fs.writeFile(&Path.from(f[2].view()), bytes.view()) { print <- "script: write failed\n"; }
+          else { print <- "script: another writer changed "; printStr(f[2].view()); print <- "\n"; }
+        }
+        case let Err(e) { print <- "script: cannot read "; printStr(f[2].view()); print <- "\n"; }
+      }
+    }
+  }
+}
+
 // The number written as argument a; 0 if it is none
 fn argNumber(argv: **u8, a: i32) f64 {
   let text = cstr.fromPtr(*(argv + usize.from(a))).view();
@@ -696,6 +1666,9 @@ fn argNumber(argv: **u8, a: i32) f64 {
 }
 
 fn main(argc: i32, argv: **u8) i32 {
+  if argc > 1i32 && libc.strcmp(cstr.fromPtr(*(argv + 1usize)), "--check-pick") == 0i32 {
+    return if checkPick() { 0i32 } else { 1i32 };
+  }
   initAll();
   programPath = *argv;
   var a = 1i32;
@@ -703,10 +1676,20 @@ fn main(argc: i32, argv: **u8) i32 {
     let arg = cstr.fromPtr(*(argv + usize.from(a)));
     let more = a + 1i32 < argc;
     if libc.strcmp(arg, "--test-part") == 0i32 { testPart = true; }
+    if libc.strcmp(arg, "--xr") == 0i32 { xrOn = true; }
+    if libc.strcmp(arg, "--desk") == 0i32 { deskOn = true; }
+    if libc.strcmp(arg, "--desk-dry-run") == 0i32 { deskOn = true; deskDryRun = true; }
+    if libc.strcmp(arg, "--desk-probe") == 0i32 { deskOn = true; deskProbe = true; }
+    if libc.strcmp(arg, "--desk-no-control") == 0i32 { deskNoControl = true; }
+    if libc.strcmp(arg, "--desk-control") == 0i32 { deskOn = true; deskControl = true; }   // control on from the start (with --desk-dry-run, for a picture of the frame)
+    if libc.strcmp(arg, "--xr-shots") == 0i32 && more { xrShotsArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--xr-shot-at") == 0i32 && more { xrShotAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--shot") == 0i32 { shot = true; }
     if libc.strcmp(arg, "--show") == 0i32 { show = true; }
     if libc.strcmp(arg, "--world") == 0i32 && more { worldArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--config") == 0i32 && more { configArg = *(argv + usize.from(a + 1i32)); }
     if libc.strcmp(arg, "--shot-at") == 0i32 && more { shotAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--exit-at") == 0i32 && more { exitAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--click-at") == 0i32 && more { clickAt = i32.from(argNumber(argv, a + 1i32)); }
     if libc.strcmp(arg, "--click-xy") == 0i32 && a + 3i32 < argc && clicks < 4 {
       clickXs[usize.from(clicks)] = f32.from(argNumber(argv, a + 1i32));
@@ -714,12 +1697,78 @@ fn main(argc: i32, argv: **u8) i32 {
       clickFrames[usize.from(clicks)] = i32.from(argNumber(argv, a + 3i32));
       clicks = clicks + 1;
     }
+    if libc.strcmp(arg, "--doc") == 0i32 && more { docArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--bridge") == 0i32 && more { bridgeArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--notes-dir") == 0i32 && more { notesArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--edit-script") == 0i32 && more { scriptArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--auto-turns") == 0i32 && more { autoTurns = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--auto-gap") == 0i32 && more { autoGap = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--auto-ptt") == 0i32 && more { autoPtt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--auto-ptt-len") == 0i32 && more { autoPttLen = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--shot-after-reply") == 0i32 && more { shotReply = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
+    if libc.strcmp(arg, "--back-after-shot") == 0i32 { backAfterShot = true; }
+    if libc.strcmp(arg, "--press-return") == 0i32 && more { pressRetAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--press-return-after-reply") == 0i32 && more { pressRetCount = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--shot-after-reload") == 0i32 && more { shotReload = i32.from(argNumber(argv, a + 1i32)); shotAt = 0; }
+    if libc.strcmp(arg, "--stem") == 0i32 && more { stemPower = f32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--page-bias") == 0i32 && more { pageBias = f32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--shot-delay") == 0i32 && more { shotDelay = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--worst") == 0i32 && a + 2i32 < argc {
+      worstFrom = i32.from(argNumber(argv, a + 1i32)); worstTo = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--scroll-trace") == 0i32 { scrollTrace = true; }
+    if libc.strcmp(arg, "--scroll-run-web") == 0i32 { runWeb = true; }
+    if libc.strcmp(arg, "--band-mult") == 0i32 && more { bandMult = u32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--web-old") == 0i32 { webOld = true; }
+    if libc.strcmp(arg, "--scroll-run") == 0i32 && a + 3i32 < argc {
+      runTenths = i32.from(argNumber(argv, a + 1i32)); runFrom = i32.from(argNumber(argv, a + 2i32)); runTo = i32.from(argNumber(argv, a + 3i32));
+    }
+    if libc.strcmp(arg, "--wheel-x") == 0i32 && more { wheelX = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--wheel") == 0i32 && a + 2i32 < argc {
+      wheelY = argNumber(argv, a + 1i32);
+      wheelAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--shot-on-error") == 0i32 { shotError = true; shotAt = 0; }
+    if libc.strcmp(arg, "--press-c-after-reload") == 0i32 && more { pressCReload = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--press-c") == 0i32 && more { pressCAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--doc-scroll") == 0i32 && more { docScroll = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--yaw") == 0i32 && more { startYaw = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--at") == 0i32 && a + 2i32 < argc { atSet = true; atX = argNumber(argv, a + 1i32); atZ = argNumber(argv, a + 2i32); }
+    if libc.strcmp(arg, "--open-page") == 0i32 && a + 2i32 < argc && openPageN < 8 {
+      openPageSrc[usize.from(openPageN)] = *(argv + usize.from(a + 1i32));
+      openPageAt[usize.from(openPageN)] = i32.from(argNumber(argv, a + 2i32));
+      openPageN = openPageN + 1;
+    }
+    if (libc.strcmp(arg, "--inc-ev") == 0i32 || libc.strcmp(arg, "--wh-ev") == 0i32) && a + 3i32 < argc && incEvs < 32 {
+      incKind[usize.from(incEvs)] = i32.from(argNumber(argv, a + 1i32));
+      incArg[usize.from(incEvs)] = i32.from(argNumber(argv, a + 2i32));
+      incFrame[usize.from(incEvs)] = i32.from(argNumber(argv, a + 3i32));
+      incEvs = incEvs + 1;
+    }
     if libc.strcmp(arg, "--tilt") == 0i32 && more { tilt = argNumber(argv, a + 1i32); }
     if libc.strcmp(arg, "--approach") == 0i32 && more { approach = argNumber(argv, a + 1i32); }
+    if libc.strcmp(arg, "--web") == 0i32 && more { webArg = *(argv + usize.from(a + 1i32)); }
+    if libc.strcmp(arg, "--web-click") == 0i32 && a + 3i32 < argc {
+      webClickX = argNumber(argv, a + 1i32); webClickY = argNumber(argv, a + 2i32); webClickAt = i32.from(argNumber(argv, a + 3i32));
+    }
+    if libc.strcmp(arg, "--web-wheel") == 0i32 && a + 2i32 < argc {
+      webWheelY = argNumber(argv, a + 1i32); webWheelAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--web-type") == 0i32 && a + 2i32 < argc {
+      webTypeArg = *(argv + usize.from(a + 1i32)); webTypeAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--web-sdl-type") == 0i32 && a + 2i32 < argc {
+      webSdlArg = *(argv + usize.from(a + 1i32)); webSdlAt = i32.from(argNumber(argv, a + 2i32));
+    }
+    if libc.strcmp(arg, "--web-back") == 0i32 && more { webBackAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--web-forward") == 0i32 && more { webForwardAt = i32.from(argNumber(argv, a + 1i32)); }
+    if libc.strcmp(arg, "--web-link") == 0i32 && a + 2i32 < argc {
+      webLinkArg = *(argv + usize.from(a + 1i32)); webLinkAt = i32.from(argNumber(argv, a + 2i32));
+    }
     a = a + 1i32;
   }
   var config = Config.fromArgs(argc, argv);
-  config.setTitle("Guide browser");
+  config.setTitle(if worldArg != null && (libc.strcmp(cstr.fromPtr(worldArg), "incubator") == 0i32 || libc.strcmp(cstr.fromPtr(worldArg), "warehouse") == 0i32) { "Incubator" } else { "Guide browser" });
   var world = worldOf(&start, &event, &simulate, &draw, &quit);
   world.network = &network;
   world.present = &present;

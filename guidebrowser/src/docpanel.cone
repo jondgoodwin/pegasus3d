@@ -1,0 +1,2474 @@
+// The document panel: a Markdown file (markdown.cone) shown on a page standing in the world, read again
+// whenever the file changes.
+//
+//   - The page is laid out and drawn by the richtext package onto a texture (DOC_TEX_W wide), which PagePass then
+//     draws as an UNLIT quad on top of the finished picture (after exposure and tone mapping), so its paper and ink
+//     are the texture's own whatever the scene's light. Scrolling moves the window of the page the texture shows.
+//   - Every 250 ms the file's modification time and size are looked at (one stat). When either changes, and
+//     for 2 s after any change (the C runtime's time is whole seconds, so an edit in the same second and of the
+//     same length would otherwise be missed), the file's text is read and compared with the last text.
+//   - A changed text is parsed and compared with the old tree. A block is the same if a block with the same
+//     heading chain, kind and text stands in the old tree (wherever); else it is a changed one if a block under
+//     the same heading chain and of the same kind is at least half the same words (blue bar), else a new one
+//     (green). A block that went has a thin red line in the margin where it stood. The bars and lines stay until
+//     the marks are cleared (C): they begin strong, fade over FADE_SECONDS to a steady low level, so that after
+//     several edits everything changed since the last look still shows. The block at the top of the view stays
+//     where it was across a reload.
+//   - A click on the page names the block: its path and the first 60 characters, printed and appended to
+//     C:\src\incubator\pointer.log. This is the hook the voice bridge will use.
+//   - A file that cannot be read keeps the old page, with one line in red at the page's foot.
+//
+// Sizes, for the headset later: the texture and text are chosen for about 25 pixels a degree (Quest 3) and the
+// panel for about 41 degrees across at 1.8 m. Change them here.
+
+const DOC_TEX_W = 1280u32;       // texture width, pixels
+const TREE_TEXT_PX = 55.;        // the folder trees' text: 2.5 times DOC_TEXT_PX (Jon, 11 Nov: too small to read or hit in the headset)
+const DOC_TEXT_PX = 22.;         // body text, pixels of em (about 1 degree at the headset's 25 pixels a degree)
+const DOC_TEX_H = 1810u32;       // A-series proportions (1 : 1.414)
+const DOC_WORLD_W = 1.346;       // meters across: 41 degrees at 1.8 m
+const DOC_CENTRE_Y = 1.45;       // meters up, the panel's middle: a little below the eye
+// A code or plain-text file opens on a wider page (1.6 times as wide, the same pixels to the metre): lines are not wrapped, the
+// right stick / wheel scrolls it sideways. Its bottom edge stands where the standard page's does.
+const WIDE_TEX_W = 2048u32;
+const WIDE_TEX_H = 1290u32;
+const WIDE_WORLD_W = 2.154f;
+const CODE_LAYOUT_W = 9000.f;     // a code page is laid out this wide, so a line wraps only past it
+const SCROLL_NOTCH_PX = 110.f;    // one wheel notch, in page pixels
+const UP_BAND_ROWS = 160u32;     // rows of RGB -> RGBA per slice of the first upload
+const UP_SLICE_MS = 3.;          // the upload's budget a frame, milliseconds
+const UP_MIP_HOLD_MS = 150u64;   // the mip chain waits this long after the last redraw (a scroll is redrawing every frame)
+const REDRAW_GAP_MS = 30u64;     // a redraw begins at most this often
+// Scrolling (Jon, 11 Nov: the picture must move on the very next frame): the page is drawn as a band BAND_MULT times as tall as the window
+// (or all of the page if that is shorter) and the window moves over it on the GPU. The next band is drawn when the window is within BAND_EDGE of
+// the spare room from an edge, or within BAND_AHEAD of it on the side the page is moving to.
+const BAND_MULT = 2u32;
+var @threadlocal bandMult = 2u32;       // '--band-mult 1': the old way (a window-sized picture, redrawn as the scroll moves), to compare with
+const BAND_EDGE = 0.12f;
+const BAND_AHEAD = 0.45f;
+var @threadlocal scrollTrace = false;   // '--scroll-trace': a line for each change of what is on show
+var @threadlocal traceFrame = 0;
+const FADE_SECONDS = 10.;
+const FADE_HOLD_SECONDS = 1.;    // full strength for this long first
+const FADE_LOW = 110.;           // the steady strength of an old mark, of 255
+const STRIP_H = 150u32;         // the error / note strip's height at the page's foot
+// The note strip's three chips (record/pause, send, clear), along its foot: CHIP_BOTTOM rows up from the page's bottom
+const CHIP_W = 190u32;
+const CHIP_H = 44u32;
+const CHIP_BOTTOM = 6u32;
+const CHIP_X0 = 662u32;
+const CHIP_STEP = 204u32;
+// Settable from the command line ('--stem P', '--page-bias B'): stem darkening's power (below 1 darkens partly covered
+// pixels), and the page's mip level bias (negative: sharper, more aliasing)
+var @threadlocal stemPower: f32 = 0.4;
+var @threadlocal pageBias: f32 = -1.;
+const POLL_MS = 250u64;
+const HOT_MS = 2000u64;
+const POINTER_LOG = "C:/src/incubator/pointer.log";
+const NOMATCH = 1000000000usize;
+
+const PAPER = 0xf8f5eeffu32;     // dark text on it: well over 7 : 1
+const INK = 0x1c1c1cffu32;
+const QUOTE_INK = 0x474747ffu32;
+const CODE_INK = 0x7a2a0effu32;
+
+// The first face that is only a fallback for characters the text fonts lack (set by makeFaces)
+var @threadlocal fallbackFrom = 0u32;
+
+fn nowMs() u64 {
+  sdl.GetPerformanceCounter() * 1000u64 / sdl.GetPerformanceFrequency()
+}
+
+fn sameText(a: &str, b: &str) bool {
+  if a.len() != b.len() { return false; }
+  var i = 0usize;
+  while i < a.len() {
+    if a[i] != b[i] { return false; }
+    i = i + 1usize;
+  }
+  true
+}
+
+// The words of 's' as start, end pairs
+fn wordRanges(s: &str) List[usize] {
+  var out = List[usize]();
+  var i = 0usize;
+  while i < s.len() {
+    while i < s.len() && (s[i] == ' ' || s[i] == '\t') { i = i + 1usize; }
+    let start = i;
+    while i < s.len() && s[i] != ' ' && s[i] != '\t' { i = i + 1usize; }
+    if i > start { out.push(start); out.push(i); }
+  }
+  out
+}
+
+// How much of the longer text's words the two share, 0 to 1
+fn similarity(a: &str, b: &str) f32 {
+  let wa = wordRanges(a);
+  let wb = wordRanges(b);
+  let na = wa.len() / 2usize;
+  let nb = wb.len() / 2usize;
+  if na == 0usize || nb == 0usize { return 0.; }
+  var taken = List[bool]();
+  var k = 0usize;
+  while k < nb { taken.push(false); k = k + 1usize; }
+  var shared = 0usize;
+  var i = 0usize;
+  while i < na {
+    let w = a.slice(*wa[i * 2usize], *wa[i * 2usize + 1usize]);
+    var j = 0usize;
+    var done = false;
+    while j < nb && !done {
+      if !*taken[j] && sameText(w, b.slice(*wb[j * 2usize], *wb[j * 2usize + 1usize])) {
+        taken.set(j, true);
+        shared = shared + 1usize;
+        done = true;
+      }
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+  f32.from(shared) / f32.from(if na > nb { na } else { nb })
+}
+
+fn loadFont(file: &str) Option[Font] {
+  var out: Option[Font] = None;
+  match fs.readFile(&Path.from(file)) {
+    case let Ok(bytes) {
+      match Font.load(bytes.view()) {
+        case let Ok(f) { out = Some[Font](f); }
+        case is Err {}
+      }
+    }
+    case is Err {}
+  }
+  out
+}
+
+// Georgia for the text and Consolas for code, if they are installed. Faces has four slots; the bold-italic
+// one holds the monospace face, so code is asked for as bold and italic, and text that is both is drawn bold.
+// After them come fallback faces (Segoe UI Symbol, Arial) for characters those lack: richtext picks a glyph from
+// one face only, so after layout, each missing glyph is given to the first fallback that has it (fixGlyphs).
+// The fonts and the text renderer (glyph atlases, pipelines) are made once and shared by all the document panels: each
+// borrows the pair for the time of one layout or draw (richTake / richPut), as the panels draw one after another.
+struct RichPair {
+  faces: Faces;
+  rr: RichRenderer;
+}
+// (kept on the heap behind an address: a global of this type would make the borrow checker doubt every String the panels lend)
+var @threadlocal richAt = 0usize;
+var @threadlocal richMade = false;
+
+fn richRef() &mut RichPair { richAt as &mut RichPair }
+
+// Let go of the pair (before the device is)
+fn richDrop() {
+  if richAt != 0usize {
+    let cell = richAt as *RichPair;
+    mem.finalize[RichPair](cell);
+    libc.free(cell as *u8);
+    richAt = 0usize;
+    richMade = false;
+  }
+}
+
+// Makes the pair if it is not made yet; false if no font was found or the renderer failed
+fn ensureRich(device: &mut Device) bool {
+  if richMade { return true; }
+  let tT0 = sdl.GetPerformanceCounter();
+  match makeFaces() {
+    case let Some(faces) {
+      var rr = RichRenderer.create(device, &faces, TEXTURE_FORMAT_RGBA8_UNORM);
+      print <- "docpanel: fonts and pipelines made in "; print <- micros(tT0, sdl.GetPerformanceCounter()) / 1000.; print <- " ms (shared by all panels)\n";
+      if rr.isValid() {
+        let cell = libc.malloc(mem.sizeof[RichPair]()) as *RichPair;
+        mem.writeRaw[RichPair](cell, RichPair(faces, rr));
+        richAt = cell as usize;
+        richMade = true;
+        return true;
+      }
+    }
+    case is None { print <- "docpanel: no font found (C:/Windows/Fonts/georgia.ttf)\n"; }
+  }
+  false
+}
+
+fn makeFaces() Option[Faces] {
+  var out: Option[Faces] = None;
+  match loadFont("C:/Windows/Fonts/georgia.ttf") {
+    case let Some(reg) {
+      var f = Faces.make(reg);
+      match loadFont("C:/Windows/Fonts/georgiab.ttf") { case let Some(b) { f.setBold(b); } case is None {} }
+      match loadFont("C:/Windows/Fonts/georgiai.ttf") { case let Some(i) { f.setItalic(i); } case is None {} }
+      match loadFont("C:/Windows/Fonts/consola.ttf") { case let Some(m) { f.setBoldItalic(m); } case is None {} }
+      fallbackFrom = u32.from(f.count());
+      match loadFont("C:/Windows/Fonts/seguisym.ttf") { case let Some(s) { f.fonts.push(s); } case is None {} }
+      match loadFont("C:/Windows/Fonts/arial.ttf") { case let Some(s) { f.fonts.push(s); } case is None {} }
+      out = Some[Faces](f);
+    }
+    case is None {}
+  }
+  out
+}
+
+// The code point at byte 'o' of 't'
+fn codePointAt(t: &str, o: usize) u32 {
+  let c = u32.from(t[o]);
+  if c < 128u32 { return c; }
+  var n = 0usize;
+  var cp = 0u32;
+  if c >= 240u32 { n = 3usize; cp = c & 7u32; }
+  else if c >= 224u32 { n = 2usize; cp = c & 15u32; }
+  else { n = 1usize; cp = c & 31u32; }
+  var k = 1usize;
+  while k <= n && o + k < t.len() {
+    cp = cp * 64u32 + (u32.from(t[o + k]) & 63u32);
+    k = k + 1usize;
+  }
+  cp
+}
+
+// A page's pass (a shader module and two pipelines: about 15 ms of a frame) made a frame ahead of the page that will want it, so that opening a
+// page does not pay for it (the worst-frame gate). Kept on the heap behind an address, as the shared fonts are.
+var @threadlocal spareAt = 0usize;
+var @threadlocal spareWaitUntil = 0u64;
+
+fn spareTake(device: &mut Device, format: u32) PagePass {
+  spareWaitUntil = nowMs() + 400u64;
+  if spareAt != 0usize {
+    let cell = spareAt as *PagePass;
+    let v = mem.readRaw[PagePass](cell);
+    libc.free(cell as *u8);
+    spareAt = 0usize;
+    return v;
+  }
+  PagePass.create(device, format)
+}
+
+// Called once a frame when the incubator is idle: makes the spare if there is none (and none was taken a moment ago)
+fn spareMake(device: &mut Device, format: u32) {
+  if spareAt != 0usize || nowMs() < spareWaitUntil { return; }
+  let p = PagePass.create(device, format);
+  let cell = libc.malloc(mem.sizeof[PagePass]()) as *PagePass;
+  mem.writeRaw[PagePass](cell, p);
+  spareAt = cell as usize;
+}
+
+// A mark where a block was taken away: the margin line stands at the top of block 'before' (the new index of the next
+// block that stayed; the block count if none did)
+struct Del {
+  before: usize;
+  born: u64;
+}
+
+// One step of the history: a file (or "browse:FOLDER") and where its page was scrolled to when it was left
+struct HistEntry {
+  file: String;
+  scroll: f32;
+}
+
+pub struct DocPanel {
+  file: String;
+  doc: Doc;
+  text: String;                  // the text last read
+  blocks: List[Block];           // richtext's, made from the doc
+  owner: List[usize];            // for each richtext block, the doc block it came from
+  images: List[ImageInfo];
+  layout: RichLayout;
+  target: Texture;
+  readback: Buffer;
+  stripTarget: Texture;
+  stripBuf: Buffer;
+  page: PagePass;               // draws the page unlit, after the scene is tone mapped
+  born: List[u64];               // for each doc block: when it was marked (ms), 0 if not
+  kinds: List[u32];              // 1 new, 2 changed
+  dels: List[Del];
+  err: String;
+  note: String;                 // a line of the bridge at the page's foot (blue) when there is no error
+  hist: List[HistEntry];         // what was opened in this panel, in order; 'hpos' is the one on show
+  pendingLink: String;           // a link the click found, followed on the next tick
+  pendingAnchor: String;
+  outOpen: String;               // the file browser's wish: open this file in the document panel
+  outBrowse: String;             // a document panel's wish: show this folder in the file browser
+  recent: List[String];          // for the file browser: the document panel's history (files)
+  outWeb: String;                // a web link was followed: show this address in the web panel
+  painter: Option[Painter];     // draws the ```mermaid blocks (mermaidview.cone)
+  cache: List[Diagram];          // the diagrams drawn, by source and width
+  blockDiag: List[usize];        // for each richtext block, its diagram in 'cache' (NOMATCH: none)
+  imgDiag: List[usize];          // for each image of 'images', its diagram in 'cache'
+  pub openDirs: List[String];    // a tree page: the folders expanded
+  treeCache: TreeCache;
+  up: PageUp;                   // the picture on its way to the GPU, a slice a frame (pageup.cone)
+  pub ed: EditState;            // editing in place (pageedit.cone)
+  stemTab: List[u8];            // the stem darkening tables, and the image being made by redrawFinish
+  fimg: Image;
+  texW: u32 = 1280u32;           // this page's texture and its size in the world (a code page is wider)
+  texH: u32 = 1810u32;
+  worldW: f32 = 1.346;
+  wide: bool = false;
+  scrollX: f32 = 0.;             // how far a wide page is scrolled sideways, and the most it can be
+  maxX: f32 = 0.;
+  pendingFirst: bool = false;    // created, not yet read: the first tick does it (opening a page is spread over frames)
+  phase2: bool = false;          // the page is drawn into 'target'; the rest of the redraw (to image, upload) comes next frame
+  drawScrollY: f32 = 0.;
+  drawScrollX: f32 = 0.;
+  pointedDiag: usize = 18446744073709551615usize;   // the diagram last clicked, and the thing in it
+  pointedKey: usize = 18446744073709551615usize;
+  ticks: u32 = 0u32;
+  painterTried: bool = false;
+  openNew: bool = false;         // the click being followed asked for a new page (set by the room just before the click)
+  scrollY: f32 = 0.;
+  // The picture on the GPU is a band of the page taller than the window (BAND_MULT times as tall at most), and scrolling moves the window over
+  // it on the GPU at once (shownY, applyWindow): the CPU draws a new band, later, when the window nears the band's edge.
+  bandTop: f32 = 0.;             // the page y of the top row of the band last drawn, and its rows
+  bandRows: u32 = 0u32;
+  texTop: f32 = 0.;              // the same for the band on the GPU now, and its rows (0 rows: none yet)
+  texRows: u32 = 0u32;
+  seenLanded: u32 = 0u32;
+  scrolledAt: u64 = 0u64;
+  scrollDir: f32 = 0.;           // 1 the page moved down (scrollY grew) the last time, -1 up
+  fin: u32 = 0u32;               // the step of the second half of a redraw (redrawFinish), the row it has reached, and the image being made
+  frow: i32 = 0i32;
+  stripBase: u32 = 0u32;        // rows from the band's foot to the window's foot, at the last draw (the note strip is drawn there)
+  drawWindow: f32 = 0.;          // the scroll at the last draw
+  traceT: f32 = -1.;
+  traceS: f32 = -1.;
+  pointed: usize = 18446744073709551615usize;   // the doc block last clicked (marked amber), none if max
+  dirty: bool = false;
+  lastPoll: u64 = 0u64;
+  lastDraw: u64 = 0u64;
+  lastMtime: i64 = 0i64;
+  lastSize: i64 = 0i64;
+  hotUntil: u64 = 0u64;
+  reloads: u32 = 0u32;
+  glyphsSwapped: u32 = 0u32;
+  hpos: usize = 0usize;
+  pub recOn: bool = false;                       // the bridge is recording: the strip's red dot and the record chip's "Pause"
+  pub chipHit: u32 = 0u32;                       // a click landed on a strip chip: 1 record/pause, 2 send, 3 clear (the caller takes it)
+  histSerial: u32 = 0u32;                       // counts changes to the history
+  pendingNav: i32 = 0i32;                        // back (-1) or forward (+1), done on the next tick
+  recentSerial: u32 = 0u32;
+  pub treeDirty: bool = false;                   // the expanded set changed (the room keeps it in room.toml)
+
+  // Check that it came out: None if no font is installed or the renderer failed
+  pub fn create(device: &mut Device, renderer: &mut Renderer, outFormat: u32, file: &str, initialScroll: f32) Option[DocPanel] {
+    var made: Option[DocPanel] = None;
+    {
+      {
+        let c0 = sdl.GetPerformanceCounter();
+        if ensureRich(device) {
+          let isWide = wantsWide(file);
+          let tw = if isWide { WIDE_TEX_W } else { DOC_TEX_W };
+          let th = if isWide { WIDE_TEX_H } else { DOC_TEX_H };
+          let desc = TextureDescriptor(tw, th, TEXTURE_FORMAT_RGBA8_UNORM,
+            TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+          var target = device.createTexture(&desc);
+          var readback = device.createBuffer(u64.from(tw * th * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+          let sdesc = TextureDescriptor(tw, STRIP_H, TEXTURE_FORMAT_RGBA8_UNORM,
+            TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+          var stripTarget = device.createTexture(&sdesc);
+          var stripBuf = device.createBuffer(u64.from(tw * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+          let c1 = sdl.GetPerformanceCounter();
+          let page = spareTake(device, outFormat);
+          let c2 = sdl.GetPerformanceCounter();
+          var p = DocPanel(String.from(file), Doc(List[DocBlock]()), String(), List[Block](), List[usize](), List[ImageInfo](),
+            emptyLayout(f32.from(tw)), target, readback, stripTarget, stripBuf,
+            page, List[u64](), List[u32](), List[Del](), String(), String(),
+            List[HistEntry](), String(), String(), String(), String(), List[String](), String(),
+            None, List[Diagram](), List[usize](), List[usize](), List[String](), TreeCache(), PageUp.idle(), editIdle(), List[u8](), Image(0, 0, 3, List[u8]()));
+          p.wide = isWide;
+          p.texW = tw;
+          p.texH = th;
+          p.worldW = if isWide { WIDE_WORLD_W } else { f32.from(DOC_WORLD_W) };
+          p.scrollY = initialScroll;
+          p.bandRows = th;
+          let c3 = sdl.GetPerformanceCounter();
+          p.pendingFirst = true;
+          let c4 = sdl.GetPerformanceCounter();
+          print <- "docpanel: create: fonts "; print <- micros(c0, c1) / 1000.; print <- " ms (textures included), page pass "; print <- micros(c1, c2) / 1000.;
+          print <- " ms, reload "; print <- micros(c3, c4) / 1000.; print <- " ms\n";
+          p.hist.push(HistEntry(String.from(file), 0.));
+          made = Some[DocPanel](p);
+        }
+      }
+    }
+    made
+  }
+
+  // Look at the file every POLL_MS, read it again when it has changed, and redraw what has to be
+  pub fn tick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    let now = nowMs();
+    if pendingFirst { pendingFirst = false; self.reload(device, renderer, true); return; }
+    self.edTick(device, renderer, now);
+    self.serveLinks(device, renderer);
+    // the first frames are crowded with the arrival's own command buffers (a frame may record 16): diagrams wait
+    ticks = ticks + 1u32;
+    if ticks > 8u32 && paintOne(&mut painter, device, &mut cache) { dirty = true; }
+    if now >= lastPoll + POLL_MS && !isBrowse(file.view()) {
+      lastPoll = now;
+      var again = false;
+      match fs.stat(&Path.from(file.view())) {
+        case let Ok(info) {
+          let m = info.modified.unixSeconds();
+          if m != lastMtime || info.size != lastSize {
+            lastMtime = m;
+            lastSize = info.size;
+            hotUntil = now + HOT_MS;
+            again = true;
+          }
+          else if now < hotUntil || err.len() > 0usize { again = true; }
+        }
+        case let Err(e) { self.setError("gone or locked"); }
+      }
+      if again { self.reload(device, renderer, false); }
+    }
+    // The picture drawn last frame goes to the CPU image and starts up to the GPU; a slice of that upload each frame after
+    if phase2 {
+      // (the image, stems and diagrams are about 9 ms: alone in their frame, after the slices of the others)
+      self.redrawFinish(device);
+      return;
+    }
+    // (the mip chain waits until the scroll has rested, too)
+    if up.busy && up.holdUntil < scrolledAt + 300u64 { up.holdUntil = scrolledAt + 300u64; }
+    let u0 = sdl.GetPerformanceCounter();
+    if up.busy { up.step(device, &mut page, now); }
+    if scrollTrace && up.busy { print <- "docpanel: upload step "; print <- micros(u0, sdl.GetPerformanceCounter()) / 1000.; print <- " ms\n"; }
+    // a band that has reached the GPU: the window is shown over it from the next draw on
+    if up.landed != seenLanded {
+      seenLanded = up.landed;
+      texTop = up.landedTop;
+      texRows = up.landedRows;
+    }
+    // the bars fade: redraw while any is still fading, then once more at rest
+    if now >= lastDraw + POLL_MS && self.fading(now) {
+      self.redraw(device, renderer);
+    }
+    else if now >= lastDraw + REDRAW_GAP_MS && !self.flatPending() && (dirty || self.needBand(now)) { self.redraw(device, renderer); }
+  }
+
+  // ---- links, history, anchors ----
+
+  // The files this panel has opened, oldest first (the file browser lists them)
+  pub fn historyFiles(self: &) List[String] {
+    var out = List[String]();
+    var i = 0usize;
+    while i < hist.len() {
+      if !isBrowse(hist[i].file.view()) { out.push(String.from(hist[i].file.view())); }
+      i = i + 1usize;
+    }
+    out
+  }
+
+  pub fn requestLink(self: &mut, target: &str) { pendingLink = String.from(target); }
+  pub fn requestNav(self: &mut, delta: i32) { pendingNav = delta; }
+  pub fn requestNth(self: &mut, n: usize) { pendingLink = self.linkTarget(n); }
+
+  // The link under a texture point of line 'li' (what click would follow there), or empty
+  fn linkAtPx(self: &, li: usize, px: f32, py: f32) String {
+    let pblock = usize.from(layout.lines[li].block);
+    if pblock >= owner.len() || *owner[pblock] >= doc.blocks.len() { return String(); }
+    let lb = &doc.blocks[*owner[pblock]];
+    let p = posAt(&layout, px, py);
+    let prefix = if lb.kind == DK_QUOTE { 6usize } else { 0usize };
+    if p.off < prefix { return String(); }
+    let at = p.off - prefix;
+    var si = 0usize;
+    var start = 0usize;
+    while si < lb.spans.len() {
+      if at >= start && at < start + lb.spans[si].len {
+        let lk = lb.spans[si].link;
+        if lk > 0u32 && usize.from(lk) <= lb.targets.len() { return String.from(lb.targets[usize.from(lk) - 1usize].view()); }
+      }
+      start = start + lb.spans[si].len;
+      si = si + 1usize;
+    }
+    String()
+  }
+
+  // A test hook: the middle of the k'th run of link text on show (reading order), in the panel's own space (x, y, 0, w 1), or w 0 if none.
+  // The simulator's fake hand aims at it.
+  pub fn linkPoint(self: &, k: usize) Vec4 {
+    var seen = 0usize;
+    var li = 0usize;
+    while li < layout.lines.len() {
+      let ln = layout.lines[li];
+      let py = ln.top + ln.height * 0.5;
+      if py > self.shownY() + 30. && py < self.shownY() + f32.from(texH) - 30. {
+        var last = String();
+        var from = 0.f;
+        var x = 20.f;
+        while x <= f32.from(texW) {
+          var t = String();
+          if x < f32.from(texW) - 20. { t = self.linkAtPx(li, x, py); }
+          if !sameText(t.view(), last.view()) {
+            if last.len() > 0usize {
+              if seen == k {
+                let px = (from + x) * 0.5;
+                let w = f32.from(worldW);
+                let h = w * f32.from(texH) / f32.from(texW);
+                let u = (px - scrollX) / f32.from(texW);
+                let v = 1. - (py - self.shownY()) / f32.from(texH);
+                return Vec4(u * w - w * 0.5, v * h + (self.centreY() - h * 0.5), 0., 1.);
+              }
+              seen = seen + 1usize;
+            }
+            from = x;
+            last = t;
+          }
+          x = x + 6.;
+        }
+      }
+      li = li + 1usize;
+    }
+    Vec4(0., 0., 0., 0.)
+  }
+
+  // The n'th link of the page, in reading order (for tests, and for a voice that says "the third link")
+  pub fn linkTarget(self: &, n: usize) String {
+    var seen = 0usize;
+    var d = 0usize;
+    while d < doc.blocks.len() {
+      var s2 = 0usize;
+      var last = 0u32;
+      while s2 < doc.blocks[d].spans.len() {
+        let l = doc.blocks[d].spans[s2].link;
+        if l > 0u32 && l != last {
+          if seen == n { return String.from(doc.blocks[d].targets[usize.from(l) - 1usize].view()); }
+          seen = seen + 1usize;
+        }
+        last = l;
+        s2 = s2 + 1usize;
+      }
+      d = d + 1usize;
+    }
+    String()
+  }
+
+  fn serveLinks(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if pendingLink.len() > 0usize {
+      let t = pendingLink.clone();
+      pendingLink = String();
+      self.follow(device, renderer, t.view());
+    }
+    if pendingNav != 0i32 {
+      let d = pendingNav;
+      pendingNav = 0i32;
+      self.goHistory(device, renderer, d);
+    }
+  }
+
+  // Follow a link of the page: an anchor, a file (here, or in the document panel if this is the file browser), a folder
+  // (in the file browser)
+  fn follow(self: &mut, device: &mut Device, renderer: &mut Renderer, target: &str) {
+    if isTree(file.view()) {
+      // a tree: a folder row opens or closes in place; a file row opens as a page
+      let path = normalizePath(target);
+      if fs.isDir(&Path.from(path.view())) {
+        var kept = List[String]();
+        var was = false;
+        var i = 0usize;
+        while i < openDirs.len() { if openDirs[i].view() == path.view() { was = true; } else { kept.push(openDirs[i].clone()); } i = i + 1usize; }
+        if !was { kept.push(path.clone()); }
+        openDirs = kept;
+        treeDirty = true;
+        print <- "docpanel: tree "; print <- (if was { "closed " } else { "opened " }); printStr(path.view()); print <- "\n";
+        self.reload(device, renderer, false);
+      }
+      else if fs.exists(&Path.from(path.view())) { outOpen = path.clone(); }
+      return;
+    }
+    print <- "docpanel: link: "; printStr(target); print <- "\n";
+    if isExternal(target) {
+      if target.startsWith("http://") || target.startsWith("https://") {
+        outWeb = String.from(target);
+        self.setNote("Opening the web link in the web panel");
+      }
+      else { self.setNote("A mail link: not followed here"); }
+      return;
+    }
+    let r = resolveLink(file.view(), target);
+    let path = r.0.view();
+    if isBrowse(file.view()) || target.len() == 0usize {
+      // the file browser's own links are absolute paths
+      if fs.isDir(&Path.from(path)) {
+        var f = String.from(BROWSE_PREFIX);
+        f.append(path);
+        self.go(device, renderer, f.view(), "");
+      }
+      else if fs.exists(&Path.from(path)) { outOpen = String.from(path); }
+      return;
+    }
+    if r.1.len() > 0usize && sameText(path, file.view()) { self.scrollToAnchor(r.1.view()); return; }
+    if fs.isDir(&Path.from(path)) { outBrowse = String.from(path); return; }
+    if !fs.exists(&Path.from(path)) {
+      var m = String.from("No such file: ");
+      m.append(path);
+      self.setNote(m.view());
+      return;
+    }
+    // Shift (desktop) or the grip (headset) held on the click: the file opens as a new page instead of replacing this one
+    if openNew { outOpen = String.from(path); return; }
+    self.go(device, renderer, path, r.1.view());
+  }
+
+  // Show 'newFile' as the next step of the history (what was ahead of this step is dropped), at 'anchor' if given
+  pub fn go(self: &mut, device: &mut Device, renderer: &mut Renderer, newFile: &str, anchor: &str) {
+    if hist.len() > 0usize && hpos < hist.len() { (&mut hist[hpos]).scroll = scrollY; }
+    while hist.len() > hpos + 1usize { hist.pop(); }
+    hist.push(HistEntry(String.from(newFile), 0.));
+    hpos = hist.len() - 1usize;
+    histSerial = histSerial + 1u32;
+    self.open(device, renderer, newFile);
+    if anchor.len() > 0usize { self.scrollToAnchor(anchor); }
+    print <- "docpanel: history "; print <- hpos + 1usize; print <- " of "; print <- hist.len(); print <- ": "; printStr(newFile); print <- "\n";
+  }
+
+  fn goHistory(self: &mut, device: &mut Device, renderer: &mut Renderer, delta: i32) {
+    if hist.len() == 0usize { return; }
+    var np = i64.from(hpos) + i64.from(delta);
+    if np < 0i64 || np >= i64.from(hist.len()) { self.setNote("Nothing further in that direction"); return; }
+    (&mut hist[hpos]).scroll = scrollY;
+    hpos = usize.from(np);
+    histSerial = histSerial + 1u32;
+    let f = String.from(hist[hpos].file.view());
+    let sc = hist[hpos].scroll;
+    self.open(device, renderer, f.view());
+    scrollY = sc;
+    self.clampScroll();
+    dirty = true;
+    print <- "docpanel: history "; print <- hpos + 1usize; print <- " of "; print <- hist.len(); print <- ": "; printStr(f.view()); print <- "\n";
+  }
+
+  // Scroll to the heading whose anchor (its title, lower case, hyphens for spaces) is 'anchor'
+  fn scrollToAnchor(self: &mut, anchor: &str) {
+    let want = slug(anchor);
+    var d = 0usize;
+    while d < doc.blocks.len() {
+      if doc.blocks[d].kind == DK_HEAD && sameText(slug(doc.blocks[d].text.view()).view(), want.view()) {
+        scrollY = self.firstLineTop(d) - 24.;
+        self.clampScroll();
+        dirty = true;
+        print <- "docpanel: anchor #"; printStr(anchor); print <- " found at block "; print <- d; print <- "\n";
+        return;
+      }
+      d = d + 1usize;
+    }
+    var m = String.from("No heading #");
+    m.append(anchor);
+    self.setNote(m.view());
+  }
+
+  fn fading(self: &, now: u64) bool {
+    var i = 0usize;
+    while i < born.len() {
+      if *born[i] != 0u64 && f64.from(now - *born[i]) < (FADE_SECONDS + 0.3) * 1000. { return true; }
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < dels.len() {
+      if f64.from(now - dels[i].born) < (FADE_SECONDS + 0.3) * 1000. { return true; }
+      i = i + 1usize;
+    }
+    false
+  }
+
+  fn setError(self: &mut, message: &str) {
+    if sameText(err.view(), message) { return; }
+    err = String.from(message);
+    print <- "docpanel: error line shown: "; printStr(message); print <- "\n";
+    dirty = true;
+  }
+
+  // For the bridge's turn: this document as a JSON object (file, whether it is on show, the block at the top of the view)
+  pub fn describe(self: &, showing: bool) String {
+    var s = String.from("{\"file\": ");
+    let fj = jsonStr(file.view());
+    s.append(fj.view());
+    s.append(", \"showing\": ");
+    s.append(if showing { "true" } else { "false" });
+    let top = self.topDocBlock();
+    s.append(", \"top_block\": ");
+    if top < doc.blocks.len() {
+      let pj = jsonStr(doc.blocks[top].path.view());
+      s.append(pj.view());
+    } else { s.append("null"); }
+    s.append("}");
+    s
+  }
+
+  // Show another file in this panel, through the same reload as the first one (no marks: it is a new document)
+  pub fn open(self: &mut, device: &mut Device, renderer: &mut Renderer, newFile: &str) {
+    file = String.from(newFile);
+    doc = Doc(List[DocBlock]());
+    text = String();
+    err = String();
+    note = String();
+    born = List[u64]();
+    kinds = List[u32]();
+    dels = List[Del]();
+    scrollY = 0.;
+    lastMtime = 0i64;
+    lastSize = 0i64;
+    hotUntil = 0u64;
+    self.reload(device, renderer, true);
+  }
+
+  // Is this panel already showing 'f'?
+  pub fn showing(self: &, f: &str) bool { sameText(file.view(), f) }
+
+  pub fn setRec(self: &mut, on: bool) {
+    if recOn == on { return; }
+    recOn = on;
+    dirty = true;
+  }
+
+  pub fn setNote(self: &mut, message: &str) {
+    if sameText(note.view(), message) { return; }
+    note = String.from(message);
+    dirty = true;
+  }
+
+  // The marks cleared (C)
+  pub fn clearMarks(self: &mut) {
+    var i = 0usize;
+    while i < born.len() { born.set(i, 0u64); kinds.set(i, 0u32); i = i + 1usize; }
+    dels = List[Del]();
+    dirty = true;
+    print <- "docpanel: marks cleared\n";
+  }
+
+  // Read the file; if its text differs from the last (or this is the first time), parse, compare, lay out, draw
+  fn reload(self: &mut, device: &mut Device, renderer: &mut Renderer, first: bool) {
+    if isTree(file.view()) {
+      let listing = treeText(treeRoot(file.view()).view(), &openDirs, &mut treeCache);
+      self.reloadText(device, renderer, first, listing.view());
+      return;
+    }
+    if isBrowse(file.view()) {
+      let listing = browserText(browseDir(file.view()).view(), &recent);
+      self.reloadText(device, renderer, first, listing.view());
+      return;
+    }
+    match fs.readFile(&Path.from(file.view())) {
+      case let Ok(s) { self.reloadText(device, renderer, first, s.view()); }
+      case let Err(e) { self.setError("gone or locked"); }
+    }
+  }
+
+  // A tree page with these folders expanded (from room.toml)
+  pub fn setOpenDirs(self: &mut, device: &mut Device, renderer: &mut Renderer, open: &List[String]) {
+    var o = List[String]();
+    var i = 0usize;
+    while i < open.len() { o.push(open[i].clone()); i = i + 1usize; }
+    openDirs = o;
+    self.reload(device, renderer, false);
+  }
+
+  // The file browser's page again (its folder is the same; the history it lists may have changed)
+  pub fn refreshListing(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if isBrowse(file.view()) { self.reload(device, renderer, false); }
+  }
+
+  // ---- editing in place (pageedit.cone has the text operations) ----
+
+  // Test hook: a click, as a ray, on the glyph 'off' of doc block d
+  pub fn testClickBlock(self: &mut, d: usize, off: usize) bool {
+    var b = 0usize;
+    while b < owner.len() && *owner[b] != d { b = b + 1usize; }
+    if b >= owner.len() { return false; }
+    var o = off;
+    if o > blocks[b].text.len() { o = blocks[b].text.len(); }
+    let cr = caretRect(&layout, pos(b, o));
+    let u = (cr.x + 1.) / f32.from(texW);
+    let v = 1. - (cr.y + cr.h * 0.5 - self.shownY()) / f32.from(texH);
+    let w = f32.from(worldW);
+    let h = w * f32.from(texH) / f32.from(texW);
+    let hx = u * w - w * 0.5;
+    let hy = v * h + (self.centreY() - h * 0.5);
+    print <- "pageedit: test click at block "; print <- d; print <- " offset "; print <- off; print <- " (u "; print <- u; print <- ", v "; print <- v; print <- ")\n";
+    self.click(Vec3(hx, hy, 1.), Vec3(0., 0., -1.))
+  }
+
+  pub fn editable(self: &) bool {
+    !wide && !isBrowse(file.view()) && !isTree(file.view()) && !isDiagramFile(file.view(), text.view()) && err.len() == 0usize
+  }
+
+  pub fn editing(self: &) bool { ed.on }
+
+  // Begin (or move) editing with the caret at byte 'at' of the text; used by the new-page action and dictation
+  pub fn editWant(self: &mut, at: usize) { ed.want = true; ed.wantCaret = at; }
+
+  fn edChunkSet(self: &mut) {
+    if ed.caret > text.len() { ed.caret = text.len(); }
+    let r = editChunkAt(text.view(), ed.caret);
+    ed.c0 = r.a;
+    ed.c1 = r.b;
+    ed.lines = editLines(text.view(), r.a, r.b).len();
+  }
+
+  // The doc with the paragraph being edited as raw lines (one monospace block per source line)
+  fn parseEditing(self: &) Doc {
+    let shown = editShown(text.view(), ed.c0, ed.c1);
+    var d = parseMarkdown(shown.view());
+    var m = d.blocks.len();
+    var i = 0usize;
+    while i < d.blocks.len() {
+      if d.blocks[i].kind == DK_PARA && d.blocks[i].text.view() == editMark() { m = i; break; }
+      i = i + 1usize;
+    }
+    if m >= d.blocks.len() { return d; }
+    let chain = d.blocks[m].chain.clone();
+    let path = d.blocks[m].path.clone();
+    d.blocks.remove(m);
+    let ls = editLines(text.view(), ed.c0, ed.c1);
+    var k = ls.len();
+    while k > 0usize {
+      k = k - 1usize;
+      var spans = List[Span]();
+      if ls[k].len() > 0usize { spans.push(Span(ls[k].len(), false, false, false, 0u32, 0u32)); }
+      d.blocks.insert(m, DocBlock(DK_CODE, 0u32, ls[k].clone(), spans, chain.clone(), path.clone(), k == 0usize, List[String](), String.from("@raw")));
+    }
+    d
+  }
+
+  fn rawFirst(self: &) usize {
+    var i = 0usize;
+    while i < doc.blocks.len() {
+      if doc.blocks[i].lang.view() == "@raw" { return i; }
+      i = i + 1usize;
+    }
+    NOMATCH
+  }
+
+  // The caret's rectangle in the laid-out page (none when not editing)
+  fn caretRectNow(self: &) CaretRect {
+    if !ed.on || layout.lines.len() == 0usize { return CaretRect(0., 0., 0.); }
+    let rf = self.rawFirst();
+    if rf == NOMATCH { return CaretRect(0., 0., 0.); }
+    var line = 0usize;
+    var i = ed.c0;
+    while i < ed.caret && i < text.len() { if text.view()[i] == '\n' { line = line + 1usize; } i = i + 1usize; }
+    let ls = edLineStart(text.view(), ed.caret);
+    var col = ed.caret - ls;
+    // (a CRLF file's raw lines lack the \r)
+    let want = rf + line;
+    var b = 0usize;
+    while b < owner.len() {
+      if *owner[b] == want {
+        if col > blocks[b].text.len() { col = blocks[b].text.len(); }
+        return caretRect(&layout, pos(b, col));
+      }
+      b = b + 1usize;
+    }
+    CaretRect(0., 0., 0.)
+  }
+
+  // Re-parse and draw after the text or the paragraph changed (no change marks: it is the editor's own doing)
+  fn edRefresh(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    self.edChunkSet();
+    doc = self.parseText();
+    // the change marks of an outside edit stay while the block count is the same (typing in a paragraph); else they are let go
+    if born.len() != doc.blocks.len() || kinds.len() != doc.blocks.len() {
+      var nb = List[u64]();
+      var nk = List[u32]();
+      var q = 0usize;
+      while q < doc.blocks.len() { nb.push(0u64); nk.push(0u32); q = q + 1usize; }
+      born = nb;
+      kinds = nk;
+      dels = List[Del]();
+    }
+    pointed = NOMATCH;
+    self.relayout(device);
+    // keep the caret in view
+    let cr = self.caretRectNow();
+    if cr.h > 0. {
+      let lo = scrollY + 40.;
+      let hi = scrollY + f32.from(texH) - 220.;
+      if cr.y < lo { scrollY = cr.y - 120.; }
+      else if cr.y + cr.h > hi { scrollY = cr.y + cr.h - f32.from(texH) + 360.; }
+      self.clampScroll();
+    }
+    self.redraw(device, renderer);
+  }
+
+  pub fn editBegin(self: &mut, device: &mut Device, renderer: &mut Renderer, at: usize) {
+    if !self.editable() { return; }
+    if !ed.on { ed.base = text.clone(); }
+    ed.on = true;
+    ed.caret = at;
+    ed.lastKind = 0u32;
+    self.edRefresh(device, renderer);
+    print <- "pageedit: editing "; printStr(file.view()); print <- " at byte "; print <- ed.caret; print <- " ("; print <- ed.lines; print <- " raw lines)\n";
+  }
+
+  pub fn editEnd(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    if !ed.on { return; }
+    self.edSave();
+    ed.on = false;
+    self.edRefresh(device, renderer);
+    print <- "pageedit: left editing "; printStr(file.view()); print <- "\n";
+  }
+
+  // The file written under a temporary name, then renamed over it in one step
+  pub fn edSave(self: &mut) {
+    if !ed.dirty { return; }
+    var tmp = String.from(file.view());
+    tmp.append(".tmp-edit");
+    let bytes = toBytes(text.view());
+    if let Err(e) = fs.writeFile(&Path.from(tmp.view()), bytes.view()) { print <- "pageedit: write failed: "; print <- e; print <- "\n"; return; }
+    if deskc.replace_file(tmp.cstr(), file.cstr()) != 1i32 { print <- "pageedit: rename failed for "; printStr(file.view()); print <- "\n"; return; }
+    match fs.stat(&Path.from(file.view())) {
+      case let Ok(info) { lastMtime = info.modified.unixSeconds(); lastSize = info.size; }
+      case let Err(e) {}
+    }
+    ed.base = text.clone();
+    ed.dirty = false;
+    ed.baseChunk = String();
+    ed.saves = ed.saves + 1u32;
+    print <- "pageedit: saved "; printStr(file.view()); print <- " ("; print <- text.len(); print <- " bytes, save "; print <- ed.saves; print <- ")\n";
+  }
+
+  fn edTick(self: &mut, device: &mut Device, renderer: &mut Renderer, now: u64) {
+    if ed.want { ed.want = false; self.editBegin(device, renderer, ed.wantCaret); }
+    if ed.pend { ed.pend = false; self.edFromClick(device, renderer); }
+    if ed.on && ed.dirty && now >= ed.saveAt { self.edSave(); }
+  }
+
+  // Before a change: remember the text and caret for Ctrl+Z (typing in a run is one step)
+  fn edSnap(self: &mut, kind: u32, now: u64) {
+    if !(kind == 1u32 && ed.lastKind == 1u32 && now < ed.lastAt + 1500u64) {
+      ed.undo.push(EdSnap(text.clone(), ed.caret));
+      if ed.undo.len() > 200usize { ed.undo.remove(0usize); }
+    }
+    if !ed.dirty { ed.baseChunk = String.from(text.view().slice(ed.c0, ed.c1)); }
+    ed.lastKind = kind;
+    ed.lastAt = now;
+  }
+
+  fn edChanged(self: &mut, device: &mut Device, renderer: &mut Renderer, now: u64) {
+    ed.dirty = true;
+    ed.saveAt = now + 1000u64;
+    self.edRefresh(device, renderer);
+  }
+
+  // The caret moved without a change: leaving the paragraph saves
+  fn edMoved(self: &mut, device: &mut Device, renderer: &mut Renderer, to: usize) {
+    let left = to < ed.c0 || to > ed.c1;
+    ed.caret = to;
+    ed.lastKind = 0u32;
+    if left && ed.dirty { self.edSave(); }
+    self.edRefresh(device, renderer);
+  }
+
+  // Typed (or dictated) text at the caret
+  pub fn editText(self: &mut, device: &mut Device, renderer: &mut Renderer, s: &str) {
+    if !ed.on { self.editBegin(device, renderer, text.len()); }
+    if !ed.on || s.len() == 0usize { return; }
+    let now = nowMs();
+    self.edSnap(1u32, now);
+    ed.caret = edInsert(&mut text, ed.caret, s);
+    self.edChanged(device, renderer, now);
+  }
+
+  // A key (SDL scancode and modifiers) while editing; false if the key is not the editor's
+  pub fn editKey(self: &mut, device: &mut Device, renderer: &mut Renderer, sc: u32, mods: u16) bool {
+    if !ed.on { return false; }
+    let now = nowMs();
+    let ctrl = (mods & 0x00C0u16) != 0u16;
+    if sc == 41u32 { self.editEnd(device, renderer); return true; }
+    if ctrl {
+      if sc == 29u32 { self.edUndo(device, renderer); }
+      return true;
+    }
+    if sc == 42u32 {         // Backspace
+      if ed.caret > 0usize {
+        self.edSnap(2u32, now);
+        let a = edPrevChar(text.view(), ed.caret);
+        edCut(&mut text, a, ed.caret);
+        ed.caret = a;
+        self.edChanged(device, renderer, now);
+      }
+      return true;
+    }
+    if sc == 76u32 {         // Delete
+      if ed.caret < text.len() {
+        self.edSnap(2u32, now);
+        let b = edNextChar(text.view(), ed.caret);
+        edCut(&mut text, ed.caret, b);
+        self.edChanged(device, renderer, now);
+      }
+      return true;
+    }
+    if sc == 40u32 || sc == 88u32 {         // Enter: a new paragraph
+      self.edSnap(3u32, now);
+      ed.caret = edInsert(&mut text, ed.caret, "\n\n");
+      self.edChanged(device, renderer, now);
+      self.edSave();
+      return true;
+    }
+    if sc == 80u32 { self.edMoved(device, renderer, edPrevChar(text.view(), ed.caret)); return true; }
+    if sc == 79u32 { self.edMoved(device, renderer, edNextChar(text.view(), ed.caret)); return true; }
+    if sc == 82u32 { self.edMoved(device, renderer, edVertical(text.view(), ed.caret, -1i32)); return true; }
+    if sc == 81u32 { self.edMoved(device, renderer, edVertical(text.view(), ed.caret, 1i32)); return true; }
+    if sc == 74u32 { self.edMoved(device, renderer, edLineStart(text.view(), ed.caret)); return true; }
+    if sc == 77u32 { self.edMoved(device, renderer, edLineEnd(text.view(), ed.caret)); return true; }
+    // other keys (letters come as text; the rest do nothing here, and the incubator does not see them)
+    true
+  }
+
+  fn edUndo(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    match ed.undo.pop() {
+      case let Some(snap) {
+        text = snap.text.clone();
+        ed.caret = snap.caret;
+        ed.lastKind = 0u32;
+        ed.dirty = true;
+        ed.saveAt = nowMs() + 1000u64;
+        self.edRefresh(device, renderer);
+        print <- "pageedit: undo, "; print <- ed.undo.len(); print <- " steps left\n";
+      }
+      else { print <- "pageedit: nothing to undo\n"; }
+    }
+  }
+
+  // Another writer changed the file: 'incoming' is what is on disk. The paragraph being edited is looked for in it (as it was before our
+  // unsaved change, if any) and our version of it put in its place; if it is not there, the edit is let go. False: nothing to show.
+  fn edExternal(self: &mut, incoming: &mut String) bool {
+    let cur = String.from(text.view().slice(ed.c0, ed.c1));
+    let off = ed.caret - ed.c0;
+    let find = if ed.dirty { ed.baseChunk.clone() } else { cur.clone() };
+    match incoming.view().find(find.view()) {
+      case let Some(p) {
+        var merged = String.from(incoming.view().slice(0usize, p));
+        merged.append(cur.view());
+        merged.append(incoming.view().sliceFrom(p + find.len()));
+        ed.base = incoming.clone();
+        ed.caret = p + off;
+        *incoming = merged;
+        if ed.dirty { ed.saveAt = nowMs() + 1000u64; }
+        print <- "pageedit: file changed outside; your paragraph kept\n";
+      }
+      else {
+        ed.base = incoming.clone();
+        ed.on = false;
+        ed.dirty = false;
+        print <- "pageedit: file changed outside, in the paragraph being edited; editing ended\n";
+      }
+    }
+    true
+  }
+
+  // The doc block clicked starts editing, or moves the caret
+  fn edFromClick(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    let d = ed.pendBlock;
+    if d >= doc.blocks.len() { return; }
+    if doc.blocks[d].lang.view() == "@raw" {
+      // a line of the paragraph on show: the caret to the byte asked for
+      let rf = self.rawFirst();
+      var want = d - rf;
+      var ls = ed.c0;
+      while want > 0usize && ls < ed.c1 {
+        ls = edLineEnd(text.view(), ls) + 1usize;
+        want = want - 1usize;
+      }
+      let le = edLineEnd(text.view(), ls);
+      var at = ls + ed.pendOff;
+      if at > le { at = le; }
+      while at > ls && at < text.len() && edIsCont(text.view()[at]) { at = at - 1usize; }
+      self.edMoved(device, renderer, at);
+      return;
+    }
+    // a rendered block: which paragraph of the file made it
+    let cs = editChunks(text.view());
+    var cursor = 0usize;
+    var found = NOMATCH;
+    var gapDone = !(ed.on && ed.c0 == ed.c1);
+    var k = 0usize;
+    while k < cs.len() && found == NOMATCH {
+      if !gapDone && cs[k].a > ed.c0 { cursor = cursor + ed.lines; gapDone = true; }
+      var cnt = 0usize;
+      if ed.on && cs[k].a == ed.c0 && cs[k].b == ed.c1 { cnt = ed.lines; }
+      else { cnt = parseMarkdown(text.view().slice(cs[k].a, cs[k].b)).blocks.len(); }
+      if d < cursor + cnt { found = k; }
+      cursor = cursor + cnt;
+      k = k + 1usize;
+    }
+    if found == NOMATCH {
+      print <- "pageedit: could not tell which paragraph block "; print <- d; print <- " is\n";
+      return;
+    }
+    let a = cs[found].a;
+    let b = cs[found].b;
+    var rendered = doc.blocks[d].text.clone();
+    var start = a;
+    var cut = rendered.len();
+    if cut > 24usize { cut = 24usize; while cut > 0usize && isContByte(rendered.view()[cut]) { cut = cut - 1usize; } }
+    if cut > 0usize {
+      match text.view().slice(a, b).find(rendered.view().slice(0usize, cut)) { case let Some(q) { start = a + q; } else {} }
+    }
+    var at = editMapOffset(text.view(), start, b, rendered.view(), ed.pendOff);
+    if ed.on && ed.dirty && (at < ed.c0 || at > ed.c1) { self.edSave(); }
+    if !ed.on { ed.base = text.clone(); ed.on = true; }
+    ed.caret = at;
+    ed.lastKind = 0u32;
+    self.edRefresh(device, renderer);
+    print <- "pageedit: caret to byte "; print <- ed.caret; print <- " of "; print <- text.len(); print <- " (paragraph "; print <- found; print <- ")\n";
+  }
+
+  fn parseText(self: &) Doc {
+    if !isBrowse(file.view()) && isDiagramFile(file.view(), text.view()) {
+      let md = diagramMarkdown(file.view(), text.view());
+      return parseMarkdown(md.view());
+    }
+    if wantsWide(file.view()) { return parseCode(text.view(), file.view()); }
+    if ed.on && !isBrowse(file.view()) { return self.parseEditing(); }
+    parseMarkdown(text.view())
+  }
+
+  // The page's height in the world, and where its middle stands: the bottom edge is the standard page's whatever the size
+  fn worldH(self: &) f32 { f32.from(worldW) * f32.from(texH) / f32.from(texW) }
+  fn centreY(self: &) f32 {
+    let stdHalf = 0.5 * f32.from(DOC_WORLD_W) * f32.from(DOC_TEX_H) / f32.from(DOC_TEX_W);
+    f32.from(DOC_CENTRE_Y) - stdHalf + 0.5 * self.worldH()
+  }
+
+  // A file that wants the other page shape (a code file after a document, or back) gets new targets before it is laid out
+  fn fitShape(self: &mut, device: &mut Device) {
+    let want = wantsWide(file.view());
+    if want == wide { return; }
+    wide = want;
+    texW = if want { WIDE_TEX_W } else { DOC_TEX_W };
+    texH = if want { WIDE_TEX_H } else { DOC_TEX_H };
+    worldW = if want { WIDE_WORLD_W } else { f32.from(DOC_WORLD_W) };
+    let desc = TextureDescriptor(texW, texH, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+    target = device.createTexture(&desc);
+    readback = device.createBuffer(u64.from(texW * texH * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+    let sdesc = TextureDescriptor(texW, STRIP_H, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+    stripTarget = device.createTexture(&sdesc);
+    stripBuf = device.createBuffer(u64.from(texW * STRIP_H * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+    phase2 = false;
+    up.cancel();
+    bandRows = texH;
+    texRows = 0u32;
+    scrollX = 0.;
+    print <- "docpanel: page shape "; print <- if want { "wide (code)" } else { "standard" }; print <- ", "; print <- texW; print <- "x"; print <- texH; print <- "\n";
+  }
+
+  fn reloadText(self: &mut, device: &mut Device, renderer: &mut Renderer, first: bool, s: &str) {
+    let began = sdl.GetPerformanceCounter();
+    {
+      {
+        if !first && sameText(s, text.view()) && err.len() == 0usize { return; }
+        var incoming = String.from(s);
+        if ed.on && !first {
+          // while editing: the file as we last wrote it is not news; another writer's change is merged under the paragraph being edited
+          if sameText(s, ed.base.view()) { return; }
+          if !self.edExternal(&mut incoming) { return; }
+        }
+        let hadError = err.len() > 0usize;
+        text = incoming;
+        self.fitShape(device);
+        if hadError { err = String(); dirty = true; print <- "docpanel: error line cleared\n"; }
+        if ed.on { self.edChunkSet(); }
+        let fresh = self.parseText();
+        // where the top of the view is, to put it back
+        let topDoc = self.topDocBlock();
+        var keepChain = String();
+        var keepText = String();
+        var keepPath = String();
+        var keepOffset = 0.;
+        if topDoc < doc.blocks.len() {
+          keepChain = String.from(doc.blocks[topDoc].chain.view());
+          keepText = String.from(doc.blocks[topDoc].text.view());
+          keepPath = String.from(doc.blocks[topDoc].path.view());
+          keepOffset = f64.from(scrollY - self.firstLineTop(topDoc));
+        }
+        let scrolledFrom = scrollY;
+        let now = nowMs();
+        let nOld = doc.blocks.len();
+        let nNew = fresh.blocks.len();
+        // match: first the same text, then the most similar (half the words) under the same heading chain and kind
+        var oldTo = List[usize]();          // for each old block, the new one it became, or NOMATCH
+        var newFrom = List[usize]();
+        var changedBy = List[bool]();       // matched by similarity (so changed)
+        var u = 0usize;
+        while u < nOld { oldTo.push(NOMATCH); u = u + 1usize; }
+        u = 0usize;
+        while u < nNew { newFrom.push(NOMATCH); changedBy.push(false); u = u + 1usize; }
+        if !first {
+          var b = 0usize;
+          var hint = 0usize;          // the old block after the last one matched: an unchanged file matches in step, so look there first (the scan from 0 grows with the position)
+          while b < nNew {
+            if hint < nOld && *oldTo[hint] == NOMATCH {
+              let old = &doc.blocks[hint];
+              let nb = &fresh.blocks[b];
+              if old.kind == nb.kind && sameText(old.text.view(), nb.text.view()) && sameText(old.chain.view(), nb.chain.view()) {
+                oldTo.set(hint, b);
+                newFrom.set(b, hint);
+              }
+            }
+            var o = 0usize;
+            while o < nOld && *newFrom[b] == NOMATCH {
+              if *oldTo[o] == NOMATCH {
+                let old = &doc.blocks[o];
+                let nb = &fresh.blocks[b];
+                if old.kind == nb.kind && sameText(old.text.view(), nb.text.view()) && sameText(old.chain.view(), nb.chain.view()) {
+                  oldTo.set(o, b);
+                  newFrom.set(b, o);
+                }
+              }
+              o = o + 1usize;
+            }
+            if *newFrom[b] != NOMATCH { hint = *newFrom[b] + 1usize; }
+            b = b + 1usize;
+          }
+          b = 0usize;
+          while b < nNew {
+            if *newFrom[b] == NOMATCH {
+              var best = 0.5 - 0.0001;
+              var bestO = NOMATCH;
+              var o = 0usize;
+              while o < nOld {
+                if *oldTo[o] == NOMATCH {
+                  let old = &doc.blocks[o];
+                  let nb = &fresh.blocks[b];
+                  if old.kind == nb.kind && sameText(old.chain.view(), nb.chain.view()) {
+                    let sc = f64.from(similarity(old.text.view(), nb.text.view()));
+                    if sc > best { best = sc; bestO = o; }
+                  }
+                }
+                o = o + 1usize;
+              }
+              if bestO != NOMATCH { oldTo.set(bestO, b); newFrom.set(b, bestO); changedBy.set(b, true); }
+            }
+            b = b + 1usize;
+          }
+        }
+        pointed = 18446744073709551615usize;     // the blocks may have moved: the click mark is let go
+        // the marks: carried across, new ones made
+        var nBorn = List[u64]();
+        var nKinds = List[u32]();
+        var marked = 0u32;
+        var b2 = 0usize;
+        while b2 < nNew {
+          let from = *newFrom[b2];
+          // (a tree opening or closing a folder is no edit to flash: the highlight keeps redrawing for 10 s, each redraw throwing away the upload under way)
+          if first || isTree(file.view()) { nBorn.push(0u64); nKinds.push(0u32); }
+          else if from == NOMATCH { nBorn.push(now); nKinds.push(1u32); marked = marked + 1u32; }
+          else if *changedBy[b2] {
+            nBorn.push(now);
+            nKinds.push(if *kinds[from] == 1u32 { 1u32 } else { 2u32 });
+            marked = marked + 1u32;
+          }
+          else { nBorn.push(*born[from]); nKinds.push(*kinds[from]); }
+          b2 = b2 + 1usize;
+        }
+        // the lines for what went, and the older ones moved to where their next block went
+        var nDels = List[Del]();
+        var d0 = 0usize;
+        while d0 < dels.len() {
+          var a = dels[d0].before;
+          while a < nOld && *oldTo[a] == NOMATCH { a = a + 1usize; }
+          nDels.push(Del(if a >= nOld { nNew } else { *oldTo[a] }, dels[d0].born));
+          d0 = d0 + 1usize;
+        }
+        var removed = 0u32;
+        var o2 = 0usize;
+        while o2 < nOld && !first && !isTree(file.view()) {
+          if *oldTo[o2] == NOMATCH {
+            var a = o2;
+            while a < nOld && *oldTo[a] == NOMATCH { a = a + 1usize; }
+            nDels.push(Del(if a >= nOld { nNew } else { *oldTo[a] }, now));
+            removed = removed + 1u32;
+          }
+          o2 = o2 + 1usize;
+        }
+        doc = fresh;
+        born = nBorn;
+        kinds = nKinds;
+        dels = nDels;
+        self.relayout(device);
+        // the same block at the top of the view
+        var at = doc.blocks.len();
+        var d = 0usize;
+        while d < doc.blocks.len() && at == doc.blocks.len() {
+          if sameText(doc.blocks[d].chain.view(), keepChain.view()) && sameText(doc.blocks[d].text.view(), keepText.view()) { at = d; }
+          d = d + 1usize;
+        }
+        if at < doc.blocks.len() { scrollY = self.firstLineTop(at) + f32.from(keepOffset); }
+        self.clampScroll();
+        let topAfter = self.topDocBlock();
+        self.redraw(device, renderer);
+        self.reloads = self.reloads + 1u32;
+        print <- "docpanel: reload "; print <- self.reloads; print <- ": "; print <- doc.blocks.len(); print <- " blocks, ";
+        print <- marked; print <- " marked, "; print <- removed; print <- " removed; read, parse, compare, layout, draw and upload took ";
+        print <- micros(began, sdl.GetPerformanceCounter()) / 1000.; print <- " ms; redrawn at unix_ms ";
+        print <- Timestamp.now().unixNanos() / 1000000i64; print <- "\n";
+        if topDoc < doc.blocks.len() || keepPath.len() > 0usize {
+          print <- "docpanel: top of view was ["; printStr(keepPath.view()); print <- "] at scroll "; print <- scrolledFrom;
+          print <- ", is ["; if topAfter < doc.blocks.len() { printStr(doc.blocks[topAfter].path.view()); }
+          print <- "] at scroll "; print <- scrollY; print <- "\n";
+        }
+      }
+    }
+  }
+
+  // The richtext blocks from the doc, and their layout; the glyphs a face lacks given to a fallback face
+  fn relayout(self: &mut, device: &mut Device) {
+    blocks = List[Block]();
+    owner = List[usize]();
+    blockDiag = List[usize]();
+    images = List[ImageInfo]();
+    imgDiag = List[usize]();
+    pointedDiag = NOMATCH;
+    pointedKey = NOMATCH;
+    var i = 0usize;
+    while i < doc.blocks.len() {
+      // a fenced ```mermaid block (all its lines) becomes one block holding a picture: the page's width less the margins
+      if doc.blocks[i].kind == DK_CODE && doc.blocks[i].lang.view() == "mermaid" {
+        var src = String();
+        var j = i;
+        while j < doc.blocks.len() && doc.blocks[j].kind == DK_CODE && doc.blocks[j].lang.view() == "mermaid" && (j == i || !doc.blocks[j].first) {
+          src.append(doc.blocks[j].text.view());
+          src.append("\n");
+          j = j + 1usize;
+        }
+        // the painter (a font, an atlas, a pipeline) is made when the first diagram is wanted
+        if !painterTried { painterTried = true; painter = makePainter(device); }
+        let di = diagramFor(&mut painter, device, &mut cache, src.view(), texW - 128u32);
+        if di != NOMATCH && cache[di].w > 0u32 {
+          images.push(ImageInfo(f32.from(cache[di].w), f32.from(cache[di].h), PL_INLINE, String.from("diagram"), 0u32, 0u32, List[u8]()));
+          imgDiag.push(di);
+          var blk = Block();
+          var anchor = String();
+          anchor.appendByte(0xEFu8);
+          anchor.appendByte(0xBFu8);
+          anchor.appendByte(0xBCu8);
+          blk.text = anchor;
+          blk.runs.push(Run(3usize, Style(false, false, false, 0., 0u32, 0u32, u32.from(images.len()))));
+          blocks.push(blk);
+          owner.push(i);
+          blockDiag.push(di);
+          i = j;
+          continue;
+        }
+      }
+      blocks.push(toBlock(&doc.blocks[i]));
+      owner.push(i);
+      blockDiag.push(NOMATCH);
+      i = i + 1usize;
+    }
+    if blocks.len() == 0usize {
+      blocks.push(Block.fromText("(empty)", Style.plain()));
+      owner.push(0usize);
+      blockDiag.push(NOMATCH);
+    }
+    if richMade {
+      let r = richRef();
+      layout = layoutRich(&blocks, &images, &r.faces, &self.config());
+      self.fixGlyphs(&r.faces);
+    }
+    // a wide page scrolls sideways as far as its longest line
+    maxX = 0.;
+    if wide {
+      var right: f32 = 0.;
+      var gi = 0usize;
+      while gi < layout.glyphs.len() {
+        let e = layout.glyphs[gi].x + layout.glyphs[gi].adv;
+        if e > right { right = e; }
+        gi = gi + 1usize;
+      }
+      maxX = right + 64. - f32.from(texW);
+      if maxX < 0. { maxX = 0.; }
+      print <- "docpanel: longest line reaches "; print <- right; print <- " px; sideways scroll up to "; print <- maxX; print <- "\n";
+    }
+    self.clampScroll();
+  }
+
+  fn layoutOne(self: &, eb: &List[Block], cfg: &LayoutConfig) RichLayout {
+    var out = emptyLayout(f32.from(texW));
+    if richMade { let r = richRef(); out = layoutRich(eb, &images, &r.faces, cfg); }
+    out
+  }
+
+  fn drawStrip(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, view: &RichView, el: &RichLayout, sel: &List[RectP], caret: &CaretRect) {
+    if richMade { let r = richRef(); r.rr.draw(device, encoder, &stripTarget, view, &r.faces, el, &images, sel, caret); }
+  }
+
+  fn config(self: &) LayoutConfig {
+    var cfg = LayoutConfig.standard(if wide { CODE_LAYOUT_W } else { f32.from(texW) });
+    cfg.margin = 64.;
+    cfg.marginTop = 48.;
+    cfg.baseSize = f32.from(DOC_TEXT_PX);
+    cfg.lineHeight = 1.3;
+    cfg.textColor = INK;
+    if isTree(file.view()) {
+      // a folder tree in the room is read and hit from the seat: text 2.5 times the page's (rows about 7 cm tall on a 1.2 m screen)
+      cfg.baseSize = f32.from(TREE_TEXT_PX);
+      cfg.paraGap = 0.12;
+      cfg.listIndent = 0.9 * f32.from(TREE_TEXT_PX);
+      cfg.marginTop = 24.;
+      cfg.margin = 32.;
+    }
+    cfg
+  }
+
+  // richtext takes each character's glyph from the one face its style names; where that face has none (glyph 0), the
+  // glyph and its width come from the first fallback face that has the character, and the rest of the line moves over
+  fn fixGlyphs(self: &mut, faces: &Faces) {
+    glyphsSwapped = 0u32;
+    if u32.from(faces.count()) <= fallbackFrom { return; }
+    var li = 0usize;
+    while li < layout.lines.len() {
+      let g0 = usize.from(layout.lines[li].g0);
+      let gn = usize.from(layout.lines[li].gn);
+      var shift: f32 = 0.;
+      var gi = g0;
+      while gi < g0 + gn {
+        let g = layout.glyphs[gi];
+        if shift != 0. { (&mut layout.glyphs[gi]).x = g.x + shift; }
+        if g.glyph == 0u32 && usize.from(g.block) < blocks.len() && g.flags & GF_SPACE == 0u32 {
+          let t = blocks[usize.from(g.block)].text.view();
+          if usize.from(g.off) < t.len() {
+            let cp = codePointAt(t, usize.from(g.off));
+            if cp > 32u32 {
+              var f = fallbackFrom;
+              var found = false;
+              while f < u32.from(faces.count()) && !found {
+                let gl = faces.font(f).glyphOf(cp);
+                if gl != 0u32 {
+                  let font = faces.font(f);
+                  let adv = f32.from(font.advance(gl)) * g.size / f32.from(font.unitsPerEm);
+                  (&mut layout.glyphs[gi]).face = f;
+                  (&mut layout.glyphs[gi]).glyph = gl;
+                  (&mut layout.glyphs[gi]).adv = adv;
+                  shift = shift + (adv - g.adv);
+                  glyphsSwapped = glyphsSwapped + 1u32;
+                  found = true;
+                }
+                f = f + 1u32;
+              }
+            }
+          }
+        }
+        gi = gi + 1usize;
+      }
+      li = li + 1usize;
+    }
+  }
+
+  // The y of the first line of doc block d (the current scroll if it has none)
+  fn firstLineTop(self: &, d: usize) f32 {
+    var i = 0usize;
+    while i < layout.lines.len() {
+      let ob = usize.from(layout.lines[i].block);
+      if ob < owner.len() && *owner[ob] == d { return layout.lines[i].top; }
+      i = i + 1usize;
+    }
+    scrollY
+  }
+
+  // The doc block at the top of the view (past the end if there is none)
+  fn topDocBlock(self: &) usize {
+    var i = 0usize;
+    while i < layout.lines.len() {
+      if layout.lines[i].top + layout.lines[i].height > scrollY {
+        let ob = usize.from(layout.lines[i].block);
+        if ob < owner.len() { return *owner[ob]; }
+      }
+      i = i + 1usize;
+    }
+    doc.blocks.len()
+  }
+
+  fn clampScroll(self: &mut) {
+    let most = layout.height - f32.from(texH);
+    if scrollY > most { scrollY = most; }
+    if scrollY < 0. { scrollY = 0.; }
+    if scrollX > maxX { scrollX = maxX; }
+    if scrollX < 0. { scrollX = 0.; }
+  }
+
+  // The wheel: 'notches' (positive: away from the user, which is up the page)
+  pub fn scroll(self: &mut, notches: f32) {
+    let oy = scrollY;
+    scrollY = scrollY - notches * SCROLL_NOTCH_PX;
+    self.clampScroll();
+    self.scrolled(oy);
+    print <- "docpanel: wheel "; print <- notches; print <- ": scroll "; print <- scrollY; print <- " of "; print <- layout.height; print <- "\n";
+  }
+
+  pub fn testJump(self: &mut, frac: f32) {
+    let oy = scrollY;
+    let most = if layout.height > f32.from(texH) { layout.height - f32.from(texH) } else { 0. };
+    scrollY = most * frac;
+    self.clampScroll();
+    self.scrolled(oy);
+  }
+
+  // The one way every kind of panel is scrolled (the document pages, the browser, the report, the main panel; the trees of the zones
+  // build use it too): 'dx' and 'dy' are wheel notches, positive meaning right and up the page (so a stick's push up or right is positive).
+  // A page redraws at most every REDRAW_GAP_MS while it is scrolled; the log is left to the caller.
+  pub fn scrollBy(self: &mut, dx: f32, dy: f32) {
+    let ox = scrollX;
+    let oy = scrollY;
+    scrollY = scrollY - dy * SCROLL_NOTCH_PX;
+    if wide { scrollX = scrollX + dx * SCROLL_NOTCH_PX; }
+    self.clampScroll();
+    if scrollX != ox { dirty = true; }
+    self.scrolled(oy);
+  }
+
+  // The scroll moved from 'oy': the picture on the GPU is shown at the new place by the next draw (applyWindow), whatever the CPU is doing.
+  // A new band is drawn later, when the window nears the edge of this one (needBand).
+  fn scrolled(self: &mut, oy: f32) {
+    if scrollY == oy { return; }
+    scrolledAt = nowMs();
+    scrollDir = if scrollY > oy { 1. } else { -1. };
+    if texRows == 0u32 { dirty = true; }
+  }
+
+  // The scroll that is on show: the target held inside the band on the GPU, in whole pixels (the same as scrollY when the band holds it)
+  pub fn shownY(self: &) f32 {
+    if texRows == 0u32 { return scrollY; }
+    let lo = texTop;
+    var hi = texTop + f32.from(texRows) - f32.from(texH);
+    if hi < lo { hi = lo; }
+    var y = scrollY;
+    if y < lo { y = lo; }
+    if y > hi { y = hi; }
+    f32.from(i32.from(y + 0.5))
+  }
+
+  // Tell the page pass which part of the band to show: called by the draws, so the picture follows the scroll on the very next frame
+  fn applyWindow(self: &mut) {
+    if texRows == 0u32 { page.vOff = 0.; page.vScale = 0.; return; }
+    let rows = f32.from(texRows);
+    let frac = f32.from(texH) / rows;
+    page.vOff = 1. - (self.shownY() - texTop) / rows - frac;
+    page.vScale = frac - 1.;
+    if scrollTrace {
+      let sh = self.shownY();
+      if scrollY != traceT || sh != traceS {
+        traceT = scrollY;
+        traceS = sh;
+        print <- "strace: frame "; print <- traceFrame; print <- " "; printStr(file.view()); print <- " target "; print <- scrollY; print <- " shown "; print <- sh;
+        print <- " band "; print <- texTop; print <- "+"; print <- texRows; print <- "\n";
+      }
+    }
+  }
+
+  // Is a new band wanted: the window is near an edge of the one on the GPU (nearer than BAND_EDGE of the spare room, or nearer than BAND_AHEAD of it
+  // on the side it is moving to), and there is more page that way
+  fn needBand(self: &, now: u64) bool {
+    if texRows == 0u32 { return false; }
+    let slack = f32.from(texRows) - f32.from(texH);
+    let above = scrollY - texTop;
+    let below = texTop + f32.from(texRows) - f32.from(texH) - scrollY;
+    let moving = now < scrolledAt + 400u64;
+    let moreUp = texTop > 0.5;
+    let moreDown = texTop + f32.from(texRows) < layout.height - 0.5;
+    if slack <= 0. { return (above < 0. && moreUp) || (below < 0. && moreDown); }
+    let ahead = BAND_AHEAD * slack;
+    let edge = BAND_EDGE * slack;
+    if moreUp && (above < edge || (moving && scrollDir < 0. && above < ahead)) { return true; }
+    if moreDown && (below < edge || (moving && scrollDir > 0. && below < ahead)) { return true; }
+    // the strip at the foot is drawn into the band at the window's foot as it was: put it right once the scroll rests
+    if (note.len() > 0usize || err.len() > 0usize) && !moving && drawWindow != scrollY { return true; }
+    false
+  }
+
+  // A picture of the page not yet on the GPU: wait for it before drawing another (a new one would throw it away)
+  fn flatPending(self: &) bool { bandMult > 1u32 && up.busy && (up.stage == 0u32 || up.stage == 3u32) }
+
+  // This panel's scroll offset, in page pixels, and the most it goes (for a caller that draws a bar or shares the offset)
+  pub fn offset(self: &) ScrollOffset {
+    ScrollOffset(scrollX, scrollY, maxX, if layout.height > f32.from(texH) { layout.height - f32.from(texH) } else { 0. })
+  }
+
+  pub fn isWide(self: &) bool { wide }
+
+  // A mark's strength, 0 to 255: strong for a while, then down to FADE_LOW and staying there
+  fn strength(now: u64, born: u64) u32 {
+    let age = f64.from(now - born) / 1000.;
+    var s = 255.;
+    if age > FADE_HOLD_SECONDS {
+      let f = if age > FADE_SECONDS { 1. } else { (age - FADE_HOLD_SECONDS) / (FADE_SECONDS - FADE_HOLD_SECONDS) };
+      s = 255. - (255. - FADE_LOW) * f;
+    }
+    u32.from(s)
+  }
+
+  // Draw the page (with the margin bars) into the texture and give the renderer a texture and material of it
+  // Choose the band this draw makes: as tall as BAND_MULT windows (less for a short page), the window a little off its middle, towards the
+  // way the page is moving; the targets are made again if the height changed
+  fn pickBand(self: &mut, device: &mut Device) {
+    let hgt = layout.height;
+    var rows = texH;
+    if hgt > f32.from(texH) {
+      var want = u32.from(hgt) + 1u32;
+      want = ((want + 255u32) / 256u32) * 256u32;
+      rows = if want < bandMult * texH { want } else { bandMult * texH };
+      if rows < texH { rows = texH; }
+    }
+    if bandRows != rows {
+      let desc = TextureDescriptor(texW, rows, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+      target = device.createTexture(&desc);
+      readback = device.createBuffer(u64.from(texW * rows * 4u32), BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+      bandRows = rows;
+    }
+    let slack = f32.from(rows - texH);
+    let dir = if nowMs() < scrolledAt + 400u64 { scrollDir } else { 0. };
+    var top = scrollY - slack * (0.5 - 0.35 * dir);
+    var maxTop = hgt - f32.from(rows);
+    if maxTop < 0. { maxTop = 0.; }
+    if top > maxTop { top = maxTop; }
+    if top < 0. { top = 0.; }
+    bandTop = f32.from(i32.from(top));
+    drawWindow = scrollY;
+    var base = bandTop + f32.from(rows) - (scrollY + f32.from(texH));
+    if base < 0. { base = 0.; }
+    stripBase = u32.from(base);
+  }
+
+  fn redraw(self: &mut, device: &mut Device, renderer: &mut Renderer) {
+    dirty = false;
+    let now = nowMs();
+    lastDraw = now;
+    let sP = sdl.GetPerformanceCounter();
+    self.pickBand(device);
+    // the bars and lines, as underline-style rectangles that belong to the layout for this one draw
+    let keep = layout.rects.len();
+    var i = 0usize;
+    while i < layout.lines.len() {
+      let ln = layout.lines[i];
+      let ob = usize.from(ln.block);
+      if ob < owner.len() && *owner[ob] < born.len() && *born[*owner[ob]] != 0u64 {
+        let d = *owner[ob];
+        let rgb = if *kinds[d] == 1u32 { 0x2e9e4f00u32 } else { 0x2f6fd800u32 };
+        layout.rects.push(RectP(16., ln.top, 12., ln.height, rgb | DocPanel.strength(now, *born[d]), RK_UNDERLINE));
+      }
+      i = i + 1usize;
+    }
+    // the clicked block: an amber tint over its whole extent and a frame round it (kept until the next click)
+    if pointed < doc.blocks.len() {
+      var top: f32 = 0.;
+      var bot: f32 = 0.;
+      var any = false;
+      var q = 0usize;
+      while q < layout.lines.len() {
+        let l2 = layout.lines[q];
+        let ob2 = usize.from(l2.block);
+        if ob2 < owner.len() && *owner[ob2] == pointed {
+          if !any || l2.top < top { top = l2.top; }
+          if !any || l2.top + l2.height > bot { bot = l2.top + l2.height; }
+          any = true;
+        }
+        q = q + 1usize;
+      }
+      if any {
+        top = top - 4.;
+        bot = bot + 4.;
+        let wd = f32.from(texW);
+        layout.rects.push(RectP(36., top, wd - 72., bot - top, 0xf5b02000u32 | 0x34u32, RK_UNDERLINE));
+        layout.rects.push(RectP(36., top, wd - 72., 3., 0xd9820000u32 | 0xe0u32, RK_UNDERLINE));
+        layout.rects.push(RectP(36., bot - 3., wd - 72., 3., 0xd9820000u32 | 0xe0u32, RK_UNDERLINE));
+        layout.rects.push(RectP(36., top, 3., bot - top, 0xd9820000u32 | 0xe0u32, RK_UNDERLINE));
+        layout.rects.push(RectP(wd - 39., top, 3., bot - top, 0xd9820000u32 | 0xe0u32, RK_UNDERLINE));
+      }
+    }
+    var k = 0usize;
+    while k < dels.len() {
+      let before = dels[k].before;
+      var y: f32 = 0.;
+      if before >= doc.blocks.len() {
+        if layout.lines.len() > 0usize { y = layout.lines[layout.lines.len() - 1usize].top + layout.lines[layout.lines.len() - 1usize].height + 2.; }
+      }
+      else { y = self.firstLineTop(before) - 4.; }
+      layout.rects.push(RectP(10., y - 1.5, 26., 3., 0xd0203000u32 | DocPanel.strength(now, dels[k].born), RK_UNDERLINE));
+      k = k + 1usize;
+    }
+    let view = RichView(f32.from(texW), f32.from(bandRows), 0. - scrollX, bandTop, PAPER, PAPER, 0u32, 0xC03000FFu32,
+      if wide { CODE_LAYOUT_W } else { f32.from(texW) }, ed.on && self.caretRectNow().h > 0.);
+    let sel = List[RectP]();
+    let caret = self.caretRectNow();
+    let s0 = sdl.GetPerformanceCounter();
+    var encoder = device.createCommandEncoder();
+    if richMade { let r = richRef(); r.rr.draw(device, &mut encoder, &target, &view, &r.faces, &layout, &images, &sel, &caret); }
+    encoder.copyTextureToBuffer(&target, &readback);
+    let sE = sdl.GetPerformanceCounter();
+    device.queue.submit(encoder.finish());
+    device.waitIdle();
+    let s1 = sdl.GetPerformanceCounter();
+    if scrollTrace { print <- "docpanel: redraw split: prelude "; print <- micros(sP, s0) / 1000.; print <- " ms, encode "; print <- micros(s0, sE) / 1000.; print <- " ms, submit+wait "; print <- micros(sE, s1) / 1000.; print <- " ms\n"; }
+    while layout.rects.len() > keep { layout.rects.pop(); }
+    // (the rest, next frame: the readback, the stems and the upload are each a frame's work of their own)
+    drawScrollY = bandTop;
+    drawScrollX = scrollX;
+    phase2 = true;
+    fin = 0u32;
+    frow = 0i32;
+    print <- "docpanel: redraw: draw+wait "; print <- micros(s0, s1) / 1000.; print <- " ms\n";
+  }
+
+  // The second half of a redraw: the target's pixels to an image, the stems darkened, the diagrams and the error strip put on, and the
+  // image handed to the sliced upload (pageup.cone), which a tick advances a little at a time
+  // (A band is tall, so this is done a slice of a frame at a time, in steps: fin 0 the rows to the image, 1 the stems, 2 diagrams and strip, 3 begin.)
+  fn redrawFinish(self: &mut, device: &mut Device) {
+    if upSpentUs >= UP_SLICE_US { return; }
+    let allowed = UP_SLICE_US - upSpentUs;
+    let t0 = sdl.GetPerformanceCounter();
+    let w = i32.from(texW);
+    let rows = i32.from(bandRows);
+    if fin == 0u32 {
+      if frow == 0i32 { fimg = Image(w, rows, 3, List[u8].withCapacity(usize.from(w * rows * 3))); }
+      let data = readback.mappedRange();
+      while frow < rows {
+        // (what Image.fromTexels does: the image's row y from the bottom is the texels' row rows - 1 - y)
+        let row = data + usize.from((rows - 1i32 - frow) * w * 4i32);
+        var x = 0i32;
+        while x < w {
+          let p = row + usize.from(x * 4i32);
+          fimg.pixels.push(*p);
+          fimg.pixels.push(*(p + 1usize));
+          fimg.pixels.push(*(p + 2usize));
+          x = x + 1i32;
+        }
+        frow = frow + 1i32;
+        if frow % 8i32 == 0i32 && PageUp.usSince(t0) >= allowed { break; }
+      }
+      if frow >= rows { fin = 1u32; frow = 0i32; }
+    }
+    else if fin == 1u32 {
+      frow = darkenRows(&mut fimg, &mut stemTab, frow, rows, t0, allowed);
+      if frow >= rows { fin = 2u32; frow = 0i32; }
+    }
+    else if fin == 2u32 {
+      blitDiagrams(&mut fimg, &layout, &imgDiag, &cache, drawScrollY, pointedDiag, pointedKey, w, rows);
+      if err.len() > 0usize || note.len() > 0usize { self.errorStrip(device, &mut fimg); }
+      fin = 3u32;
+    }
+    else {
+      up.begin(&mut fimg, nowMs() + UP_MIP_HOLD_MS, drawScrollY);
+      fimg = Image(0, 0, 3, List[u8]());
+      fin = 0u32;
+      frow = 0i32;
+      phase2 = false;
+    }
+    let us = PageUp.usSince(t0);
+    upSpentUs = upSpentUs + us;
+    if us > 8000u64 || scrollTrace { print <- "docpanel: finish step "; print <- fin; print <- " took "; print <- us / 1000u64; print <- " ms\n"; }
+  }
+
+  // The error as one red line at the foot of the page: laid out and drawn apart (richtext draws only a document),
+  // then its rows written over the page's last rows
+  fn errorStrip(self: &mut, device: &mut Device, img: &mut Image) {
+    var line = String();
+    var bg = 0xf2a8b0ffu32;
+    var ink = 0x600010ffu32;
+    if err.len() > 0usize {
+      line.append("File error: ");
+      line.append(err.view());
+      line.append(". Showing the last good version.");
+    }
+    else {
+      line.append(note.view());
+      bg = 0xc9dcf5ffu32;
+      ink = 0x10264dffu32;
+    }
+    var eb = List[Block]();
+    eb.push(Block.fromText(line.view(), Style(true, false, false, 0., ink, 0u32, 0u32)));
+    var cfg = self.config();
+    cfg.marginTop = 10.;
+    cfg.baseSize = 22.;
+    let el = self.layoutOne(&eb, &cfg);
+    let view = RichView(f32.from(texW), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32,
+      f32.from(texW), false);
+    let sel = List[RectP]();
+    let caret = CaretRect(0., 0., 0.);
+    var encoder = device.createCommandEncoder();
+    self.drawStrip(device, &mut encoder, &view, &el, &sel, &caret);
+    encoder.copyTextureToBuffer(&stripTarget, &stripBuf);
+    device.queue.submit(encoder.finish());
+    device.waitIdle();
+    let strip = Image.fromTexels(stripBuf.mappedBytes(), i32.from(texW), i32.from(STRIP_H), false);
+    // both are bottom row first: the strip's rows 0.. go over the page's rows 0..
+    let n = usize.from(texW * STRIP_H * 3u32);
+    let base = usize.from(stripBase) * usize.from(texW) * 3usize;
+    var p = 0usize;
+    while p < n { img.pixels.set(base + p, *strip.pixels[p]); p = p + 1usize; }
+    if err.len() == 0usize {
+      self.chip(device, img, 0u32, if recOn { "F2 Pause" } else { "F2 Record" }, if recOn { 0xd02020ffu32 } else { 0x2e8b57ffu32 });
+      self.chip(device, img, 1u32, "F3 Send", 0x2060c0ffu32);
+      self.chip(device, img, 2u32, "Clear", 0x808080ffu32);
+      if recOn { self.dot(img); }
+    }
+  }
+
+  // One chip: its label is laid out and drawn like the strip's line (white on a colour), and its top-left corner is
+  // copied to the strip's foot (the images are bottom row first, so the label's rows are the strip's highest)
+  fn chip(self: &mut, device: &mut Device, img: &mut Image, slot: u32, label: &str, bg: u32) {
+    var eb = List[Block]();
+    eb.push(Block.fromText(label, Style(true, false, false, 0., 0xffffffffu32, 0u32, 0u32)));
+    var cfg = self.config();
+    cfg.margin = 14.;
+    cfg.marginTop = 10.;
+    cfg.baseSize = 22.;
+    let el = self.layoutOne(&eb, &cfg);
+    let view = RichView(f32.from(texW), f32.from(STRIP_H), 0., 0., bg, bg, 0u32, 0u32, f32.from(texW), false);
+    let sel = List[RectP]();
+    let caret = CaretRect(0., 0., 0.);
+    var encoder = device.createCommandEncoder();
+    self.drawStrip(device, &mut encoder, &view, &el, &sel, &caret);
+    encoder.copyTextureToBuffer(&stripTarget, &stripBuf);
+    device.queue.submit(encoder.finish());
+    device.waitIdle();
+    let strip = Image.fromTexels(stripBuf.mappedBytes(), i32.from(texW), i32.from(STRIP_H), false);
+    let x0 = usize.from(CHIP_X0 + slot * CHIP_STEP);
+    var ry = 0usize;
+    while ry < usize.from(CHIP_H) {
+      let srcRow = usize.from(STRIP_H) - usize.from(CHIP_H) + ry;
+      let dstRow = usize.from(stripBase) + usize.from(CHIP_BOTTOM) + ry;
+      var cx = 0usize;
+      while cx < usize.from(CHIP_W) {
+        var c = 0usize;
+        while c < 3usize {
+          img.pixels.set((dstRow * usize.from(texW) + x0 + cx) * 3usize + c, *strip.pixels[(srcRow * usize.from(texW) + cx) * 3usize + c]);
+          c = c + 1usize;
+        }
+        cx = cx + 1usize;
+      }
+      ry = ry + 1usize;
+    }
+  }
+
+  // The recording dot: a red disc at the strip's lower left
+  fn dot(self: &mut, img: &mut Image) {
+    let cx = 40i32;
+    let cy = 28i32 + i32.from(stripBase);
+    var y = cy - 14i32;
+    while y <= cy + 14i32 {
+      var x = cx - 14i32;
+      while x <= cx + 14i32 {
+        if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= 196i32 {
+          let o = (usize.from(y) * usize.from(texW) + usize.from(x)) * 3usize;
+          img.pixels.set(o, 230u8);
+          img.pixels.set(o + 1usize, 20u8);
+          img.pixels.set(o + 2usize, 20u8);
+        }
+        x = x + 1i32;
+      }
+      y = y + 1i32;
+    }
+  }
+
+  // Record the page into 'target' (the finished picture, kept), unlit, from the camera's view and projection
+  pub fn drawPage(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4) {
+    let w = f32.from(worldW) * 0.5;
+    let h = w * f32.from(texH) / f32.from(texW);
+    let y = self.centreY();
+    self.applyWindow();
+    page.draw(device, encoder, target, viewProjection, Vec4(0. - w, y - h, w, y + h));
+  }
+
+  // As drawPage, hidden where the scene's depth is nearer (the incubator: a beam or a dot in front of the page shows)
+  pub fn drawPageDepth(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, viewProjection: Mat4) {
+    let w = f32.from(worldW) * 0.5;
+    let h = w * f32.from(texH) / f32.from(texW);
+    let y = self.centreY();
+    self.applyWindow();
+    page.drawDepthed(device, encoder, target, depth, viewProjection, Vec4(0. - w, y - h, w, y + h));
+  }
+
+  // How far along the ray the page is met (in the page's own space), or -1 if the ray misses it: click's test, taking nothing. The
+  // headset's beam ends there.
+  pub fn reach(self: &, eye: Vec3, direction: Vec3) f32 {
+    if direction.z > -0.00001 && direction.z < 0.00001 { return -1.; }
+    let t = (0. - eye.z) / direction.z;
+    if t < 0. { return -1.; }
+    let hit = eye + direction * t;
+    let w = f32.from(worldW);
+    let h = w * f32.from(texH) / f32.from(texW);
+    let u = (hit.x + w * 0.5) / w;
+    let v = (hit.y - (self.centreY() - h * 0.5)) / h;
+    if u < 0. || u > 1. || v < 0. || v > 1. { return -1.; }
+    t
+  }
+
+  // A click on a diagram: the node, message, note or participant under it, named by its key (the log line is rewritten)
+  fn pointDiagram(self: &mut, pblock: usize, px: f32, py: f32, line: &mut String) {
+    let di = *blockDiag[pblock];
+    var bi = 0usize;
+    while bi < layout.boxes.len() {
+      if usize.from(layout.boxes[bi].block) == pblock {
+        let ux = px - layout.boxes[bi].x;
+        let uy = py - layout.boxes[bi].y;
+        var k = 0usize;
+        while k < cache[di].keys.len() {
+          let rx = *cache[di].rects[k * 4usize];
+          let ry = *cache[di].rects[k * 4usize + 1usize];
+          let rw = *cache[di].rects[k * 4usize + 2usize];
+          let rh = *cache[di].rects[k * 4usize + 3usize];
+          if ux >= rx && ux <= rx + rw && uy >= ry && uy <= ry + rh {
+            pointedDiag = di;
+            pointedKey = k;
+            var path = String.from(doc.blocks[*owner[pblock]].path.view());
+            path.append(SEP);
+            path.append(cache[di].keys[k].view());
+            path.append(" | ");
+            path.append(cache[di].labels[k].view());
+            *line = path;
+            print <- "docpanel: diagram "; print <- di; print <- ": pointed at ["; printStr(cache[di].keys[k].view()); print <- "]\n";
+            return;
+          }
+          k = k + 1usize;
+        }
+      }
+      bi = bi + 1usize;
+    }
+  }
+
+  // A ray from the eye: does it meet the page? If so, name the block there.
+  pub fn click(self: &mut, eye: Vec3, direction: Vec3) bool {
+    if direction.z > -0.00001 && direction.z < 0.00001 { return false; }
+    let t = (0. - eye.z) / direction.z;
+    if t < 0. { return false; }
+    let hit = eye + direction * t;
+    let w = f32.from(worldW);
+    let h = w * f32.from(texH) / f32.from(texW);
+    let u = (hit.x + w * 0.5) / w;
+    let v = (hit.y - (self.centreY() - h * 0.5)) / h;
+    if u < 0. || u > 1. || v < 0. || v > 1. { return false; }
+    // a chip on the note strip (the strip is fixed at the page's foot, whatever the scroll)
+    if note.len() > 0usize && err.len() == 0usize {
+      let tx = u * f32.from(texW);
+      let ty = (1. - v) * f32.from(texH);
+      if ty >= f32.from(texH - CHIP_BOTTOM - CHIP_H) && ty <= f32.from(texH - CHIP_BOTTOM) {
+        var slot = 0u32;
+        while slot < 3u32 {
+          let x0 = f32.from(CHIP_X0 + slot * CHIP_STEP);
+          if tx >= x0 && tx < x0 + f32.from(CHIP_W) { chipHit = slot + 1u32; return true; }
+          slot = slot + 1u32;
+        }
+      }
+    }
+    let px = u * f32.from(texW) + scrollX;
+    let py = (1. - v) * f32.from(texH) + self.shownY();
+    if layout.lines.len() == 0usize { return true; }
+    // the line under the pointer (by its own rows); between lines, the nearest one by distance
+    var best = layout.lines.len();
+    var bestD: f32 = 1000000.;
+    var li = 0usize;
+    while li < layout.lines.len() {
+      let ln = layout.lines[li];
+      var dd: f32 = 0.;
+      if py < ln.top { dd = ln.top - py; }
+      else if py >= ln.top + ln.height { dd = py - (ln.top + ln.height) + 0.001; }
+      if dd < bestD { bestD = dd; best = li; }
+      li = li + 1usize;
+    }
+    var pblock = 0usize;
+    if best < layout.lines.len() { pblock = usize.from(layout.lines[best].block); }
+    let p = posAt(&layout, px, py);
+    print <- "hit: u "; print <- u; print <- " v "; print <- v; print <- " tex ("; print <- px; print <- ", "; print <- py - self.shownY();
+    print <- ") scroll "; print <- self.shownY(); print <- " page y "; print <- py; print <- " line "; print <- best;
+    if best < layout.lines.len() { print <- " rows "; print <- layout.lines[best].top; print <- ".."; print <- layout.lines[best].top + layout.lines[best].height; }
+    print <- " gap "; print <- bestD; print <- " layoutblock "; print <- pblock; print <- " (posAt said "; print <- p.block; print <- ")\n";
+    var line = String();
+    if isTree(file.view()) && bestD < 60. && pblock < owner.len() && *owner[pblock] < doc.blocks.len() {
+      // a tree row: the whole row is the button (the arrow, the name, the empty part to its right), one click
+      let tb = &doc.blocks[*owner[pblock]];
+      var ts = 0usize;
+      while ts < tb.spans.len() {
+        let lk = tb.spans[ts].link;
+        if lk > 0u32 && usize.from(lk) <= tb.targets.len() && pendingLink.len() == 0usize { pendingLink = String.from(tb.targets[usize.from(lk) - 1usize].view()); }
+        ts = ts + 1usize;
+      }
+    }
+    else if bestD < 0.5 && pblock < owner.len() && *owner[pblock] < doc.blocks.len() {
+      // a link under the pointer: followed on the next tick
+      let lb = &doc.blocks[*owner[pblock]];
+      let prefix = if lb.kind == DK_QUOTE { 6usize } else { 0usize };
+      if p.off >= prefix {
+        var at = p.off - prefix;
+        var si = 0usize;
+        var start = 0usize;
+        while si < lb.spans.len() {
+          if at >= start && at < start + lb.spans[si].len {
+            let lk = lb.spans[si].link;
+            if lk > 0u32 && usize.from(lk) <= lb.targets.len() { pendingLink = String.from(lb.targets[usize.from(lk) - 1usize].view()); }
+          }
+          start = start + lb.spans[si].len;
+          si = si + 1usize;
+        }
+      }
+    }
+    if bestD < 40. && pblock < owner.len() && *owner[pblock] < doc.blocks.len() {
+      pointed = *owner[pblock];
+      dirty = true;
+      // a click on a paragraph of a Markdown page puts the caret there (a link followed is not an edit)
+      if self.editable() && pendingLink.len() == 0usize {
+        ed.pend = true;
+        ed.pendBlock = *owner[pblock];
+        ed.pendOff = p.off;
+        if doc.blocks[*owner[pblock]].kind == DK_QUOTE && ed.pendOff >= 6usize { ed.pendOff = ed.pendOff - 6usize; }
+      }
+      let b = &doc.blocks[*owner[pblock]];
+      line.append(b.path.view());
+      line.append(" | ");
+      var cut = b.text.len();
+      if cut > 60usize {
+        cut = 60usize;
+        while cut > 0usize && isContByte(b.text.view()[cut]) { cut = cut - 1usize; }
+      }
+      line.append(b.text.view().slice(0usize, cut));
+    }
+    else { line.append("(no block here)"); }
+    if bestD < 40. && pblock < blockDiag.len() && *blockDiag[pblock] != NOMATCH { self.pointDiagram(pblock, px, py, &mut line); }
+    print <- "panel click: "; printStr(line.view()); print <- "\n";
+    // the log line is: unix ms TAB document TAB path | text (the bridge reads it)
+    var stamped = numText(unixMs());
+    stamped.append("\t");
+    // (a click that only expands or collapses a folder is navigation, not something Jon pointed at: the bridge sorts it by this mark)
+    if isTree(file.view()) && pendingLink.len() > 0usize && fs.isDir(&Path.from(normalizePath(pendingLink.view()).view())) { stamped.append("nav:"); }
+    stamped.append(file.view());
+    stamped.append("\t");
+    stamped.append(line.view());
+    line = stamped;
+    line.append("\n");
+    var bytes = List[u8]();
+    var k = 0usize;
+    while k < line.len() { bytes.push(line.view()[k]); k = k + 1usize; }
+    if let Err(e) = fs.appendFile(&Path.from(POINTER_LOG), bytes.view()) { print <- "pointer log: "; print <- e; print <- "\n"; }
+    true
+  }
+}
+
+// Copy each diagram's pixels over its picture box in the page (both are bottom row first, 3 bytes a pixel), clipped to
+// the view; the thing last pointed at gets an amber frame
+fn blitDiagrams(img: &mut Image, layout: &RichLayout, imgDiag: &List[usize], cache: &List[Diagram], scrollY: f32, hd: usize, hk: usize, pw: i32, ph: i32) {
+  var b = 0usize;
+  while b < layout.boxes.len() {
+    let bx = &layout.boxes[b];
+    b = b + 1usize;
+    if bx.image == 0u32 { continue; }
+    let ii = usize.from(bx.image) - 1usize;
+    if ii >= imgDiag.len() { continue; }
+    let di = *imgDiag[ii];
+    if cache[di].pixels.len() == 0usize { continue; }
+    let dw = i32.from(cache[di].w);
+    let dh = i32.from(cache[di].h);
+    let x0 = i32.from(bx.x + 0.5);
+    let y0 = i32.from(bx.y - scrollY + 4000.5) - 4000;
+    var r = 0i32;
+    while r < dh {
+      let sy = y0 + (dh - 1i32 - r);
+      if sy >= 0i32 && sy < ph {
+        let dstRow = ph - 1i32 - sy;
+        var x = 0i32;
+        while x < dw {
+          let dx = x0 + x;
+          if dx >= 0i32 && dx < pw {
+            let si = usize.from((r * dw + x) * 3i32);
+            let di3 = usize.from((dstRow * pw + dx) * 3i32);
+            img.pixels.set(di3, *cache[di].pixels[si]);
+            img.pixels.set(di3 + 1usize, *cache[di].pixels[si + 1usize]);
+            img.pixels.set(di3 + 2usize, *cache[di].pixels[si + 2usize]);
+          }
+          x = x + 1i32;
+        }
+      }
+      r = r + 1i32;
+    }
+    if di == hd && hk < cache[di].keys.len() {
+      let fx = x0 + i32.from(*cache[di].rects[hk * 4usize]);
+      let fy = y0 + i32.from(*cache[di].rects[hk * 4usize + 1usize]);
+      let fw = i32.from(*cache[di].rects[hk * 4usize + 2usize]);
+      let fh = i32.from(*cache[di].rects[hk * 4usize + 3usize]);
+      var t = 0i32;
+      while t < 3i32 {
+        var k = 0i32;
+        while k < fw + 6i32 {
+          putPixel(img, pw, ph, fx - 3i32 + k, fy - 3i32 + t);
+          putPixel(img, pw, ph, fx - 3i32 + k, fy + fh + t);
+          k = k + 1i32;
+        }
+        k = 0i32;
+        while k < fh + 6i32 {
+          putPixel(img, pw, ph, fx - 3i32 + t, fy - 3i32 + k);
+          putPixel(img, pw, ph, fx + fw + t, fy - 3i32 + k);
+          k = k + 1i32;
+        }
+        t = t + 1i32;
+      }
+    }
+  }
+}
+
+// An amber pixel at x, y of the view (y down)
+fn putPixel(img: &mut Image, pw: i32, ph: i32, x: i32, y: i32) {
+  if x < 0i32 || y < 0i32 || x >= pw || y >= ph { return; }
+  let at = usize.from(((ph - 1i32 - y) * pw + x) * 3i32);
+  img.pixels.set(at, 0xd9u8);
+  img.pixels.set(at + 1usize, 0x82u8);
+  img.pixels.set(at + 2usize, 0x00u8);
+}
+
+// Stem darkening. Thin strokes of 22-pixel text are partly covered pixels, which look pale once the page is
+// drawn small on the wall (the mip chain averages in linear light). Each channel's distance from the paper's is
+// raised to a power below one, so a half-covered pixel is darker than half: text keeps its contrast at a distance.
+// The paper itself and full ink are unchanged.
+// Stem darkening of the image's rows from 'y0' on, until 'rows' or the time is out (t0: the counter when the slice began, 'allowed' in
+// microseconds); the row it got to is returned. 'stemTab' is the three tables (made on the first call).
+fn darkenRows(img: &mut Image, stemTab: &mut List[u8], y0: i32, rows: i32, t0: u64, allowed: u64) i32 {
+  if stemTab.len() == 0usize {
+    var c = 0usize;
+    while c < 3usize {
+      let paper = f32.from(u32.from(if c == 0usize { PAPER >> 24u32 } else if c == 1usize { (PAPER >> 16u32) & 255u32 } else { (PAPER >> 8u32) & 255u32 }));
+      var v = 0usize;
+      while v < 256usize {
+        let ink = (paper - f32.from(v)) / paper;
+        var out = f32.from(v);
+        if ink > 0. { out = paper * (1. - libc.powf(ink, stemPower)); }
+        if out < 0. { out = 0.; }
+        stemTab.push(u8.from(u32.from(out + 0.5)));
+        v = v + 1usize;
+      }
+      c = c + 1usize;
+    }
+  }
+  let rowBytes = usize.from(img.width) * 3usize;
+  var y = y0;
+  while y < rows {
+    var p = usize.from(y) * rowBytes;
+    let end = p + rowBytes;
+    while p + 2usize < end {
+      img.pixels.set(p, *stemTab[usize.from(*img.pixels[p])]);
+      img.pixels.set(p + 1usize, *stemTab[256usize + usize.from(*img.pixels[p + 1usize])]);
+      img.pixels.set(p + 2usize, *stemTab[512usize + usize.from(*img.pixels[p + 2usize])]);
+      p = p + 3usize;
+    }
+    y = y + 1i32;
+    if y % 8i32 == 0i32 && PageUp.usSince(t0) >= allowed { break; }
+  }
+  y
+}
+
+fn darkenStems(img: &mut Image) {
+  var tables = List[u8]();
+  var c = 0usize;
+  while c < 3usize {
+    let paper = f32.from(u32.from(if c == 0usize { PAPER >> 24u32 } else if c == 1usize { (PAPER >> 16u32) & 255u32 } else { (PAPER >> 8u32) & 255u32 }));
+    var v = 0usize;
+    while v < 256usize {
+      let ink = (paper - f32.from(v)) / paper;
+      var out = f32.from(v);
+      if ink > 0. { out = paper * (1. - libc.powf(ink, stemPower)); }
+      if out < 0. { out = 0.; }
+      tables.push(u8.from(u32.from(out + 0.5)));
+      v = v + 1usize;
+    }
+    c = c + 1usize;
+  }
+  let n = img.pixels.len();
+  var p = 0usize;
+  while p + 2usize < n {
+    img.pixels.set(p, *tables[usize.from(*img.pixels[p])]);
+    img.pixels.set(p + 1usize, *tables[256usize + usize.from(*img.pixels[p + 1usize])]);
+    img.pixels.set(p + 2usize, *tables[512usize + usize.from(*img.pixels[p + 2usize])]);
+    p = p + 3usize;
+  }
+}
+
+// A doc block as richtext's block: its kind, and its spans as styled runs
+fn toBlock(b: &DocBlock) Block {
+  var blk = Block();
+  if b.kind == DK_HEAD {
+    blk.kind = if b.depth <= 1u32 { BK_H1 } else if b.depth == 2u32 { BK_H2 } else { BK_H3 };
+  }
+  else if b.kind == DK_BULLET { blk.kind = BK_BULLET; blk.depth = b.depth; }
+  else if b.kind == DK_NUMBER { blk.kind = BK_NUMBER; blk.depth = b.depth; }
+  var text = String();
+  let quote = b.kind == DK_QUOTE;
+  let wholeCode = b.kind == DK_CODE;
+  if quote {
+    // an indented paragraph: richtext has no quote kind (a package follow-up)
+    text.append("      ");
+    blk.runs.push(Run(6usize, quoteStyle(false)));
+  }
+  text.append(b.text.view());
+  var i = 0usize;
+  while i < b.spans.len() {
+    let sp = &b.spans[i];
+    var st = Style.plain();
+    if sp.code || wholeCode { st = Style(true, true, false, 0., toneInk(sp.tone), 0u32, 0u32); }       // bold + italic: the monospace slot
+    else if quote { st = quoteStyle(sp.bold); }
+    else { st.bold = sp.bold; st.italic = sp.italic && !sp.bold; }
+    if sp.link > 0u32 { st = Style(st.bold, st.italic && !st.bold, true, 0., LINK_INK, sp.link, 0u32); }
+    pushRun(&mut blk.runs, sp.len, st);
+    i = i + 1usize;
+  }
+  blk.text = text;
+  blk
+}
+
+const LINK_INK = 0x1a4fb4ffu32;
+
+// The colour of a code file's token class (0: the code ink)
+fn toneInk(tone: u32) u32 {
+  if tone == TONE_KEYWORD { return 0x0b5fa5ffu32; }
+  if tone == TONE_STRING { return 0x1f7a2fffu32; }
+  if tone == TONE_COMMENT { return 0x707070ffu32; }
+  if tone == TONE_NUMBER { return 0x9a3a86ffu32; }
+  if tone == TONE_LINENO { return 0xa0a0a0ffu32; }
+  if tone == TONE_TYPE { return 0x8a4a08ffu32; }
+  CODE_INK
+}
+
+fn quoteStyle(bold: bool) Style {
+  Style(bold, !bold, false, 0., QUOTE_INK, 0u32, 0u32)
+}
+
+fn pushRun(runs: &mut List[Run], len: usize, st: Style) {
+  let n = runs.len();
+  if n > 0usize && sameStyle(&runs[n - 1usize].style, &st) {
+    (&mut runs[n - 1usize]).len = runs[n - 1usize].len + len;
+  }
+  else { runs.push(Run(len, st)); }
+}
+
+// The page: DOC_WORLD_W across, standing at z = 0 facing +z, its middle DOC_CENTRE_Y up. uv (0, 0) is its lower left.
+struct PageParams {
+  transform: Mat4;               // the camera's projection times its view
+  rect: Vec4;                    // x0, y0, x1, y1 of the page in the world (z = 0)
+  extra: Vec4;                   // x: the mip level bias
+}
+
+// The unlit page pass (docpage.slang): a pipeline drawing one textured quad into the finished picture, so the page's
+// texels are what the screen shows, whatever the scene's light, exposure, auto-exposure, bloom and tone map. The
+// texture is the renderer's sRGB one with its mip chain, sampled trilinear and anisotropic (16) with a small
+// negative bias; the target is sRGB too, so the values go out as they came in (no second gamma).
+// Fields die in this order: the group before what it was made from.
+struct PagePass {
+  group: BindGroup;
+  texture: Texture;
+  uniforms: Buffer;
+  sampler: Sampler;
+  pipeline: RenderPipeline;
+  pipelineD: RenderPipeline;    // the same, depth tested (for drawDepthed)
+  layout: PipelineLayout;
+  groupLayout: BindGroupLayout;
+  shader: ShaderModule;
+  depthed: bool;                // drawn against the scene's depth (createDepth), for labels that hide behind things
+  vOff: f32 = 0.;               // the part of the texture shown, vertically (docpage.slang: uv.y = c.y * (1 + vScale) + vOff); 0, 0: all of it
+  vScale: f32 = 0.;
+
+  fn create(device: &mut Device, format: u32) PagePass { PagePass.build(device, format, false) }
+
+  // The same, depth tested (not written) against the scene's depth kept by ImageFx
+  fn createDepth(device: &mut Device, format: u32) PagePass { PagePass.build(device, format, true) }
+
+  fn build(device: &mut Device, format: u32, depthed: bool) PagePass {
+    var shader = device.createShaderModule(&DOCPAGE_SPIRV);
+    let entries = [BindGroupLayoutEntry(binding: 0u32, visibility: SHADER_STAGE_VERTEX | SHADER_STAGE_FRAGMENT),
+      BindGroupLayoutEntry(binding: 1u32, visibility: SHADER_STAGE_FRAGMENT, kind: BINDING_KIND_TEXTURE),
+      BindGroupLayoutEntry(binding: 2u32, visibility: SHADER_STAGE_FRAGMENT, kind: BINDING_KIND_SAMPLER)];
+    var groupLayout = device.createBindGroupLayout(&entries);
+    let groupLayouts = [&groupLayout];
+    var layout = device.createPipelineLayout(&groupLayouts, 0u32);
+    let attributes = [VertexAttribute(VERTEX_FORMAT_FLOAT32, 0u64, 0u32)];
+    let buffers = [VertexBufferLayout(arrayStride: 4u64, attributes: &attributes)];
+    let desc = RenderPipelineDescriptor(layout: &layout, vertexModule: &shader, vertexEntryPoint: "vertexMain",
+      buffers: &buffers[..<0], fragmentModule: &shader, fragmentEntryPoint: "fragmentMain", colorFormat: format,
+      depthFormat: if depthed { TEXTURE_FORMAT_DEPTH32_FLOAT } else { TEXTURE_FORMAT_UNDEFINED },
+      depthCompare: COMPARE_FUNCTION_LESS_EQUAL, blendEnabled: true, colorSrcFactor: BLEND_FACTOR_SRC_ALPHA,
+      colorDstFactor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+    var pipeline = device.createRenderPipeline(&desc);
+    // (and the same tested against the scene's depth, for a panel in the incubator: what stands in front of it, a beam, hides it)
+    let descD = RenderPipelineDescriptor(layout: &layout, vertexModule: &shader, vertexEntryPoint: "vertexMain",
+      buffers: &buffers[..<0], fragmentModule: &shader, fragmentEntryPoint: "fragmentMain", colorFormat: format,
+      depthFormat: TEXTURE_FORMAT_DEPTH32_FLOAT,
+      depthCompare: COMPARE_FUNCTION_LESS_EQUAL, blendEnabled: true, colorSrcFactor: BLEND_FACTOR_SRC_ALPHA,
+      colorDstFactor: BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+    var pipelineD = device.createRenderPipeline(&descD);
+    let samplerDesc = SamplerDescriptor(addressModeU: ADDRESS_MODE_CLAMP_TO_EDGE, addressModeV: ADDRESS_MODE_CLAMP_TO_EDGE,
+      addressModeW: ADDRESS_MODE_CLAMP_TO_EDGE, mipmapFilter: FILTER_MODE_LINEAR, maxAnisotropy: 16u32);
+    var sampler = device.createSampler(&samplerDesc);
+    var uniforms = device.createBuffer(96u64, BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST);
+    let one = TextureDescriptor(1u32, 1u32, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST);
+    var texture = device.createTexture(&one);
+    let view = texture.createView();
+    let group = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    PagePass(group, texture, uniforms, sampler, pipeline, pipelineD, layout, groupLayout, shader, depthed)
+  }
+
+  // The page's new picture: a texture of it with its mip chain (averaged in linear light, as the renderer's own sRGB
+  // textures are), a bind group of that; the old ones released once the GPU is done with them
+  fn upload(self: &mut, device: &mut Device, img: &Image) {
+    let w = u32.from(img.width);
+    let h = u32.from(img.height);
+    var rgba = List[u8].withCapacity(usize.from(w * h * 4u32));
+    var p = 0usize;
+    let n = usize.from(w * h);
+    while p < n {
+      rgba.push(*img.pixels[p * 3usize]);
+      rgba.push(*img.pixels[p * 3usize + 1usize]);
+      rgba.push(*img.pixels[p * 3usize + 2usize]);
+      rgba.push(255u8);
+      p = p + 1usize;
+    }
+    self.uploadRgba(device, w, h, &rgba);
+  }
+
+  // The same from bytes already RGBA (a soft ring or shadow has an alpha of its own)
+  fn uploadRgba(self: &mut, device: &mut Device, w: u32, h: u32, rgba: &List[u8]) {
+    let chain = buildMips(rgba, w, h, MIP_COLOUR);
+    let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+      mipLevelCount(w, h));
+    var fresh = device.createTexture(&desc);
+    let cv = chain.view();
+    device.queue.writeTextureLevels(&fresh, &cv[0] as *u8);
+    let view = fresh.createView();
+    var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    made <-> group;
+    fresh <-> texture;
+    device.queue.releaseBindGroup(&mut made);
+    device.queue.releaseTexture(&mut fresh);
+  }
+
+  // The same without a mip chain (one level, the bytes as they are): for a picture that is replaced often, as the web
+  // panel's is, where building the chain on the CPU costs most of 80 ms
+  fn uploadRgbaFlat(self: &mut, device: &mut Device, w: u32, h: u32, rgba: &List[u8]) {
+    let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+      1u32);
+    let m0 = sdl.GetPerformanceCounter();
+    var fresh = device.createTexture(&desc);
+    let m1 = sdl.GetPerformanceCounter();
+    let cv = rgba.view();
+    device.queue.writeTextureLevels(&fresh, &cv[0] as *u8);
+    let m2 = sdl.GetPerformanceCounter();
+    let view = fresh.createView();
+    var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    made <-> group;
+    fresh <-> texture;
+    device.queue.releaseBindGroup(&mut made);
+    device.queue.releaseTexture(&mut fresh);
+    let m3 = sdl.GetPerformanceCounter();
+    if scrollTrace { print <- "flat upload: create "; print <- micros(m0, m1) / 1000.; print <- " ms, write "; print <- micros(m1, m2) / 1000.; print <- " ms, group+release "; print <- micros(m2, m3) / 1000.; print <- " ms\n"; }
+  }
+
+  // The page's texture with its whole mip chain from bytes already built (pageup.cone): 'levels' levels, the largest first, tightly packed
+  fn uploadChain(self: &mut, device: &mut Device, w: u32, h: u32, levels: u32, chain: &List[u8]) {
+    let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+      levels);
+    var fresh = device.createTexture(&desc);
+    let cv = chain.view();
+    device.queue.writeTextureLevels(&fresh, &cv[0] as *u8);
+    let view = fresh.createView();
+    var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    made <-> group;
+    fresh <-> texture;
+    device.queue.releaseBindGroup(&mut made);
+    device.queue.releaseTexture(&mut fresh);
+  }
+
+  // A texture with its whole mip chain, made once from 'chain' (the levels' bytes one after another, as buildMips gives them) and then
+  // rewritten by refreshChain: for a picture that changes often in small parts (the web page's), where a new texture and bind group
+  // each time would cost more than the change
+  fn makeChain(self: &mut, device: &mut Device, w: u32, h: u32, levels: u32, chain: &List[u32]) {
+    let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+      levels);
+    var fresh = device.createTexture(&desc);
+    let cv = chain.view();
+    device.queue.writeTextureLevels(&fresh, &cv[0] as *u8);
+    let view = fresh.createView();
+    var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+      BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+    made <-> group;
+    fresh <-> texture;
+    device.queue.releaseBindGroup(&mut made);
+    device.queue.releaseTexture(&mut fresh);
+  }
+
+  // 'rows' rows of level 0 from 'y', 'wide' texels each, taken from 'data' (the rows packed one after another)
+  fn refreshRows(self: &mut, device: &mut Device, data: *u8, wide: u32, y: u32, rows: u32) {
+    device.queue.writeTextureRegion(&texture, data, wide * 4u32, 0u32, y, wide, rows);
+  }
+
+  fn refreshChain(self: &mut, device: &mut Device, chain: &List[u32]) {
+    let cv = chain.view();
+    device.queue.writeTextureLevels(&texture, &cv[0] as *u8);
+  }
+
+  // As draw, hidden where the scene's depth is nearer
+  fn drawDepthed(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture,
+                 viewProjection: Mat4, rect: Vec4) {
+    let params = PageParams(viewProjection, rect, Vec4(pageBias, 1., vOff, vScale));
+    device.queue.writeBuffer(&uniforms, 0u64, &params as *u8, 96u64);
+    let color = RenderPassColorAttachment(view: target.createView(), loadOp: LOAD_OP_LOAD,
+      clearValue: Color(0., 0., 0., 0.));
+    let da = RenderPassDepthStencilAttachment(view: depth.createView(), depthLoadOp: LOAD_OP_LOAD);
+    var pass = encoder.beginRenderPassWithDepth(&color, &da);
+    pass.setPipeline(&pipelineD);
+    pass.setBindGroup(0u32, &group);
+    pass.draw(6u32, 1u32, 0u32, 0u32);
+    pass.end();
+  }
+
+  // A picture that changes every frame (the desk's screen): 'bgra' is w x h tightly packed sRGB bytes. One texture, made
+  // once (again if the size changes) and rewritten each time; no mip chain
+  fn uploadFrame(self: &mut, device: &mut Device, w: u32, h: u32, bgra: *u8) {
+    if texture.width != w || texture.height != h || texture.format != TEXTURE_FORMAT_BGRA8_UNORM_SRGB
+        || texture.mipLevelCount != mipLevelCount(w, h) {
+      let desc = TextureDescriptor(w, h, TEXTURE_FORMAT_BGRA8_UNORM_SRGB, TEXTURE_USAGE_TEXTURE_BINDING | TEXTURE_USAGE_COPY_DST,
+        mipLevelCount(w, h));
+      var fresh = device.createTexture(&desc);
+      let view = fresh.createView();
+      var made = device.createBindGroup(&groupLayout, &[BindGroupEntry.buffer(0u32, &uniforms),
+        BindGroupEntry.texture(1u32, &view), BindGroupEntry.sampler(2u32, &sampler)]);
+      made <-> group;
+      fresh <-> texture;
+      device.queue.releaseBindGroup(&mut made);
+      device.queue.releaseTexture(&mut fresh);
+    }
+    device.queue.writeTextureLevels(&texture, bgra);
+  }
+
+  fn draw(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4, rect: Vec4) {
+    let params = PageParams(viewProjection, rect, Vec4(pageBias, 1., vOff, vScale));
+    device.queue.writeBuffer(&uniforms, 0u64, &params as *u8, 96u64);
+    let color = RenderPassColorAttachment(view: target.createView(), loadOp: LOAD_OP_LOAD,
+      clearValue: Color(0., 0., 0., 0.));
+    var pass = encoder.beginRenderPass(&color);
+    pass.setPipeline(&pipeline);
+    pass.setBindGroup(0u32, &group);
+    pass.draw(6u32, 1u32, 0u32, 0u32);
+    pass.end();
+  }
+
+  // Into 'target' with 'opacity', hidden where 'depth' (the scene's) is nearer if this pass was made by createDepth
+  fn drawFaded(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture,
+               viewProjection: Mat4, rect: Vec4, opacity: f32) {
+    let params = PageParams(viewProjection, rect, Vec4(pageBias, opacity, vOff, vScale));
+    device.queue.writeBuffer(&uniforms, 0u64, &params as *u8, 96u64);
+    let color = RenderPassColorAttachment(view: target.createView(), loadOp: LOAD_OP_LOAD,
+      clearValue: Color(0., 0., 0., 0.));
+    if depthed {
+      let da = RenderPassDepthStencilAttachment(view: depth.createView(), depthLoadOp: LOAD_OP_LOAD);
+      var pass = encoder.beginRenderPassWithDepth(&color, &da);
+      pass.setPipeline(&pipeline);
+      pass.setBindGroup(0u32, &group);
+      pass.draw(6u32, 1u32, 0u32, 0u32);
+      pass.end();
+    } else {
+      var pass = encoder.beginRenderPass(&color);
+      pass.setPipeline(&pipeline);
+      pass.setBindGroup(0u32, &group);
+      pass.draw(6u32, 1u32, 0u32, 0u32);
+      pass.end();
+    }
+  }
+}

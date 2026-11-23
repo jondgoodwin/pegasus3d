@@ -1,0 +1,687 @@
+// The web panel: a real web page, drawn by the Chromium Embedded Framework in windowless (off-screen) mode into a
+// texture on a panel beside the document panel. cefshim.dll (guidebrowser/cef/src/cefshim.cc) is the flat C API over
+// CEF; cefhelper.exe is the program CEF starts for its other processes.
+//
+//   - Once a frame: web_pump runs CEF's message loop work, then web_frame copies the latest paint (RGBA, only if
+//     there is a new one) into 'buf', which PagePass uploads (the same unlit page pass the document panel uses).
+//   - A pointer ray that meets the panel gives page pixels, as the document panel's click does: mouse moves, clicks
+//     and the wheel go to the page by them. Typed text and keys go to it while it holds the focus (a click on it).
+//   - Everything CEF writes (cache, cookies, log) is under the 'cache' folder of the working directory.
+//   - Audio is off (--mute-audio, in the shim).
+
+extern {
+  fn @c("web_init") webInit(cacheDir: cstr, helper: cstr) i32;
+  fn @c("web_open") webOpen(url: cstr, w: i32, h: i32) i32;
+  fn @c("web_pump") webPump();
+  fn @c("web_frame") webFrame(view: i32, dst: *u8, cap: i32, w: &mut i32, h: &mut i32) i32;
+  fn @c("web_frame_rect") webFrameRect(view: i32, dst: *u8, cap: i32, x: &mut i32, y: &mut i32, w: &mut i32, h: &mut i32,
+                                       fw: &mut i32, fh: &mut i32) i32;
+  fn @c("web_paints") webPaints(view: i32) u32;
+  fn @c("web_loading") webLoading(view: i32) i32;
+  fn @c("web_wants_text") webWantsText(view: i32) i32;
+  fn @c("web_mouse_move") webMouseMove(view: i32, x: i32, y: i32, leave: i32);
+  fn @c("web_mouse_button") webMouseButton(view: i32, x: i32, y: i32, button: i32, up: i32, clicks: i32);
+  fn @c("web_wheel") webWheel(view: i32, x: i32, y: i32, dx: i32, dy: i32);
+  fn @c("web_key") webKey(view: i32, vk: i32, down: i32, mods: i32);
+  fn @c("web_char") webChar(view: i32, ch: i32, mods: i32);
+  fn @c("web_text_input") webTextInput(on: i32);
+  fn @c("web_go") webGo(view: i32, url: cstr);
+  fn @c("web_back") webBack(view: i32);
+  fn @c("web_forward") webForward(view: i32);
+  fn @c("web_can_back") webCanBack(view: i32) i32;
+  fn @c("web_can_forward") webCanForward(view: i32) i32;
+  fn @c("web_url") webUrl(view: i32, out: *u8, cap: i32) i32;
+  fn @c("web_close") webClose(view: i32);
+  fn @c("web_shutdown") webShutdown();
+}
+
+const WEB_TEX_W = 1280u32;       // the page's size in pixels
+const WEB_TEX_H = 800u32;
+const WEB_BAND_ROWS = 40u32;     // rows of the page sent to the texture in one frame
+const WEB_WORLD_W = 1.8;         // meters across
+const WEB_GAP = 0.12;            // between the document panel's right edge and this panel's left
+
+var @threadlocal webStarted = false;      // CEF initialised
+// What a frame costs, in performance-counter ticks
+var @threadlocal webPumpTicks = 0u64;
+var @threadlocal webPumps = 0u64;
+var @threadlocal webPumpMax = 0u64;
+var @threadlocal webUploadTicks = 0u64;
+var @threadlocal webUploads = 0u64;
+var @threadlocal webUploadMax = 0u64;
+
+fn ticksToMs(t: u64) f64 { f64.from(t) * 1000.0f64 / f64.from(sdl.GetPerformanceFrequency()) }
+
+// The folder the program's exe is in, with a trailing slash
+fn exeFolder() String {
+  var folder = String();
+  if programPath != null {
+    let p = cstr.fromPtr(programPath).view();
+    var cut = 0usize;
+    var i = 0usize;
+    while i < p.len() {
+      if p[i] == '\\' || p[i] == '/' { cut = i + 1usize; }
+      i = i + 1usize;
+    }
+    folder.append(&p[0usize..<cut]);
+  }
+  folder
+}
+
+// Start CEF once. False if it would not start.
+fn webStart() bool {
+  if webStarted { return true; }
+  var helper = exeFolder();
+  helper.append("cefhelper.exe");
+  let ok = webInit("cache", helper.cstr());
+  if ok == 1i32 { webStarted = true; }
+  else { print <- "webpanel: CEF would not initialise\n"; }
+  webStarted
+}
+
+// Run CEF's work once; to be called once a frame
+fn webPumpFrame() {
+  if !webStarted { return; }
+  let t0 = sdl.GetPerformanceCounter();
+  webPump();
+  let d = sdl.GetPerformanceCounter() - t0;
+  webPumpTicks = webPumpTicks + d;
+  webPumps = webPumps + 1u64;
+  if d > webPumpMax { webPumpMax = d; }
+}
+
+fn webReport() {
+  if webPumps > 0u64 {
+    print <- "web: pump "; print <- ticksToMs(webPumpTicks) / f64.from(webPumps); print <- " ms avg, "; print <- ticksToMs(webPumpMax);
+    print <- " ms max over "; print <- webPumps; print <- " frames; upload "; print <- webUploads; print <- " frames, ";
+    if webUploads > 0u64 {
+      print <- ticksToMs(webUploadTicks) / f64.from(webUploads); print <- " ms avg, "; print <- ticksToMs(webUploadMax); print <- " ms max";
+    }
+    print <- "\n";
+  }
+}
+
+// Windows virtual-key codes for the keys that are not text (0 if the key is not one)
+fn virtualKey(scancode: u32) i32 {
+  if scancode == 40u32 { return 13i32; }      // Return
+  if scancode == 41u32 { return 27i32; }      // Escape
+  if scancode == 42u32 { return 8i32; }       // Backspace
+  if scancode == 43u32 { return 9i32; }       // Tab
+  if scancode == 76u32 { return 46i32; }      // Delete
+  if scancode == 79u32 { return 39i32; }      // Right
+  if scancode == 80u32 { return 37i32; }      // Left
+  if scancode == 81u32 { return 40i32; }      // Down
+  if scancode == 82u32 { return 38i32; }      // Up
+  if scancode == 74u32 { return 36i32; }      // Home
+  if scancode == 77u32 { return 35i32; }      // End
+  if scancode == 75u32 { return 33i32; }      // Page up
+  if scancode == 78u32 { return 34i32; }      // Page down
+  0i32
+}
+
+// The page's picture and its mip chain, one texel a u32 (R in the low byte): level 0, then each half-size level after it
+alias Texels = List[u32];
+
+// Four texels averaged (each channel's top six bits summed, plus 3 so white stays white; alpha opaque)
+fn avg4(a: u32, b: u32, c: u32, d: u32) u32 {
+  let m = 0xFCFCFCFCu32;
+  (((a & m) >> 2u32) + ((b & m) >> 2u32) + ((c & m) >> 2u32) + ((d & m) >> 2u32) + 0x03030303u32) | 0xFF000000u32
+}
+
+// Scrolling a web page (Jon, 11 Nov: the picture moves on the very next frame). The wheel goes to the page, but CEF's paint of the scrolled
+// page comes a frame or three later, so the panel shows the picture it has moved by the step it expects (WEB_NOTCH_PX a notch) at once,
+// and takes the real paint when it arrives (a whole paint at once while scrolling, not a band a frame). The step is measured from the paints
+// (measureShift), so a page that moves otherwise, or not at all, corrects the guess.
+const WEB_NOTCH_PX = 100.f;      // the first guess at how far a wheel notch moves the page
+const WEB_SHIFT_MAX = 360.f;     // the most the shown picture is moved ahead of the paints
+const WEB_SCROLL_MS = 400u64;    // after a wheel event the panel takes every paint whole
+const WEB_GIVE_UP_MS = 250u64;   // a guess nothing has borne out by now is dropped
+const SHIFT_COLS = 8usize;     // columns of the picture compared
+var @threadlocal webOld = false;        // '--web-old': the old way (no moving ahead of the paints, 30 a second, a band of rows a frame), to compare with
+
+// How many rows the page moved down between 'old' (level 0 of the chain, rows from the bottom) and 'fresh' (a whole paint, RGBA, rows from
+// the bottom): searched from 'lo' to 'hi', 0 if the picture did not change or no shift matches. The green of SHIFT_COLS columns, every third row.
+fn measureShift(old: &Texels, fresh: &List[u8], lo: i32, hi: i32) i32 {
+  let ov = old.view();
+  let fv = fresh.view();
+  let w = usize.from(WEB_TEX_W);
+  let h = i32.from(WEB_TEX_H);
+  var bestD = 0i32;
+  var bestS = 4000000000u64;
+  var s0 = 0u64;
+  var d = 0i32;
+  var first = true;
+  var again = true;
+  // 0 first, then the rest of the range
+  var dd = lo;
+  while again {
+    d = if first { 0i32 } else { dd };
+    if !first && d == 0i32 { d = 0i32; }
+    var r = if d < 0i32 { 0i32 - d } else { 0i32 };
+    let r1 = if d > 0i32 { h - d } else { h };
+    var sad = 0u64;
+    var n = 0u64;
+    while r < r1 {
+      var c = 0usize;
+      while c < SHIFT_COLS {
+        let x = (c * 2usize + 1usize) * w / (SHIFT_COLS * 2usize);
+        let a = (ov[usize.from(u32.from(r + d)) * w + x] >> 8u32) & 255u32;
+        let b = u32.from(fv[(usize.from(u32.from(r)) * w + x) * 4usize + 1usize]);
+        sad = sad + u64.from(if a > b { a - b } else { b - a });
+        n = n + 1u64;
+        c = c + 1usize;
+      }
+      r = r + 7i32;
+    }
+    if n > 30u64 {
+      let score = sad * 1024u64 / n;
+      if first { s0 = score; bestS = score; }
+      else if score < bestS { bestS = score; bestD = d; }
+    }
+    if first {
+      first = false;
+      if s0 < 48u64 { again = false; }          // the same picture
+    }
+    else {
+      dd = dd + 1i32;
+      if dd > hi { again = false; }
+    }
+  }
+  // a shift is believed only if it explains the change much better than none
+  if bestD != 0i32 && bestS * 10u64 < s0 * 6u64 { bestD } else { 0i32 }
+}
+
+fn maxu(a: u32, b: u32) u32 { if a > b { a } else { b } }
+fn minu(a: u32, b: u32) u32 { if a < b { a } else { b } }
+
+// The half-size levels of the rectangle (x, y, w, h) of level 0 (the rows of 'wide' texels): only the texels it touches are redone
+fn mipRect(chain: &mut Texels, wide: u32, high: u32, levels: u32, x: u32, y: u32, w: u32, h: u32) {
+  var lw = wide;
+  var lh = high;
+  var off = 0usize;
+  var x0 = x; var y0 = y; var x1 = x + w; var y1 = y + h;
+  var l = 1u32;
+  while l < levels {
+    let nw = maxu(1u32, lw / 2u32);
+    let nh = maxu(1u32, lh / 2u32);
+    let off1 = off + usize.from(lw * lh);
+    let nx0 = x0 / 2u32; let ny0 = y0 / 2u32;
+    let nx1 = minu((x1 + 1u32) / 2u32, nw); let ny1 = minu((y1 + 1u32) / 2u32, nh);
+    var yy = ny0;
+    while yy < ny1 {
+      let ya = minu(2u32 * yy, lh - 1u32);
+      let yb = minu(2u32 * yy + 1u32, lh - 1u32);
+      var xx = nx0;
+      while xx < nx1 {
+        let xa = minu(2u32 * xx, lw - 1u32);
+        let xb = minu(2u32 * xx + 1u32, lw - 1u32);
+        let v = avg4(*chain[off + usize.from(ya * lw + xa)], *chain[off + usize.from(ya * lw + xb)],
+                     *chain[off + usize.from(yb * lw + xa)], *chain[off + usize.from(yb * lw + xb)]);
+        chain.set(off1 + usize.from(yy * nw + xx), v);
+        xx = xx + 1u32;
+      }
+      yy = yy + 1u32;
+    }
+    off = off1; lw = nw; lh = nh; x0 = nx0; y0 = ny0; x1 = nx1; y1 = ny1;
+    l = l + 1u32;
+  }
+}
+
+// Texels of every level of a wide x high picture
+fn chainTexels(wide: u32, high: u32, levels: u32) usize {
+  var n = 0usize;
+  var lw = wide; var lh = high;
+  var l = 0u32;
+  while l < levels { n = n + usize.from(lw * lh); lw = maxu(1u32, lw / 2u32); lh = maxu(1u32, lh / 2u32); l = l + 1u32; }
+  n
+}
+
+// How wide a web page stands in a page's own frame (z = 0, middle at DOC_CENTRE_Y)
+const WEBPG_W = 1.9;
+
+pub struct WebPanel {
+  page: PagePass;                // draws the page unlit, as the document panel's does
+  view: i32;                     // the shim's number for the browser
+  buf: List[u8];                 // the latest paint's rectangle, RGBA
+  url: String;                   // the address last asked for or shown
+  chain: Texels;                 // the picture and its mip chain, kept here and written whole to the texture
+  levels: u32 = 1u32;
+  nextAt: u64 = 0u64;            // the earliest the next paint may be taken (at most 30 a second, and about 1.5 ms in 33)
+  textured: bool = false;
+  pub cost: u64 = 0u64;          // the last paint's cost, in performance-counter ticks
+  focus: bool = false;           // keys and text go to the page
+  hover: bool = false;
+  wasLoading: bool = false;
+  lastX: i32 = 0i32;             // the pointer on the page, in page pixels, as last seen
+  lastY: i32 = 0i32;
+  uploaded: u32 = 0u32;
+  pendY0: u32 = 0u32;            // rows of level 0 taken from a paint and not yet in the texture: [pendY0, pendY1)
+  pendY1: u32 = 0u32;
+  mipDirty: bool = false;        // the levels below 0 are older than level 0: redone and written whole once the page has been quiet a moment
+  mipX0: u32 = 0u32; mipY0: u32 = 0u32; mipX1: u32 = 0u32; mipY1: u32 = 0u32;
+  lastPaint: u64 = 0u64;         // when the last paint came (counter ticks)
+  firstMip: u64 = 0u64;          // when the levels first went stale (counter ticks)
+  // scrolling: the picture is shown moved by 'pend' rows (down: positive) ahead of the paints (see measureShift)
+  pend: f32 = 0.;                // rows the wheel has moved the page that no paint has shown yet
+  pendN: f32 = 0.;               // the wheel notches behind them
+  notchPx: f32 = 100.;           // rows a notch moves this page (learnt from the paints)
+  lastWheelAt: u64 = 0u64;       // when the wheel last turned (ms)
+  wantTotal: f32 = 0.;           // for the trace: all the rows the wheel has asked for, and all the paints have shown
+  texTotal: f32 = 0.;
+  traceT: f32 = -1.;
+  traceS: f32 = -1.;
+
+  // None if CEF would not start or the browser could not be made
+  pub fn create(device: &mut Device, outFormat: u32, url: &str) Option[WebPanel] {
+    if !webStart() { return None; }
+    var u = String.from(url);
+    let view = webOpen(u.cstr(), i32.from(WEB_TEX_W), i32.from(WEB_TEX_H));
+    if view < 0i32 { print <- "webpanel: the browser could not be made\n"; return None; }
+    var buf = List[u8].withCapacity(usize.from(WEB_TEX_W * WEB_TEX_H * 4u32));
+    buf.resize(usize.from(WEB_TEX_W * WEB_TEX_H * 4u32), 0u8);
+    print <- "webpanel: opened "; printStr(url); print <- "\n";
+    let levels = mipLevelCount(WEB_TEX_W, WEB_TEX_H);
+    var chain = Texels.withCapacity(chainTexels(WEB_TEX_W, WEB_TEX_H, levels));
+    chain.resize(chainTexels(WEB_TEX_W, WEB_TEX_H, levels), 0xFFFFFFFFu32);
+    var wp = WebPanel(PagePass.createDepth(device, outFormat), view, buf, u, chain);
+    wp.levels = levels;
+    Some[WebPanel](wp)
+  }
+
+  pub fn localRect() Vec4 {
+    let w = f32.from(WEBPG_W);
+    let h = w * f32.from(WEB_TEX_H) / f32.from(WEB_TEX_W);
+    let y = f32.from(DOC_CENTRE_Y);
+    Vec4(0. - w * 0.5, y - h * 0.5, w * 0.5, y + h * 0.5)
+  }
+
+  // As a page in the room: hidden where the scene's depth is nearer
+  pub fn drawLocal(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, depth: &Texture, vp: Mat4) {
+    if !textured { return; }
+    self.applyShift();
+    page.drawDepthed(device, encoder, target, depth, vp, WebPanel.localRect());
+  }
+
+  // A ray in the page's own frame: the page pixel it meets as (x, y, 1), or z = 0; and how far along it is met (-1: not)
+  pub fn pickLocal(self: &, eye: Vec3, direction: Vec3) Vec3 {
+    if direction.z > -0.00001 && direction.z < 0.00001 { return Vec3(0., 0., 0.); }
+    let t = (0. - eye.z) / direction.z;
+    if t < 0. { return Vec3(0., 0., 0.); }
+    let hit = eye + direction * t;
+    let r = WebPanel.localRect();
+    let u = (hit.x - r.x) / (r.z - r.x);
+    let v = (hit.y - r.y) / (r.w - r.y);
+    if u < 0. || u > 1. || v < 0. || v > 1. { return Vec3(0., 0., 0.); }
+    Vec3(u * f32.from(WEB_TEX_W), (1. - v) * f32.from(WEB_TEX_H), 1.)
+  }
+  pub fn reachLocal(self: &, eye: Vec3, direction: Vec3) f32 {
+    if self.pickLocal(eye, direction).z < 0.5 { return -1.; }
+    (0. - eye.z) / direction.z
+  }
+
+  pub fn open(self: &mut, url: &str) {
+    self.url = String.from(url);
+    webGo(view, self.url.cstr());
+    print <- "webpanel: loading "; printStr(url); print <- "\n";
+  }
+
+  // Once a frame: a new paint goes up to the texture
+  pub fn tick(self: &mut, device: &mut Device) {
+    var w = 0i32;
+    var h = 0i32;
+    let busy = webLoading(view) != 0i32;
+    if wasLoading && !busy {
+      print <- "webpanel: loaded "; printStr(self.address().view()); print <- "\n";
+    }
+    wasLoading = busy;
+    let t0 = sdl.GetPerformanceCounter();
+    let freq = sdl.GetPerformanceFrequency();
+    var worked = false;
+    let nowM = nowMs();
+    let scrolling = nowM < lastWheelAt + WEB_SCROLL_MS;
+    // a guess about the page's scroll that no paint has borne out is dropped
+    if pend != 0. && nowM > lastWheelAt + WEB_GIVE_UP_MS { pend = 0.; pendN = 0.; wantTotal = texTotal; }
+    if t0 >= nextAt {
+      var rx = 0i32; var ry = 0i32; var rw = 0i32; var rh = 0i32;
+      let n = webFrameRect(view, &buf[0] as *u8, i32.from(buf.len()), &mut rx, &mut ry, &mut rw, &mut rh, &mut w, &mut h);
+      if n > 0i32 && u32.from(w) == WEB_TEX_W && u32.from(h) == WEB_TEX_H {
+        // a whole paint while the wheel is turning: how far did the page move since the picture we hold? (before it is overwritten)
+        if textured && scrolling && rw == w && rh == h {
+          let pi = i32.from(pend);
+          var lo = (if pi < 0i32 { pi } else { 0i32 }) - 30i32;
+          var hi = (if pi > 0i32 { pi } else { 0i32 }) + 30i32;
+          if lo < 0i32 - 400i32 { lo = 0i32 - 400i32; }
+          if hi > 400i32 { hi = 400i32; }
+          let ms0 = sdl.GetPerformanceCounter();
+          let sd = measureShift(&chain, &buf, lo, hi);
+          if sd != 0i32 {
+            texTotal = texTotal + f32.from(sd);
+            if nowM > lastWheelAt + 100u64 {
+              // everything asked for has arrived: this is what the notches came to
+              if pendN > 0.5 || pendN < -0.5 {
+                var k = f32.from(sd) / pendN;
+                if k < 0. { k = 0. - k; }
+                if k > 20. && k < 300. { notchPx = k; }
+              }
+              pend = 0.; pendN = 0.;
+            }
+            else { pend = pend - f32.from(sd); pendN = pendN - f32.from(sd) / notchPx; }
+          }
+          else if nowM > lastWheelAt + 120u64 { pend = 0.; pendN = 0.; wantTotal = texTotal; }
+        }
+        // the rectangle into level 0 of the CPU copy (a memcpy of its rows); the texture gets it band by band over the next frames
+        var j = 0i32;
+        while j < rh {
+          let dst = usize.from(u32.from(ry + j) * WEB_TEX_W + u32.from(rx));
+          libc.memcpy(&chain[dst] as *u8, &buf[usize.from(u32.from(j * rw * 4i32))] as *u8, usize.from(u32.from(rw * 4i32)));
+          j = j + 1i32;
+        }
+        let x0 = u32.from(rx); let y0 = u32.from(ry); let x1 = x0 + u32.from(rw); let y1 = y0 + u32.from(rh);
+        if !textured {
+          mipRect(&mut chain, WEB_TEX_W, WEB_TEX_H, levels, x0, y0, u32.from(rw), u32.from(rh));
+          page.makeChain(device, WEB_TEX_W, WEB_TEX_H, levels, &chain); textured = true;
+          worked = true;
+        } else {
+          if pendY0 >= pendY1 { pendY0 = y0; pendY1 = y1; }
+          else { if y0 < pendY0 { pendY0 = y0; } if y1 > pendY1 { pendY1 = y1; } }
+          if !mipDirty { mipDirty = true; mipX0 = x0; mipY0 = y0; mipX1 = x1; mipY1 = y1; firstMip = t0; }
+          else {
+            if x0 < mipX0 { mipX0 = x0; } if y0 < mipY0 { mipY0 = y0; } if x1 > mipX1 { mipX1 = x1; } if y1 > mipY1 { mipY1 = y1; }
+          }
+        }
+        lastPaint = t0;
+        uploaded = uploaded + 1u32;
+        nextAt = if scrolling && !webOld { t0 } else { t0 + freq / 30u64 };
+      }
+    }
+    // one band of rows a frame to level 0 (about 0.2 MB), whatever the size of the paint; the whole paint at once while the page is moving
+    if textured && pendY0 < pendY1 {
+      var rows = pendY1 - pendY0;
+      if rows > WEB_BAND_ROWS && (webOld || (!scrolling && pend == 0.)) { rows = WEB_BAND_ROWS; }
+      page.refreshRows(device, &chain[usize.from(pendY0 * WEB_TEX_W)] as *u8, WEB_TEX_W, pendY0, rows);
+      pendY0 = pendY0 + rows;
+      worked = true;
+    }
+    // the levels below: redone and written whole once the rows are all in and the page has been quiet 125 ms (or busy for 700 ms)
+    else if textured && mipDirty && !scrolling && ((t0 > lastPaint + freq / 8u64) || (t0 > firstMip + freq * 7u64 / 10u64)) {
+      mipRect(&mut chain, WEB_TEX_W, WEB_TEX_H, levels, mipX0, mipY0, mipX1 - mipX0, mipY1 - mipY0);
+      page.refreshChain(device, &chain);
+      mipDirty = false;
+      worked = true;
+    }
+    if worked {
+      let d = sdl.GetPerformanceCounter() - t0;
+      cost = d;
+      webUploadTicks = webUploadTicks + d;
+      webUploads = webUploads + 1u64;
+      if d > webUploadMax { webUploadMax = d; }
+    }
+  }
+
+  // The address the page is at
+  pub fn address(self: &) String {
+    var bytes = List[u8]();
+    bytes.resize(1024usize, 0u8);
+    let n = webUrl(view, &bytes[0] as *u8, 1024i32);
+    String.fromBytes(&bytes.view()[0usize..<usize.from(n)])
+  }
+
+  // Where the panel stands in the panel frame the document panel's page is in: z = 0
+  fn rect() Vec4 {
+    let x0 = f32.from(DOC_WORLD_W) * 0.5 + f32.from(WEB_GAP);
+    let w = f32.from(WEB_WORLD_W);
+    let h = w * f32.from(WEB_TEX_H) / f32.from(WEB_TEX_W);
+    let y = f32.from(DOC_CENTRE_Y);
+    Vec4(x0, y - h * 0.5, x0 + w, y + h * 0.5)
+  }
+
+  pub fn drawPage(self: &mut, device: &mut Device, encoder: &mut CommandEncoder, target: &Texture, viewProjection: Mat4) {
+    self.applyShift();
+    page.draw(device, encoder, target, viewProjection, WebPanel.rect());
+  }
+
+  // A ray (in the panel frame): the page pixel it meets, as (x, y, 1), or z = 0 if it misses the panel
+  pub fn pick(self: &, eye: Vec3, direction: Vec3) Vec3 {
+    if direction.z > -0.00001 && direction.z < 0.00001 { return Vec3(0., 0., 0.); }
+    let t = (0. - eye.z) / direction.z;
+    if t < 0. { return Vec3(0., 0., 0.); }
+    let hit = eye + direction * t;
+    let r = WebPanel.rect();
+    let u = (hit.x - r.x) / (r.z - r.x);
+    let v = (hit.y - r.y) / (r.w - r.y);
+    if u < 0. || u > 1. || v < 0. || v > 1. { return Vec3(0., 0., 0.); }
+    Vec3(u * f32.from(WEB_TEX_W), (1. - v) * f32.from(WEB_TEX_H), 1.)
+  }
+
+  pub fn moved(self: &mut, px: i32, py: i32) {
+    lastX = px; lastY = py; hover = true;
+    webMouseMove(view, px, py, 0i32);
+  }
+  pub fn left(self: &mut) {
+    if hover { webMouseMove(view, lastX, lastY, 1i32); hover = false; }
+  }
+  pub fn button(self: &mut, px: i32, py: i32, up: bool) {
+    lastX = px; lastY = py;
+    webMouseButton(view, px, py, 1i32, if up { 1i32 } else { 0i32 }, 1i32);
+  }
+  pub fn wheel(self: &mut, px: i32, py: i32, notches: f32) {
+    webWheel(view, px, py, 0i32, i32.from(notches * 120.));
+    lastWheelAt = nowMs();
+    pend = pend + notches * notchPx;
+    pendN = pendN + notches;
+    wantTotal = wantTotal + notches * notchPx;
+  }
+
+  // The picture moved ahead of the paints, as a fraction of its height (for the page pass), set for each draw; with the trace, a line when it changes
+  fn applyShift(self: &mut) {
+    var d = if webOld { 0. } else { pend };
+    if d > WEB_SHIFT_MAX { d = WEB_SHIFT_MAX; }
+    if d < 0. - WEB_SHIFT_MAX { d = 0. - WEB_SHIFT_MAX; }
+    page.vOff = d / f32.from(WEB_TEX_H);
+    page.vScale = 0.;
+    if scrollTrace {
+      let sh = texTotal + d;
+      if wantTotal != traceT || sh != traceS {
+        traceT = wantTotal;
+        traceS = sh;
+        print <- "strace: frame "; print <- traceFrame; print <- " web target "; print <- wantTotal; print <- " shown "; print <- sh;
+        print <- " (paints "; print <- texTotal; print <- ", ahead "; print <- d; print <- ")\n";
+      }
+    }
+  }
+  // A text field of the page holds its focus (the virtual keyboard appears for it)
+  pub fn wantsText(self: &) bool { focus && webWantsText(view) == 1i32 }
+  pub fn setFocus(self: &mut, on: bool) {
+    if on != focus {
+      focus = on;
+      webTextInput(if on { 1i32 } else { 0i32 });
+    }
+  }
+  pub fn key(self: &mut, vk: i32, down: bool, mods: i32) {
+    webKey(view, vk, if down { 1i32 } else { 0i32 }, mods);
+    if down && vk == 13i32 { webChar(view, 13i32, mods); }
+  }
+  // UTF-8 text typed: each code point (those past the first plane are not sent)
+  pub fn typed(self: &mut, text: &str) {
+    var i = 0usize;
+    while i < text.len() {
+      let b = i32.from(text[i]);
+      var cp = b;
+      var more = 0usize;
+      if b >= 240i32 { cp = b & 7i32; more = 3usize; }
+      else if b >= 224i32 { cp = b & 15i32; more = 2usize; }
+      else if b >= 192i32 { cp = b & 31i32; more = 1usize; }
+      var k = 0usize;
+      while k < more && i + 1usize + k < text.len() {
+        cp = (cp << 6i32) | (i32.from(text[i + 1usize + k]) & 63i32);
+        k = k + 1usize;
+      }
+      i = i + 1usize + more;
+      if cp < 65536i32 { webChar(view, cp, 0i32); }
+    }
+  }
+  pub fn close(self: &mut) { webClose(view); }
+  pub fn back(self: &mut) { webBack(view); }
+  pub fn forward(self: &mut) { webForward(view); }
+  pub fn canBack(self: &) bool { webCanBack(view) != 0i32 }
+  pub fn canForward(self: &) bool { webCanForward(view) != 0i32 }
+}
+
+// ---- the web panel in the incubator (Shell's side) ----
+
+fn webFocused(s: &Shell) bool {
+  if s.inc.on && s.inc.webFocused() { return true; }
+  match &s.web { case let Some(w) { return w.focus; } else {} }
+  false
+}
+
+// The direction of the ray through the window's point x, y (the eye is the camera's)
+fn rayDir(s: &Shell, x: f32, y: f32, w: f32, h: f32) Vec3 {
+  let tw = f32.from(s.target.texture.width);
+  let th = f32.from(s.target.texture.height);
+  let inverse = (s.camera.projectionMatrix(tw / th) * s.camera.viewMatrix()).inverse();
+  let p = inverse * Vec4(x / w * 2. - 1., 1. - y / h * 2., 0.5, 1.);
+  (p.xyz() * (1. / p.w) - s.camera.origin).normalize()
+}
+
+// The page pixel under the window's point x, y as (px, py, 1), or z = 0 if the point is not on the web panel
+fn webPick(s: &Shell, x: f32, y: f32, w: f32, h: f32) Vec3 {
+  if w <= 0. || h <= 0. || f32.from(s.target.texture.height) <= 0. { return Vec3(0., 0., 0.); }
+  let dir = rayDir(s, x, y, w, h);
+  var le = s.camera.origin;
+  var ld = dir;
+  if s.inc.on {
+    let inv = s.inc.pageModel().inverse();
+    le = inv * s.camera.origin;
+    ld = inv.transformVector(dir);
+  }
+  match &s.web { case let Some(wp) { return wp.pick(le, ld); } else {} }
+  Vec3(0., 0., 0.)
+}
+
+fn webPointer(s: &mut Shell, x: f32, y: f32, w: f32, h: f32) {
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if !has { return; }
+  let hit = webPick(&*s, x, y, w, h);
+  match &mut s.web {
+    case var &mut Some(wp) {
+      if hit.z > 0.5 { wp.moved(i32.from(hit.x), i32.from(hit.y)); } else { wp.left(); }
+    }
+    else {}
+  }
+}
+
+// A left press: on the web panel it is the page's, and takes the focus. False if it was not on the panel.
+fn webPress(s: &mut Shell, x: f32, y: f32, w: f32, h: f32) bool {
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if !has { return false; }
+  let hit = webPick(&*s, x, y, w, h);
+  var onPanel = false;
+  match &mut s.web {
+    case var &mut Some(wp) {
+      if hit.z > 0.5 {
+        onPanel = true;
+        wp.setFocus(true);
+        wp.button(i32.from(hit.x), i32.from(hit.y), false);
+      }
+      else { wp.setFocus(false); }
+    }
+    else {}
+  }
+  onPanel
+}
+
+fn webRelease(s: &mut Shell) {
+  match &mut s.web {
+    case var &mut Some(wp) { if wp.focus { wp.button(wp.lastX, wp.lastY, true); } }
+    else {}
+  }
+}
+
+// The wheel over the web panel scrolls the page; false if the pointer is not on it
+fn webWheelOn(s: &mut Shell, x: f32, y: f32, w: f32, h: f32, notches: f32) bool {
+  if s.inc.on && w > 0. && h > 0. && f32.from(s.target.texture.height) > 0. {
+    if s.inc.webWheelRay(s.camera.origin, rayDir(&*s, x, y, w, h), notches) { return true; }
+  }
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if !has { return false; }
+  let hit = webPick(&*s, x, y, w, h);
+  if hit.z < 0.5 { return false; }
+  match &mut s.web { case var &mut Some(wp) { wp.wheel(i32.from(hit.x), i32.from(hit.y), notches); } else {} }
+  true
+}
+
+// A key or text while the page holds the focus. Alt+Left and Alt+Right are back and forward in the page's history.
+fn webKeys(s: &mut Shell, e: &imm sdl.Event) {
+  if e.type == sdl.EVENT_TEXT_INPUT {
+    let t = e as &sdl.TextInputEvent;
+    if s.inc.on && s.inc.webFocused() { s.inc.webTyped(cstr.fromPtr(t.text).view()); return; }
+    match &mut s.web { case var &mut Some(wp) { wp.typed(cstr.fromPtr(t.text).view()); } else {} }
+    return;
+  }
+  let key = e as &sdl.KeyboardEvent;
+  let down = e.type == sdl.EVENT_KEY_DOWN;
+  var mods = 0i32;
+  if (key.keymod & 0x0003u16) != 0u16 { mods = mods | 1i32; }
+  if (key.keymod & 0x00C0u16) != 0u16 { mods = mods | 2i32; }
+  if (key.keymod & 0x0300u16) != 0u16 { mods = mods | 4i32; }
+  let vk = virtualKey(key.scancode);
+  if s.inc.on && s.inc.webFocused() {
+    s.inc.webKeyed(vk, down, mods, (mods & 4i32) != 0i32 && key.scancode == KEY_LEFT, (mods & 4i32) != 0i32 && key.scancode == KEY_RIGHT);
+    return;
+  }
+  match &mut s.web {
+    case var &mut Some(wp) {
+      if (mods & 4i32) != 0i32 && key.scancode == KEY_LEFT { if down && !key.repeat { wp.back(); } return; }
+      if (mods & 4i32) != 0i32 && key.scancode == KEY_RIGHT { if down && !key.repeat { wp.forward(); } return; }
+      if vk != 0i32 { wp.key(vk, down, mods); }
+    }
+    else {}
+  }
+}
+
+// Show 'url' in the web panel, making the panel if there is none yet
+fn openWeb(s: &mut Shell, url: &str) {
+  var has = false;
+  match &s.web { case let Some(wp) { has = true; } else {} }
+  if has { match &mut s.web { case var &mut Some(wp) { wp.open(url); } else {} } }
+  else { s.web = WebPanel.create(&mut s.device, s.swapchain.format, url); }
+}
+
+// Once a frame, before the scene is drawn: the test flags' events, then CEF's work, then the new paint up to the
+// texture, then any web link the document panel was asked to follow
+fn webFrameTick(s: &mut Shell) {
+  if webLinkAt != 0 && drawn == webLinkAt && webLinkArg != null {
+    match &mut s.panel { case var &mut Some(p) { p.requestLink(cstr.fromPtr(webLinkArg).view()); } else {} }
+  }
+  match &mut s.web {
+    case var &mut Some(wp) {
+      let px = i32.from(webClickX);
+      let py = i32.from(webClickY);
+      if webClickAt != 0 && drawn == webClickAt { wp.moved(px, py); wp.setFocus(true); wp.button(px, py, false); }
+      if webClickAt != 0 && drawn == webClickAt + 3 { wp.button(px, py, true); }
+      if webWheelAt != 0 && drawn == webWheelAt {
+        wp.wheel(i32.from(WEB_TEX_W / 2u32), i32.from(WEB_TEX_H / 2u32), f32.from(webWheelY));
+        print <- "webpanel: wheel "; print <- webWheelY; print <- "\n";
+      }
+      if webTypeAt != 0 && drawn == webTypeAt && webTypeArg != null { wp.typed(cstr.fromPtr(webTypeArg).view()); }
+      if webBackAt != 0 && drawn == webBackAt { wp.back(); }
+      if webForwardAt != 0 && drawn == webForwardAt { wp.forward(); }
+    }
+    else {}
+  }
+  webPumpFrame();
+  match &mut s.web { case var &mut Some(wp) { wp.tick(&mut s.device); } else {} }
+  var link = String();
+  match &mut s.panel {
+    case var &mut Some(p) { if p.outWeb.len() > 0usize { link = p.outWeb.clone(); p.outWeb = String(); } }
+    else {}
+  }
+  if link.len() > 0usize { if s.inc.on { s.inc.wantPage(link.view()); } else { openWeb(s, link.view()); } }
+}
+
+// Text events from SDL arrive only while text input is on for the window: the page editor turns it on while a page is edited
+fn webPanelText(on: bool) { webTextInput(if on { 1i32 } else { 0i32 }); }

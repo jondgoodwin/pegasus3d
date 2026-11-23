@@ -1,0 +1,1063 @@
+// The incubator's configuration (WI\incubator-config.md): two TOML files, incubator.toml (Penny's, the incubator only reads it) and
+// room.toml (the room's, Penny only reads it), overlaid with the newest 'at' winning for each project and field.
+//
+// The reader is Cone's toml package, which is a subset: no [[arrays of tables]], no floats, no dates, no inline tables. So a
+// project is a table named for it, [project.knight], its menu entries [project.knight.menu.1], [project.knight.menu.2]..., and
+// every number is a whole number (yaw_deg in degrees, scale_pct in percent, ring sizes in cm); an 'at' time is a quoted string
+// ("2026-11-11T14:03:22Z"), which compares correctly as text.
+//
+// This file is pure: reading, checking, overlaying and writing text. incubator.cone applies the result to the room.
+
+const CFG_DIR_DEFAULT = "C:/src/incubator/config";
+
+// ---- the parts of a configuration ----
+
+struct MenuCfg {
+  label: String;
+  action: String;
+  key: String;
+}
+
+// A project as one file describes it. 'has' flags say which of the optional fields the file gave.
+struct ProjCfg {
+  id: String;
+  name: String;
+  source: String;
+  place: String;        // "ring:3", "shelf:back:5", "shelf:side:2", "at:x,y,z"; empty if not given
+  yaw: i64;
+  hasYaw: bool;
+  scale: i64;
+  hasScale: bool;
+  at: String;           // when this table was last written
+  owner: String;        // who answers for it ("3D Web", "Cone design chat", ...); shown on its label
+  menu: List[MenuCfg];
+}
+
+fn newProj(id: &str) ProjCfg {
+  ProjCfg(String.from(id), String(), String(), String(), 0i64, false, 100i64, false, String(), String(), List[MenuCfg]())
+}
+
+// A parked folder: a marker standing in the room; clicking it opens a browser panel rooted at 'path'
+struct FolderCfg {
+  id: String;
+  name: String;
+  path: String;
+  place: String;
+  at: String;
+}
+
+// A page the room opened (room.toml): a file or an address, and where it stands (arc:N, shelf:N or at:x,y,z)
+struct PageCfg {
+  id: String;
+  src: String;
+  place: String;
+  at: String;
+}
+
+// [panel.browser] / [panel.report]: where such a panel stands when it opens
+struct PanelCfg {
+  id: String;
+  place: String;
+  yaw: i64;
+  hasYaw: bool;
+  width: i64;
+  hasWidth: bool;
+}
+
+// [shelf.ID]: how many slots of a wall ("back" or "side") may be used when something is shelved by itself
+struct ShelfCfg {
+  id: String;
+  wall: String;
+  slots: i64;
+  hasSlots: bool;
+}
+
+// [zone.ID]: one backdrop board at the back of the incubator (zones.cone). place "at:x,y,z", yaw_deg and width_cm place it; site,
+// repo, incubator, diagram say what its panes show; projects lists project ids; line names the line.json zone; layout_<pane> =
+// "x,y,w,h" (meters from the board's bottom left) overrides a pane's rectangle.
+struct ZoneCfg {
+  id: String;
+  name: String;
+  place: String;
+  yaw: i64;
+  hasYaw: bool;
+  width: i64;
+  hasWidth: bool;
+  site: String;
+  repo: String;
+  incubator: String;
+  diagram: String;
+  projects: String;
+  line: String;
+  at: String;
+  rects: List[String];     // site, repo, incubator, projects, line, diagram
+  tint: String;            // the portraits' backing colour, "RRGGBB"
+  side: i64;               // which edge carries the factory metrics: -1 the left, 1 the right
+  hasSide: bool;
+  mYaw: i64;               // the metrics panel's own yaw, degrees (the wall behind it)
+  hasMYaw: bool;
+}
+
+// [mark.ID] (room.toml, or incubator.toml for Penny's own shelf documents): one spine on a shelf: what it opens (src), the name it
+// wears (name), and its slot (place = "shelf:Q") on its domain's shelf; at (ISO time) says which file wins for one id: the newer
+struct MarkCfg {
+  id: String;
+  src: String;
+  name: String;
+  place: String;
+  at: String;
+}
+
+// [tree.ID] (room.toml): the folders a tree pane has open
+struct TreeCfg {
+  id: String;
+  open: List[String];
+}
+
+fn newZoneCfg(id: &str) ZoneCfg {
+  var r = List[String]();
+  var i = 0;
+  while i < 6 { r.push(String()); i = i + 1; }
+  ZoneCfg(String.from(id), String(), String(), 0i64, false, 0i64, false, String(), String(), String(), String(), String(), String(), String(), r, String(), 1i64, false, 0i64, false)
+}
+
+fn zoneRectKey(i: usize) &str {
+  if i == 0usize { "layout_site" } else if i == 1usize { "layout_repo" } else if i == 2usize { "layout_incubator" }
+  else if i == 3usize { "layout_projects" } else if i == 4usize { "layout_line" } else { "layout_diagram" }
+}
+
+// [palette.KIND]: the icons the palette shows for a kind of focus (document, web, diagram, project, room), each "icon|Label|action"
+struct PalSetCfg {
+  kind: String;
+  icons: List[String];
+}
+
+// [workspace.ID] and [workspace.ID.item.N]: a work item's whole set (WI\incubator-world.md, "Workspaces"). Each item: source (doc: url: tree:
+// mermaid: world: app:), place ("at:x,y,z", or ring:N for a 3-D item), yaw_deg and scale_pct (3-D items). The workspace: name, place
+// ("shelf:Q", the slot its spine takes on the shelf of 'zone' when folded), zone ("cone" / "web3d"; empty: 3D Web), at.
+struct WsItemCfg {
+  n: i64;
+  source: String;
+  place: String;
+  yaw: i64;
+  hasYaw: bool;
+  scale: i64;
+  hasScale: bool;
+}
+
+struct WsCfg {
+  id: String;
+  name: String;
+  place: String;
+  zone: String;
+  at: String;
+  manifest: String;     // an absolute .md path: the members come from that workstream manifest (no [item] tables)
+  items: List[WsItemCfg];
+}
+
+fn newWs(id: &str) WsCfg {
+  WsCfg(String.from(id), String(), String(), String(), String(), String(), List[WsItemCfg]())
+}
+
+fn copyWsItem(t: &WsItemCfg) WsItemCfg {
+  WsItemCfg(t.n, String.from(t.source.view()), String.from(t.place.view()), t.yaw, t.hasYaw, t.scale, t.hasScale)
+}
+
+fn copyWs(w: &WsCfg) WsCfg {
+  var o = newWs(w.id.view());
+  o.name = String.from(w.name.view()); o.place = String.from(w.place.view()); o.zone = String.from(w.zone.view()); o.at = String.from(w.at.view()); o.manifest = String.from(w.manifest.view());
+  var i = 0usize;
+  while i < w.items.len() {
+    let t = &w.items[i];
+    o.items.push(WsItemCfg(t.n, String.from(t.source.view()), String.from(t.place.view()), t.yaw, t.hasYaw, t.scale, t.hasScale));
+    i = i + 1usize;
+  }
+  o
+}
+
+// [wsmem.N] (room.toml, or a seed in incubator.toml): what is remembered of a manifest item, keyed by its resolved path.
+// state "out" (in the work area) or "rack"; place at:x,y,z; yaw and scale as for an item; the newer 'at' wins per item.
+struct WsMemCfg {
+  ws: String;           // the workspace it was remembered in: an item standing in two workspaces has two memories
+  path: String;
+  state: String;
+  place: String;
+  yaw: i64;
+  scale: i64;
+  at: String;
+  sect: String;         // the manifest section the item was in when this was written; a memory from another Start-here-ness is dropped
+}
+
+fn copyWsMem(m: &WsMemCfg) WsMemCfg {
+  WsMemCfg(String.from(m.ws.view()), String.from(m.path.view()), String.from(m.state.view()), String.from(m.place.view()), m.yaw, m.scale, String.from(m.at.view()), String.from(m.sect.view()))
+}
+
+fn wsMemText(m: &WsMemCfg, n: usize) String {
+  var s = String.from("\n[wsmem."); s.append(numText(i64.from(n)).view()); s.append("]\n");
+  s.append("ws = "); s.append(tomlStr(m.ws.view()).view()); s.append("\n");
+  s.append("path = "); s.append(tomlStr(m.path.view()).view()); s.append("\n");
+  s.append("state = "); s.append(tomlStr(m.state.view()).view()); s.append("\n");
+  if m.place.len() > 0usize { s.append("place = "); s.append(tomlStr(m.place.view()).view()); s.append("\n"); }
+  s.append("yaw_deg = "); s.append(intText(m.yaw).view()); s.append("\n");
+  s.append("scale_pct = "); s.append(intText(m.scale).view()); s.append("\n");
+  s.append("at = "); s.append(tomlStr(m.at.view()).view()); s.append("\n");
+  if m.sect.len() > 0usize { s.append("section = "); s.append(tomlStr(m.sect.view()).view()); s.append("\n"); }
+  s
+}
+
+// ---- workstream manifests (WI\incubator-world.md, "Workspaces from design chat's workstream manifests") ----
+const CONE_DIR = "C:/Users/jondg/MyDrive/Incubator/Cone/";
+
+struct MfItem {
+  section: String;      // the heading it stands under
+  name: String;
+  path: String;         // resolved, forward slashes
+  line: String;
+  child: String;        // the workspace id when the link is Workstreams/<id>.md, else empty
+}
+
+struct Manifest {
+  title: String;
+  items: List[MfItem];
+}
+
+fn slashes(s: &str) String {
+  var o = String();
+  var i = 0usize;
+  while i < s.len() { o.append(if s[i] == '\\' { "/" } else { s.slice(i, i + 1usize) }); i = i + 1usize; }
+  o
+}
+
+fn mfResolve(p: &str) String {
+  let n = slashes(p);
+  let v = n.view();
+  if v.len() >= 2usize && v[1usize] == ':' { return n.clone(); }
+  if v.len() >= 1usize && v[0usize] == '/' { return n.clone(); }
+  var o = String.from(CONE_DIR);
+  o.append(v);
+  o
+}
+
+fn noTrailSlash(s: &str) String {
+  var e = s.len();
+  while e > 3usize && s[e - 1usize] == '/' { e = e - 1usize; }
+  String.from(s.slice(0usize, e))
+}
+
+// Workstreams/<id>.md: the id, else empty
+fn mfChildId(path: &str) String {
+  let n = path.len();
+  if n < 4usize || path[n - 3usize] != '.' || path[n - 2usize] != 'm' || path[n - 1usize] != 'd' { return String(); }
+  var j = n - 3usize;
+  while j > 0usize && path[j - 1usize] != '/' { j = j - 1usize; }
+  if j < 12usize { return String(); }
+  let w = "Workstreams/";
+  var q = 0usize;
+  while q < 12usize { if path[j - 12usize + q] != w[q] { return String(); } q = q + 1usize; }
+  String.from(path.slice(j, n - 3usize))
+}
+
+fn trimText(s: &str) String {
+  var a = 0usize; var b = s.len();
+  while a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r') { a = a + 1usize; }
+  while b > a && (s[b - 1usize] == ' ' || s[b - 1usize] == '\t' || s[b - 1usize] == '\r') { b = b - 1usize; }
+  String.from(s.slice(a, b))
+}
+
+// Line 1 "# Name"; "## Section" headings; items "- [Display](path) - one line". Lines without a link are skipped.
+fn mfParse(text: &str) Manifest {
+  var m = Manifest(String(), List[MfItem]());
+  var section = String();
+  var first = true;
+  var a = 0usize;
+  while a <= text.len() {
+    var b = a;
+    while b < text.len() && text[b] != '\n' { b = b + 1usize; }
+    let ln = trimText(text.slice(a, b));
+    let l = ln.view();
+    if first {
+      first = false;
+      if startsWithText(l, "# ") { m.title = trimText(l.slice(2usize, l.len())); }
+    } else if startsWithText(l, "## ") { section = trimText(l.slice(3usize, l.len())); }
+    else if startsWithText(l, "- [") {
+      var c = 3usize;
+      while c < l.len() && l[c] != ']' { c = c + 1usize; }
+      if c + 1usize < l.len() && l[c + 1usize] == '(' {
+        var d = c + 2usize;
+        while d < l.len() && l[d] != ')' { d = d + 1usize; }
+        if d < l.len() {
+          let path = noTrailSlash(mfResolve(trimText(l.slice(c + 2usize, d)).view()).view());
+          var rest = trimText(l.slice(d + 1usize, l.len()));
+          // the separator: an em dash (3 bytes) or a hyphen
+          if startsWithText(rest.view(), "—") { rest = trimText(rest.slice(3usize, rest.len())); }
+          else if startsWithText(rest.view(), "-") { rest = trimText(rest.slice(1usize, rest.len())); }
+          m.items.push(MfItem(section.clone(), String.from(l.slice(3usize, c)), path.clone(), rest, mfChildId(path.view())));
+        }
+      }
+    }
+    a = b + 1usize;
+  }
+  m
+}
+
+fn wsSourceOk(s: &str) bool {
+  startsWithText(s, "doc:") || startsWithText(s, "url:") || startsWithText(s, "tree:") || startsWithText(s, "mermaid:")
+    || startsWithText(s, "world:") || startsWithText(s, "app:")
+}
+
+alias Folders = List[FolderCfg];
+alias PageCfgs = List[PageCfg];
+
+// A file read: ok with its projects and the room-wide settings, or not ok with 'err' (one line for a person)
+struct Parsed {
+  ok: bool;
+  err: String;
+  projects: List[ProjCfg];
+  ringCm: i64;          // [ring] radius_cm (0: not given)
+  floatCm: i64;         // [ring] float_cm (0: not given)
+  ringCount: i64;       // [ring] count (0: not given)
+  lineFile: String;     // [line] file
+  roots: List[String];  // [browser] roots
+  warnings: List[String];
+  folders: Folders;     // [folder.ID]
+  pages: PageCfgs;      // [page.ID] (room.toml)
+  panels: List[PanelCfg];
+  shelves: List[ShelfCfg];
+  palSets: List[PalSetCfg];   // [palette.KIND] (incubator.toml)
+  palPlace: String;           // [palette] place = "at:x,y,z" (room.toml): where the palette was left floating; empty: on the hand
+  zones: List[ZoneCfg];  // [zone.ID]
+  trees: List[TreeCfg];  // [tree.ID] (room.toml)
+  marks: List[MarkCfg];  // [mark.ID] (room.toml): what is on the shelves, place "shelf:Q" (slot Q of its domain's shelf)
+  seeded: List[String];  // [seeded] zones = [..] (room.toml): the shelves already seeded from their plans
+  workspaces: List[WsCfg];  // [workspace.ID] (both files)
+  wsMems: List[WsMemCfg];   // [wsmem.N]
+  wsOpen: String;           // [workspaces] open = "ID" (room.toml): the workspace open when the room was left
+}
+
+fn newParsed() Parsed {
+  Parsed(true, String(), List[ProjCfg](), 0i64, 0i64, 0i64, String(), List[String](), List[String](), Folders(), PageCfgs(),
+    List[PanelCfg](), List[ShelfCfg](), List[PalSetCfg](), String(), List[ZoneCfg](), List[TreeCfg](), List[MarkCfg](), List[String](), List[WsCfg](), List[WsMemCfg](), String())
+}
+
+// A place, parsed
+struct Place {
+  kind: u32;            // 0 ring, 1 shelf (back wall), 2 shelf (side wall), 3 free (at)
+  idx: u32;
+  x: f32;
+  y: f32;
+  z: f32;
+}
+
+fn cfgFail(p: &mut Parsed, file: &str, line: u32, reason: &str) {
+  if !p.ok { return; }        // the first fault is the one shown
+  p.ok = false;
+  var s = String.from(file);
+  s.append(" line ");
+  s.append(numText(i64.from(line)).view());
+  s.append(": ");
+  s.append(reason);
+  p.err = s;
+}
+
+// Text to a whole number of at most 6 digits, or false
+fn cfgDigits(s: &str, out: &mut u32) bool {
+  if s.len() == 0usize || s.len() > 6usize { return false; }
+  var v = 0u32;
+  var i = 0usize;
+  while i < s.len() {
+    if s[i] < '0' || s[i] > '9' { return false; }
+    v = v * 10u32 + u32.from(s[i] - '0');
+    i = i + 1usize;
+  }
+  *out = v;
+  true
+}
+
+// "-1.25" to a number
+fn cfgFloat(s: &str, out: &mut f32) bool {
+  if s.len() == 0usize { return false; }
+  var i = 0usize;
+  var neg = false;
+  if s[0usize] == '-' { neg = true; i = 1usize; }
+  var whole = 0.0f;
+  var any = false;
+  while i < s.len() && s[i] >= '0' && s[i] <= '9' { whole = whole * 10. + f32.from(u32.from(s[i] - '0')); i = i + 1usize; any = true; }
+  var frac = 0.0f;
+  if i < s.len() && s[i] == '.' {
+    i = i + 1usize;
+    var scale = 0.1f;
+    while i < s.len() && s[i] >= '0' && s[i] <= '9' { frac = frac + scale * f32.from(u32.from(s[i] - '0')); scale = scale * 0.1; i = i + 1usize; any = true; }
+  }
+  if i != s.len() || !any { return false; }
+  let v = whole + frac;
+  *out = if neg { 0. - v } else { v };
+  true
+}
+
+fn cfgSplit(s: &str, sep: u8) List[String] {
+  var out = List[String]();
+  var from = 0usize;
+  var i = 0usize;
+  while i <= s.len() {
+    if i == s.len() || s[i] == sep {
+      out.push(String.from(s.slice(from, i)));
+      from = i + 1usize;
+    }
+    i = i + 1usize;
+  }
+  out
+}
+
+// "ring:3", "shelf:back:5", "shelf:side:2", "at:1.5,0,-2" to a Place; false if it is none of these
+fn parsePlace(s: &str, pl: &mut Place) bool {
+  let parts = cfgSplit(s, ':');
+  if parts.len() == 2usize && parts[0usize].view() == "ring" {
+    var n = 0u32;
+    if !cfgDigits(parts[1usize].view(), &mut n) || n >= 5u32 { return false; }
+    *pl = Place(0u32, n, 0., 0., 0.);
+    return true;
+  }
+  if parts.len() == 3usize && parts[0usize].view() == "shelf" {
+    var n = 0u32;
+    if !cfgDigits(parts[2usize].view(), &mut n) { return false; }
+    if parts[1usize].view() == "back" && n < 16u32 { *pl = Place(1u32, n, 0., 0., 0.); return true; }
+    if parts[1usize].view() == "side" && n < 8u32 { *pl = Place(2u32, n, 0., 0., 0.); return true; }
+    return false;
+  }
+  if parts.len() == 2usize && parts[0usize].view() == "at" {
+    let c = cfgSplit(parts[1usize].view(), ',');
+    if c.len() != 3usize { return false; }
+    var x = 0.0f; var y = 0.0f; var z = 0.0f;
+    if !cfgFloat(c[0usize].view(), &mut x) || !cfgFloat(c[1usize].view(), &mut y) || !cfgFloat(c[2usize].view(), &mut z) { return false; }
+    *pl = Place(3u32, 0u32, x, y, z);
+    return true;
+  }
+  false
+}
+
+// The fixed vocabulary of menu actions. step:+1 / step:-1 (and scenario:N) are the architecture walk's; link:X and say:X carry an argument.
+fn knownAction(a: &str) bool {
+  if a == "zoom" || a == "zoomout" || a == "shelve" || a == "bring" || a == "open" || a == "talk" || a == "back" || a == "forward" { return true; }
+  if a == "files" || a == "reload" || a == "play" || a == "restart" || a == "legend" || a == "follow" || a == "timing" || a == "server" { return true; }
+  if a == "step:+1" || a == "step:-1" || a == "scenario:+1" || a == "scenario:-1" { return true; }
+  if a.len() > 3usize && a.slice(0usize, 3usize) == "ws-" { return true; }
+  if a.len() > 5usize && a.slice(0usize, 5usize) == "link:" { return true; }
+  if a.len() > 4usize && a.slice(0usize, 4usize) == "say:" { return true; }
+  if a.len() > 9usize && a.slice(0usize, 9usize) == "scenario:" {
+    var n = 0u32;
+    return cfgDigits(a.slice(9usize, a.len()), &mut n);
+  }
+  false
+}
+
+// ---- reading ----
+
+fn projKey(k: &str) bool { k == "name" || k == "source" || k == "place" || k == "yaw_deg" || k == "scale_pct" || k == "at" || k == "owner" }
+fn menuKey(k: &str) bool { k == "label" || k == "action" || k == "key" }
+
+// Every key of the table must be one 'ok' says; the first that is not is the fault
+fn checkKeys(p: &mut Parsed, file: &str, t: &toml.Table, kind: u32, tname: &str) {
+  let ks = t.keys();
+  var i = 0usize;
+  while i < ks.len() {
+    let k = ks[i].view();
+    let good = if kind == 0u32 { projKey(k) } else if kind == 1u32 { menuKey(k) }
+      else if kind == 2u32 { k == "count" || k == "radius_cm" || k == "float_cm" }
+      else if kind == 3u32 { k == "file" } else if kind == 4u32 { k == "roots" }
+      else if kind == 5u32 { k == "wall" || k == "slots" }
+      else if kind == 9u32 { k == "place" }
+      else if kind == 10u32 { k == "icons" }
+      else if kind == 7u32 { k == "name" || k == "path" || k == "place" || k == "at" }
+      else if kind == 8u32 { k == "src" || k == "place" || k == "at" }
+      else if kind == 11u32 {
+        k == "name" || k == "place" || k == "yaw_deg" || k == "width_cm" || k == "site" || k == "repo" || k == "incubator" || k == "diagram"
+          || k == "projects" || k == "line" || k == "at" || k == "tint" || k == "metrics_side" || k == "metrics_yaw_deg" || startsWithText(k, "layout_")
+      }
+      else if kind == 12u32 { k == "open" }
+      else if kind == 13u32 { k == "zones" }
+      else if kind == 15u32 { k == "name" || k == "place" || k == "zone" || k == "at" || k == "manifest" }
+      else if kind == 18u32 { k == "ws" || k == "path" || k == "state" || k == "place" || k == "yaw_deg" || k == "scale_pct" || k == "at" || k == "section" }
+      else if kind == 16u32 { k == "source" || k == "place" || k == "yaw_deg" || k == "scale_pct" }
+      else if kind == 17u32 { k == "open" }
+      else if kind == 14u32 { k == "src" || k == "name" || k == "place" || k == "at" }
+      else { k == "place" || k == "yaw_deg" || k == "width_cm" };
+    if !good {
+      var m = String.from("unknown key '");
+      m.append(k);
+      m.append("' in [");
+      m.append(tname);
+      m.append("]");
+      cfgFail(p, file, t.lineOf(k), m.view());
+    }
+    i = i + 1usize;
+  }
+}
+
+fn tableText(t: &toml.Table, key: &str) String {
+  match t.getString(key) { case let Some(s) { return String.from(s.view()); } else {} }
+  String()
+}
+
+// One integer key: absent leaves 'out' alone; present but not a whole number is a fault
+fn tableInt(p: &mut Parsed, file: &str, t: &toml.Table, key: &str, has: &mut bool, out: &mut i64) {
+  if !t.has(key) { return; }
+  match t.getInt(key) {
+    case let Some(v) { *out = v; *has = true; }
+    case is None {
+      var m = String.from(key);
+      m.append(" must be a whole number");
+      cfgFail(p, file, t.lineOf(key), m.view());
+    }
+  }
+}
+
+fn findWs(p: &mut Parsed, id: &str) usize {
+  var i = 0usize;
+  while i < p.workspaces.len() { if p.workspaces[i].id.view() == id { return i; } i = i + 1usize; }
+  p.workspaces.push(newWs(id));
+  p.workspaces.len() - 1usize
+}
+
+fn findProj(p: &mut Parsed, id: &str) usize {
+  var i = 0usize;
+  while i < p.projects.len() { if p.projects[i].id.view() == id { return i; } i = i + 1usize; }
+  p.projects.push(newProj(id));
+  p.projects.len() - 1usize
+}
+
+// Read a file's text. 'file' names it in messages ("incubator.toml"). A fault keeps nothing: the caller keeps its last good Parsed.
+fn parseConfig(text: &str, file: &str) Parsed {
+  var p = newParsed();
+  match toml.parse(text) {
+    case let Err(e) {
+      var m = String() <- e;
+      p.ok = false;
+      var s = String.from(file);
+      s.append(" ");
+      s.append(m.view());
+      p.err = s;
+      return p;
+    }
+    case let Ok(doc) {
+      let names = doc.names();
+      var n = 0usize;
+      while n < names.len() && p.ok {
+        let nm = names[n].view();
+        let seg = cfgSplit(nm, '.');
+        if nm.len() == 0usize {
+          if doc[nm].keys().len() > 0usize { cfgFail(&mut p, file, doc[nm].lineOf(doc[nm].keys()[0usize].view()), "keys must be inside a [table]"); }
+        }
+        else if seg[0usize].view() == "project" {
+          if seg.len() == 2usize {
+            let pi = findProj(&mut p, seg[1usize].view());
+            checkKeys(&mut p, file, &doc[nm], 0u32, nm);
+            p.projects[pi].name = tableText(&doc[nm], "name");
+            p.projects[pi].source = tableText(&doc[nm], "source");
+            p.projects[pi].place = tableText(&doc[nm], "place");
+            p.projects[pi].at = tableText(&doc[nm], "at");
+            p.projects[pi].owner = tableText(&doc[nm], "owner");
+            var hy = false; var yy = 0i64;
+            tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+            p.projects[pi].hasYaw = hy; p.projects[pi].yaw = yy;
+            var hs = false; var ss = 100i64;
+            tableInt(&mut p, file, &doc[nm], "scale_pct", &mut hs, &mut ss);
+            p.projects[pi].hasScale = hs; p.projects[pi].scale = ss;
+            if hs && (ss < 10i64 || ss > 1000i64) { cfgFail(&mut p, file, doc[nm].lineOf("scale_pct"), "scale_pct must be from 10 to 1000"); }
+            if p.projects[pi].place.len() > 0usize {
+              var pl = Place(0u32, 0u32, 0., 0., 0.);
+              if !parsePlace(p.projects[pi].place.view(), &mut pl) {
+                var m = String.from("place '");
+                m.append(p.projects[pi].place.view());
+                m.append("' is not ring:N (0-4), shelf:back:N (0-15), shelf:side:N (0-7) or at:x,y,z");
+                cfgFail(&mut p, file, doc[nm].lineOf("place"), m.view());
+              }
+            }
+          }
+          else if seg.len() == 4usize && seg[2usize].view() == "menu" {
+            let pi = findProj(&mut p, seg[1usize].view());
+            checkKeys(&mut p, file, &doc[nm], 1u32, nm);
+            let label = tableText(&doc[nm], "label");
+            let action = tableText(&doc[nm], "action");
+            if label.len() == 0usize || action.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a menu entry needs a label and an action"); }
+            p.projects[pi].menu.push(MenuCfg(label, action, tableText(&doc[nm], "key")));
+          }
+          else { cfgFail(&mut p, file, doc[nm].line, "a project table is [project.ID] or [project.ID.menu.N]"); }
+        }
+        else if nm == "ring" {
+          checkKeys(&mut p, file, &doc[nm], 2u32, nm);
+          var h = false;
+          var rc = 0i64; var fc = 0i64; var cc = 0i64;
+          tableInt(&mut p, file, &doc[nm], "radius_cm", &mut h, &mut rc);
+          tableInt(&mut p, file, &doc[nm], "float_cm", &mut h, &mut fc);
+          tableInt(&mut p, file, &doc[nm], "count", &mut h, &mut cc);
+          p.ringCm = rc; p.floatCm = fc; p.ringCount = cc;
+        }
+        else if nm == "line" { checkKeys(&mut p, file, &doc[nm], 3u32, nm); p.lineFile = tableText(&doc[nm], "file"); }
+        else if nm == "browser" {
+          checkKeys(&mut p, file, &doc[nm], 4u32, nm);
+          match doc[nm].getStrings("roots") { case let Some(r) { p.roots = r; } else {} }
+        }
+        else if seg[0usize].view() == "shelf" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 5u32, nm);
+          var hs = false; var sl = 0i64;
+          tableInt(&mut p, file, &doc[nm], "slots", &mut hs, &mut sl);
+          var wall = tableText(&doc[nm], "wall");
+          if wall.len() == 0usize { wall = String.from(seg[1usize].view()); }
+          if wall.view() != "back" && wall.view() != "side" { cfgFail(&mut p, file, doc[nm].line, "a shelf is on the wall \"back\" or \"side\""); }
+          p.shelves.push(ShelfCfg(String.from(seg[1usize].view()), wall, sl, hs));
+        }
+        else if seg[0usize].view() == "panel" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 6u32, nm);
+          var hy = false; var yy = 0i64;
+          var hw = false; var ww = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          tableInt(&mut p, file, &doc[nm], "width_cm", &mut hw, &mut ww);
+          let pl = tableText(&doc[nm], "place");
+          if pl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(pl.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a panel's place is at:x,y,z"); }
+          }
+          p.panels.push(PanelCfg(String.from(seg[1usize].view()), pl, yy, hy, ww, hw));
+        }
+        else if nm == "palette" {
+          checkKeys(&mut p, file, &doc[nm], 9u32, nm);
+          let pl = tableText(&doc[nm], "place");
+          if pl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(pl.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "the palette's place is at:x,y,z"); }
+          }
+          p.palPlace = pl;
+        }
+        else if seg[0usize].view() == "palette" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 10u32, nm);
+          var icons = List[String]();
+          match doc[nm].getStrings("icons") { case let Some(r) { icons = r; } else {} }
+          p.palSets.push(PalSetCfg(String.from(seg[1usize].view()), icons));
+        }
+        else if seg[0usize].view() == "folder" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 7u32, nm);
+          let path = tableText(&doc[nm], "path");
+          if path.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a folder needs a path"); }
+          let pl = tableText(&doc[nm], "place");
+          if pl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(pl.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a folder's place is at:x,y,z"); }
+          }
+          p.folders.push(FolderCfg(String.from(seg[1usize].view()), tableText(&doc[nm], "name"), path, pl, tableText(&doc[nm], "at")));
+        }
+        else if seg[0usize].view() == "page" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 8u32, nm);
+          let src = tableText(&doc[nm], "src");
+          if src.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a page needs a src (a file or an address)"); }
+          p.pages.push(PageCfg(String.from(seg[1usize].view()), src, tableText(&doc[nm], "place"), tableText(&doc[nm], "at")));
+        }
+        else if seg[0usize].view() == "mark" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 14u32, nm);
+          let src = tableText(&doc[nm], "src");
+          if src.len() == 0usize { cfgFail(&mut p, file, doc[nm].line, "a mark needs a src (a file or an address)"); }
+          p.marks.push(MarkCfg(String.from(seg[1usize].view()), src, tableText(&doc[nm], "name"), tableText(&doc[nm], "place"), tableText(&doc[nm], "at")));
+        }
+        else if seg[0usize].view() == "workspace" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 15u32, nm);
+          let wi = findWs(&mut p, seg[1usize].view());
+          p.workspaces[wi].name = tableText(&doc[nm], "name");
+          p.workspaces[wi].place = tableText(&doc[nm], "place");
+          p.workspaces[wi].zone = tableText(&doc[nm], "zone");
+          p.workspaces[wi].at = tableText(&doc[nm], "at");
+          p.workspaces[wi].manifest = slashes(tableText(&doc[nm], "manifest").view());
+          let wp = p.workspaces[wi].place.clone();
+          var wsq = 0u32;
+          if wp.len() > 0usize && (!startsWithText(wp.view(), "shelf:") || !cfgDigits(wp.slice(6usize, wp.len()), &mut wsq)) {
+            cfgFail(&mut p, file, doc[nm].lineOf("place"), "a workspace's place is shelf:Q (a slot of its zone's shelf)");
+          }
+        }
+        else if seg[0usize].view() == "workspace" && seg.len() == 4usize && seg[2usize].view() == "item" {
+          checkKeys(&mut p, file, &doc[nm], 16u32, nm);
+          let wi = findWs(&mut p, seg[1usize].view());
+          var num = 0u32;
+          if !cfgDigits(seg[3usize].view(), &mut num) { cfgFail(&mut p, file, doc[nm].line, "a workspace item is [workspace.ID.item.N] with N a number"); }
+          let src = tableText(&doc[nm], "source");
+          if !wsSourceOk(src.view()) { cfgFail(&mut p, file, doc[nm].line, "a workspace item needs a source: doc: url: tree: mermaid: world: or app:"); }
+          let ipl = tableText(&doc[nm], "place");
+          if ipl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(ipl.view(), &mut pp) { cfgFail(&mut p, file, doc[nm].lineOf("place"), "an item's place is at:x,y,z (or ring:N for a 3-D item)"); }
+          }
+          var hy = false; var yy = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          var hs = false; var ss = 100i64;
+          tableInt(&mut p, file, &doc[nm], "scale_pct", &mut hs, &mut ss);
+          if hs && (ss < 10i64 || ss > 1000i64) { cfgFail(&mut p, file, doc[nm].lineOf("scale_pct"), "scale_pct must be from 10 to 1000"); }
+          var at = p.workspaces[wi].items.len();
+          while at > 0usize && p.workspaces[wi].items[at - 1usize].n > i64.from(num) { at = at - 1usize; }
+          p.workspaces[wi].items.insert(at, WsItemCfg(i64.from(num), src, ipl, yy, hy, ss, hs));
+        }
+        else if seg[0usize].view() == "wsmem" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 18u32, nm);
+          var hy = false; var yy = 0i64; var hs = false; var ss = 100i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          tableInt(&mut p, file, &doc[nm], "scale_pct", &mut hs, &mut ss);
+          p.wsMems.push(WsMemCfg(tableText(&doc[nm], "ws"), tableText(&doc[nm], "path"), tableText(&doc[nm], "state"), tableText(&doc[nm], "place"), yy, ss, tableText(&doc[nm], "at"), tableText(&doc[nm], "section")));
+        }
+        else if nm == "workspaces" {
+          checkKeys(&mut p, file, &doc[nm], 17u32, nm);
+          p.wsOpen = tableText(&doc[nm], "open");
+        }
+        else if nm == "seeded" {
+          checkKeys(&mut p, file, &doc[nm], 13u32, nm);
+          match doc[nm].getStrings("zones") { case let Some(r) { p.seeded = r; } else {} }
+        }
+        else if nm == "screens" {
+          checkKeys(&mut p, file, &doc[nm], 6u32, nm);
+          var hy = false; var yy = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          let pl = tableText(&doc[nm], "place");
+          if pl.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(pl.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a screen's place is at:x,y,z"); }
+          }
+          p.panels.push(PanelCfg(String.from("screen-both"), pl, yy, hy, 0i64, false));
+        }
+        else if seg[0usize].view() == "zone" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 11u32, nm);
+          var z = newZoneCfg(seg[1usize].view());
+          z.name = tableText(&doc[nm], "name");
+          z.place = tableText(&doc[nm], "place");
+          z.site = tableText(&doc[nm], "site");
+          z.repo = tableText(&doc[nm], "repo");
+          z.incubator = tableText(&doc[nm], "incubator");
+          z.diagram = tableText(&doc[nm], "diagram");
+          z.projects = tableText(&doc[nm], "projects");
+          z.line = tableText(&doc[nm], "line");
+          z.at = tableText(&doc[nm], "at");
+          var hy = false; var yy = 0i64;
+          tableInt(&mut p, file, &doc[nm], "yaw_deg", &mut hy, &mut yy);
+          z.hasYaw = hy; z.yaw = yy;
+          var hw = false; var ww = 0i64;
+          tableInt(&mut p, file, &doc[nm], "width_cm", &mut hw, &mut ww);
+          z.hasWidth = hw; z.width = ww;
+          if hw && (ww < 200i64 || ww > 2000i64) { cfgFail(&mut p, file, doc[nm].lineOf("width_cm"), "width_cm must be from 200 to 2000"); }
+          if z.place.len() > 0usize {
+            var pp = Place(0u32, 0u32, 0., 0., 0.);
+            if !parsePlace(z.place.view(), &mut pp) || pp.kind != 3u32 { cfgFail(&mut p, file, doc[nm].lineOf("place"), "a zone's place is at:x,y,z"); }
+          }
+          var ri = 0usize;
+          while ri < 6usize {
+            z.rects.set(ri, tableText(&doc[nm], zoneRectKey(ri)));
+            ri = ri + 1usize;
+          }
+          z.tint = tableText(&doc[nm], "tint");
+          var hsd = false; var sdv = 1i64;
+          tableInt(&mut p, file, &doc[nm], "metrics_side", &mut hsd, &mut sdv);
+          z.hasSide = hsd; z.side = sdv;
+          if hsd && sdv != 1i64 && sdv != -1i64 { cfgFail(&mut p, file, doc[nm].lineOf("metrics_side"), "metrics_side is -1 (left edge) or 1 (right edge)"); }
+          var hmy = false; var myv = 0i64;
+          tableInt(&mut p, file, &doc[nm], "metrics_yaw_deg", &mut hmy, &mut myv);
+          z.hasMYaw = hmy; z.mYaw = myv;
+          p.zones.push(z);
+        }
+        else if seg[0usize].view() == "tree" && seg.len() == 2usize {
+          checkKeys(&mut p, file, &doc[nm], 12u32, nm);
+          var open = List[String]();
+          match doc[nm].getStrings("open") { case let Some(r) { open = r; } else {} }
+          p.trees.push(TreeCfg(String.from(seg[1usize].view()), open));
+        }
+        else { cfgFail(&mut p, file, doc[nm].line, "unknown table (known: project, ring, shelf, panel, screens, folder, page, mark, workspace, workspaces, wsmem, seeded, palette, line, browser, zone, tree)"); }
+        n = n + 1usize;
+      }
+    }
+  }
+  p
+}
+
+// ---- the overlay ----
+
+// What the room should be: a incubator project (by index) with the newest place, yaw and scale
+struct EffProj {
+  pi: usize;
+  place: String;
+  yaw: i64;
+  hasYaw: bool;
+  scale: i64;
+  hasScale: bool;
+}
+
+fn findRoom(room: &Parsed, id: &str) i32 {
+  var i = 0usize;
+  while i < room.projects.len() { if room.projects[i].id.view() == id { return i32.from(i); } i = i + 1usize; }
+  -1
+}
+
+// Each field comes from the file whose table for that project has the later 'at' (the room's, if they are equal)
+fn overlay(incubator: &Parsed, room: &Parsed) List[EffProj] {
+  var out = List[EffProj]();
+  var i = 0usize;
+  while i < incubator.projects.len() {
+    let sp = &incubator.projects[i];
+    var e = EffProj(i, String.from(sp.place.view()), sp.yaw, sp.hasYaw, sp.scale, sp.hasScale);
+    let ri = findRoom(room, sp.id.view());
+    if ri >= 0 {
+      let rp = &room.projects[usize.from(u32.from(ri))];
+      let roomNewer = rp.at.view() >= sp.at.view();
+      if rp.place.len() > 0usize && (sp.place.len() == 0usize || roomNewer) { e.place = String.from(rp.place.view()); }
+      if rp.hasYaw && (!sp.hasYaw || roomNewer) { e.yaw = rp.yaw; e.hasYaw = true; }
+      if rp.hasScale && (!sp.hasScale || roomNewer) { e.scale = rp.scale; e.hasScale = true; }
+    }
+    out.push(e);
+    i = i + 1usize;
+  }
+  out
+}
+
+// ---- writing ----
+
+fn tomlStr(s: &str) String {
+  var o = String.from("\"");
+  var i = 0usize;
+  while i < s.len() {
+    if s[i] == '"' { o.append("\\\""); }
+    else if s[i] == '\\' { o.append("\\\\"); }
+    else { o.appendByte(s[i]); }
+    i = i + 1usize;
+  }
+  o.append("\"");
+  o
+}
+
+fn intText(v: i64) String {
+  if v < 0i64 { var s = String.from("-"); s.append(numText(0i64 - v).view()); return s; }
+  numText(v)
+}
+
+// room.toml: the room's own changes, one table per project
+fn roomText(r: &Parsed) String {
+  var s = String.from("# room.toml: what was done in the room (the incubator writes this; Penny reads it, never edits it).\n");
+  s.append("# The room is incubator.toml overlaid by this file: for each project and field, the newer 'at' wins.\n");
+  var i = 0usize;
+  while i < r.projects.len() {
+    let p = &r.projects[i];
+    s.append("\n[project.");
+    s.append(p.id.view());
+    s.append("]\n");
+    if p.place.len() > 0usize { s.append("place = "); s.append(tomlStr(p.place.view()).view()); s.append("\n"); }
+    if p.hasYaw { s.append("yaw_deg = "); s.append(intText(p.yaw).view()); s.append("\n"); }
+    if p.hasScale { s.append("scale_pct = "); s.append(intText(p.scale).view()); s.append("\n"); }
+    s.append("at = "); s.append(tomlStr(p.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  s.append(extrasText(r).view());
+  if r.palPlace.len() > 0usize { s.append("\n[palette]\nplace = "); s.append(tomlStr(r.palPlace.view()).view()); s.append("\n"); }
+  s
+}
+
+// The parked folders and the open pages, as tables (room.toml has both; incubator.toml's first-run file has the folders)
+fn extrasText(r: &Parsed) String {
+  var s = String();
+  var i = 0usize;
+  while i < r.folders.len() {
+    let f = &r.folders[i];
+    s.append("\n[folder."); s.append(f.id.view()); s.append("]\n");
+    s.append("name = "); s.append(tomlStr(f.name.view()).view()); s.append("\n");
+    s.append("path = "); s.append(tomlStr(f.path.view()).view()); s.append("\n");
+    s.append("place = "); s.append(tomlStr(f.place.view()).view()); s.append("\n");
+    s.append("at = "); s.append(tomlStr(f.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.panels.len() {
+    let g = &r.panels[i];
+    s.append("\n[panel."); s.append(g.id.view()); s.append("]\n");
+    s.append("place = "); s.append(tomlStr(g.place.view()).view()); s.append("\n");
+    if g.hasYaw { s.append("yaw_deg = "); s.append(intText(g.yaw).view()); s.append("\n"); }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.pages.len() {
+    let g = &r.pages[i];
+    s.append("\n[page."); s.append(g.id.view()); s.append("]\n");
+    s.append("src = "); s.append(tomlStr(g.src.view()).view()); s.append("\n");
+    s.append("place = "); s.append(tomlStr(g.place.view()).view()); s.append("\n");
+    s.append("at = "); s.append(tomlStr(g.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.marks.len() {
+    let g = &r.marks[i];
+    s.append("\n[mark."); s.append(g.id.view()); s.append("]\n");
+    s.append("src = "); s.append(tomlStr(g.src.view()).view()); s.append("\n");
+    s.append("name = "); s.append(tomlStr(g.name.view()).view()); s.append("\n");
+    s.append("place = "); s.append(tomlStr(g.place.view()).view()); s.append("\n");
+    s.append("at = "); s.append(tomlStr(g.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.workspaces.len() {
+    s.append(wsText(&r.workspaces[i]).view());
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.wsMems.len() { s.append(wsMemText(&r.wsMems[i], i + 1usize).view()); i = i + 1usize; }
+  if r.wsOpen.len() > 0usize { s.append("\n[workspaces]\nopen = "); s.append(tomlStr(r.wsOpen.view()).view()); s.append("\n"); }
+  if r.seeded.len() > 0usize {
+    s.append("\n[seeded]\nzones = [");
+    var q0 = 0usize;
+    while q0 < r.seeded.len() { if q0 > 0usize { s.append(", "); } s.append(tomlStr(r.seeded[q0].view()).view()); q0 = q0 + 1usize; }
+    s.append("]\n");
+  }
+  i = 0usize;
+  while i < r.zones.len() {
+    let z = &r.zones[i];
+    s.append("\n[zone."); s.append(z.id.view()); s.append("]\n");
+    if z.name.len() > 0usize { s.append("name = "); s.append(tomlStr(z.name.view()).view()); s.append("\n"); }
+    s.append("place = "); s.append(tomlStr(z.place.view()).view()); s.append("\n");
+    if z.hasYaw { s.append("yaw_deg = "); s.append(intText(z.yaw).view()); s.append("\n"); }
+    if z.hasWidth { s.append("width_cm = "); s.append(intText(z.width).view()); s.append("\n"); }
+    s.append("at = "); s.append(tomlStr(z.at.view()).view()); s.append("\n");
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < r.trees.len() {
+    let t = &r.trees[i];
+    s.append("\n[tree."); s.append(t.id.view()); s.append("]\nopen = [");
+    var q = 0usize;
+    while q < t.open.len() {
+      if q > 0usize { s.append(", "); }
+      s.append(tomlStr(t.open[q].view()).view());
+      q = q + 1usize;
+    }
+    s.append("]\n");
+    i = i + 1usize;
+  }
+  s
+}
+
+fn wsText(w: &WsCfg) String {
+  var s = String.from("\n[workspace."); s.append(w.id.view()); s.append("]\n");
+  s.append("name = "); s.append(tomlStr(w.name.view()).view()); s.append("\n");
+  if w.place.len() > 0usize { s.append("place = "); s.append(tomlStr(w.place.view()).view()); s.append("\n"); }
+  if w.zone.len() > 0usize { s.append("zone = "); s.append(tomlStr(w.zone.view()).view()); s.append("\n"); }
+  if w.manifest.len() > 0usize { s.append("manifest = "); s.append(tomlStr(w.manifest.view()).view()); s.append("\n"); }
+  s.append("at = "); s.append(tomlStr(w.at.view()).view()); s.append("\n");
+  var i = 0usize;
+  while i < w.items.len() {
+    let t = &w.items[i];
+    s.append("\n[workspace."); s.append(w.id.view()); s.append(".item."); s.append(numText(i64.from(i + 1usize)).view()); s.append("]\n");
+    s.append("source = "); s.append(tomlStr(t.source.view()).view()); s.append("\n");
+    if t.place.len() > 0usize { s.append("place = "); s.append(tomlStr(t.place.view()).view()); s.append("\n"); }
+    if t.hasYaw { s.append("yaw_deg = "); s.append(intText(t.yaw).view()); s.append("\n"); }
+    if t.hasScale { s.append("scale_pct = "); s.append(intText(t.scale).view()); s.append("\n"); }
+    i = i + 1usize;
+  }
+  s
+}
+
+// incubator.toml, first run: written from the layout the incubator was built with, commented, so the file starts out as the truth
+fn incubatorText(r: &Parsed, ringCm: i64, floatCm: i64, lineFile: &str, root: &str) String {
+  var s = String.from("# incubator.toml: what exists in the incubator incubator and where it is meant to stand. PENNY'S FILE: the incubator only reads it.\n");
+  s.append("# Edit it and save: the room changes within a second (each project flies to its new place). A mistake never breaks the room:\n");
+  s.append("# the last good layout stays and a red card on the production line says which line is wrong.\n");
+  s.append("# What Jon moves in the room goes to room.toml, never here. The room is this file overlaid by room.toml, the NEWER 'at' winning\n");
+  s.append("# per project and field. To override a move Jon made, give the project a fresh 'at' (a quoted ISO time, e.g. \"2026-11-11T15:00:00Z\").\n");
+  s.append("#\n# Project tables: [project.ID]  name, source, place, yaw_deg (whole degrees), scale_pct (whole percent), at\n");
+  s.append("#   source: world:<file>#<part> | doc:<path> | mermaid:<path> | url:<https> | app:archwalk      (this build knows the projects below)\n");
+  s.append("#   place:  ring:N (N 0-4, 0 straight ahead, going round to the right) | shelf:back:N (0-15) | shelf:side:N (0-7) | at:x,y,z (meters)\n");
+  s.append("# Menu entries (the chips beside the selected project): [project.ID.menu.N]  label, action, key (optional hint)\n");
+  s.append("#   actions: zoom zoomout shelve bring open talk back forward files reload play restart legend follow timing\n");
+  s.append("#            step:+1 step:-1 scenario:+1 scenario:-1 scenario:N server link:<path or url> say:<text sent to the session as a turn>\n");
+  s.append("#   shelve shows only on the ring, bring only on a shelf; an unknown action shows greyed and the reason is logged.\n");
+  s.append("# This build reads numbers as whole numbers only (Cone's toml package has no floats), so sizes are in cm and percent.\n\n");
+  s.append("[ring]\nradius_cm = "); s.append(intText(ringCm).view());
+  s.append("      # the ring of five slots round the start spot\nfloat_cm = "); s.append(intText(floatCm).view());
+  s.append("       # how high projects float over the floor\n\n");
+  s.append("[line]\nfile = "); s.append(tomlStr(lineFile).view()); s.append("   # the production line's cards (JSON)\n\n");
+  s.append("[browser]\nroots = ["); s.append(tomlStr(root).view()); s.append("]   # where the file browser starts\n");
+  var i = 0usize;
+  while i < r.projects.len() {
+    let p = &r.projects[i];
+    s.append("\n[project."); s.append(p.id.view()); s.append("]\n");
+    s.append("name = "); s.append(tomlStr(p.name.view()).view()); s.append("\n");
+    s.append("source = "); s.append(tomlStr(p.source.view()).view()); s.append("\n");
+    s.append("place = "); s.append(tomlStr(p.place.view()).view()); s.append("\n");
+    s.append("yaw_deg = "); s.append(intText(p.yaw).view()); s.append("\n");
+    s.append("scale_pct = "); s.append(intText(p.scale).view()); s.append("\n");
+    s.append("at = "); s.append(tomlStr(p.at.view()).view()); s.append("\n");
+    if p.owner.len() > 0usize { s.append("owner = "); s.append(tomlStr(p.owner.view()).view()); s.append("\n"); }
+    var m = 0usize;
+    while m < p.menu.len() {
+      s.append("\n[project."); s.append(p.id.view()); s.append(".menu."); s.append(numText(i64.from(m + 1usize)).view()); s.append("]\n");
+      s.append("label = "); s.append(tomlStr(p.menu[m].label.view()).view()); s.append("\n");
+      s.append("action = "); s.append(tomlStr(p.menu[m].action.view()).view()); s.append("\n");
+      if p.menu[m].key.len() > 0usize { s.append("key = "); s.append(tomlStr(p.menu[m].key.view()).view()); s.append("\n"); }
+      m = m + 1usize;
+    }
+    i = i + 1usize;
+  }
+  s.append(extrasText(r).view());
+  s.append(paletteDefaultsText().view());
+  s.append(zonesDefaultText().view());
+  s.append("\n# Optional: [panel.browser] and [panel.report] place = \"at:x,y,z\", yaw_deg = N (where such a panel stands when it opens);\n");
+  s.append("# [shelf.back] / [shelf.side] slots = N (how many slots the room may use when it shelves something by itself).\n");
+  s.append("# [folder.ID] name, path, place (\"at:x,y,z\"): a parked folder, a post in the room that opens a browser rooted at path.\n");
+  s.append("# A [project.ID] the building does not have, with source = \"doc:<file>\" or \"url:<address>\", appears as a page; remove it and it leaves.\n");
+  s.append("# owner = \"3D Web\" on a project: who answers for it, shown on its label.\n");
+  s
+}
+
+// The two boards at the back, as the first-run file writes them (and as the room has them when a file gives no [zone.*] at all)
+fn zonesDefaultText() String {
+  var s = String.from("\n# Boards at the back of the incubator, each made of live panes: its site (a web page), repo and Incubator folder (expandable trees),\n");
+  s.append("# its projects (a shelf strip), its production line (cards whose line.json \"zone\" is `line`) and a Mermaid diagram.\n");
+  s.append("# place = \"at:x,y,z\" (meters; the middle of the board's foot), yaw_deg (turned toward the start spot), width_cm. A board moved by hand\n");
+  s.append("# goes to room.toml. layout_site, layout_repo, layout_incubator, layout_projects, layout_line, layout_diagram = \"x,y,w,h\" (meters from\n");
+  s.append("# the board's bottom left, board 7.2 m wide at 720 cm) move or size a pane.\n");
+  s.append("\n[zone.cone]\nname = \"Cone\"\nplace = \"at:-4.2,0,-6.2\"\nyaw_deg = 25\nwidth_cm = 640\nsite = \"https://cone.jondgoodwin.com\"\n");
+  s.append("repo = \"C:/src/cone\"\nincubator = \"C:/Users/jondg/MyDrive/Incubator/Cone\"\n");
+  s.append("diagram = \"C:/Users/jondg/MyDrive/Incubator/Cone/Diagrams\"\nprojects = \"\"\nline = \"cone\"\nat = \"2026-11-11T00:00:00Z\"\n");
+  s.append("\n[zone.web3d]\nname = \"3D Web\"\nplace = \"at:4.2,0,-6.2\"\nyaw_deg = -25\nwidth_cm = 640\nsite = \"https://web3d.jondgoodwin.com\"\n");
+  s.append("repo = \"C:/src/pegasus3d\"\nincubator = \"C:/Users/jondg/MyDrive/Incubator/3D Web\"\n");
+  s.append("diagram = \"C:/Users/jondg/MyDrive/Incubator/3D Web/Diagrams\"\nprojects = \"\"\nline = \"web3d\"\nat = \"2026-11-11T00:00:00Z\"\n");
+  s.append("\n# Penny's prompts folder: its own tree pane beside the workbench (no posts that retarget another pane)\n");
+  s.append("[page.penny]\nsrc = \"tree:C:/Users/jondg/MyDrive/Incubator/Penny/prompts\"\nplace = \"at:-3.6,0,1.4\"\nat = \"2026-11-11T00:00:00Z\"\n");
+  s
+}
+
+// The menus a project has when its file gives none, and in the first-run file: 0 a model, 1 the document page, 2 the architecture walk
+fn defaultMenu(kind: u32) List[MenuCfg] {
+  var m = List[MenuCfg]();
+  m.push(MenuCfg(String.from("shelve (X)"), String.from("shelve"), String.from("X")));
+  m.push(MenuCfg(String.from("bring (B)"), String.from("bring"), String.from("B")));
+  m.push(MenuCfg(String.from("zoom (Z)"), String.from("zoom"), String.from("Z")));
+  m.push(MenuCfg(String.from("open (O)"), String.from("open"), String.from("O")));
+  if kind == 1u32 {
+    m.push(MenuCfg(String.from("talk (T)"), String.from("talk"), String.from("T")));
+    m.push(MenuCfg(String.from("back ([)"), String.from("back"), String.from("[")));
+    m.push(MenuCfg(String.from("forward (])"), String.from("forward"), String.from("]")));
+    m.push(MenuCfg(String.from("files (F)"), String.from("files"), String.from("F")));
+  }
+  if kind == 2u32 {
+    m.push(MenuCfg(String.from("step forward"), String.from("step:+1"), String()));
+    m.push(MenuCfg(String.from("step back"), String.from("step:-1"), String()));
+    m.push(MenuCfg(String.from("play / pause"), String.from("play"), String()));
+    m.push(MenuCfg(String.from("next scenario"), String.from("scenario:+1"), String()));
+    m.push(MenuCfg(String.from("legend"), String.from("legend"), String()));
+    m.push(MenuCfg(String.from("client / server"), String.from("server"), String()));
+    m.push(MenuCfg(String.from("restart"), String.from("restart"), String()));
+  }
+  m
+}
+
+// 1.5 as "1.5", -0.25 as "-0.25": two decimals at most
+fn floatText(v: f32) String {
+  var n = v;
+  var s = String();
+  if n < 0. { s.append("-"); n = 0. - n; }
+  let hundredths = i64.from(u32.from(n * 100. + 0.5));
+  s.append(numText(hundredths / 100i64).view());
+  let f = hundredths % 100i64;
+  if f != 0i64 {
+    s.append(".");
+    s.append(numText(f / 10i64).view());
+    if f % 10i64 != 0i64 { s.append(numText(f % 10i64).view()); }
+  }
+  s
+}

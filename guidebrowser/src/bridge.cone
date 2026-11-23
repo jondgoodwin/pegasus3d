@@ -1,0 +1,476 @@
+// The incubator bridge, app side: a folder protocol with a Claude Code session (C:\src\incubator\bridge\PROTOCOL.md).
+//
+//   - A turn is composed in a draft file (draft.txt; the user dictates or types into it) and sent with a key
+//     (Return): turn-NNNN.json is written into inbox\ (under a temp name, then renamed), carrying the text, the
+//     sent time, the clicks on the page since the last turn (read from pointer.log, which docpanel writes), and the
+//     documents in view.
+//   - The outbox is polled: when reply-NNNN.md appears (written last, after reply-NNNN.txt), the caller shows it.
+
+const BRIDGE_POLL_MS = 250u64;
+var @threadlocal lineCount = 0u32;       // lines posted so far (they share a millisecond's name)
+
+fn unixMs() i64 {
+  Timestamp.now().unixNanos() / 1000000i64
+}
+
+fn numText(n: i64) String {
+  var s = String();
+  var digits = List[u8]();
+  var v = n;
+  if v < 0i64 { v = 0i64; }
+  if v == 0i64 { digits.push('0'); }
+  while v > 0i64 {
+    digits.push(u8.from(usize.from('0') + usize.from(v % 10i64)));
+    v = v / 10i64;
+  }
+  var i = digits.len();
+  while i > 0usize {
+    i = i - 1usize;
+    let d = usize.from(*digits[i]) - usize.from('0');
+    s.append("0123456789".slice(d, d + 1usize));
+  }
+  s
+}
+
+fn pad(n: i64, width: usize) String {
+  var s = numText(n);
+  var out = String();
+  var k = s.len();
+  while k < width { out.append("0"); k = k + 1usize; }
+  out.append(s.view());
+  out
+}
+
+fn turnName(prefix: &str, n: u32, ext: &str) String {
+  var s = String.from(prefix);
+  s.append(pad(i64.from(n), 4usize).view());
+  s.append(ext);
+  s
+}
+
+// The text as a JSON string with its quotes
+fn jsonStr(s: &str) String {
+  var out = String.from("\"");
+  var start = 0usize;
+  var i = 0usize;
+  while i < s.len() {
+    let c = s[i];
+    var esc = "";
+    if c == '"' { esc = "\\\""; }
+    else if c == '\\' { esc = "\\\\"; }
+    else if c == '\n' { esc = "\\n"; }
+    else if c == '\r' { esc = "\\r"; }
+    else if c == '\t' { esc = "\\t"; }
+    else if c < ' ' { esc = " "; }
+    if esc.len() > 0usize {
+      out.append(s.slice(start, i));
+      out.append(esc);
+      start = i + 1usize;
+    }
+    i = i + 1usize;
+  }
+  out.append(s.slice(start, s.len()));
+  out.append("\"");
+  out
+}
+
+// ISO 8601 UTC from unix milliseconds
+fn isoUtc(ms: i64) String {
+  let secs = ms / 1000i64;
+  var days = secs / 86400i64;
+  let rem = secs % 86400i64;
+  // civil from days (Howard Hinnant)
+  days = days + 719468i64;
+  let era = days / 146097i64;
+  let doe = days - era * 146097i64;
+  let yoe = (doe - doe / 1460i64 + doe / 36524i64 - doe / 146096i64) / 365i64;
+  var y = yoe + era * 400i64;
+  let doy = doe - (365i64 * yoe + yoe / 4i64 - yoe / 100i64);
+  let mp = (5i64 * doy + 2i64) / 153i64;
+  let d = doy - (153i64 * mp + 2i64) / 5i64 + 1i64;
+  var m = mp + 3i64;
+  if mp >= 10i64 { m = mp - 9i64; }
+  if m <= 2i64 { y = y + 1i64; }
+  var s = pad(y, 4usize);
+  s.append("-"); s.append(pad(m, 2usize).view());
+  s.append("-"); s.append(pad(d, 2usize).view());
+  s.append("T"); s.append(pad(rem / 3600i64, 2usize).view());
+  s.append(":"); s.append(pad((rem % 3600i64) / 60i64, 2usize).view());
+  s.append(":"); s.append(pad(rem % 60i64, 2usize).view());
+  s.append(".");  s.append(pad(ms % 1000i64, 3usize).view());
+  s.append("Z");
+  s
+}
+
+fn toBytes(text: &str) List[u8] {
+  var bytes = List[u8]();
+  var k = 0usize;
+  while k < text.len() { bytes.push(text[k]); k = k + 1usize; }
+  bytes
+}
+
+// Write under a temp name in the same folder, then rename, so a reader never sees half a file
+fn writeAtomic(folder: &str, name: &str, text: &str) bool {
+  var tmp = String.from(folder);
+  tmp.append("/.tmp-");
+  tmp.append(name);
+  var fin = String.from(folder);
+  fin.append("/");
+  fin.append(name);
+  let bytes = toBytes(text);
+  // Windows will not rename over a file; only the draft (the app's own, never read half-way by anyone else) is replaced
+  if fs.exists(&Path.from(fin.view())) { _ = fs.removeFile(&Path.from(fin.view())); }
+  if let Err(e) = fs.writeFile(&Path.from(tmp.view()), bytes.view()) { print <- "bridge: write failed: "; print <- e; print <- "\n"; return false; }
+  if let Err(e) = fs.rename(&Path.from(tmp.view()), &Path.from(fin.view())) { print <- "bridge: rename failed: "; print <- e; print <- "\n"; return false; }
+  true
+}
+
+fn pathIn(dir: &str, name: &str) String {
+  var p = String.from(dir);
+  p.append("/");
+  p.append(name);
+  p
+}
+
+fn hasWord(s: &str) bool {
+  var i = 0usize;
+  while i < s.len() {
+    let c = s[i];
+    if c != ' ' && c != '\n' && c != '\r' && c != '\t' { return true; }
+    i = i + 1usize;
+  }
+  false
+}
+
+// The number in a name like 'turn-0007.json' (0 if it is not of that form)
+fn numberIn(name: &str, prefix: &str) usize {
+  if name.len() < prefix.len() + 4usize { return 0usize; }
+  var i = 0usize;
+  while i < prefix.len() { if name[i] != prefix[i] { return 0usize; } i = i + 1usize; }
+  var n = 0usize;
+  var k = 0usize;
+  while k < 4usize {
+    let c = name[prefix.len() + k];
+    if c < '0' || c > '9' { return 0usize; }
+    n = n * 10usize + (usize.from(c) - usize.from('0'));
+    k = k + 1usize;
+  }
+  n
+}
+
+fn highestIn(folder: &str, prefix: &str) usize {
+  var best = 0usize;
+  match fs.readDir(&Path.from(folder)) {
+    case let Ok(entries) {
+      var i = 0usize;
+      while i < entries.len() {
+        let n = numberIn(entries[i].name.view(), prefix);
+        if n > best { best = n; }
+        i = i + 1usize;
+      }
+    }
+    case let Err(e) {}
+  }
+  best
+}
+
+pub struct Bridge {
+  dir: String;
+  pointerLog: String;
+  pub draftNote: String;      // the draft as last read from draft.txt, for the note strip
+  pub statusSeen: String;     // the status line last shown on the note strip (the caller's)
+  turn: u32 = 0u32;          // the last turn sent
+  shown: u32 = 0u32;          // the last reply shown
+  noteShown: u32 = 0u32;      // the last late note shown (outbox\note-NNNN: their own count, not tied to turns)
+  pub noteReady: u32 = 0u32;  // a note whose .md has landed and is not yet shown (0: none); set by poll
+  pointerOff: usize = 0usize;
+  lastPoll: u64 = 0u64;
+  sentMs: i64 = 0i64;
+  pub showingReply: bool = false;
+  pub voiceSend: bool = false;    // send.flag was found (and deleted): the voice process says "send it"; the caller sends the draft
+  pub draftChanged: bool = false; // draftNote changed since the caller last looked
+  // PUSH TO TALK: the app owns rec.flag (it exists while recording); studiovoice owns busy.flag (recording or transcribing)
+  pub recording: bool = false;
+  pub busy: bool = false;
+  wantSend: bool = false;         // send asked for: goes when the recording is over and the draft is final
+  pauseMs: u64 = 0u64;
+  dictPoll: u64 = 0u64;
+
+  // DICTATE MODE (the page editor): dictate.flag names the file whose caret takes the voice; while it exists studiovoice writes each
+  // transcription to dictate-NNNN.txt (not into the draft) and the app takes those. Turning the mode on or off clears the leftovers.
+  pub fn setDictate(self: &mut, on: bool, file: String) {
+    self.clearDictation();
+    if on {
+      var body = file;
+      body.append("\n");
+      writeAtomic(dir.view(), "dictate.flag", body.view());
+    } else {
+      _ = fs.removeFile(&Path.from(pathIn(dir.view(), "dictate.flag").view()));
+    }
+  }
+
+  fn clearDictation(self: &mut) {
+    match fs.readDir(&Path.from(dir.view())) {
+      case let Ok(entries) {
+        var i = 0usize;
+        while i < entries.len() {
+          if numberIn(entries[i].name.view(), "dictate-") > 0usize { _ = fs.removeFile(&Path.from(pathIn(dir.view(), entries[i].name.view()).view())); }
+          i = i + 1usize;
+        }
+      }
+      case let Err(e) {}
+    }
+  }
+
+  // The oldest transcription waiting for the page ("" if none); its file is removed
+  pub fn takeDictation(self: &mut) String {
+    let now = nowMs();
+    if now < dictPoll + 200u64 { return String(); }
+    dictPoll = now;
+    var best = 0usize;
+    var bestName = String();
+    match fs.readDir(&Path.from(dir.view())) {
+      case let Ok(entries) {
+        var i = 0usize;
+        while i < entries.len() {
+          let n = numberIn(entries[i].name.view(), "dictate-");
+          if n > 0usize && (best == 0usize || n < best) { best = n; bestName = String.from(entries[i].name.view()); }
+          i = i + 1usize;
+        }
+      }
+      case let Err(e) {}
+    }
+    if best == 0usize { return String(); }
+    let p = pathIn(dir.view(), bestName.view());
+    var out = String();
+    match fs.readFile(&Path.from(p.view())) { case let Ok(t) { out = String.from(t.view()); } case let Err(e) {} }
+    _ = fs.removeFile(&Path.from(p.view()));
+    out
+  }
+
+  // F2 / the record chip
+  pub fn toggleRecord(self: &mut) {
+    if recording {
+      _ = fs.removeFile(&Path.from(pathIn(dir.view(), "rec.flag").view()));
+      recording = false;
+      pauseMs = nowMs();
+    } else {
+      writeAtomic(dir.view(), "rec.flag", "rec\n");
+      recording = true;
+    }
+  }
+
+  // F3 / the send chip: a recording is paused first; the turn goes when the draft is final
+  pub fn requestSend(self: &mut) {
+    if recording { self.toggleRecord(); }
+    wantSend = true;
+    pauseMs = nowMs();
+  }
+
+  // B pressed and the turn not gone yet (the recording is being written down): the note strip says "sending"
+  pub fn sendWaiting(self: &) bool { wantSend }
+
+  pub fn clearDraft(self: &mut) { writeAtomic(dir.view(), "draft.txt", ""); }
+
+  pub fn create(dir: &str, pointerLog: &str) Bridge {
+    var b = Bridge(String.from(dir), String.from(pointerLog), String(), String());
+    // flags left by an earlier run are not this one's
+    _ = fs.removeFile(&Path.from(pathIn(dir, "rec.flag").view()));
+    _ = fs.removeFile(&Path.from(pathIn(dir, "busy.flag").view()));
+    _ = fs.removeFile(&Path.from(pathIn(dir, "dictate.flag").view()));
+    var sub = String.from(dir); sub.append("/inbox");
+    _ = fs.makeDirAll(&Path.from(sub.view()));
+    var s2 = String.from(dir); s2.append("/inbox/done");
+    _ = fs.makeDirAll(&Path.from(s2.view()));
+    var s3 = String.from(dir); s3.append("/outbox");
+    _ = fs.makeDirAll(&Path.from(s3.view()));
+    // numbering goes on from what is already there
+    var hi = highestIn(sub.view(), "turn-");
+    let h2 = highestIn(s2.view(), "turn-");
+    if h2 > hi { hi = h2; }
+    let h3 = highestIn(s3.view(), "reply-");
+    if h3 > hi { hi = h3; }
+    b.turn = u32.from(hi);
+    b.shown = u32.from(hi);
+    b.noteShown = u32.from(highestIn(s3.view(), "note-"));
+    // clicks from before now are not this session's
+    match fs.stat(&Path.from(pointerLog)) { case let Ok(info) { b.pointerOff = usize.from(info.size); } case let Err(e) {} }
+    print <- "bridge: folder "; printStr(dir); print <- ", next turn "; print <- (b.turn + 1u32); print <- "\n";
+    b
+  }
+
+  // The click lines since the last turn as a JSON array. A line is: unixMs TAB file TAB path " | " text
+  // (nav: false the clicks on things, true the clicks that only expanded or collapsed a folder; documents marked "nav:" are those)
+  fn listed(self: &mut, nav: bool) String {
+    var out = String.from("[");
+    var first = true;
+    match fs.readFile(&Path.from(pointerLog.view())) {
+      case let Ok(all) {
+        let t = all.view();
+        var pos = pointerOff;
+        if pos > t.len() { pos = 0usize; }
+        while pos < t.len() {
+          var e = pos;
+          while e < t.len() && t[e] != '\n' { e = e + 1usize; }
+          let line = t.slice(pos, e);
+          pos = e + 1usize;
+          // fields
+          var t1 = 0usize;
+          while t1 < line.len() && line[t1] != '\t' { t1 = t1 + 1usize; }
+          if t1 >= line.len() { continue; }
+          var t2 = t1 + 1usize;
+          while t2 < line.len() && line[t2] != '\t' { t2 = t2 + 1usize; }
+          if t2 >= line.len() { continue; }
+          let isNav = t2 - t1 > 5usize && line.slice(t1 + 1usize, t1 + 5usize) == "nav:";
+          if isNav != nav { continue; }
+          let rest = line.slice(t2 + 1usize, line.len());
+          var bar = 0usize;
+          while bar + 2usize < rest.len() && !(rest[bar] == ' ' && rest[bar + 1usize] == '|' && rest[bar + 2usize] == ' ') { bar = bar + 1usize; }
+          var path = rest;
+          var snippet = "";
+          if bar + 2usize < rest.len() { path = rest.slice(0usize, bar); snippet = rest.slice(bar + 3usize, rest.len()); }
+          if !first { out.append(",\n    "); }
+          first = false;
+          out.append("{\"kind\": \"click\", \"time_ms\": ");
+          out.append(line.slice(0usize, t1));
+          out.append(", \"document\": ");
+          out.append(jsonStr(line.slice(if isNav { t1 + 5usize } else { t1 + 1usize }, t2)).view());
+          out.append(", \"block_path\": ");
+          out.append(jsonStr(path).view());
+          out.append(", \"text\": ");
+          out.append(jsonStr(snippet).view());
+          out.append("}");
+        }
+      }
+      case let Err(e) {}
+    }
+    out.append("]");
+    out
+  }
+
+  // Send the draft as the next turn. 'documents' is the JSON array of what is in view. False if the draft is empty.
+  pub fn send(self: &mut, documents: &str) bool {
+    var text = String();
+    var draftFile = String.from(dir.view());
+    draftFile.append("/draft.txt");
+    match fs.readFile(&Path.from(draftFile.view())) { case let Ok(s) { text = String.from(s.view()); } case let Err(e) {} }
+    if !hasWord(text.view()) { print <- "bridge: the draft is empty, nothing sent\n"; return false; }
+    let n = turn + 1u32;
+    let now = unixMs();
+    var j = String.from("{\n  \"turn\": ");
+    j.append(numText(i64.from(n)).view());
+    j.append(",\n  \"sent_ms\": "); j.append(numText(now).view());
+    j.append(",\n  \"sent_utc\": \""); j.append(isoUtc(now).view());
+    j.append("\",\n  \"text\": "); j.append(jsonStr(text.view()).view());
+    j.append(",\n  \"targets\": "); j.append(self.listed(false).view());
+    j.append(",\n  \"navigation\": "); j.append(self.listed(true).view());
+    match fs.stat(&Path.from(pointerLog.view())) { case let Ok(info) { pointerOff = usize.from(info.size); } case let Err(e) {} }
+    j.append(",\n  \"documents\": "); j.append(documents);
+    j.append(",\n  \"reply_md\": "); j.append(jsonStr(self.replyPath(n, ".md").view()).view());
+    j.append(",\n  \"reply_txt\": "); j.append(jsonStr(self.replyPath(n, ".txt").view()).view());
+    j.append("\n}\n");
+    var inbox = String.from(dir.view()); inbox.append("/inbox");
+    if !writeAtomic(inbox.view(), turnName("turn-", n, ".json").view(), j.view()) { return false; }
+    turn = n;
+    sentMs = now;
+    // the draft is spent
+    writeAtomic(dir.view(), "draft.txt", "");
+    print <- "bridge: sent turn "; print <- n; print <- " at "; print <- now; print <- " ms\n";
+    true
+  }
+
+  pub fn replyPath(self: &, n: u32, ext: &str) String {
+    var s = String.from(dir.view());
+    s.append("/outbox/");
+    s.append(turnName("reply-", n, ext).view());
+    s
+  }
+
+  pub fn notePath(self: &, n: u32, ext: &str) String {
+    var s = String.from(dir.view());
+    s.append("/outbox/");
+    s.append(turnName("note-", n, ext).view());
+    s
+  }
+
+  pub fn noteSummary(self: &, n: u32) String {
+    var out = String();
+    match fs.readFile(&Path.from(self.notePath(n, ".txt").view())) {
+      case let Ok(s) { out = String.from(s.view()); }
+      case let Err(e) {}
+    }
+    out
+  }
+
+  pub fn pending(self: &) bool { turn > shown }
+
+  pub fn postLine(self: &, text: &str) bool { postLineTo(dir.view(), text) }
+
+  // The voice process's two signals (studiovoice): send.flag works like Return (the flag is deleted here, the caller
+  // sends the draft), and draft.txt as it grows is kept in draftNote for the note strip.
+  fn watchVoice(self: &mut) {
+    var flag = String.from(dir.view());
+    flag.append("/send.flag");
+    if fs.exists(&Path.from(flag.view())) {
+      _ = fs.removeFile(&Path.from(flag.view()));
+      voiceSend = true;
+    }
+    busy = fs.exists(&Path.from(pathIn(dir.view(), "busy.flag").view()));
+    // a send waits for the recording to be over and transcribed (busy.flag gone, 400 ms after the pause for studiovoice to see it)
+    if wantSend && !recording && !busy && nowMs() > pauseMs + 400u64 { wantSend = false; voiceSend = true; print <- "bridge: the words are written down: sending\n"; }
+    // (the voice process never finished: send what the draft holds rather than wait for ever)
+    if wantSend && nowMs() > pauseMs + 30000u64 { wantSend = false; voiceSend = true; print <- "bridge: waited 30 s for the voice process: sending the draft as it is\n"; }
+    var text = String();
+    var draftFile = String.from(dir.view());
+    draftFile.append("/draft.txt");
+    match fs.readFile(&Path.from(draftFile.view())) { case let Ok(t) { text = String.from(t.view()); } case let Err(e) {} }
+    if text.view() != draftNote.view() { draftNote = text; draftChanged = true; }
+  }
+
+  // The number of a reply that has arrived and not been shown (0 if none). Looked at every BRIDGE_POLL_MS.
+  pub fn poll(self: &mut) u32 {
+    let now = nowMs();
+    if now < lastPoll + BRIDGE_POLL_MS { return 0u32; }
+    lastPoll = now;
+    self.watchVoice();
+    noteReady = 0u32;
+    match fs.stat(&Path.from(self.notePath(noteShown + 1u32, ".md").view())) { case let Ok(info) { noteReady = noteShown + 1u32; } case let Err(e) {} }
+    var n = shown + 1u32;
+    while n <= turn {
+      match fs.stat(&Path.from(self.replyPath(n, ".md").view())) { case let Ok(info) { return n; } case let Err(e) {} }
+      n = n + 1u32;
+    }
+    0u32
+  }
+
+  // The summary text of reply n, or ""
+  pub fn summary(self: &, n: u32) String {
+    var out = String();
+    match fs.readFile(&Path.from(self.replyPath(n, ".txt").view())) {
+      case let Ok(s) { out = String.from(s.view()); }
+      case let Err(e) {}
+    }
+    out
+  }
+}
+
+// A line from the room to the session (a project moved): inbox\line-<unix ms>.json, written like a turn but not numbered and
+// needing no reply. The session reads these with its turns (studio-wait.ps1 waits for turn-*.json only; read line-*.json beside it).
+fn postLineTo(dir: &str, text: &str) bool {
+  let now = unixMs();
+  var j = String.from("{\n  \"line\": ");
+  j.append(jsonStr(text).view());
+  j.append(",\n  \"sent_ms\": "); j.append(numText(now).view());
+  j.append(",\n  \"sent_utc\": \""); j.append(isoUtc(now).view());
+  j.append("\"\n}\n");
+  var inbox = String.from(dir);
+  inbox.append("/inbox");
+  _ = fs.makeDirAll(&Path.from(inbox.view()));
+  var name = String.from("line-");
+  name.append(numText(now).view());
+  name.append("-");
+  name.append(numText(i64.from(lineCount)).view());
+  lineCount = lineCount + 1u32;
+  name.append(".json");
+  writeAtomic(inbox.view(), name.view(), j.view())
+}

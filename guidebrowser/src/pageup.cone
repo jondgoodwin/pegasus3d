@@ -1,0 +1,222 @@
+// The first upload of a document page, sliced across frames (WI\incubator-world.md, "Second wear"; Jon's gate: the worst frame opening a
+// page under 30 ms). Done whole it cost 65 to 85 ms: RGB -> RGBA for 2.3 million texels, then the mip chain averaged in linear light.
+//
+//   stage 0: the RGB picture becomes RGBA, UP_BAND_ROWS rows at a time (and never more than UP_SLICE_US of a frame); when the last row is
+//            in, a one-level texture of it is put up at once (the page is readable), and its bytes start the chain.
+//   stage 1: after UP_MIP_HOLD_MS with no new redraw (a scroll redraws every frame and would only throw the chain away), each mip level is
+//            a box filter of the one before, in linear light through two small tables, a few rows at a time; the finished levels join
+//            the chain; the last level puts the whole chain up as the page's texture, replacing the flat one.
+// A redraw that begins while this is under way throws it away and starts again from its own picture.
+
+const UP_SLICE_US = 3000u64;
+
+// One frame's budget for every panel's upload together (the panels tick one after another): what the slices of this frame have spent so far
+var @threadlocal upSpentUs = 0u64;
+
+// Called once a frame, before the panels tick
+fn upNewFrame() { upSpentUs = 0u64; }
+
+struct PageUp {
+  src: List[u8];             // the picture, RGB, rows as render's Image holds them
+  cur: List[u8];             // the level being built (RGBA)
+  prev: List[u8];            // the level before it
+  chain: List[u8];           // the finished levels one after another, the largest first
+  decode: List[f32];         // sRGB byte -> linear light
+  encode: List[u8];          // linear light in 4096 steps -> sRGB byte
+  busy: bool;
+  stage: u32;
+  w: u32;                    // the picture
+  h: u32;
+  row: u32;                  // the next row to make (stage 0: of level 0; stage 1: of the level being built)
+  level: u32;                // the level being built
+  levels: u32;
+  lw: u32;                   // the level being built, and the one before it
+  lh: u32;
+  pw: u32;
+  ph: u32;
+  holdUntil: u64;
+  startedAt: u64;
+  worstUs: u64;              // the longest slice of this upload
+  tagTop: f32 = 0.;          // what the picture being made stands for (the page y of its top row): the caller's, given to begin
+  landed: u32 = 0u32;        // counts the pictures that have reached the GPU as the page's texture (the flat one is the first sight of it)
+  landedTop: f32 = 0.;       // the tag and the rows of the last one to land
+  landedRows: u32 = 0u32;
+
+  fn idle() PageUp {
+    PageUp(List[u8](), List[u8](), List[u8](), List[u8](), List[f32](), List[u8](), false, 0u32, 0u32, 0u32, 0u32, 0u32, 1u32, 0u32, 0u32, 0u32, 0u32, 0u64, 0u64, 0u64)
+  }
+
+  fn cancel(self: &mut) {
+    busy = false;
+    src = List[u8]();
+    cur = List[u8]();
+    prev = List[u8]();
+    chain = List[u8]();
+  }
+
+  fn tables(self: &mut) {
+    if decode.len() > 0usize { return; }
+    var i = 0u32;
+    while i < 256u32 {
+      let c = f32.from(i) / 255.;
+      decode.push(if c <= 0.04045 { c / 12.92 } else { libc.powf((c + 0.055) / 1.055, 2.4) });
+      i = i + 1u32;
+    }
+    i = 0u32;
+    while i < 4096u32 {
+      let v = f32.from(i) / 4095.;
+      let s = if v <= 0.0031308 { v * 12.92 } else { 1.055 * libc.powf(v, 1. / 2.4) - 0.055 };
+      var b = s * 255. + 0.5;
+      if b > 255. { b = 255.; }
+      encode.push(u8.from(u32.from(b)));
+      i = i + 1u32;
+    }
+  }
+
+  // Take the picture (its pixels are moved here, 'img' is left empty) and start; the mip chain waits until 'holdUntil' (ms)
+  fn begin(self: &mut, img: &mut Image, holdUntilMs: u64, tag: f32) {
+    self.cancel();
+    tagTop = tag;
+    self.tables();
+    w = u32.from(img.width);
+    h = u32.from(img.height);
+    src <-> img.pixels;
+    cur = List[u8].withCapacity(usize.from(w) * usize.from(h) * 4usize);
+    levels = mipLevelCount(w, h);
+    busy = true;
+    stage = 0u32;
+    row = 0u32;
+    level = 0u32;
+    holdUntil = holdUntilMs;
+    startedAt = sdl.GetPerformanceCounter();
+    worstUs = 0u64;
+  }
+
+  fn usSince(t0: u64) u64 { (sdl.GetPerformanceCounter() - t0) * 1000000u64 / sdl.GetPerformanceFrequency() }
+
+  // One frame's slice
+  fn step(self: &mut, device: &mut Device, pass: &mut PagePass, nowMs: u64) {
+    if !busy || upSpentUs >= UP_SLICE_US { return; }
+    let t0 = sdl.GetPerformanceCounter();
+    let allowed = UP_SLICE_US - upSpentUs;
+    if stage == 0u32 {
+      let rowBytes = usize.from(w) * 3usize;
+      while row < h {
+        let o = usize.from(row) * rowBytes;
+        var x = 0usize;
+        while x < rowBytes {
+          cur.push(*src[o + x]);
+          cur.push(*src[o + x + 1usize]);
+          cur.push(*src[o + x + 2usize]);
+          cur.push(255u8);
+          x = x + 3usize;
+        }
+        row = row + 1u32;
+        if row % 8u32 == 0u32 && PageUp.usSince(t0) >= allowed { break; }
+      }
+      if row >= h { src = List[u8](); stage = 3u32; }
+      self.account(t0);
+      return;
+    }
+    // (each of these is a frame's work of its own: the flat texture, the first bytes of the chain, the finished chain)
+    if stage == 3u32 {
+      pass.uploadRgbaFlat(device, w, h, &cur);
+      landed = landed + 1u32;
+      landedTop = tagTop;
+      landedRows = h;
+      stage = 4u32;
+      self.account(t0);
+      return;
+    }
+    // (the rest is the mip chain: it waits until the page has been quiet a while, whatever stage it is at; the chain is made only for a page at rest)
+    if stage != 3u32 && nowMs < holdUntil { return; }
+    if stage == 4u32 {
+      chain.appendSlice(cur.view());
+      prev <-> cur;
+      cur = List[u8]();
+      pw = w;
+      ph = h;
+      stage = 1u32;
+      level = 1u32;
+      row = 0u32;
+      lw = if pw > 1u32 { pw >> 1u32 } else { 1u32 };
+      lh = if ph > 1u32 { ph >> 1u32 } else { 1u32 };
+      if levels <= 1u32 { stage = 5u32; }
+      self.account(t0);
+      return;
+    }
+    if stage == 5u32 {
+      self.finish(device, pass);
+      self.account(t0);
+      return;
+    }
+    if nowMs < holdUntil { return; }
+    // a level of the chain, rows from `row`
+    let prow = usize.from(pw) * 4usize;
+    {
+    let pv = prev.view();
+    let dec = decode.view();
+    let enc = encode.view();
+    while row < lh {
+      let y0 = usize.from(if row * 2u32 < ph { row * 2u32 } else { ph - 1u32 });
+      let y1 = usize.from(if row * 2u32 + 1u32 < ph { row * 2u32 + 1u32 } else { ph - 1u32 });
+      var x = 0u32;
+      while x < lw {
+        let x0 = usize.from(if x * 2u32 < pw { x * 2u32 } else { pw - 1u32 }) * 4usize;
+        let x1 = usize.from(if x * 2u32 + 1u32 < pw { x * 2u32 + 1u32 } else { pw - 1u32 }) * 4usize;
+        let a = y0 * prow + x0;
+        let b = y0 * prow + x1;
+        let c = y1 * prow + x0;
+        let d = y1 * prow + x1;
+        var k = 0usize;
+        while k < 3usize {
+          let sum = dec[usize.from(pv[a + k])] + dec[usize.from(pv[b + k])] + dec[usize.from(pv[c + k])] + dec[usize.from(pv[d + k])];
+          let step4095 = sum * 0.25 * 4095. + 0.5;
+          var idx = usize.from(u32.from(step4095));
+          if idx > 4095usize { idx = 4095usize; }
+          cur.push(enc[idx]);
+          k = k + 1usize;
+        }
+        cur.push(255u8);
+        x = x + 1u32;
+      }
+      row = row + 1u32;
+      if row % 4u32 == 0u32 && PageUp.usSince(t0) >= allowed { break; }
+    }
+    }
+    if row >= lh {
+      chain.appendSlice(cur.view());
+      prev <-> cur;
+      cur = List[u8]();
+      pw = lw;
+      ph = lh;
+      level = level + 1u32;
+      row = 0u32;
+      if level >= levels { stage = 5u32; }
+      else {
+        lw = if pw > 1u32 { pw >> 1u32 } else { 1u32 };
+        lh = if ph > 1u32 { ph >> 1u32 } else { 1u32 };
+      }
+    }
+    self.account(t0);
+  }
+
+  fn account(self: &mut, t0: u64) {
+    let us = PageUp.usSince(t0);
+    upSpentUs = upSpentUs + us;
+    if us > worstUs { worstUs = us; }
+    if us > 8000u64 { print <- "pageup: a slice took "; print <- us / 1000u64; print <- " ms, stage after it "; print <- stage; print <- " level "; print <- level; print <- " row "; print <- row; print <- "\n"; }
+  }
+
+  fn finish(self: &mut, device: &mut Device, pass: &mut PagePass) {
+    pass.uploadChain(device, w, h, levels, &chain);
+    busy = false;
+    let total = PageUp.usSince(startedAt);
+    print <- "pageup: page "; print <- w; print <- "x"; print <- h; print <- " up with "; print <- levels; print <- " levels "; print <- total / 1000u64;
+    print <- " ms after its picture was handed over (worst slice "; print <- worstUs / 1000u64; print <- "."; print <- (worstUs % 1000u64) / 100u64; print <- " ms)\n";
+    src = List[u8]();
+    cur = List[u8]();
+    prev = List[u8]();
+    chain = List[u8]();
+  }
+}

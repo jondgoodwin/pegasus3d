@@ -1,0 +1,170 @@
+// Plans for the boards' projects strips (Jon, 11 Nov: "the starting point is the active/backlog per skein"). A plan is a Markdown file with
+// "## Active" and "## Design" sections of numbered items ("1. Title [tags] — `file.md`, ..." that may run on over indented lines) and a "## Backlog"
+// section. A skein is one numbered item of Active or Design: its card title is the text up to " [" or " —", and a click opens the first backticked
+// file the item names, relative to the plan's folder. Backlog is a count. Both plans (3d-web-plan.md and cone-plan.md) are shaped so.
+
+struct PlanCard {
+  title: String;
+  file: String;            // the file a click opens (the plan itself if the item names none)
+  design: bool;            // from the Design section (Active ones come first)
+}
+
+struct PlanRead {
+  cards: List[PlanCard];
+  backlog: u32;
+}
+
+fn isDigitCh(c: u8) bool { c >= '0' && c <= '9' }
+
+// Where an item's text begins after its number ("12. ", "1c. "), or 0 if the line is not an item
+fn itemStart(line: &str) usize {
+  var i = 0usize;
+  while i < line.len() && isDigitCh(line[i]) { i = i + 1usize; }
+  if i == 0usize { return 0usize; }
+  if i < line.len() && line[i] >= 'a' && line[i] <= 'z' { i = i + 1usize; }
+  if i + 1usize < line.len() && line[i] == '.' && line[i + 1usize] == ' ' { return i + 2usize; }
+  0usize
+}
+
+// The first place 'pat' occurs in 's', or s.len()
+fn findText(s: &str, pat: &str) usize {
+  var i = 0usize;
+  while i + pat.len() <= s.len() {
+    var k = 0usize;
+    while k < pat.len() && s[i + k] == pat[k] { k = k + 1usize; }
+    if k == pat.len() { return i; }
+    i = i + 1usize;
+  }
+  s.len()
+}
+
+// A card's title from an item's text: bold marks dropped, cut at " [" or " —", shortened to 40 characters
+fn planTitle(item: &str) String {
+  var flat = String();
+  var i = 0usize;
+  while i < item.len() {
+    if i + 1usize < item.len() && item[i] == '*' && item[i + 1usize] == '*' { i = i + 2usize; }
+    else { flat.appendByte(item[i]); i = i + 1usize; }
+  }
+  var cut = findText(flat.view(), " [");
+  let c2 = findText(flat.view(), " —");
+  if c2 < cut { cut = c2; }
+  var t = String.from(flat.view().slice(0usize, cut));
+  if t.len() > 40usize {
+    var k = 40usize;
+    while k > 30usize && t.view()[k] != ' ' { k = k - 1usize; }
+    while k > 0usize && (t.view()[k] & 0xC0u8) == 0x80u8 { k = k - 1usize; }
+    t =String.from(t.view().slice(0usize, k));
+    t.append("...");
+  }
+  t
+}
+
+fn knownExt(name: &str) bool {
+  let e = extensionOf(name);
+  let v = e.view();
+  v == "md" || v == "mmd" || v == "txt" || v == "csv" || v == "json" || v == "toml" || v == "cone"
+}
+
+// The first backticked token of the text that names a file (a known extension, no spaces, not a path ending in a slash)
+fn firstFileNamed(item: &str) String {
+  var i = 0usize;
+  while i < item.len() {
+    if item[i] == '`' {
+      var j = i + 1usize;
+      while j < item.len() && item[j] != '`' { j = j + 1usize; }
+      if j < item.len() {
+        let tok = item.slice(i + 1usize, j);
+        if tok.len() > 3usize && findText(tok, " ") == tok.len() && tok[tok.len() - 1usize] != '\\' && tok[tok.len() - 1usize] != '/' && knownExt(tok) {
+          return String.from(tok);
+        }
+        i = j + 1usize;
+      } else { i = item.len(); }
+    } else { i = i + 1usize; }
+  }
+  String()
+}
+
+// 'file' (as the plan writes it, with backslashes) against the plan's folder
+fn planFilePath(planPath: &str, file: &str) String {
+  if file.len() == 0usize { return String.from(planPath); }
+  var base = dirOf(planPath);
+  base.append("/");
+  base.append(file);
+  normalizePath(base.view())
+}
+
+fn finishItem(out: &mut List[PlanCard], item: &String, design: bool, planPath: &str) {
+  if item.len() == 0usize { return; }
+  let title = planTitle(item.view());
+  let file = planFilePath(planPath, firstFileNamed(item.view()).view());
+  out.push(PlanCard(title, file, design));
+}
+
+// The skeins and the backlog's size from the plan's text
+fn parsePlan(text: &str, planPath: &str) PlanRead {
+  var cards = List[PlanCard]();
+  var backlog = 0u32;
+  var section = 0u32;          // 1 Active, 2 Design, 3 Backlog, 0 any other
+  var item = String();
+  var from = 0usize;
+  var i = 0usize;
+  while i <= text.len() {
+    if i == text.len() || text[i] == '\n' {
+      var line = text.slice(from, i);
+      if line.len() > 0usize && line[line.len() - 1usize] == '\r' { line = line.slice(0usize, line.len() - 1usize); }
+      from = i + 1usize;
+      if line.startsWith("## ") {
+        finishItem(&mut cards, &item, section == 2u32, planPath);
+        item = String();
+        if line.startsWith("## Active") { section = 1u32; }
+        else if line.startsWith("## Design") { section = 2u32; }
+        else if line.startsWith("## Backlog") { section = 3u32; }
+        else { section = 0u32; }
+      }
+      else if section == 3u32 {
+        if line.startsWith("- ") || itemStart(line) > 0usize { backlog = backlog + 1u32; }
+      }
+      else if section == 1u32 || section == 2u32 {
+        let st = itemStart(line);
+        if st > 0usize {
+          finishItem(&mut cards, &item, section == 2u32, planPath);
+          item = String.from(line.sliceFrom(st));
+        }
+        else if line.len() > 0usize && (line[0usize] == ' ' || line[0usize] == '\t') && item.len() > 0usize {
+          item.append(" ");
+          item.append(line);
+        }
+        else if line.len() > 0usize {
+          finishItem(&mut cards, &item, section == 2u32, planPath);
+          item = String();
+        }
+      }
+    }
+    i = i + 1usize;
+  }
+  finishItem(&mut cards, &item, section == 2u32, planPath);
+  PlanRead(cards, backlog)
+}
+
+// The plan of an Incubator folder: its first file named "*plan.md" (3d-web-plan.md, cone-plan.md), or empty
+fn findPlanFile(incubator: &str) String {
+  if incubator.len() == 0usize { return String(); }
+  match fs.readDir(&Path.from(incubator)) {
+    case let Ok(entries) {
+      var best = String();
+      var i = 0usize;
+      while i < entries.len() {
+        let nm = entries[i].name.view();
+        if nm.endsWith("plan.md") && best.len() == 0usize { best = String.from(nm); }
+        i = i + 1usize;
+      }
+      if best.len() == 0usize { return String(); }
+      var p = String.from(incubator);
+      p.append("/");
+      p.append(best.view());
+      return normalizePath(p.view());
+    }
+    case let Err(e) { return String(); }
+  }
+}
