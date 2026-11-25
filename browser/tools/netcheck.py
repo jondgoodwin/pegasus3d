@@ -33,10 +33,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # The server's tick is 1/60 s (netchecks.cone's Step). 9.1 leaves 0.7% over the measured 0.1506 m a tick
 V_MAX = 9.1
 TICK_S = 1.0 / 60.0
-# The most a frame may move the drawn A, per tick drawn on: 0.4 m. When a snapshot ends an extrapolation B re-times its draw several ticks back
-# and the point moves 0.2 to 0.37 m in one frame (measured over 10 impaired runs, 13 Nov; 0.276 m the most over 20 on 13 Nov); a snap or a teleport
-# is metres. (It was 2 x V_MAX x TICK_S, 0.4 with the old V_MAX; it is not a speed, so it keeps its own number)
-STEP_MAX = 0.4
+# The most a frame may move the drawn A, per tick drawn on: 0.6 m. When a snapshot ends an extrapolation B re-times its draw several ticks back
+# and the point moves 0.2 to 0.39 m in one frame (measured over 10 impaired runs 13 Nov, 0.276 m the most over 20 then, 0.392 m the most over 20 on
+# 25 Nov, which left no room under 0.4); a snap or a teleport is metres. (It was 2 x V_MAX x TICK_S, 0.4 with the old V_MAX; it is not a speed,
+# so it has its own number: 1.5 x the largest seen)
+STEP_MAX = 0.6
 
 DEFAULT_EXE = os.path.join(HERE, '..', 'build', 'release', 'browser.exe')
 
