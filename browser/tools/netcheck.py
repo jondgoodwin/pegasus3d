@@ -27,14 +27,16 @@ draws) is skipped.
 import argparse, os, re, subprocess, sys, time, threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# A's top speed, m/s: the movement code's ceiling for a being that runs, walk.cone's Walk (speed 3 m/s, runFactor 4); the script's A (server.cone's
-# autoIntents) was measured at 9 m/s (0.150 m a tick), under it. The server's step is 1/60 s (netchecks.cone's Step)
-V_MAX = 12.0
+# The fastest the script's A (server.cone's autoIntents) moves, m/s: the server's TS lines over 21 impaired runs (25 Nov) give 0.1506 m in a tick,
+# and 0.150 m a tick over 2, 4 and (for one being) 8 ticks, so 9 m/s; over 16 ticks 7.6 m/s. (walk.cone's Walk would allow 12 m/s; the mannequin's
+# RUN_SPEED is 4.5 m/s, half the measured; why a tick moves 0.15 m is not found, the figure is the measurement.)
+# The server's tick is 1/60 s (netchecks.cone's Step). 9.1 leaves 0.7% over the measured 0.1506 m a tick
+V_MAX = 9.1
 TICK_S = 1.0 / 60.0
-# The most a frame may move the drawn A, per tick drawn on: twice the top speed. When a snapshot ends an extrapolation B re-times its draw
-# several ticks back and the point moves 0.2 to 0.37 m in one frame (measured over 10 impaired runs, 13 Nov), over 1.5 x V_MAX x TICK_S (0.3);
-# a snap or a teleport is metres
-STEP_MAX = 2.0 * V_MAX * TICK_S
+# The most a frame may move the drawn A, per tick drawn on: 0.4 m. When a snapshot ends an extrapolation B re-times its draw several ticks back
+# and the point moves 0.2 to 0.37 m in one frame (measured over 10 impaired runs, 13 Nov; 0.276 m the most over 20 on 13 Nov); a snap or a teleport
+# is metres. (It was 2 x V_MAX x TICK_S, 0.4 with the old V_MAX; it is not a speed, so it keeps its own number)
+STEP_MAX = 0.4
 
 DEFAULT_EXE = os.path.join(HERE, '..', 'build', 'release', 'browser.exe')
 
@@ -435,7 +437,21 @@ def main():
         # (measured 14 Oct, base and branch alike: the server's two samples 5 to 10 m apart, B's later sample elsewhere on the same roll)
         lastS = sp[-1]
         steady = len(sp) < 2 or sum((int(a) - int(b)) ** 2 for a, b in zip(sp[0][4:7], lastS[4:7])) ** 0.5 / 1000.0 <= 0.05
-        if steady:
+        # With PEGASUS_NETDIAG both print a BP line (tick, ball in mm) for each snapshot: B's last snapshot is set against the server's ball at
+        # that same tick, so the time between the samples is out of it (W45, 25 Nov: the server notices a client gone 0.3 to 1.7 s after the client's
+        # last snapshot; when that falls in the ball's 1.4 s glide home, B's ball, right for its tick, is tens of metres from the server's later sample)
+        sbp = {int(l.split()[1]): l.split()[2:5] for l in S if l.startswith('BP ')}
+        bbp = [l.split() for l in B if l.startswith('BP ')]
+        if bbp and sbp:
+            bt = int(bbp[-1][1])
+            if bt in sbp:
+                bx, by, bz = (int(v) / 1000.0 for v in bbp[-1][2:5])
+                sx, sy, sz = (int(v) / 1000.0 for v in sbp[bt])
+                d = ((bx - sx) ** 2 + (by - sy) ** 2 + (bz - sz) ** 2) ** 0.5
+                check(d <= 0.05, f'B has the ball at ({bx:.3f}, {bz:.3f}), {d:.3f} m from the server\'s ({sx:.3f}, {sz:.3f}) at B\'s last snapshot, tick {bt}')
+            else:
+                check(False, f'the server has a ball line for B\'s last snapshot (tick {bt})')
+        elif steady:
             check(d <= 0.05, f'B has the ball at ({bx:.3f}, {bz:.3f}), {d:.3f} m from the server\'s ({sx:.3f}, {sz:.3f})')
         else:
             print(f'     (the ball was still rolling when the clients left: the server had it at ({sx:.3f}, {sz:.3f}), then ({int(lastS[4])/1000.0:.3f}, {int(lastS[6])/1000.0:.3f}); B\'s ({bx:.3f}, {bz:.3f}) is a later sample of the same roll: not compared)')
