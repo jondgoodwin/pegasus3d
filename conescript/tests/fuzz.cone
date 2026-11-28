@@ -1,0 +1,335 @@
+// A longer fuzz of the whole pipeline (W135): 100,000 random byte mutations of valid containers (the reader, then the
+// verifier, then the interpreter), and 100,000 mutations of the decoded code itself (so many more reach the
+// verifier's checks). Neither the reader nor the verifier crashes, and everything the strict verifier accepts runs
+// to a result or one of the defined traps (fuel out, an import's failure, unreachable), never a bad call or a
+// refused unit. The counts are printed.
+
+mod fuzz;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import conescript use *;
+
+fn impSum(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
+  var t = 0.0;
+  if usize.from(s[0usize]) < h.size() {
+    let p = h.payload(s[0usize]);
+    var i = 0usize;
+    while i < p.len() { t = t + f64.fromBits(*p[i]); i = i + 1usize; }
+  }
+  s[0usize] = t.bits();
+  true
+}
+fn impWide(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
+  let x = f64.fromBits(s[0usize]);
+  s[1usize] = (x + 1.0).bits();
+  s[2usize] = (x + 2.0).bits();
+  true
+}
+fn impAct(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { true }
+fn impFail(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { false }
+
+fn tables() ImportTables[u8] {
+  var ti = ImportTables[u8].make();
+  let lf = ti.types.list(TY_F64);
+  let e = List[u32]();
+  ti.add("host", "sum", ti.types.sig(&[lf], &[TY_F64]), false, 3u32, &impSum);
+  ti.add("host", "wide", ti.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]), true, 1u32, &impWide);
+  ti.add("host", "act", ti.types.sig(e.view(), e.view()), true, 1u32, &impAct);
+  ti.add("host", "fail", ti.types.sig(&[TY_F64], &[TY_F64]), false, 1u32, &impFail);
+  ti
+}
+
+// The first seed: a bit of everything (blocks, an if with an else, a loop, a call, tuples, a list, imports)
+fn rich() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let bt0 = w.code.types.sig(e.view(), e.view());
+  let sigFF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let t2 = w.code.types.tuple(&[TY_F64, TY_F64]);
+  let lf = w.code.types.list(TY_F64);
+  let isum = w.addImport("host", "sum", w.code.types.sig(&[lf], &[TY_F64]));
+  let iwide = w.addImport("host", "wide", w.code.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]));
+  w.beginUnit(sigFF, "main");
+  let acc = w.local(TY_F64);
+  let tl = w.local(t2);
+  w.opU(OP_BLOCK, btF);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_LT);
+  w.opU(OP_IF, btF); w.f64Const(1.0); w.op(OP_ELSE); w.f64Const(2.0); w.op(OP_END);
+  w.opU(OP_BR, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_SET, acc);
+  w.opU(OP_LOOP, bt0);
+  w.opU(OP_LOCAL_GET, acc); w.f64Const(1.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_TEE, acc);
+  w.f64Const(5.0); w.op(OP_F64_LT); w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, acc); w.opU(OP_CALL, 1u32); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_TUPLE_MAKE, t2); w.opU(OP_LOCAL_SET, tl);
+  w.opU(OP_LOCAL_GET, tl); w.opUU(OP_TUPLE_GET, t2, 1u32);
+  w.f64Const(1.0); w.f64Const(2.0); w.opUU(OP_LIST_MAKE, lf, 2u32); w.opU(OP_IMPORT, isum); w.op(OP_F64_ADD);
+  w.f64Const(7.0); w.opU(OP_IMPORT, iwide); w.op(OP_F64_ADD); w.op(OP_F64_ADD); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(sigFF, "double");
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(btF, "one");
+  w.f64Const(1.0);
+  w.endUnit();
+  w.addEntry(ENTRY_FIXED, 2u32, 0u32, 0u32);
+  w.addEntry(ENTRY_DERIVE, 2u32, 3u32, 0u32);
+  w
+}
+
+// The second seed: i64 and bool ops, select, return, nested ifs, br_if with a result, drop, an acting import, a
+// failing import, and a call that may recurse
+fn mixed() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let bt0 = w.code.types.sig(e.view(), e.view());
+  let sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let sigB = w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64]);
+  let sig00 = w.code.types.sig(e.view(), e.view());
+  let t3 = w.code.types.tuple(&[TY_F64, TY_BOOL, TY_I64]);
+  let iact = w.addImport("host", "act", sig00);
+  let ifail = w.addImport("host", "fail", sigF);
+  w.beginUnit(sigB, "pick");
+  let n = w.local(TY_I64);
+  let tl = w.local(t3);
+  w.i64Const(40i64); w.i64Const(2i64); w.op(OP_I64_ADD); w.opU(OP_LOCAL_SET, n);
+  w.opU(OP_LOCAL_GET, n); w.i64Const(42i64); w.op(OP_I64_EQ); w.opU(OP_LOCAL_GET, 1u32); w.op(OP_BOOL_AND);
+  w.opU(OP_IF, btF);
+    w.opU(OP_LOCAL_GET, 0u32); w.f64Const(2.0); w.op(OP_F64_MUL);
+  w.op(OP_ELSE);
+    w.opU(OP_BLOCK, btF);
+      w.f64Const(9.0); w.opU(OP_LOCAL_GET, 1u32); w.opU(OP_BR_IF, 0u32);
+      w.opU(OP_DROP, TY_F64);
+      w.f64Const(3.0); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_MAX);
+    w.op(OP_END);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 1u32); w.i64Const(7i64); w.opU(OP_TUPLE_MAKE, t3); w.opU(OP_LOCAL_SET, tl);
+  w.opU(OP_LOCAL_GET, tl); w.opUU(OP_TUPLE_GET, t3, 0u32); w.op(OP_F64_ADD);
+  w.f64Const(1.0); w.f64Const(2.0); w.opU(OP_LOCAL_GET, 1u32); w.opU(OP_SELECT, TY_F64); w.op(OP_F64_ADD);
+  w.opU(OP_LOCAL_GET, 1u32); w.opU(OP_IF, bt0); w.f64Const(4.0); w.opU(OP_CALL, 1u32); w.opU(OP_DROP, TY_F64); w.op(OP_END);
+  w.op(OP_RETURN);
+  w.endUnit();
+  w.beginUnit(sigF, "recur");
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, btF);
+    w.opU(OP_LOCAL_GET, 0u32); w.f64Const(1.0); w.op(OP_F64_SUB); w.opU(OP_CALL, 1u32);
+  w.op(OP_ELSE);
+    w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_IMPORT, ifail);
+  w.op(OP_END);
+  w.endUnit();
+  w.beginUnit(sig00, "acts");
+  w.opU(OP_IMPORT, iact); w.op(OP_UNREACHABLE);
+  w.endUnit();
+  w.beginUnit(btF, "one");
+  w.f64Const(1.0);
+  w.endUnit();
+  w.addEntry(ENTRY_FIXED, 3u32, 0u32, 0u32);
+  w.addEntry(ENTRY_HANDLER, 2u32, 1u32, 0u32);
+  w
+}
+
+struct Rng { s: u64;
+  fn next(self: &mut) u64 {
+    var x = self.s;
+    x = x ^ (x << 13u64); x = x ^ (x >> 7u64); x = x ^ (x << 17u64);
+    self.s = x;
+    x
+  }
+  fn below(self: &mut, n: usize) usize { usize.from(self.next() % u64.from(n)) }
+}
+
+struct Tally {
+  decoded: u32;
+  verified: u32;
+  ran: u32;
+  trapped: u32;
+  fuelOut: u32;
+  importFailed: u32;
+  unreachable: u32;
+  badCall: u32;       // must stay 0
+  refusedRun: u32;    // must stay 0
+}
+
+// Runs every unit of verified code with zero arguments and a small budget
+fn runAll(v: &VerifiedCode, tb: &ImportTables[u8], t: &mut Tally) {
+  var u = 0usize;
+  while u < v.unitCount() {
+    var args = List[u64]();
+    var q = 0u32;
+    while q < v.paramSlots(u) { args.push(0u64); q = q + 1u32; }
+    var it = Interpreter.make();
+    it.setFuel(2000u64);
+    var h = HandleTable[u8].make();
+    var out = List[u64]();
+    let r = it.run(v, tb, &mut h, u32.from(u), args.view(), &mut out);
+    t.ran = t.ran + 1u32;
+    match r {
+      case let Some(tr) {
+        t.trapped = t.trapped + 1u32;
+        match tr.kind {
+          case FuelOut { t.fuelOut = t.fuelOut + 1u32; }
+          case ImportFailed { t.importFailed = t.importFailed + 1u32; }
+          case Unreachable { t.unreachable = t.unreachable + 1u32; }
+          case BadCall { t.badCall = t.badCall + 1u32; }
+          case Refused { t.refusedRun = t.refusedRun + 1u32; }
+        }
+      }
+      case is None {}
+    }
+    u = u + 1usize;
+  }
+}
+
+// One damage to a byte vector
+fn damageBytes(b: &mut List[u8], rng: &mut Rng) {
+  let kind = rng.below(5usize);
+  if kind == 0usize { b.set(rng.below(b.len()), u8.from(rng.next() & 0xFFu64)); }
+  else if kind == 1usize { let i = rng.below(b.len()); b.set(i, *b[i] ^ u8.from(1u64 << (rng.next() & 7u64))); }
+  else if kind == 2usize { b.insert(rng.below(b.len()), u8.from(rng.next() & 0xFFu64)); }
+  else if kind == 3usize { if b.len() > 9usize { b.remove(rng.below(b.len())); } }
+  else { if b.len() > 9usize && rng.below(40usize) == 0usize { b.truncate(8usize + rng.below(b.len() - 8usize)); } }
+}
+
+// One damage to decoded code: a unit's code bytes, a local's or unit's type, an import's or an entry's fields, a type
+fn damageCode(c: &mut Code, rng: &mut Rng) {
+  let which = rng.below(10usize);
+  let nu = c.units.len();
+  let ni = c.imports.len();
+  let nt = c.types.defs.len();
+  let ne = c.entries.len();
+  if which < 5usize && nu > 0usize {
+    let ui = rng.below(nu);
+    let u = &mut c.units[ui];
+    if u.code.len() > 1usize { damageBytes(&mut u.code, rng); }
+  } else if which == 5usize && nu > 0usize {
+    let ui = rng.below(nu);
+    let u = &mut c.units[ui];
+    if u.locals.len() > 0usize { u.locals.set(rng.below(u.locals.len()), u32.from(rng.below(nt + 2usize))); }
+    else { u.locals.push(u32.from(rng.below(nt + 2usize))); }
+  } else if which == 6usize && nu > 0usize {
+    (&mut c.units[rng.below(nu)]).sig = u32.from(rng.below(nt + 2usize));
+  } else if which == 7usize && ni > 0usize {
+    let ii = rng.below(ni);
+    if rng.below(2usize) == 0usize { (&mut c.imports[ii]).sig = u32.from(rng.below(nt + 2usize)); }
+    else { (&mut c.imports[ii]).name = String.from("sum"); }
+  } else if which == 8usize && ne > 0usize {
+    let ei = rng.below(ne);
+    if rng.below(2usize) == 0usize { (&mut c.entries[ei]).unit = u32.from(rng.below(nu + 2usize)); }
+    else { (&mut c.entries[ei]).kind = u8.from(rng.below(4usize)); }
+  } else if nt > 4usize {
+    let ti = 4usize + rng.below(nt - 4usize);
+    let d = &mut c.types.defs[ti];
+    if d.items.len() > 0usize { d.items.set(rng.below(d.items.len()), u32.from(rng.below(nt + 2usize))); }
+    else { d.arg = u32.from(rng.below(nt + 2usize)); }
+  }
+}
+
+fn main() i32 {
+  let tb = tables();
+  let s0 = rich();
+  let s1 = mixed();
+
+  // the seeds themselves verify strictly and run
+  match verify(&s0.code, &tb) {
+    case let Ok(v) { var t0 = Tally(0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32); runAll(&v, &tb, &mut t0); expectInt(i64.from(t0.badCall), 0i64, "the first seed runs"); }
+    case let Err(ps) { expect(false, "the first seed verifies"); }
+  }
+  match verify(&s1.code, &tb) {
+    case let Ok(v) { var t1 = Tally(0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32); runAll(&v, &tb, &mut t1); expectInt(i64.from(t1.badCall), 0i64, "the second seed runs"); print <- "seed 2 traps: "; print <- t1.trapped; print <- " of "; print <- t1.ran; print <- "\n"; }
+    case let Err(ps) { expect(false, "the second seed verifies"); print <- ps[0usize].what.view(); print <- " at "; print <- ps[0usize].unit; print <- ":"; print <- ps[0usize].offset; print <- "\n"; }
+  }
+
+  // 1: 100,000 mutations of the bytes
+  var rng = Rng(0x9E3779B97F4A7C15u64);
+  var a = Tally(0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+  var n = 0u32;
+  while n < 100000u32 {
+    var b = if (n & 1u32) == 0u32 { encode(&s0.code) } else { encode(&s1.code) };
+    let edits = 1usize + rng.below(3usize);
+    var k = 0usize;
+    while k < edits { damageBytes(&mut b, &mut rng); k = k + 1usize; }
+    match decode(b.view()) {
+      case let Ok(c) {
+        a.decoded = a.decoded + 1u32;
+        match verify(&c, &tb) {
+          case let Ok(v) { a.verified = a.verified + 1u32; runAll(&v, &tb, &mut a); }
+          case let Err(ps) {}
+        }
+      }
+      case let Err(p) {}
+    }
+    n = n + 1u32;
+  }
+  print <- "byte mutants: 100000, read "; print <- a.decoded; print <- ", verified "; print <- a.verified;
+  print <- ", units run "; print <- a.ran; print <- ", trapped "; print <- a.trapped;
+  print <- " (fuel "; print <- a.fuelOut; print <- ", import "; print <- a.importFailed; print <- ", unreachable "; print <- a.unreachable;
+  print <- "), bad calls "; print <- a.badCall; print <- ", refused runs "; print <- a.refusedRun; print <- "\n";
+  expect(a.decoded > 0u32 && a.verified > 0u32 && a.ran > 0u32, "some byte mutants reach the interpreter");
+  expectInt(i64.from(a.badCall), 0i64, "no byte mutant makes a bad call");
+  expectInt(i64.from(a.refusedRun), 0i64, "no byte mutant runs a refused unit");
+
+  // 2: 100,000 mutations of the decoded code (one to three each)
+  var b2 = Tally(0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+  var partly = 0u32;         // mutants verifyEach accepted with some unit refused
+  var keptUnits = 0u32;
+  n = 0u32;
+  while n < 100000u32 {
+    var c = if (n & 1u32) == 0u32 { cloneCode(&s0.code) } else { cloneCode(&s1.code) };
+    let edits = 1usize + rng.below(3usize);
+    var k = 0usize;
+    while k < edits { damageCode(&mut c, &mut rng); k = k + 1usize; }
+    b2.decoded = b2.decoded + 1u32;
+    match verify(&c, &tb) {
+      case let Ok(v) { b2.verified = b2.verified + 1u32; runAll(&v, &tb, &mut b2); }
+      case let Err(ps) {
+        // the resilient form: the good units of a partly bad code still run
+        match verifyEach(&c, &tb) {
+          case let Ok(v) {
+            partly = partly + 1u32;
+            var u = 0usize;
+            while u < v.unitCount() {
+              if !v.isRefused(u) {
+                keptUnits = keptUnits + 1u32;
+                var args = List[u64]();
+                var q = 0u32;
+                while q < v.paramSlots(u) { args.push(0u64); q = q + 1u32; }
+                var it = Interpreter.make();
+                it.setFuel(2000u64);
+                var h = HandleTable[u8].make();
+                var out = List[u64]();
+                let r = it.run(&v, &tb, &mut h, u32.from(u), args.view(), &mut out);
+                match r {
+                  case let Some(tr) {
+                    match tr.kind {
+                      case BadCall { b2.badCall = b2.badCall + 1u32; }
+                      case Refused { b2.refusedRun = b2.refusedRun + 1u32; }
+                      else {}
+                    }
+                  }
+                  case is None {}
+                }
+              }
+              u = u + 1usize;
+            }
+          }
+          case let Err(ps2) {}
+        }
+      }
+    }
+    n = n + 1u32;
+  }
+  print <- "code mutants: 100000, verified strictly "; print <- b2.verified;
+  print <- ", units run "; print <- b2.ran; print <- ", trapped "; print <- b2.trapped;
+  print <- " (fuel "; print <- b2.fuelOut; print <- ", import "; print <- b2.importFailed; print <- ", unreachable "; print <- b2.unreachable;
+  print <- "), bad calls "; print <- b2.badCall; print <- ", refused runs "; print <- b2.refusedRun;
+  print <- "; partly bad "; print <- partly; print <- ", their kept units run "; print <- keptUnits; print <- "\n";
+  expect(b2.verified > 0u32 && b2.ran > 0u32, "some code mutants reach the interpreter");
+  expectInt(i64.from(b2.badCall), 0i64, "no code mutant makes a bad call");
+  expectInt(i64.from(b2.refusedRun), 0i64, "no code mutant runs a refused unit");
+  done()
+}
