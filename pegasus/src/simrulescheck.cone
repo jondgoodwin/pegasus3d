@@ -181,6 +181,11 @@ fn checkTint(deaf: bool) bool {
 pub fn checkRules(applyOnTrap: bool) bool {
   var all = true;
   all = checkTint(mutantIs("tint-deaf")) && all;
+  var stepMutant = STEP_MUTANT_NONE;
+  if mutantIs("step-never") { stepMutant = STEP_MUTANT_NEVER; }
+  if mutantIs("step-twice") { stepMutant = STEP_MUTANT_TWICE; }
+  if mutantIs("step-drop") { stepMutant = STEP_MUTANT_DROP; }
+  all = checkSteps(stepMutant) && all;
   var animMutant = ANIM_MUTANT_NONE;
   if mutantIs("anim-never") { animMutant = ANIM_MUTANT_NEVER; }
   if mutantIs("anim-twice") { animMutant = ANIM_MUTANT_TWICE; }
@@ -211,5 +216,65 @@ pub fn checkRules(applyOnTrap: bool) bool {
     all = rulesVerdict(r.live() && r.refusedCount() == 1usize && bad && untouched && good && r.fieldValue(0usize) == 5. && r.fired == 1u64,
       "a world with one refused rule keeps its other rule: 1 refused, the bad click does nothing, the good click runs") && all;
   }
+  all
+}
+
+// Step functions (W148, FOR REVIEW), driven. Two birds a (0, 1, 0) and b (3, 1, 0), velocities (1, 0, 0) and (2, 0, 0). Each step
+// a bird doubles its velocity, clamps it to 1.5 (an if, length, scaling), looks along it, and moves to the other's place plus
+// the clamped velocity times the step: a swap, which shows only if each bird read the world as it stood at the step's start
+// (a loop over the holder's parts, `dot`, points). After one step, a stands at (3.025, 1, 0), b at (0.025, 1, 0), and a faces +x.
+// 'mutant' is the check's (PEGASUS_MUTANT=step-never, step-twice, step-drop)
+const STEP_WORLD = "
+part hello
+  part materials
+    part stone: plain(srgb(140, 140, 135))
+  part bird: box(x: -0.1 ..= 0.1, y: -0.1 ..= 0.1, z: -0.1 ..= 0.1), material: materials.stone
+    field velocity: place = (0, 0, 0), mutable: true
+  part pair
+    part a: bird(velocity: (1, 0, 0)), at: (0, 1, 0)
+    part b: bird(velocity: (2, 0, 0)), at: (3, 1, 0)
+  fn swap(p: part, dt: duration) bool {
+    var target = p.place;
+    each o in pair.parts {
+      let d = o.place - p.place;
+      if dot(d, d) > 0.001 { target = o.place; }
+    }
+    var v = p.velocity * 2;
+    if length(v) > 1.5 { v = v * (1.5 / length(v)); }
+    set(p.velocity, v);
+    set(p.place, target + v * dt);
+    set(p.facing, v);
+    true
+  }
+  each p in pair.parts {
+    on(created, start(stepAnimator(p, step: swap)))
+  }
+  part arrivals
+    part start, at: (0, 0, 3), facing: (0, 0, -1)
+";
+
+fn near(x: f32, y: f32) bool { let d = x - y; d < 0.002 && d > -0.002 }
+
+fn checkSteps(mutant: u32) bool {
+  var all = true;
+  var image = readImage("steps.ddd", STEP_WORLD);
+  var behaviour = Behaviour.none();
+  behaviour <-> image.behaviour;
+  var r = SimRules.make(behaviour, false);
+  r.steps.mutant = mutant;
+  let a = slotNamed(&r, "a");
+  let b = slotNamed(&r, "b");
+  all = rulesVerdict(r.live() && r.refusedCount() == 0usize && a != 0u32 && b != 0u32 && r.steps.units.len() == 2usize,
+    "a world with a step function and two steppers is verified with nothing refused") && all;
+  r.animate(1u64, STEP_NS);            // the created rule starts the steppers
+  r.stepAll(1u64, STEP_NS);
+  r.slots.refresh();
+  let pa = r.slots.place(a).translation();
+  let pb = r.slots.place(b).translation();
+  all = rulesVerdict(near(pa.x, 3.025) && near(pa.y, 1.) && near(pb.x, 0.025) && near(pb.y, 1.),
+    "after one step the birds have swapped places and each moved 1.5 m/s: each read the world as it stood at the step's start") && all;
+  let q = r.slots.turnOf(a);
+  all = rulesVerdict(q.y > 0.7 && q.y < 0.72 && q.w > 0.7 && q.w < 0.72, "set(p.facing, v) turns a to face +x (90 degrees about y)") && all;
+  all = rulesVerdict(r.steps.dropped == 0u64 && r.steps.runs == 2u64, "both steppers ran, none stopped") && all;
   all
 }
