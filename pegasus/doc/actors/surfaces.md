@@ -18,7 +18,7 @@ The kinds of handshake are those of [Messages](messages.md); the proposed kinds 
   - Out: the surface's picture, on the surface's own clock, as a texture Render accepts under its per-frame upload budget (unmeasured beyond the built slices in "What exists today").
   - In: whether the surface is visible and how large it is drawn is proposed (see Open).
 - **Player** ([Player](player.md)).
-  - In: what the person types, forwarded by Player straight to the focused page ([Strangers' worlds](../design/strangers-worlds.md), [Actions and triggers](../design/actions-and-triggers.md)); the reserved keys stay live while a page has focus.
+  - In: what the person types, forwarded by Player straight to the focused page ([Strangers' worlds](../design/strangers-worlds.md), [Actions and triggers](../design/actions-and-triggers.md)); the browser's own controls stay live while a page has focus.
   - Sending input to the desktop controls the whole laptop; whether that is a grant is Open.
 - **Sim** ([Sim](sim.md)).
   - A surface is shown on a part, and the part is Sim's. How Sim opens, closes and points a surface, and what a surface reports back (a page's title changed), are Open.

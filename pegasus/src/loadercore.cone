@@ -1,0 +1,229 @@
+// The Loader's catalog and queue, apart from the actor, so a check can drive
+// them step by step with no threads (as RenderCore is Render's).
+//
+// The catalog maps a content key to its entry: the recipe, where it is in
+// being built, and who uses it (a list of parts, so a part counted twice or
+// released twice changes nothing). A key is built once however many parts use
+// it. Requests wait in the catalog as QUEUED entries; `next` takes the
+// nearest. When the last user lets go the entry goes, and the caller tells
+// Render it may drop the mesh.
+//
+// The linear scans over the catalog are fine for the hundreds of keys a zone
+// holds today; a table by key replaces them when a measurement asks.
+
+pub const STATE_QUEUED = 1u32;
+pub const STATE_BUILDING = 2u32;
+pub const STATE_BUILT = 3u32;
+
+// What `ask` found
+pub const ASK_UNKNOWN = 0u32;       // no recipe for this key: nothing can be built
+pub const ASK_QUEUED = 1u32;        // a new entry waits to be built
+pub const ASK_JOINED = 2u32;        // the key is queued or building; this part is another user
+pub const ASK_SHARED = 3u32;        // already built: its user shares what Render and Sim hold
+
+// What `done` says to do with a finished build
+pub const DONE_DELIVER = 1u32;
+pub const DONE_DISCARD = 2u32;      // every user let go while it was building
+
+// What `unused` found
+pub const UNUSED_NOT_USER = 0u32;   // no such key, or the part does not use it
+pub const UNUSED_STILL = 1u32;      // other users remain
+pub const UNUSED_FREED = 2u32;      // the last user left a built key: Render may drop the mesh
+pub const UNUSED_CANCELLED = 3u32;  // the last user left a key still queued: it will not be built
+
+struct CatalogEntry {
+  key: ContentKey;
+  recipe: Recipe;
+  state: u32;
+  users: List[PartId];
+  nearness: f32;                    // the nearest user's, in metres
+}
+alias Catalog = List[CatalogEntry];
+
+struct KnownRecipe {
+  key: ContentKey;
+  recipe: Recipe;
+}
+alias KnownRecipes = List[KnownRecipe];
+
+pub struct LoaderCore {
+  known: KnownRecipes;              // what each key is made from, taught by the world image
+  catalog: Catalog;
+  startedNearness: List[f32];       // the nearness of each job, in the order the jobs were handed out
+  offByOne: bool;                   // the check's mutant: frees one user too soon
+  pub started: u64;                 // jobs handed out
+  pub shared: u64;                  // asks answered by a key already built
+  pub freed: u64;                   // keys whose last user left
+  pub discarded: u64;               // builds that finished with no user
+  pub unknown: u64;                 // asks for a key with no recipe
+
+  pub fn make(offByOne: bool) LoaderCore {
+    LoaderCore(KnownRecipes(), Catalog(), List[f32](), offByOne, 0u64, 0u64, 0u64, 0u64, 0u64)
+  }
+
+  // The world image says what 'key' is made from
+  pub fn learn(self: &mut, key: ContentKey, recipe: Recipe) {
+    var i = 0usize;
+    while i < known.len() {
+      if known[i].key == key { return; }
+      i = i + 1usize;
+    }
+    known.push(KnownRecipe(key, recipe));
+  }
+
+  fn find(self: &, key: ContentKey) usize {
+    var i = 0usize;
+    while i < catalog.len() {
+      if catalog[i].key == key { return i; }
+      i = i + 1usize;
+    }
+    catalog.len()
+  }
+
+  fn recipeFor(self: &, key: ContentKey) Option[Recipe] {
+    var i = 0usize;
+    while i < known.len() {
+      if known[i].key == key {
+        let r = &known[i].recipe;
+        return Some[Recipe](Recipe(r.shape.clone(), r.args.clone(), r.lod));
+      }
+      i = i + 1usize;
+    }
+    None[Recipe]
+  }
+
+  // Sim -> Loader: part 'req.part' uses 'req.key', which is 'req.nearness' metres off
+  pub fn ask(self: &mut, req: &ContentRequest) u32 {
+    let at = self.find(req.key);
+    if at < catalog.len() {
+      let e = &mut catalog[at];
+      if !e.users.contains(&req.part) { e.users.push(req.part); }
+      if req.nearness < e.nearness { e.nearness = req.nearness; }
+      if e.state == STATE_BUILT { shared = shared + 1u64; return ASK_SHARED; }
+      return ASK_JOINED;
+    }
+    match self.recipeFor(req.key) {
+      case let Some(r) {
+        var users = List[PartId]();
+        users.push(req.part);
+        catalog.push(CatalogEntry(req.key, r, STATE_QUEUED, users, req.nearness));
+        ASK_QUEUED
+      }
+      case is None[Recipe] { unknown = unknown + 1u64; ASK_UNKNOWN }
+    }
+  }
+
+  pub fn queued(self: &) usize {
+    var n = 0usize;
+    each e in &catalog { if e.state == STATE_QUEUED { n = n + 1usize; } }
+    n
+  }
+
+  // The nearest queued key, handed out to be built
+  pub fn next(self: &mut) Option[BuildJob] {
+    var best = catalog.len();
+    var i = 0usize;
+    while i < catalog.len() {
+      if catalog[i].state == STATE_QUEUED && (best == catalog.len() || catalog[i].nearness < catalog[best].nearness) { best = i; }
+      i = i + 1usize;
+    }
+    if best == catalog.len() { return None[BuildJob]; }
+    let e = &mut catalog[best];
+    e.state = STATE_BUILDING;
+    started = started + 1u64;
+    startedNearness.push(e.nearness);
+    Some[BuildJob](BuildJob(e.key, Recipe(e.recipe.shape.clone(), e.recipe.args.clone(), e.recipe.lod), e.nearness))
+  }
+
+  // The build of 'key' finished: deliver it, unless nobody wants it now
+  pub fn done(self: &mut, key: ContentKey) u32 {
+    let at = self.find(key);
+    if at == catalog.len() { discarded = discarded + 1u64; return DONE_DISCARD; }
+    if catalog[at].users.len() == 0usize {
+      catalog.remove(at);
+      discarded = discarded + 1u64;
+      return DONE_DISCARD;
+    }
+    catalog[at].state = STATE_BUILT;
+    DONE_DELIVER
+  }
+
+  // Sim -> Loader: 'part' no longer uses 'key'
+  pub fn unused(self: &mut, key: ContentKey, part: PartId) u32 {
+    let at = self.find(key);
+    if at == catalog.len() { return UNUSED_NOT_USER; }
+    let e = &mut catalog[at];
+    match e.users.indexOf(&part) {
+      case let Some(k) { e.users.remove(k); }
+      case is None[usize] { return UNUSED_NOT_USER; }
+    }
+    var limit = 0usize;
+    if offByOne { limit = 1usize; }
+    if e.users.len() > limit { return UNUSED_STILL; }
+    if e.state == STATE_BUILT {
+      catalog.remove(at);
+      freed = freed + 1u64;
+      return UNUSED_FREED;
+    }
+    if e.state == STATE_QUEUED {
+      catalog.remove(at);
+      return UNUSED_CANCELLED;
+    }
+    UNUSED_STILL                    // building: `done` finds it empty and discards it
+  }
+
+  // How many parts use 'key' (0: not in the catalog)
+  pub fn userCount(self: &, key: ContentKey) usize {
+    let at = self.find(key);
+    if at == catalog.len() { return 0usize; }
+    catalog[at].users.len()
+  }
+
+  // The key of the first entry in the catalog (the check's choice of one to let go of)
+  pub fn firstKey(self: &) ContentKey { if catalog.len() == 0usize { 0u64 } else { catalog[0usize].key } }
+
+  // The parts that use 'key', as a copy
+  pub fn usersOf(self: &, key: ContentKey) List[PartId] {
+    let at = self.find(key);
+    if at == catalog.len() { return List[PartId](); }
+    catalog[at].users.clone()
+  }
+
+  pub fn isBuilt(self: &, key: ContentKey) bool {
+    let at = self.find(key);
+    at < catalog.len() && catalog[at].state == STATE_BUILT
+  }
+
+  pub fn inFlight(self: &) usize {
+    var n = 0usize;
+    each e in &catalog { if e.state == STATE_BUILDING { n = n + 1usize; } }
+    n
+  }
+
+  // The jobs were handed out nearest first: no job nearer than the one before it
+  // (true when every ask came before the first `next`)
+  pub fn startedNearestFirst(self: &) bool {
+    var i = 1usize;
+    while i < startedNearness.len() {
+      if startedNearness[i] < startedNearness[i - 1usize] { return false; }
+      i = i + 1usize;
+    }
+    true
+  }
+}
+
+// ---- What a build's products become ----
+
+// The mesh, for Render
+pub fn meshContentOf(key: ContentKey, p: PartProducts) MeshContent {
+  var q = p;
+  let bytes = q.mesh.vertexCount() * 32usize + q.mesh.triangleCount() * 12usize;
+  var mesh = Mesh.cube(1.);
+  mesh <-> q.mesh;                  // the mesh is moved out, not copied
+  MeshContent(key, mesh, q.material, bytes)
+}
+
+// The collision and pick shapes, for Sim: the box that holds the mesh
+pub fn shapesOf(key: ContentKey, p: &PartProducts) ContentShapes {
+  ContentShapes(key, BoxShape(p.half), BoxShape(p.half))
+}

@@ -1,0 +1,250 @@
+// The messages between the browser's actors: one thin module, so that a
+// message's name or kind changes here and nowhere else.
+//
+// Every row is PROPOSED (browser-arch's answer to pegasus-build, 28 Nov 2026,
+// `Sessions\pegasus-skeleton-messages-2026-11-28.md`); none of it is decided.
+// The kinds are those of `Browser\doc\actors\messages.md`:
+//   state   the newest supersedes the older; in one process a latest value with
+//           a sequence number (StateWriter / StateReader below). Itself a
+//           proposed fifth kind.
+//   event   a message that happens once, in order (an actor behaviour)
+//   move    ownership of a value passes to the receiver (a behaviour argument
+//           taken by value)
+//   latest  a value published whole and never changed after (an imm Arc)
+//
+// The behaviours that carry the events and moves are declared on the
+// receiving actors; each is listed here by row with the types it carries.
+//
+// Row 1  Player -> client Sim: MoveIntent and LookIntent (state, below);
+//        Sim.act(Action) for a pointer pressed along a ray at drawn time T
+//        (event, carrying an Action).
+// Row 2  Sim -> Render, Audio: Render.snapshot(Published), Audio.snapshot(Published)
+//        (latest: the Snapshot never changes after it is published).
+// Row 3  Sim -> Loader: Loader.build(ContentRequest) (event); Loader.unused(key, part)
+//        (event). "Priorities changed" waits.
+// Row 4  Loader -> Sim: Sim.world(WorldImage) (move), Sim.shapes(ContentShapes)
+//        (move). Loader -> Render: Render.content(MeshContent) (bulk move,
+//        taken under Render's upload budget). Render -> Loader "K dropped" waits.
+// Row 5  Head pose: Render reads Player's LookIntent itself, last, at draw time
+//        (renderactor.cone, readHeadPose). Render -> Player, Sim: DrawnFrame
+//        (state). Player -> Render: Render.inhabit(avatar, camera) (event).
+// Row 6  Player starts the zone's Sim (playeractor.cone, startZoneSim), then
+//        Loader.openWorld(world, sim) (event).
+
+// ---- Names every message uses ----
+
+alias PartId = u32;                 // a part, in the zone's Sim: given by Sim when the part is declared
+alias ContentKey = u64;             // a piece of content the Loader builds (a mesh, its shapes)
+pub const NO_PART = 0xFFFFFFFFu32;  // no part: as a platform, the zone's own frame
+
+// ---- Row 1: Player -> Sim, state ----
+
+// Which way the person wants to walk, each -1 to 1 (forward is the way the
+// body faces; strafe is to its right). Latest value.
+pub struct MoveIntent {
+  pub forward: f32;
+  pub strafe: f32;
+}
+
+// Where the person looks, in radians: yaw about the up axis (0 faces -z),
+// pitch up from level. On the desktop this is also the mouse-look slot Render
+// reads the head pose from. Latest value.
+pub struct LookIntent {
+  pub yaw: f32;
+  pub pitch: f32;
+}
+
+// ---- Row 1: Player -> Sim, the event's action ----
+
+pub const VERB_PRESS = 1u32;        // a pointer pressed
+pub const ORIGIN_PERSON = 1u32;     // made by the local person's input
+
+// An action: a verb, its receiver, its parameters, when it was made and by
+// whom. Not the actions proposal's 64-byte record. A pointer press arrives
+// with 'receiver' NO_PART and the ray in 'from' and 'along'; Sim's admit picks
+// along the ray against its pick shapes and sets the receiver.
+pub struct Action {
+  pub verb: u32;
+  pub receiver: PartId;
+  pub from: Vec3;                   // the parameters: for a press, the ray's start
+  pub along: Vec3;                  // and its direction, a unit vector
+  pub madeNs: u64;                  // the drawn frame's display time the ray belongs to
+  pub origin: u32;                  // ORIGIN_...
+}
+
+// ---- Row 2: Sim -> Render, Audio, latest ----
+
+// One part as a step left it: its content and where it stands, in the frame
+// of its platform (NO_PART: the zone's frame).
+pub struct PartState {
+  pub id: PartId;
+  pub key: ContentKey;
+  pub platform: PartId;
+  pub placement: Mat4;
+}
+alias PartStates = List[PartState];
+
+// The person's body: its feet and which way it faces (radians about up)
+pub struct PersonState {
+  pub feet: Vec3;
+  pub yaw: f32;
+}
+
+// What the zone looks like after one step. Never changed after Sim publishes
+// it; 'sum' is taken at publishing so a check can tell if it was.
+pub struct Snapshot {
+  pub step: u64;                    // the step's number, from 1
+  pub atNs: u64;                    // the step's time, on time.Instant's clock
+  pub person: PersonState;
+  pub parts: PartStates;
+  pub sum: u64;
+}
+alias Published = Arc[imm, Snapshot];
+
+// The sum of what a snapshot says (everything but 'sum')
+pub fn snapshotSum(s: &Snapshot) u64 {
+  var h = 1469598103934665603u64;
+  h = mixIn(h, s.step);
+  h = mixIn(h, s.atNs);
+  h = mixFloat(h, s.person.feet.x); h = mixFloat(h, s.person.feet.y); h = mixFloat(h, s.person.feet.z);
+  h = mixFloat(h, s.person.yaw);
+  each p in &s.parts {
+    h = mixIn(h, u64.from(p.id));
+    h = mixIn(h, p.key);
+    h = mixIn(h, u64.from(p.platform));
+    h = mixFloat(h, p.placement.m[12]); h = mixFloat(h, p.placement.m[13]); h = mixFloat(h, p.placement.m[14]);
+  }
+  h
+}
+
+fn mixIn(h: u64, v: u64) u64 { (h ^ v) * 1099511628211u64 }
+fn mixFloat(h: u64, f: f32) u64 { mixIn(h, u64.from(f.bits())) }
+
+// ---- Row 3: Sim -> Loader, events ----
+
+// Build content 'key' for part 'part'; a smaller 'nearness' is sooner
+pub struct ContentRequest {
+  pub key: ContentKey;
+  pub part: PartId;
+  pub nearness: f32;                // metres from the person, for now
+}
+
+// ---- Row 4: Loader -> Sim, moves ----
+
+// A part the world image declares: Sim gives it an id when it takes the image
+pub struct PartDecl {
+  pub name: String;
+  pub key: ContentKey;
+  pub placement: Mat4;              // in the zone's frame (no platforms in the mock)
+}
+alias PartDecls = List[PartDecl];
+alias SimUnits = List[String];     // the world's code, for the interpreter; the mock sends names only
+
+pub struct WorldImage {
+  pub name: String;
+  pub parts: PartDecls;
+  pub units: SimUnits;
+  pub startFeet: Vec3;                // where the person's feet start
+}
+
+// A box, centred on its part's origin, in the part's frame
+pub struct BoxShape {
+  pub half: Vec3;
+}
+
+// The shapes Sim owns for one key: what it collides with and what a ray picks
+pub struct ContentShapes {
+  pub key: ContentKey;
+  pub collide: BoxShape;
+  pub pick: BoxShape;
+}
+
+// ---- Row 4: Loader -> Render, bulk move ----
+
+// One key's look, as CPU buffers Render uploads and then drops
+pub struct MeshContent {
+  pub key: ContentKey;
+  pub mesh: Mesh;
+  pub material: Material;
+  pub bytes: usize;                 // what it costs against Render's upload budget
+}
+
+// ---- Row 5: Render -> Player, Sim, state ----
+
+// A frame as Render drew it: when it was shown, which steps it blended, and
+// the head as drawn (on the desktop: the eye over the person's feet, looking
+// along the mouse look). The hands wait for the headset.
+pub struct DrawnFrame {
+  pub frame: u64;                   // Render's frame number, from 1
+  pub displayNs: u64;               // when it was drawn, on time.Instant's clock
+  pub step: u64;                    // the newer of the two snapshots blended
+  pub eye: Vec3;
+  pub yaw: f32;
+  pub pitch: f32;
+  pub lookSeq: u64;                 // the version of the LookIntent it drew with
+}
+
+// ---- State: the latest-value slot ----
+
+// A latest-value slot of a plain value T (no owners or borrows inside: it is
+// copied as bytes), over the sync package's latest-value cell. One writer
+// replaces the value; each reader takes the newest without waiting, and the
+// version is the sequence number: 1, 2, ... counting puts.
+pub fn stateSlot[T](initial: T) StateWriter[T], StateReader[T] {
+  var w: LatestWriter;
+  var r: LatestReader;
+  w, r = latestCell(mem.sizeof[T]());
+  var sw = StateWriter[T](w);
+  sw.put(&initial);
+  sw, StateReader[T].make(r, initial)
+}
+
+pub struct StateWriter[T] is Move, Sendable {
+  cell: LatestWriter;
+
+  // Replace the value: readers take it from now on
+  pub fn put(self: &mut, v: &T) {
+    _ = cell.put(mem.sliceFromParts(v as *T as *u8, mem.sizeof[T]()));
+  }
+
+  // The sequence number of the newest put
+  pub fn seq(self: &) u64 { cell.version() }
+
+  // Another reader, starting from 'initial' until it reads
+  pub fn reader(self: &, initial: T) StateReader[T] {
+    StateReader[T].make(cell.reader(), initial)
+  }
+}
+
+pub struct StateReader[T] is Move, Sendable {
+  cell: LatestReader;
+  bytes: List[u8];                  // where a read copies to, kept for the reader's life
+  last: T;
+  seen: u64;
+
+  fn make(cell: LatestReader, initial: T) StateReader[T] {
+    var b = List[u8]();
+    b.resize(mem.sizeof[T](), 0u8);
+    StateReader[T](cell, b, initial, 0u64)
+  }
+
+  // The newest value: read again if a newer one was put
+  pub fn newest(self: &mut) T {
+    match cell.readNewer(seen, bytes.viewMut()) {
+      case let Some(got) {
+        seen = got.version;
+        let p = &mut last as *T as *u8;
+        var i = 0usize;
+        while i < got.len {
+          *(p + i) = bytes[i];
+          i = i + 1usize;
+        }
+      }
+      case is None[CellRead] {}
+    }
+    last
+  }
+
+  // The sequence number of the value 'newest' last answered (0: none read)
+  pub fn seq(self: &) u64 { seen }
+}

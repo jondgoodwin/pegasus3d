@@ -21,6 +21,7 @@ Inherits: [The content language](content-language.md) (ConeScript is resilient; 
 - **A world learns only what Player hands over.** It forbids a world reading identity, devices, typing or body data on its own. `[design choice]`
 - **A stranger's world is never run as native code it supplied.** It forbids a server or a world sending compiled code for the browser to run. `[design choice]`
 - **A world that hangs stalls only itself:** its own Sims and nothing outside the world. It forbids a hung world stalling another world or the browser. `[design choice]`
+- **The smallest unit that can stall is a zone's Sim,** and a handler's budget bounds the stall to one step. A world's zones are separate Sims and do not stall each other. `[design choice]`
 - **What the person types into a focused page goes from Player straight to that page,** through no world. It forbids a world reading what the person types into a page. `[design choice]`
 
 ### The unit is the world
@@ -62,7 +63,6 @@ ConeScript's resilience ([The content language](content-language.md)) means, for
 
 ### Designs not yet settled
 
-- **The smallest unit that can be stalled.** Whether a zone's Sim, which holds both a zone's code and its physics, is the smallest unit a hung world can stall.
 - **A world's memory.** Proposed: the memory a world's code uses (its behaviour state) belongs to its zone's Sim, with that Sim's own collector, and no other actor reads it. Recommended: yes.
 - **Secrets.** Proposed: a world that wants a secret keeps it in a field or rule that lives only on the server, out of the description anyone can download. Recommended: yes.
 - **What a world receives at entry.** Options: a statement from Player (a world's own id for the person, a chosen name and avatar, claims such as guest or an age band), with the world able to ask for grants; a conversation with the identity service. Recommended: the statement, and a world never reads identity on its own.

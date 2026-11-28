@@ -1,0 +1,336 @@
+// Sim: the zone's simulation. It holds the zone's parts and the shapes the
+// Loader moved to it, steps at 60 Hz on its own clock, moves the person from
+// Player's intents, and publishes an immutable snapshot after each step to
+// Render and Audio, which never wait for it (`Browser\doc\actors\sim.md`,
+// design choices, all proposed).
+//
+// One program, three roles: 'role' chooses which parts of the step run.
+// Only SIM_WHOLE (local play) is built; SIM_SERVER and SIM_CLIENT are named so
+// the step's switches have somewhere to go.
+//
+// The step, in its order: admit (actions that arrived, stamped for this
+// step), move (the person from its intents), sense (stub), react (the action
+// queue, with the handler-budget seam), derive (stub), publish.
+//
+// Its behaviours (the messages of `messages.cone`):
+//   world(image)      Loader -> Sim, move: the world image and its Sim units
+//   shapes(s)         Loader -> Sim, move: collision and pick shapes for a key
+//   act(action)       Player -> Sim, event: a pointer press (or any action)
+//   run(...)          started once by Player: the step loop
+//   stop()            the run ends after the step under way
+
+pub const SIM_WHOLE = 0u32;         // local play: the truth, every rule
+pub const SIM_SERVER = 1u32;        // a shared zone's truth (not built)
+pub const SIM_CLIENT = 2u32;        // predicts its person, follows a server (not built)
+
+pub const STEP_HZ = 60u64;
+pub const STEP_NS = 16666667u64;    // 1 / 60 s
+pub const WALK_SPEED: f32 = 1.4;    // m/s, a person's walk
+const STEP_SECONDS: f32 = 0.016666668;
+const MOST_STEPS_A_TURN = 4u32;     // behind by more than this many steps: the rest are dropped
+
+pub fn simRoleName(role: u32) &str {
+  if role == SIM_WHOLE { return "whole"; }
+  if role == SIM_SERVER { return "server"; }
+  "client"
+}
+
+// A part as Sim holds it
+struct SimPart {
+  id: PartId;
+  name: String;
+  key: ContentKey;
+  placement: Mat4;
+  asked: bool;                      // its content was asked of the Loader
+}
+alias SimParts = List[SimPart];
+alias ShapeTable = List[ContentShapes];
+alias Actions = List[Action];
+
+// What Player hands Sim when it starts it: the readers of Player's and
+// Render's latest values, and how long to run
+pub struct SimStart {
+  pub moves: StateReader[MoveIntent];
+  pub looks: StateReader[LookIntent];
+  pub drawn: StateReader[DrawnFrame];
+  pub steps: u64;                   // 0: until stopped
+  pub stallAtStep: u64;             // a check: at this step, busy for 'stallMs' (0: never)
+  pub stallMs: u64;
+  pub finished: Sender[i32];        // told the run's verdict when 'steps' are done
+}
+
+actor Sim {
+  role: u32;
+  render: Render;
+  audio: Audio;
+  loader: Loader;
+  io: SimStart;                     // the latest values it reads, how long to run, whom to tell
+  parts: SimParts;
+  heldShapes: ShapeTable;
+  arrived: Actions;                 // actions sent since the last admit
+  queue: Actions;                   // this step's admitted actions, for react
+  reacted: Actions;                 // the actions react ran, for the run's checks
+  person: PersonState;
+  worldName: String;
+  step: u64;
+  running: bool;
+  walkSteps: u64;                   // steps that moved the person forward
+  walked: f32;                      // how far those steps moved it
+  lateSteps: u64;                   // steps dropped because the loop fell behind
+  mutateAfterPublish: bool;         // the snapshot check's mutant (PEGASUS_MUTANT=mutate-snapshot)
+  lastPublished: Option[Published];
+
+  fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
+    *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
+      Actions(), Actions(), Actions(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published]);
+  }
+
+  // Loader -> Sim (move): the world image. Each part is given its id now,
+  // before its content exists, and its content is asked for by key
+  pub async fn world(self, image: WorldImage) {
+    worldName = image.name.clone();
+    person.feet = image.startFeet;
+    each d in &image.parts {
+      let id = u32.from(parts.len());
+      parts.push(SimPart(id, d.name.clone(), d.key, d.placement, true));
+      let at = d.placement.translation();
+      loader.build(ContentRequest(d.key, id, (at - person.feet).length()));
+    }
+    print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(parts.len());
+    print <- " parts, "; print <- u64.from(image.units.len()); print <- " Sim units (mock)\n";
+  }
+
+  // Loader -> Sim (move): the shapes of a key
+  pub async fn shapes(self, s: ContentShapes) {
+    heldShapes.push(s);
+  }
+
+  // Player -> Sim (event): an action, admitted at the next step
+  pub async fn act(self, a: Action) {
+    arrived.push(a);
+  }
+
+  pub async fn stop(self) {
+    running = false;
+  }
+
+  // The step loop: a step every STEP_NS on the steady clock, catching up by
+  // whole steps when late. Other messages are taken at each await.
+  pub async fn run(self) {
+    running = true;
+    print <- "sim: role "; printStr(simRoleName(role)); print <- ", "; print <- STEP_HZ; print <- " Hz\n";
+    var next = Instant.now().nanos() + i64.from(STEP_NS);
+    while running {
+      _ = await aio.sleepUntil(Instant.fromNanos(next));
+      var taken = 0u32;
+      while running && Instant.now().nanos() >= next {
+        if taken < MOST_STEPS_A_TURN {
+          self.stepOnce(u64.from(next));
+          taken = taken + 1u32;
+        } else {
+          lateSteps = lateSteps + 1u64;
+        }
+        next = next + i64.from(STEP_NS);
+      }
+    }
+    render.stop();
+    audio.stop();
+    loader.stop();
+  }
+
+  fn stepOnce(self: &mut, atNs: u64) {
+    step = step + 1u64;
+    if role == SIM_WHOLE || role == SIM_SERVER { self.admit(); }
+    self.move();
+    self.sense();
+    self.react();
+    self.derive();
+    self.publish(atNs);
+    if step % STEP_HZ == 0u64 { self.printLine(); }
+    if io.stallAtStep != 0u64 && step == io.stallAtStep { busyFor(io.stallMs); }
+    if io.steps != 0u64 && step == io.steps {
+      running = false;
+      let verdict = self.checks();
+      var f = io.finished.clone();
+      f <- verdict;
+    }
+  }
+
+  // Admit: the actions that arrived, in the order they came, stamped for
+  // this step. A pointer press is given its receiver by picking along its ray
+  fn admit(self: &mut) {
+    var got = Actions();
+    got <-> arrived;
+    each a in &got {
+      var b = *a;
+      if b.verb == VERB_PRESS && b.receiver == NO_PART { b.receiver = self.pick(b.from, b.along); }
+      queue.push(b);
+    }
+    got.clear();
+    got <-> arrived;                // the list's block is kept for the next step
+  }
+
+  // Move: the person from its intents (the body faces the look's yaw)
+  fn move(self: &mut) {
+    let m = io.moves.newest();
+    let look = io.looks.newest();
+    person.yaw = look.yaw;
+    let ahead = Vec3(0. - sin(look.yaw), 0., 0. - cos(look.yaw));
+    let right = Vec3(cos(look.yaw), 0., 0. - sin(look.yaw));
+    var dir = ahead * clampUnit(m.forward) + right * clampUnit(m.strafe);
+    let len = dir.length();
+    if len > 1. { dir = dir * (1. / len); }
+    let d = dir * (WALK_SPEED * STEP_SECONDS);
+    person.feet = person.feet + d;
+    if m.forward > 0.5 {
+      walkSteps = walkSteps + 1u64;
+      walked = walked + d.length();
+    }
+  }
+
+  // Sense: areas crossed, contacts, timers due. None in the mock world
+  fn sense(self: &mut) {}
+
+  // React: the queue of triggers, in order. Actions a handler sends join the
+  // back of the queue (to a depth limit, once handlers exist).
+  fn react(self: &mut) {
+    var q = Actions();
+    q <-> queue;
+    each a in &q {
+      if self.runHandler(a) { reacted.push(*a); }
+    }
+    q.clear();
+    q <-> queue;
+  }
+
+  // THE HANDLER-BUDGET SEAM. A world's handler runs here, under its budget;
+  // one that overruns is stopped, its writes dropped and the world told
+  // (sim.md, proposed). That comes with the interpreter; until then the only
+  // handler is the log line below, and every action counts as run.
+  fn runHandler(self: &mut, a: &Action) bool {
+    print <- "sim: step "; print <- step; print <- " react: verb "; print <- a.verb; print <- " to part ";
+    if a.receiver == NO_PART { print <- "none"; }
+    else { print <- a.receiver; print <- " ("; printStr(parts[usize.from(a.receiver)].name.view()); print <- ")"; }
+    print <- "\n";
+    true
+  }
+
+  // Derive: subscriptions in dependency order. None yet
+  fn derive(self: &mut) {}
+
+  // Publish: the zone's parts and the person, as a snapshot nothing changes
+  // after this
+  fn publish(self: &mut, atNs: u64) {
+    var ps = PartStates();
+    each p in &parts { ps.push(PartState(p.id, p.key, NO_PART, p.placement)); }
+    var s = Snapshot(step, atNs, person, ps, 0u64);
+    s.sum = snapshotSum(&s);
+    let out = Published(s);
+    if mutateAfterPublish {
+      // The mutant: change the step before this one's snapshot after it was
+      // published, as a pool that reused snapshots too soon would
+      match &lastPublished {
+        case let Some(prev) {
+          let p = &**prev as *Snapshot;
+          (*p).person.feet.x = (*p).person.feet.x + 1.;
+          if step == 2u64 { print <- "sim: MUTANT: changing each snapshot after publishing\n"; }
+        }
+        case is None[Published] {}
+      }
+    }
+    render.snapshot(out);
+    audio.snapshot(out);
+    lastPublished = Some[Published](out);
+  }
+
+  // The part whose pick shape the ray meets first, or NO_PART
+  fn pick(self: &, from: Vec3, along: Vec3) PartId {
+    var best = NO_PART;
+    var bestT: f32 = 1000000000.;
+    each p in &parts {
+      each s in &heldShapes {
+        if s.key == p.key {
+          let t = rayBox(from, along, p.placement.translation(), s.pick.half);
+          if t >= 0. && t < bestT { bestT = t; best = p.id; }
+        }
+      }
+    }
+    best
+  }
+
+  fn printLine(self: &mut) {
+    let d = io.drawn.newest();
+    print <- "step "; print <- step; print <- " feet ("; printF(person.feet.x); print <- ", "; printF(person.feet.y);
+    print <- ", "; printF(person.feet.z); print <- ") yaw "; printF(person.yaw); print <- " shapes ";
+    print <- u64.from(heldShapes.len()); print <- "/"; print <- u64.from(parts.len()); print <- " actions ";
+    print <- u64.from(reacted.len()); print <- " | drawn frame "; print <- d.frame; print <- " of step "; print <- d.step;
+    print <- " look seq "; print <- d.lookSeq; print <- "\n";
+  }
+
+  // The run's checks, printed: 0 if all passed, 1 if not
+  fn checks(self: &mut) i32 {
+    var ok = true;
+    let expected = f32.from(walkSteps) * STEP_SECONDS * WALK_SPEED;
+    let seconds = f32.from(walkSteps) * STEP_SECONDS;
+    print <- "check walk: "; print <- walkSteps; print <- " steps forward ("; printF(seconds); print <- " s) moved ";
+    printF(walked); print <- " m, "; printF(walked / seconds); print <- " m/s against "; printF(WALK_SPEED);
+    let good = walkSteps >= 110u64 && walkSteps <= 130u64 && absf(walked - expected) < 0.01;
+    if good { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+    var boxA = NO_PART;
+    each p in &parts { if p.name.view() == "box-a" { boxA = p.id; } }
+    var hit = false;
+    each a in &reacted { if a.verb == VERB_PRESS && a.receiver == boxA { hit = true; } }
+    print <- "check pointer: a press reached Sim with box-a's handle ("; print <- boxA; print <- ")";
+    if hit { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+    print <- "sim: "; print <- step; print <- " steps, "; print <- lateSteps; print <- " dropped as late\n";
+    if ok { 0 } else { 1 }
+  }
+}
+
+// Where along the ray ('from', unit 'along') it enters the box at 'centre'
+// with half sizes 'half', or -1 if it misses
+fn rayBox(from: Vec3, along: Vec3, centre: Vec3, half: Vec3) f32 {
+  var lo: f32 = -1000000000.;
+  var hi: f32 = 1000000000.;
+  if !slab(from.x, along.x, centre.x - half.x, centre.x + half.x, &mut lo, &mut hi) { return -1.; }
+  if !slab(from.y, along.y, centre.y - half.y, centre.y + half.y, &mut lo, &mut hi) { return -1.; }
+  if !slab(from.z, along.z, centre.z - half.z, centre.z + half.z, &mut lo, &mut hi) { return -1.; }
+  if hi < 0. || lo > hi { return -1.; }
+  if lo < 0. { 0. } else { lo }
+}
+
+fn slab(o: f32, d: f32, a: f32, b: f32, lo: &mut f32, hi: &mut f32) bool {
+  if absf(d) < 0.00000001 { return o >= a && o <= b; }
+  var t0 = (a - o) / d;
+  var t1 = (b - o) / d;
+  if t0 > t1 { let t = t0; t0 = t1; t1 = t; }
+  if t0 > *lo { *lo = t0; }
+  if t1 < *hi { *hi = t1; }
+  *lo <= *hi
+}
+
+fn clampUnit(x: f32) f32 {
+  if x > 1. { return 1.; }
+  if x < -1. { return -1.; }
+  x
+}
+
+fn absf(x: f32) f32 { if x < 0. { 0. - x } else { x } }
+
+// A busy wait, standing in for a slow step in the stall check
+fn busyFor(ms: u64) {
+  let end = Instant.now().nanos() + i64.from(ms * 1000000u64);
+  while Instant.now().nanos() < end {}
+}
+
+// A number with three decimals
+fn printF(x: f32) {
+  var v = x;
+  if v < 0. { print <- "-"; v = 0. - v; }
+  let whole = u64.from(v);
+  print <- whole; print <- ".";
+  let frac = u64.from((v - f32.from(whole)) * 1000. + 0.5);
+  if frac < 100u64 { print <- "0"; }
+  if frac < 10u64 { print <- "0"; }
+  print <- frac;
+}

@@ -21,7 +21,7 @@ The avatar is a part in the world, and Sim's; its camera is a part of the avatar
 The kinds of handshake are those of [Messages](messages.md). The kinds of the rows the first browser is built to are decided there; the kinds of the rest are in the proposed table of messages there.
 
 **The devices** (keyboard, mouse, controllers, hands, headset).
-- In: what the person does on them, of four kinds ([Actions and triggers](../design/actions-and-triggers.md)). The reserved keys stay live while text goes to a focused field. The owner of raw streams (the microphone) is open (see Open).
+- In: what the person does on them, of four kinds ([Actions and triggers](../design/actions-and-triggers.md)). The browser's own controls stay live while text goes to a focused field ([Actions and triggers](../design/actions-and-triggers.md)); which inputs are reserved from worlds is deferred (see Open). The owner of raw streams (the microphone) is open (see Open).
 - Bindings are triggers ([Actions and triggers](../design/actions-and-triggers.md)); a world sees the actions, never the devices.
 
 **The client Sim of the zone the person is in.**
@@ -61,6 +61,7 @@ Player is one actor: its work is a sequence of handoffs down one stack (who they
 
 ## What exists today
 
+- **Pegasus skeleton, `pegasus/src/playeractor.cone` (W110, 28 Nov).** A `Player` actor: the shell (main thread, which owns the SDL window) sends it an `InputSample` each poll; it writes `MoveIntent` and `LookIntent` latest values (the look is the desktop's mouse-look slot Render reads) and turns a left click into an `Action` aimed along the `DrawnFrame`. It starts the zone's Sim in one function, `startZoneSim`, then sends the Loader `openWorld`. Headless (`--steps N`) it runs a script instead of input. Interactive input built but not yet tried by hand.
 - The island's shell (`browser\src\browser.cone`, in `C:\src\pegasus3d`) reads window events on the main thread, turns them into actions with the Cone `input` package (bindings in `browser\src\walk.cone`), and builds the frame's input. Held state travels as numbered input samples and edges as reliable commands (`browser\src\simview.cone`). The keep: signals resolved through bindings into actions. `[differs: this is the shell, not an actor, and there are no contexts a world declares.]`
 - The island's headset hands come from `browser\src\xrhands.cone`; Render reads the head at the predicted display time inside `drawXr` (`browser\src\renderactor.cone`) and returns the hands in the draw's reply, one frame late. The keep: Render reads the head. `[differs: hands travel through the shell into the next frame's input.]`
 - The island's identity is a name string (`--name`) and a play token that authorises a firewall rule (`browser\server\request\`, `browser\src\requestplay.cone`); the token is not an identity the simulation sees. `[differs: no account, no guest, no per-world id.]`
