@@ -115,8 +115,68 @@ def norm_event(e):
     return e.replace(" is now true", " is now 1.0").replace(" is now false", " is now 0.0")
 
 
+# --look: a picture of each world from the world's own first arrival, by the guide browser (its frame LOOK_FRAME) and by
+# pegasus (--shot --shot-view EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG: the arrival's eye, a point 2 m along its facing, the
+# lens's vertical field in whole degrees). A world not listed (the guide browser of incubator never reaches a shot in this
+# setup) is not compared.
+LOOK_VIEWS = {
+    "studio": "0,55,340,0,41,140,16",
+    "knight": "0,55,340,0,41,140,16",
+    "lineup": "0,75,460,0,63,260,27",
+    "home": "0,160,300,0,100,100,60",
+    "guide3": "0,160,300,0,160,100,60",
+}
+LOOK_FRAME = 400        # past the guide's settling: its auto-exposure has come up by then, and a big world has arrived
+LOOK_CELL_LIMIT = 40.0  # a 3 x 3 cell's mean colour that differs from the guide's by more than this (of 255) is a look difference
+
+
+def bmp_cells(path: Path):
+    """The picture resized to a common 240 x 135, and the mean colour of its 3 x 3 cells."""
+    from PIL import Image
+    import numpy as np
+    a = np.asarray(Image.open(path).convert("RGB").resize((240, 135), Image.BOX), float)
+    return a, [a[r * 45:(r + 1) * 45, c * 80:(c + 1) * 80].mean((0, 1)) for r in range(3) for c in range(3)]
+
+
+def look_compare(name: str, guide: Path, pegasus: Path):
+    """Pictures of one world from the guide browser and pegasus: (text, differs). The text gives each picture's mean
+    colour, the mean absolute difference per pixel and the largest 3 x 3 cell difference (of 255); `differs` is that
+    cell difference over LOOK_CELL_LIMIT. Needs Pillow and numpy."""
+    import tempfile
+    import time
+    import numpy as np
+    work = Path(tempfile.mkdtemp(prefix="look-"))
+    (work / "build").mkdir()
+    gbmp, pbmp = work / "build" / "shot.bmp", work / "p.bmp"
+    proc = subprocess.Popen([str(guide), "--world", name, "--shot", "--shot-at", str(LOOK_FRAME)], cwd=work, env=env(),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:                                        # the guide browser does not exit after its shot: stop the one started here
+        for _ in range(120):
+            time.sleep(0.5)
+            if gbmp.exists():
+                time.sleep(1.0)                 # written whole
+                break
+    finally:
+        proc.kill()
+        proc.wait()
+    if not gbmp.exists():
+        return "no guide picture", True
+    subprocess.run([str(pegasus), "--world", name + ".ddd", "--shot", str(pbmp), "--shot-view", LOOK_VIEWS[name]],
+                   cwd=WORLDS, env=env(), capture_output=True, timeout=180)
+    if not pbmp.exists():
+        return "no pegasus picture", True
+    ga, gc = bmp_cells(gbmp)
+    pa, pc = bmp_cells(pbmp)
+    per_pixel = float(np.abs(ga - pa).mean())
+    worst = max(float(np.abs(g - p).max()) for g, p in zip(gc, pc))
+    text = (f"mean colour guide {tuple(int(x) for x in ga.mean((0, 1)))} pegasus {tuple(int(x) for x in pa.mean((0, 1)))}; "
+            f"per pixel {per_pixel:.1f}, worst 3x3 cell {worst:.1f}")
+    return text, worst > LOOK_CELL_LIMIT
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--look", action="store_true", help="also take a picture pair of each world and compare mean colours")
     ap.add_argument("worlds", nargs="*")
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--pegasus", default=str(REPO / "pegasus" / "build" / "release" / "pegasus.exe"))
@@ -171,9 +231,17 @@ def main() -> int:
         rows.append((name, counts, loads, meshes, behav, chk))
     for r in rows:
         print(f"{r[0]}: [{r[1]}] loads {r[2]} | meshes {r[3]} | behaviour {r[4]} | pegasus checks {r[5]}")
+    lookdiff = 0
+    if args.look:
+        for name in names:
+            if name in LOOK_VIEWS:
+                text, differs = look_compare(name, Path(args.guide), Path(args.pegasus))
+                lookdiff += 1 if differs else 0
+                print(f"look {name}: {text}{' DIFFERS' if differs else ''}")
     print(f"{len(rows)} world(s), {bad} with a difference in loads, meshes or checks; "
-          f"{sum(1 for r in rows if r[0] in CLICKS)} with replayed clicks, {behdiff} of them with a different event list")
-    return 1 if bad or behdiff else 0
+          f"{sum(1 for r in rows if r[0] in CLICKS)} with replayed clicks, {behdiff} of them with a different event list"
+          + (f"; {lookdiff} with a look difference" if args.look else ""))
+    return 1 if bad or behdiff or lookdiff else 0
 
 
 if __name__ == "__main__":
