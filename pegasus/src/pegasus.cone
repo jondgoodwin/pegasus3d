@@ -16,7 +16,9 @@
 //   pegasus --shot FILE        one frame off screen, to FILE (a BMP), once its content is resident
 //   pegasus --steps N --parts40
 //                              the 40-part world sharing five keys; the Loader lets go of one
-//   pegasus --checks           the driven checks (the head pose read last; the Loader's key, sharing, order, unused)
+//   pegasus --world FILE       a real world's .ddd file read by the conescript package (with --steps or --shot); its
+//                              parts get stand-in boxes until the interpreter builds them
+//   pegasus --checks          the driven checks (the head pose read last; the Loader's key, sharing, order, unused)
 //
 // PEGASUS_MUTANT=stale-pose or mutate-snapshot runs a check's mutant, which
 // the check must catch. The shell (this file) owns the window and the main
@@ -36,7 +38,12 @@ import render use *;
 import path use Path;
 import window use *;
 import actors;
-import aio;
+import aio use File;
+import iobuf use IoBuf;
+import iocore use Access;
+import fs;
+import conescript use Understood, Val, Kind, Problem, Names, read, showProblems, numOf, OPT_AT, OPT_ROTATION, OPT_MATERIAL;
+import partbuild use vocabulary;
 import sync use Arc, Channel, Sender, Receiver, LatestWriter, LatestReader, latestCell, CellRead;
 import time use Instant, Duration;
 
@@ -116,6 +123,7 @@ fn main(argc: i32, argv: **u8) i32 {
   var stallMs = 0u64;
   var checksOnly = false;
   var parts40 = false;
+  var worldFile = String();
   var a = 1;
   while a < argc {
     let arg = *(argv + usize.from(a));
@@ -133,8 +141,11 @@ fn main(argc: i32, argv: **u8) i32 {
       checksOnly = true;
     } else if argIs(arg, "--parts40") {
       parts40 = true;
+    } else if argIs(arg, "--world") && a + 1 < argc {
+      worldFile = argString(*(argv + usize.from(a + 1)));
+      a = a + 1;
     } else {
-      print <- "pegasus: unknown argument; use --steps N, --stall-sim MS, --parts40, --shot FILE or --checks\n";
+      print <- "pegasus: unknown argument; use --steps N, --stall-sim MS, --parts40, --world FILE, --shot FILE or --checks\n";
       return 2;
     }
     a = a + 1;
@@ -193,17 +204,30 @@ fn main(argc: i32, argv: **u8) i32 {
     // the 40-part world's five less the one its Loader lets go of
     var exactKeys = 0usize;
     if headless { exactKeys = MOCK_KEYS; }
-    let render = Render(handle, w, h, !headless, lookForRender, drawnW, shot.clone(), MOCK_KEYS, exactKeys, stoppedS,
-      finishedS.clone(), stallMs, mutantIs("stale-pose"));
-    let audio = Audio();
+    var wantKeys = MOCK_KEYS;
     var wantBuilds = 4u64;
     if parts40 { wantBuilds = 5u64; }
+    if worldFile.len() > 0usize {
+      // A real world: how many keys it makes is what the run checks (the Loader reads it again, when it opens it)
+      var keys = 0usize;
+      match fs.readFile(&Path.from(worldFile.view())) {
+        case let Ok(text) { keys = distinctKeys(&readImage(worldFile.view(), text.view())); }
+        case let Err(e) { print <- "pegasus: "; printStr(worldFile.view()); print <- " cannot be read: "; print <- e; print <- "\n"; return 1; }
+      }
+      wantKeys = keys;
+      if headless { exactKeys = keys; }
+      wantBuilds = u64.from(keys);
+    }
+    let render = Render(handle, w, h, !headless, lookForRender, drawnW, shot.clone(), wantKeys, exactKeys, stoppedS,
+      finishedS.clone(), stallMs, mutantIs("stale-pose"));
+    let audio = Audio();
     let loader = Loader(render, loaderS, wantBuilds, parts40 && headless, mutantIs("unused-off-by-one"));
     let player = Player(render, loader, audio, moveW, lookW, drawnR, mutantIs("mutate-snapshot"));
     var stallAt = 0u64;
     if stallMs > 0u64 { stallAt = STALL_AT_STEP; }
     var worldName = String.from("mock");
     if parts40 { worldName = String.from("parts40"); }
+    if worldFile.len() > 0usize { worldName = worldFile.clone(); }
     player.start(worldName,SimStart(moveR, lookR, drawnForSim, steps, stallAt, stallMs, finishedS));
     render.run();
     var scriptS: Sender[bool];

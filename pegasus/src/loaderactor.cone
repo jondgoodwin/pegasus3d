@@ -23,6 +23,7 @@
 // reader and the interpreter.
 
 pub const MOCK_KEYS = 4usize;       // keys resident once either mock world has arrived (the 40-part world's five, less the one it lets go)
+const READ_CHUNK = 65536usize;     // a world file is read this much at a time
 const WORKERS = 3usize;            // jobs in flight at once
 const SETTLE_US = 1000i64;          // the burst of requests that follows a world image is gathered for this long
 
@@ -61,8 +62,59 @@ actor Loader {
   // started. Phase 1: the world image is moved to that Sim; its parts name
   // their keys, and Sim then asks for each
   pub async fn openWorld(self, world: String, sim: Sim) {
-    sim.world(mockWorld(world, &mut core));
+    if world.view() == "mock" || world.view() == "parts40" {
+      sim.world(mockWorld(world, &mut core));
+    } else {
+      // A world's file: read, understood by the conescript reader, and its parts kept that have no problem
+      let path = Path.from(world.view());
+      var text = String();
+      var f = File.none();
+      var opened = await aio.openFile(&path, Access.Read);
+      match &mut opened {
+        case var &mut Ok(ok) { f <-> *ok; }
+        case var &mut Err(e) { print <- "loader: "; printStr(world.view()); print <- " cannot be opened: error "; print <- e.code; print <- "\n"; }
+      }
+      var offset = 0u64;
+      var going = !f.isNone();
+      while going {
+        var read = await f.readAt(offset, IoBuf(READ_CHUNK));
+        going = false;
+        match &mut read {
+          case var &mut Ok(buf) {
+            text.appendBytes(buf.view());
+            offset = offset + u64.from(buf.len());
+            going = buf.len() == READ_CHUNK;
+          }
+          case var &mut Err(e) { print <- "loader: "; printStr(world.view()); print <- " cannot be read: error "; print <- e.code; print <- "\n"; }
+        }
+      }
+      sim.world(self.imageOfText(world.view(), text.view()));
+    }
     self.sim = Some[Sim](sim);
+  }
+
+  // The text of a world file as the message Sim takes: every part the reader kept, each key taught its recipe
+  fn imageOfText(self: &mut, file: &str, text: &str) WorldImage {
+    let image = readImage(file, text);
+    showProblems(file, &image.problems);
+    var parts = PartDecls();
+    each p in &image.parts {
+      core.learn(p.key, Recipe(p.recipe.shape.clone(), p.recipe.args.clone(), p.recipe.lod));
+      parts.push(PartDecl(p.path.clone(), p.key, p.placement));
+    }
+    print <- "loader: world "; printStr(file); print <- ": "; print <- u64.from(image.parts.len()); print <- " parts, ";
+    print <- u64.from(distinctKeys(&image)); print <- " distinct keys, "; print <- u64.from(image.problems.len());
+    print <- " problems, "; print <- u64.from(image.dropped.len()); print <- " parts dropped";
+    var k = 0usize;
+    while k < image.dropped.len() {
+      if k == 0usize { print <- ": "; } else { print <- ", "; }
+      printStr(image.dropped[k].view());
+      k = k + 1usize;
+    }
+    print <- "\n";
+    var units = SimUnits();
+    units.push(String.from(file));
+    WorldImage(image.name.clone(), parts, units, image.startFeet)
   }
 
   // Sim -> Loader (event): part 'req.part' uses key 'req.key'. A key already

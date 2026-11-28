@@ -21,6 +21,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 WORLDS = REPO / "guidebrowser" / "worlds"
+PEGASUS_WORLDS = REPO / "pegasus" / "worlds"      # the new browser's worlds, checked the same way
 EXPECTED = Path(__file__).resolve().parent / "checkworlds-expected"
 SDL3 = os.environ.get("SDL3_LIB", r"C:\libs\SDL3-3.4.16\lib\x64")
 CEF = os.environ.get("CEF_RELEASE", r"C:\src\cef\cef_binary_156.0.28+g57389f0+chromium-156.0.8078.88_windows64_minimal\Release")
@@ -39,12 +40,12 @@ def main() -> int:
     ap.add_argument("--exe", default=str(REPO / "guidebrowser" / "build" / "release" / "guidebrowser.exe"))
     args = ap.parse_args()
     exe = Path(args.exe)
-    worlds = sorted(WORLDS.glob("*.ddd"))
+    worlds = sorted(WORLDS.glob("*.ddd")) + sorted(PEGASUS_WORLDS.glob("*.ddd"))
     bad = 0
     if args.update:
         EXPECTED.mkdir(exist_ok=True)
     for world in worlds:
-        code, lines = run(exe, WORLDS, world.name)
+        code, lines = run(exe, world.parent, world.name)
         want_file = EXPECTED / (world.stem + ".txt")
         if args.update:
             if lines:
