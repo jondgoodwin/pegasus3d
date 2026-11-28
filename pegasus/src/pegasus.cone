@@ -1,0 +1,262 @@
+// Pegasus: the 3-D browser, first version (plan step 5): its actor skeleton
+// on mock content. The actors (each in its own file):
+//
+//   Player   playeractor.cone   input to intents and actions; starts the zone's Sim
+//   Sim      simactor.cone      the parts, the 60 Hz step, the snapshot
+//   Render   renderactor.cone   the display, never waiting on Sim; the GPU's only submitter
+//   Loader   loaderactor.cone   the catalog, content keys and a worker pool (mock content behind buildContent)
+//   Audio    audioactor.cone    a MOCK: takes snapshots, does nothing
+//
+// and the messages between them, all proposed, in messages.cone.
+//
+//   pegasus                    a window: WASD walks, the mouse looks, the left button presses
+//   pegasus --steps N          headless: N steps with scripted intents, no drawing; a line a second
+//   pegasus --steps N --stall-sim MS
+//                              and Sim busy for MS ms at step 300: Render must keep drawing
+//   pegasus --shot FILE        one frame off screen, to FILE (a BMP), once its content is resident
+//   pegasus --steps N --parts40
+//                              the 40-part world sharing five keys; the Loader lets go of one
+//   pegasus --checks           the driven checks (the head pose read last; the Loader's key, sharing, order, unused)
+//
+// PEGASUS_MUTANT=stale-pose or mutate-snapshot runs a check's mutant, which
+// the check must catch. The shell (this file) owns the window and the main
+// thread, as SDL wants: it pumps the devices and hands Player each sample.
+
+mod pegasus;
+
+import stdio use *;
+import libc;
+import sdl;
+import collections use *;
+import geomath use *;
+import mesh use Mesh, PolyMesh;
+import sculpt use subdivisionLevels;
+import gpu use *;
+import render use *;
+import path use Path;
+import window use *;
+import actors;
+import aio;
+import sync use Arc, Channel, Sender, Receiver, LatestWriter, LatestReader, latestCell, CellRead;
+import time use Instant, Duration;
+
+const STALL_AT_STEP = 300u64;
+const SHOT_W = 640u32;
+const SHOT_H = 360u32;
+
+fn argIs(a: *u8, b: &str) bool {
+  var i = 0usize;
+  while i < b.len() {
+    if *(a + i) != b[i] { return false; }
+    i = i + 1usize;
+  }
+  *(a + b.len()) == 0u8
+}
+
+fn argNumber(s: *u8) u64 {
+  var n = 0u64;
+  var i = 0usize;
+  while *(s + i) >= '0' && *(s + i) <= '9' {
+    n = n * 10u64 + u64.from(*(s + i) - '0');
+    i = i + 1usize;
+  }
+  n
+}
+
+fn argString(s: *u8) String {
+  var out = String();
+  var i = 0usize;
+  while *(s + i) != 0u8 {
+    out.appendByte(*(s + i));
+    i = i + 1usize;
+  }
+  out
+}
+
+// The mutant asked for in PEGASUS_MUTANT is 'name'
+fn mutantIs(name: &str) bool {
+  let e = libc.getenv("PEGASUS_MUTANT");
+  if (e as usize) == 0usize { return false; }
+  argIs(e, name)
+}
+
+fn zeroFrame() DrawnFrame { DrawnFrame(0u64, 0u64, 0u64, Vec3(0., EYE_HEIGHT, 0.), 0., 0., 0u64) }
+
+// ---- The driven check: the head pose is read last ----
+
+// A frame is prepared, the mouse moves, and the frame is finished: what it
+// drew must be the pose after the move. The mutant reads the pose while
+// preparing, and draws a stale one.
+fn checkHeadPose(stale: bool) bool {
+  var lw: StateWriter[LookIntent];
+  var lr: StateReader[LookIntent];
+  lw, lr = stateSlot[LookIntent](LookIntent(0., 0.));
+  var dw: StateWriter[DrawnFrame];
+  var dr: StateReader[DrawnFrame];
+  dw, dr = stateSlot[DrawnFrame](zeroFrame());
+  var core = RenderCore.make(lr, dw, stale);
+  lw.put(&LookIntent(0.1, 0.));
+  let plan = core.prepare();
+  lw.put(&LookIntent(0.7, 0.2));
+  let d = core.finish(&plan);
+  let seen = dr.newest();
+  let ok = d.yaw == 0.7 && d.pitch == 0.2 && d.lookSeq == lw.seq() && seen.frame == d.frame;
+  print <- "check head pose read last: drew look seq "; print <- d.lookSeq; print <- " of "; print <- lw.seq();
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED (a stale pose)\n"; }
+  ok
+}
+
+// ---- The run ----
+
+fn main(argc: i32, argv: **u8) i32 {
+  initAll();
+  var steps = 0u64;
+  var headless = false;
+  var shot = String();
+  var stallMs = 0u64;
+  var checksOnly = false;
+  var parts40 = false;
+  var a = 1;
+  while a < argc {
+    let arg = *(argv + usize.from(a));
+    if argIs(arg, "--steps") && a + 1 < argc {
+      steps = argNumber(*(argv + usize.from(a + 1)));
+      headless = true;
+      a = a + 1;
+    } else if argIs(arg, "--shot") && a + 1 < argc {
+      shot = argString(*(argv + usize.from(a + 1)));
+      a = a + 1;
+    } else if argIs(arg, "--stall-sim") && a + 1 < argc {
+      stallMs = argNumber(*(argv + usize.from(a + 1)));
+      a = a + 1;
+    } else if argIs(arg, "--checks") {
+      checksOnly = true;
+    } else if argIs(arg, "--parts40") {
+      parts40 = true;
+    } else {
+      print <- "pegasus: unknown argument; use --steps N, --stall-sim MS, --parts40, --shot FILE or --checks\n";
+      return 2;
+    }
+    a = a + 1;
+  }
+  if checksOnly {
+    let poseOk = checkHeadPose(mutantIs("stale-pose"));
+    let loaderOk = checkLoader(mutantIs("unused-off-by-one"));
+    let ok = poseOk && loaderOk;
+    finalAll();
+    return if ok { 0 } else { 1 };
+  }
+
+  // The latest values: Player's intents (the look is the mouse-look slot
+  // Render reads the head pose from), and the frame as Render drew it
+  var moveW: StateWriter[MoveIntent];
+  var moveR: StateReader[MoveIntent];
+  moveW, moveR = stateSlot[MoveIntent](MoveIntent(0., 0.));
+  var lookW: StateWriter[LookIntent];
+  var lookR: StateReader[LookIntent];
+  lookW, lookR = stateSlot[LookIntent](LookIntent(0., -0.15));
+  let lookForRender = lookW.reader(LookIntent(0., -0.15));
+  var drawnW: StateWriter[DrawnFrame];
+  var drawnR: StateReader[DrawnFrame];
+  drawnW, drawnR = stateSlot[DrawnFrame](zeroFrame());
+  let drawnForSim = drawnW.reader(zeroFrame());
+
+  var finishedS: Sender[i32];
+  var finishedR: Receiver[i32];
+  finishedS, finishedR = Channel[i32].make();
+  var loaderS: Sender[bool];
+  var loaderR: Receiver[bool];
+  loaderS, loaderR = Channel[bool].make();
+  var stoppedS: Sender[bool];
+  var stoppedR: Receiver[bool];
+  stoppedS, stoppedR = Channel[bool].make();
+
+  // The window, unless headless or a shot
+  let windowed = !headless && shot.len() == 0usize;
+  // (opened in place: a Window dropped on reassignment would end SDL's video under the new one)
+  var win = if windowed { Window.openVulkan("Pegasus") } else { Window.unopened() };
+  var handle = 0usize;
+  var w = SHOT_W;
+  var h = SHOT_H;
+  if windowed {
+    if !win.isOpen() { print <- "pegasus: no window could be opened\n"; return 1; }
+    handle = win.sdlHandle() as usize;
+    let size = win.size();
+    w = u32.from(size.w);
+    h = u32.from(size.h);
+    _ = sdl.SetWindowRelativeMouseMode(win.sdlHandle(), true);
+  }
+
+  var verdict = 0;
+  {
+    // A headless run checks what is resident at its end: the mock's four keys, or
+    // the 40-part world's five less the one its Loader lets go of
+    var exactKeys = 0usize;
+    if headless { exactKeys = MOCK_KEYS; }
+    let render = Render(handle, w, h, !headless, lookForRender, drawnW, shot.clone(), MOCK_KEYS, exactKeys, stoppedS,
+      finishedS.clone(), stallMs, mutantIs("stale-pose"));
+    let audio = Audio();
+    var wantBuilds = 4u64;
+    if parts40 { wantBuilds = 5u64; }
+    let loader = Loader(render, loaderS, wantBuilds, parts40 && headless, mutantIs("unused-off-by-one"));
+    let player = Player(render, loader, audio, moveW, lookW, drawnR, mutantIs("mutate-snapshot"));
+    var stallAt = 0u64;
+    if stallMs > 0u64 { stallAt = STALL_AT_STEP; }
+    var worldName = String.from("mock");
+    if parts40 { worldName = String.from("parts40"); }
+    player.start(worldName,SimStart(moveR, lookR, drawnForSim, steps, stallAt, stallMs, finishedS));
+    render.run();
+    var scriptS: Sender[bool];
+    var scriptR: Receiver[bool];
+    scriptS, scriptR = Channel[bool].make();
+    if headless { player.script(scriptS); }
+
+    if windowed {
+      var held = 0u32;
+      while win.running {
+        var sample = InputSample(0u32, 0., 0., false);
+        var event = sdl.Event();
+        while win.pollEvent(&mut event) {
+          if event.type == sdl.EVENT_KEY_DOWN || event.type == sdl.EVENT_KEY_UP {
+            let k = &event as &sdl.KeyboardEvent;
+            var bit = 0u32;
+            if k.scancode == sdl.SCANCODE_W { bit = HOLD_W; }
+            if k.scancode == sdl.SCANCODE_A { bit = HOLD_A; }
+            if k.scancode == sdl.SCANCODE_S { bit = HOLD_S; }
+            if k.scancode == sdl.SCANCODE_D { bit = HOLD_D; }
+            if k.down { held = held | bit; } else { held = held & (0xFFFFFFFFu32 ^ bit); }
+          } else if event.type == sdl.EVENT_MOUSE_MOTION {
+            let m = &event as &sdl.MouseMotionEvent;
+            sample.dx = sample.dx + m.xrel;
+            sample.dy = sample.dy + m.yrel;
+          } else if event.type == sdl.EVENT_MOUSE_BUTTON_DOWN {
+            sample.pressed = true;
+          }
+        }
+        sample.keys = held;
+        player.input(sample);
+        sdl.Delay(2u32);
+      }
+    } else {
+      match finishedR.recv() {
+        case let Some(v) { verdict = v; }
+        case is None[i32] { verdict = 1; }
+      }
+    }
+    player.quit();
+    match stoppedR.recv() {
+      case let Some(clean) { if !clean { verdict = 1; } }
+      case is None[bool] {}
+    }
+    if headless {
+      match loaderR.recv() {
+        case let Some(clean) { if !clean { verdict = 1; } }
+        case is None[bool] {}
+      }
+      _ = scriptR.recv();
+    }   // the script's last sleep ends before the program does
+  }
+  finalAll();
+  print <- "pegasus: "; if verdict == 0 { print <- "ok\n"; } else { print <- "FAILED\n"; }
+  verdict
+}

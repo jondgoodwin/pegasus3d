@@ -2,6 +2,7 @@
 $snap = "C:\src\cone"
 $env:LIB = "$env:LIB;C:\libs\SDL3-3.4.16\lib\x64;C:\src\cone\deps\openssl"
 $env:PATH = "$env:PATH;C:\libs\SDL3-3.4.16\lib\x64"
+$env:CONGO_HOME = "$PSScriptRoot\tools\congo-home"   # where congo finds the conescript package (tools\congo-home\config.toml)
 $env:CONEC = "$snap\build\x64-release\conec.exe"
 $env:CONESTD = "$snap\build\x64-release\conestd.lib"
 Push-Location "$PSScriptRoot\guidebrowser"
