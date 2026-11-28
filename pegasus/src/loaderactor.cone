@@ -45,16 +45,18 @@ actor Worker {
   leaf: List[String];               // each part's own name, by slot (for the mesh hash lines)
   hashes: bool;                     // PEGASUS_MESH_HASHES is set
   cacheDir: Path;                   // the mesh cache's folder, read from only (empty: no cache)
-  skipSum: bool;                    // the mutant that reads cache entries without checking their checksum
+  stamp: u64;                       // this build's stamp: an entry another build wrote is a miss
+  lax: u32;                         // the mutants that read cache entries without checking the checksum or the stamp (cacheLax)
 
   fn init(self: &new) {
     let e = libc.getenv("PEGASUS_MESH_HASHES");
-    *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize, Path.from(""), mutantIs("cache-skip-checksum"));
+    *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize, Path.from(""), 0u64, cacheLax());
   }
 
   // Loader -> Worker: the world's text. 'index' is this worker's number: the first one reports a refusal, for all
-  pub async fn open(self, index: usize, file: String, text: String, cacheDir: String) {
+  pub async fn open(self, index: usize, file: String, text: String, cacheDir: String, stamp: u64) {
     self.cacheDir = Path.from(cacheDir.view());
+    self.stamp = stamp;
     var names = Names.standard();
     let vocab = vocabulary(&mut names);
     let reading = read(text.view(), names, vocab);
@@ -105,7 +107,7 @@ actor Worker {
       var cached = plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
       var outcome = 0u32;
       if !cacheDir.isEmpty() {
-        outcome = loadEntry(&cacheDir, job.key, CACHE_MATERIAL, skipSum, &mut cached);
+        outcome = loadEntry(&cacheDir, job.key, CACHE_MATERIAL, stamp, lax, &mut cached);
         if outcome == LOAD_HIT { return Built(cached, outcome); }
       }
       match &mut builder {
@@ -123,7 +125,7 @@ actor Worker {
       var outcome = 0u32;
       var cached = plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
       if !cacheDir.isEmpty() {
-        outcome = loadEntry(&cacheDir, job.key, CACHE_MESH, skipSum, &mut cached);
+        outcome = loadEntry(&cacheDir, job.key, CACHE_MESH, stamp, lax, &mut cached);
         if outcome == LOAD_HIT {
           if hashes {
             printStr(meshHashLine(leaf[usize.from(job.recipe.slot)].view(), meshHash(&cached.mesh)).view());
@@ -181,7 +183,7 @@ actor Loader {
     catalog.learn(browserAvatarKey(), browserAvatarRecipe());   // the browser's own avatar needs nothing from a world
     catalog.learn(browserAvatarMaterialKey(), browserAvatarMaterialRecipe());
     *self = Self(render, None[Sim], catalog, ws, b, false, report, expectBuilds, retire, false, simOnly,
-      MeshCache.make(Path.from(cacheFolder().view()), CACHE_CAP_BYTES), 0u64, 0u64, 0u64, Instant.now(), false);
+      MeshCache.make(Path.from(cacheFolder().view()), buildStamp(), CACHE_CAP_BYTES), 0u64, 0u64, 0u64, Instant.now(), false);
   }
 
   // Player -> Loader (event): open world 'world' for 'sim', which Player has
@@ -217,7 +219,7 @@ actor Loader {
       }
       var w = 0usize;
       while w < WORKERS {
-        workers[w].open(w, world.clone(), String.from(text.view()), String.from(cache.dir.view()));
+        workers[w].open(w, world.clone(), String.from(text.view()), String.from(cache.dir.view()), cache.stamp);
         w = w + 1usize;
       }
       sim.world(self.imageOfText(world.view(), text.view()));
