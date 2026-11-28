@@ -17,6 +17,9 @@ Inherits: [The frame and its deadlines](frame-and-deadlines.md) (nothing delays 
 
 - **Each thing is built once and moved to its one user.** It forbids two actors each building or holding the same product. `[design choice]`
 - **A part shows when its content is resident; nobody waits for "ready".** It forbids a handshake that holds a world back until it is complete. `[design choice]`
+- **A world of several files sends a manifest first.** It lists each file with its size and the hash of its content, and the path of the part whose subtree the file holds. The hash lets the Loader check what arrived and keep a file by its content, so a file two worlds share downloads once (the manual's construction page), and an unchanged file is not fetched again. The sizes let the Loader know when the world is complete and order its fetches, and the paths say which file declares which parts. A file holds whole subtrees; one file adding to a part that another file made is a question of the content language, held in Open. The spelling of the manifest is not chosen. `[design choice]`
+- **The Loader reads each file as it arrives,** and Sim declares its parts then, so the near parts' builds start before the far files are in. Rules and derives start only when every file in the manifest is in, because a rule may name any part by its path. `[design choice]`
+- **Compression is the transport's** (the content encoding of the connection), not a feature of the world's files. `[design choice]`
 
 ### What crosses the wire
 
@@ -80,7 +83,9 @@ The budgets that arrival answers to are owned by the performance perspective: th
 - **The content key** (a part refers to its content by key; see [Parts and imports](parts-and-imports.md)). Proposed: a content key names a built thing, what was built, from what, and with what arguments. Open: who assigns it, and what makes it up, including the cache key of a built description. Options: a hash of the description plus the vocabulary version; the layout digest of live editing. Recommended: the Loader assigns it.
 - **Crossing between zones without a pause.** Whether the next zone is prepared before the person reaches it, on the person's ask or on the zone's declared neighbours. Recommended: both are allowed; crossing stays seamless by preparing first.
 - **Leaving the old world in a portal entry.** Options: the old world is dropped at an irreversible moment partway through the portal's animation; it is dropped only after the new world's first file has parsed, and the home world is always the landing. Recommended: the second.
-- **Manifest first.** Whether a world sends a small manifest before its files, and whether each file reports its stage (arrived, understood, built, registered, active). Recommended: yes to the manifest.
+- **A file adding to a part another file made.** The content language has no way for one file to reopen a part declared in another; today a world's files are cut at part boundaries. Whether the language allows it, and by what rule, is the language's to decide. Recommended: not yet; files that hold whole subtrees meet arrival's needs.
+- **Each file's stage.** Whether each file reports its stage (arrived, understood, built, registered, active).
+- **How many fetches at once.** Today every file is asked for at once and the client's pool decides; a cap waits on a measurement against a real server, with TLS and HTTP/2.
 - **GPU hydration against the frame budget.** Hydrating on the GPU competes with the frame. The test is that loading a whole world never moves the tail of frame times; the measurement is owed.
 - **A long session.** The catalog is the mechanism for freeing content; nothing has run long enough to show it.
 - **The upload budget** beyond the island's 4 MB a frame: unmeasured.
