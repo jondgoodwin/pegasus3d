@@ -1,0 +1,127 @@
+// Player: the person at the keyboard and mouse. It turns their input into
+// intents (state: MoveIntent, and LookIntent, which is also the mouse-look
+// slot Render reads the head pose from) and a pointer press into an action
+// for Sim, aimed along the frame as Render drew it (DrawnFrame). It starts
+// the zone's Sim, in startZoneSim, then asks the Loader to open the world for
+// it (`Browser\doc\actors\player.md`; messages.cone rows 1, 5 and 6; proposed).
+//
+// Its behaviours: start (once, from the shell), input (the shell's input
+// sample, each poll), script (headless: scripted intents), quit.
+
+pub const HOLD_W = 1u32;            // InputSample.keys: the keys held
+pub const HOLD_A = 2u32;
+pub const HOLD_S = 4u32;
+pub const HOLD_D = 8u32;
+const LOOK_PER_PIXEL: f32 = 0.0025; // radians of look per pixel of mouse movement
+const MOST_PITCH: f32 = 1.4;
+
+// What the shell read from the devices since the last sample
+pub struct InputSample {
+  pub keys: u32;                    // HOLD_...
+  pub dx: f32;                      // mouse movement, in pixels
+  pub dy: f32;
+  pub pressed: bool;                // the left button went down
+}
+
+// The script of a headless run, by the step the drawn frame shows
+const WALK_FROM = 60u64;            // walk forward from this step
+const WALK_TO = 180u64;             // to this one: 2 s
+const PRESS_AT = 240u64;            // then press at box-a
+const BOX_A_CENTRE = Vec3(0., 0.5, -8.);
+
+actor Player {
+  render: Render;
+  loader: Loader;
+  audio: Audio;
+  moves: StateWriter[MoveIntent];
+  looks: StateWriter[LookIntent];
+  drawn: StateReader[DrawnFrame];
+  sim: Option[Sim];
+  yaw: f32;
+  pitch: f32;
+  running: bool;
+  pressed: bool;
+  mutant: bool;                     // passed to Sim: the snapshot check's mutant
+
+  fn init(self: &new, render: Render, loader: Loader, audio: Audio, moves: StateWriter[MoveIntent],
+      looks: StateWriter[LookIntent], drawn: StateReader[DrawnFrame], mutant: bool) {
+    *self = Self(render, loader, audio, moves, looks, drawn, None[Sim], 0., -0.15, true, false, mutant);
+  }
+
+  // Start the zone's Sim, then ask the Loader to open 'world' for it
+  pub async fn start(self, world: String, start: SimStart) {
+    let s = self.startZoneSim(start);
+    render.inhabit(NO_PART, NO_PART);   // the mock world has no avatar part yet: the eye is over the person's feet
+    loader.openWorld(world, s);
+    self.sim = Some[Sim](s);
+  }
+
+  // SIM START-UP, in this one place, so the world's owner can take it over
+  // when worlds have more than one zone. One world, one zone, role whole
+  fn startZoneSim(self: &mut, start: SimStart) Sim {
+    let s = Sim(SIM_WHOLE, render, audio, loader, start, mutant);
+    s.run();
+    s
+  }
+
+  // The shell's input: intents, and a press aimed along the drawn frame
+  pub async fn input(self, i: InputSample) {
+    yaw = yaw - i.dx * LOOK_PER_PIXEL;
+    pitch = pitch - i.dy * LOOK_PER_PIXEL;
+    if pitch > MOST_PITCH { pitch = MOST_PITCH; }
+    if pitch < 0. - MOST_PITCH { pitch = 0. - MOST_PITCH; }
+    if i.dx != 0. || i.dy != 0. { looks.put(&LookIntent(yaw, pitch)); }
+    var f: f32 = 0.;
+    var r: f32 = 0.;
+    if (i.keys & HOLD_W) != 0u32 { f = f + 1.; }
+    if (i.keys & HOLD_S) != 0u32 { f = f - 1.; }
+    if (i.keys & HOLD_D) != 0u32 { r = r + 1.; }
+    if (i.keys & HOLD_A) != 0u32 { r = r - 1.; }
+    moves.put(&MoveIntent(f, r));
+    if i.pressed {
+      let d = drawn.newest();
+      let along = Vec3(0. - sin(d.yaw) * cos(d.pitch), sin(d.pitch), 0. - cos(d.yaw) * cos(d.pitch));
+      self.press(d.eye, along, d.displayNs);
+    }
+  }
+
+  // A headless run's person: walk forward for 2 s, then press at box-a, as
+  // the drawn frames show the steps
+  pub async fn script(self, ended: Sender[bool]) {
+    looks.put(&LookIntent(yaw, pitch));
+    while running {
+      _ = await aio.sleep(Duration.fromNanos(i64.from(STEP_NS)));
+      if !running { break; }
+      let d = drawn.newest();
+      var f: f32 = 0.;
+      if d.step >= WALK_FROM && d.step < WALK_TO { f = 1.; }
+      moves.put(&MoveIntent(f, 0.));
+      // the look moves a little every tick, so each frame has a newer pose to read
+      let wobble = 0.001 * f32.from(d.frame % 7u64);
+      looks.put(&LookIntent(yaw, pitch + wobble));
+      if !pressed && d.step >= PRESS_AT {
+        pressed = true;
+        let along = (BOX_A_CENTRE - d.eye).normalize();
+        self.press(d.eye, along, d.displayNs);
+      }
+    }
+    var e = ended;
+    e <- true;
+  }
+
+  fn press(self: &mut, from: Vec3, along: Vec3, atNs: u64) {
+    match &sim {
+      case let Some(s) { s.act(Action(VERB_PRESS, NO_PART, from, along, atNs, ORIGIN_PERSON)); }
+      case is None[Sim] {}
+    }
+  }
+
+  pub async fn quit(self) {
+    running = false;
+    match &sim {
+      case let Some(s) { s.stop(); }
+      case is None[Sim] {}
+    }
+    self.sim = None[Sim];
+  }
+}

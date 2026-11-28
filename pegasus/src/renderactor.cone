@@ -1,0 +1,408 @@
+// Render: puts the picture on the display every frame and never waits for
+// Sim, the Loader or a world's code (`Browser\doc\actors\render.md` and
+// `doc\design\frame-and-deadlines.md`, design choices, all proposed).
+//
+// A frame, on Render's own clock (the display's, through a vsynced present;
+// headless, a timer at HEADLESS_HZ):
+//   1. take content the Loader moved, under the per-frame upload budget,
+//      uploading it to the GPU and keeping no CPU copy;
+//   2. blend the two newest snapshots by the frame's display time (drawn one
+//      step behind, so there is a newer one to blend toward);
+//   3. read the head pose, last (readHeadPose: the one function that reads it);
+//   4. draw and present;
+//   5. publish the frame as drawn (DrawnFrame, state) for Player and Sim.
+//
+// Its behaviours: snapshot (Sim, latest), content (Loader, bulk move),
+// inhabit (Player, event), run (the frame loop), stop.
+//
+// It is the only code that submits to the GPU. Its device is made by its
+// initializer, which runs on the shell's thread (the one that made the
+// window, as SDL wants); from then on only its messages reach it, on
+// whichever worker runs them, as the island's RenderActor does.
+
+pub const UPLOAD_BUDGET_BYTES = 4194304usize;  // a frame's uploads (the island's 4 MB)
+pub const HEADLESS_HZ = 72u64;                 // a headless Render's frame rate (a Quest's display)
+pub const EYE_HEIGHT: f32 = 1.6;
+
+// The GPU side. Made first, ended last: fields end in order, so what was
+// made on the device comes before it.
+struct Gfx {
+  list: DrawList;
+  renderer: Renderer;
+  post: Post;
+  swapchain: Option[SwapChain];     // a window's; none off screen
+  color: Option[Texture];           // off screen (--shot): the picture and its depth
+  depth: Option[Texture];
+  width: u32;
+  height: u32;
+  light: Light;
+  device: Device;
+  adapter: Adapter;
+  surface: Surface;
+  instance: Instance;
+}
+
+// Content resident on the GPU, by key
+struct Resident {
+  key: ContentKey;
+  mesh: MeshHandle;
+  material: MaterialHandle;
+}
+alias Residents = List[Resident];
+alias Arrivals = List[MeshContent];
+
+// What steps 1 and 2 of a frame leave for 3 to 5
+pub struct FramePlan {
+  pub nowNs: u64;
+  pub feet: Vec3;                   // the person, blended
+  pub step: u64;                    // the newer snapshot's step (0: none yet)
+  pub earlyLook: LookIntent;        // the mutant's stale read (PEGASUS_MUTANT=stale-pose)
+  pub earlySeq: u64;
+}
+
+// Render's work, apart from the actor, so a check can drive a frame step by
+// step without a GPU or a thread
+pub struct RenderCore {
+  gfx: Option[Gfx];
+  looks: StateReader[LookIntent];
+  drawnOut: StateWriter[DrawnFrame];
+  older: Option[Published];
+  newer: Option[Published];
+  arrivals: Arrivals;               // moved by the Loader, not yet uploaded
+  residents: Residents;
+  frame: u64;
+  avatar: PartId;
+  camera: PartId;
+  stalePose: bool;                  // the head-pose check's mutant
+  pub uploadedBytes: usize;
+  pub uploadFrames: u64;            // frames that uploaded anything
+  pub sumMismatches: u64;           // snapshots found changed after publishing
+  pub lastFrameNs: u64;
+  pub longestGapNs: u64;            // between two frames
+  pub sameSince: u64;               // when the snapshot drawn last changed
+  pub sameStep: u64;
+  pub longestSameNs: u64;           // the longest time drawing without a new snapshot
+  pub framesDuringSame: u64;        // frames drawn in that time
+  pub framesNow: u64;
+
+  pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
+    RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), 0u64,
+      NO_PART, NO_PART, stalePose, 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+  }
+
+  // The newest snapshot: kept with the one before it
+  pub fn takeSnapshot(self: &mut, s: Published) {
+    older = None[Published];
+    older <-> newer;
+    newer = Some[Published](s);
+  }
+
+  pub fn takeContent(self: &mut, c: MeshContent) { arrivals.push(c); }
+
+  pub fn residentCount(self: &) usize { residents.len() }
+
+  // Steps 1 and 2
+  pub fn prepare(self: &mut) FramePlan {
+    let now = u64.from(Instant.now().nanos());
+    frame = frame + 1u64;
+    if lastFrameNs != 0u64 && now - lastFrameNs > longestGapNs { longestGapNs = now - lastFrameNs; }
+    lastFrameNs = now;
+    self.upload();
+    var plan = FramePlan(now, Vec3(0., 0., 0.), 0u64, LookIntent(0., 0.), 0u64);
+    self.blend(&mut plan);
+    if plan.step != sameStep || sameSince == 0u64 {
+      sameStep = plan.step;
+      sameSince = now;
+      framesNow = 0u64;
+    } else {
+      framesNow = framesNow + 1u64;
+      if now - sameSince > longestSameNs { longestSameNs = now - sameSince; framesDuringSame = framesNow; }
+    }
+    if stalePose {
+      plan.earlyLook = looks.newest();
+      plan.earlySeq = looks.seq();
+    }
+    plan
+  }
+
+  // Steps 3 to 5: the head pose read last, the picture, the frame as drawn
+  pub fn finish(self: &mut, plan: &FramePlan) DrawnFrame {
+    var look = self.readHeadPose();
+    var seq = looks.seq();
+    if stalePose { look = plan.earlyLook; seq = plan.earlySeq; }
+    let eye = plan.feet + Vec3(0., EYE_HEIGHT, 0.);
+    self.draw(eye, look, "");
+    let d = DrawnFrame(frame, plan.nowNs, plan.step, eye, look.yaw, look.pitch, seq);
+    drawnOut.put(&d);
+    d
+  }
+
+  // THE HEAD POSE, read in this one function only, last before drawing. On
+  // the desktop it is Player's mouse look; in the headset it would be
+  // OpenXR's pose at the predicted display time (who reads the device is
+  // still open, B4).
+  fn readHeadPose(self: &mut) LookIntent {
+    looks.newest()
+  }
+
+  // Step 1: what the Loader moved, under the budget (at least one item a
+  // frame, so a large one is never starved). Each is uploaded, then dropped
+  fn upload(self: &mut) {
+    var spent = 0usize;
+    var taken = 0usize;
+    while taken < arrivals.len() && (taken == 0usize || spent + arrivals[taken].bytes <= UPLOAD_BUDGET_BYTES) {
+      spent = spent + arrivals[taken].bytes;
+      taken = taken + 1usize;
+    }
+    if taken == 0usize { return; }
+    each c in arrivals.drain(0usize, taken) {
+      match &mut gfx {
+        case var &mut Some(g) {
+          let m = g.renderer.addMesh(&mut g.device, &c.mesh);
+          let mat = g.renderer.addMaterial(&mut g.device, &c.material);
+          residents.push(Resident(c.key, m, mat));
+        }
+        else { residents.push(Resident(c.key, MeshHandle.none(), MaterialHandle.none())); }
+      }
+    }
+    uploadedBytes = uploadedBytes + spent;
+    uploadFrames = uploadFrames + 1u64;
+  }
+
+  // Step 2: the person between the two newest snapshots, at the display
+  // time less a step; and each snapshot checked against its sum
+  fn blend(self: &mut, plan: &mut FramePlan) {
+    let target = plan.nowNs - STEP_NS;
+    match &newer {
+      case let Some(b) {
+        plan.step = b.step;
+        plan.feet = b.person.feet;
+        if snapshotSum(&**b) != b.sum { sumMismatches = sumMismatches + 1u64; }
+        match &older {
+          case let Some(a) {
+            if snapshotSum(&**a) != a.sum { sumMismatches = sumMismatches + 1u64; }
+            if b.atNs > a.atNs {
+              var alpha: f32 = 1.;
+              if target <= a.atNs { alpha = 0.; }
+              else if target < b.atNs { alpha = f32.from(target - a.atNs) / f32.from(b.atNs - a.atNs); }
+              plan.feet = a.person.feet + (b.person.feet - a.person.feet) * alpha;
+            }
+          }
+          case is None[Published] {}
+        }
+      }
+      case is None[Published] {}
+    }
+  }
+
+  // Step 4: the newer snapshot's resident parts, from 'eye' looking along
+  // 'look'; to the window, or off screen and saved to 'shot' when named
+  fn draw(self: &mut, eye: Vec3, look: LookIntent, shot: &str) {
+    var g: Option[Gfx] = None;
+    g <-> gfx;
+    match &mut g {
+      case var &mut Some(some) { self.drawWith(some, eye, look, shot); }
+      else {}
+    }
+    g <-> gfx;
+  }
+
+  fn drawWith(self: &mut, g: &mut Gfx, eye: Vec3, look: LookIntent, shot: &str) {
+    var camera = Camera.make();
+    camera.fov = radians(60.);
+    camera.near = 0.1;
+    camera.far = 500.;
+    camera.background = Color(0.5, 0.7, 0.9, 1.);
+    let ahead = Vec3(0. - sin(look.yaw) * cos(look.pitch), sin(look.pitch), 0. - cos(look.yaw) * cos(look.pitch));
+    camera.lookAt(eye, eye + ahead, Vec3(0., 1., 0.));
+    g.list.clear();
+    match &newer {
+      case let Some(s) {
+        each p in &s.parts {
+          each r in &residents {
+            if r.key == p.key { g.list.add(r.mesh, r.material, p.placement); }
+          }
+        }
+      }
+      case is None[Published] {}
+    }
+    var w = g.width;
+    var h = g.height;
+    match &mut g.swapchain {
+      case var &mut Some(sc) {
+        let target = sc.getCurrentTexture(&mut g.device);
+        if !target.ok() { return; }
+        w = target.texture.width;
+        h = target.texture.height;
+        g.post.resize(&mut g.device, w, h);
+        var encoder = g.device.createCommandEncoder();
+        g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &target.depth, &camera, &g.light, &g.list);
+        g.post.apply(&mut encoder, &target.texture);
+        _ = g.device.queue.submit(encoder.finish());
+        _ = sc.present(&mut g.device);
+        return;
+      }
+      else {}
+    }
+    // Off screen: drawn only when a shot is asked for
+    if shot.len() == 0usize { return; }
+    match &g.color {
+      case let Some(color) {
+        match &g.depth {
+          case let Some(depth) {
+            var encoder = g.device.createCommandEncoder();
+            g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, depth, &camera, &g.light, &g.list);
+            g.post.apply(&mut encoder, color);
+            var readback = g.device.createBuffer(u64.from(w) * u64.from(h) * 4u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
+            encoder.copyTextureToBuffer(color, &readback);
+            _ = g.device.queue.submit(encoder.finish());
+            g.device.waitIdle();
+            let picture = Image.fromTexels(readback.mappedBytes(), i32.from(w), i32.from(h), false);
+            let written = picture.save(&Path.from(shot));
+            print <- "render: "; print <- u64.from(g.list.len()); print <- " parts drawn to "; printStr(shot);
+            if written { print <- "\n"; } else { print <- " (NOT written)\n"; }
+          }
+          case is None[Texture] {}
+        }
+      }
+      case is None[Texture] {}
+    }
+  }
+
+  // --shot: one frame off screen, from where the person stands
+  pub fn shoot(self: &mut, file: &str) {
+    let plan = self.prepare();
+    let look = self.readHeadPose();
+    self.draw(plan.feet + Vec3(0., EYE_HEIGHT, 0.), look, file);
+  }
+
+  pub fn printStats(self: &) {
+    print <- "render: "; print <- frame; print <- " frames; longest gap between frames "; printF(msOf(longestGapNs));
+    print <- " ms; longest drawing with no new snapshot "; printF(msOf(longestSameNs)); print <- " ms ("; print <- framesDuringSame;
+    print <- " frames); "; print <- u64.from(residents.len()); print <- " keys resident, "; print <- u64.from(uploadedBytes);
+    print <- " bytes uploaded over "; print <- uploadFrames; print <- " frames; snapshots changed after publishing: ";
+    print <- sumMismatches; print <- "\n";
+  }
+}
+
+fn msOf(ns: u64) f32 { f32.from(ns) / 1000000. }
+
+// The GPU for a window ('window': its SDL handle as a number, since a raw
+// pointer is not Sendable), or off screen at 'w' x 'h' when 'window' is 0
+fn makeGfx(window: usize, w: u32, h: u32) Option[Gfx] {
+  var instance = Instance.create("pegasus");
+  if !instance.isValid() { print <- "render: no Vulkan 1.3 instance\n"; return None[Gfx]; }
+  var surface = Surface.none();
+  if window != 0usize { surface = instance.createSurface(window as *u8 as *sdl.Window); }
+  var adapter = instance.requestAdapter(&surface, POWER_PREFERENCE_HIGH_PERFORMANCE);
+  if !adapter.isValid() { print <- "render: no GPU\n"; return None[Gfx]; }
+  var device = adapter.requestDevice();
+  var swapchain = None[SwapChain];
+  var color = None[Texture];
+  var depth = None[Texture];
+  var outFormat = TEXTURE_FORMAT_RGBA8_UNORM;
+  if window != 0usize {
+    let sc = device.createSwapChain(&surface, w, h, TEXTURE_FORMAT_DEPTH32_FLOAT);
+    outFormat = sc.format;
+    swapchain = Some[SwapChain](sc);
+  } else {
+    let cd = TextureDescriptor(w, h, TEXTURE_FORMAT_RGBA8_UNORM, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+    color = Some[Texture](device.createTexture(&cd));
+    let dd = TextureDescriptor(w, h, TEXTURE_FORMAT_DEPTH32_FLOAT, TEXTURE_USAGE_RENDER_ATTACHMENT);
+    depth = Some[Texture](device.createTexture(&dd));
+  }
+  var renderer = Renderer.create(&mut device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  var post = Post.create(&mut device, outFormat, w, h);
+  if !renderer.isValid() || !post.isValid() { print <- "render: the renderer could not be made\n"; return None[Gfx]; }
+  // The world's sky, fixed for now (the mock world names none)
+  let sky = Sky.dusk(radians(35.), radians(40.));
+  renderer.setSky(&mut device, &sky);
+  let light = sky.sunLight(Color(2.2, 2.0, 1.8, 1.), Color(0.25, 0.27, 0.32, 1.));
+  Some[Gfx](Gfx(DrawList(), renderer, post, swapchain, color, depth, w, h, light, device, adapter, surface, instance))
+}
+
+actor Render {
+  core: RenderCore;
+  running: bool;
+  headless: bool;                   // no window: paced by a timer
+  shot: String;                     // --shot FILE: one frame off screen, once its content is resident
+  wantKeys: usize;                  // how many keys a shot waits for
+  stopped: Sender[bool];            // told, once the loop has ended, whether Render's checks passed (the shell then lets the window go)
+  finished: Sender[i32];            // a shot's verdict
+  stallMs: u64;                     // the stall check: Sim is busy this long once (0: no stall)
+
+  fn init(self: &new, window: usize, w: u32, h: u32, gpu: bool, looks: StateReader[LookIntent],
+      drawnOut: StateWriter[DrawnFrame], shot: String, wantKeys: usize, stopped: Sender[bool], finished: Sender[i32],
+      stallMs: u64, stalePose: bool) {
+    var core = RenderCore.make(looks, drawnOut, stalePose);
+    if gpu { core.gfx = makeGfx(window, w, h); }
+    *self = Self(core, false, window == 0usize, shot, wantKeys, stopped, finished, stallMs);
+  }
+
+  // Render's checks at the end of a run: no snapshot changed after it was
+  // published, and, when Sim stalled, Render went on drawing at its own rate
+  fn checks(self: &) bool {
+    var ok = true;
+    print <- "check snapshots unchanged after publishing: "; print <- core.sumMismatches; print <- " changed";
+    if core.sumMismatches == 0u64 { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+    if stallMs > 0u64 {
+      let gapMs = msOf(core.longestGapNs);
+      let sameMs = msOf(core.longestSameNs);
+      print <- "check render never waited on sim: Sim stalled "; print <- stallMs; print <- " ms; Render drew ";
+      print <- core.framesDuringSame; print <- " frames with no new snapshot over "; printF(sameMs);
+      print <- " ms, its longest gap "; printF(gapMs); print <- " ms";
+      let good = sameMs > f32.from(stallMs) * 0.8 && gapMs < 50. && core.framesDuringSame > stallMs * HEADLESS_HZ / 2000u64;
+      if good { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+    }
+    ok
+  }
+
+  // Sim -> Render (latest): the newest snapshot, kept with the one before
+  pub async fn snapshot(self, s: Published) { core.takeSnapshot(s); }
+
+  // Loader -> Render (bulk move): a key's look, uploaded under the budget
+  pub async fn content(self, c: MeshContent) { core.takeContent(c); }
+
+  // Player -> Render (event): the person inhabits 'avatar', seen from 'camera'
+  pub async fn inhabit(self, avatar: PartId, camera: PartId) {
+    core.avatar = avatar;
+    core.camera = camera;
+  }
+
+  pub async fn stop(self) { running = false; }
+
+  // The frame loop. With a window the present waits for the display; the
+  // short sleep after it only lets the other messages in. Headless, a timer
+  // at HEADLESS_HZ stands in for the display.
+  pub async fn run(self) {
+    running = true;
+    let period = i64.from(1000000000u64 / HEADLESS_HZ);
+    var next = Instant.now().nanos() + period;
+    while running {
+      if headless {
+        _ = await aio.sleepUntil(Instant.fromNanos(next));
+        next = next + period;
+        if Instant.now().nanos() > next { next = Instant.now().nanos() + period; }
+      } else {
+        _ = await aio.sleep(Duration.fromMicros(100i64));
+      }
+      if !running { break; }
+      if shot.len() > 0usize {
+        let plan = core.prepare();
+        if core.residentCount() >= wantKeys && plan.step > 10u64 {
+          core.shoot(shot.view());
+          var f = finished.clone();
+          f <- 0;
+          shot = String();
+        }
+      } else {
+        let plan = core.prepare();
+        _ = core.finish(&plan);
+      }
+    }
+    core.printStats();
+    let ok = self.checks();
+    var s = stopped.clone();
+    s <- ok;
+  }
+}

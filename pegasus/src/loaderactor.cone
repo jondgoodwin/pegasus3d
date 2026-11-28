@@ -1,0 +1,97 @@
+// The Loader, a MOCK until plan step 4's real one replaces it. It answers
+// "open world W for Sim S" with one fixed world image (a ground plane and a
+// few boxes; the sky is Render's fixed default), and "build K" with a mesh
+// moved to Render and the pick and collision shapes moved to Sim. The real
+// Loader's catalog, content keys, two-phase arrival, workers and cache plug
+// in behind the same behaviours (messages.cone, rows 3, 4 and 6).
+
+pub const KEY_GROUND = 1u64;
+pub const KEY_BOX_SMALL = 2u64;
+pub const KEY_BOX_TALL = 3u64;
+pub const KEY_BOX_ROUND = 4u64;      // a box rounded by sculpt's subdivision
+pub const MOCK_KEYS = 4usize;
+
+const GROUND_HALF: f32 = 40.;
+
+actor Loader {
+  render: Render;
+  sim: Option[Sim];
+  built: u64;
+  unusedSeen: u64;
+
+  fn init(self: &new, render: Render) {
+    *self = Self(render, None[Sim], 0u64, 0u64);
+  }
+
+  // Player -> Loader (event): open world 'world' for 'sim', which Player has
+  // started. The world image and its Sim units are moved to that Sim
+  pub async fn openWorld(self, world: String, sim: Sim) {
+    sim.world(mockWorld(world));
+    self.sim = Some[Sim](sim);
+  }
+
+  // Sim -> Loader (event): build content 'req.key' for part 'req.part'. The
+  // mock builds at once, in the order asked, whatever the nearness
+  pub async fn build(self, req: ContentRequest) {
+    var half = Vec3(0.5, 0.5, 0.5);
+    var mesh = Mesh.cube(0.5);
+    var colour = Color(0.8, 0.3, 0.2, 1.);
+    if req.key == KEY_GROUND {
+      mesh = groundMesh();
+      half = Vec3(GROUND_HALF, 0.01, GROUND_HALF);
+      colour = Color(0.35, 0.55, 0.25, 1.);
+    } else if req.key == KEY_BOX_TALL {
+      mesh = boxMesh(Vec3(0.5, 1.5, 0.5));
+      half = Vec3(0.5, 1.5, 0.5);
+      colour = Color(0.25, 0.35, 0.8, 1.);
+    } else if req.key == KEY_BOX_ROUND {
+      let cube = PolyMesh.cube(0.7);
+      let lods = subdivisionLevels(&cube, 2u32);
+      mesh = lods[2usize].triangulate(true);
+      half = Vec3(0.7, 0.7, 0.7);
+      colour = Color(0.85, 0.75, 0.3, 1.);
+    }
+    let bytes = mesh.vertexCount() * 32usize + mesh.triangleCount() * 12usize;
+    render.content(MeshContent(req.key, mesh, Material.plain(colour), bytes));
+    match &sim {
+      case let Some(s) { s.shapes(ContentShapes(req.key, BoxShape(half), BoxShape(half))); }
+      case is None[Sim] {}
+    }
+    built = built + 1u64;
+  }
+
+  // Sim -> Loader (event): part 'part' no longer uses 'key'. The mock keeps nothing to drop
+  pub async fn unused(self, key: ContentKey, part: PartId) {
+    unusedSeen = unusedSeen + 1u64;
+  }
+
+  pub async fn stop(self) {
+    self.sim = None[Sim];
+  }
+}
+
+// The fixed world: a ground plane, three boxes ahead of the person
+fn mockWorld(name: String) WorldImage {
+  var parts = PartDecls();
+  parts.push(PartDecl(String.from("ground"), KEY_GROUND, Mat4.identity()));
+  parts.push(PartDecl(String.from("box-a"), KEY_BOX_SMALL, Mat4.fromTranslation(Vec3(0., 0.5, -8.))));
+  parts.push(PartDecl(String.from("box-b"), KEY_BOX_TALL, Mat4.fromTranslation(Vec3(-3., 1.5, -10.))));
+  parts.push(PartDecl(String.from("box-c"), KEY_BOX_ROUND, Mat4.fromTranslation(Vec3(3., 0.7, -9.))));
+  var units = SimUnits();
+  units.push(String.from("mock.zone"));
+  WorldImage(name, parts, units, Vec3(0., 0., 0.))
+}
+
+// The ground: render's unit plane, scaled to GROUND_HALF each way
+fn groundMesh() Mesh {
+  var m = Mesh.plane(16, 16.);
+  each p in m.positions.mutItems() { p.x = p.x * GROUND_HALF; p.z = p.z * GROUND_HALF; }
+  m
+}
+
+// A box of half sizes 'half', centred on its origin
+fn boxMesh(half: Vec3) Mesh {
+  var m = Mesh.cube(1.);
+  each p in m.positions.mutItems() { p.x = p.x * half.x; p.y = p.y * half.y; p.z = p.z * half.z; }
+  m
+}

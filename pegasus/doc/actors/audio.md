@@ -35,6 +35,7 @@ Not settled (see Open).
 
 ## What exists today
 
+- **Pegasus skeleton, `pegasus/src/audioactor.cone` (W110, 28 Nov).** A mock `Audio` actor: it takes each snapshot from Sim and counts it, nothing more.
 - **Island, `browser/src/audioview.cone`.** Audio is not an actor: `AudioView` lives in the view actor's state, and `audioFrame` runs once per frame from `publishSnapshot`. `[differs: the design has Audio as its own actor]`.
 - **Island, sources of sound.** Sound is derived from the view's own state each frame, and the one world-driven sound is the balloon's burner, recognised by the part's name. The listener is the view's eyes, or the headset's head in the headset.
 - **Island, the mixer.** Commands go into a lock-free single-producer ring consumed by the feeder thread of the device package. Automated runs mix in-thread to a null device, with a fixed 48000/60 samples per step so runs repeat. A server has no audio. The sounds are recipes, not files.
