@@ -53,6 +53,11 @@ try {
     if (-not $okWarm) { $warm -split "`n" | Where-Object { $_ -match 'arrival: \d+ files|mesh cache:|fetch:' } | ForEach-Object { Write-Output "   $_" } }
   }
 
+  # --world takes the address on its own (no local copy named for a key count): the run exits ok
+  Remove-Item -Recurse -Force $cache -ErrorAction SilentlyContinue
+  $null = & $exe --world "$base/split/first.world" --steps 300 2>&1
+  Check '--world with an https address and nothing else: exit 0' ($LASTEXITCODE -eq 0)
+
   # 2
   foreach ($case in @(@('another certificate than the trusted one', (Join-Path $certs 'other.pem')), @('no trust switch (the system roots)', ''))) {
     foreach ($w in @('first.ddd', 'split/first.world')) {
