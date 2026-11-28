@@ -1,0 +1,103 @@
+// Pegasus's shared core: the part of the program a browser and a server both run, so the world's rules stay one program.
+// Sim (the zone's simulation, in the whole, client and server roles), the Loader (the catalog, the content keys and the
+// worker pool; a server's builds only what Sim needs), connected play (netplay, partsync), the world's image and its fetch,
+// the messages between the actors, and the driven checks of those. It holds no window, GPU, SDL, Render, Player or Audio:
+// `pegasus` (the browser) and `pegasusserver` (`pegasus-server`) each add their own actors and a shell.
+//
+// Sim and the Loader send to a display and a sound by the actor traits below, not by the browser's actors: Render and
+// Audio meet them by their behaviours (an actor conforms by having them), and a server's stand-in does too.
+
+mod pegasuscore;
+
+import stdio use *;
+import libc;
+import collections use *;
+import geomath use *;
+import mesh use Mesh, PolyMesh, Group;
+import sculpt use subdivisionLevels;
+import path use Path;
+import actors;
+import aio use File, IoLimits;
+import actorhttp use HttpClient;
+import iobuf use IoBuf, Bytes;
+import iocore use Access, SocketAddr;
+import netmsg use NetEvent, EventHandler, Connection, Endpoint, NetConfig, LinkConfig, LossyRelay, eventHandler, mustListen, mustConnect, startLossyRelay;
+import fs;
+import process;
+import conescript use Understood, Val, Kind, Problem, Names, read, showProblems, numOf, OPT_AT, OPT_ROTATION, OPT_MATERIAL,
+  Code, CodeWriter, CodeProblem, VerifiedCode, ImportTables, HandleTable, HANDLE_HOST, Interpreter, verify, verifyEach, lowerSim, entryUnit,
+  ENTRY_DERIVE, ENTRY_HANDLER, ENTRY_MOVE_FLAG, NS_HOST, HOST_FIELD, HOST_OCCUPIED, HOST_SET_FIELD, HOST_START_ANIM, HOST_GLIDE,
+  fieldSignature, occupiedSignature, setFieldSignature, startAnimSignature, glideSignature, P_FIELD, OP_IMPORT, OP_UNREACHABLE,
+  KeysInfo, P_ROTATION, P_OFFSET, P_TINT;
+import tweenstack use Anim, Animators;
+import keyframetracks use Track, Clip, TK_QUAT, TK_VEC3, INTERP_LINEAR;
+import analyticdaylight use PreethamSky;
+import partbuild use srgbToLinear, vocabulary, PartProducts, PartBuilder, toolImports, plainProducts, MaterialRec, LIGHT_SUN;
+import sync use Arc, Channel, Sender, Receiver, LatestWriter, LatestReader, latestCell, CellRead;
+import time use Instant, Duration;
+
+// What Sim and the Loader send to the display: the browser's Render, or nothing at all on a server
+pub actor trait RenderSink {
+  pub async fn snapshot(self, s: Published);
+  pub async fn content(self, c: MeshContent);
+  pub async fn material(self, c: MaterialContent);
+  pub async fn release(self, key: ContentKey);
+  pub async fn partsAwaited(self, n: usize);
+  pub async fn stop(self);
+}
+
+// What Sim sends to the sound: the browser's Audio (a mock), or nothing on a server
+pub actor trait AudioSink {
+  pub async fn snapshot(self, s: Published);
+  pub async fn stop(self);
+}
+
+// The command line's words, as C strings (`argv`)
+pub fn argIs(a: *u8, b: &str) bool {
+  var i = 0usize;
+  while i < b.len() {
+    if *(a + i) != b[i] { return false; }
+    i = i + 1usize;
+  }
+  *(a + b.len()) == 0u8
+}
+
+pub fn argNumber(s: *u8) u64 {
+  var n = 0u64;
+  var i = 0usize;
+  while *(s + i) >= '0' && *(s + i) <= '9' {
+    n = n * 10u64 + u64.from(*(s + i) - '0');
+    i = i + 1usize;
+  }
+  n
+}
+
+pub fn argString(s: *u8) String {
+  var out = String();
+  var i = 0usize;
+  while *(s + i) != 0u8 {
+    out.appendByte(*(s + i));
+    i = i + 1usize;
+  }
+  out
+}
+
+// The mutant asked for in PEGASUS_MUTANT is 'name'
+pub fn mutantIs(name: &str) bool {
+  let e = libc.getenv("PEGASUS_MUTANT");
+  if (e as usize) == 0usize { return false; }
+  argIs(e, name)
+}
+
+// The driven checks of the shared code (connected play's reconciliation, stale snapshots and wire; the rules; picking; the
+// blend; the mesh cache; the world fetch), each with its mutant (PEGASUS_MUTANT). `pegasus --checks` and
+// `pegasus-server --checks` both run them
+pub fn checkShared() bool {
+  let netOk = checkConnected();
+  let rulesOk = checkRules(mutantIs("trapped-writes"));
+  let pickOk = checkPick(mutantIs("pick-ignores-turn"));
+  let blendOk = checkBlend(mutantIs("blend-lerp-matrix"));
+  let cacheOk = checkMeshCache(cacheLax());
+  let fetchOk = checkWorldFetch(mutantIs("manifest-skip-hash"));
+  netOk && rulesOk && pickOk && blendOk && cacheOk && fetchOk
+}

@@ -1,15 +1,19 @@
 # Two-client loopback tests (W117, W125): a server and headless clients, as processes. Build first (build.ps1); output goes to build\run-<scenario>. Usage: net-test.ps1 loop|loss|glide|glideloss|avatar|rejoin|refuse [world]
-param([string]$Scenario = "loop", [string]$World = "worlds\first.ddd", [string]$Tag = "", [string]$AfterSteps = "60")
+param([string]$Scenario = "loop", [string]$World = "worlds\first.ddd", [string]$Tag = "", [string]$AfterSteps = "60", [string]$ServerExe = "")
+# The server is pegasus-server (W149; ..\..\pegasusserver\build.ps1 builds it); -ServerExe names another (a pegasus.exe is run as `--serve`, the old way)
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pg = Split-Path -Parent $here
 $exe = Join-Path $pg "build\release\pegasus.exe"
+if ($ServerExe -eq "") { $ServerExe = Join-Path $pg "..\pegasusserver\build\release\pegasus-server.exe" }
+$oldServe = $ServerExe -like "*\pegasus.exe"
 $env:PATH = "$env:PATH;C:\libs\SDL3-3.4.16\lib\x64"
 $out = Join-Path $pg "build\run-$Scenario$Tag"
 New-Item -ItemType Directory -Force $out | Out-Null
 Remove-Item "$out\*" -Force -ErrorAction SilentlyContinue
 $procs = @()
 function Start-P($name, $argv) {
-  $p = Start-Process -FilePath $exe -ArgumentList $argv -WorkingDirectory $pg -RedirectStandardOutput "$out\$name.log" -RedirectStandardError "$out\$name.err" -PassThru -WindowStyle Hidden
+  $which = if ($name -eq "server") { $ServerExe } else { $exe }
+  $p = Start-Process -FilePath $which -ArgumentList $argv -WorkingDirectory $pg -RedirectStandardOutput "$out\$name.log" -RedirectStandardError "$out\$name.err" -PassThru -WindowStyle Hidden
   $script:procs += $p
   $p
 }
@@ -28,7 +32,7 @@ if ($Scenario -eq "lamp") {
   $World = "worlds\lamp.ddd"                                  # the scenario's own world, whatever the argument says (W145)
   $port = Get-Random -Minimum 47200 -Maximum 48900            # not the port another lane's server may hold
 }
-$srvArgs = @("--serve", "$port", "--loopback", "--world", $World)
+$srvArgs = @($(if ($oldServe) { "--serve" } else { "--port" }), "$port", "--loopback", "--world", $World)
 $target = "127.0.0.1:$port"
 switch ($Scenario) {
   "loop" { $srvArgs += @("--steps", "1800", "--until-empty") }
