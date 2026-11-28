@@ -113,7 +113,7 @@ if ($Scenario -eq "light") {
 if ($Scenario -eq "lamp") {
   $srvLamp = (Get-Content "$out\server.log" | Select-String -Pattern "^sim: light: .*?(\d+) lamps \(first ([\d.]+) cd\)").Matches | Select-Object -First 1
   $cd = $srvLamp.Groups[2].Value
-  Write-Host "LAMP-CHECK server: lamp $cd cd, $((Get-Content "$out\server.log" | Select-String -Pattern 'tint is now').Count) tint changes"
+  Write-Host "LAMP-CHECK server: lamp $cd cd, $((Get-Content "$out\server.log" | Select-String -Pattern 'tint set to').Count) tint changes"
   foreach ($n in "clientA", "clientB") {
     $r = (Get-Content "$out\$n.log" -ErrorAction SilentlyContinue | Select-String -Pattern "^render: light: .*?\(first ([\d.]+) cd\)").Matches | Select-Object -First 1
     $s = (Get-Content "$out\$n.log" -ErrorAction SilentlyContinue | Select-String -Pattern "^sim: light: .*?\(first ([\d.]+) cd\)").Matches | Select-Object -First 1
