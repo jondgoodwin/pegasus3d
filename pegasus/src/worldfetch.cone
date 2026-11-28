@@ -372,8 +372,18 @@ pub const READ_NONE = 0u32;         // nothing: a read is under way, every file 
 pub const READ_PREFIX = 1u32;       // read the files in from the start so far (`run` of them): their shape parts are declared early
 pub const READ_WHOLE = 2u32;        // every file is in: read the whole world, and only now start its rules and derives
 
+// A prefix read re-reads every file in so far, so reading after every file costs quadratically in the world's size (W146: 7 s of Reader
+// time on 1 MB in 152 files, ten times one whole read). A prefix read starts only when the run's text is at least PREFIX_GROWTH times the
+// last prefix read's, and at least PREFIX_MIN_STEP bytes longer (so the early parts of a small world are not too far apart); the first
+// read, on the first file, and the whole read when every file is in, are never held back. All prefix reads together then cost about
+// one more whole read.
+pub const PREFIX_GROWTH = 2usize;
+pub const PREFIX_MIN_STEP = 2048usize;
+
 pub struct FileArrival {
   have: List[bool];                 // file i is in (arrived and judged, or left out)
+  sizes: List[usize];               // the bytes of file i's text (0 until it arrives, and for a file left out)
+  readBytes: usize;                 // the bytes the latest prefix read covered
   got: usize;
   run: usize;                       // the files in from the start with none missing: a part's id is its place in the whole world's order, so
                                     // only a run from the first file can be declared
@@ -384,14 +394,17 @@ pub struct FileArrival {
 
   pub fn make(files: usize, early: bool) FileArrival {
     var have = List[bool]();
+    var sizes = List[usize]();
     var i = 0usize;
-    while i < files { have.push(false); i = i + 1usize; }
-    FileArrival(have, 0usize, 0usize, 0usize, false, false, early)
+    while i < files { have.push(false); sizes.push(0usize); i = i + 1usize; }
+    FileArrival(have, sizes, 0usize, 0usize, 0usize, 0usize, false, false, early)
   }
 
-  pub fn arrive(self: &mut, i: usize) {
+  // File i is in, its text 'bytes' long
+  pub fn arrive(self: &mut, i: usize, bytes: usize) {
     if i >= have.len() || *have[i] { return; }
     have.set(i, true);
+    sizes.set(i, bytes);
     got = got + 1usize;
     while run < have.len() && *have[run] { run = run + 1usize; }
   }
@@ -404,8 +417,21 @@ pub struct FileArrival {
   pub fn next(self: &mut) u32 {
     if reading || concluded { return READ_NONE; }
     if run == have.len() || (early && run > 0usize) { reading = true; return READ_WHOLE; }
-    if run > readFiles { reading = true; readFiles = run; return READ_PREFIX; }
+    if run > readFiles {
+      let bytes = self.runBytes();
+      let first = readFiles == 0usize;
+      let grown = bytes >= PREFIX_GROWTH * readBytes && bytes >= readBytes + PREFIX_MIN_STEP;
+      if first || grown { reading = true; readFiles = run; readBytes = bytes; return READ_PREFIX; }
+    }
     READ_NONE
+  }
+
+  // The bytes of the files in from the start with none missing
+  fn runBytes(self: &) usize {
+    var n = 0usize;
+    var i = 0usize;
+    while i < run { n = n + *sizes[i]; i = i + 1usize; }
+    n
   }
 
   pub fn readDone(self: &mut, whole: bool) {

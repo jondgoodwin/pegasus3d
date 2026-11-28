@@ -91,7 +91,7 @@ The rows listed under Design choices are decided; the others are proposed, and a
 | client Sim ↔ server Sim | actions, joins, creations, possession, world events | event | T (server side) |
 | server Sim → client Sim | on joining: declarations (ids, places, platforms, areas, content keys) | bulk | |
 | client Loader ↔ an origin's server | assets | bulk, on its own connection or a lower-priority stream | |
-| Sim (zone A) → Player → Sim (zone B) | crossing a portal: release the avatar, admit it with what identity Player allows (open: [Worlds and zones](../design/worlds-and-zones.md), the steps of the entering sequence) | event | T (`Entered` in B) |
+| Sim (zone A) → Player → Sim (zone B) | crossing a portal: prepare X at R; enter X at R; admit at R; admitted (avatar, camera); release in A (the order in [Worlds and zones](../design/worlds-and-zones.md), crossing a portal) | event | T (`Entered` in B, `Left` in A) |
 | Sim ↔ world's owner | (open: [Sim](sim.md)) | | |
 | Sim inside (between parts) | triggers: `Entered`, `Left`, `Rang`, `Dusk`, `Dawn`, a handler's message to another part | event | T |
 

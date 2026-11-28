@@ -24,6 +24,10 @@ function Wait-Line($file, $pattern, $secs) {
 function Wait-Exit($p, $secs) { if (-not $p.WaitForExit($secs * 1000)) { Write-Host "TIMEOUT: pid $($p.Id) did not exit in $secs s"; Stop-Process -Id $p.Id -Force } }
 
 $port = 47117
+if ($Scenario -eq "lamp") {
+  $World = "worlds\lamp.ddd"                                  # the scenario's own world, whatever the argument says (W145)
+  $port = Get-Random -Minimum 47200 -Maximum 48900            # not the port another lane's server may hold
+}
 $srvArgs = @("--serve", "$port", "--loopback", "--world", $World)
 $target = "127.0.0.1:$port"
 switch ($Scenario) {
@@ -31,6 +35,7 @@ switch ($Scenario) {
   "loss" { $srvArgs += @("--steps", "1800", "--until-empty", "--impair", "50", "20", "10") }
   "glide" { $srvArgs += @("--steps", "1800", "--until-empty") }
   "light" { $srvArgs += @("--steps", "1800", "--until-empty"); $env:PEGASUS_LIGHT_CHANGE = "400:sun:25000" }
+  "lamp" { $srvArgs += @("--steps", "480") }       # W145: lamp.ddd; A walks into the lantern's area (B stands away); the server ends while A is still there
   "avatar" { $srvArgs += @("--steps", "1800", "--until-empty") }
   "glideloss" { $srvArgs += @("--steps", "1800", "--until-empty", "--impair", "50", "20", "10") }
   "rejoin" { $srvArgs += @("--steps", "900") }
@@ -63,6 +68,11 @@ if ($Scenario -eq "glide" -or $Scenario -eq "glideloss") {
   $b = Start-P "clientB" ($cl + @("--steps", "520", "--stand"))
   Start-Sleep -Milliseconds 1500
   $a = Start-P "clientA" ($cl + @("--steps", "420"))
+  Wait-Exit $a 60; Wait-Exit $b 60; Wait-Exit $srv 60
+} elseif ($Scenario -eq "lamp") {
+  $b = Start-P "clientB" ($cl + @("--steps", "420", "--stand"))
+  Start-Sleep -Milliseconds 1000
+  $a = Start-P "clientA" ($cl + @("--steps", "520"))
   Wait-Exit $a 60; Wait-Exit $b 60; Wait-Exit $srv 60
 } elseif ($Scenario -eq "rejoin") {
   $a1 = Start-P "clientA1" ($cl + @("--steps", "200"))
@@ -100,5 +110,19 @@ if ($Scenario -eq "light") {
     $rlux = [regex]::Match($r.Groups[1].Value, "lux ([\d.]+)").Groups[1].Value
     $slux = [regex]::Match($s.Groups[1].Value, "lux ([\d.]+)").Groups[1].Value
     Write-Host "LIGHT-CHECK $n render: $($r.Groups[1].Value) | sim: $($s.Groups[1].Value): $(if (($lux -eq $rlux) -and ($lux -eq $slux)) { 'MATCH' } else { 'DIFFER' })"
+  }
+}
+# lamp scenario (W145): the world's rule (lamp.ddd's derive of the glass's tint, run on the server) lights the lamp when client A is near;
+# the server, client A and client B must each end with the same lamp light in Sim and in Render
+if ($Scenario -eq "lamp") {
+  $srvLamp = (Get-Content "$out\server.log" | Select-String -Pattern "^sim: light: .*?(\d+) lamps \(first ([\d.]+) cd\)").Matches | Select-Object -First 1
+  $cd = $srvLamp.Groups[2].Value
+  Write-Host "LAMP-CHECK server: lamp $cd cd, $((Get-Content "$out\server.log" | Select-String -Pattern 'tint set to').Count) tint changes"
+  foreach ($n in "clientA", "clientB") {
+    $r = (Get-Content "$out\$n.log" -ErrorAction SilentlyContinue | Select-String -Pattern "^render: light: .*?\(first ([\d.]+) cd\)").Matches | Select-Object -First 1
+    $s = (Get-Content "$out\$n.log" -ErrorAction SilentlyContinue | Select-String -Pattern "^sim: light: .*?\(first ([\d.]+) cd\)").Matches | Select-Object -First 1
+    $ch = [regex]::Match((Get-Content "$out\$n.log" | Select-String -Pattern "^sim: light: .* (\d+) look changes").Line, "(\d+) look changes").Groups[1].Value
+    $sch = [regex]::Match((Get-Content "$out\server.log" | Select-String -Pattern "^sim: light: .* (\d+) look changes").Line, "(\d+) look changes").Groups[1].Value
+    Write-Host "LAMP-CHECK $n render $($r.Groups[1].Value) cd | sim $($s.Groups[1].Value) cd, $ch look changes (server $sch): $(if (($cd -eq $r.Groups[1].Value) -and ($cd -eq $s.Groups[1].Value) -and ($ch -eq $sch) -and ([int]$ch -ge 2)) { 'MATCH' } else { 'DIFFER' })"
   }
 }
