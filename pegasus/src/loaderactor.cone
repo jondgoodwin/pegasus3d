@@ -19,14 +19,24 @@
 // timer or the display, find a free pool thread. A real low-priority class
 // waits for the runtime.
 //
-// NOT YET: the disk cache, the network fetch, the server-side Loader, the
+// THE CACHE (meshcache.cone). A real world's mesh and material keys are looked up on disk by the Worker first; what is built
+// is written by this Loader, its only writer, when the job lands.
+//
+// NOT YET: the network fetch, the server-side Loader, the
 // reader and the interpreter.
 
 pub const MOCK_KEYS = 8usize;       // keys resident once the small mock world has arrived: four meshes and four materials
 pub const MOCK_KEYS_40 = 9usize;    // the 40-part world's five meshes and five materials, less the mesh it lets go
 const READ_CHUNK = 65536usize;     // a world file is read this much at a time
 const WORKERS = 3usize;            // jobs in flight at once
-const SETTLE_US = 1000i64;          // the burst of requests that follows a world image is gathered for this long
+const CACHE_EVICT_EVERY = 32u64;   // the mesh cache is trimmed to its cap after this many writes (and at stop)
+const SETTLE_US = 1000i64;         // the burst of requests that follows a world image is gathered for this long
+
+// What a worker's job came back with: the products, and what the cache said (0: the cache was not asked: mock content, or off)
+pub struct Built {
+  pub products: PartProducts;
+  pub outcome: u32;                 // 0, LOAD_HIT, LOAD_MISS, LOAD_CORRUPT or LOAD_OLD
+}
 
 actor Worker {
   // The world's builder: its code lowered and verified, its material parts made. Each worker makes its own (a
@@ -34,14 +44,17 @@ actor Worker {
   builder: Option[PartBuilder];
   leaf: List[String];               // each part's own name, by slot (for the mesh hash lines)
   hashes: bool;                     // PEGASUS_MESH_HASHES is set
+  cacheDir: Path;                   // the mesh cache's folder, read from only (empty: no cache)
+  skipSum: bool;                    // the mutant that reads cache entries without checking their checksum
 
   fn init(self: &new) {
     let e = libc.getenv("PEGASUS_MESH_HASHES");
-    *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize);
+    *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize, Path.from(""), mutantIs("cache-skip-checksum"));
   }
 
   // Loader -> Worker: the world's text. 'index' is this worker's number: the first one reports a refusal, for all
-  pub async fn open(self, index: usize, file: String, text: String) {
+  pub async fn open(self, index: usize, file: String, text: String, cacheDir: String) {
+    self.cacheDir = Path.from(cacheDir.view());
     var names = Names.standard();
     let vocab = vocabulary(&mut names);
     let reading = read(text.view(), names, vocab);
@@ -86,35 +99,52 @@ actor Worker {
 
   // Loader -> Worker: build 'job'. Pure, so the worker that runs it never changes the bits. A real world's part
   // (shape "cs.") is made by the interpreter from its slot; the mock worlds' content by `buildContent`
-  pub async fn build(self, job: BuildJob) PartProducts {
+  pub async fn build(self, job: BuildJob) Built {
     if job.recipe.shape.view() == MATERIAL_SHAPE {
-      // a material key: the world's material, run alone from its slot (no mesh is built)
+      // a material key: the world's material, run alone from its slot (no mesh is built). The cache is asked first
+      var cached = plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
+      var outcome = 0u32;
+      if !cacheDir.isEmpty() {
+        outcome = loadEntry(&cacheDir, job.key, CACHE_MATERIAL, skipSum, &mut cached);
+        if outcome == LOAD_HIT { return Built(cached, outcome); }
+      }
       match &mut builder {
         case var &mut Some(b) {
           var p = b.buildMaterial(usize.from(job.recipe.slot));
           each note in &p.notes { print <- "build: material of part "; print <- job.recipe.slot; print <- " left grey: "; printStr(note.view()); print <- "\n"; }
-          return p;
+          return Built(p, outcome);
         }
         else {}
       }
-      return plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
+      return Built(plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.)), 0u32);
     }
-    if job.recipe.shape.view() == MOCK_MATERIAL_SHAPE { return buildMockMaterial(&job); }
+    if job.recipe.shape.view() == MOCK_MATERIAL_SHAPE { return Built(buildMockMaterial(&job), 0u32); }
     if job.recipe.shape.view().startsWith("cs.") {
+      var outcome = 0u32;
+      var cached = plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
+      if !cacheDir.isEmpty() {
+        outcome = loadEntry(&cacheDir, job.key, CACHE_MESH, skipSum, &mut cached);
+        if outcome == LOAD_HIT {
+          if hashes {
+            printStr(meshHashLine(leaf[usize.from(job.recipe.slot)].view(), meshHash(&cached.mesh)).view());
+          }
+          return Built(cached, outcome);
+        }
+      }
       match &mut builder {
         case var &mut Some(b) {
           var p = b.buildPart(usize.from(job.recipe.slot), Kind.Shape);
           each note in &p.notes { print <- "build: part "; print <- job.recipe.slot; print <- " left out: "; printStr(note.view()); print <- "\n"; }
           if hashes && p.made {
-            print <- "meshhash "; printStr(leaf[usize.from(job.recipe.slot)].view()); print <- " "; print <- meshHash(&p.mesh); print <- "\n";
+            printStr(meshHashLine(leaf[usize.from(job.recipe.slot)].view(), meshHash(&p.mesh)).view());
           }
-          return p;
+          return Built(p, outcome);
         }
         else {}
       }
-      return plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
+      return Built(plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.)), 0u32);
     }
-    buildContent(&job)
+    Built(buildContent(&job), 0u32)
   }
 }
 
@@ -130,6 +160,12 @@ actor Loader {
   retire: bool;                     // a check: once all are built, let go of the first key's parts
   retired: bool;
   simOnly: bool;                    // a server's Loader: builds what Sim needs (the shapes) and sends Render nothing
+  cache: MeshCache;                 // built content kept on disk across runs (meshcache.cone); this Loader is its only writer
+  hits: u64;                        // keys the cache gave
+  built: u64;                       // keys the cache was asked for and did not have (or had damaged), so were built
+  damaged: u64;                     // of those, entries that were damaged or unreadable
+  opened: Instant;                  // when the world was opened
+  arrived: bool;                    // the line saying every key landed has been printed
 
   fn init(self: &new, render: Render, report: Sender[bool], expectBuilds: u64, retire: bool, offByOne: bool, simOnly: bool) {
     var ws = List[Worker]();
@@ -143,13 +179,15 @@ actor Loader {
     var catalog = LoaderCore.make(offByOne);
     catalog.learn(browserAvatarKey(), browserAvatarRecipe());   // the browser's own avatar needs nothing from a world
     catalog.learn(browserAvatarMaterialKey(), browserAvatarMaterialRecipe());
-    *self = Self(render, None[Sim], catalog, ws, b, false, report, expectBuilds, retire, false, simOnly);
+    *self = Self(render, None[Sim], catalog, ws, b, false, report, expectBuilds, retire, false, simOnly,
+      MeshCache.make(Path.from(cacheFolder().view()), CACHE_CAP_BYTES), 0u64, 0u64, 0u64, Instant.now(), false);
   }
 
   // Player -> Loader (event): open world 'world' for 'sim', which Player has
   // started. Phase 1: the world image is moved to that Sim; its parts name
   // their keys, and Sim then asks for each
   pub async fn openWorld(self, world: String, sim: Sim) {
+    self.opened = Instant.now();
     if world.view() == "mock" || world.view() == "parts40" {
       sim.world(mockWorld(world, &mut core));
     } else {
@@ -178,7 +216,7 @@ actor Loader {
       }
       var w = 0usize;
       while w < WORKERS {
-        workers[w].open(w, world.clone(), String.from(text.view()));
+        workers[w].open(w, world.clone(), String.from(text.view()), String.from(cache.dir.view()));
         w = w + 1usize;
       }
       sim.world(self.imageOfText(world.view(), text.view()));
@@ -254,12 +292,34 @@ actor Loader {
     let key = job.key;
     let isMaterial = isMaterialRecipe(&job.recipe);
     let worker = workers[w].clone();
-    let products = await worker.build(job);
-    self.landed(w, key, isMaterial, products);
+    var built = await worker.build(job);
+    var products = plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
+    products <-> built.products;
+    self.landed(w, key, isMaterial, built.outcome, products);
   }
 
-  fn landed(self: &mut, w: usize, key: ContentKey, isMaterial: bool, p: PartProducts) {
+  // The cache's side of a landed job: a hit is the newest entry; anything else the cache was asked about, that was built,
+  // is written (the Loader is the only writer), and the folder is kept under its cap
+  fn cached(self: &mut, key: ContentKey, isMaterial: bool, outcome: u32, p: &PartProducts) {
+    if outcome == 0u32 || !cache.on() { return; }
+    if outcome == LOAD_HIT {
+      hits = hits + 1u64;
+      cache.touch(key);
+      return;
+    }
+    built = built + 1u64;
+    if outcome == LOAD_CORRUPT {
+      damaged = damaged + 1u64;
+      print <- "loader: mesh cache entry "; printStr(cacheHex(key).view()); print <- " was damaged or unreadable: rebuilt\n";
+    }
+    if cache.store(key, if isMaterial { CACHE_MATERIAL } else { CACHE_MESH }, p) {
+      if cache.stored % CACHE_EVICT_EVERY == 0u64 { _ = cache.evict(); }
+    }
+  }
+
+  fn landed(self: &mut, w: usize, key: ContentKey, isMaterial: bool, outcome: u32, p: PartProducts) {
     busy.set(w, false);
+    self.cached(key, isMaterial, outcome, &p);
     if core.done(key) == DONE_DELIVER {
       if isMaterial {
         // a material key gives Render the material; Sim has no use for it
@@ -274,6 +334,13 @@ actor Loader {
       }
     }
     self.pump();
+    if !arrived && core.started == expectBuilds && core.inFlight() == 0usize && core.queued() == 0usize {
+      // every key the world makes has landed: how long it took from the world's opening, and what the cache did
+      arrived = true;
+      print <- "loader: all "; print <- core.started; print <- " keys landed "; print <- (Instant.now() - opened).micros() / 1000i64;
+      print <- " ms after the world was opened; mesh cache: "; print <- hits; print <- " hits, "; print <- built; print <- " built, ";
+      print <- damaged; print <- " damaged\n";
+    }
     if retire && !retired && core.started == expectBuilds && core.inFlight() == 0usize && core.queued() == 0usize {
       retired = true;
       self.letGoOfFirst();
@@ -295,7 +362,8 @@ actor Loader {
 
   pub async fn stop(self) {
     self.sim = None[Sim];
-    let ordered = core.startedNearestFirst();
+    _ = cache.evict();
+    let ordered =core.startedNearestFirst();
     var wantFreed = 0u64;
     if retire { wantFreed = 1u64; }
     let ok = core.started == expectBuilds && core.freed == wantFreed && ordered && core.unknown == 0u64;
