@@ -1,0 +1,134 @@
+# Sim
+
+`[planned]`
+
+Sim is everything that changes the parts of one zone: physics, triggered behaviours and their consequences, animation, and the world's own code, on one fixed-step clock. This note takes the position that a zone has one Sim, that Sim and the world's code are one block, and that Sim has a client version and a server version. What it exchanges with Render, Audio, the Loader and the server Sim is decided (see Design choices and connected play); its other handshakes, the world's owner and how it spreads its work are open. Nothing of this exists as one actor today: the island splits it across a simulation actor, a view actor and a world actor; the studio's world actor runs one step behind the loop.
+
+## The design
+
+### Design choices
+
+- **One Sim program, three roles.** A Sim runs as *whole* (local play: it holds the truth and runs every rule), *server* (it holds the truth of a shared zone and runs every rule but client-only ones), or *client* (it predicts what the person controls, interpolates everything else from the server, and runs only the rules that live on the client). One code path serves all three; a role chooses which parts of the step run. Local play is not a server and a client joined in-process. `[design choice]`
+- **The step's order is reactive:** admit (outside actions and samples stamped for this step, in a fixed order), move (animators, physics, riders carried by their platforms), sense (areas crossed, contacts, timers due), react (the queue of triggers; actions their handlers send join the back of the queue, to a depth limit), derive (subscriptions in dependency order), publish. A contact or a crossing is answered in the step that caused it, and the person's own movement is in "move", before any handler runs. A step is 60 a second. `[design choice]`
+- **A handler that overruns its budget is stopped and its changes dropped,** and the world is told (a report to the world and, in the editor, to the author). The rest of the step runs. This follows the author's principle that ConeScript is resilient. The interpreter counts work; compiled code checks at loops and calls when it exists. `[design choice]`
+- **The snapshot.** After each step Sim publishes the zone's parts as one snapshot that never changes after publishing: for each visible part its id, placement, the frame it stands in (its platform), look, and content keys. Render and Audio read the newest; Sim never waits for them. On a client, the snapshot is the merge described under connected play. `[design choice]`
+- **Render never waits for Sim.** It keeps the two newest snapshots and blends between them by the frame's display time, which costs at most one step of age on the world's things and nothing on the person's head. A bounded wait is kept as an optimisation to measure, not built first. `[design choice]`
+- **Sim owns collision, pick and navigation shapes.** The Loader builds each once and moves it to Sim; inside Sim they are read by physics, picking and navigation. `[design choice]`
+- **Sim allocates a part's id at once** when the part is declared or created, before its content exists; content is asked of the Loader by key and the part shows when its content is resident. `[design choice]`
+- **Player starts a zone's Sim, for now,** and asks the Loader to open the world for it; the Loader moves the world image and Sim units to that Sim. Starting and retiring Sims is a lifecycle job that moves to the world's owner once worlds have more than one zone. `[design choice]`
+
+### Connected play: the server Sim and the client's merge
+
+The server Sim is the same program in the server role, run by the server with a Loader that builds only what Sim needs (the world image, Sim units, shapes; no meshes or textures).
+
+**Joining.** Player hands the client Sim the person's admission for the world; the client Sim sends it to the server Sim, which admits or refuses and then sends the declarations (ids, places, platforms, areas, content keys) as bulk. The client Sim declares the parts at once and asks its Loader for their content, nearest first.
+
+**Client to server, each step:**
+- the person's input samples, each with a sequence number; each packet carries the last several so a lost packet costs nothing (state, latest wins);
+- the person's actions (a press along a ray, with the time of the frame it was drawn in; a world action bound to a key) as events, reliable and in order.
+
+**Server to client:**
+- a snapshot at a regular rate below the step rate (the island's 30 a second is the start), split into a shared part encoded once for everyone and a personal part per client that carries the last input sequence number the server applied (state, latest wins);
+- world events, creations, removals and changes of who steers, as events.
+
+**The client's merge.** Each client step:
+1. Take the newest server snapshot. For the person's own body (and anything else the person controls), start from the server's state at the acknowledged sequence number and replay the samples since, with the same body code the server ran. Where that differs from what was shown, the difference is blended away over a short time (the island's 0.1 s) rather than snapped, unless it is large.
+2. Draw every other being and moving part from the server's snapshots, interpolated a fixed delay in the past (the island's 100 ms), so they move smoothly between snapshots.
+3. Run the world's client-side rules and client-only parts (an effect shown at once on a click).
+4. Publish one snapshot that merges the three, each part in the frame it stands in, so Render and Audio see one zone and do not know whether it is local or connected.
+
+The snapshot the server sends over the network (at a rate below the step rate) and the snapshot a client Sim publishes each step are two different things: the first is state the client receives and merges; the second is the merged result that Render and Audio read.
+
+A rider's body is predicted and reconciled in the frame of the platform it stands on, so the platform's motion never causes a correction. A click is resolved by the client Sim against where things were in the frame the person saw and forwarded as an event; the server accepts it (re-testing the ray is a later defence against cheating). A shared outcome is the server's: a client's change to shared state waits for the server's word, and what was shown at once is a client-only effect.
+
+### Role
+
+A Sim simulates one zone, not one world. A world has one or more zones and a world-level owner beside its zone Sims (see Open). An instance of a zone is started from the zone's definition, its saved state, or a save, never copied live. Changing a world's code reloads the world; code is never swapped under a running instance.
+
+Sim and the world's code are one block: Sim is everything that changes the state of parts, all on one clock, with triggers as the common currency. The isolation line goes around the world, as browsers isolate sites, and not between script and physics ([Strangers' worlds](../design/strangers-worlds.md)). A hung world stalls only itself.
+
+**Client version and server version.**
+- The client Sim is a lightweight Sim. It predicts what this person controls (their avatar's body, a ship they steer), and only that ([Local and connected](../design/local-and-connected.md)); it keeps the body history to reconcile with the server, and carries the state and event conversation with the server Sim. Locally, with no server, it is the full Sim; local and connected play are one model, as a goal ([Local and connected](../design/local-and-connected.md)).
+- The server Sim holds the truth of a shared world. A world with no server runs whole on the person's machine.
+- Each rule of a world says where it runs. The client runs what it needs to predict what the person controls. A world that wants a secret keeps it in a rule that runs only on the server.
+
+**The snapshot.** The snapshot is the state of the zone's parts after one step, published whole and never changed (see Design choices). Render and Audio never block waiting for Sim ([The frame and its deadlines](../design/frame-and-deadlines.md)).
+
+**Handlers and their budget.** A handler is a trigger's response when it is code in the world's language. Handlers reach parts only through the language's interface, on a time budget, with a watchdog, as a script in a web page does ([Strangers' worlds](../design/strangers-worlds.md)). One that overruns is stopped and its changes dropped (see Design choices). The budget is unmeasured; the performance perspective keeps the measured numbers.
+
+### Who it works with
+
+The kinds of handshake are those of [Messages](messages.md): the rows the first browser is built to are decided there, and the rest of its table is proposed. Sim runs on one clock, the step's.
+
+**Player** (client Sim only). Player and Sim talk in actions ([Actions and triggers](../design/actions-and-triggers.md)).
+- In: the person's movement and look samples with a sequence number (state); a press along a ray at the drawn frame's time, and bound world actions (events, carrying an action).
+- Player shares the avatar choice with Sim and starts the zone's Sim for now (see Design choices). What else passes between them is proposed (see Open).
+
+**Render and Audio.**
+- Out: the snapshot after each step, a latest value never changed after publishing. Neither waits for Sim (see Design choices).
+- In, from Render: the frame's display time and the head and hands as drawn, a latest value ([Render](render.md)).
+- One-off effects and sound events are proposed (see Open).
+
+**The Loader.**
+- In: the Loader builds a part's content; Sim allocates the part's id at once and asks for the content by key (see Design choices). The world image and Sim units, and the collision, pick and navigation shapes, each built once, are moved to Sim, their one user ([Arrival](../design/arrival.md)).
+- Out: build content K for part P at a priority set by nearness; part P no longer uses K (events). Creating an object live is a request to Sim, which asks the Loader to build anything new ([Live editing](../design/live-editing.md)). Priorities changed, and the rest, are proposed (see Open).
+- The Loader builds and compiles; how a world's code becomes something that runs is in the [Loader](loader.md) note. A server's Loader builds only what Sim needs.
+
+**Surfaces.** A surface is shown on a part, and the part is Sim's. How they talk is proposed (see Open).
+
+**The other version of itself** (client Sim to server Sim, over the [network library](network.md)).
+- A state and event conversation, as set out under connected play above.
+- State and event traffic and asset traffic never block each other ([Network](network.md)).
+
+**The world's owner** (open: see Open).
+
+**Between parts inside the Sim:** triggers, the common currency (in the island, `Entered`, `Left`, `Rang`, `Dusk`, `Dawn`, and a handler's message to another part).
+
+### What it owns
+
+- The live parts of the zone and everything attached to them. A part is an id, allocated by Sim, and refers to its content by key, never by a GPU handle ([Parts and imports](../design/parts-and-imports.md)).
+- The physics world.
+- The world's code as it runs.
+- On the client, the predicted body and the body history; on the server, the truth of the zone.
+- Creating, destroying and editing parts live are requests to Sim ([Live editing](../design/live-editing.md)).
+- Collision shapes, pick shapes and navigation meshes, built once by the Loader and moved to Sim (see Design choices).
+
+### How it spreads its work
+
+Each zone is simulated by its own Sim. How a Sim spreads its work over cores is not settled (see Open).
+
+## What exists today
+
+- **The simulation actor** (`browser\src\simactor.cone`, in `C:\src\pegasus3d`): steps physics at 60 Hz, runs villagers and creatures compiled into it, awaits the world's turn, and publishes. It serves as the server (`serveTick`) and, in single player, takes turns with the view. The keep: the server holds the truth; a client predicts its own body and reconciles on an echoed input number (`browser\src\viewactor.cone`). `[differs: single player is lockstep, every actor awaiting the next; connected play is pipelined.]`
+- **The world actor** (`browser\src\worldactor.cone`, `browser\src\bakedworld\bakedworld.cone`): the island's code, compiled in, answering mail with requests through a door, one object a turn. `[differs: it is a separate actor awaited by Sim, not one block with it; it has no budget and no watchdog, so a slow turn lengthens the frame and a hung one freezes the program.]`
+- **The view actor** builds and publishes the snapshot (`browser\src\parts\snapshot.cone`), interpolates others six steps behind (100 ms) and predicts the own body. `[differs: the design gives prediction, interpolation and the snapshot to the client Sim.]` The newest island code splits the snapshot into a shared part and a per-person part (`RegionState`, `PersonalState` in `browser\src\simview.cone`), and one snapshot format for local and connected play follows from playing both as one model.
+- **The wire**: reliable messages and latest-wins numbered streams over `netmsg` (`browser\src\netcodec.cone`, `netlink.cone`); a replay log catches a late joiner up (`browser\src\replaylog.cone`). The server publishes a snapshot every other step.
+- **The studio's world actor** (`guidebrowser\src\world.cone`, branch `incubator-archwalk17`): runs animators, publishes changed part states without being awaited, and the loop interpolates one step behind. The keep: the world's work is off the loop's thread. `[differs: it publishes changes, not a whole snapshot; it has two triggers, created and clicked, and no handler code, so no budget is needed yet; the studio has no network play.]`
+- **The step today**: in the island, input, then physics, then the world's turn, then publish (`simactor.cone`). The studio steps animators in the world actor.
+
+## Open
+
+- **A bounded wait for Render:** see [Render](render.md), Open.
+- **The manual's "long work yields and resumes"** changes to the drop rule (see Design choices); the manual's events page is edited when the actions proposal is judged.
+- **The handshakes not yet decided.** With Player (client Sim only): in, the signed statement for a world being joined (deferred with safety and identity, see [Player](player.md)); out, admitted or refused, a being offered to inhabit, a page was clicked and offers focus, which contexts are on. To Render: one-off effects (a burst of particles) as events. To Audio: "play sound S on part P" as an event. To the Loader: priorities changed, as state. With Surfaces: open or close a surface for part P and navigate, as events; the page's content changed, as an event back. Recommended: these, as the standard the proposed table of messages in [Messages](messages.md) sets out.
+- **What a part holds.** Proposed: ids, tree, placement, visibility, look, and references to its content, surfaces and sounds; the physics world holds bodies and contacts. Recommended: this.
+- **How Sim spreads its work.** Proposed: physics as a parallel loop over groups of bodies that do not touch, run deterministically so a replay is exact; zones side by side, each in its own Sim; the client Sim light (prediction, interpolation and the snapshot) and the server Sim where the whole zone is simulated; a step of 60 a second, as in the island. Recommended: this, measured before the physics loop is split.
+- **The step order's price.** An animator started by a click writes its first value one step later; the manual's events and subscriptions pages change to the reactive order (see Design choices).
+- **The world's owner.** Its role, what it holds (world-wide state; a person's possessions that travel between zones), and where it runs. Lean: a Sim in a fourth role, one per world, with no physics, running wherever the world's truth is (the server, or the person's machine for a local world); it starts and retires zone instances and takes over that job from Player. Not needed while a world has one zone.
+- **Testing and replay.** Any run can be replayed exactly, and normal running does not pay for it. Open is how a run is recorded and what the test mode is. A step takes outside input stamped at its start, which is what a replay would record; waiting without limit is the test mode.
+- **Where an AI character acts.** A world's character sends the same actions as a person through the same door; where its mind runs is open in [The person](../design/person.md).
+- **Compiled code's budget check.** The check a drop needs does not exist in compiled code today; options are checks at loops and calls, or a separate means of stopping a handler. Recommended: checks at loops and calls.
+- **Scale and admission** (how many people a zone's Sim can carry, what the server checks at joining) are open in [Network](network.md) and [Server](server.md).
+
+## What lives elsewhere
+
+- [Messages](messages.md): every message to and from Sim, by kind.
+- [Worlds and zones](../design/worlds-and-zones.md): zones, instances, the world's owner, entering.
+- [Local and connected](../design/local-and-connected.md): prediction, interpolation, reconciliation, riding platforms, where rules run.
+- [Strangers' worlds](../design/strangers-worlds.md): the budget, the watchdog, and what a handler may reach.
+- [Actions and triggers](../design/actions-and-triggers.md): the action, the trigger and the step's reactive order.
+- [Parts and imports](../design/parts-and-imports.md): ids, content keys and imported parts.
+- [Live editing](../design/live-editing.md): creating, destroying and editing parts while the world runs.
+- [The frame and its deadlines](../design/frame-and-deadlines.md): Render's wait and the performance budgets.
+- [Loader](loader.md), [Render](render.md), [Audio](audio.md), [Network](network.md), [Server](server.md).
+- The manual's events, subscriptions, actions, worlds and distribution pages.
