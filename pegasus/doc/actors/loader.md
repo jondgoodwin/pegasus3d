@@ -1,0 +1,216 @@
+# Loader
+
+`[planned]`
+
+The Loader takes a world's files and assets in over disk or network and has them built: meshes and textures for Render, parts, collision shapes and behaviour code for Sim. It includes the ConeScript compiler and the way compiled code is executed. It takes the position that arrival is governed (low priority, nearest first, never on a frame's path), that each built thing is moved to its one user, and that a world's code is compiled by the browser itself. The Loader's design is mostly a proposal awaiting judgement: the decided part is short, and the proposed compiler, intermediate form, handshakes, cache and error handling are in Open. The island has no Loader actor and builds its world from compiled Cone code; the studio has a Loader actor that reads and builds one world with an interpreter.
+
+## The design
+
+### Role
+
+The Loader brings assets in and gets them built. A path's scheme says where an asset lives, on disk or on a server, and the Loader picks the transport. Above that it is one pipeline, whatever the source: content-language files with embedded data, and other content types ([Arrival](../design/arrival.md): worlds arrive as programs with embedded data, and are built on the person's machine).
+
+The pipeline: fetch; parse; set up the world image and Sim units, from which Sim declares its parts (Sim allocates each part's id at once, before its content exists); run procedural generation once to make meshes, textures and collision shapes; compile behaviour code for wherever it will run. Imports (registry parts, textures, sounds) are resolved in front of the compiler.
+
+Generation is not one-shot. It runs progressively, near things first, and runs again when something changes while a world runs (an avatar's sliders, an edit). Sim can trigger a regeneration as well as the Loader.
+
+**Two kinds of code come out of it, with different needs.** Sim code is reactive, per action or per frame, and latency matters. Procgen code builds meshes in bulk at load and on regeneration: its run time is arrival time, it must give the same result on every machine (so shared worlds show the same geometry and caches stay valid), and it runs on worker cores.
+
+The browser ships and compiles a world's source itself, and never runs native code a stranger supplied ([Strangers' worlds](../design/strangers-worlds.md)). Whether the origin of an asset decides what it may do is deferred there, with safety and identity.
+
+**The compiler and the executable side.** The compiler is part of the Loader. Its intermediate form is the browser's own: linear, typed, with structured control flow, built on WebAssembly's principles but with ConeScript's types and direct calls into native data; it is neither LLVM's form nor WebAssembly's format. There is no LLVM in the browser; the native backend is written in Cone, for x64 and then ARM64, and the Cone compiler shares it once the Cone compiler is self-hosted. The first working version runs on an interpreter, with wrappers for calls into native Cone libraries; the native backend comes later. Embedding an existing engine (V8, Luau, QuickJS) is not the direction.
+
+**Failures.** ConeScript is resilient ([The content language](../design/content-language.md)). In the Loader that means a part that fails to build, including one whose library tool refuses (a boolean that fails), is dropped, and the world loads without it. The same holds for load-time errors and run-time failures: whatever fails is isolated and the rest runs.
+
+**Reload.** Changing a world's code reloads the world; nothing is swapped under a running instance ([Live editing](../design/live-editing.md)).
+
+**Deferred.** Safety against hostile code beyond the rules above, persistence, and author tooling are later. The compiler's output is chosen so that safety stays possible.
+
+### Who it works with
+
+The kinds of handshake are those of [Messages](messages.md). The Loader has no deadline of its own, and arrival is governed ([The frame and its deadlines](../design/frame-and-deadlines.md)). Render and Audio never block waiting for the Loader.
+
+- **The network library** ([Network](network.md)). The Loader uses it for asset traffic. State, event and input traffic belong to the client Sim; the two never block each other (see [Network](network.md)).
+- **Sim** ([Sim](sim.md)).
+  - Out: the world image and Sim units, and collision, pick and navigation shapes, each built once and moved to Sim, its one user ([Arrival](../design/arrival.md)). Sim owns the parts and the shapes, allocates each part's id when it is declared, and a part refers to its content by key ([Parts and imports](../design/parts-and-imports.md)).
+  - In: requests to build anything new, from Sim ([Live editing](../design/live-editing.md)). A part shows when its content is resident ([Arrival](../design/arrival.md)).
+- **Render** ([Render](render.md)).
+  - Out: meshes, textures and materials as CPU-side buffers, each built once and moved to Render, its one user; Render is the only code that submits GPU work for now, and uploads them. Render accepts them under its per-frame upload budget ([The frame and its deadlines](../design/frame-and-deadlines.md)).
+- **Audio** and **Player.** What passes between them and the Loader is open (see Open).
+- **A server's Loader** builds only what Sim needs.
+
+### What it owns
+
+- Disk and network access for content: the transports.
+- The build pipeline: parsing, compiling, and the procedural generation run.
+
+Whether it owns a catalog of built content and the caches on disk is open (see Open).
+
+### How it spreads its work
+
+The Loader runs across spare cores, governed as set out in [The frame and its deadlines](../design/frame-and-deadlines.md). Reading assets runs as streams. Procedural generation runs on worker cores. How its queue and jobs are arranged is open (see Open).
+
+## What exists today
+
+- **Studio, `guidebrowser\src\loader.cone` (branch `incubator-archwalk17`).** A `Loader` actor builds a world off the main loop. Its `arrive` behaviour reads the file (on the I/O thread) or fetches it over HTTP, then runs the reader pipeline and sends the result back as `Arrival`s over a channel. It is called once per process, from `guidebrowser.cone`. The keep: the build is off the loop's thread and parts reach the loop as moved arrivals; the loop makes at most 64 built parts live a frame (`scene.cone`). `[differs: one world per process; no cache of fetched worlds; no nearest-first order; the build runs twice for timing.]`
+- **Studio, the ConeScript reader.** One file per stage: `lexer.cone`, `parser.cone`, `expand.cone` (loops, design copies, constant arithmetic), `understand.cone` (slots, types, units, checks, an error per part), and `build.cone`, which walks the checked tree and calls the builders it names. The keep: the stages, and an error that drops its part. `[differs: build.cone is a tree-walking interpreter over a closed set of builders; there is no intermediate form and no native code. The only triggers are created and clicked.]`
+- **Island, `C:\src\pegasus3d`, `browser\src`.** No Loader actor and no content language: the world is Cone code compiled into the program (`bakedworld\bakedworld.cone`), generated rather than fetched ("the sounds are recipes, not files"). Baked textures are cached on disk (`bakedworld\bakecache.cone`, keyed by the executable's size and time, the bake's name, its inputs and format, with a checksum and atomic write). The island arrives progressively, one world object per world-actor turn (`worldactor.cone`), and holds uploads to 4 MB a frame when connected (`viewactor.cone`). `[differs: the world is baked once before any actor starts and then shared read-only, so the built data is shared, not moved to one user; nothing is fetched, compiled or interpreted at run time.]`
+
+## Open
+
+Everything below is proposed, not decided, except where it says a thing is already stated above.
+
+### The requirements, ranked
+
+Proposed, highest first:
+1. Procedural generation gives the same bits on every machine. Shared worlds must show the same geometry, and a cache keyed by inputs is only valid if output is a pure function of them; a wrong mesh is silent.
+2. The frame never waits on the Loader (decided above).
+3. Arrival is fast: something near is visible within a tenth of a second of the world's first bytes, and the rest streams nearest first. Arrival time is generation run time plus compile time.
+4. Sim code keeps to its step budget: what a person controls never waits for a world's code.
+5. Procedural throughput on worker cores, for arrival and regeneration.
+6. The language can change a lot without rewriting the back half of the compiler.
+7. Safety stays possible (deferred above, not designed).
+8. One developer and several lanes can build it in steps, each step running: interpreter first, one semantics and not two.
+9. It runs where generating code is forbidden (iPhone, iPad, Vision Pro), through the interpreter.
+
+Where they compete: 3 against 1 (fast-math is off the table, so speed comes from elsewhere); 4 and 5 against 8 (the native backend is the cost, and "Where native code pays" below says where it pays). Recommended: this order.
+
+### The compiler's shape: binding times and three products
+
+What the proposal rests on in the language: it is statically typed and checked at load, with units erased after checking; it has values only (no pointers, nothing borrowed, allocated or freed), so memory safety is a property of the compiler's output; the part is the module; value blocks may not act and acting blocks may, so the checker already knows which code is pure; build is pure, cacheable and parallelisable, and start runs after it; open functions (world functions handed to tools, such as a displacement per vertex) are pure, bounded and deterministic; every block runs within a budget.
+
+Proposed: every expression has a binding time, computed by the checker: fixed (known at build), per-instance (known when a copy or spawn is made), or live (changes while the world runs). Fixed code is evaluated at load and leaves data. Only what remains becomes executable code. One front end and one intermediate form produce three products, separated by binding time and not by three back ends:
+- **The world image**: data. The part table, each design's field schema and defaults, initial values, the dispatch tables (which handler answers which verb on which design), the derive graph, and a content key for every shape. Made from fixed code at load; moved to Sim.
+- **Procgen jobs**: a shape unit and its argument values, named by a content key. Made from shape functions and their call sites; run on the Loader's workers; their products go to Render (meshes, textures) and Sim (collision, pick shapes).
+- **Sim units**: executable code for handlers, derive expressions, `became` conditions, step functions and spawn constructors. Made from live and per-instance code; run by Sim's executor.
+
+Odd cases it answers: a slider that changes a body field is live, so the shape's content key is computed at run time, Sim asks the Loader, the old mesh stays drawn until the new one arrives, and superseded jobs for the same part are cancelled (latest wins). A run-time `spawn` of a design shares builds with every copy that has equal fixed inputs. A derive over the clock is a Sim unit, recomputed when its inputs change, in the derive graph's order. Why: the code that must be fast is small, the cache is natural (fixed evaluation is a pure function of the source, so the world image caches by hash), and build-time evaluation runs the same intermediate form in the same interpreter as run-time code, so there is one semantics. Recommended: this.
+
+**The stages.** Proposed, in a `conescript` library, each per file or per part where it can be, so work starts while later files still arrive:
+1. Fetch, by scheme; a world manifest says which files exist, so the Loader knows when a part's declarations are complete.
+2. Read each file as it arrives, on a worker: lex and parse. Files are independent, so this is parallel; a syntax error is local to a declaration.
+3. Gather: merge every file's declarations into the part tree by path. Because any file may add to any part, a part is complete only when every file is read, so arrival is two-phase: declarations for the whole world first (small), then building, nearest first. Sim declares what exists, then asks for content by nearness.
+4. Check: resolve names to slots; types and units; exhaustive `match`; effects (value or acting); binding times; placement (client, server or both, with server-only reads forcing server); open-function limits; the dependencies each derive and shape reads. A part with an error is dropped with its dependents and reported; the rest loads.
+5. Lower each function, handler, derive and shape body to the intermediate form, one unit per body.
+6. Evaluate fixed code in the interpreter, producing the world image and the procgen jobs' arguments.
+7. Verify every unit (types, structured control flow, import signatures) in one forward pass, as WebAssembly does. This is the safety seam: whatever reaches native code has passed it.
+8. Hand over.
+
+Recommended: these stages.
+
+**How constructs lower.** Proposed:
+- Structs, tuples, enums and options are aggregate value types passed by value; the lowering moves at last use and copies otherwise, with no reference counting.
+- Library generics (lists and tables of world types): the form has none; the front end instantiates per element type, and the runtime's containers are type-erased, parameterised by a layout descriptor (size, alignment, copy and drop). Containers of library types that Cone code consumes use the library's own concrete types.
+- A closure is a unit index plus a captured record (by value); handed to a native tool, it becomes a callable thunk.
+- Parts are never values in code. Code holds part handles (an index plus a generation) and reads and writes fields through typed field operations naming the field's slot in its design's schema; paths resolve to handles at load.
+- A design is a schema plus a constructor unit; a copy is a row; a copy's differences are constructor arguments.
+- A handler is a unit taking the receiver handle and the action record and producing staged writes, which Sim applies when the handler finishes and drops if it overruns or fails. A dispatch table maps (design, verb) to a unit; an unhandled verb goes to the parent at run time.
+- Animators are mostly data (the animation package's records); only the step function is code.
+- A shape function is a unit whose result is a shape; its calls into the sculpting library are import calls.
+
+Recommended: these.
+
+**Where the first version's subset sits.** Stages 1 to 4 are what the studio's reader does for parts, designs, fields, `each`, `if`, shape functions with `let`s, the shape builders, materials, lights, `on` rules with animators, derives and areas, less effects, placement and binding times as named analyses. Stage 5 does not exist there. Proposed first version, each step running: (1) the shared front end for today's subset, unchanged in behaviour; (2) the vocabulary table and its shim generator, replacing the closed set of builders, for the builders the guide worlds use; (3) the form, its verifier and the interpreter, for scalars, vectors, structs, `let`s, `each`, `if`, calls, shape functions, `on` handlers with `set` and `start`, and derives, tested by identical output on every guide world before and after; (4) the Loader as an actor with the catalog and content keys: two-phase arrival, generation jobs on workers nearest first, meshes moved to Render under its budget, collision and pick shapes to Sim, the mesh cache; (5) a determinism test from the start: hash every procgen product of the guide worlds and compare across an x64 machine and an ARM64 machine, checked in continuous integration. Not in it: closures, open functions, spawn, the native backend, the native cache, server placement, pre-built forms. Recommended: this order.
+
+### The intermediate form and its two executors
+
+**The form.** Proposed:
+- Stack-based in its stored encoding, with typed locals: this makes single-pass verification and single-pass native compilation simple, and the encoding compact for the cache.
+- Types: the scalars (units erased), bool, aggregate value types, library handle types (shape, outline, material, animator: opaque values the runtime owns), part handles, closures, containers by layout descriptor. No raw pointers and no address arithmetic in ConeScript's profile.
+- Vector math is primitive (add, scale, dot and the like are operations of the form, not calls).
+- Fuel: a budget check at every loop back-edge and every call, counted in work units. Overrun aborts the unit and drops its staged writes. (This is the budget check [Sim](sim.md) lists as missing from compiled code.)
+- Strict floating point: each operation rounds once, with no contraction into fused multiply-add and no fast-math; transcendental functions are the browser's own library functions, giving the same bits everywhere. ConeScript cannot see a NaN's bits, so their payloads do not matter.
+- A core plus a Cone profile: the self-hosted Cone compiler needs raw memory operations and pointers; they are a profile the ConeScript verifier refuses. One form, one backend.
+- Versioned from its first byte.
+
+Recommended: this form.
+
+**The interpreter.** Proposed: first, and the permanent fallback where generating code is forbidden. At load it rewrites each unit from the stack encoding to an internal register form with resolved branch targets. Published interpreters of this kind run about 4 to 15 times slower than compiled code (the figure is another engine's, not measured here). It also runs fixed code at load. Guaranteed tail calls would give the fastest dispatch loop and are unverified in Cone; a switch loop is the fallback. Recommended: this.
+
+**The native backend.** Proposed: later; written in Cone, x64 then ARM64; compiles in one pass from the stack form, keeping values in registers while it can. Published baseline compilers of this kind compile 10 to 15 times faster than optimising ones and produce code about 1.2 to 2 times slower (figures from other engines, not measured here). No optimising tier. Recommended: this.
+
+**Where native code pays**, by the code's kind. Proposed reading, to be measured on the guide worlds: procgen glue barely gains, because its time is inside the sculpting library, which is already native Cone; open functions gain most, because an interpreted callback per vertex or texel is where the interpreter's slowness hurts throughput, and their limits (no recursion, bounded loops, pure) are also what could later let them run on the GPU; Sim code gains in proportion to per-step work (handlers are small and rare; per-step derives and step functions across many parts are the hot set); the Cone compiler gains a great deal. So the interpreter carries the first browser a long way, and the backend's first users are open functions, per-step Sim code and the Cone compiler. Recommended: measure before building the backend.
+
+**Choosing the executor.** Proposed: per unit and per platform. Native where generating code is allowed (Windows, Linux, Android; the Quest is unverified; the Mac with its executable-memory flag), the interpreter elsewhere and until native code for a unit is ready. With no on-stack replacement, a unit switches executor at its next entry. Native code is compiled eagerly on arrival, on workers, at low priority. Recommended: this.
+
+**The two kinds of code, side by side.** Proposed: one form and one backend serve both; what separates them is where they run, what they may touch (the checker's effect analysis) and how results are used. Sim code runs on Sim's thread, acts by staged writes, has fuel (overrun drops the writes), and needs the same bits everywhere only where the client predicts (open in the manual: physics bit-exactness). Procgen code runs on the Loader's workers, is pure and returns a product, has fuel (overrun fails the job, reports it, and the part shows without that product), and needs the same bits always. Recommended: this.
+
+### Calls into Cone libraries
+
+Proposed: a vocabulary table, generated when the browser is built, replaces a hand-written branch per builder.
+1. A binding generator reads the Cone packages the browser exposes (the sculpting, geometry and animation packages, the behaviour packages) and the list of names exposed to worlds.
+2. For each exposed function it writes a shim in Cone, compiled with the browser: it takes an argument block and a result block, unpacks typed arguments, calls the real function, and packs the result.
+3. It writes the function's signature into the table that the checker (names and types) and the verifier (import signatures) read.
+
+Both executors call every library function through the same one-signature shim. That takes the hardest risk (structs passed by value across four platform calling conventions) out of the backend, which needs only its own internal convention and this one call shape. The cost is a pack and an unpack per call, negligible against the sculpting library's work; a hot small call becomes a primitive of the form. Native data crosses without copying: a shape is a library value living in the job's arena, script code holds a handle, and the result moves out of the arena when the job ends. A callback (a closure handed to a tool) gets a thunk that enters the executor with the closure's unit and record; interpreted, that is one interpreter entry per call. Safety later is choosing the table per origin (which names a world may call), memory limits on arenas and containers, and fuel. Recommended: this.
+
+### The Loader's handshakes
+
+Proposed, with the kinds of [Messages](messages.md):
+
+| From to | What | Kind |
+|---|---|---|
+| Player to Loader | open world W, by path, for Sim S, which Player has started (the origin rule checked by Player) | event |
+| Loader to Sim | the world image and its Sim units, for an instance to start from | move |
+| Sim to Loader | build content K for part P at a priority (nearness); priorities changed; P no longer uses K | event, state |
+| Sim to Loader | regenerate: part P's shape now has arguments A (latest wins per part); spawn needs design D's content with arguments A | event |
+| Loader to Render | mesh, texture, material for K, under Render's upload budget | move |
+| Loader to Sim | collision shape, pick shape, navigation mesh for K | move |
+| Render to Loader | K dropped (eviction, device lost); memory left | event, state |
+| Loader to Audio | decoded samples for K | move |
+| Loader to Sim | a local world's file changed: a new world image is ready | move |
+
+Recommended: these. Player starts a zone's Sim for now and asks the Loader to open the world for it; the Loader moves the world image and Sim units to that Sim ([Sim](sim.md)).
+
+**Handing over without copying.** Proposed: meshes and samples are built into buffers the Loader moves (Cone's unique ownership across actors). Code is immutable once compiled, so a world's code pages and interpreted units are shared read-only with its Sim, and with a second Sim running the same world, as a portal needs. Executable memory is written by the Loader and made executable before any Sim sees it (no memory both writable and executable; the Mac's per-thread toggle). Recommended: this.
+
+**Content keys.** Proposed composition: for a mesh, a hash of the shape unit, its argument values, the vocabulary version and the level of detail; for code, the source hashes of the part's files, the interface hashes of what it uses, the compiler version and the target. Recommended: this.
+
+**How the work is arranged.** Proposed: one Loader actor owns the queue and the catalog; the work itself (parse, per-part checking, fixed evaluation, generation jobs, native compiles) runs as jobs on the worker pool at low priority, nearest first. Generation jobs are pure, so their order and worker never change their bits. Parallelism inside a library call must be deterministic too. Recommended: this. **The catalog** proposed: it is the one place built content is known, with no shared library of it; it maps a content key to its product, holder and user count, builds each thing once, knows what exists, frees GPU content nobody uses, and supplies it again after eviction or a lost device. Recommended: this. **Pick shapes and navigation meshes** are Loader products moved to Sim, so Render keeps no CPU copy of a mesh ([Sim](sim.md), [Render](render.md)).
+
+**On a server.** The Loader builds only what Sim needs (decided above); proposed that this is the world image, the Sim units and Sim's products, with no meshes or textures. Recommended: this.
+
+**What Audio and Player exchange with the Loader.** Audio receives decoded samples as above; whether sounds are built by generation or fetched as files is not designed. Player opens a world as above.
+
+### The cache
+
+Proposed: three kinds of entry, each keyed by content, each disposable and rebuilt on a miss.
+1. Checked and lowered units per part (portable): saves the front end and fixed evaluation.
+2. Built content (meshes, collision, textures) by content key: the big one, since generation is where arrival time goes.
+3. Native code per target, with an import relocation list patched at load. Recommended: build it only if measured worth it; one engine deliberately does not cache its baseline tier, because recompiling is about as fast as loading.
+
+It lives in the user's profile, checksummed, least recently used evicted. The Loader is its only writer, and the catalog is its in-memory index. Recommended: this.
+
+### Errors, recovery and reload
+
+That a failing part is dropped and the rest runs is decided above. Proposed in detail:
+- Load-time errors drop the part and its dependents and are reported to whoever is looking (the world's author in development, a console line otherwise).
+- A tool refusal is treated the same: the part is dropped and named, so one bad lantern does not blank a world. This changes the manual's page, which says it stops the world loading; the page changes with it.
+- A run-time failure in Sim code (an index out of range, a budget overrun, a failed library call) aborts the unit, its staged writes are dropped, and a report goes to the origin. The step goes on.
+- Reload, when a local world's file changes: the Loader re-reads that file, re-checks what depends on it, reuses every cached unit and mesh whose key is unchanged, and hands Sim a new world image; Sim starts a fresh instance from it. Nothing live is copied. Carrying a running zone's state across is persistence, deferred.
+
+Recommended: these.
+
+### The Loader's own open questions
+
+- **The numeric types.** ConeScript has one number type; Cone libraries use specific widths. The author's view is open: most numbers will be floating point, probably 64-bit. Recommended: `number` as 64-bit float in the form, library types at their own widths at the shim, vectors as the libraries define them; large worlds argue for 64-bit positions, and determinism holds either way.
+- **Value semantics for containers.** Moves at last use and copies otherwise, or copy-on-write. Recommended: the first; add copy-on-write only if a measured world shows copies costing.
+- **The unit of compilation and caching.** Recommended: the part (the manual's module), with function-level units inside it, and a world manifest so streaming knows when declarations are complete.
+- **Pre-built forms from servers.** Later. A server may send the portable form as a hint; the browser re-verifies it. Native code a server supplied is never run (decided above).
+- **Whether a world's source is always viewable, as a web page's is.** A values question; open. Recommended: yes, since the browser ships and compiles source anyway.
+- **Compiling at load time: a compiler in the browser, or on a server that sends native code.** Decided above that the browser compiles; what remains open is only pre-built forms, above.
+- **Open functions on the GPU.** Later; the form's open-function profile keeps it possible.
+- **Requirements on Cone itself, to check.** Cone packages must build without floating-point contraction on every target (defaults differ by target, a real risk to the first requirement, unverified); the sculpting library's internal parallelism must be deterministic; guaranteed tail calls for the interpreter's dispatch (unverified); how the shims are compiled with the browser, which is the same local-package question the shared front end has.
+- **Build-time evaluation through the interpreter rather than the reader's tree-folding.** Recommended: yes in the whole design (one semantics); the first version can keep the reader's folding and move later.
+
+## What lives elsewhere
+
+- [Arrival](../design/arrival.md): how a world appears progressively, the content key, when a part shows.
+- [The content language](../design/content-language.md): what the language is and how its code becomes something that runs, at the level of the topic.
+- [Strangers' worlds](../design/strangers-worlds.md): origin rules, never running a stranger's native code, budgets.
+- [Live editing](../design/live-editing.md): creating, destroying and editing while a world runs, and the reload on a code change.
+- [Sim](sim.md): what it asks the Loader and what it receives; the snapshot and the step.
+- [Render](render.md): the upload budget, and what it owns of what the Loader builds.
+- [Messages](messages.md): the kinds of handshake.
+- [Network](network.md): the library asset traffic uses.
+- The manual's loading, parts, packages and open-functions pages.
