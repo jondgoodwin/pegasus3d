@@ -1,0 +1,937 @@
+// The verifier made complete for the subset (W135): every rule of the step-3 spec's section 6, each with a one-defect
+// unit the verifier must refuse, per op where the rule is per op. The lane's report holds the table of rules and the
+// mutants (a check removed, some case here fails).
+
+mod complete;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import conescript use *;
+
+fn has(s: &String, needle: &str) bool {
+  let hay = s.view();
+  let nd = String.from(needle);
+  let n = nd.view();
+  if n.len > hay.len { return false; }
+  var i = 0usize;
+  while i + n.len <= hay.len {
+    var j = 0usize;
+    while j < n.len && hay[i + j] == n[j] { j = j + 1usize; }
+    if j == n.len { return true; }
+    i = i + 1usize;
+  }
+  false
+}
+
+// True if the verifier refuses, with a problem in 'unit' whose text holds 'needle'
+fn refusedBy(w: &CodeWriter, tables: &ImportTables[u8], unit: u32, needle: &str) bool {
+  match verify(&w.code, tables) {
+    case let Ok(v) { false }
+    case let Err(ps) {
+      var found = false;
+      var i = 0usize;
+      while i < ps.len() { if has(&ps[i].what, needle) && ps[i].unit == unit { found = true; } i = i + 1usize; }
+      found
+    }
+  }
+}
+
+fn refused(label: &str, w: &CodeWriter, tables: &ImportTables[u8], unit: u32, needle: &str) {
+  expect(refusedBy(w, tables, unit, needle), label);
+}
+
+fn accepted(label: &str, w: &CodeWriter, tables: &ImportTables[u8]) {
+  match verify(&w.code, tables) {
+    case let Ok(v) { expect(true, label); }
+    case let Err(ps) { expect(false, label); }
+  }
+}
+
+fn reads(b: &Array[u8]) bool {
+  match decode(b) {
+    case let Ok(c) { true }
+    case let Err(p) { false }
+  }
+}
+
+fn noop(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { true }
+
+fn unit(params: &Array[u32], results: &Array[u32]) CodeWriter {
+  var w = CodeWriter.make();
+  let sig = w.code.types.sig(params, results);
+  w.beginUnit(sig, "u");
+  w
+}
+
+// Pushes one value of a primitive type
+fn pushOf(w: &mut CodeWriter, t: u32) {
+  if t == TY_F64 { w.f64Const(1.0); }
+  else if t == TY_BOOL { w.boolConst(true); }
+  else if t == TY_I64 { w.i64Const(1i64); }
+  else { w.opU(OP_PART_CONST, 0u32); }
+}
+
+fn wrongFor(t: u32) u32 { if t == TY_F64 { TY_BOOL } else { TY_F64 } }
+
+// An op that takes 'n' plain values of type 'arg' and gives one of type 'res': right operands accepted, and a wrong
+// type in the deepest operand refused
+fn simpleOp(op: u8, n: u32, arg: u32, res: u32, tables: &ImportTables[u8]) {
+  let e = List[u32]();
+  var w = unit(e.view(), &[res]);
+  pushOf(&mut w, arg);
+  if n == 2u32 { pushOf(&mut w, arg); }
+  w.op(op); w.endUnit();
+  match verify(&w.code, tables) {
+    case let Ok(v) {}
+    case let Err(ps) { print <- "  right operands refused, op "; print <- u32.from(op); print <- "\n"; expect(false, "an op with right operands is accepted"); }
+  }
+  var x = unit(e.view(), &[res]);
+  pushOf(&mut x, wrongFor(arg));
+  if n == 2u32 { pushOf(&mut x, arg); }
+  x.op(op); x.endUnit();
+  if !refusedBy(&x, tables, 0u32, "wrong type") { print <- "  wrong operand accepted, op "; print <- u32.from(op); print <- "\n"; expect(false, "an op given a wrong operand type is refused"); }
+  if n == 2u32 {
+    var y = unit(e.view(), &[res]);
+    pushOf(&mut y, arg); pushOf(&mut y, wrongFor(arg));
+    y.op(op); y.endUnit();
+    if !refusedBy(&y, tables, 0u32, "wrong type") { print <- "  wrong top operand accepted, op "; print <- u32.from(op); print <- "\n"; expect(false, "an op given a wrong top operand is refused"); }
+  }
+  var z = unit(e.view(), &[res]);
+  if n == 2u32 { pushOf(&mut z, arg); }
+  z.op(op); z.endUnit();
+  if !refusedBy(&z, tables, 0u32, "empty") { print <- "  empty stack accepted, op "; print <- u32.from(op); print <- "\n"; expect(false, "an op on too few operands is refused"); }
+}
+
+fn main() i32 {
+  let e = List[u32]();
+  let tables = ImportTables[u8].make();
+  var w = unit(e.view(), e.view());
+
+  // ---- per op: operand types and the stack ----
+  simpleOp(OP_F64_ADD, 2u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_SUB, 2u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_MUL, 2u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_DIV, 2u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_MIN, 2u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_MAX, 2u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_NEG, 1u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_ABS, 1u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_SQRT, 1u32, TY_F64, TY_F64, &tables);
+  simpleOp(OP_F64_EQ, 2u32, TY_F64, TY_BOOL, &tables);
+  simpleOp(OP_F64_NE, 2u32, TY_F64, TY_BOOL, &tables);
+  simpleOp(OP_F64_LT, 2u32, TY_F64, TY_BOOL, &tables);
+  simpleOp(OP_F64_LE, 2u32, TY_F64, TY_BOOL, &tables);
+  simpleOp(OP_F64_GT, 2u32, TY_F64, TY_BOOL, &tables);
+  simpleOp(OP_F64_GE, 2u32, TY_F64, TY_BOOL, &tables);
+  simpleOp(OP_BOOL_NOT, 1u32, TY_BOOL, TY_BOOL, &tables);
+  simpleOp(OP_BOOL_AND, 2u32, TY_BOOL, TY_BOOL, &tables);
+  simpleOp(OP_BOOL_OR, 2u32, TY_BOOL, TY_BOOL, &tables);
+  simpleOp(OP_BOOL_FROM_F64, 1u32, TY_F64, TY_BOOL, &tables);
+  simpleOp(OP_F64_FROM_BOOL, 1u32, TY_BOOL, TY_F64, &tables);
+  simpleOp(OP_I64_ADD, 2u32, TY_I64, TY_I64, &tables);
+  simpleOp(OP_I64_SUB, 2u32, TY_I64, TY_I64, &tables);
+  simpleOp(OP_I64_MUL, 2u32, TY_I64, TY_I64, &tables);
+  simpleOp(OP_I64_EQ, 2u32, TY_I64, TY_BOOL, &tables);
+  simpleOp(OP_I64_NE, 2u32, TY_I64, TY_BOOL, &tables);
+  simpleOp(OP_I64_LT, 2u32, TY_I64, TY_BOOL, &tables);
+  simpleOp(OP_I64_FROM_PART, 1u32, TY_PART, TY_I64, &tables);
+  simpleOp(OP_F64_FROM_I64, 1u32, TY_I64, TY_F64, &tables);
+
+  // the constants
+  w = unit(e.view(), &[TY_I64]);
+  w.i64Const(-5i64); w.endUnit();
+  accepted("an i64 constant", &w, &tables);
+  w = unit(e.view(), &[TY_PART]);
+  w.opU(OP_PART_CONST, 3u32); w.endUnit();
+  accepted("a part constant", &w, &tables);
+  w = unit(e.view(), &[TY_F64]);
+  w.i64Const(1i64); w.endUnit();
+  refused("an i64 constant where an f64 is wanted", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  w.opU(OP_PART_CONST, 0u32); w.endUnit();
+  refused("a part constant where an f64 is wanted", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  w.op(OP_I64_CONST); w.op(0x80u8);
+  refused("a cut-short i64 constant", &w, &tables, 0u32, "cut-short");
+  w = unit(e.view(), e.view());
+  w.op(OP_PART_CONST);
+  refused("a cut-short part constant", &w, &tables, 0u32, "cut-short");
+  w = unit(e.view(), e.view());
+  w.op(OP_BOOL_CONST);
+  refused("a bool constant with no byte", &w, &tables, 0u32, "bool constant");
+  w = unit(e.view(), e.view());
+  w.op(OP_BLOCK); w.op(0xFFu8); w.op(0xFFu8); w.op(0xFFu8); w.op(0xFFu8); w.op(0x1Fu8); w.endUnit();
+  refused("an immediate too large for 32 bits", &w, &tables, 0u32, "oversized");
+
+  // ---- control ----
+  w = unit(e.view(), &[TY_F64]);
+  var bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_LOOP, bf); w.boolConst(true); w.op(OP_END); w.endUnit();
+  refused("a loop ends with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  var b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_IF, b0); w.op(OP_END); w.endUnit();
+  refused("an if whose condition is not a bool", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_IF, b0); w.op(OP_END); w.endUnit();
+  refused("an if with no condition", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.boolConst(true); w.opU(OP_IF, bf); w.f64Const(1.0); w.op(OP_ELSE); w.boolConst(false); w.op(OP_END); w.endUnit();
+  refused("an else arm ends with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.boolConst(true); w.opU(OP_IF, bf); w.boolConst(false); w.op(OP_ELSE); w.f64Const(1.0); w.op(OP_END); w.endUnit();
+  refused("a then arm ends with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.boolConst(true); w.opU(OP_IF, b0); w.f64Const(1.0); w.op(OP_ELSE); w.op(OP_END); w.endUnit();
+  refused("a then arm leaves a value its block does not give", &w, &tables, 0u32, "left on the stack");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.boolConst(true); w.opU(OP_IF, b0); w.op(OP_ELSE); w.f64Const(1.0); w.op(OP_END); w.endUnit();
+  refused("an else arm leaves a value its block does not give", &w, &tables, 0u32, "left on the stack");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.boolConst(true); w.opU(OP_IF, b0); w.op(OP_ELSE); w.op(OP_ELSE); w.op(OP_END); w.endUnit();
+  refused("a second else", &w, &tables, 0u32, "else");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_BLOCK, b0); w.op(OP_ELSE); w.op(OP_END); w.endUnit();
+  refused("else inside a block", &w, &tables, 0u32, "else");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_LOOP, b0); w.op(OP_ELSE); w.op(OP_END); w.endUnit();
+  refused("else inside a loop", &w, &tables, 0u32, "else");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_BLOCK, b0); w.endUnit();
+  refused("a block never closed", &w, &tables, 0u32, "does not end");
+  w = unit(e.view(), e.view());
+  w.opU(OP_BLOCK, 99u32); w.op(OP_END); w.endUnit();
+  refused("a block type out of range", &w, &tables, 0u32, "without parameters");
+  w = unit(e.view(), e.view());
+  w.opU(OP_BLOCK, TY_F64); w.op(OP_END); w.endUnit();
+  refused("a block type that is not a signature", &w, &tables, 0u32, "without parameters");
+
+  // branches
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_BLOCK, b0); w.f64Const(1.0); w.opU(OP_BR_IF, 0u32); w.op(OP_END); w.endUnit();
+  refused("br_if whose condition is not a bool", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  w.boolConst(true); w.opU(OP_BR_IF, 1u32); w.endUnit();
+  refused("br_if with a depth out of range", &w, &tables, 0u32, "depth");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_BLOCK, b0); w.opU(OP_BR_IF, 0u32); w.op(OP_END); w.endUnit();
+  refused("br_if with no condition", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_BLOCK, bf); w.boolConst(true); w.boolConst(true); w.opU(OP_BR_IF, 0u32); w.op(OP_END); w.endUnit();
+  refused("br_if carries the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_BLOCK, bf); w.boolConst(true); w.opU(OP_BR_IF, 0u32); w.op(OP_END); w.endUnit();
+  refused("br_if carries nothing where a value is wanted", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_BLOCK, bf); w.opU(OP_BR, 0u32); w.op(OP_END); w.endUnit();
+  refused("br carries nothing where a value is wanted", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_BLOCK, bf); w.f64Const(1.0); w.boolConst(true); w.opU(OP_BR_IF, 0u32); w.op(OP_END); w.endUnit();
+  accepted("br_if carrying the right type", &w, &tables);
+  w = unit(e.view(), &[TY_F64]);
+  w.boolConst(true); w.op(OP_RETURN); w.endUnit();
+  refused("return with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  w.op(OP_RETURN); w.endUnit();
+  refused("return with nothing where a value is wanted", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  w.f64Const(1.0); w.op(OP_RETURN); w.endUnit();
+  accepted("return with the right type", &w, &tables);
+  w = unit(e.view(), &[TY_F64]);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_BLOCK, b0); w.f64Const(1.0); w.op(OP_RETURN); w.op(OP_END); w.f64Const(2.0); w.endUnit();
+  accepted("return from inside a block", &w, &tables);
+  w = unit(e.view(), &[TY_F64]);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_BLOCK, b0); w.boolConst(true); w.op(OP_RETURN); w.op(OP_END); w.f64Const(2.0); w.endUnit();
+  refused("return from inside a block with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_LOOP, b0); w.f64Const(1.0); w.boolConst(true); w.opU(OP_BR_IF, 0u32); w.opU(OP_DROP, TY_F64); w.op(OP_END); w.endUnit();
+  accepted("a back-edge with a stray value beneath", &w, &tables);
+
+  // nothing is popped below a block's base
+  w = unit(e.view(), &[TY_F64]);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_BLOCK, b0); w.op(OP_F64_NEG); w.op(OP_END); w.endUnit();
+  refused("a block pops a value from outside it", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_LOOP, b0); w.opU(OP_DROP, TY_F64); w.op(OP_END); w.endUnit();
+  refused("a loop pops a value from outside it", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_IF, b0); w.opU(OP_DROP, TY_F64); w.op(OP_ELSE); w.op(OP_END); w.endUnit();
+  refused("an if arm pops a value from outside it", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_IF, b0); w.op(OP_ELSE); w.opU(OP_DROP, TY_F64); w.op(OP_END); w.endUnit();
+  refused("an else arm pops a value from outside it", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_F64]);
+  bf = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_BLOCK, bf); w.op(OP_END); w.endUnit();
+  refused("a block with results and an empty body", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_BLOCK, b0); w.op(OP_END); w.endUnit();
+  refused("a value beneath a block is left at the function's end", &w, &tables, 0u32, "left on the stack");
+
+  // ---- locals ----
+  w = unit(e.view(), e.view());
+  var l0 = w.local(TY_F64);
+  w.boolConst(true); w.opU(OP_LOCAL_SET, l0); w.endUnit();
+  refused("local.set with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_LOCAL_SET, 7u32); w.endUnit();
+  refused("local.set out of range", &w, &tables, 0u32, "local out of range");
+  w = unit(e.view(), e.view());
+  w.opU(OP_LOCAL_SET, 0u32); w.endUnit();
+  refused("local.set on a unit with no locals", &w, &tables, 0u32, "local out of range");
+  w = unit(e.view(), e.view());
+  l0 = w.local(TY_F64);
+  w.opU(OP_LOCAL_SET, l0); w.endUnit();
+  refused("local.set from an empty stack", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), e.view());
+  l0 = w.local(TY_F64);
+  w.boolConst(true); w.opU(OP_LOCAL_TEE, l0); w.opU(OP_DROP, TY_F64); w.endUnit();
+  refused("local.tee with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_LOCAL_TEE, 7u32); w.endUnit();
+  refused("local.tee out of range", &w, &tables, 0u32, "local out of range");
+  w = unit(e.view(), e.view());
+  l0 = w.local(TY_F64);
+  w.opU(OP_LOCAL_TEE, l0); w.opU(OP_DROP, TY_F64); w.endUnit();
+  refused("local.tee from an empty stack", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), &[TY_BOOL]);
+  l0 = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, l0); w.endUnit();
+  refused("local.get gives its local's type", &w, &tables, 0u32, "wrong type");
+  w = unit(&[TY_F64], &[TY_BOOL]);
+  w.opU(OP_LOCAL_GET, 0u32); w.endUnit();
+  refused("local.get of a parameter gives its type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  l0 = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, l0); w.endUnit();
+  accepted("a scalar local may be read before it is set", &w, &tables);
+
+  // handle, list and tuple-holding-a-handle locals must be set before they are read
+  w = unit(e.view(), e.view());
+  var lt = w.code.types.list(TY_F64);
+  l0 = w.local(lt);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, lt); w.endUnit();
+  refused("a list local read before it is set", &w, &tables, 0u32, "before it is set");
+  w = unit(e.view(), e.view());
+  var ht = w.code.types.handle(2u32);
+  var tt = w.code.types.tuple(&[TY_F64, ht]);
+  l0 = w.local(tt);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, tt); w.endUnit();
+  refused("a tuple holding a handle read before it is set", &w, &tables, 0u32, "before it is set");
+  w = unit(e.view(), e.view());
+  ht = w.code.types.handle(2u32);
+  tt = w.code.types.tuple(&[TY_F64, ht]);
+  var tt2 = w.code.types.tuple(&[TY_F64, tt]);
+  l0 = w.local(tt2);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, tt2); w.endUnit();
+  refused("a tuple holding a tuple holding a handle, read before it is set", &w, &tables, 0u32, "before it is set");
+  w = unit(e.view(), e.view());
+  tt = w.code.types.tuple(&[TY_F64, TY_BOOL]);
+  l0 = w.local(tt);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, tt); w.endUnit();
+  accepted("a tuple of scalars may be read before it is set", &w, &tables);
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  let hs = w.code.types.sig(&[ht], e.view());
+  w.beginUnit(hs, "u");
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_DROP, ht); w.endUnit();
+  accepted("a handle parameter is set on entry", &w, &tables);
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_TEE, l0); w.opU(OP_DROP, ht);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, ht); w.endUnit();
+  accepted("local.tee sets a handle local", &w, &tables);
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  var ht4 = w.code.types.handle(4u32);
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht4);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_SET, l0); w.endUnit();
+  refused("a handle of one kind stored in a local of another", &w, &tables, 0u32, "wrong type");
+  // a loop body: set before the exit test, read after
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht);
+  w.opU(OP_LOOP, b0); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_SET, l0); w.boolConst(false); w.opU(OP_BR_IF, 0u32); w.op(OP_END);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, ht); w.endUnit();
+  accepted("a handle set in a loop body is set after the loop", &w, &tables);
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht);
+  w.opU(OP_LOOP, b0); w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, ht); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_SET, l0);
+  w.boolConst(true); w.opU(OP_BR_IF, 0u32); w.op(OP_END); w.endUnit();
+  refused("a handle read at the top of a loop, set only later in it", &w, &tables, 0u32, "before it is set");
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht);
+  w.opU(OP_BLOCK, b0); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_SET, l0); w.opU(OP_BR, 0u32); w.op(OP_END);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, ht); w.endUnit();
+  accepted("a handle set before an unconditional branch out of its block", &w, &tables);
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht);
+  w.opU(OP_BLOCK, b0); w.boolConst(true); w.opU(OP_BR_IF, 0u32); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_SET, l0); w.opU(OP_BR, 0u32); w.op(OP_END);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, ht); w.endUnit();
+  refused("a conditional branch skips the set, then an unconditional one leaves", &w, &tables, 0u32, "before it is set");
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht);
+  w.opU(OP_BLOCK, b0); w.opU(OP_BLOCK, b0); w.boolConst(true); w.opU(OP_BR_IF, 1u32);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_SET, l0); w.op(OP_END); w.op(OP_END);
+  w.opU(OP_LOCAL_GET, l0); w.opU(OP_DROP, ht); w.endUnit();
+  refused("a branch two blocks out skips the set", &w, &tables, 0u32, "before it is set");
+  w = CodeWriter.make();
+  ht = w.code.types.handle(2u32);
+  w.beginUnit(w.code.types.sig(&[ht], e.view()), "u");
+  l0 = w.local(ht);
+  w.boolConst(true); w.op(OP_RETURN); w.endUnit();
+  accepted("a return needs no local set (it leaves the unit)", &w, &tables);
+
+  // ---- aggregates ----
+  w = unit(e.view(), e.view());
+  tt = w.code.types.tuple(&[TY_F64, TY_BOOL]);
+  w.boolConst(true); w.f64Const(1.0); w.opU(OP_TUPLE_MAKE, tt); w.opU(OP_DROP, tt); w.endUnit();
+  refused("tuple.make with the fields in the wrong order", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  tt = w.code.types.tuple(&[TY_F64, TY_F64]);
+  w.f64Const(1.0); w.opU(OP_TUPLE_MAKE, tt); w.opU(OP_DROP, tt); w.endUnit();
+  refused("tuple.make with too few values", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_TUPLE_MAKE, TY_F64); w.endUnit();
+  refused("tuple.make of a type that is not a tuple", &w, &tables, 0u32, "tuple type");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_TUPLE_MAKE, 99u32); w.endUnit();
+  refused("tuple.make of a type out of range", &w, &tables, 0u32, "tuple type");
+  w = unit(e.view(), e.view());
+  tt = w.code.types.tuple(&[TY_F64, TY_F64]);
+  w.f64Const(1.0); w.opUU(OP_TUPLE_GET, tt, 0u32); w.endUnit();
+  refused("tuple.get on a value that is not that tuple", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  tt = w.code.types.tuple(&[TY_F64, TY_F64]);
+  w.opUU(OP_TUPLE_GET, tt, 0u32); w.endUnit();
+  refused("tuple.get on an empty stack", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opUU(OP_TUPLE_GET, TY_F64, 0u32); w.endUnit();
+  refused("tuple.get of a type that is not a tuple", &w, &tables, 0u32, "tuple type");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opUU(OP_TUPLE_GET, 99u32, 0u32); w.endUnit();
+  refused("tuple.get of a type out of range", &w, &tables, 0u32, "tuple type");
+  w = unit(e.view(), &[TY_BOOL]);
+  tt = w.code.types.tuple(&[TY_F64, TY_BOOL]);
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_TUPLE_MAKE, tt); w.opUU(OP_TUPLE_GET, tt, 0u32); w.endUnit();
+  refused("tuple.get gives the field's type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_BOOL]);
+  tt = w.code.types.tuple(&[TY_F64, TY_BOOL]);
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_TUPLE_MAKE, tt); w.opUU(OP_TUPLE_GET, tt, 1u32); w.endUnit();
+  accepted("tuple.make then tuple.get", &w, &tables);
+  w = unit(e.view(), e.view());
+  tt = w.code.types.tuple(&[TY_F64, TY_F64]);
+  tt2 = w.code.types.tuple(&[TY_F64, TY_BOOL]);
+  w.f64Const(1.0); w.f64Const(1.0); w.opU(OP_TUPLE_MAKE, tt); w.opUU(OP_TUPLE_GET, tt2, 0u32); w.endUnit();
+  refused("tuple.get of a different tuple type", &w, &tables, 0u32, "wrong type");
+  // two tuple types spelled twice, the same structure, are the same type
+  w = CodeWriter.make();
+  tt = w.code.types.tuple(&[TY_F64, TY_F64]);
+  w.code.types.defs.push(TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]()));
+  (&mut w.code.types.defs[w.code.types.defs.len() - 1usize]).items.push(TY_F64);
+  (&mut w.code.types.defs[w.code.types.defs.len() - 1usize]).items.push(TY_F64);
+  let twin = u32.from(w.code.types.defs.len() - 1usize);
+  w.beginUnit(w.code.types.sig(e.view(), &[TY_F64]), "u");
+  w.f64Const(1.0); w.f64Const(2.0); w.opU(OP_TUPLE_MAKE, tt); w.opUU(OP_TUPLE_GET, twin, 1u32); w.endUnit();
+  accepted("a tuple type spelled twice is one type", &w, &tables);
+
+  w = unit(e.view(), e.view());
+  lt = w.code.types.list(TY_F64);
+  w.boolConst(true); w.opUU(OP_LIST_MAKE, lt, 1u32); w.opU(OP_DROP, lt); w.endUnit();
+  refused("list.make with the wrong element type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  lt = w.code.types.list(TY_F64);
+  w.f64Const(1.0); w.opUU(OP_LIST_MAKE, lt, 2u32); w.opU(OP_DROP, lt); w.endUnit();
+  refused("list.make with too few values", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), e.view());
+  lt = w.code.types.list(TY_F64);
+  w.opUU(OP_LIST_MAKE, lt, 0u32); w.opU(OP_DROP, lt); w.endUnit();
+  accepted("an empty list", &w, &tables);
+  w = unit(e.view(), e.view());
+  lt = w.code.types.list(TY_F64);
+  w.opUU(OP_LIST_MAKE, lt, 70000u32); w.opU(OP_DROP, lt); w.endUnit();
+  refused("list.make with too many items", &w, &tables, 0u32, "too many");
+  w = unit(e.view(), e.view());
+  w.opUU(OP_LIST_MAKE, 99u32, 0u32); w.endUnit();
+  refused("list.make of a type out of range", &w, &tables, 0u32, "list type");
+  w = unit(e.view(), &[TY_F64]);
+  lt = w.code.types.list(TY_F64);
+  w.opUU(OP_LIST_MAKE, lt, 0u32); w.endUnit();
+  refused("a list where an f64 is wanted", &w, &tables, 0u32, "wrong type");
+
+  w = unit(e.view(), &[TY_F64]);
+  w.f64Const(1.0); w.f64Const(2.0); w.boolConst(true); w.opU(OP_SELECT, TY_F64); w.endUnit();
+  accepted("select", &w, &tables);
+  w = unit(e.view(), &[TY_F64]);
+  w.f64Const(1.0); w.f64Const(2.0); w.f64Const(3.0); w.opU(OP_SELECT, TY_F64); w.endUnit();
+  refused("select whose condition is not a bool", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  w.f64Const(1.0); w.boolConst(true); w.boolConst(true); w.opU(OP_SELECT, TY_F64); w.endUnit();
+  refused("select whose first arm has the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  w.boolConst(true); w.f64Const(2.0); w.boolConst(true); w.opU(OP_SELECT, TY_F64); w.endUnit();
+  refused("select whose second arm has the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), &[TY_F64]);
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_SELECT, TY_F64); w.endUnit();
+  refused("select with too few values", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.f64Const(2.0); w.boolConst(true); w.opU(OP_SELECT, 99u32); w.endUnit();
+  refused("select of a type out of range", &w, &tables, 0u32, "value type");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.f64Const(2.0); w.boolConst(true); w.opU(OP_SELECT, b0); w.endUnit();
+  refused("select of a signature type", &w, &tables, 0u32, "value type");
+  w = unit(e.view(), &[TY_BOOL]);
+  w.f64Const(1.0); w.f64Const(2.0); w.boolConst(true); w.opU(OP_SELECT, TY_F64); w.endUnit();
+  refused("select gives its type", &w, &tables, 0u32, "wrong type");
+
+  w = unit(e.view(), e.view());
+  w.opU(OP_DROP, TY_F64); w.endUnit();
+  refused("drop with an empty stack", &w, &tables, 0u32, "empty");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_DROP, 99u32); w.endUnit();
+  refused("drop of a type out of range", &w, &tables, 0u32, "value type");
+  w = unit(e.view(), e.view());
+  b0 = w.code.types.sig(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_DROP, b0); w.endUnit();
+  refused("drop of a signature type", &w, &tables, 0u32, "value type");
+
+  // ---- calls ----
+  w = CodeWriter.make();
+  var sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  var sigB = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(sigF, "callee"); w.opU(OP_LOCAL_GET, 0u32); w.endUnit();
+  w.beginUnit(sigB, "caller"); w.boolConst(true); w.opU(OP_CALL, 0u32); w.endUnit();
+  refused("a call with an argument of the wrong type", &w, &tables, 1u32, "wrong type");
+  w = CodeWriter.make();
+  sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  sigB = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(sigF, "callee"); w.opU(OP_LOCAL_GET, 0u32); w.endUnit();
+  w.beginUnit(sigB, "caller"); w.opU(OP_CALL, 0u32); w.endUnit();
+  refused("a call with too few arguments", &w, &tables, 1u32, "empty");
+  w = CodeWriter.make();
+  sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  sigB = w.code.types.sig(e.view(), &[TY_BOOL]);
+  w.beginUnit(sigF, "callee"); w.opU(OP_LOCAL_GET, 0u32); w.endUnit();
+  w.beginUnit(sigB, "caller"); w.f64Const(1.0); w.opU(OP_CALL, 0u32); w.endUnit();
+  refused("a call's result used as the wrong type", &w, &tables, 1u32, "wrong type");
+  w = CodeWriter.make();
+  sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  sigB = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(sigF, "callee"); w.opU(OP_LOCAL_GET, 0u32); w.endUnit();
+  w.beginUnit(sigB, "caller"); w.f64Const(1.0); w.opU(OP_CALL, 0u32); w.endUnit();
+  refused("a call's result left on the stack", &w, &tables, 1u32, "left on the stack");
+  w = CodeWriter.make();
+  sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(sigF, "callee"); w.opU(OP_LOCAL_GET, 0u32); w.endUnit();
+  w.beginUnit(sigF, "caller"); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 0u32); w.opU(OP_CALL, 0u32); w.endUnit();
+  accepted("calls, in a chain", &w, &tables);
+  w = CodeWriter.make();
+  sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(sigF, "self"); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 0u32); w.endUnit();
+  accepted("a unit that calls itself (fuel stops it)", &w, &tables);
+  // a call whose callee's signature has two parameters, passed in the wrong order
+  w = CodeWriter.make();
+  let sig2 = w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64]);
+  sigB = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(sig2, "callee"); w.opU(OP_LOCAL_GET, 0u32); w.endUnit();
+  w.beginUnit(sigB, "caller"); w.boolConst(true); w.f64Const(1.0); w.opU(OP_CALL, 0u32); w.endUnit();
+  refused("a call with its arguments in the wrong order", &w, &tables, 1u32, "wrong type");
+  // handle kinds and list element types are part of a type
+  w = CodeWriter.make();
+  let h3 = w.code.types.handle(3u32);
+  let h4 = w.code.types.handle(4u32);
+  let s3 = w.code.types.sig(&[h3], e.view());
+  let s4 = w.code.types.sig(&[h4], e.view());
+  w.beginUnit(s3, "wants3"); w.endUnit();
+  w.beginUnit(s4, "gives4"); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 0u32); w.endUnit();
+  refused("a handle of kind 4 passed where kind 3 is wanted", &w, &tables, 1u32, "wrong type");
+  w = CodeWriter.make();
+  let lf = w.code.types.list(TY_F64);
+  let li = w.code.types.list(TY_I64);
+  let sl = w.code.types.sig(&[lf], e.view());
+  let sli = w.code.types.sig(&[li], e.view());
+  w.beginUnit(sl, "wantsF"); w.endUnit();
+  w.beginUnit(sli, "givesI"); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 0u32); w.endUnit();
+  refused("a list of i64 passed where a list of f64 is wanted", &w, &tables, 1u32, "wrong type");
+
+  // ---- imports: the signature the host offers, and the arguments ----
+  var ti = ImportTables[u8].make();
+  let th3 = ti.types.handle(3u32);
+  let tl3 = ti.types.list(th3);
+  ti.add("vocabulary", "mk", ti.types.sig(&[TY_F64], &[th3]), false, 1u32, &noop);
+  ti.add("vocabulary", "use", ti.types.sig(&[tl3], &[TY_F64]), false, 1u32, &noop);
+  ti.add("host", "two", ti.types.sig(&[TY_F64, TY_BOOL], &[TY_F64, TY_BOOL]), false, 1u32, &noop);
+  w = CodeWriter.make();
+  var c3 = w.code.types.handle(3u32);
+  var cl3 = w.code.types.list(c3);
+  var imk = w.addImport("vocabulary", "mk", w.code.types.sig(&[TY_F64], &[c3]));
+  var iuse = w.addImport("vocabulary", "use", w.code.types.sig(&[cl3], &[TY_F64]));
+  w.beginUnit(w.code.types.sig(e.view(), &[TY_F64]), "u");
+  w.f64Const(1.0); w.opU(OP_IMPORT, imk); w.opUU(OP_LIST_MAKE, cl3, 1u32); w.opU(OP_IMPORT, iuse); w.endUnit();
+  accepted("imports whose signatures match", &w, &ti);
+  w = CodeWriter.make();
+  c3 = w.code.types.handle(4u32);
+  imk = w.addImport("vocabulary", "mk", w.code.types.sig(&[TY_F64], &[c3]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.f64Const(1.0); w.opU(OP_IMPORT, imk); w.opU(OP_DROP, c3); w.endUnit();
+  refused("an import whose result is a handle of another kind", &w, &ti, 0u32, "different signature");
+  w = CodeWriter.make();
+  c3 = w.code.types.handle(3u32);
+  cl3 = w.code.types.list(TY_F64);
+  iuse = w.addImport("vocabulary", "use", w.code.types.sig(&[cl3], &[TY_F64]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.opUU(OP_LIST_MAKE, cl3, 0u32); w.opU(OP_IMPORT, iuse); w.opU(OP_DROP, TY_F64); w.endUnit();
+  refused("an import whose parameter is a list of another element type", &w, &ti, 0u32, "different signature");
+  w = CodeWriter.make();
+  imk = w.addImport("vocabulary", "mk", w.code.types.sig(&[TY_F64, TY_F64], &[w.code.types.handle(3u32)]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.f64Const(1.0); w.f64Const(1.0); w.opU(OP_IMPORT, imk); w.opU(OP_DROP, w.code.types.handle(3u32)); w.endUnit();
+  refused("an import with a parameter too many", &w, &ti, 0u32, "different signature");
+  w = CodeWriter.make();
+  imk = w.addImport("vocabulary", "mk", w.code.types.sig(e.view(), &[w.code.types.handle(3u32)]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.opU(OP_IMPORT, imk); w.opU(OP_DROP, w.code.types.handle(3u32)); w.endUnit();
+  refused("an import with a parameter too few", &w, &ti, 0u32, "different signature");
+  w = CodeWriter.make();
+  var itwo = w.addImport("host", "two", w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_BOOL, TY_F64]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_IMPORT, itwo); w.opU(OP_DROP, TY_F64); w.opU(OP_DROP, TY_BOOL); w.endUnit();
+  refused("an import whose results are in another order", &w, &ti, 0u32, "different signature");
+  w = CodeWriter.make();
+  itwo = w.addImport("host", "two", w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64, TY_BOOL]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.boolConst(true); w.f64Const(1.0); w.opU(OP_IMPORT, itwo); w.opU(OP_DROP, TY_BOOL); w.opU(OP_DROP, TY_F64); w.endUnit();
+  refused("an import called with its arguments in the wrong order", &w, &ti, 0u32, "wrong type");
+  w = CodeWriter.make();
+  itwo = w.addImport("host", "two", w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64, TY_BOOL]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.opU(OP_IMPORT, itwo); w.endUnit();
+  refused("an import called with too few arguments", &w, &ti, 0u32, "empty");
+  w = CodeWriter.make();
+  itwo = w.addImport("host", "two", w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64, TY_BOOL]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_IMPORT, itwo); w.opU(OP_DROP, TY_BOOL); w.endUnit();
+  refused("an import's results left on the stack", &w, &ti, 0u32, "left on the stack");
+  w = CodeWriter.make();
+  itwo = w.addImport("host", "two", w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64, TY_BOOL]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.f64Const(1.0); w.boolConst(true); w.opU(OP_IMPORT, itwo); w.opU(OP_DROP, TY_F64); w.opU(OP_DROP, TY_BOOL); w.endUnit();
+  refused("an import's results dropped in the wrong order", &w, &ti, 0u32, "wrong type");
+  w = CodeWriter.make();
+  w.addImport("host", "two", TY_F64);
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u"); w.opU(OP_IMPORT, 0u32); w.endUnit();
+  refused("an import whose type is not a signature", &w, &ti, 0u32, "not a signature");
+  w = CodeWriter.make();
+  w.addImport("host", "two", 99u32);
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u"); w.opU(OP_IMPORT, 0u32); w.endUnit();
+  refused("an import whose type is out of range", &w, &ti, 0u32, "not a signature");
+  w = CodeWriter.make();
+  w.addImport("host", "Two", w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64, TY_BOOL]));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u"); w.opU(OP_IMPORT, 0u32); w.endUnit();
+  refused("an import named in other case", &w, &ti, 0u32, "not offered");
+
+  // ---- the unit's own declarations ----
+  w = unit(e.view(), e.view());
+  w.code.units[0usize].sig = TY_F64;
+  w.endUnit();
+  refused("a unit whose type is not a signature", &w, &tables, 0u32, "not a signature");
+  w = unit(e.view(), e.view());
+  w.code.units[0usize].sig = 77u32;
+  w.endUnit();
+  refused("a unit whose type is out of range", &w, &tables, 0u32, "not a signature");
+  w = unit(e.view(), e.view());
+  w.code.units[0usize].locals.push(88u32);
+  w.endUnit();
+  refused("a local whose type is out of range", &w, &tables, 0u32, "value type");
+  w = unit(e.view(), e.view());
+  w.code.units[0usize].locals.push(w.code.types.sig(e.view(), e.view()));
+  w.endUnit();
+  refused("a local whose type is a signature", &w, &tables, 0u32, "value type");
+  w = unit(e.view(), e.view());
+  w.endUnit();
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "second"); w.op(OP_F64_NEG); w.endUnit();
+  refused("a second unit's fault is the second unit's", &w, &tables, 1u32, "empty");
+
+  // ---- types ----
+  w = unit(e.view(), e.view());
+  w.code.types.defs.push(TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]()));
+  w.endUnit();
+  refused("an empty tuple type", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  var sg = w.code.types.sig(e.view(), e.view());
+  var td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  td.items.push(sg);
+  w.code.types.defs.push(td);
+  w.endUnit();
+  refused("a tuple holding a signature", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  sg = w.code.types.sig(e.view(), e.view());
+  w.code.types.defs.push(TypeDef(T_LIST, sg, List[u32](), List[u32]()));
+  w.endUnit();
+  refused("a list of signatures", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  w.code.types.defs.push(TypeDef(99u8, 0u32, List[u32](), List[u32]()));
+  w.endUnit();
+  refused("a type of an unknown kind", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  w.code.types.defs.push(TypeDef(T_F64, 0u32, List[u32](), List[u32]()));
+  w.endUnit();
+  refused("a primitive type outside the first four", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  w.code.types.defs[1usize].kind = T_F64;
+  w.endUnit();
+  refused("the first four types not the primitives", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  var q = 0u32;
+  while q < 4097u32 { td.items.push(TY_F64); q = q + 1u32; }
+  w.code.types.defs.push(td);
+  w.endUnit();
+  refused("a tuple of more than 4096 slots", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  q = 0u32;
+  while q < 4096u32 { td.items.push(TY_F64); q = q + 1u32; }
+  w.code.types.defs.push(td);
+  w.endUnit();
+  accepted("a tuple of exactly 4096 slots", &w, &tables);
+  w = unit(e.view(), e.view());
+  td = TypeDef(T_SIG, 0u32, List[u32](), List[u32]());
+  td.items.push(500u32);
+  w.code.types.defs.push(td);
+  w.endUnit();
+  refused("a signature whose parameter type is out of range", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  sg = w.code.types.sig(e.view(), e.view());
+  td = TypeDef(T_SIG, 0u32, List[u32](), List[u32]());
+  td.results.push(sg);
+  w.code.types.defs.push(td);
+  w.endUnit();
+  refused("a signature with a signature as a result", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  w.code.types.defs.push(TypeDef(T_HANDLE, 5u32, List[u32](), List[u32]()));
+  w.endUnit();
+  accepted("a handle of any kind index", &w, &tables);
+
+  // ---- entries, version, and the acting wall ----
+  w = unit(e.view(), e.view());
+  w.endUnit(); w.addEntry(ENTRY_FIXED, 5u32, 0u32, 0u32);
+  refused("an entry for a unit that does not exist", &w, &tables, NO_UNIT, "does not exist");
+  w = unit(e.view(), e.view());
+  w.endUnit(); w.addEntry(9u8, 0u32, 0u32, 0u32);
+  refused("an entry of an unknown kind", &w, &tables, 0u32, "unknown kind");
+  w = unit(e.view(), e.view());
+  w.endUnit();
+  w.code.major = 2u16;
+  refused("verify checks the major version itself", &w, &tables, NO_UNIT, "major version");
+  w = unit(e.view(), e.view());
+  w.endUnit();
+  w.code.minor = 9u16;
+  accepted("a newer minor version is accepted", &w, &tables);
+  // two calls deep, and a mixed pair of entries on one unit
+  var ta = ImportTables[u8].make();
+  let asig = ta.types.sig(e.view(), e.view());
+  ta.add("host", "act", asig, true, 1u32, &noop);
+  w = CodeWriter.make();
+  let wasig = w.code.types.sig(e.view(), e.view());
+  let ia = w.addImport("host", "act", wasig);
+  w.beginUnit(wasig, "acts"); w.opU(OP_IMPORT, ia); w.endUnit();
+  w.beginUnit(wasig, "mid"); w.opU(OP_CALL, 0u32); w.endUnit();
+  w.beginUnit(wasig, "top"); w.opU(OP_CALL, 1u32); w.endUnit();
+  w.addEntry(ENTRY_DERIVE, 2u32, 0u32, 0u32);
+  refused("a derive reaching an acting import through two calls", &w, &ta, 2u32, "acting");
+  w = CodeWriter.make();
+  let wasig2 = w.code.types.sig(e.view(), e.view());
+  let ia2 = w.addImport("host", "act", wasig2);
+  w.beginUnit(wasig2, "acts"); w.opU(OP_IMPORT, ia2); w.endUnit();
+  w.addEntry(ENTRY_HANDLER, 0u32, 0u32, 0u32);
+  w.addEntry(ENTRY_FIXED, 0u32, 1u32, 0u32);
+  refused("a unit that is a handler and also a fixed entry", &w, &ta, 0u32, "acting");
+  w = CodeWriter.make();
+  let wasig3 = w.code.types.sig(e.view(), e.view());
+  let ia3 = w.addImport("host", "act", wasig3);
+  w.beginUnit(wasig3, "acts"); w.opU(OP_IMPORT, ia3); w.endUnit();
+  w.beginUnit(wasig3, "calls"); w.opU(OP_CALL, 0u32); w.endUnit();
+  w.addEntry(ENTRY_FIXED, 1u32, 0u32, 0u32);
+  match verifyEach(&w.code, &ta) {
+    case let Ok(v) { expect(v.isRefused(1usize), "the fixed caller is refused"); expect(!v.isRefused(0usize), "the acting unit itself is kept"); }
+    case let Err(ps) { expect(false, "verifyEach gives a VerifiedCode for unit faults"); }
+  }
+  // a mutual recursion that reaches an acting import
+  w = CodeWriter.make();
+  let wasig4 = w.code.types.sig(e.view(), e.view());
+  let ia4 = w.addImport("host", "act", wasig4);
+  w.beginUnit(wasig4, "a"); w.opU(OP_CALL, 1u32); w.endUnit();
+  w.beginUnit(wasig4, "b"); w.opU(OP_CALL, 0u32); w.opU(OP_IMPORT, ia4); w.endUnit();
+  w.addEntry(ENTRY_DERIVE, 0u32, 0u32, 0u32);
+  refused("a derive in a call cycle that reaches an acting import", &w, &ta, 0u32, "acting");
+
+  // ---- the size of a frame: slot counts must not wrap (a wrapped count would put a local outside the frame) ----
+  w = unit(e.view(), e.view());
+  td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  q = 0u32;
+  while q < 4096u32 { td.items.push(TY_F64); q = q + 1u32; }
+  w.code.types.defs.push(td);
+  let big = u32.from(w.code.types.defs.len() - 1usize);
+  q = 0u32;
+  while q < 256u32 { w.local(big); q = q + 1u32; }
+  w.endUnit();
+  accepted("locals filling exactly the largest frame", &w, &tables);
+  w.code.units[0usize].locals.push(big);
+  refused("locals one slot-block over the largest frame", &w, &tables, 0u32, "frame is too large");
+  q = 0u32;
+  while q < 1048320u32 { w.code.units[0usize].locals.push(big); q = q + 1u32; }
+  refused("so many large locals that their slot count wraps 32 bits", &w, &tables, 0u32, "frame is too large");
+  w = unit(e.view(), e.view());
+  td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  q = 0u32;
+  while q < 4096u32 { td.items.push(TY_F64); q = q + 1u32; }
+  w.code.types.defs.push(td);
+  let big2 = u32.from(w.code.types.defs.len() - 1usize);
+  var bl = w.local(big2);
+  q = 0u32;
+  while q < 256u32 { w.opU(OP_LOCAL_GET, bl); q = q + 1u32; }
+  q = 0u32;
+  while q < 256u32 { w.opU(OP_DROP, big2); q = q + 1u32; }
+  w.endUnit();
+  accepted("an operand stack filling exactly the largest frame", &w, &tables);
+  w = unit(e.view(), e.view());
+  td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  q = 0u32;
+  while q < 4096u32 { td.items.push(TY_F64); q = q + 1u32; }
+  w.code.types.defs.push(td);
+  let big3 = u32.from(w.code.types.defs.len() - 1usize);
+  bl = w.local(big3);
+  q = 0u32;
+  while q < 257u32 { w.opU(OP_LOCAL_GET, bl); q = q + 1u32; }
+  q = 0u32;
+  while q < 257u32 { w.opU(OP_DROP, big3); q = q + 1u32; }
+  w.endUnit();
+  refused("an operand stack one slot-block over the largest frame", &w, &tables, 0u32, "too deep");
+  // an import whose results alone are larger than a frame
+  var tb2 = ImportTables[u8].make();
+  var bigRes = List[u32]();
+  td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  q = 0u32;
+  while q < 4096u32 { td.items.push(TY_F64); q = q + 1u32; }
+  tb2.types.defs.push(td);
+  let tbig = u32.from(tb2.types.defs.len() - 1usize);
+  q = 0u32;
+  while q < 300u32 { bigRes.push(tbig); q = q + 1u32; }
+  tb2.add("host", "huge", tb2.types.sig(e.view(), bigRes.view()), false, 1u32, &noop);
+  w = CodeWriter.make();
+  td = TypeDef(T_TUPLE, 0u32, List[u32](), List[u32]());
+  q = 0u32;
+  while q < 4096u32 { td.items.push(TY_F64); q = q + 1u32; }
+  w.code.types.defs.push(td);
+  let cbig = u32.from(w.code.types.defs.len() - 1usize);
+  let ihuge = w.addImport("host", "huge", w.code.types.sig(e.view(), bigRes.view()));
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "u");
+  w.opU(OP_IMPORT, ihuge); w.endUnit();
+  refused("an import whose results are larger than a frame", &w, &tb2, 0u32, "too deep");
+
+  // ---- the container ----
+  w = unit(e.view(), e.view());
+  w.endUnit();
+  let good = encode(&w.code);
+  expect(reads(good.view()), "the container of a sound unit reads");
+  var starts = List[usize]();
+  var k = 8usize;
+  while k < good.len() { starts.push(k); k = k + 2usize + usize.from(*good[k + 1usize]); }
+  var bad = good.clone();
+  bad.set(*starts[2usize] + 2usize, 1u8);
+  expect(!reads(bad.view()), "a non-empty constants section is refused");
+  bad = good.clone();
+  bad.push(7u8); bad.push(0u8);
+  expect(!reads(bad.view()), "an unknown section of the same minor version is refused");
+  bad = good.clone();
+  bad.push(7u8); bad.push(2u8); bad.push(1u8); bad.push(2u8);
+  bad.set(6usize, 1u8);
+  expect(reads(bad.view()), "an unknown section of a newer minor version is skipped");
+  bad = good.clone();
+  bad.set(6usize, 1u8);
+  expect(reads(bad.view()), "a newer minor version with known sections reads");
+  bad = good.clone();
+  bad.push(7u8); bad.push(9u8); bad.set(6usize, 1u8);
+  expect(!reads(bad.view()), "a skipped section must still fit in the bytes");
+  bad = List[u8]();
+  k = 0usize;
+  while k < *starts[4usize] { bad.push(*good[k]); k = k + 1usize; }
+  k = *starts[5usize];
+  while k < good.len() { bad.push(*good[k]); k = k + 1usize; }
+  expect(!reads(bad.view()), "a missing required section is refused");
+  bad = List[u8]();
+  k = 0usize;
+  while k < *starts[5usize] { bad.push(*good[k]); k = k + 1usize; }
+  k = *starts[4usize];
+  while k < *starts[5usize] { bad.push(*good[k]); k = k + 1usize; }
+  k = *starts[5usize];
+  while k < good.len() { bad.push(*good[k]); k = k + 1usize; }
+  expect(!reads(bad.view()), "a repeated section is refused");
+  bad = good.clone();
+  bad.set(*starts[1usize] + 1usize, *good[*starts[1usize] + 1usize] + 5u8);
+  expect(!reads(bad.view()), "a section length that runs past the bytes is refused");
+  bad = good.clone();
+  bad.set(*starts[3usize] + 1usize, *good[*starts[3usize] + 1usize] + 1u8);
+  expect(!reads(bad.view()), "a section length longer than its contents is refused");
+  bad = good.clone();
+  bad.truncate(5usize);
+  expect(!reads(bad.view()), "a container cut inside the version is refused");
+  bad = List[u8]();
+  expect(!reads(bad.view()), "no bytes is refused");
+  bad = good.clone();
+  bad.truncate(8usize);
+  expect(!reads(bad.view()), "a header with no sections is refused");
+  bad = good.clone();
+  bad.set(3usize, 1u8);
+  expect(!reads(bad.view()), "a wrong fourth magic byte is refused");
+  bad = good.clone();
+  bad.set(5usize, 1u8);
+  expect(!reads(bad.view()), "a major version of 256 is refused");
+  bad = good.clone();
+  bad.set(4usize, 0u8);
+  expect(!reads(bad.view()), "a major version of 0 is refused");
+  done()
+}
