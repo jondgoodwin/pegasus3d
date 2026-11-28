@@ -1,0 +1,186 @@
+// The driven checks of connected play (`pegasus --checks`): the pure cores of netplay.cone run with no network, so a
+// silent failure is caught by a number. Each has a mutant (PEGASUS_MUTANT) the check must fail:
+//   no-replay        the samples after the acknowledged one are never replayed over the server's body
+//   stale-personal   an older acknowledgement is taken as if it were the newest
+//   stale-shared     an older shared snapshot is merged as if it were the newest
+// The wire check has no mutant: it is a round trip of every message.
+
+const CHECK_STEPS = 120u32;
+const CHECK_DELAY = 6u32;           // the server's answer to sample N reaches the client at step N + this
+
+// The body after the first 'n' samples of the check's walk: every sample walks forward, the look turning a little each step
+fn walkYaw(i: u32) f32 { 0.01 * f32.from(i) }
+
+fn truthAfter(n: u32) PersonState {
+  var p = PersonState(Vec3(0., 0., 0.), 0.);
+  var i = 1u32;
+  while i <= n { applyBody(&mut p, 1., 0., walkYaw(i)); i = i + 1u32; }
+  p
+}
+
+// A client walks for CHECK_STEPS steps; the server's word on sample N arrives CHECK_DELAY steps after it, and one
+// answer in twenty is lost. Every answer the server gives is its body after sample N, run with the same body code.
+// Passes if prediction was never wrong: no correction, no mismatch, and the body ends where the whole walk puts it
+fn checkReconcile(skipReplay: bool) bool {
+  var p = Predictor.make(Vec3(0., 0., 0.), skipReplay, false);
+  var lost = 0u32;
+  var s = 1u32;
+  while s <= CHECK_STEPS {
+    _ = p.sample(1., 0., walkYaw(s));
+    p.smooth();
+    if s > CHECK_DELAY {
+      let n = s - CHECK_DELAY;
+      if (n * 7919u32) % 20u32 == 0u32 {
+        lost = lost + 1u32;      // this answer never arrives; the next carries a later number
+      } else {
+        let t = truthAfter(n);
+        p.acknowledge(n, t.feet, t.yaw);
+      }
+    }
+    s = s + 1u32;
+  }
+  let end = truthAfter(CHECK_STEPS);
+  let off = (p.person.feet - end.feet).length();
+  print <- "check reconcile (a "; print <- CHECK_DELAY; print <- "-step delay, "; print <- lost; print <- " of "; print <- CHECK_STEPS - CHECK_DELAY;
+  print <- " answers lost): "; print <- p.acks; print <- " taken, "; print <- p.replayed; print <- " samples replayed, "; print <- p.corrections;
+  print <- " corrections, "; print <- p.mismatches; print <- " mismatches, ends "; printF(off * 1000.); print <- " mm from the whole walk";
+  let ok = p.acks > 0u64 && p.replayed > 0u64 && p.corrections == 0u64 && p.mismatches == 0u64 && off < PREDICT_TOLERANCE;
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED (an unacknowledged sample was not replayed)\n"; }
+  ok
+}
+
+// The server answers sample 20, then an older answer (sample 10) arrives late. The older must be dropped: the body
+// stays where sample 30 put it
+fn checkStalePersonal(takeStale: bool) bool {
+  var p = Predictor.make(Vec3(0., 0., 0.), false, takeStale);
+  var s = 1u32;
+  while s <= 30u32 { _ = p.sample(1., 0., walkYaw(s)); s = s + 1u32; }
+  let t20 = truthAfter(20u32);
+  p.acknowledge(20u32, t20.feet, t20.yaw);
+  let t10 = truthAfter(10u32);
+  p.acknowledge(10u32, t10.feet, t10.yaw);
+  let end = truthAfter(30u32);
+  let off = (p.person.feet - end.feet).length();
+  print <- "check stale acknowledgement: "; print <- p.stale; print <- " dropped, body "; printF(off * 1000.); print <- " mm from where sample 30 puts it";
+  let ok = p.stale == 1u64 && off < PREDICT_TOLERANCE;
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED (an old acknowledgement was merged)\n"; }
+  ok
+}
+
+fn onePerson(id: u32, x: f32) OtherPersons {
+  var l = OtherPersons();
+  l.push(OtherPerson(id, Vec3(x, 0., 0.), 0.));
+  l
+}
+
+// Shared snapshots 10 and 12 arrive, then an old one (9) with the person far away. The merge must show the person
+// where 10 and 12 put it, and at the middle time the halfway place
+fn checkSharedInterp(takeStale: bool) bool {
+  var ip = Interpolator.make(takeStale);
+  let step = i64.from(STEP_NS);
+  let t0 = 1000000000i64;
+  _ = ip.add(10u64, t0, onePerson(2u32, 0.));
+  _ = ip.add(12u64, t0 + 2i64 * step, onePerson(2u32, 1.));
+  _ = ip.add(9u64, t0 + 2i64 * step + 1000i64, onePerson(2u32, 999.));
+  // half way between 10 and 12 is step 11: "now" is the newest's arrival plus (6 - 1) steps of delay
+  let mid = ip.at(t0 + 2i64 * step + 5i64 * step);
+  var midX: f32 = -1.;
+  if mid.len() == 1usize { midX = mid[0usize].feet.x; }
+  // past the newest, it holds the newest
+  let late = ip.at(t0 + 2i64 * step + 20i64 * step);
+  var lateX: f32 = -1.;
+  if late.len() == 1usize { lateX = late[0usize].feet.x; }
+  print <- "check shared snapshots: "; print <- ip.stale; print <- " stale dropped; at the middle the person is at x "; printF(midX);
+  print <- ", past the newest at x "; printF(lateX);
+  let ok = ip.stale == 1u64 && absf(midX - 0.5) < 0.02 && absf(lateX - 1.) < 0.001;
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED (a stale or misplaced snapshot was merged)\n"; }
+  ok
+}
+
+// The wire: every message encoded, taken apart again, and a message cut short refused
+fn checkWire() bool {
+  var ok = true;
+  // parts and shapes, as many as one world holds, in messages that fit a packet
+  var parts = SimParts();
+  var i = 0u32;
+  while i < 100u32 {
+    var name = String.from("a/part/path-");
+    name.appendByte('0' + u8.from(i / 10u32));
+    name.appendByte('0' + u8.from(i % 10u32));
+    parts.push(SimPart(i, name, 7000u64 + u64.from(i), Mat4.fromTranslation(Vec3(f32.from(i), 0.5, -8.)), i, true));
+    i = i + 1u32;
+  }
+  let msgs = encodeParts(&parts);
+  var most = 0usize;
+  var got = PartDecls();
+  var idsOk = true;
+  each m in &msgs {
+    if m.len() > most { most = m.len(); }
+    let says = decodeServerSays(bytesOfList(m));
+    if says.tag != S_PARTS || says.firstId != u32.from(got.len()) { idsOk = false; }
+    each d in &says.declared { got.push(PartDecl(d.name.clone(), d.key, d.placement, d.slot)); }
+  }
+  var partsOk = idsOk && got.len() == 100usize && most <= 1173usize && msgs.len() > 1usize;
+  if partsOk {
+    let k = 57usize;
+    partsOk = got[k].key == 7057u64 && got[k].name.view() == "a/part/path-57" && got[k].placement.m[12] == 57.;
+  }
+  print <- "check wire parts: 100 parts in "; print <- u64.from(msgs.len()); print <- " messages, the largest "; print <- u64.from(most); print <- " bytes";
+  if partsOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+  var shapes = ShapeTable();
+  i = 0u32;
+  while i < 40u32 { shapes.push(ContentShapes(7000u64 + u64.from(i), BoxShape(Vec3(0.5, 0.5, 0.5), Vec3(0., 0.5, 0.)), BoxShape(Vec3(0.6, 0.5, 0.5), Vec3(0., 0.25, 0.)))); i = i + 1u32; }
+  let sm = encodeShapes(&shapes);
+  var shapesGot = 0usize;
+  var shapesOk = true;
+  each m in &sm {
+    let says = decodeServerSays(bytesOfList(m));
+    if says.tag != S_SHAPES || m.len() > 1173usize { shapesOk = false; }
+    each s in &says.shapes { if s.pick.half.x != 0.6 { shapesOk = false; } shapesGot = shapesGot + 1usize; }
+  }
+  shapesOk = shapesOk && shapesGot == 40usize;
+  print <- "check wire shapes: "; print <- u64.from(shapesGot); print <- " of 40"; if shapesOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+  // the input: the newest MOST_SENT_SAMPLES of what is unacknowledged
+  var p = Predictor.make(Vec3(0., 0., 0.), false, false);
+  i = 1u32;
+  while i <= 45u32 { _ = p.sample(1., 0.5, walkYaw(i)); i = i + 1u32; }
+  let inb = bytesOfList(&p.encodeInput());
+  var back = BodySamples();
+  let inOk = decodeInput(inb, &mut back) && back.len() == 30usize && back[0usize].seq == 16u32 && back[29usize].seq == 45u32 && back[29usize].strafe == 0.5;
+  print <- "check wire input: "; print <- u64.from(back.len()); print <- " samples in "; print <- u64.from(inb.len()); print <- " bytes, the newest 30";
+  if inOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+  // hello and a press
+  let hello = decodeClientSays(bytesOfList(&encodeHello("worlds/first.ddd")));
+  let press = decodeClientSays(bytesOfList(&encodePress(&Action(VERB_PRESS, 3u32, Vec3(1., 2., 3.), Vec3(0., 0., -1.), 99u64, ORIGIN_PERSON))));
+  let msgOk = hello.tag == C_HELLO && hello.version == NET_VERSION && hello.world.view() == "worlds/first.ddd"
+    && press.tag == C_PRESS && press.action.receiver == 3u32 && press.action.from.y == 2. && press.action.along.z == -1. && press.action.madeNs == 99u64;
+  print <- "check wire hello and press"; if msgOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+  // a message cut short, and one with an unknown tag
+  var cut = encodePress(&Action(VERB_PRESS, 3u32, Vec3(1., 2., 3.), Vec3(0., 0., -1.), 99u64, ORIGIN_PERSON));
+  _ = cut.pop();
+  let bad = decodeClientSays(bytesOfList(&cut));
+  var junk = List[u8]();
+  junk.push(200u8);
+  let unknown = decodeClientSays(bytesOfList(&junk));
+  var shortInput = encodeHelloOnlyHeader();
+  var none = BodySamples();
+  let badInput = decodeInput(bytesOfList(&shortInput), &mut none);
+  let refusalOk = bad.tag == 0u32 && unknown.tag == 0u32 && !badInput;
+  print <- "check wire refuses a message cut short or unknown"; if refusalOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+  ok
+}
+
+// An input message that says 3 samples and holds half of one
+fn encodeHelloOnlyHeader() List[u8] {
+  var out = List[u8]();
+  out.push(3u8); out.push(0u8); out.push(0u8); out.push(0u8); out.push(1u8); out.push(0u8);
+  out
+}
+
+pub fn checkConnected() bool {
+  let a = checkReconcile(mutantIs("no-replay"));
+  let b = checkStalePersonal(mutantIs("stale-personal"));
+  let c = checkSharedInterp(mutantIs("stale-shared"));
+  let d = checkWire();
+  a && b && c && d
+}

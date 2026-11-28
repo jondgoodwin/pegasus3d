@@ -19,9 +19,19 @@
 //                              the 40-part world sharing five keys; the Loader lets go of one
 //   pegasus --world FILE       a real world's .ddd file read by the conescript package (with --steps or --shot); its
 //                              parts get stand-in boxes until the interpreter builds them
-//   pegasus --checks          the driven checks (the head pose read last; the Loader's key, sharing, order, unused)
+//   pegasus --checks          the driven checks (the head pose read last; the Loader's key, sharing, order, unused;
+//                              connected play's reconciliation, stale snapshots and wire)
 //
-// PEGASUS_MUTANT=stale-pose or mutate-snapshot runs a check's mutant, which
+// Connected play (plan step 8, W117; netplay.cone, the roles in simactor.cone):
+//   pegasus --serve PORT --world FILE [--steps N] [--loopback] [--until-empty] [--impair LOSS LATENCY JITTER]
+//                              a server Sim (no window, no Render) with a Loader that builds Sim's products only. It listens on
+//                              UDP PORT (0: the system chooses); --impair puts a lossy relay in front (loss per 1000, ms, ms) and
+//                              prints the relay's port; --until-empty ends it once a client has joined and none is left
+//   pegasus --join HOST:PORT --world FILE [--steps N] [--stand]
+//                              Player, a client Sim and Render; headless with --steps (scripted: walks 2 s, presses at box-a;
+//                              --stand stays still). The world file is the client's own, for its own Loader
+//
+// PEGASUS_MUTANT=stale-pose, mutate-snapshot, no-replay, stale-personal or stale-shared runs a check's mutant, which
 // the check must catch. The shell (this file) owns the window and the main
 // thread, as SDL wants: it pumps the devices and hands Player each sample.
 
@@ -40,8 +50,9 @@ import path use Path;
 import window use *;
 import actors;
 import aio use File;
-import iobuf use IoBuf;
-import iocore use Access;
+import iobuf use IoBuf, Bytes;
+import iocore use Access, SocketAddr;
+import netmsg use NetEvent, EventHandler, Connection, Endpoint, NetConfig, LinkConfig, LossyRelay, eventHandler, mustListen, mustConnect, startLossyRelay;
 import fs;
 import conescript use Understood, Val, Kind, Problem, Names, read, showProblems, numOf, OPT_AT, OPT_ROTATION, OPT_MATERIAL,
   Code, CodeWriter, CodeProblem, VerifiedCode, ImportTables, HandleTable, HANDLE_HOST, Interpreter, verify, lowerSim, entryUnit,
@@ -153,6 +164,8 @@ fn main(argc: i32, argv: **u8) i32 {
   var checksOnly = false;
   var parts40 = false;
   var worldFile = String();
+  var serving = false;
+  var netStart = NetStart.whole();
   var shotAfter = 0u64;
   var presses = ScriptPresses();
   var a = 1;
@@ -175,6 +188,27 @@ fn main(argc: i32, argv: **u8) i32 {
     } else if argIs(arg, "--world") && a + 1 < argc {
       worldFile = argString(*(argv + usize.from(a + 1)));
       a = a + 1;
+    } else if argIs(arg, "--serve") && a + 1 < argc {
+      serving = true;
+      headless = true;
+      netStart.role = SIM_SERVER;
+      netStart.port = u32.from(argNumber(*(argv + usize.from(a + 1))));
+      a = a + 1;
+    } else if argIs(arg, "--join") && a + 1 < argc {
+      netStart.role = SIM_CLIENT;
+      netStart.address = argString(*(argv + usize.from(a + 1)));
+      a = a + 1;
+    } else if argIs(arg, "--loopback") {
+      netStart.loopback = true;
+    } else if argIs(arg, "--until-empty") {
+      netStart.untilEmpty = true;
+    } else if argIs(arg, "--stand") {
+      netStart.walks = false;
+    } else if argIs(arg, "--impair") && a + 3 < argc {
+      netStart.impairLoss = u32.from(argNumber(*(argv + usize.from(a + 1))));
+      netStart.impairLatency = u32.from(argNumber(*(argv + usize.from(a + 2))));
+      netStart.impairJitter = u32.from(argNumber(*(argv + usize.from(a + 3))));
+      a = a + 3;
     } else if argIs(arg, "--shot-after") && a + 1 < argc {
       shotAfter = argNumber(*(argv + usize.from(a + 1)));
       a = a + 1;
@@ -185,7 +219,7 @@ fn main(argc: i32, argv: **u8) i32 {
       }
       a = a + 1;
     } else {
-      print <- "pegasus: unknown argument; use --steps N, --stall-sim MS, --parts40, --world FILE, --press STEP,XCM,ZCM, --shot FILE [--shot-after N] or --checks\n";
+      print <- "pegasus: unknown argument; use --steps N, --stall-sim MS, --parts40, --world FILE, --press STEP,XCM,ZCM, --shot FILE [--shot-after N], --checks, --serve PORT or --join HOST:PORT\n";
       return 2;
     }
     a = a + 1;
@@ -194,11 +228,13 @@ fn main(argc: i32, argv: **u8) i32 {
   if shot.len() > 0usize && shotAfter == 0u64 {
     each p in &presses { if p.step + 120u64 > shotAfter { shotAfter = p.step + 120u64; } }
   }
+  if netStart.role == SIM_CLIENT && steps != 0u64 { headless = true; }
   if checksOnly {
     let poseOk = checkHeadPose(mutantIs("stale-pose"));
     let loaderOk = checkLoader(mutantIs("unused-off-by-one"));
+    let netOk = checkConnected();
     let rulesOk = checkRules(mutantIs("trapped-writes"));
-    let ok = poseOk && loaderOk && rulesOk;
+    let ok = poseOk && loaderOk && rulesOk && netOk;
     finalAll();
     return if ok { 0 } else { 1 };
   }
@@ -263,24 +299,27 @@ fn main(argc: i32, argv: **u8) i32 {
       if headless { exactKeys = keys; }
       wantBuilds = u64.from(keys);
     }
+    // A server has no Render to run: it is never started, and its Loader sends it nothing
+    if serving { exactKeys = 0usize; }
     let render = Render(handle, w, h, !headless, lookForRender, drawnW, shot.clone(), wantKeys, exactKeys, stoppedS,
       finishedS.clone(), stallMs, mutantIs("stale-pose"), shotAfter);
     let audio = Audio();
-    let loader = Loader(render, loaderS, wantBuilds, parts40 && headless, mutantIs("unused-off-by-one"));
+    let loader = Loader(render, loaderS, wantBuilds, parts40 && headless, mutantIs("unused-off-by-one"), serving);
     let player = Player(render, loader, audio, moveW, lookW, drawnR, mutantIs("mutate-snapshot"));
     var stallAt = 0u64;
     if stallMs > 0u64 { stallAt = STALL_AT_STEP; }
     var worldName = String.from("mock");
     if parts40 { worldName = String.from("parts40"); }
     if worldFile.len() > 0usize { worldName = worldFile.clone(); }
-    player.start(worldName,SimStart(moveR, lookR, drawnForSim, steps, stallAt, stallMs, finishedS));
-    render.run();
+    let walks = netStart.walks;
+    player.start(worldName,SimStart(moveR, lookR, drawnForSim, steps, stallAt, stallMs, finishedS, netStart));
+    if !serving { render.run(); }
     var scriptS: Sender[bool];
     var scriptR: Receiver[bool];
     scriptS, scriptR = Channel[bool].make();
-    // the script runs headless, and in a shot told to press (a shot of a rook moved)
+    // the script runs headless, and in a shot told to press (a shot of a rook moved); a server has none
     let scripted = headless || presses.len() > 0usize;
-    if scripted { player.presses(presses, !headless); player.script(scriptS); }
+    if scripted && !serving { player.presses(presses, !headless); player.script(scriptS, walks); }
 
     if windowed {
       var held = 0u32;
@@ -315,16 +354,18 @@ fn main(argc: i32, argv: **u8) i32 {
       }
     }
     player.quit();
-    match stoppedR.recv() {
-      case let Some(clean) { if !clean { verdict = 1; } }
-      case is None[bool] {}
+    if !serving {
+      match stoppedR.recv() {
+        case let Some(clean) { if !clean { verdict = 1; } }
+        case is None[bool] {}
+      }
     }
     if headless {
       match loaderR.recv() {
         case let Some(clean) { if !clean { verdict = 1; } }
         case is None[bool] {}
       }
-      _ = scriptR.recv();
+      if !serving { _ = scriptR.recv(); }
     }   // the script's last sleep ends before the program does
   }
   finalAll();
