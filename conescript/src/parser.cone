@@ -115,13 +115,43 @@ pub struct EachDecl {
   pub behaviors: List[Expr];
 }
 
-// A function of a part as written: fn NAME() TYPE { let a = EXPR; ... EXPR }
+// A function of a part as written: fn NAME() TYPE { let a = EXPR; ... EXPR }; or a step function (W148, FOR
+// REVIEW: the language is Jon's), one with parameters, whose body is statements run by Sim each step:
+//   fn NAME(p: part, dt: duration) bool { STMT ... EXPR }
 pub struct FnDecl {
   pub at: Spot;
   pub name: u32;
   pub ty: u32;                   // its result's type's name: 'shape'
   pub lets: List[LetDecl];       // its steps, in order
   pub result: Expr;              // its last line
+  pub params: List[ParamDecl];   // a step function's parameters (none: a function of values, as above)
+  pub body: List[Stmt];          // a step function's statements, before its result
+}
+
+// A step function's parameter: NAME: TYPE ('part', 'duration' or 'number')
+pub struct ParamDecl {
+  pub at: Spot;
+  pub name: u32;
+  pub ty: u32;
+}
+
+// A step function's statement (W148, FOR REVIEW). Cone's own forms:
+//   let NAME = EXPR;   var NAME = EXPR;   NAME = EXPR;   EXPR;   (an act: set(p.place, v);)
+//   if EXPR { STMT ... } [else { STMT ... } | else if ...]
+//   each NAME in PART.parts { STMT ... }      run as the world runs, over the parts PART holds
+pub const STMT_LET = 0u32;
+pub const STMT_VAR = 1u32;
+pub const STMT_ASSIGN = 2u32;
+pub const STMT_DO = 3u32;
+pub const STMT_IF = 4u32;
+pub const STMT_EACH = 5u32;
+pub struct Stmt {
+  pub at: Spot;
+  pub kind: u32;                 // STMT_*
+  pub name: u32;                 // what a let, var, assignment or each names
+  pub value: List[Expr];         // one: the value, the act, the condition, or what the loop goes through
+  pub body: List[Stmt];          // if: the block if true; each: the loop's body
+  pub other: List[Stmt];         // if: the else block (an 'else if' is one if in it)
 }
 
 pub struct LetDecl {
@@ -164,7 +194,7 @@ pub struct PartDecl {
 pub fn parse(src: &Array[u8], names: &mut Names, problems: &mut List[Problem]) List[PartDecl] {
   var table = Names.empty();
   table <-> *names;
-  var p = Parser(lexer(src, table), token(TokKind.End, Spot(1u32, 1u32)), token(TokKind.End, Spot(1u32, 1u32)));
+  var p = Parser(lexer(src, table), token(TokKind.End, Spot(1u32, 1u32)), token(TokKind.End, Spot(1u32, 1u32)), false);
   p.cur = p.lex.next();
   p.ahead = p.lex.next();
   let parts = p.top();
@@ -181,6 +211,7 @@ struct Parser['a] {
   lex: Lexer['a];
   cur: Token;
   ahead: Token;
+  failedHere: bool;              // a step function's statement failed (W148): the mistake is told
 
   fn kind(self: &) TokKind { self.cur.kind }
   fn at(self: &) Spot { self.cur.at }
@@ -407,13 +438,49 @@ struct Parser['a] {
     self.advance();
     if !self.isSymbol('(') { self.fail("expected '(' and its parameters"); self.skipLine(); return None; }
     self.advance();
-    if !self.isSymbol(')') { self.fail("a function takes no parameters, for now: expected ')'"); self.skipLine(); return None; }
+    var params = List[ParamDecl]();
+    while !self.isSymbol(')') {
+      // a step function's parameters (W148, for review)
+      if !self.labelNext() { self.fail("expected a parameter, NAME: TYPE, or ')'"); self.skipLine(); return None; }
+      let pat = self.at();
+      let pname = self.cur.name;
+      self.advance();
+      self.advance();                                 // ':'
+      if self.kind() != TokKind.Name { self.fail("expected the parameter's type: part, duration or number"); self.skipLine(); return None; }
+      params.push(ParamDecl(pat, pname, self.cur.name));
+      self.advance();
+      if self.isSymbol(',') { self.advance(); }
+      else if !self.isSymbol(')') { self.fail("expected ',' or ')' after a parameter"); self.skipLine(); return None; }
+    }
     self.advance();
     if self.kind() != TokKind.Name { self.fail("expected the type of its result, such as shape"); self.skipLine(); return None; }
     let ty = self.cur.name;
     self.advance();
     if !self.isSymbol('{') { self.fail("expected '{' and its body"); self.skipLine(); return None; }
     self.advance();
+    if params.len() > 0usize {
+      // a step function: statements, then its result
+      var body = List[Stmt]();
+      var stepResult: Expr;
+      while true {
+        match self.statement(true) {
+          case let Some(s) { body.push(s); }
+          case is None {
+            if self.failedHere { self.failedHere = false; self.skipLine(); return None; }
+            break;
+          }
+        }
+      }
+      match self.expr() {
+        case let Some(e) { stepResult = e; }
+        case is None { self.skipLine(); return None; }
+      }
+      if !self.isSymbol('}') { self.fail("expected '}' after the function's result"); self.skipLine(); return None; }
+      self.advance();
+      if self.kind() != TokKind.Newline { self.fail("expected the line's end after the function"); self.skipLine(); return None; }
+      self.advance();
+      return Some[FnDecl](FnDecl(at, name, ty, List[LetDecl](), stepResult, params, body));
+    }
     var lets = List[LetDecl]();
     while self.isName(N_LET) {
       let lat = self.at();
@@ -439,7 +506,94 @@ struct Parser['a] {
     self.advance();
     if self.kind() != TokKind.Newline { self.fail("expected the line's end after the function"); self.skipLine(); return None; }
     self.advance();
-    Some[FnDecl](FnDecl(at, name, ty, lets, result))
+    Some[FnDecl](FnDecl(at, name, ty, lets, result, List[ParamDecl](), List[Stmt]()))
+  }
+
+  // One statement of a step function (W148, for review), or None: at the result ('last' and no statement starts here,
+  // the position left where it was), at a block's '}', or after a mistake (failedHere set, the mistake told)
+  fn statement(self: &mut, last: bool) Option[Stmt] {
+    let at = self.at();
+    if self.isSymbol('}') { return None; }
+    if self.isName(N_LET) || self.isName(N_VAR) {
+      let kind = if self.isName(N_LET) { STMT_LET } else { STMT_VAR };
+      self.advance();
+      if self.kind() != TokKind.Name { return self.stmtFail("expected the name it gives"); }
+      let n = self.cur.name;
+      self.advance();
+      if !self.isSymbol('=') { return self.stmtFail("expected '=' and its value"); }
+      self.advance();
+      return self.stmtEnd(at, kind, n);
+    }
+    if self.kind() == TokKind.Name && self.ahead.kind == TokKind.Symbol && self.ahead.sym == '=' {
+      let n = self.cur.name;
+      self.advance();
+      self.advance();
+      return self.stmtEnd(at, STMT_ASSIGN, n);
+    }
+    if self.isName(N_IF) {
+      self.advance();
+      var cond = List[Expr]();
+      match self.expr() { case let Some(e) { cond.push(e); } case is None { self.failedHere = true; return None; } }
+      var body = List[Stmt]();
+      if !self.stmtBlock(&mut body) { return None; }
+      var other = List[Stmt]();
+      if self.isName(N_ELSE) {
+        self.advance();
+        if self.isName(N_IF) {
+          match self.statement(false) { case let Some(s) { other.push(s); } case is None { self.failedHere = true; return None; } }
+        }
+        else if !self.stmtBlock(&mut other) { return None; }
+      }
+      return Some[Stmt](Stmt(at, STMT_IF, N_NONE, cond, body, other));
+    }
+    if self.isName(N_EACH) {
+      self.advance();
+      if self.kind() != TokKind.Name { return self.stmtFail("expected the name each part is given"); }
+      let n = self.cur.name;
+      self.advance();
+      if !self.isName(N_IN) { return self.stmtFail("expected 'in' and what to go through"); }
+      self.advance();
+      var over = List[Expr]();
+      match self.expr() { case let Some(e) { over.push(e); } case is None { self.failedHere = true; return None; } }
+      var body = List[Stmt]();
+      if !self.stmtBlock(&mut body) { return None; }
+      return Some[Stmt](Stmt(at, STMT_EACH, n, over, body, List[Stmt]()));
+    }
+    if last {
+      // an expression: an act if ';' ends it, else the function's result (read again by the caller)
+      if !self.isName(N_SET) { return None; }
+    }
+    self.stmtEnd(at, STMT_DO, N_NONE)
+  }
+
+  fn stmtFail(self: &mut, message: &str) Option[Stmt] {
+    self.fail(message);
+    self.failedHere = true;
+    None
+  }
+
+  // EXPR ';' ends a let, var, assignment or act
+  fn stmtEnd(self: &mut, at: Spot, kind: u32, n: u32) Option[Stmt] {
+    var v = List[Expr]();
+    match self.expr() { case let Some(e) { v.push(e); } case is None { self.failedHere = true; return None; } }
+    if !self.isSymbol(';') { return self.stmtFail("expected ';' to end the statement"); }
+    self.advance();
+    Some[Stmt](Stmt(at, kind, n, v, List[Stmt](), List[Stmt]()))
+  }
+
+  // '{' STMT ... '}'; false after a mistake (told, failedHere set)
+  fn stmtBlock(self: &mut, block: &mut List[Stmt]) bool {
+    if !self.isSymbol('{') { _ = self.stmtFail("expected '{' and the block's statements"); return false; }
+    self.advance();
+    while true {
+      match self.statement(false) {
+        case let Some(s) { block.push(s); }
+        case is None { if self.failedHere { return false; } break; }
+      }
+    }
+    if !self.isSymbol('}') { _ = self.stmtFail("expected '}' where the block ends"); return false; }
+    self.advance();
+    true
   }
 
   // field NAME: TYPE [= EXPR] [, LABEL: EXPR]*; None, the line skipped, after a mistake

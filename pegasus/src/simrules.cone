@@ -20,7 +20,18 @@ alias RuleHandles = HandleTable[u8];
 const RULE_FIELDS = 1usize;         // handle 1: the fields' values, as f64 bits
 const RULE_INSIDE = 2usize;         // handle 2: by slot, 1 if the visitor is inside an area of that part
 const RULE_WRITES = 3usize;         // handle 3: the staged writes of the run, four words each
+// W148, for review: what a world's step functions read and write (conescript's steps.cone)
+const RULE_PLACES = 4usize;         // handle 4: by slot, three words: where it stands in its holder, at the step's start
+const RULE_CHILD_AT = 5usize;       // handle 5: by slot, then one more: where its parts begin in handle 6
+const RULE_CHILDREN = 6usize;       // handle 6: each slot's parts, in slot order
+const RULE_PFIELDS = 7usize;        // handle 7: by slot * K + field, three words: the place fields' values
+const RULE_PHAS = 8usize;           // handle 8: K, then by slot * K + field: 1 if the part has that place field
+const RULE_STEP_WRITES = 9usize;    // handle 9: the step's staged writes, six words each: kind, slot, field, x, y, z
 const NO_UNIT = 0xFFFFFFFFu32;
+
+const STEP_PLACE = 0u64;
+const STEP_FIELD = 1u64;
+const STEP_FACING = 2u64;
 
 // What a run may spend (a derive or a handler is a few ops; this only stops a runaway)
 pub const RULE_FUEL = 100000u64;
@@ -76,6 +87,85 @@ fn hostGlide(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
   true
 }
 
+// -------- the step functions' imports (W148, for review) --------
+
+fn hostPlace(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let p = hs.payload(RULE_PLACES);
+  if 3usize * s + 2usize >= p.len() { hs.fail = String.from("host.place: no such part"); return false; }
+  slots[0usize] = *p[3usize * s]; slots[1usize] = *p[3usize * s + 1usize]; slots[2usize] = *p[3usize * s + 2usize];
+  true
+}
+
+fn hostPlaceField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let has = hs.payload(RULE_PHAS);
+  let kk = if has.len() > 0usize { usize.from(*has[0usize]) } else { 0usize };
+  let i = s * kk + k;
+  if k >= kk || 1usize + i >= has.len() || *has[1usize + i] == 0u64 {
+    hs.fail = String.from("host.place_field: that part has no such place field");
+    return false;
+  }
+  let p = hs.payload(RULE_PFIELDS);
+  slots[0usize] = *p[3usize * i]; slots[1usize] = *p[3usize * i + 1usize]; slots[2usize] = *p[3usize * i + 2usize];
+  true
+}
+
+fn hostChild(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let at = hs.payload(RULE_CHILD_AT);
+  if s + 1usize >= at.len() { hs.fail = String.from("host.child: no such part"); return false; }
+  let from = usize.from(*at[s]);
+  let to = usize.from(*at[s + 1usize]);
+  if from + k >= to { hs.fail = String.from("host.child: the part holds fewer parts"); return false; }
+  slots[0usize] = *hs.payload(RULE_CHILDREN)[from + k];
+  true
+}
+
+fn stageStep(hs: &mut RuleHandles, kind: u64, slot: u64, k: u64, x: u64, y: u64, z: u64) {
+  let w = &mut hs.data[RULE_STEP_WRITES];
+  w.push(kind); w.push(slot); w.push(k); w.push(x); w.push(y); w.push(z);
+}
+
+fn hostSetPlace(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  if usize.from(slots[0usize]) + 1usize >= hs.payload(RULE_CHILD_AT).len() { hs.fail = String.from("host.set_place: no such part"); return false; }
+  stageStep(hs, STEP_PLACE, slots[0usize], 0u64, slots[1usize], slots[2usize], slots[3usize]);
+  true
+}
+
+fn hostSetPlaceField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let has = hs.payload(RULE_PHAS);
+  let kk = if has.len() > 0usize { usize.from(*has[0usize]) } else { 0usize };
+  if k >= kk || 1usize + s * kk + k >= has.len() || *has[1usize + s * kk + k] == 0u64 {
+    hs.fail = String.from("host.set_place_field: that part has no such place field");
+    return false;
+  }
+  stageStep(hs, STEP_FIELD, slots[0usize], slots[1usize], slots[2usize], slots[3usize], slots[4usize]);
+  true
+}
+
+fn hostSetFacing(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  if usize.from(slots[0usize]) + 1usize >= hs.payload(RULE_CHILD_AT).len() { hs.fail = String.from("host.set_facing: no such part"); return false; }
+  stageStep(hs, STEP_FACING, slots[0usize], 0u64, slots[1usize], slots[2usize], slots[3usize]);
+  true
+}
+
+// The turn that makes a part's front (+z) look along 'v' with its top kept up; None for a direction too short to say
+fn facingTurn(v: Vec3) Option[Quat] {
+  let len = v.length();
+  if len < 0.000001 { return None; }
+  let yaw = atan2(v.x, v.z);
+  var s = v.y / len;
+  if s > 1. { s = 1.; }
+  if s < -1. { s = -1.; }
+  let pitch = 0. - asin(s);
+  Some[Quat](Quat.angleAxis(yaw, Vec3(0., 1., 0.)) * Quat.angleAxis(pitch, Vec3(1., 0., 0.)))
+}
+
 // The imports Sim offers (the code's, lowerSim's, are checked against these)
 fn ruleImports() ImportTables[u8] {
   var t = ImportTables[u8].make();
@@ -89,6 +179,19 @@ fn ruleImports() ImportTables[u8] {
   t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &hostStartAnim);
   let g = glideSignature(&mut t.types);
   t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &hostGlide);
+  // a step function's (W148, for review): each weighs 1, as every import here does
+  let p = placeSignature(&mut t.types);
+  t.add(NS_HOST, HOST_PLACE, p, false, 1u32, &hostPlace);
+  let pf = placeFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_PLACE_FIELD, pf, false, 1u32, &hostPlaceField);
+  let c = childSignature(&mut t.types);
+  t.add(NS_HOST, HOST_CHILD, c, false, 1u32, &hostChild);
+  let sp = setPlaceSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_PLACE, sp, true, 1u32, &hostSetPlace);
+  let spf = setPlaceFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_PLACE_FIELD, spf, true, 1u32, &hostSetPlaceField);
+  let sf = setFacingSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FACING, sf, true, 1u32, &hostSetFacing);
   t
 }
 
@@ -117,6 +220,8 @@ pub struct RuleHost {
         hs.alloc(HANDLE_HOST, f);
         hs.alloc(HANDLE_HOST, s);
         hs.alloc(HANDLE_HOST, List[u64]());
+        var h = 4usize;
+        while h <= RULE_STEP_WRITES { hs.alloc(HANDLE_HOST, List[u64]()); h = h + 1usize; }   // filled by stepSetup
         var it = Interpreter.make();
         // PEGASUS_PROFILE_RULES set: the interpreter times its runs (W136); `profileReport` says what it found
         it.profiling = (libc.getenv("PEGASUS_PROFILE_RULES") as usize) != 0usize;
@@ -157,6 +262,125 @@ pub struct RuleHost {
 
   // The units the verifier refused, one problem each
   pub fn refusals(self: &) &List[CodeProblem] { self.code.problems() }
+
+  // W148: what step functions read, made from the frames: each slot's parts and the place fields' starting values (the
+  // code's ENTRY_FIXED units: a = the part, b = the field's number). The steppers' units and parts are put in 'units'
+  // and 'parts'; a refused stepper is left out (its refusal is told with the others)
+  pub fn stepSetup(self: &mut, slots: &Slots, units: &mut List[u32], parts: &mut List[u32]) {
+    let n = slots.count();
+    var at = List[u64]();
+    var i = 0usize;
+    while i <= n { at.push(0u64); i = i + 1usize; }
+    var s = 0usize;
+    while s < n {
+      let p = usize.from(slots.parentOf(u32.from(s)));
+      if p != s { at.set(p + 1usize, *at[p + 1usize] + 1u64); }
+      s = s + 1usize;
+    }
+    i = 1usize;
+    while i <= n { at.set(i, *at[i] + *at[i - 1usize]); i = i + 1usize; }
+    var kids = List[u64]();
+    i = 0usize;
+    while i < usize.from(*at[n]) { kids.push(0u64); i = i + 1usize; }
+    var cursor = at.clone();
+    s = 0usize;
+    while s < n {
+      let p = usize.from(slots.parentOf(u32.from(s)));
+      if p != s { kids.set(usize.from(*cursor[p]), u64.from(s)); cursor.set(p, *cursor[p] + 1u64); }
+      s = s + 1usize;
+    }
+    self.hs.data[RULE_CHILD_AT] = at;
+    self.hs.data[RULE_CHILDREN] = kids;
+    var places = List[u64]();
+    i = 0usize;
+    while i < 3usize * n { places.push(0u64); i = i + 1usize; }
+    self.hs.data[RULE_PLACES] = places;
+    // the place fields
+    var kk = 0usize;
+    var e = 0usize;
+    let entries = &self.code.source().entries;
+    while e < entries.len() {
+      if entries[e].kind == ENTRY_FIXED && usize.from(entries[e].b) + 1usize > kk { kk = usize.from(entries[e].b) + 1usize; }
+      e = e + 1usize;
+    }
+    var has = List[u64]();
+    has.push(u64.from(kk));
+    var vals = List[u64]();
+    i = 0usize;
+    while i < n * kk { has.push(0u64); vals.push(0u64); vals.push(0u64); vals.push(0u64); i = i + 1usize; }
+    var fixed = List[u32]();
+    var fixedAt = List[usize]();
+    e = 0usize;
+    while e < self.code.source().entries.len() {
+      let en = &self.code.source().entries[e];
+      if en.kind == ENTRY_FIXED && usize.from(en.a) < n && !self.code.isRefused(usize.from(en.unit)) {
+        fixed.push(en.unit);
+        fixedAt.push(usize.from(en.a) * kk + usize.from(en.b));
+      }
+      else if en.kind == ENTRY_STEP && !self.code.isRefused(usize.from(en.unit)) { units.push(en.unit); parts.push(en.b); }
+      e = e + 1usize;
+    }
+    i = 0usize;
+    while i < fixed.len() {
+      var out = List[u64]();
+      match self.run(*fixed[i], &mut out) {
+        case is None {
+          let k = *fixedAt[i];
+          has.set(1usize + k, 1u64);
+          vals.set(3usize * k, *out[0usize]); vals.set(3usize * k + 1usize, *out[1usize]); vals.set(3usize * k + 2usize, *out[2usize]);
+        }
+        case let Some(why) { print <- "sim: a place field's starting value was stopped: "; printStr(why.view()); print <- "\n"; }
+      }
+      i = i + 1usize;
+    }
+    self.hs.data[RULE_PHAS] = has;
+    self.hs.data[RULE_PFIELDS] = vals;
+  }
+
+  // Each slot's place in its holder's frame as it stands now (at + offset): what host.place reads during a step
+  pub fn refreshPlaces(self: &mut, slots: &Slots) {
+    let p = &mut self.hs.data[RULE_PLACES];
+    var s = 0usize;
+    while s < slots.count() {
+      let v = slots.atOf(u32.from(s)) + slots.offsetOf(u32.from(s));
+      p.set(3usize * s, f64.from(v.x).bits()); p.set(3usize * s + 1usize, f64.from(v.y).bits()); p.set(3usize * s + 2usize, f64.from(v.z).bits());
+      s = s + 1usize;
+    }
+    (&mut self.hs.data[RULE_STEP_WRITES]).clear();
+  }
+
+  // A stepper run with the step's length: true in 'goOn' if it asked to; the fuel it spent; the trap's message if it
+  // stopped, in which case what it staged is dropped
+  pub fn stepRun(self: &mut, unit: u32, dt: f64, goOn: &mut bool, fuel: &mut u64) Option[String] {
+    let mark = self.hs.payload(RULE_STEP_WRITES).len();
+    self.hs.fail = String();
+    self.interp.setFuel(RULE_FUEL);
+    var args = List[u64]();
+    args.push(dt.bits());
+    var out = List[u64]();
+    let r = self.interp.run(&self.code, &self.tables, &mut self.hs, unit, args.view(), &mut out);
+    *fuel = RULE_FUEL - self.interp.fuelLeft();
+    match r {
+      case let Some(t) {
+        let w = &mut self.hs.data[RULE_STEP_WRITES];
+        while w.len() > mark { _ = w.pop(); }
+        *goOn = false;
+        Some[String](t.message.clone())
+      }
+      case is None { *goOn = out.len() > 0usize && *out[0usize] != 0u64; None }
+    }
+  }
+
+  // The step's staged writes, six words each
+  pub fn stepWrites(self: &) &List[u64] { self.hs.payload(RULE_STEP_WRITES) }
+
+  // A place field's value set: the field's slot in handle 7 (slot * K + field)
+  pub fn setPlaceField(self: &mut, slot: u64, k: u64, x: u64, y: u64, z: u64) {
+    let kk = *self.hs.payload(RULE_PHAS)[0usize];
+    let i = 3usize * usize.from(slot * kk + k);
+    let p = &mut self.hs.data[RULE_PFIELDS];
+    p.set(i, x); p.set(i + 1usize, y); p.set(i + 2usize, z);
+  }
 
   // Runs a unit, leaving its result slots in 'out' and its staged writes in the write list; the trap's message if it stopped
   fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
@@ -230,13 +454,14 @@ pub struct SimRules {
   traceSlot: u32;                   // the part whose frame `trace` prints (NO_UNIT: none)
   pub stopped: u64;                 // handlers and derives stopped, their writes dropped
   pub fired: u64;                   // handlers run to their end
+  pub steps: StepStats;             // the step functions' steppers and what they cost (W148)
   tints: TintNows;                  // each tinted part's tint now
   tintChanged: TintNows;            // the tints that changed since `takeTints` last took them
   pub tintDeaf: bool;               // the check's mutant: no tint is ever noted
 
   pub fn none() SimRules {
     SimRules(None[RuleHost], Slots.none(), List[String](), MoveDecls(), List[u32](), DeriveDecls(), List[u32](),
-      KeysDecls(), List[u32](), AreaDecls(), SimAnim.make(), false, 0u64, NO_UNIT, 0u64, 0u64, TintNows(), TintNows(), false)
+      KeysDecls(), List[u32](), AreaDecls(), SimAnim.make(), false, 0u64, NO_UNIT, 0u64, 0u64, StepStats.none(), TintNows(), TintNows(), false)
   }
 
   // The rules of a behaviour: its code verified now. 'applyOnTrap' is the check's mutant
@@ -250,7 +475,9 @@ pub struct SimRules {
     r.derives <-> behaviour.derives;
     r.keys <-> behaviour.keys;
     r.areas <-> behaviour.areas;
-    if r.moves.len() == 0usize && r.derives.len() == 0usize && r.keys.len() == 0usize { return r; }
+    var anySteps = false;
+    each e in &behaviour.code.entries { if e.kind == ENTRY_STEP { anySteps = true; } }
+    if r.moves.len() == 0usize && r.derives.len() == 0usize && r.keys.len() == 0usize && !anySteps { return r; }
     match RuleHost.make(&behaviour.code, behaviour.fields.len(), r.slots.count(), applyOnTrap) {
       case let Ok(host) {
         var h = host;
@@ -275,6 +502,9 @@ pub struct SimRules {
           r.keyUnits.push(unitOrNone(h.unitFor(ENTRY_HANDLER, u32.from(i), 0u32)));
           i = i + 1usize;
         }
+        if anySteps { h.stepSetup(&r.slots, &mut r.steps.units, &mut r.steps.parts); }
+        i = 0usize;
+        while i < r.steps.units.len() { r.steps.on.push(true); i = i + 1usize; }
         var k = 0usize;
         while k < h.refusals().len() {
           print <- "sim: a rule of the world was refused and left out: "; printStr(h.refusals()[k].what.view());
@@ -479,6 +709,92 @@ pub struct SimRules {
     }
   }
 
+  // MOVE, the step functions (W148, for review): every stepper still going runs with the step's length, each reading the
+  // world as it stood at the step's start; then what they all staged is applied, in order. A stepper that traps or
+  // runs out of fuel is dropped for this step, its writes with it, and runs again the next; one that gives false ends.
+  // Called once a step, after the animators
+  pub fn stepAll(self: &mut, step: u64, stepNs: u64) {
+    if steps.units.len() == 0usize || steps.mutant == STEP_MUTANT_NEVER { return; }
+    if steps.mutant == STEP_MUTANT_TWICE {          // the check's mutant: every stepper runs twice a step
+      steps.mutant = STEP_MUTANT_NONE;
+      self.stepAll(step, stepNs);
+      steps.mutant = STEP_MUTANT_TWICE;
+    }
+    let t0 = Instant.now().nanos();
+    let dt = f64.from(stepNs) / 1.0e9f64;
+    var fuelStep = 0u64;
+    var runs = 0u64;
+    var writes = List[u64]();
+    match &mut host {
+      case var &mut Some(h) {
+        h.refreshPlaces(&slots);
+        var i = 0usize;
+        while i < steps.units.len() {
+          if *steps.on[i] {
+            var goOn = true;
+            var fuel = 0u64;
+            match h.stepRun(*steps.units[i], dt, &mut goOn, &mut fuel) {
+              case let Some(why) {
+                steps.dropped = steps.dropped + 1u64;
+                if steps.dropped <= 3u64 {
+                  print <- "sim: step "; print <- step; print <- ", a step function was stopped and its changes dropped: ";
+                  printStr(why.view()); print <- " ("; printStr(slots.nameOf(*steps.parts[i])); print <- ")\n";
+                }
+              }
+              case is None { if !goOn { steps.on.set(i, false); } }
+            }
+            if fuel > steps.fuelRunMax { steps.fuelRunMax = fuel; }
+            fuelStep = fuelStep + fuel;
+            runs = runs + 1u64;
+          }
+          i = i + 1usize;
+        }
+        writes = h.stepWrites().clone();
+        if steps.mutant == STEP_MUTANT_DROP { writes = List[u64](); }   // the check's mutant: the staged writes are never applied
+      }
+      else {}
+    }
+    var w = 0usize;
+    while w + 5usize < writes.len() {
+      let kind = *writes[w];
+      let slot = u32.from(*writes[w + 1usize]);
+      let v = Vec3(f32.from(f64.fromBits(*writes[w + 3usize])), f32.from(f64.fromBits(*writes[w + 4usize])),
+        f32.from(f64.fromBits(*writes[w + 5usize])));
+      if kind == STEP_PLACE { slots.setOffset(slot, v - slots.atOf(slot)); }
+      else if kind == STEP_FACING {
+        match facingTurn(v) { case let Some(q) { slots.setTurn(slot, q); } else {} }
+      }
+      else {
+        match &mut host {
+          case var &mut Some(h) { h.setPlaceField(*writes[w + 1usize], *writes[w + 2usize], *writes[w + 3usize], *writes[w + 4usize], *writes[w + 5usize]); }
+          else {}
+        }
+      }
+      w = w + 6usize;
+    }
+    steps.ns.push(Instant.now().nanos() - t0);
+    steps.fuel.push(fuelStep);
+    steps.runs = runs;
+  }
+
+  // What the step functions cost, over the run: printed at its end (the boids timings, W148)
+  pub fn stepReport(self: &) {
+    if steps.ns.len() == 0usize { return; }
+    var ns = steps.ns.clone();
+    sortI64(&mut ns);
+    var fs = steps.fuel.clone();
+    var total = 0u64;
+    var most = 0u64;
+    each f in &fs { total = total + *f; if *f > most { most = *f; } }
+    let n = ns.len();
+    print <- "sim: step functions: "; print <- steps.units.len(); print <- " steppers over "; print <- u64.from(n);
+    print <- " steps; run time per step median "; print <- f64.from(*ns[n / 2usize]) / 1000.; print <- " us, p95 ";
+    print <- f64.from(*ns[(n * 95usize) / 100usize]) / 1000.; print <- " us, max "; print <- f64.from(*ns[n - 1usize]) / 1000.;
+    print <- " us; fuel per step mean "; print <- total / u64.from(n); print <- ", max "; print <- most;
+    print <- "; fuel per run max "; print <- steps.fuelRunMax; print <- " of "; print <- RULE_FUEL;
+    print <- "; runs stopped "; print <- steps.dropped; print <- "\n";
+  }
+
   // A derive wrote the tint 'value' for the part at 'slot': noted for Sim when it differs from the tint the part had
   fn tintNow(self: &mut, slot: u32, value: f32, step: u64) {
     if tintDeaf { return; }
@@ -535,5 +851,39 @@ fn unitOrNone(u: Option[u32]) u32 {
   match u {
     case let Some(x) { x }
     else { NO_UNIT }
+  }
+}
+
+// The steppers of a world's step functions (W148), and what running them cost: per step, its time and fuel
+pub const STEP_MUTANT_NONE = 0u32;
+pub const STEP_MUTANT_NEVER = 1u32;   // no stepper ever runs
+pub const STEP_MUTANT_TWICE = 2u32;   // each runs twice a step
+pub const STEP_MUTANT_DROP = 3u32;    // what they stage is never applied
+
+pub struct StepStats {
+  units: List[u32];                 // by stepper: its unit
+  parts: List[u32];                 // and its part
+  on: List[bool];                   // false once it has given false
+  ns: List[i64];                    // by step: the time all the steppers took, with the writes applied
+  fuel: List[u64];                  // by step: the fuel they spent
+  fuelRunMax: u64;                  // the most one run spent
+  runs: u64;                        // runs in the last step
+  dropped: u64;                     // runs stopped (a trap, or out of fuel), their writes dropped
+  pub mutant: u32;                  // the check's mutant: STEP_MUTANT_*
+
+  fn none() StepStats {
+    StepStats(List[u32](), List[u32](), List[bool](), List[i64](), List[u64](), 0u64, 0u64, 0u64, STEP_MUTANT_NONE)
+  }
+}
+
+// In place, smallest first (insertion sort over runs of a few thousand steps)
+fn sortI64(l: &mut List[i64]) {
+  var i = 1usize;
+  while i < l.len() {
+    let x = *l[i];
+    var j = i;
+    while j > 0usize && *l[j - 1usize] > x { l.set(j, *l[j - 1usize]); j = j - 1usize; }
+    l.set(j, x);
+    i = i + 1usize;
   }
 }

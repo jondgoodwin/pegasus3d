@@ -1,0 +1,262 @@
+// Step functions lowered (steps.cone has what they are; W148, FOR REVIEW). lowerSim calls lowerSteps after its other
+// units: each step function a unit (part, f64) -> bool; each stepper a unit (f64) -> bool, entry ENTRY_STEP; each place
+// field's starting value a unit () -> (f64, f64, f64), entry ENTRY_FIXED, a = its part, b = its number.
+
+fn formOf(tt: &mut TypeTable, t: u32) u32 {
+  if t == ST_BOOL { return TY_BOOL; }
+  if t == ST_POINT { return point3(tt); }
+  if t == ST_PART { return TY_PART; }
+  if t == ST_COUNT { return TY_I64; }
+  TY_F64
+}
+
+fn voidBlock(cw: &mut CodeWriter) u32 { let none = List[u32](); cw.code.types.sig(none.view(), none.view()) }
+
+fn hostImport(lw: &mut Lowering, name: &str, which: u32) u32 {
+  var sig = 0u32;
+  if which == 0u32 { sig = placeSignature(&mut lw.cw.code.types); }
+  else if which == 1u32 { sig = placeFieldSignature(&mut lw.cw.code.types); }
+  else if which == 2u32 { sig = childSignature(&mut lw.cw.code.types); }
+  else if which == 3u32 { sig = setPlaceSignature(&mut lw.cw.code.types); }
+  else if which == 4u32 { sig = setPlaceFieldSignature(&mut lw.cw.code.types); }
+  else { sig = setFacingSignature(&mut lw.cw.code.types); }
+  lw.imp(NS_HOST, name, sig)
+}
+
+// A value kept in a new local, for its coordinates to be read
+fn keep(lw: &mut Lowering, e: &SExpr) u32 {
+  emitStep(lw, e);
+  let t = formOf(&mut lw.cw.code.types, e.ty);
+  let l = lw.cw.local(t);
+  lw.cw.opU(OP_LOCAL_SET, l);
+  l
+}
+
+fn coord(lw: &mut Lowering, l: u32, c: u32) {
+  let t3 = point3(&mut lw.cw.code.types);
+  lw.cw.opU(OP_LOCAL_GET, l);
+  lw.cw.opUU(OP_TUPLE_GET, t3, c);
+}
+
+fn arithOp(sym: u8) u8 {
+  if sym == '+' { return OP_F64_ADD; }
+  if sym == '-' { return OP_F64_SUB; }
+  if sym == '*' { return OP_F64_MUL; }
+  OP_F64_DIV
+}
+
+fn cmpOp(s: u8) u8 {
+  if s == '<' { return OP_F64_LT; }
+  if s == '>' { return OP_F64_GT; }
+  if s == 'l' { return OP_F64_LE; }
+  if s == 'g' { return OP_F64_GE; }
+  if s == 'E' { return OP_F64_EQ; }
+  OP_F64_NE
+}
+
+fn emitStep(lw: &mut Lowering, e: &SExpr) {
+  let op = e.op;
+  if op == SX_NUM { lw.cw.f64Const(e.num); return; }
+  if op == SX_TRUTH { lw.cw.boolConst(e.num != 0.); return; }
+  if op == SX_LOCAL { lw.cw.opU(OP_LOCAL_GET, e.index); return; }
+  if op == SX_PART { lw.cw.opU(OP_PART_CONST, e.index); return; }
+  if op == SX_PLACE {
+    emitStep(lw, &e.args[0usize]);
+    let n = hostImport(lw, HOST_PLACE, 0u32);
+    lw.cw.opU(OP_IMPORT, n);
+    return;
+  }
+  if op == SX_FIELD {
+    emitStep(lw, &e.args[0usize]);
+    lw.cw.i64Const(i64.from(e.index));
+    let n = hostImport(lw, HOST_PLACE_FIELD, 1u32);
+    lw.cw.opU(OP_IMPORT, n);
+    return;
+  }
+  let t3 = point3(&mut lw.cw.code.types);
+  if op == SX_TUPLE {
+    var i = 0usize;
+    while i < 3usize { emitStep(lw, &e.args[i]); i = i + 1usize; }
+    lw.cw.opU(OP_TUPLE_MAKE, t3);
+    return;
+  }
+  if op == SX_COMPONENT {
+    emitStep(lw, &e.args[0usize]);
+    lw.cw.opUU(OP_TUPLE_GET, t3, e.index);
+    return;
+  }
+  if op == SX_ARITH && e.ty == ST_NUM {
+    emitStep(lw, &e.args[0usize]);
+    emitStep(lw, &e.args[1usize]);
+    lw.cw.op(arithOp(e.sym));
+    return;
+  }
+  if op == SX_ARITH {
+    // point + point, point - point: by coordinate; point * number, point / number: each coordinate by the number
+    let a = keep(lw, &e.args[0usize]);
+    let b = keep(lw, &e.args[1usize]);
+    let byPoint = e.args[1usize].ty == ST_POINT;
+    var c = 0u32;
+    while c < 3u32 {
+      coord(lw, a, c);
+      if byPoint { coord(lw, b, c); } else { lw.cw.opU(OP_LOCAL_GET, b); }
+      lw.cw.op(arithOp(e.sym));
+      c = c + 1u32;
+    }
+    lw.cw.opU(OP_TUPLE_MAKE, t3);
+    return;
+  }
+  if op == SX_CMP {
+    emitStep(lw, &e.args[0usize]);
+    emitStep(lw, &e.args[1usize]);
+    lw.cw.op(cmpOp(e.sym));
+    return;
+  }
+  if op == SX_LOGIC {
+    emitStep(lw, &e.args[0usize]);
+    emitStep(lw, &e.args[1usize]);
+    lw.cw.op(if e.sym == 'A' { OP_BOOL_AND } else { OP_BOOL_OR });
+    return;
+  }
+  if op == SX_NOT { emitStep(lw, &e.args[0usize]); lw.cw.op(OP_BOOL_NOT); return; }
+  if op == SX_NEG && e.ty == ST_NUM { emitStep(lw, &e.args[0usize]); lw.cw.op(OP_F64_NEG); return; }
+  if op == SX_NEG {
+    let a = keep(lw, &e.args[0usize]);
+    var c = 0u32;
+    while c < 3u32 { coord(lw, a, c); lw.cw.op(OP_F64_NEG); c = c + 1u32; }
+    lw.cw.opU(OP_TUPLE_MAKE, t3);
+    return;
+  }
+  // length(v), dot(a, b)
+  let a = keep(lw, &e.args[0usize]);
+  var b = a;
+  if op == SX_DOT { b = keep(lw, &e.args[1usize]); }
+  var c = 0u32;
+  while c < 3u32 {
+    coord(lw, a, c);
+    coord(lw, b, c);
+    lw.cw.op(OP_F64_MUL);
+    if c > 0u32 { lw.cw.op(OP_F64_ADD); }
+    c = c + 1u32;
+  }
+  if op == SX_LENGTH { lw.cw.op(OP_F64_SQRT); }
+}
+
+fn emitStmts(lw: &mut Lowering, l: &List[SStmt]) {
+  var i = 0usize;
+  while i < l.len() { emitStmt(lw, &l[i]); i = i + 1usize; }
+}
+
+fn emitStmt(lw: &mut Lowering, s: &SStmt) {
+  if s.op == SS_SET {
+    emitStep(lw, &s.value[0usize]);
+    lw.cw.opU(OP_LOCAL_SET, s.index);
+    return;
+  }
+  if s.op == SS_IF {
+    emitStep(lw, &s.value[0usize]);
+    let bt = voidBlock(&mut lw.cw);
+    lw.cw.opU(OP_IF, bt);
+    emitStmts(lw, &s.body);
+    if s.other.len() > 0usize { lw.cw.op(OP_ELSE); emitStmts(lw, &s.other); }
+    lw.cw.op(OP_END);
+    return;
+  }
+  if s.op == SS_EACH {
+    // k = 0; loop { if !(k < n) break; o = host.child(holder, k); body; k = k + 1 }
+    let bt = voidBlock(&mut lw.cw);
+    lw.cw.i64Const(0i64);
+    lw.cw.opU(OP_LOCAL_SET, s.count);
+    lw.cw.opU(OP_BLOCK, bt);
+    lw.cw.opU(OP_LOOP, bt);
+    lw.cw.opU(OP_LOCAL_GET, s.count);
+    lw.cw.i64Const(i64.from(s.n));
+    lw.cw.op(OP_I64_LT);
+    lw.cw.op(OP_BOOL_NOT);
+    lw.cw.opU(OP_BR_IF, 1u32);
+    lw.cw.opU(OP_PART_CONST, s.slot);
+    lw.cw.opU(OP_LOCAL_GET, s.count);
+    let n = hostImport(lw, HOST_CHILD, 2u32);
+    lw.cw.opU(OP_IMPORT, n);
+    lw.cw.opU(OP_LOCAL_SET, s.index);
+    emitStmts(lw, &s.body);
+    lw.cw.opU(OP_LOCAL_GET, s.count);
+    lw.cw.i64Const(1i64);
+    lw.cw.op(OP_I64_ADD);
+    lw.cw.opU(OP_LOCAL_SET, s.count);
+    lw.cw.opU(OP_BR, 0u32);
+    lw.cw.op(OP_END);
+    lw.cw.op(OP_END);
+    return;
+  }
+  // the acts: the part, the field's number for a place field, the point
+  emitStep(lw, &s.value[0usize]);
+  if s.op == SS_SET_FIELD { lw.cw.i64Const(i64.from(s.index)); }
+  emitStep(lw, &s.value[1usize]);
+  var n = 0u32;
+  if s.op == SS_SET_PLACE { n = hostImport(lw, HOST_SET_PLACE, 3u32); }
+  else if s.op == SS_SET_FIELD { n = hostImport(lw, HOST_SET_PLACE_FIELD, 4u32); }
+  else { n = hostImport(lw, HOST_SET_FACING, 5u32); }
+  lw.cw.opU(OP_IMPORT, n);
+}
+
+const NO_STEP_UNIT = 0xFFFFFFFFu32;
+
+// The step functions, their steppers and the place fields' starting values, after lowerSim's other units
+fn lowerSteps(lw: &mut Lowering, w: &Understood) {
+  var units = List[u32]();
+  var f = 0usize;
+  while f < w.steps.len() {
+    let s = &w.steps[f];
+    if s.ok && *w.alive[s.slot] {
+      let sig = lw.cw.code.types.sig(&[TY_PART, TY_F64], &[TY_BOOL]);
+      let u = lw.cw.beginUnit(sig, w.names.text(s.name));
+      var k = 2usize;
+      while k < s.locals.len() {
+        let t = formOf(&mut lw.cw.code.types, *s.locals[k]);
+        _ = lw.cw.local(t);
+        k = k + 1usize;
+      }
+      emitStmts(lw, &s.body);
+      emitStep(lw, &s.result);
+      lw.cw.endUnit();
+      units.push(u);
+    }
+    else { units.push(NO_STEP_UNIT); }
+    f = f + 1usize;
+  }
+  var ordinal = 0u32;
+  var r = 0usize;
+  while r < w.steppers.len() {
+    let st = &w.steppers[r];
+    let fu = *units[st.step];
+    if st.live && fu != NO_STEP_UNIT && *w.alive[st.target] {
+      let sig = stepperSignature(&mut lw.cw.code.types);
+      let u = lw.cw.beginUnit(sig, "stepper");
+      lw.cw.opU(OP_PART_CONST, u32.from(st.target));
+      lw.cw.opU(OP_LOCAL_GET, 0u32);
+      lw.cw.opU(OP_CALL, fu);
+      lw.cw.endUnit();
+      lw.cw.addEntry(ENTRY_STEP, u, ordinal, u32.from(st.target));
+      ordinal = ordinal + 1u32;
+    }
+    r = r + 1usize;
+  }
+  var p = 0usize;
+  while p < w.placeFields.len() {
+    let pf = &w.placeFields[p];
+    if *w.alive[pf.slot] {
+      let t3 = point3(&mut lw.cw.code.types);
+      let none = List[u32]();
+      let sig = lw.cw.code.types.sig(none.view(), &[t3]);
+      let u = lw.cw.beginUnit(sig, w.names.text(pf.name));
+      lw.cw.f64Const(pf.x);
+      lw.cw.f64Const(pf.y);
+      lw.cw.f64Const(pf.z);
+      lw.cw.opU(OP_TUPLE_MAKE, t3);
+      lw.cw.endUnit();
+      lw.cw.addEntry(ENTRY_FIXED, u, u32.from(pf.slot), pf.number);
+    }
+    p = p + 1usize;
+  }
+}
