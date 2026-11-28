@@ -1,0 +1,88 @@
+// Where a part is drawn between two snapshots: its place moved along a straight line, its turn along the shortest arc
+// (slerp), its size along a line. Render uses it for every part, so a part a rule turns turns smoothly between steps, not
+// in jumps of one step. The driven check is in the end of this file (`--checks`).
+
+// The place between 'a' (alpha 0) and 'b' (alpha 1). A placement is a translation, a turn and a size (Mat4.fromTrs); a
+// pair with the same 3x3 (no turn, no resize, the common case) moves along a line only and is returned exactly as before.
+pub fn blendPlacement(a: &Mat4, b: &Mat4, alpha: f32) Mat4 {
+  var same = true;
+  var i = 0usize;
+  while i < 12usize { if a.m[i] != b.m[i] { same = false; } i = i + 1usize; }
+  var out = *b;
+  out.m[12] = a.m[12] + (b.m[12] - a.m[12]) * alpha;
+  out.m[13] = a.m[13] + (b.m[13] - a.m[13]) * alpha;
+  out.m[14] = a.m[14] + (b.m[14] - a.m[14]) * alpha;
+  if same { return out; }
+  let sa = columnScale(a);
+  let sb = columnScale(b);
+  var qa = turnOfPlacement(a, sa);
+  let qb = turnOfPlacement(b, sb);
+  if qa.dot(qb) < 0. { qa = Quat(0. - qa.x, 0. - qa.y, 0. - qa.z, 0. - qa.w); }   // the shorter way round
+  let q = qa.slerp(qb, alpha);
+  let t = Vec3(out.m[12], out.m[13], out.m[14]);
+  Mat4.fromTrs(t, q, sa + (sb - sa) * alpha)
+}
+
+fn columnScale(p: &Mat4) Vec3 {
+  Vec3((p.m[0] * p.m[0] + p.m[1] * p.m[1] + p.m[2] * p.m[2]).sqrt(),
+       (p.m[4] * p.m[4] + p.m[5] * p.m[5] + p.m[6] * p.m[6]).sqrt(),
+       (p.m[8] * p.m[8] + p.m[9] * p.m[9] + p.m[10] * p.m[10]).sqrt())
+}
+
+// The unit quaternion of a placement's turn: its 3x3 with each column divided by its length (a column of no length stands
+// for the axis it began on)
+fn turnOfPlacement(p: &Mat4, s: Vec3) Quat {
+  var d0 = s.x; if d0 < 0.000001 { d0 = 1.; }
+  var d1 = s.y; if d1 < 0.000001 { d1 = 1.; }
+  var d2 = s.z; if d2 < 0.000001 { d2 = 1.; }
+  let m00 = p.m[0] / d0;  let m10 = p.m[1] / d0;  let m20 = p.m[2] / d0;     // column 0
+  let m01 = p.m[4] / d1;  let m11 = p.m[5] / d1;  let m21 = p.m[6] / d1;     // column 1
+  let m02 = p.m[8] / d2;  let m12 = p.m[9] / d2;  let m22 = p.m[10] / d2;    // column 2
+  let tr = m00 + m11 + m22;
+  var q = Quat.identity();
+  if tr > 0. {
+    let k = (tr + 1.).sqrt() * 2.;
+    q = Quat((m21 - m12) / k, (m02 - m20) / k, (m10 - m01) / k, k / 4.);
+  } else if m00 > m11 && m00 > m22 {
+    let k = (1. + m00 - m11 - m22).sqrt() * 2.;
+    q = Quat(k / 4., (m01 + m10) / k, (m02 + m20) / k, (m21 - m12) / k);
+  } else if m11 > m22 {
+    let k = (1. + m11 - m00 - m22).sqrt() * 2.;
+    q = Quat((m01 + m10) / k, k / 4., (m12 + m21) / k, (m02 - m20) / k);
+  } else {
+    let k = (1. + m22 - m00 - m11).sqrt() * 2.;
+    q = Quat((m02 + m20) / k, (m12 + m21) / k, k / 4., (m10 - m01) / k);
+  }
+  q.normalize()
+}
+
+// A placement turned 0 and 90 degrees about up, at 0.5, is 45 degrees (and the same turned the long way round, 350 and 10
+// degrees, is 0); a size 1 and 3 is 2; a pair with no turn moves along a line. PEGASUS_MUTANT=blend-lerp-matrix blends the
+// matrices entry by entry instead, which shrinks a half turn; the first check must catch it.
+fn checkBlend(mutant: bool) bool {
+  let up = Vec3(0., 1., 0.);
+  let a = Mat4.fromTrs(Vec3(0., 0., 0.), Quat.angleAxis(0., up), Vec3(1., 1., 1.));
+  let b = Mat4.fromTrs(Vec3(2., 0., 0.), Quat.angleAxis(radians(90.), up), Vec3(1., 1., 1.));
+  var m = blendPlacement(&a, &b, 0.5);
+  if mutant { var i = 0usize; while i < 12usize { m.m[i] = (a.m[i] + b.m[i]) * 0.5; i = i + 1usize; } }
+  let want = Mat4.fromTrs(Vec3(1., 0., 0.), Quat.angleAxis(radians(45.), up), Vec3(1., 1., 1.));
+  var off: f32 = 0.;
+  var i = 0usize;
+  while i < 16usize { let d = m.m[i] - want.m[i]; if d * d > off { off = d * d; } i = i + 1usize; }
+  let half = off < 0.00001;
+  let c = Mat4.fromTrs(Vec3(0., 0., 0.), Quat.angleAxis(radians(350.), up), Vec3(1., 1., 1.));
+  let d = Mat4.fromTrs(Vec3(0., 0., 0.), Quat.angleAxis(radians(10.), up), Vec3(1., 1., 1.));
+  let cd = blendPlacement(&c, &d, 0.5);
+  let round = cd.m[0] > 0.9999 && cd.m[2] < 0.0001 && cd.m[2] > -0.0001;
+  let e = Mat4.fromTrs(Vec3(0., 0., 0.), Quat.identity(), Vec3(1., 1., 1.));
+  let f = Mat4.fromTrs(Vec3(0., 0., 0.), Quat.identity(), Vec3(3., 3., 3.));
+  let ef = blendPlacement(&e, &f, 0.5);
+  let size = ef.m[0] > 1.9999 && ef.m[0] < 2.0001 && ef.m[5] > 1.9999 && ef.m[5] < 2.0001;
+  let g = Mat4.fromTrs(Vec3(0., 1., 0.), Quat.identity(), Vec3(1., 1., 1.));
+  let h = Mat4.fromTrs(Vec3(4., 1., 0.), Quat.identity(), Vec3(1., 1., 1.));
+  let gh = blendPlacement(&g, &h, 0.25);
+  let line = gh.m[12] > 0.9999 && gh.m[12] < 1.0001 && gh.m[0] == 1.;
+  print <- "check blend: half of a quarter turn is 45 degrees (worst entry off by "; print <- off; print <- ") ";
+  print <- half; print <- "; the short way round "; print <- round; print <- "; size "; print <- size; print <- "; a line "; print <- line; print <- "\n";
+  half && round && size && line
+}
