@@ -1,0 +1,258 @@
+// The glue the shims call: each tool made as one call, from values already read out of the slots. Moved from the guide
+// browser's build.cone with its arithmetic untouched, so a part's mesh is the same bits as before. (The helpers these
+// call, from smoothByAngle to throughPoints, follow in helpers.cone.)
+//
+// A shape is a list of pieces, not one mesh: join keeps pieces apart, and subdivide, smooth, move, turn and arrayRadial
+// map over pieces; a union or a difference makes one piece of two, by the sculpt package's exact booleans.
+
+// A shape of one piece
+fn pieceOf(p: PolyMesh) List[PolyMesh] {
+  var l = List[PolyMesh]();
+  l.push(p);
+  l
+}
+
+// A shape's pieces as one PolyMesh, nothing welded: what a boolean takes
+fn joinOne(pieces: List[PolyMesh]) PolyMesh {
+  var held = pieces;
+  if held.len() == 1usize {
+    match held.pop() {
+      case let Some(p) { return p; }
+      case is None {}
+    }
+  }
+  var polys = List[PolyMesh]();
+  while held.len() > 0usize {
+    match held.pop() {
+      case let Some(p) { polys.push(p); }
+      case is None {}
+    }
+  }
+  var problems = List[String]();
+  sculpt.join(&polys, &mut problems)
+}
+
+// box(x, y, z): the unit cube, put where the ranges say
+fn toolBox(x: Vec2, y: Vec2, z: Vec2) List[PolyMesh] {
+  var cube = List[PolyMesh]();
+  cube.push(PolyMesh.cube(0.5));
+  var place = List[Transform3]();
+  place.push(Transform3(Vec3((x.x + x.y) * 0.5, (y.x + y.y) * 0.5, (z.x + z.y) * 0.5),
+    Quat.identity(), Vec3(x.y - x.x, y.y - y.x, z.y - z.x)));
+  var problems = List[String]();
+  pieceOf(sculpt.joinPlaced(&cube, &place, &mut problems))
+}
+
+fn printProblems(problems: &List[String]) {
+  var k = 0usize;
+  while k < problems.len() { print <- "build: "; printStr(problems[k].view()); print <- "\n"; k = k + 1usize; }
+}
+
+fn toolUnion(a: List[PolyMesh], b: List[PolyMesh], crease: f32) List[PolyMesh] {
+  let pa = joinOne(a);
+  let pb = joinOne(b);
+  var problems = List[String]();
+  let made = sculpt.booleanWith(&pa, &pb, sculpt.BooleanUnion, crease, &mut problems);
+  printProblems(&problems);
+  pieceOf(made)
+}
+
+fn toolDifference(a: List[PolyMesh], b: List[PolyMesh], crease: f32) List[PolyMesh] {
+  let pa = joinOne(a);
+  let pb = joinOne(b);
+  var problems = List[String]();
+  let made = sculpt.booleanWith(&pa, &pb, sculpt.BooleanDifference, crease, &mut problems);
+  printProblems(&problems);
+  pieceOf(made)
+}
+
+fn toolMirror(s: List[PolyMesh], normal: Vec3, origin: Vec3, merge: f32) List[PolyMesh] {
+  let one = joinOne(s);
+  pieceOf(sculpt.mirror(&one, origin, normal, merge))
+}
+
+fn toolSmooth(s: List[PolyMesh], factor: f32, iterations: u32, keep: bool) List[PolyMesh] {
+  var out = List[PolyMesh]();
+  var i = 0usize;
+  while i < s.len() {
+    if keep { out.push(sculpt.smoothTaubin(&s[i], factor, sculpt.taubinMu(factor, 0.1), iterations)); }
+    else { out.push(sculpt.smooth(&s[i], factor, iterations)); }
+    i = i + 1usize;
+  }
+  out
+}
+
+fn toolSubdivide(s: List[PolyMesh], levels: u32) List[PolyMesh] {
+  var out = List[PolyMesh]();
+  var i = 0usize;
+  while i < s.len() { out.push(sculpt.subdivide(&s[i], levels)); i = i + 1usize; }
+  out
+}
+
+// move and turn: each piece placed on its own, the last piece first (as the walk always did)
+fn placedEach(s: List[PolyMesh], place: Transform3) List[PolyMesh] {
+  var made = s;
+  var out = List[PolyMesh]();
+  var places = List[Transform3]();
+  places.push(place);
+  while made.len() > 0usize {
+    match made.pop() {
+      case let Some(p) {
+        var one = List[PolyMesh]();
+        one.push(p);
+        var problems = List[String]();
+        out.push(sculpt.joinPlaced(&one, &places, &mut problems));
+      }
+      case is None {}
+    }
+  }
+  out
+}
+
+fn toolMove(s: List[PolyMesh], shift: Vec3) List[PolyMesh] {
+  placedEach(s, Transform3(shift, Quat.identity(), Vec3(1., 1., 1.)))
+}
+
+fn toolTurn(s: List[PolyMesh], angle: f32, about: Vec3, origin: Vec3) List[PolyMesh] {
+  let q = Quat.angleAxis(angle, about.normalize());
+  placedEach(s, Transform3(origin - q * origin, q, Vec3(1., 1., 1.)))
+}
+
+fn toolArrayRadial(copied: List[PolyMesh], count: u32, axis: Vec3, angle: f32, origin: Vec3, merge: f32) List[PolyMesh] {
+  var out = List[PolyMesh]();
+  var i = 0usize;
+  while i < copied.len() {
+    out.push(sculpt.arrayRadial(&copied[i], count, axis, angle, origin, merge));
+    i = i + 1usize;
+  }
+  out
+}
+
+// carve(s, strokes, mirror): the strokes applied in order, each also mirrored across the plane through the origin
+// when a mirror direction is given (0, 0, 0 is none)
+fn toolCarve(s: List[PolyMesh], strokes: List[StrokeSpec], mirror: Vec3) List[PolyMesh] {
+  var shape = joinOne(s);
+  var sc = sculptbrush.Sculptor.of(&shape);
+  var i = 0usize;
+  while i < strokes.len() {
+    var st = strokeOf(&strokes[i], &shape);
+    if mirror.x != 0. || mirror.y != 0. || mirror.z != 0. { st.mirrorAcross(Vec3(0., 0., 0.), mirror); }
+    sc.stroke(&st);
+    i = i + 1usize;
+  }
+  pieceOf(sc.finish())
+}
+
+// A brush call as a recipe: 'along' is an outline's handle, or 0 for one dab at 'at'
+fn toolStroke(handles: &mut ToolHandles, kind: u32, along: u64, at: Vec2, onto: Vec3, radius: f32, given: f32,
+    ends: f32) StrokeSpec {
+  var flat = sculpt.Profile.rectangle(0.1, 0.1);
+  if along != 0u64 { flat = handles.outline(along); }
+  StrokeSpec(kind, along != 0u64, flat, at, onto, radius, given, ends)
+}
+
+fn toolEllipse(width: f32, height: f32, segments: u32) sculpt.Profile {
+  let rx = width * 0.5;
+  let ry = height * 0.5;
+  var points = List[Vec2]();
+  var k = 0u32;
+  while k < segments {
+    let a = 6.2831853f * f32.from(k) / f32.from(segments);
+    points.push(Vec2(rx * cos(a), ry * sin(a)));
+    k = k + 1u32;
+  }
+  sculpt.Profile(points, true)
+}
+
+// outline.points: the points of an open outline, closed or not as asked
+fn toolClosed(open: sculpt.Profile, closed: bool) sculpt.Profile {
+  var o = open;
+  var points = List[Vec2]();
+  points <-> o.points;
+  sculpt.Profile(points, closed)
+}
+
+fn toolThrough(given: List[Vec3], segments: u32) sculpt.Path {
+  let pts = throughPoints(&given, segments);
+  sculpt.Path.fromPoints(pts.view(), false)
+}
+
+fn toolPlain(color: Color) MaterialRec {
+  MaterialRec(color, false, 1., 0., 1., 0., 0.05, 0.)
+}
+
+fn toolPhysical(color: Color, roughness: f32, metal: f32) MaterialRec {
+  MaterialRec(color, true, roughness, metal, 1., 0., 0.05, 0.)
+}
+
+// A material and its modifiers, applied in order
+fn toolLayered(base: MaterialRec, mods: List[ModifierRec]) MaterialRec {
+  var look = base;
+  var i = 0usize;
+  while i < mods.len() {
+    let m = *mods[i];
+    if m.kind == MOD_COVERS { look.covers = m.a; }
+    else if m.kind == MOD_COAT { look.coat = m.a; look.coatRoughness = m.b; }
+    else if m.kind == MOD_REFLECTS { look.reflects = m.a; }
+    i = i + 1usize;
+  }
+  look
+}
+
+fn toolLamp(reach: f32, color: Color, candela: f32, source: f32, shadows: bool, aim: Vec3, cone: f32, softEdge: f32,
+    spot: bool) LampRec {
+  LampRec(aim, color, candela, reach, source, cone, softEdge, spot, shadows)
+}
+
+// -------- a stroke, resolved against the shape it is carved onto --------
+//
+// A stroke from brush.NAME(along:, at:, onto:, radius:, strength:, ends:): its flat points are places on the side seen
+// from 'onto' (front: looking down -z at the x, y side view), each carried straight onto the surface facing that way;
+// three or more are joined by a smooth curve. A negative strength takes away (the brush's inverted action). 'ends' is
+// how much of each end of the stroke thins away, as a hand lifts.
+fn strokeOf(spec: &StrokeSpec, shape: &PolyMesh) sculptbrush.Stroke {
+  let kind = spec.kind;
+  let onto = spec.onto;
+  let radius = spec.radius;
+  let given = spec.given;
+  let strength = if given < 0. { -given } else { given };
+  var st = sculptbrush.Stroke.dab(sculptbrush.Brush.of(kind), Vec3(0., 0., 0.), radius, strength);
+  if spec.hasAlong {
+    let flat = &spec.along;
+    var pts = List[Vec3]();
+    var i = 0usize;
+    while i < flat.points.len() { pts.push(ontoSurface(shape, *flat.points[i], onto)); i = i + 1usize; }
+    let path = if pts.len() >= 3usize { sculptbrush.splinePoints(&pts, 6u32) } else { pts };
+    st = sculptbrush.Stroke.make(sculptbrush.Brush.of(kind), path, radius, strength);
+  } else {
+    // One dab: for the brushes that raise or press (draw, inflate, blob),
+    // its strength is the height raised, or the depth pressed in, as a
+    // fraction of its radius: Draw Sharp, which rises to a height over
+    // where the surface began (0.15 of the radius at strength 1)
+    let at = spec.at;
+    var dabKind = kind;
+    var dabStrength = strength;
+    if kind == sculptbrush.BrushDraw || kind == sculptbrush.BrushInflate || kind == sculptbrush.BrushBlob {
+      dabKind = sculptbrush.BrushDrawSharp;
+      dabStrength = strength / 0.15;
+    }
+    st = sculptbrush.Stroke.dab(sculptbrush.Brush.of(dabKind), ontoSurface(shape, at, onto), radius, dabStrength);
+    st.falloff = sculpt.Falloff.preset(0u32);    // geomath's FalloffSmooth: a rounded hollow or swell, not a cone
+    // pressed several times, so the height is reached
+    st.points.push(*st.points[0]);
+    st.points.push(*st.points[0]);
+    st.points.push(*st.points[0]);
+    st.points.push(*st.points[0]);
+    st.points.push(*st.points[0]);
+  }
+  st.subtract = given < 0.;
+  let e = spec.ends;
+  if e > 0. {
+    let a = if e > 0.49 { 0.49f } else { e };
+    let pts: Array[Vec2, 4] = [Vec2(0., 0.1), Vec2(a, 1.), Vec2(1. - a, 1.), Vec2(1., 0.1)];
+    st.strengthCurve = sculpt.Falloff.custom(&pts);
+    st.radiusCurve = sculpt.Falloff.custom(&pts);
+  }
+  st
+}
+

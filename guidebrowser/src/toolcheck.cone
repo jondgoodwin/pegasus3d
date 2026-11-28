@@ -1,0 +1,190 @@
+// --check-tools: the vocabulary's shims driven directly, and a world built with a refusing tool. No window, no GPU.
+// Prints one line per check ("ok  name" or "FAIL name") and exits 1 if any failed.
+//
+//   round trips   a call's arguments packed into slots, one row's shim called, its result read back, against the
+//                 library's own call made by hand (rotation, color, srgb, sunLight, box, spine.line: every slot form
+//                 but the lists, which the worlds' mesh hashes cover)
+//   aliasing      the results of rotation and color overwrite their own arguments
+//   refusal       a shim given a handle of the wrong kind declines, and says why; a world built with a tool that
+//                 refuses loses exactly that part, with one line, and its other part is built
+//   the table     the first eight rows, every default as many slots as its type takes
+
+fn rowNamed(v: &Vocabulary, names: &mut Names, word: &str) usize {
+  var path = List[u32]();
+  path.push(names.intern(word));
+  match v.find(&path) {
+    case let Some(t) { usize.from(t) }
+    case is None { 0xFFFFFFFFusize }
+  }
+}
+
+fn word(x: f64) u64 { x.bits() }
+
+fn f32Word(x: f32) u64 { f64.from(x).bits() }
+
+
+
+fn verdict(failed: &mut u32, name: &str, ok: bool) {
+  if ok { print <- "ok   "; } else { print <- "FAIL "; *failed = *failed + 1u32; }
+  printStr(name); print <- "\n";
+}
+
+// A shim that always declines, standing in for a row (never in the table)
+fn refusing(handles: &mut ToolHandles, slots: &mut Array[u64]) bool {
+  handles.refuse("the tool declined (a check)");
+  false
+}
+
+fn checkTools() bool {
+  var names = Names.standard();
+  let vocab = vocabulary(&mut names);
+  let shims = toolShims();
+  var hs = ToolHandles.make();
+  var failed = 0u32;
+
+  // the table
+  verdict(&mut failed, "the table has as many shims as rows", shims.len() == vocab.tools.len());
+  var firstEight = true;
+  let wanted = ["box", "plain", "srgb", "color", "rotation", "sunLight", "physical", "sphere"];
+  var r = 0usize;
+  while r < 8usize {
+    let t = &vocab.tools[r];
+    if t.path.len() != 1usize || t.path[0] != names.intern(wanted[r]) { firstEight = false; }
+    r = r + 1usize;
+  }
+  verdict(&mut failed, "the first eight rows are box, plain, srgb, color, rotation, sunLight, physical, sphere", firstEight);
+  var defaultsFit = true;
+  r = 0usize;
+  while r < vocab.tools.len() {
+    var p = 0usize;
+    while p < vocab.tools[r].params.len() {
+      let q = &vocab.tools[r].params[p];
+      if q.required && q.fallback.len() != 0usize { defaultsFit = false; }
+      if !q.required && q.fallback.len() != usize.from(slotsOf(q.ty)) && !(q.fallback.len() == 1usize) { defaultsFit = false; }
+      p = p + 1usize;
+    }
+    r = r + 1usize;
+  }
+  verdict(&mut failed, "every default is as many slots as its type takes", defaultsFit);
+
+  // rotation: Angle + Direction in, Rotation (4 slots) out over the same slots
+  let rot = rowNamed(&vocab, &mut names, "rotation");
+  var s = List[u64]();
+  s.push(word(0.7)); s.push(word(0.2)); s.push(word(0.9)); s.push(word(-0.4));
+  let rotShim = *shims[rot];
+  let okRot = rotShim(&mut hs, s.viewMut().sliceMut(0usize, 4usize));
+  let q = Quat.angleAxis(f32.from(0.7), Vec3(f32.from(0.2), f32.from(0.9), f32.from(-0.4)).normalize());
+  verdict(&mut failed, "rotation: four slots in, a quaternion over them", okRot && *s[0usize] == f32Word(q.x) && *s[1usize] == f32Word(q.y)
+    && *s[2usize] == f32Word(q.z) && *s[3usize] == f32Word(q.w));
+
+  // color: r, g, b, opacity in, a Color over them
+  let col = rowNamed(&vocab, &mut names, "color");
+  var c = List[u64]();
+  c.push(word(0.1)); c.push(word(0.2)); c.push(word(0.3)); c.push(word(0.4));
+  let colShim = *shims[col];
+  let okCol = colShim(&mut hs, c.viewMut().sliceMut(0usize, 4usize));
+  verdict(&mut failed, "color: four numbers in, a color over them", okCol && *c[0usize] == f32Word(f32.from(0.1)) && *c[1usize] == f32Word(f32.from(0.2))
+    && *c[2usize] == f32Word(f32.from(0.3)) && *c[3usize] == f32Word(f32.from(0.4)));
+
+  // srgb
+  let sr = rowNamed(&vocab, &mut names, "srgb");
+  var e = List[u64]();
+  e.push(word(170.)); e.push(word(214.)); e.push(word(222.)); e.push(word(1.));
+  let srShim = *shims[sr];
+  let okSr = srShim(&mut hs, e.viewMut().sliceMut(0usize, 4usize));
+  verdict(&mut failed, "srgb: the true sRGB curve, opacity kept", okSr && *e[0usize] == f32Word(srgbToLinear(170.)) && *e[1usize] == f32Word(srgbToLinear(214.))
+    && *e[2usize] == f32Word(srgbToLinear(222.)) && *e[3usize] == f32Word(1.));
+
+  // sunLight: Direction (3), Color (4), Illuminance, Truth in; a handle out
+  let sun = rowNamed(&vocab, &mut names, "sunLight");
+  var u = List[u64]();
+  u.push(word(-0.5)); u.push(word(0.7)); u.push(word(0.5));
+  u.push(f32Word(0.25)); u.push(f32Word(0.5)); u.push(f32Word(0.75)); u.push(f32Word(1.));
+  u.push(word(50000.)); u.push(1u64);
+  let sunShim = *shims[sun];
+  let okSun = sunShim(&mut hs, u.viewMut().sliceMut(0usize, 9usize));
+  let sr2 = hs.sun(*u[0usize]);
+  verdict(&mut failed, "sunLight: direction, color, lux and shadows read from their slots", okSun && sr2.toSun.x == f32.from(-0.5)
+    && sr2.toSun.y == f32.from(0.7) && sr2.toSun.z == f32.from(0.5) && sr2.color.green == 0.5 && sr2.color.blue == 0.75
+    && sr2.lux == f32.from(50000.) && sr2.shadows);
+
+  // box: three LengthRanges in, a shape out
+  let box = rowNamed(&vocab, &mut names, "box");
+  var b = List[u64]();
+  b.push(word(-1.)); b.push(word(3.)); b.push(word(0.)); b.push(word(2.)); b.push(word(-0.5)); b.push(word(0.5));
+  let boxShim = *shims[box];
+  let okBox = boxShim(&mut hs, b.viewMut().sliceMut(0usize, 6usize));
+  let pieces = hs.pieces(*b[0usize]);
+  var lo = Vec3(1.0e30f, 1.0e30f, 1.0e30f);
+  var hi = Vec3(-1.0e30f, -1.0e30f, -1.0e30f);
+  var k = 0usize;
+  while pieces.len() > 0usize && k < pieces[0].positions.len() {
+    lo = lo.min(*pieces[0].positions[k]);
+    hi = hi.max(*pieces[0].positions[k]);
+    k = k + 1usize;
+  }
+  verdict(&mut failed, "box: three ranges give a box with those corners", okBox && pieces.len() == 1usize && lo.x == -1. && hi.x == 3. && lo.y == 0.
+    && hi.y == 2. && lo.z == -0.5 && hi.z == 0.5);
+
+  // spine.line: Point, Point, a count in; a handle out
+  let sp = rowNamed2(&vocab, &mut names, "spine", "line");
+  var l = List[u64]();
+  l.push(word(0.)); l.push(word(0.)); l.push(word(-1.)); l.push(word(0.)); l.push(word(0.)); l.push(word(1.)); l.push(word(4.));
+  let spShim = *shims[sp];
+  let okSp = spShim(&mut hs, l.viewMut().sliceMut(0usize, 7usize));
+  let path = hs.spine(*l[0usize]);
+  verdict(&mut failed, "spine.line: two points and a count of segments", okSp && path.points.len() == 5usize && path.points[0].z == -1.
+    && path.points[4].z == 1.);
+
+  // refusal: join given a list whose item is a material's handle
+  let plain = rowNamed(&vocab, &mut names, "plain");
+  var m = List[u64]();
+  m.push(f32Word(0.5)); m.push(f32Word(0.5)); m.push(f32Word(0.5)); m.push(f32Word(1.));
+  let plainShim = *shims[plain];
+  let okPlain = plainShim(&mut hs, m.viewMut().sliceMut(0usize, 4usize));
+  var asList = List[u64]();
+  asList.push(*m[0usize]);
+  let listHandle = hs.newList(1u32, asList.view());
+  let join = rowNamed(&vocab, &mut names, "join");
+  var j = List[u64]();
+  j.push(listHandle);
+  let joinShim = *shims[join];
+  var fresh = ToolHandles.make();
+  let freshList = fresh.newList(1u32, asList.view());
+  j.set(0usize, freshList);
+  let okJoin = joinShim(&mut fresh, j.viewMut().sliceMut(0usize, 1usize));
+  verdict(&mut failed, "a shim given the wrong kind of handle declines, saying why", okPlain && !okJoin && fresh.refused()
+    && fresh.why().startsWith("expected a shape"));
+
+  // a world built with a refusing tool loses exactly that part
+  var world = String.from("part w\n  part materials\n    part grey: plain(color: color(0.5, 0.5, 0.5))\n  part pieces\n");
+  world.append("    part good: box(x: 0 ..= 1, y: 0 ..= 1, z: 0 ..= 1), material: materials.grey\n");
+  world.append("    part bad: lathe(profile: [(0, 0), (0.1, 0), (0.1, 0.1)]), material: materials.grey\n");
+  var made = readWorld(world.view());
+  var tx: Sender[Arrival];
+  var rx: Receiver[Arrival];
+  tx, rx = Channel[Arrival].make();
+  var withRefusal = toolShims();
+  let lathe = rowNamed(&made.understood.vocab, &mut made.understood.names, "lathe");
+  withRefusal.set(lathe, &refusing);
+  let built = buildWith(withRefusal, &made.understood, &tx, true);
+  var sent = 0u32;
+  while true {
+    match rx.tryRecv() {
+      case let Some(a) { sent = sent + 1u32; }
+      else { break; }
+    }
+  }
+  verdict(&mut failed, "a world with a refusing tool: the part is left out, the other built", made.problems.len() == 0usize && built == 1u64 && sent == 1u32);
+  failed == 0u32
+}
+
+fn rowNamed2(v: &Vocabulary, names: &mut Names, a: &str, b: &str) usize {
+  var path = List[u32]();
+  path.push(names.intern(a));
+  path.push(names.intern(b));
+  match v.find(&path) {
+    case let Some(t) { usize.from(t) }
+    case is None { 0xFFFFFFFFusize }
+  }
+}
