@@ -33,6 +33,12 @@ Inherits: [Strangers' worlds](strangers-worlds.md) (a world learns only what Pla
 - **Device input is of four kinds:** signals mapped by bindings to actions; text to the focused field, through a typing
   context Player switches on with focus (SDL's key and text streams); body tracking under permission; raw streams.
   `[design choice]`
+- **A click means what the person saw.** Player sends, as an action in an event, "pressed, along this ray, at the
+  time of the frame the person saw", addressed to the avatar's hand. The client Sim picks against its pick shapes as
+  they were in that frame and fires `Clicked` on the part hit. Connected, the client Sim forwards the resolved press
+  to the server Sim, which accepts it. `[design choice]`
+- **While text goes to a focused field, the browser's own controls stay live** (leaving the field, the browser's
+  exit). Which inputs are reserved from worlds in general is a separate question, deferred with safety. `[design choice]`
 
 ### What an action is
 - An action is a universal data structure with its own type: a verb, a receiver handle and parameters.
@@ -105,9 +111,8 @@ The island is `C:\src\pegasus3d` master (`browser/src/`); the studio is the bran
 - **The pointer on a focused surface.** Typing goes from Player straight to the page ([Strangers' worlds](strangers-worlds.md)).
   Options for the pointer: Player sends it straight to that surface, Sim learning only that focus moved; or it passes
   through the zone's Sim. Recommended: straight to the surface.
-- **The click.** Player sends "pressed, along this ray, at the time of the frame the person saw" to the avatar's hand,
-  and only Sim knows what lies under the ray and turns it into `Clicked` on the part hit. Whether this is the form the
-  message table takes is to be settled with the table in [Messages](../actors/messages.md).
+- **Re-testing a click on the server.** Whether the server Sim re-tests a forwarded press's ray against where things
+  were, as a defence against cheating. Not built first.
 - **The microphone.** Options: Audio owns the device and Player decides who hears it; or Player owns both. Recommended:
   Audio owns the device, because capture runs on the audio clock and echo cancellation needs the speaker's signal;
   Player decides who hears it.
