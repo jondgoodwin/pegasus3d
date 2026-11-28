@@ -48,9 +48,8 @@ def main():
         lines = run(exe, w, CLICKS.get(name, MIDDLE))
         # the frame a loop line names varies with timing: keep only that the behaviors arrived
         lines = ["loop: the world's behaviors arrived" if "behaviors arrived" in l else l for l in lines]
-        # which step a click lands on varies with the machine's timing: step 0 (created) is exact, the rest read 'step N'
-        lines = [re.sub(r"\(\d+(\.\d+)? s\)", "(T s)", re.sub(r"step (?!0\b)\d+", "step N", l)) if not l.startswith("world: step 0") else l
-                 for l in lines]
+        # which step a world is created on and a click lands on varies with the machine's timing: they read 'step N'
+        lines = [re.sub(r"\(\d+(\.\d+)? s\)", "(T s)", re.sub(r"step \d+", "step N", l)) for l in lines]
         (out / (name + ".log")).write_text("\n".join(lines) + "\n", encoding="utf-8")
         note = ""
         if a.compare:

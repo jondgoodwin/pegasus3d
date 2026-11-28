@@ -5,7 +5,11 @@
 // understood (build.cone): every part's place in its parent, the fields and
 // their defaults, the areas, the derives in the order they are worked out,
 // and the event rules with their animators already built (tweenstack's Anim,
-// plain data, so it crosses like a mesh does).
+// plain data, so it crosses like a mesh does). The derives and the rules are
+// code of the intermediate form (conescript's lowerSim), which the World
+// verifies when it starts and runs through the interpreter (simhost.cone): a
+// derive's unit gives its value; a rule's unit says what it does through
+// staged writes, which the World applies when the unit returns.
 //
 // The loop sends one message a step: the step's number, and what came in for
 // it (a part clicked, where the visitor's eye is). Nothing from outside
@@ -47,7 +51,7 @@ pub struct AreaRt {
 pub struct DeriveRt {
   pub prop: u32;               // P_FIELD or P_TINT
   pub index: u32;              // the field's number, or the part's slot
-  pub calc: Calc;
+  pub number: u32;             // the derive's number in the checked world: its unit's entry
 }
 
 pub struct RuleRt {
@@ -57,21 +61,11 @@ pub struct RuleRt {
   pub what: String;            // what it moves, to say so
 }
 
-// One thing a pick-and-place rule does (understand.cone's MoveAct): kind 0
-// sets the field to the part 'value' (-1: none); kind 1 starts the part the
-// field holds gliding, over 'seconds', to stand over the middle of part 'to'
-pub struct MoveActRt {
-  pub kind: u32;
-  pub field: u32;
-  pub value: i64;
-  pub to: u32;
-  pub middle: Vec3;            // the middle of 'to''s shape, in its own frame
-  pub seconds: f32;
-}
-
+// A pick-and-place rule: set(field, part | None) and
+// start(transition(field.offset, to:, over:)), as its unit says
 pub struct MoveRt {
   pub part: u32;               // clicked: it, or any part inside it
-  pub acts: List[MoveActRt];
+  pub number: u32;             // the rule's number in the checked world: its unit's entry (ENTRY_MOVE_FLAG | number)
 }
 
 pub struct Program {
@@ -79,8 +73,10 @@ pub struct Program {
   pub fields: List[FieldRt];
   pub areas: List[AreaRt];
   pub derives: List[DeriveRt]; // in the order they are worked out
-  pub rules: List[RuleRt];
+  pub rules: List[RuleRt];     // the live rules in order: a rule's unit says host.start_anim with its place here
   pub moves: List[MoveRt];
+  pub middles: List[Vec3];     // by slot: the middle of the part's shape in its own frame (where a glide to it ends)
+  pub code: Code;              // the derives' and rules' units (conescript's lowerSim)
 }
 
 // No part clicked this step
@@ -92,8 +88,10 @@ actor WorldActor {
   animators: Animators;
   started: bool;
   first: u64;                  // the step the world was created in
-  values: List[f64];           // by field
-  inside: List[bool];          // by area: is the visitor on this machine inside?
+  sim: Option[SimHost];        // the derives' and rules' units and the values they read (None: the code was refused)
+  deriveUnits: List[u32];      // by derive in the program: its unit (NO_UNIT: none)
+  ruleUnits: List[u32];        // by rule in the program
+  moveUnits: List[u32];        // by pick-and-place rule in the program
   positions: List[Vec3];       // by slot: in the world, at the end of this step
   rotations: List[Quat];
   tints: List[f32];
@@ -103,12 +101,36 @@ actor WorldActor {
   sentTints: List[f32];
 
   fn init(self: &new, out: Sender[Published], program: Program) {
-    var values = List[f64]();
+    var sim = None[SimHost];
+    var deriveUnits = List[u32]();
+    var ruleUnits = List[u32]();
+    var moveUnits = List[u32]();
     var i = 0usize;
-    while i < program.fields.len() { values.push(program.fields[i].value); i = i + 1usize; }
-    var inside = List[bool]();
-    i = 0usize;
-    while i < program.areas.len() { inside.push(false); i = i + 1usize; }
+    match SimHost.make(&program.code, program.fields.len(), program.frames.len()) {
+      case let Ok(host) {
+        var h = host;
+        i = 0usize;
+        while i < program.fields.len() { h.setValue(i, program.fields[i].value); i = i + 1usize; }
+        i = 0usize;
+        while i < program.derives.len() { deriveUnits.push(unitOrNone(h.unitFor(ENTRY_DERIVE, program.derives[i].number, 0u32))); i = i + 1usize; }
+        i = 0usize;
+        while i < program.rules.len() { ruleUnits.push(unitOrNone(h.unitFor(ENTRY_HANDLER, u32.from(i), 0u32))); i = i + 1usize; }
+        i = 0usize;
+        while i < program.moves.len() {
+          moveUnits.push(unitOrNone(h.unitFor(ENTRY_HANDLER, ENTRY_MOVE_FLAG | program.moves[i].number, 0u32)));
+          i = i + 1usize;
+        }
+        sim = Some[SimHost](h);
+      }
+      case let Err(problems) {
+        // code that does not verify never runs: this world's derives and rules are left out
+        i = 0usize;
+        while i < problems.len() {
+          print <- "world: the world's behavior code was refused: "; printStr(problems[i].what.view()); print <- "\n";
+          i = i + 1usize;
+        }
+      }
+    }
     var positions = List[Vec3]();
     var rotations = List[Quat]();
     var tints = List[f32]();
@@ -122,8 +144,8 @@ actor WorldActor {
       sent.push(false); sentPositions.push(Vec3(0., 0., 0.)); sentRotations.push(Quat.identity()); sentTints.push(1.);
       i = i + 1usize;
     }
-    *self = Self(out: out, program: program, animators: Animators.make(), started: false, first: 0u64, values: values,
-      inside: inside, positions: positions, rotations: rotations, tints: tints, sent: sent,
+    *self = Self(out: out, program: program, animators: Animators.make(), started: false, first: 0u64, sim: sim,
+      deriveUnits: deriveUnits, ruleUnits: ruleUnits, moveUnits: moveUnits, positions: positions, rotations: rotations, tints: tints, sent: sent,
       sentPositions: sentPositions, sentRotations: sentRotations, sentTints: sentTints);
   }
 
@@ -136,11 +158,7 @@ actor WorldActor {
       first = index;
       var r = 0usize;
       while r < program.rules.len() {
-        if !program.rules[r].clicked {
-          animators.start(&program.rules[r].anim);
-          print <- "world: step "; print <- index; print <- ", created: "; printStr(program.rules[r].what.view());
-          print <- " started\n";
-        }
+        if !program.rules[r].clicked { self.runHandler(*ruleUnits[r], index, NO_CLICK); }
         r = r + 1usize;
       }
     }
@@ -152,41 +170,14 @@ actor WorldActor {
       while m < program.moves.len() {
         if self.within(clicked, program.moves[m].part) {
           any = true;
-          var k = 0usize;
-          while k < program.moves[m].acts.len() {
-            let a = program.moves[m].acts[k];
-            let f = usize.from(a.field);
-            if a.kind == 0u32 {
-              values.set(f, f64.from(a.value));
-              print <- "world: step "; print <- index; print <- ", ";
-              printStr(program.fields[f].name.view()); print <- " is now ";
-              if a.value < 0i64 { print <- "None"; } else { printStr(program.frames[usize.from(a.value)].name.view()); }
-              print <- "\n";
-            }
-            else if *values[f] >= 0. {
-              let piece = usize.from(i64.from(*values[f]));
-              let to = usize.from(a.to);
-              let here = *positions[piece];
-              let there = *positions[to] + *rotations[to] * a.middle;
-              let parent = usize.from(program.frames[piece].parent);
-              // the change in the piece's own parent's frame, level: it keeps its height
-              let shift = rotations[parent].conjugate() * Vec3(there.x - here.x, 0., there.z - here.z);
-              let now = animators.valueVec3(u32.from(piece), P_OFFSET, Vec3(0., 0., 0.));
-              animators.start(&Anim.transition(u32.from(piece), P_OFFSET, AnimValue.ofVec3(now + shift), a.seconds));
-              print <- "world: step "; print <- index; print <- ", "; printStr(program.frames[piece].name.view());
-              print <- " glides to "; printStr(program.frames[to].name.view()); print <- "\n";
-            }
-            k = k + 1usize;
-          }
+          self.runHandler(*moveUnits[m], index, clicked);
         }
         m = m + 1usize;
       }
       var r = 0usize;
       while r < program.rules.len() {
         if program.rules[r].clicked && self.within(clicked, program.rules[r].part) {
-          animators.start(&program.rules[r].anim);
-          print <- "world: step "; print <- index; print <- ", "; printStr(program.frames[usize.from(clicked)].name.view());
-          print <- " clicked: "; printStr(program.rules[r].what.view()); print <- " started\n";
+          self.runHandler(*ruleUnits[r], index, clicked);
           any = true;
         }
         r = r + 1usize;
@@ -217,23 +208,44 @@ actor WorldActor {
       }
       s = s + 1usize;
     }
-    // Who is inside each area
+    // Who is inside each area: a part is occupied if the visitor is inside any of its areas
     var a = 0usize;
+    while a < program.areas.len() {
+      self.setInside(usize.from(program.areas[a].slot), false);
+      a = a + 1usize;
+    }
+    a = 0usize;
     while a < program.areas.len() {
       let area = program.areas[a];
       let k = usize.from(area.slot);
       let middle = *positions[k] + *rotations[k] * area.center;
-      inside.set(a, (eye - middle).length() <= area.radius);
+      if (eye - middle).length() <= area.radius { self.setInside(k, true); }
       a = a + 1usize;
     }
     // The derives, in their order
     var d = 0usize;
     while d < program.derives.len() {
-      let v = self.calc(&program.derives[d].calc);
+      var v = 0.;
+      var got = false;
+      let unit = *deriveUnits[d];
+      if unit != NO_UNIT {
+        match &mut sim {
+          case var &mut Some(h) {
+            match h.derive(unit) {
+              case let Ok(x) { v = x; got = true; }
+              case let Err(why) {
+                print <- "world: step "; print <- index; print <- ", a derive was stopped: "; printStr(why.view()); print <- "\n";
+              }
+            }
+          }
+          else {}
+        }
+      }
+      if !got { d = d + 1usize; continue; }
       let i = usize.from(program.derives[d].index);
       if program.derives[d].prop == P_FIELD {
-        if v != *values[i] {
-          values.set(i, v);
+        if v != self.valueOf(i) {
+          self.setValue(i, v);
           let field = &program.fields[i];
           print <- "world: step "; print <- index; print <- " ("; print <- now; print <- " s), ";
           printStr(program.frames[usize.from(field.slot)].name.view()); print <- "."; printStr(field.name.view());
@@ -281,23 +293,82 @@ actor WorldActor {
     false
   }
 
-  // A derive's formula, worked out now
-  fn calc(self: &, c: &Calc) f64 {
-    match c {
-      case let Num(x) { *x }
-      case let Field(f) { *values[*f] }
-      case let Occupied(slot) {
-        var yes = false;
-        var a = 0usize;
-        while a < program.areas.len() {
-          if usize.from(program.areas[a].slot) == *slot && *inside[a] { yes = true; }
-          a = a + 1usize;
-        }
-        if yes { 1. } else { 0. }
-      }
-      case let Choose(parts) {
-        if self.calc(&parts[0]) != 0. { self.calc(&parts[1]) } else { self.calc(&parts[2]) }
-      }
+  fn valueOf(self: &, i: usize) f64 {
+    match &sim {
+      case let Some(h) { h.value(i) }
+      else { 0. }
     }
+  }
+
+  fn setValue(self: &mut, i: usize, v: f64) {
+    match &mut sim { case var &mut Some(h) { h.setValue(i, v); } else {} }
+  }
+
+  fn setInside(self: &mut, slot: usize, inside: bool) {
+    match &mut sim { case var &mut Some(h) { h.setInside(slot, inside); } else {} }
+  }
+
+  // Runs a rule's unit (none: nothing) as the click on 'clicked' or the creation of the world (NO_CLICK) at step 'index',
+  // and applies what it staged, in order, once it has returned; a unit that traps is dropped whole, writes and all
+  fn runHandler(self: &mut, unit: u32, index: u64, clicked: u32) {
+    if unit == NO_UNIT { return; }
+    var writes = List[StagedWrite]();
+    var stopped = None[String];
+    match &mut sim {
+      case var &mut Some(h) { stopped = h.handle(unit, &mut writes); }
+      else {}
+    }
+    match &stopped {
+      case let Some(why) {
+        print <- "world: step "; print <- index; print <- ", a rule was stopped and its changes dropped: "; printStr(why.view());
+        print <- "\n";
+        return;
+      }
+      else {}
+    }
+    var k = 0usize;
+    while k < writes.len() {
+      let w = &writes[k];
+      if w.kind == WRITE_SET {
+        let f = usize.from(w.a);
+        let v = f64.fromBits(w.b);
+        self.setValue(f, v);
+        print <- "world: step "; print <- index; print <- ", ";
+        printStr(program.fields[f].name.view()); print <- " is now ";
+        if v < 0. { print <- "None"; } else { printStr(program.frames[usize.from(i64.from(v))].name.view()); }
+        print <- "\n";
+      }
+      else if w.kind == WRITE_ANIM {
+        let r = usize.from(w.a);
+        animators.start(&program.rules[r].anim);
+        print <- "world: step "; print <- index; print <- ", ";
+        if clicked == NO_CLICK { print <- "created: "; }
+        else { printStr(program.frames[usize.from(clicked)].name.view()); print <- " clicked: "; }
+        printStr(program.rules[r].what.view()); print <- " started\n";
+      }
+      else if self.valueOf(usize.from(w.a)) >= 0. {
+        // a glide: the part the field holds stands over the middle of the part 'to', level
+        let piece = usize.from(i64.from(self.valueOf(usize.from(w.a))));
+        let to = usize.from(w.b);
+        let here = *positions[piece];
+        let there = *positions[to] + *rotations[to] * program.middles[to];
+        let parent = usize.from(program.frames[piece].parent);
+        // the change in the piece's own parent's frame, level: it keeps its height
+        let shift = rotations[parent].conjugate() * Vec3(there.x - here.x, 0., there.z - here.z);
+        let now = animators.valueVec3(u32.from(piece), P_OFFSET, Vec3(0., 0., 0.));
+        animators.start(&Anim.transition(u32.from(piece), P_OFFSET, AnimValue.ofVec3(now + shift), f32.from(f64.fromBits(w.c))));
+        print <- "world: step "; print <- index; print <- ", "; printStr(program.frames[piece].name.view());
+        print <- " glides to "; printStr(program.frames[to].name.view()); print <- "\n";
+      }
+      k = k + 1usize;
+    }
+  }
+}
+
+// An entry's unit, or NO_UNIT
+fn unitOrNone(u: Option[u32]) u32 {
+  match u {
+    case let Some(x) { x }
+    else { NO_UNIT }
   }
 }

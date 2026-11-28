@@ -1,0 +1,172 @@
+// The Sim side of the intermediate form: what the World actor runs derives and rules with.
+//
+// A world's derives and rules are lowered (conescript's lowerSim) to a Code of units that reach the world only through
+// imports in namespace "host". This file is the table of those imports and the one place that runs a unit:
+//
+//   host.field(i)            a field's value, as it stood before the run (handle 1)
+//   host.occupied(part)      is the visitor inside that part's area (handle 2, set by the World each step)
+//   host.set_field(i, v)     acting: staged, not written
+//   host.start_anim(k)       acting: staged
+//   host.glide(i, to, s)     acting: staged
+//
+// Staged writes: an acting import appends to the run's write list (handle 3) and changes nothing else, so a handler
+// does not see its own writes and a handler that traps leaves nothing behind. 'handle' gives the list to the caller
+// only when the run finished; the World applies it, in order, once the handler has returned.
+//
+// The table is the browser's, as Sim's data is; the new browser's Sim makes its own from the same names and
+// signatures (conescript's HOST_* and *Signature).
+
+alias SimHandles = HandleTable[u8];
+
+const SIM_FIELDS = 1usize;      // handle 1: the fields' values, as f64 bits
+const SIM_INSIDE = 2usize;      // handle 2: by part slot, 1 if the visitor is inside an area of that part
+const SIM_WRITES = 3usize;      // handle 3: the staged writes of the run, four words each
+
+// What a run may spend (a derive or a handler is a few ops; this only stops a runaway)
+pub const SIM_FUEL = 100000u64;
+
+pub const WRITE_SET = 0u64;     // a: the field, b: its value as bits
+pub const WRITE_ANIM = 1u64;    // a: the animator's number
+pub const WRITE_GLIDE = 2u64;   // a: the field holding the part, b: where it goes (a slot), c: seconds as bits
+
+// One thing a handler asked for, in the order it asked
+pub struct StagedWrite {
+  pub kind: u64;
+  pub a: u64;
+  pub b: u64;
+  pub c: u64;
+}
+
+fn hostField(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(SIM_FIELDS).len() { hs.fail = String.from("host.field: no such field"); return false; }
+  slots[0usize] = *hs.payload(SIM_FIELDS)[i];
+  true
+}
+
+fn hostOccupied(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  slots[0usize] = if s < hs.payload(SIM_INSIDE).len() { *hs.payload(SIM_INSIDE)[s] } else { 0u64 };
+  true
+}
+
+fn hostSetField(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(SIM_FIELDS).len() { hs.fail = String.from("host.set_field: no such field"); return false; }
+  let v = slots[1usize];
+  (&mut hs.data[SIM_WRITES]).push(WRITE_SET);
+  (&mut hs.data[SIM_WRITES]).push(u64.from(i));
+  (&mut hs.data[SIM_WRITES]).push(v);
+  (&mut hs.data[SIM_WRITES]).push(0u64);
+  true
+}
+
+fn hostStartAnim(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let k = slots[0usize];
+  (&mut hs.data[SIM_WRITES]).push(WRITE_ANIM);
+  (&mut hs.data[SIM_WRITES]).push(k);
+  (&mut hs.data[SIM_WRITES]).push(0u64);
+  (&mut hs.data[SIM_WRITES]).push(0u64);
+  true
+}
+
+fn hostGlide(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(SIM_FIELDS).len() { hs.fail = String.from("host.glide: no such field"); return false; }
+  let to = slots[1usize];
+  let seconds = slots[2usize];
+  (&mut hs.data[SIM_WRITES]).push(WRITE_GLIDE);
+  (&mut hs.data[SIM_WRITES]).push(u64.from(i));
+  (&mut hs.data[SIM_WRITES]).push(to);
+  (&mut hs.data[SIM_WRITES]).push(seconds);
+  true
+}
+
+// The imports Sim offers (the code's, lowerSim's, are checked against these)
+pub fn simImports() ImportTables[u8] {
+  var t = ImportTables[u8].make();
+  let f = fieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_FIELD, f, false, 1u32, &hostField);
+  let o = occupiedSignature(&mut t.types);
+  t.add(NS_HOST, HOST_OCCUPIED, o, false, 1u32, &hostOccupied);
+  let s = setFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FIELD, s, true, 1u32, &hostSetField);
+  let a = startAnimSignature(&mut t.types);
+  t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &hostStartAnim);
+  let g = glideSignature(&mut t.types);
+  t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &hostGlide);
+  t
+}
+
+// A world's Sim code, verified, with the values it reads and the interpreter that runs it
+pub struct SimHost {
+  code: VerifiedCode;
+  tables: ImportTables[u8];
+  hs: SimHandles;
+  interp: Interpreter;
+
+  // The host for code, with 'fields' fields (each starting at 0) and 'slots' parts; or what the verifier refused
+  pub fn make(code: &Code, fields: usize, slots: usize) Result[SimHost, List[CodeProblem]] {
+    let tables = simImports();
+    match verify(code, &tables) {
+      case let Ok(v) {
+        var hs = SimHandles.make();
+        var f = List[u64]();
+        var i = 0usize;
+        while i < fields { f.push(0u64); i = i + 1usize; }
+        var s = List[u64]();
+        i = 0usize;
+        while i < slots { s.push(0u64); i = i + 1usize; }
+        hs.alloc(HANDLE_HOST, f);
+        hs.alloc(HANDLE_HOST, s);
+        hs.alloc(HANDLE_HOST, List[u64]());
+        Ok[SimHost, List[CodeProblem]](SimHost(v, tables, hs, Interpreter.make()))
+      }
+      case let Err(ps) { Err[SimHost, List[CodeProblem]](ps) }
+    }
+  }
+
+  pub fn setValue(self: &mut, i: usize, v: f64) { (&mut self.hs.data[SIM_FIELDS]).set(i, v.bits()); }
+  pub fn value(self: &, i: usize) f64 { f64.fromBits(*self.hs.payload(SIM_FIELDS)[i]) }
+  pub fn setInside(self: &mut, slot: usize, inside: bool) { (&mut self.hs.data[SIM_INSIDE]).set(slot, if inside { 1u64 } else { 0u64 }); }
+
+  // The unit an entry names, if the code has one
+  pub fn unitFor(self: &, kind: u8, a: u32, b: u32) Option[u32] { entryUnit(self.code.source(), kind, a, b) }
+
+  // Runs a unit, leaving its result slots in 'out' and its staged writes in the write list; the trap's message if it stopped
+  fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
+    self.hs.fail = String();
+    (&mut self.hs.data[SIM_WRITES]).clear();
+    self.interp.setFuel(SIM_FUEL);
+    let none = List[u64]();
+    match self.interp.run(&self.code, &self.tables, &mut self.hs, unit, none.view(), out) {
+      case let Some(t) { Some[String](t.message.clone()) }
+      case is None { None }
+    }
+  }
+
+  // A derive's value now; the trap's message if it stopped
+  pub fn derive(self: &mut, unit: u32) Result[f64, String] {
+    var out = List[u64]();
+    match self.run(unit, &mut out) {
+      case let Some(why) { Err[f64, String](why) }
+      case is None { Ok[f64, String](f64.fromBits(*out[0usize])) }
+    }
+  }
+
+  // A handler run to its end: what it staged, in order, for the caller to apply. A handler that traps hands back nothing:
+  // 'writes' is left empty and the trap's message is returned
+  pub fn handle(self: &mut, unit: u32, writes: &mut List[StagedWrite]) Option[String] {
+    writes.clear();
+    var out = List[u64]();
+    let stopped = self.run(unit, &mut out);
+    if stopped is Some { return stopped; }
+    let w = self.hs.payload(SIM_WRITES);
+    var i = 0usize;
+    while i + 3usize < w.len() {
+      writes.push(StagedWrite(*w[i], *w[i + 1usize], *w[i + 2usize], *w[i + 3usize]));
+      i = i + 4usize;
+    }
+    None
+  }
+}

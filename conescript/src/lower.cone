@@ -323,6 +323,90 @@ struct Lowering {
     self.val(w, f, &info.result, info.ty, &List[u64]());
     self.cw.endUnit();
   }
+
+  // A derive's formula as code that gives its value (a truth as 1 or 0)
+  fn calc(self: &mut, c: &Calc) {
+    match c {
+      case let Num(x) { self.cw.f64Const(*x); }
+      case let Field(f) {
+        self.cw.i64Const(i64.from(*f));
+        let sig = fieldSignature(&mut self.cw.code.types);
+        let n = self.imp(NS_HOST, HOST_FIELD, sig);
+        self.cw.opU(OP_IMPORT, n);
+      }
+      case let Occupied(slot) {
+        self.cw.opU(OP_PART_CONST, u32.from(*slot));
+        let sig = occupiedSignature(&mut self.cw.code.types);
+        let n = self.imp(NS_HOST, HOST_OCCUPIED, sig);
+        self.cw.opU(OP_IMPORT, n);
+        self.cw.op(OP_F64_FROM_BOOL);
+      }
+      case let Choose(parts) {
+        self.calc(&parts[0usize]);
+        self.cw.op(OP_BOOL_FROM_F64);
+        let none = List[u32]();
+        let bt = self.cw.code.types.sig(none.view(), &[TY_F64]);
+        self.cw.opU(OP_IF, bt);
+        self.calc(&parts[1usize]);
+        self.cw.op(OP_ELSE);
+        self.calc(&parts[2usize]);
+        self.cw.op(OP_END);
+      }
+    }
+  }
+
+  fn derive(self: &mut, w: &Understood, d: usize) {
+    let none = List[u32]();
+    let sig = self.cw.code.types.sig(none.view(), &[TY_F64]);
+    let u = self.cw.beginUnit(sig, "derive");
+    self.calc(&w.derives[d].calc);
+    self.cw.endUnit();
+    self.cw.addEntry(ENTRY_DERIVE, u, u32.from(d), 0u32);
+  }
+
+  // A handler's unit: no parameters and no results
+  fn beginHandler(self: &mut, name: &str) u32 {
+    let none = List[u32]();
+    let sig = self.cw.code.types.sig(none.view(), none.view());
+    self.cw.beginUnit(sig, name)
+  }
+
+  // A rule that starts an animator: the animator's number is the rule's place among the live rules
+  fn startRule(self: &mut, ordinal: u32) {
+    let u = self.beginHandler("rule");
+    self.cw.i64Const(i64.from(ordinal));
+    let sig = startAnimSignature(&mut self.cw.code.types);
+    let n = self.imp(NS_HOST, HOST_START_ANIM, sig);
+    self.cw.opU(OP_IMPORT, n);
+    self.cw.endUnit();
+    self.cw.addEntry(ENTRY_HANDLER, u, ordinal, 0u32);
+  }
+
+  // A pick-and-place rule: its actions in the order written
+  fn moveRule(self: &mut, w: &Understood, m: usize) {
+    let u = self.beginHandler("move");
+    var k = 0usize;
+    while k < w.moves[m].acts.len() {
+      let a = &w.moves[m].acts[k];
+      self.cw.i64Const(i64.from(a.field));
+      if a.kind == 0u32 {
+        self.cw.f64Const(f64.from(a.value));
+        let sig = setFieldSignature(&mut self.cw.code.types);
+        let n = self.imp(NS_HOST, HOST_SET_FIELD, sig);
+        self.cw.opU(OP_IMPORT, n);
+      }
+      else {
+        self.cw.opU(OP_PART_CONST, u32.from(a.to));
+        self.cw.f64Const(a.seconds);
+        let sig = glideSignature(&mut self.cw.code.types);
+        let n = self.imp(NS_HOST, HOST_GLIDE, sig);
+        self.cw.opU(OP_IMPORT, n);
+      }
+      k = k + 1usize;
+    }
+    self.cw.endUnit();
+    self.cw.addEntry(ENTRY_HANDLER, u, ENTRY_MOVE_FLAG | u32.from(m), 0u32);
+  }
 }
 
 // The checked world's fixed values as code: one unit per function (unit number = function number), then one per value
@@ -354,6 +438,73 @@ pub fn lower(w: &Understood) Code {
       }
     }
     r = r + 1usize;
+  }
+  var done = Code.empty();
+  done <-> lw.cw.code;
+  done
+}
+
+// -------- Sim's code: derives and rules --------
+//
+// What the World (Sim) runs, lowered into a Code of its own beside the fixed code above (the fixed code names
+// vocabulary imports that Sim does not offer, so the two are verified against different tables):
+//
+//   a derive      one unit () -> f64, entry ENTRY_DERIVE, a = the derive's number in the checked world; Sim writes its
+//                 target. It reads through host.field and host.occupied, which do not act.
+//   a rule        one unit () with no result, entry ENTRY_HANDLER, a = the rule's place among the live rules (the number
+//                 of its animator in the world image's table); it says host.start_anim(k).
+//   a pick-and-place rule   one unit () with no result, entry ENTRY_HANDLER, a = ENTRY_MOVE_FLAG | its number in the
+//                 checked world; it says host.set_field and host.glide in the order written.
+//
+// The host imports (namespace "host") have the signatures below; set_field, start_anim and glide act.
+pub const ENTRY_MOVE_FLAG = 0x80000000u32;
+pub const HOST_FIELD = "field";
+pub const HOST_OCCUPIED = "occupied";
+pub const HOST_SET_FIELD = "set_field";
+pub const HOST_START_ANIM = "start_anim";
+pub const HOST_GLIDE = "glide";
+
+// (i64: the field's number) -> its value as a number (a truth as 1 or 0)
+pub fn fieldSignature(tt: &mut TypeTable) u32 { tt.sig(&[TY_I64], &[TY_F64]) }
+// (part) -> is the visitor inside that part's area
+pub fn occupiedSignature(tt: &mut TypeTable) u32 { tt.sig(&[TY_PART], &[TY_BOOL]) }
+// (i64: the field's number, f64: the value; a part as its slot, -1 for none)
+pub fn setFieldSignature(tt: &mut TypeTable) u32 { let none = List[u32](); tt.sig(&[TY_I64, TY_F64], none.view()) }
+// (i64: the animator's number)
+pub fn startAnimSignature(tt: &mut TypeTable) u32 { let none = List[u32](); tt.sig(&[TY_I64], none.view()) }
+// (i64: the field holding the part to move, part: where it goes, f64: seconds)
+pub fn glideSignature(tt: &mut TypeTable) u32 { let none = List[u32](); tt.sig(&[TY_I64, TY_PART, TY_F64], none.view()) }
+
+// The unit an entry names, if the code has one
+pub fn entryUnit(code: &Code, kind: u8, a: u32, b: u32) Option[u32] {
+  var i = 0usize;
+  while i < code.entries.len() {
+    let e = &code.entries[i];
+    if e.kind == kind && e.a == a && e.b == b { return Some[u32](e.unit); }
+    i = i + 1usize;
+  }
+  None
+}
+
+// The checked world's Sim code: a unit for each live derive, each live rule (numbered among the live rules, in order)
+// and each pick-and-place rule whose part is alive
+pub fn lowerSim(w: &Understood) Code {
+  var lw = Lowering(CodeWriter.make(), List[String]());
+  var d = 0usize;
+  while d < w.derives.len() {
+    if w.derives[d].live { lw.derive(w, d); }
+    d = d + 1usize;
+  }
+  var ordinal = 0u32;
+  var r = 0usize;
+  while r < w.rules.len() {
+    if w.rules[r].live { lw.startRule(ordinal); ordinal = ordinal + 1u32; }
+    r = r + 1usize;
+  }
+  var m = 0usize;
+  while m < w.moves.len() {
+    if *w.alive[w.moves[m].part] { lw.moveRule(w, m); }
+    m = m + 1usize;
   }
   var done = Code.empty();
   done <-> lw.cw.code;

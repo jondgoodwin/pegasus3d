@@ -1,0 +1,104 @@
+// --check-sim: the Sim host's staged writes, driven with hand-assembled handlers (no window, no GPU).
+//
+//   a handler that sets a field twice and returns: its two writes come back in order, and the field is as it was
+//   (a handler does not write until the World applies what it staged)
+//   a handler that sets a field and then traps: the trap's message comes back, no writes do, the field is as it was
+//   a derive that reaches an acting import is refused by the verifier
+//   a derive that reads a field gives its value as it stands
+
+// A unit that sets field 0 to 5 and then to 6; then traps if 'trap'; filed as 'kind' (ENTRY_HANDLER or ENTRY_DERIVE)
+fn setTwice(trap: bool, kind: u8) Code {
+  var cw = CodeWriter.make();
+  let setSig = setFieldSignature(&mut cw.code.types);
+  let imp = cw.addImport(NS_HOST, HOST_SET_FIELD, setSig);
+  let none = List[u32]();
+  let sig = cw.code.types.sig(none.view(), none.view());
+  let u = cw.beginUnit(sig, "h");
+  cw.i64Const(0i64); cw.f64Const(5.); cw.opU(OP_IMPORT, imp);
+  cw.i64Const(0i64); cw.f64Const(6.); cw.opU(OP_IMPORT, imp);
+  if trap { cw.op(OP_UNREACHABLE); }
+  cw.endUnit();
+  cw.addEntry(kind, u, 0u32, 0u32);
+  var done = Code.empty();
+  done <-> cw.code;
+  done
+}
+
+// A derive that gives field 0's value plus 1
+fn readPlusOne() Code {
+  var cw = CodeWriter.make();
+  let fSig = fieldSignature(&mut cw.code.types);
+  let imp = cw.addImport(NS_HOST, HOST_FIELD, fSig);
+  let none = List[u32]();
+  let sig = cw.code.types.sig(none.view(), &[TY_F64]);
+  let u = cw.beginUnit(sig, "d");
+  cw.i64Const(0i64); cw.opU(OP_IMPORT, imp);
+  cw.f64Const(1.); cw.op(OP_F64_ADD);
+  cw.endUnit();
+  cw.addEntry(ENTRY_DERIVE, u, 0u32, 0u32);
+  var done = Code.empty();
+  done <-> cw.code;
+  done
+}
+
+fn simVerdict(ok: bool, what: &str) bool {
+  print <- "check-sim: "; printStr(what); print <- if ok { " ok\n" } else { " WRONG\n" };
+  ok
+}
+
+pub fn checkSim() bool {
+  var all = true;
+
+  // A handler that returns: its writes, in order; the field not yet written
+  match SimHost.make(&setTwice(false, ENTRY_HANDLER), 1usize, 1usize) {
+    case let Ok(host) {
+      var h = host;
+      var writes = List[StagedWrite]();
+      let unit = h.unitFor(ENTRY_HANDLER, 0u32, 0u32);
+      var stopped = Some[String](String.from("not run"));
+      match unit { case let Some(u) { stopped = h.handle(u, &mut writes); } case is None {} }
+      all = simVerdict(stopped is None, "a handler that returns is not stopped") && all;
+      all = simVerdict(writes.len() == 2usize && writes[0usize].a == 0u64 && f64.fromBits(writes[0usize].b) == 5.
+        && f64.fromBits(writes[1usize].b) == 6., "its two writes come back in order") && all;
+      all = simVerdict(h.value(0usize) == 0., "the field is as it was until the writes are applied") && all;
+    }
+    case let Err(ps) { all = simVerdict(false, "the handler's code verifies") && all; }
+  }
+
+  // A handler that traps: nothing staged comes back
+  match SimHost.make(&setTwice(true, ENTRY_HANDLER), 1usize, 1usize) {
+    case let Ok(host) {
+      var h = host;
+      var writes = List[StagedWrite]();
+      writes.push(StagedWrite(9u64, 9u64, 9u64, 9u64));
+      var stopped = None[String];
+      match h.unitFor(ENTRY_HANDLER, 0u32, 0u32) { case let Some(u) { stopped = h.handle(u, &mut writes); } case is None {} }
+      all = simVerdict(stopped is Some, "a handler that traps is stopped") && all;
+      all = simVerdict(writes.len() == 0usize, "a trapped handler's staged writes are dropped") && all;
+      all = simVerdict(h.value(0usize) == 0., "a trapped handler leaves the field as it was") && all;
+    }
+    case let Err(ps) { all = simVerdict(false, "the trapping handler's code verifies") && all; }
+  }
+
+  // The second wall: a derive may not act
+  match SimHost.make(&setTwice(false, ENTRY_DERIVE), 1usize, 1usize) {
+    case let Ok(host) { all = simVerdict(false, "a derive that sets a field is refused") && all; }
+    case let Err(ps) { all = simVerdict(ps.len() > 0usize, "a derive that sets a field is refused") && all; }
+  }
+
+  // A derive reads a field as it stands
+  match SimHost.make(&readPlusOne(), 1usize, 1usize) {
+    case let Ok(host) {
+      var h = host;
+      h.setValue(0usize, 41.);
+      var got = 0.;
+      match h.unitFor(ENTRY_DERIVE, 0u32, 0u32) {
+        case let Some(u) { match h.derive(u) { case let Ok(v) { got = v; } case let Err(why) {} } }
+        case is None {}
+      }
+      all = simVerdict(got == 42., "a derive reads the field as it stands") && all;
+    }
+    case let Err(ps) { all = simVerdict(false, "the derive's code verifies") && all; }
+  }
+  all
+}
