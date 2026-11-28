@@ -97,6 +97,59 @@ fn checkWorldFetch(skipHash: bool) bool {
   writeText(&keptFilePath(&keep, contentHash(body)), "part kepx\n");
   all = fetchLine("a kept file whose bytes were changed is not given",
     match loadKeptFile(&keep, 10u64, contentHash(body)) { case is Some[String] { false } case is None[String] { true } }) && all;
+  // the manifest as a whole: a table that cannot be read, or names a file twice, is a fault (the world does not open); a bad field on
+  // one line is only that file's
+  let goodTable = "a.ddd 3 00000000000000ff first.a\nb.ddd 10 0123456789abcdef first.b\n";
+  all = fetchLine("a sound manifest has no fault", manifestFault(goodTable, &manifestEntries(goodTable)).len() == 0usize) && all;
+  let junk = "<html>\n<body>404 not here</body>\n</html>\n";
+  all = fetchLine("a manifest that is not a manifest (an error page) is a fault",
+    manifestFault(junk, &manifestEntries(junk)).len() > 0usize) && all;
+  var binary = String.from("a.ddd 3 00000000000000ff first.a\n");
+  binary.appendByte(1u8); binary.appendByte(2u8);
+  all = fetchLine("a manifest with control bytes is a fault", manifestFault(binary.view(), &manifestEntries(binary.view())).len() > 0usize) && all;
+  let cutTable = "a.ddd 3 00000000000000ff first.a\nb.ddd 10 0123456789ab";
+  all = fetchLine("a manifest cut off in the middle of a line is a fault", manifestFault(cutTable, &manifestEntries(cutTable)).len() > 0usize) && all;
+  let emptyTable = "// nothing here\n\n";
+  all = fetchLine("a manifest that lists no file is a fault", manifestFault(emptyTable, &manifestEntries(emptyTable)).len() > 0usize) && all;
+  let twice = "a.ddd 3 00000000000000ff first.a\nb.ddd 10 0123456789abcdef first.b\na.ddd 3 00000000000000ff first.a\n";
+  let twiceFault = manifestFault(twice, &manifestEntries(twice));
+  all = fetchLine("a manifest naming a file twice is a fault", twiceFault.len() > 0usize) && all;
+  let badField = "a.ddd 3x 00000000000000ff first.a\nb.ddd 10 0123456789abcdef first.b\n";
+  let badEntries = manifestEntries(badField);
+  all = fetchLine("a bad size or hash on one line is no fault of the manifest: that line's file alone is not ok",
+    manifestFault(badField, &badEntries).len() == 0usize && !badEntries[0].ok && badEntries[1].ok) && all;
+  // each file's declared place: the part its first line declares (with the parts open above it), or the part that line sits in
+  var placed = List[String]();
+  placed.push(String.from("part first\n"));
+  placed.push(String.from("  part materials\n    part lawn: physical(color: x)\n"));
+  placed.push(String.from("  worldAvatars(cast: [a])\n  part people\n"));
+  placed.push(String.from("// only a comment\n"));
+  placed.push(String.from("    part deep\n"));
+  let at = declaredPaths(&placed);
+  all = fetchLine("a file's declared place is read from its first line of code and the parts open above it",
+    at.len() == 5usize && at[0].view() == "first" && at[1].view() == "first.materials" && at[2].view() == "first"
+    && at[3].len() == 0usize && at[4].view() == "first.people.deep") && all;
+  // a manifest whose path for a file is wrong (it says first.sea; the file begins at first.island), read from disk: that file is left
+  // out and the others stay; and a manifest that is a fault reads as nothing
+  writeText(&dir.join("p1.ddd"), "part first\n");
+  writeText(&dir.join("p2.ddd"), "  part island\n");
+  writeText(&dir.join("p3.ddd"), "  part sea\n");
+  var placedWorld = String.from(manifestLineOf("p1.ddd", "part first\n", "first").view());
+  placedWorld.append(manifestLineOf("p2.ddd", "  part island\n", "first.sea").view());
+  placedWorld.append(manifestLineOf("p3.ddd", "  part sea\n", "first.sea").view());
+  writeText(&dir.join("placed.world"), placedWorld.view());
+  all = fetchLine("a file whose declared place is not the manifest's path is left out and the others stay",
+    readWorldNow(dir.join("placed.world").view()).view() == "part first\n  part sea\n") && all;
+  var rightWorld = String.from(manifestLineOf("p1.ddd", "part first\n", "first").view());
+  rightWorld.append(manifestLineOf("p2.ddd", "  part island\n", "first.island").view());
+  rightWorld.append(manifestLineOf("p3.ddd", "  part sea\n", "first.sea").view());
+  writeText(&dir.join("right.world"), rightWorld.view());
+  all = fetchLine("the same files with the right paths all stay",
+    readWorldNow(dir.join("right.world").view()).view() == "part first\n  part island\n  part sea\n") && all;
+  var dupWorld = String.from(rightWorld.view());
+  dupWorld.append(manifestLineOf("p1.ddd", "part first\n", "first").view());
+  writeText(&dir.join("dup.world"), dupWorld.view());
+  all = fetchLine("a manifest naming a file twice reads as nothing: the world does not open", readWorldNow(dir.join("dup.world").view()).len() == 0usize) && all;
   all = fetchLine("a file that was never kept is not given",
     match loadKeptFile(&keep, 3u64, contentHash("abc")) { case is Some[String] { false } case is None[String] { true } }) && all;
   all

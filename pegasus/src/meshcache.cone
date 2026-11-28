@@ -28,7 +28,9 @@
 //
 // SIZE AND ORDER. The folder is kept under CACHE_CAP_BYTES by deleting the least recently used entry first. Recency is the file's
 // last-written time, set on every hit (whole seconds: all the file system gives), and within one second the order this Loader
-// used the entries in. The newest entry is never deleted, whatever the cap.
+// used the entries in. The newest entry is never deleted, whatever the cap. The files a world keeps (`.wtx`, below) share this one
+// cap and order: meshes, materials and kept files are evicted together, least recently used first, and what the running world is
+// using (`hold`, `holdFile`) is never evicted, even if that leaves the folder over the cap.
 //
 // NOT CACHED: a build that left its part out or has notes (the notes are reported on every build), and meshes with vertex colours
 // or tangents (the worlds' meshes have neither; the entry does not carry them). Mock worlds' content is not cached: it is cheaper
@@ -60,6 +62,7 @@ const FNV_OFFSET = 14695981039346656037u64;
 const FNV_PRIME = 1099511628211u64;
 const CACHE_TMP_EXTENSION = ".tmp";
 const CACHE_EXTENSION = ".pgm";
+const FILE_EXTENSION = ".wtx";      // a kept world file
 
 // The folder asked for by the environment; empty: no cache
 pub fn cacheFolder() String {
@@ -86,6 +89,19 @@ pub fn cacheHex(x: u64) String {
     out.appendByte(if d < 10u8 { '0' + d } else { 'a' + (d - 10u8) });
   }
   out
+}
+
+// The file name of the entry of 'key', and of the kept world file of content hash 'hash'
+pub fn entryName(key: ContentKey) String {
+  var name = cacheHex(key);
+  name.append(CACHE_EXTENSION);
+  name
+}
+
+pub fn keptName(hash: u64) String {
+  var name = cacheHex(hash);
+  name.append(FILE_EXTENSION);
+  name
 }
 
 // Where the entry of 'key' lives in 'dir'
@@ -347,11 +363,9 @@ pub fn loadEntry(dir: &Path, key: ContentKey, kind: u32, stamp: u64, lax: u32, o
 }
 
 // ---- Files of a world kept by content ----
-// A file the manifest names is kept under its content hash, beside the mesh entries (`.wtx`, not counted in the cap: a world's
-// text is small beside what it builds). A kept file is read back and checked against the size and hash the manifest gives, so a
-// damaged or foreign file there is a miss, never a world.
-
-const FILE_EXTENSION = ".wtx";
+// A file the manifest names is kept under its content hash, beside the mesh entries (`.wtx`; counted in the cap with them and
+// evicted by the same least-recently-used order, `MeshCache.evict`). A kept file is read back and checked against the size and hash
+// the manifest gives, so a damaged or foreign file there is a miss, never a world.
 
 // The hash of a file's bytes (the same sum that checks the entries)
 pub fn contentHash(b: &Array[u8]) u64 { sumOfBytes(b) }
@@ -413,36 +427,70 @@ struct Found {
   size: u64;
   seconds: i64;
   rank: usize;                      // 0: not used by this Loader; else its place in the order it used entries
+  held: bool;                       // in use by the running world: never deleted
 }
 
-// The cache as its one writer, the Loader, keeps it: the folder, the cap, and the order this run used its entries in
+// The cache as its one writer, the Loader, keeps it: the folder, the cap, and the order this run used its entries in. One cap holds
+// every kind of file in the folder (mesh entries, material entries, kept world files), least recently used first
 pub struct MeshCache {
   pub dir: Path;                    // empty: no cache
   pub cap: u64;
   pub stamp: u64;                   // the build that writes: its entries carry this (`buildStamp`)
-  used: List[ContentKey];           // oldest first
+  used: List[String];               // the file names, oldest use first
+  held: List[String];               // the file names the running world is using (`hold`, `holdFile`)
   pub stored: u64;
   pub evicted: u64;
 
-  pub fn make(dir: Path, stamp: u64, cap: u64) MeshCache { MeshCache(dir, cap, stamp, List[ContentKey](), 0u64, 0u64) }
+  pub fn make(dir: Path, stamp: u64, cap: u64) MeshCache {
+    MeshCache(dir, cap, stamp, List[String](), List[String](), 0u64, 0u64)
+  }
 
   pub fn on(self: &) bool { !dir.isEmpty() }
 
-  fn markUsed(self: &mut, key: ContentKey) {
+  fn markUsed(self: &mut, name: String) {
     var i = 0usize;
     while i < used.len() {
-      if *used[i] == key { _ = used.remove(i); break; }
+      if used[i].view() == name.view() { _ = used.remove(i); break; }
       i = i + 1usize;
     }
-    used.push(key);
+    used.push(name);
+  }
+
+  fn markHeld(self: &mut, name: String) {
+    var i = 0usize;
+    while i < held.len() {
+      if held[i].view() == name.view() { return; }
+      i = i + 1usize;
+    }
+    held.push(name);
   }
 
   // The entry of 'key' was read: it is the newest
   pub fn touch(self: &mut, key: ContentKey) {
     if !self.on() { return; }
-    self.markUsed(key);
+    self.markUsed(entryName(key));
     let now = time.Timestamp.now();
     match fs.utime(&entryPath(&dir, key), now, now) { else {} }
+  }
+
+  // The kept world file of content hash 'hash' was read, or was just kept: it is the newest
+  pub fn touchFile(self: &mut, hash: u64) {
+    if !self.on() { return; }
+    self.markUsed(keptName(hash));
+    let now = time.Timestamp.now();
+    match fs.utime(&keptFilePath(&dir, hash), now, now) { else {} }
+  }
+
+  // The running world uses the entry of 'key': eviction does not delete it, however small the cap
+  pub fn hold(self: &mut, key: ContentKey) {
+    if !self.on() { return; }
+    self.markHeld(entryName(key));
+  }
+
+  // The running world uses the kept world file of content hash 'hash': likewise
+  pub fn holdFile(self: &mut, hash: u64) {
+    if !self.on() { return; }
+    self.markHeld(keptName(hash));
   }
 
   // Keep 'p' under 'key'; false if it is not kept (not cacheable, or the disk would not take it)
@@ -450,31 +498,42 @@ pub struct MeshCache {
     if !self.on() || !cacheable(kind, p) { return false; }
     let bytes = entryBytes(key, kind, stamp, p);
     if !writeKept(&dir, cacheHex(key), &entryPath(&dir, key), bytes.view()) { return false; }
-    self.markUsed(key);
+    self.markUsed(entryName(key));
     self.stored = self.stored + 1u64;
     true
   }
 
-  // Delete the least recently used entries until the folder is under the cap; the newest is never deleted. How many went
+  // Whether 'name' is a file the running world holds
+  fn isHeld(self: &, name: &str) bool {
+    var i = 0usize;
+    while i < held.len() {
+      if held[i].view() == name { return true; }
+      i = i + 1usize;
+    }
+    false
+  }
+
+  // Delete the least recently used files (mesh entries, material entries and kept world files alike) until the folder is under the
+  // cap; the newest is never deleted, nor one the running world holds (PEGASUS_MUTANT=cache-ignore-holds deletes those too, and a
+  // check must fail on it). How many went
   pub fn evict(self: &mut) u64 {
     if !self.on() { return 0u64; }
+    let ignoreHolds = mutantIs("cache-ignore-holds");
     var found = List[Found]();
     var total = 0u64;
     match fs.readDir(&dir) {
       case let Ok(entries) {
         each e in &entries {
-          if !e.isFile || !e.name.view().endsWith(CACHE_EXTENSION) { continue; }
+          if !e.isFile || !(e.name.view().endsWith(CACHE_EXTENSION) || e.name.view().endsWith(FILE_EXTENSION)) { continue; }
           match fs.stat(&e.path) {
             case let Ok(info) {
               var rank = 0usize;
               var i = 0usize;
               while i < used.len() {
-                var name = cacheHex(*used[i]);
-                name.append(CACHE_EXTENSION);
-                if name.view() == e.name.view() { rank = i + 1usize; }
+                if used[i].view() == e.name.view() { rank = i + 1usize; }
                 i = i + 1usize;
               }
-              found.push(Found(e.path.clone(), u64.from(info.size), info.modified.unixSeconds(), rank));
+              found.push(Found(e.path.clone(), u64.from(info.size), info.modified.unixSeconds(), rank, !ignoreHolds && self.isHeld(e.name.view())));
               total = total + u64.from(info.size);
             }
             else {}
@@ -485,15 +544,21 @@ pub struct MeshCache {
     }
     var gone = 0u64;
     while total > cap && found.len() > 1usize {
-      // the least recently used: the oldest second, and within it the one this Loader used longest ago
-      var oldest = 0usize;
-      var i = 1usize;
+      // the least recently used that is not held: the oldest second, and within it the one this Loader used longest ago
+      var oldest = found.len();
+      var i = 0usize;
       while i < found.len() {
         let a = &found[i];
-        let b = &found[oldest];
-        if a.seconds < b.seconds || (a.seconds == b.seconds && a.rank < b.rank) { oldest = i; }
+        if !a.held {
+          if oldest == found.len() { oldest = i; }
+          else {
+            let b = &found[oldest];
+            if a.seconds < b.seconds || (a.seconds == b.seconds && a.rank < b.rank) { oldest = i; }
+          }
+        }
         i = i + 1usize;
       }
+      if oldest == found.len() { break; }
       let victim = found.remove(oldest);
       match fs.removeFile(&victim.path) { else {} }
       total = total - victim.size;

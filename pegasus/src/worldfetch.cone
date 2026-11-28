@@ -113,7 +113,7 @@ pub fn manifestEntries(text: &str) List[ManifestEntry] {
         var hash = 0u64;
         var ok = f.len() == 4usize;
         if ok { ok = parseNumber(f[1].view(), 10u64, &mut size) && f[2].len() == 16usize && parseNumber(f[2].view(), 16u64, &mut hash); }
-        out.push(ManifestEntry(f[0].clone(), size, hash, if f.len() == 4usize { f[3].clone() } else { String() }, ok));
+        out.push(ManifestEntry(if f.len() > 0usize { f[0].clone() } else { String() }, size, hash, if f.len() == 4usize { f[3].clone() } else { String() }, ok));
       }
       else { break; }
     }
@@ -153,6 +153,139 @@ pub fn dropLine(name: &str, path: &str, verdict: u32, got: &Array[u8], size: u64
   s
 }
 
+// Why a manifest cannot be used at all: "" if it can. It is the world's table of contents, so a fault in the table as a whole means
+// there is nothing to fall back to and the world does not open: the text is not text (a control byte), it lists no file, a line has
+// other than four fields (an error page, a cut-off download), or two lines name one file. (A line of four fields whose size or hash
+// is wrong is only its own file's fault: `ManifestEntry.ok`.) 'entries' is `manifestEntries(text)`
+pub fn manifestFault(text: &str, entries: &List[ManifestEntry]) String {
+  let raw: &Array[u8] = text;
+  var i = 0usize;
+  while i < raw.len {
+    let c = raw[i];
+    if c < ' ' && c != '\n' && c != '\r' && c != '\t' { return String.from("is not text"); }
+    i = i + 1usize;
+  }
+  if entries.len() == 0usize { return String.from("lists no files"); }
+  var it = text.lines();
+  while true {
+    match it.next() {
+      case let Some(line) {
+        let t = line.trim();
+        if t.len() == 0usize || t.startsWith("//") { continue; }
+        let f = splitFields(t);
+        if f.len() != 4usize {
+          var s = String.from("has a line of ");
+          s.append(numberLine("", u64.from(f.len()), " fields, not four (NAME SIZE HASH PATH): ").view());
+          s.append(t);
+          return s;
+        }
+      }
+      else { break; }
+    }
+  }
+  var a = 0usize;
+  while a < entries.len() {
+    var b = a + 1usize;
+    while b < entries.len() {
+      if entries[a].name.view() == entries[b].name.view() {
+        var s = String.from("names the file ");
+        s.append(entries[a].name.view());
+        s.append(" twice");
+        return s;
+      }
+      b = b + 1usize;
+    }
+    a = a + 1usize;
+  }
+  String()
+}
+
+// The one line saying a manifest cannot be used and the world does not open
+pub fn manifestFaultLine(loc: &str, fault: &str) String {
+  var s = String.from("loader: the manifest ");
+  s.append(loc);
+  s.append(" cannot be used: it ");
+  s.append(fault);
+  s.append(". The world does not open.\n");
+  s
+}
+
+// The name after "part " on a stripped line ("part lawn: physical(...)" is lawn); empty if the line does not declare a part
+fn partNameOf(t: &str) String {
+  var out = String();
+  if !t.startsWith("part ") { return out; }
+  let b: &Array[u8] = t;
+  var i = 5usize;
+  while i < b.len {
+    let c = b[i];
+    if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' { out.appendByte(c); } else { break; }
+    i = i + 1usize;
+  }
+  out
+}
+
+// Where each file's text begins, as the dotted path of the parts open there (the same rule tools\splitworld.py writes the manifest's
+// PATH by): the part declared on a file's first line of code, with the parts open above it (by indentation, through every file
+// before); or, if the file starts with something else, the part that line sits in. Empty for a file with no code in it. 'texts' are
+// the files in the manifest's order
+pub fn declaredPaths(texts: &List[String]) List[String] {
+  var out = List[String]();
+  var indents = List[usize]();
+  var names = List[String]();
+  each text in &*texts {
+    var path = String();
+    var have = false;
+    var it = text.view().lines();
+    while true {
+      match it.next() {
+        case let Some(line) {
+          let t = line.trim();
+          if t.len() == 0usize || t.startsWith("//") { continue; }
+          let raw: &Array[u8] = line;
+          var indent = 0usize;
+          while indent < raw.len && raw[indent] == ' ' { indent = indent + 1usize; }
+          while indents.len() > 0usize && *indents[indents.len() - 1usize] >= indent {
+            _ = indents.pop();
+            _ = names.pop();
+          }
+          let pname = partNameOf(t);
+          if !have {
+            have = true;
+            var k = 0usize;
+            while k < names.len() {
+              if k > 0usize { path.append("."); }
+              path.append(names[k].view());
+              k = k + 1usize;
+            }
+            if pname.len() > 0usize {
+              if names.len() > 0usize { path.append("."); }
+              path.append(pname.view());
+            }
+          }
+          if pname.len() > 0usize { indents.push(indent); names.push(pname); }
+        }
+        else { break; }
+      }
+    }
+    out.push(path);
+  }
+  out
+}
+
+// The one line saying a file was left out because its text begins somewhere other than the manifest says
+pub fn pathLine(name: &str, path: &str, declared: &str) String {
+  var s = String.from("loader: file ");
+  s.append(name);
+  s.append(" (subtree ");
+  s.append(path);
+  s.append(") left out: its text begins at ");
+  s.append(declared);
+  s.append(", the manifest says ");
+  s.append(path);
+  s.append("\n");
+  s
+}
+
 // The location of 'name' beside 'loc': 'loc' up to and including its last '/' (or '\'), then 'name'
 pub fn siblingOf(loc: &str, name: &str) String {
   let b: &Array[u8] = loc;
@@ -175,16 +308,28 @@ pub fn readWorldNow(loc: &str) String {
   match fs.readFile(&Path.from(loc)) {
     case let Ok(text) {
       if !isManifest(loc) { out.appendBytes(text.view()); return out; }
-      let names = manifestEntries(String.from(text.view()).view());
+      let manifest = String.from(text.view());
+      let names = manifestEntries(manifest.view());
+      if manifestFault(manifest.view(), &names).len() > 0usize { return String(); }
+      var texts = List[String]();
       each n in &names {
         match fs.readFile(&Path.from(siblingOf(loc, n.name.view()).view())) {
           case let Ok(part) {
             // a file the Loader leaves out (a bad line, a wrong size or hash) is left out here too, so the counts agree
-            if !n.ok || judgeFile(n.size, n.hash, part.view(), mutantIs("manifest-skip-hash")) != FILE_FINE { continue; }
-            out.appendBytes(part.view()); out.append(joinAfter(part.view()).view());
+            if !n.ok || judgeFile(n.size, n.hash, part.view(), mutantIs("manifest-skip-hash")) != FILE_FINE { texts.push(String()); }
+            else { texts.push(String.from(part.view())); }
           }
           else { return String(); }
         }
+      }
+      let declared = declaredPaths(&texts);
+      var i = 0usize;
+      while i < names.len() {
+        let t = &texts[i];
+        if declared[i].len() == 0usize || declared[i].view() == names[i].path.view() {
+          out.append(t.view()); out.append(joinAfter(t.view()).view());
+        }
+        i = i + 1usize;
       }
     }
     else {}

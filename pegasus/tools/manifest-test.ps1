@@ -97,6 +97,32 @@ try {
   $e = Open-World (Join-Path $src $name)
   Check "the world mended: $($e.files) file fetched again (the one left out), the rest kept" `
     (($e.files -eq 1) -and ($e.out -match "$($files - 1) kept, 1 fetched, 0 left out") -and (& $okRun $e.out))
+
+  # 5. a manifest line whose path is wrong (first-07 says first.wrong; it begins at first.plinth): that file is left out, said once,
+  # the rest stay; the local copy of the manifest says the same, so the run's key count agrees
+  Copy-Item (Join-Path $src $sizeFile) (Join-Path $local $sizeFile) -Force   # (test 3 left the local copy's longer)
+  $good = Get-Content (Join-Path $src $name)
+  $badPath = $good | ForEach-Object { if ($_ -match '^first-07') { ($_ -replace ' \S+$', ' first.wrong') } else { $_ } }
+  foreach ($d in @($served, $local)) { Set-Content -Path (Join-Path $d $name) -Value $badPath -Encoding ascii }
+  $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache5'
+  $f = Open-World (Join-Path $local $name)
+  $said = @([regex]::Matches($f.out, "file first-07.ddd \(subtree first.wrong\) left out: its text begins at first.plinth, the manifest says first.wrong")).Count
+  Check "wrong path: first-07.ddd left out and said once ($said), 1 left out, the run's checks pass" `
+    (($said -eq 1) -and ($f.out -match ' 1 left out') -and (& $okRun $f.out))
+
+  # 6. a manifest that names a file twice, and one that is an error page: each is said once, no file is fetched, the world does not open
+  $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache6'
+  $dup = @($good) + ($good | Where-Object { $_ -match '^first-03' })
+  Set-Content -Path (Join-Path $served $name) -Value $dup -Encoding ascii
+  $g = Open-World (Join-Path $src $name)
+  $said = @([regex]::Matches($g.out, 'cannot be used: it names the file first-03.ddd twice\. The world does not open\.')).Count
+  Check "duplicate file in the manifest: said once ($said), $($g.files) files fetched, no arrival line" `
+    (($said -eq 1) -and ($g.files -eq 0) -and -not ($g.out -match 'arrival: \d+ files'))
+  Set-Content -Path (Join-Path $served $name) -Value @('<html>', '<body>502 Bad Gateway</body>', '</html>') -Encoding ascii
+  $h = Open-World (Join-Path $src $name)
+  $said = @([regex]::Matches($h.out, 'cannot be used: it has a line of 1 fields, not four')).Count
+  Check "manifest that cannot be read: said once ($said), $($h.files) files fetched, no arrival line" `
+    (($said -eq 1) -and ($h.files -eq 0) -and -not ($h.out -match 'arrival: \d+ files'))
 }
 finally {
   Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
