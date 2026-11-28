@@ -24,6 +24,10 @@ function Wait-Line($file, $pattern, $secs) {
 function Wait-Exit($p, $secs) { if (-not $p.WaitForExit($secs * 1000)) { Write-Host "TIMEOUT: pid $($p.Id) did not exit in $secs s"; Stop-Process -Id $p.Id -Force } }
 
 $port = 47117
+if ($Scenario -eq "lamp") {
+  $World = "worlds\lamp.ddd"                                  # the scenario's own world, whatever the argument says (W145)
+  $port = Get-Random -Minimum 47200 -Maximum 48900            # not the port another lane's server may hold
+}
 $srvArgs = @("--serve", "$port", "--loopback", "--world", $World)
 $target = "127.0.0.1:$port"
 switch ($Scenario) {
