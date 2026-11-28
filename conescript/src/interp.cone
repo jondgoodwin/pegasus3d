@@ -21,6 +21,16 @@ pub struct Trap {
   pub message: String;
 }
 
+// What a profiled run spent (Interpreter.profiling): a run's whole time, and inside it the host's call, and the copying of
+// the window in and out. All in nanoseconds of the steady clock, read twice per import: for measuring, not shipping.
+pub struct Profile {
+  pub runs: u64;
+  pub runNs: i64;
+  pub imports: u64;
+  pub callNs: i64;
+  pub copyNs: i64;
+}
+
 struct Frame {
   unit: usize;
   pc: usize;
@@ -35,8 +45,10 @@ pub struct Interpreter {
   stack: List[u64];
   frames: List[Frame];
   fuel: u64;
+  pub profiling: bool;
+  pub profile: Profile;
 
-  pub fn make() Interpreter { Interpreter(List[u64](), List[Frame](), 0u64) }
+  pub fn make() Interpreter { Interpreter(List[u64](), List[Frame](), 0u64, false, Profile(0u64, 0i64, 0u64, 0i64, 0i64)) }
 
   // The fuel the next run may spend
   pub fn setFuel(self: &mut, fuel: u64) { self.fuel = fuel; }
@@ -59,6 +71,16 @@ pub struct Interpreter {
 
   // Runs a unit with the argument slots given; on success the result slots are in 'out' and the answer is None
   pub fn run[V](self: &mut, v: &VerifiedCode, tables: &ImportTables[V], handles: &mut HandleTable[V], unit: u32,
+             args: &Array[u64], out: &mut List[u64]) Option[Trap] {
+    if !self.profiling { return self.exec(v, tables, handles, unit, args, out); }
+    let t0 = Instant.now().nanos();
+    let r = self.exec(v, tables, handles, unit, args, out);
+    self.profile.runs = self.profile.runs + 1u64;
+    self.profile.runNs = self.profile.runNs + (Instant.now().nanos() - t0);
+    r
+  }
+
+  fn exec[V](self: &mut, v: &VerifiedCode, tables: &ImportTables[V], handles: &mut HandleTable[V], unit: u32,
              args: &Array[u64], out: &mut List[u64]) Option[Trap] {
     out.clear();
     self.frames.clear();
@@ -296,12 +318,21 @@ pub struct Interpreter {
           let f = tables.entries[usize.from(ri.table)].call;
           handles.fail = String();
           // The window is copied out and back: the host may reshape lists the compiler cannot tell from the stack
+          let t0 = if self.profiling { Instant.now().nanos() } else { 0i64 };
           var win = List[u64]();
           var q = lo;
           while q < hi { win.push(self.rd(q)); q = q + 1usize; }
+          let t1 = if self.profiling { Instant.now().nanos() } else { 0i64 };
           let ok = f(handles, win.viewMut());
+          let t2 = if self.profiling { Instant.now().nanos() } else { 0i64 };
           q = lo;
           while q < hi { self.wr(q, *win[q - lo]); q = q + 1usize; }
+          if self.profiling {
+            let t3 = Instant.now().nanos();
+            self.profile.imports = self.profile.imports + 1u64;
+            self.profile.callNs = self.profile.callNs + (t2 - t1);
+            self.profile.copyNs = self.profile.copyNs + (t1 - t0) + (t3 - t2);
+          }
           if !ok {
             let mut_msg = if handles.fail.len() == 0usize { String.from("an import refused") } else { handles.fail.clone() };
             return Some(Trap(TrapKind.ImportFailed, u32.from(cur), u32.from(at), mut_msg));

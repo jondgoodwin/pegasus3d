@@ -121,11 +121,12 @@ actor Sim {
   movedLastNs: i64;                 // ... and the last time it did
   avatarMaterial: ContentKey;       // a client: the material key of that design
   materialChanges: u64;             // material keys a part changed to (`setMaterial`)
+  poseHistory: PoseHistory;         // each part's place at the last POSE_STEPS steps, for picking at a press's drawn time
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
       Actions(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
-      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64);
+      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, PoseHistory.make());
   }
 
   // Loader -> Sim (move): the world image. Each part is given its id now,
@@ -243,6 +244,7 @@ actor Sim {
     self.react();
     self.derive();
     if role == SIM_SERVER { self.sendSnapshots(); self.hangUps(); }
+    self.remember(atNs);
     self.publish(atNs);
     if step % STEP_HZ == 0u64 { self.printLine(); }
     if io.stallAtStep != 0u64 && step == io.stallAtStep { busyFor(io.stallMs); }
@@ -261,6 +263,7 @@ actor Sim {
     running = false;
     if finishedSent { return; }
     finishedSent = true;
+    rules.profileReport(step);
     let verdict = self.checks();
     var f = io.finished.clone();
     f <- verdict;
@@ -273,7 +276,7 @@ actor Sim {
     got <-> arrived;
     each a in &got {
       var b = *a;
-      if b.verb == VERB_PRESS && b.receiver == NO_PART { b.receiver = self.pick(b.from, b.along); }
+      if b.verb == VERB_PRESS && b.receiver == NO_PART { b.receiver = self.pick(b.from, b.along, b.madeNs); }
       queue.push(b);
     }
     got.clear();
@@ -680,7 +683,7 @@ actor Sim {
     got <-> arrived;
     each a in &got {
       var b = *a;
-      if b.verb == VERB_PRESS && b.receiver == NO_PART { b.receiver = self.pick(b.from, b.along); }
+      if b.verb == VERB_PRESS && b.receiver == NO_PART { b.receiver = self.pick(b.from, b.along, b.madeNs); }
       match &mut net.link {
         case var &mut Some(c) { sendReliable(c, &encodePress(&b)); }
         else {}
@@ -848,6 +851,12 @@ actor Sim {
     }
   }
 
+  // Keep this step's poses for picking against what the person saw (`PoseHistory`)
+  fn remember(self: &mut, atNs: u64) {
+    poseHistory.begin(atNs);
+    each p in &parts { poseHistory.add(self.placeOf(p)); }
+  }
+
   // Publish: the zone's parts and the person, as a snapshot nothing changes
   // after this
   fn publish(self: &mut, atNs: u64) {
@@ -886,13 +895,15 @@ actor Sim {
   }
 
   // The part whose pick shape the ray meets first, or NO_PART
-  fn pick(self: &, from: Vec3, along: Vec3) PartId {
+  // as the person saw it: the poses of the press's drawn time (`rayPlacedAt`). On a client these are the poses it showed
+  // (`shown`, its interpolated view), since `placeOf` is what each step records
+  fn pick(self: &, from: Vec3, along: Vec3, madeNs: u64) PartId {
     var best = NO_PART;
     var bestT: f32 = 1000000000.;
     each p in &parts {
       each s in &heldShapes {
         if s.key == p.key {
-          let t = rayPlaced(from, along, &self.placeOf(p), &s.pick, mutantIs("pick-ignores-turn"));
+          let t = rayPlacedAt(&poseHistory, madeNs, usize.from(p.id), &self.placeOf(p), from, along, &s.pick, mutantIs("pick-at-current"));
           if t >= 0. && t < bestT { bestT = t; best = p.id; }
         }
       }
