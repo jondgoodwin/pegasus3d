@@ -20,7 +20,8 @@
 param(
   [double]$Mbit = 1,
   [double]$LatencyMs = 100,
-  [string]$World = ''
+  [string]$World = '',
+  [switch]$Tls              # serve https:// with a self-signed certificate (tools\selfsigned.ps1) that pegasus trusts by its test switch
 )
 $here = Split-Path -Parent $PSCommandPath
 $exe = Join-Path $here '..\build\release\pegasus.exe'
@@ -38,7 +39,16 @@ New-Item -ItemType Directory -Force $served | Out-Null
 Copy-Item (Join-Path $src '*') $served
 $outLog = Join-Path $tmp 'server.out'
 $errLog = Join-Path $tmp 'server.err'
-$server = Start-Process python -ArgumentList @('-u', (Join-Path $here 'worldserve.py'), $served, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs) `
+$scheme = 'http'
+$tlsArgs = @()
+if ($Tls) {
+  $scheme = 'https'
+  $certs = Join-Path $tmp 'certs'
+  $null = & (Join-Path $here 'selfsigned.ps1') $certs
+  $tlsArgs = @('--tls', (Join-Path $certs 'cert.pem'), (Join-Path $certs 'key.pem'))
+  $env:PEGASUS_TEST_TRUST_CA = Join-Path $certs 'cert.pem'
+}
+$server = Start-Process python -ArgumentList (@('-u', (Join-Path $here 'worldserve.py'), $served, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs) + $tlsArgs) `
   -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
 $failed = 0
 function Check($what, $good) {
@@ -51,7 +61,7 @@ try {
     if ((Test-Path $outLog) -and ((Get-Content $outLog -Raw) -match 'on (\d+)')) { $port = [int]$Matches[1] }
   }
   if ($port -eq 0) { Write-Output 'the server did not start'; exit 3 }
-  $url = "http://127.0.0.1:$port/$name"
+  $url = "${scheme}://127.0.0.1:$port/$name"
   $files = @(Get-Content (Join-Path $served $name) | Where-Object { $_ -notmatch '^//' -and $_.Trim() }).Count
 
   function Open-World($keysFrom) {
@@ -148,7 +158,7 @@ try {
   $deepServed = Join-Path $served 'deep'
   Copy-Item $deepLocal $deepServed -Recurse
   $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache7'
-  $urlDeep = "http://127.0.0.1:$port/deep/first.world"
+  $urlDeep = "${scheme}://127.0.0.1:$port/deep/first.world"
   $outDeep = & $exe --world $urlDeep --keys-from (Join-Path $deepLocal 'first.world') --steps 300 2>&1 | Out-String
   $saidDeep = @([regex]::Matches($outDeep, "file $victim \(subtree [^)]*\) left out: its hash is")).Count
   Check "a file left out in the middle ($victim, which opens a part whose children follow): said once ($saidDeep), the only one left out, no other file's place is wrong" `
@@ -160,7 +170,7 @@ try {
   $slowOut = Join-Path $tmp 'slow.out'
   $slowErr = Join-Path $tmp 'slow.err'
   $last = ($dl = @(Get-Content (Join-Path $src $name) | Where-Object { $_ -notmatch '^//' -and $_.Trim() }))[-1].Split(' ')[0]
-  $slow = Start-Process python -ArgumentList @('-u', (Join-Path $here 'worldserve.py'), $src, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs, '--delay', "$last=1500") `
+  $slow = Start-Process python -ArgumentList (@('-u', (Join-Path $here 'worldserve.py'), $src, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs, '--delay', "$last=1500") + $tlsArgs) `
     -RedirectStandardOutput $slowOut -RedirectStandardError $slowErr -PassThru -WindowStyle Hidden
   try {
     $slowPort = 0
@@ -169,7 +179,7 @@ try {
       if ((Test-Path $slowOut) -and ((Get-Content $slowOut -Raw) -match 'on (\d+)')) { $slowPort = [int]$Matches[1] }
     }
     $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache8'
-    $lineList = @(& $exe --world "http://127.0.0.1:$slowPort/$name" --keys-from (Join-Path $src $name) --steps 500 2>&1 | Out-String -Stream)
+    $lineList = @(& $exe --world "${scheme}://127.0.0.1:$slowPort/$name" --keys-from (Join-Path $src $name) --steps 500 2>&1 | Out-String -Stream)
     $early = ($lineList | Select-String -Pattern 'parts declared early' | Select-Object -First 1).LineNumber
     $textIn = ($lineList | Select-String -Pattern 'bytes of world in at' | Select-Object -First 1).LineNumber
     $drawn = ($lineList | Select-String -Pattern 'arrival: first part drawn' | Select-Object -First 1).LineNumber

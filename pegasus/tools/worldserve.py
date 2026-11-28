@@ -1,7 +1,9 @@
 """A local file server that serves a world's files over a slowed link, for arrival tests.
 
-    python worldserve.py ROOT_DIR [--port N] [--mbit RATE] [--latency-ms MS] [--delay NAME=MS ...]
+    python worldserve.py ROOT_DIR [--port N] [--mbit RATE] [--latency-ms MS] [--delay NAME=MS ...] [--tls CERT.pem KEY.pem]
 
+--tls serves https:// (HTTP/1.1 over TLS) with the given certificate, for the loopback tests of the https path; pegasus trusts a
+self-signed one only through its test switch PEGASUS_TEST_TRUST_CA (see tools\selfsigned.ps1 for making one).
 Binds 127.0.0.1 only. GET /PATH answers the file ROOT_DIR/PATH (HTTP/1.1, keep-alive, Content-Length). The link is ONE pipe
 shared by every connection: the bytes of all responses together go at --mbit megabits a second (0: no limit), so asking for
 files in parallel does not make the link faster. --latency-ms is added once before each response's first byte (the time a
@@ -51,6 +53,11 @@ def main():
                 mbit = float(value)
             else:
                 latency = float(value)
+    tls = None
+    if "--tls" in args:
+        i = args.index("--tls")
+        tls = (args[i + 1], args[i + 2])
+        del args[i:i + 3]
     delays = {}                       # --delay NAME=MS (repeatable): a file whose response starts MS later than the rest
     while "--delay" in args:
         i = args.index("--delay")
@@ -94,6 +101,11 @@ def main():
 
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.daemon_threads = True
+    if tls:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(tls[0], tls[1])
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
     print("serving %s on %d" % (root, server.server_address[1]), flush=True)
     server.serve_forever()
 

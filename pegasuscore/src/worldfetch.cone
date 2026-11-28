@@ -14,8 +14,38 @@
 // asset traffic and state traffic never share one). A fetch awaits, so the Loader's other messages run while the bytes come; a
 // fetch of a file that fails prints what went wrong and is empty. Several files are asked for at once; the client's pool decides
 // how many connections that is.
+//
+// HTTPS. A URL is fetched with Cone's own `actorhttp` client, which speaks TLS (`tls`, the operating system's certificate verifier
+// and its trusted roots, the name checked) and offers HTTP/2 by ALPN, so one connection carries every file of a world; no transport
+// is written here. A certificate that does not verify refuses the fetch, and the refusal is said once. The one exception is a
+// TEST switch, the environment variable PEGASUS_TEST_TRUST_CA: a PEM file whose certificates are then the only roots trusted (the
+// name is still checked), so a self-signed certificate on loopback can be tried; it is named so and never on by default.
 
 pub const FETCH_LIMIT_SECONDS = 30i64;
+
+// The client a Loader fetches with: the standard one, or with only the roots of the test switch's PEM file trusted
+fn makeClient() HttpClient {
+  let own = libc.getenv("PEGASUS_TEST_TRUST_CA");
+  if (own as usize) == 0usize { return HttpClient.standard(); }
+  match fs.readFile(&Path.from(String.fromCStr(cstr.fromPtr(own)).view())) {
+    case let Ok(pem) {
+      var cfg = httpclient.Config.make();
+      cfg.tlsConfig.verify = tls.Verifier.roots(pem.view());
+      cfg.tlsConfig.offline = true;
+      print <- "fetch: TEST SWITCH: trusting only the certificates of PEGASUS_TEST_TRUST_CA\n";
+      HttpClient.make(cfg, actorhttp.defaultMaxBody)
+    }
+    case let Err(e) {
+      print <- "fetch: PEGASUS_TEST_TRUST_CA cannot be read; the usual roots are used\n";
+      HttpClient.standard()
+    }
+  }
+}
+
+// The protocol that carried a response, in words
+pub fn versionWord(v: Version) &str {
+  if v == Version.Http3 { "HTTP/3" } else if v == Version.Http2 { "HTTP/2" } else { "HTTP/1.1" }
+}
 
 // What `Fetcher.text` came back with
 pub struct Fetched {
@@ -412,8 +442,10 @@ pub struct FileArrival {
 
 actor Fetcher {
   client: HttpClient;
+  said: bool;                       // the protocol of the first answer was printed (once, for a run)
+  refused: bool;                    // a refusal by TLS (a certificate) was printed (once, for a run)
 
-  fn init(self: &new) { *self = Self(HttpClient.standard()); }
+  fn init(self: &new) { *self = Self(makeClient(), false, false); }
 
   // The file kept under content hash 'hash' in the cache folder 'dir' (of this size, hash checked again); ok false: not kept
   pub async fn kept(self, dir: String, size: u64, hash: u64) Fetched {
@@ -436,10 +468,24 @@ actor Fetcher {
       let r = await client.getIn(loc.view(), IoLimits.until(Instant.now() + Duration.fromSeconds(FETCH_LIMIT_SECONDS)));
       match r {
         case let Ok(res) {
-          if res.status == 200u16 { text.append(res.body.view()); ok = true; }
+          if res.status == 200u16 {
+            text.append(res.body.view()); ok = true;
+            if !said {
+              said = true;
+              print <- "fetch: "; printStr(loc.view()); print <- " answered over "; printStr(versionWord(res.version));
+              print <- if loc.startsWith("https://") { " with TLS (certificate verified)\n" } else { " with no encryption\n" };
+            }
+          }
           else { print <- "fetch: "; printStr(loc.view()); print <- " answered status "; print <- u64.from(res.status); print <- "\n"; }
         }
-        case let Err(e) { print <- "fetch: "; printStr(loc.view()); print <- " cannot be fetched: "; print <- e; print <- "\n"; }
+        case let Err(e) {
+          if e.failure.stage == httpclient.Stage.Tls {
+            if !refused {
+              refused = true;
+              print <- "fetch: "; printStr(loc.view()); print <- " REFUSED: the server's certificate was not accepted: "; print <- e; print <- "\n";
+            }
+          } else { print <- "fetch: "; printStr(loc.view()); print <- " cannot be fetched: "; print <- e; print <- "\n"; }
+        }
       }
       return Fetched(text, ok);
     }

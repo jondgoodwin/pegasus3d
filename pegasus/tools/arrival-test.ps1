@@ -9,7 +9,9 @@ param(
   [double]$LatencyMs = 0,
   [ValidateSet('cold', 'warm')][string]$Cache = 'cold',
   [int]$Runs = 3,
-  [int]$Steps = 600
+  [int]$Steps = 600,
+  [string]$Url = '',        # fetch the world from this address (over the real internet, say) instead of the local server; -World is still the local copy the key count is read from
+  [switch]$Tls              # the local server serves https:// with a self-signed certificate that pegasus trusts by its test switch (tools\selfsigned.ps1)
 )
 $here = Split-Path -Parent $PSCommandPath
 $exe = Join-Path $here '..\build\release\pegasus.exe'
@@ -24,7 +26,16 @@ if ($others) { Write-Output "a browser outside the lane worktrees is running ($(
 
 $outLog = Join-Path $env:TEMP "worldserve-$PID.out"
 $errLog = Join-Path $env:TEMP "worldserve-$PID.err"
-$server = Start-Process python -ArgumentList @('-u', (Join-Path $here 'worldserve.py'), $root, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs) `
+$scheme = 'http'
+$tlsArgs = @()
+if ($Tls) {
+  $scheme = 'https'
+  $certs = Join-Path $env:TEMP "arrival-certs-$PID"
+  $null = & (Join-Path $here 'selfsigned.ps1') $certs
+  $tlsArgs = @('--tls', (Join-Path $certs 'cert.pem'), (Join-Path $certs 'key.pem'))
+  $env:PEGASUS_TEST_TRUST_CA = Join-Path $certs 'cert.pem'
+}
+$server = Start-Process python -ArgumentList (@('-u', (Join-Path $here 'worldserve.py'), $root, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs) + $tlsArgs) `
   -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
 try {
   $port = 0
@@ -33,7 +44,8 @@ try {
     if ((Test-Path $outLog) -and ((Get-Content $outLog -Raw) -match 'on (\d+)')) { $port = [int]$Matches[1] }
   }
   if ($port -eq 0) { Write-Output 'the server did not start'; exit 3 }
-  $url = "http://127.0.0.1:$port/$name"
+  $url = "${scheme}://127.0.0.1:$port/$name"
+  if ($Url) { $url = $Url }
   $cacheDir = Join-Path $env:TEMP "arrival-cache-$PID"
   $env:PEGASUS_MESH_CACHE = $cacheDir
   function Run-Once {
