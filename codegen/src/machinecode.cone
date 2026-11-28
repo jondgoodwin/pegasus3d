@@ -15,7 +15,7 @@ pub enum Abi { Win64; SysV; }
 pub const TRAP_BADFUNC = 255u64;
 
 pub const MC_MAJOR = 1u16;
-pub const MC_MINOR = 0u16;
+pub const MC_MINOR = 1u16;      // 1: each function's frame size and the largest (NB4: native code runs on a stack of its own)
 
 // One trap stub: where it starts in the code, the kind it returns, and the site it stores in the context
 pub struct TrapSite {
@@ -31,13 +31,17 @@ pub struct MachineCode {
   pub funcOffsets: List[u32];
   pub funcSizes: List[u32];
   pub nAreas: List[u32];
+  // Each function's frame in bytes as it takes the stack: the spills, the outgoing area, the shadow space, the saved rbp
+  // and the return address. 'maxFrame' is the largest, which sizes the stack the code runs on (execmem.cone).
+  pub frameSizes: List[u32];
+  pub maxFrame: u32;
   pub traps: List[TrapSite];
   // The content key (design section 7): set by whoever compiled from some form, and carried and checked by the cache; the
   // backend itself never reads it
   pub key: List[u8];
 
   pub fn make(abi: Abi) MachineCode {
-    MachineCode(abi, List[u8](), 0u32, List[u32](), List[u32](), List[u32](), List[TrapSite](), List[u8]())
+    MachineCode(abi, List[u8](), 0u32, List[u32](), List[u32](), List[u32](), List[u32](), 0u32, List[TrapSite](), List[u8]())
   }
 }
 
@@ -76,12 +80,14 @@ pub fn encode(mc: &MachineCode) List[u8] {
   var i = 0usize;
   while i < mc.key.len() { o.push(*mc.key[i]); i = i + 1usize; }
   put32(&mut o, mc.entryOffset);
+  put32(&mut o, mc.maxFrame);
   put32(&mut o, u32.from(mc.funcOffsets.len()));
   i = 0usize;
   while i < mc.funcOffsets.len() {
     put32(&mut o, *mc.funcOffsets[i]);
     put32(&mut o, *mc.funcSizes[i]);
     put32(&mut o, *mc.nAreas[i]);
+    put32(&mut o, *mc.frameSizes[i]);
     i = i + 1usize;
   }
   put32(&mut o, u32.from(mc.traps.len()));
@@ -151,6 +157,7 @@ pub fn decode(data: &Array[u8]) Result[MachineCode, String] {
   let minor = u16.from(r.u8v()) | (u16.from(r.u8v()) << 8u16);
   if major != MC_MAJOR { return Err(String.from("the container's major version is not one this reader knows")); }
   if minor > MC_MINOR { return Err(String.from("the container's minor version is newer than this reader")); }
+  if minor < MC_MINOR { return Err(String.from("the container's minor version is older than this reader needs (no frame sizes, and its entry stub does not switch stacks): compile it again")); }
   let target = r.u8v();
   if target > 1u8 { return Err(String.from("a target this reader does not know")); }
   var mc = MachineCode.make(if target == 0u8 { Abi.Win64 } else { Abi.SysV });
@@ -159,15 +166,22 @@ pub fn decode(data: &Array[u8]) Result[MachineCode, String] {
   var i = 0usize;
   while i < nkey { mc.key.push(r.u8v()); i = i + 1usize; }
   mc.entryOffset = r.u32v();
+  mc.maxFrame = r.u32v();
   let nf = usize.from(r.u32v());
-  if !r.need(nf * 12usize) { return Err(String.from("the function table runs past the end")); }
+  if !r.need(nf * 16usize) { return Err(String.from("the function table runs past the end")); }
   i = 0usize;
+  var biggest = 0u32;
   while i < nf {
     mc.funcOffsets.push(r.u32v());
     mc.funcSizes.push(r.u32v());
     mc.nAreas.push(r.u32v());
+    let fr = r.u32v();
+    mc.frameSizes.push(fr);
+    if fr > biggest { biggest = fr; }
     i = i + 1usize;
   }
+  // the largest frame sizes the stack the code runs on, so it must be the largest of the table's
+  if biggest != mc.maxFrame { return Err(String.from("the largest frame is not the largest in the function table")); }
   let nt = usize.from(r.u32v());
   if !r.need(nt * 20usize) { return Err(String.from("the trap table runs past the end")); }
   i = 0usize;

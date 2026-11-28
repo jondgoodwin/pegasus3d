@@ -575,6 +575,76 @@ fn recursion() CodeWriter {
   w
 }
 
+// ---- a recursion with fat frames: 'k' f64 values live across the call (NB4) ----
+// unit 0 countdown(n) as 'recursion's, unit 1 an endless recursion, each with k locals set before the call and summed after it,
+// so each frame holds k spilled values (k = 250 is about 2 KB of frame).
+fn fatRecursion(k: usize) CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let sig01 = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(sigF, "fatCountdown");
+  var ls = List[u32]();
+  var i = 0usize;
+  while i < k { ls.push(w.local(TY_F64)); i = i + 1usize; }
+  i = 0usize;
+  while i < k { w.f64Const(f64.from(i) + 1.0); w.opU(OP_LOCAL_SET, *ls[i]); i = i + 1usize; }
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, btF);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(1.0); w.op(OP_F64_SUB); w.opU(OP_CALL, 0u32);
+  i = 0usize;
+  while i < k { w.opU(OP_LOCAL_GET, *ls[i]); w.op(OP_F64_ADD); i = i + 1usize; }
+  w.op(OP_ELSE);
+  w.f64Const(0.0);
+  w.op(OP_END);
+  w.endUnit();
+  w.beginUnit(sig01, "fatForever");
+  var ms = List[u32]();
+  i = 0usize;
+  while i < k { ms.push(w.local(TY_F64)); i = i + 1usize; }
+  i = 0usize;
+  while i < k { w.f64Const(f64.from(i) + 1.0); w.opU(OP_LOCAL_SET, *ms[i]); i = i + 1usize; }
+  w.opU(OP_CALL, 1u32);
+  i = 0usize;
+  while i < k { w.opU(OP_LOCAL_GET, *ms[i]); w.op(OP_F64_ADD); i = i + 1usize; }
+  w.endUnit();
+  w
+}
+
+// A unit whose frame is so large that 1,024 of them would not fit the 16 MiB native stack: 3,000 values live across a call
+fn hugeFrame() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let sig01 = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(sig01, "huge");
+  var ls = List[u32]();
+  var i = 0usize;
+  while i < 3000usize { ls.push(w.local(TY_F64)); i = i + 1usize; }
+  i = 0usize;
+  while i < 3000usize { w.f64Const(f64.from(i) + 1.0); w.opU(OP_LOCAL_SET, *ls[i]); i = i + 1usize; }
+  w.opU(OP_CALL, 1u32);
+  i = 0usize;
+  while i < 3000usize { w.opU(OP_LOCAL_GET, *ls[i]); w.op(OP_F64_ADD); i = i + 1usize; }
+  w.endUnit();
+  w.beginUnit(sig01, "one");
+  w.f64Const(1.0);
+  w.endUnit();
+  w
+}
+
+// As runNative, with the runner's stack fault ('stackMutant', 1 = sized for half the depth)
+fn runNativeStack(nc: &NativeCode, v: &VerifiedCode, tb: &ImportTables[u8], unit: u32, args: &Array[u64], fuel: u64, stackMutant: u32) Snap {
+  var it = NativeRunner.make();
+  it.stackMutant = stackMutant;
+  it.setFuel(fuel);
+  var h = HandleTable[u8].make();
+  h.alloc(77u32, List[u64]());
+  var out = List[u64]();
+  let r = it.run(nc, v, tb, &mut h, unit, args, &mut out);
+  snap(&r, &out, it.fuelLeft(), &h)
+}
+
 fn fuzzTables() ImportTables[u8] { tables() }
 
 // The first fuzz seed: a bit of everything
@@ -829,6 +899,78 @@ fn main() i32 {
         expectUInt(fv.fuel, 100000u64 - 1024u64, "having charged each call, the refused one too");
       }
       case let Err(ps) { expect(false, "the recursion verifies"); }
+    }
+  }
+
+  // ---- the call-depth limit with fat frames (NB4): native code runs on a stack sized from its largest frame ----
+  {
+    let fw = fatRecursion(250usize);
+    var cnt = newTally();
+    var sets = List[List[u64]]();
+    var depths = List[u64]();
+    depths.push((1.0).bits()); depths.push((1022.0).bits()); depths.push((1023.0).bits());
+    depths.push((1024.0).bits()); depths.push((1025.0).bits()); depths.push((5000.0).bits());
+    var fl = List[u64](); fl.push(1000000u64); fl.push(1500u64); fl.push(1023u64);
+    var di = 0usize;
+    while di < depths.len() {
+      sets = List[List[u64]]();
+      var a0 = List[u64](); a0.push(*depths[di]); sets.push(a0);
+      diffAll("fat depth", &fw.code, &tb, &fl, &sets, true, &mut cnt);
+      di = di + 1usize;
+    }
+    expect(cnt.runs > 15u64, "the fat depth runs happened");
+    expectInt(i64.from(cnt.badEval + cnt.badNative), 0i64, "fat frames: interpreter, evaluator and native stop at the same call");
+    match verify(&fw.code, &tb) {
+      case let Ok(v) {
+        match compileNative(&v) {
+          case let Err(e) { expect(false, "the fat recursion compiles natively"); }
+          case let Ok(nc) {
+            var a1 = List[u64](); a1.push((1023.0).bits());
+            let n1 = runNativeStack(&nc, &v, &tb, 0u32, a1.view(), 1000000u64, 0u32);
+            let i1 = runInterp(&v, &tb, 0u32, a1.view(), 1000000u64);
+            expect(!n1.trapped && !i1.trapped && differ(&i1, &n1).len() == 0usize, "fat frames: 1023 nested calls run natively, as in the interpreter");
+            var a2 = List[u64](); a2.push((1024.0).bits());
+            let n2 = runNativeStack(&nc, &v, &tb, 0u32, a2.view(), 1000000u64, 0u32);
+            let i2 = runInterp(&v, &tb, 0u32, a2.view(), 1000000u64);
+            expect(n2.trapped && n2.kind == 4u32 && differ(&i2, &n2).len() == 0usize, "fat frames: 1024 trap DepthOut at the same offset with the same fuel");
+            let none = List[u64]();
+            let nf = runNativeStack(&nc, &v, &tb, 1u32, none.view(), 100000u64, 0u32);
+            let iff = runInterp(&v, &tb, 1u32, none.view(), 100000u64);
+            expect(nf.trapped && nf.kind == 4u32 && differ(&iff, &nf).len() == 0usize, "fat frames: an endless recursion stops at the same call");
+            expectUInt(nf.fuel, 100000u64 - 1024u64, "native: having charged each call, the refused one too");
+            // the mutant: a runner whose stack is sized for half the depth must be seen to stop early
+            let m1 = runNativeStack(&nc, &v, &tb, 0u32, a1.view(), 1000000u64, 1u32);
+            let mf = runNativeStack(&nc, &v, &tb, 1u32, none.view(), 100000u64, 1u32);
+            expect(differ(&i1, &m1).len() > 0usize, "caught: a stack sized for half the depth stops 1023 nested calls");
+            expect(differ(&iff, &mf).len() > 0usize, "caught: a stack sized for half the depth stops the endless recursion early");
+            print <- "mutant, stack sized for half the depth: 1023 nested calls "; print <- (if m1.trapped { "trap" } else { "run" });
+            print <- ", the endless recursion leaves fuel "; print <- mf.fuel; print <- " against the interpreter's "; print <- iff.fuel; print <- "\n";
+          }
+        }
+      }
+      case let Err(ps) { expect(false, "the fat recursion verifies"); }
+    }
+  }
+
+  // ---- a Code that would need more than 16 MiB of stack is not run natively: one line, and the interpreter is used ----
+  {
+    let hw = hugeFrame();
+    match verify(&hw.code, &tb) {
+      case let Ok(v) {
+        match compileNative(&v) {
+          case let Ok(nc) { expect(false, "a Code whose 1,024 frames need over 16 MiB is refused by compileNative"); }
+          case let Err(e) {
+            print <- "over the stack cap: "; print <- e.view(); print <- "\n";
+            expect(e.len() > 0usize, "compileNative refuses it with a reason");
+          }
+        }
+        let l = nativeAlways(&v, "nativediff", liftOptsNone());
+        expectInt(i64.from(l.len()), 0i64, "nativeAlways gives no native code, so the host keeps the interpreter");
+        let none = List[u64]();
+        let r = runInterp(&v, &tb, 0u32, none.view(), 100000u64);
+        expect(!r.trapped, "and the interpreter runs it");
+      }
+      case let Err(ps) { expect(false, "the huge-frame code verifies"); }
     }
   }
 

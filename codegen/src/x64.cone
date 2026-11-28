@@ -11,6 +11,13 @@
 // xmm14 and xmm15 are the emitter's scratch and never allocated. Every other register is clobbered by any call, which is
 // why regalloc keeps nothing in one across a call.
 //
+// THE STACKS (NB4). Generated code runs on a stack of its own, which the host reserves (execmem.cone, NativeStack) and
+// puts in the context. The entry stub keeps its own frame on the host stack, saves the host rsp in the context, switches
+// rsp to the native stack's top, copies the area in below it and calls; it switches back on the way out, and a trap's unwind
+// goes back to the saved host rsp. The gate is not called on the native stack: generated code calls a thunk that switches
+// to the host stack (below the stub's frame), calls the gate there and switches back, so a host import has the thread's real
+// stack. Each Func's frame size (frame + saved rbp + return address) goes in MachineCode, and the largest sizes the stack.
+//
 // FLOATS. Every float op is one scalar SSE2 instruction, rounded once to nearest, in the operand order the form says.
 // fmin and fmax are a ucomisd sequence with the exact meaning ir.cone gives them. Never emitted: minsd and maxsd (except
 // by the test mutant MUT_FMIN_MINSD), FMA, x87, and any folding of float constants.
@@ -22,6 +29,8 @@ pub const MUT_FUEL_NO_ADD = 2u32;     // the fuel trap stub forgets to give the 
 pub const MUT_NO_MXCSR_SET = 3u32;    // the entry stub runs the code under the host's MXCSR
 pub const MUT_NO_MXCSR_RESTORE = 4u32;  // the way out leaves our MXCSR for the host
 pub const MUT_NO_R12_RESTORE = 5u32;  // the way out leaves r12 as the generated code last used it
+pub const MUT_NO_TRAP_SWITCH = 6u32;  // a trap's unwind does not switch back to the host stack (it crashes: tests run it in a child)
+pub const MUT_GATE_ON_NATIVE = 7u32;  // the gate is called on the native stack, with no thunk (to see what the system does)
 
 const XMM_SCRATCH = 14u8;
 const XMM_SCRATCH2 = 15u8;
@@ -53,6 +62,8 @@ struct Gen {
   stubs: List[Stub];
   funcLabels: List[u32];
   unwind: u32;
+  gateThunk: u32;            // the gate call's trampoline, which runs the gate on the host stack
+  frames: List[u32];         // each function's frame in bytes, in order
   traps: List[TrapSite];
   next: u32;                 // the block that follows the one being emitted, NO_BLOCK after the last
 }
@@ -563,7 +574,8 @@ fn emitInst(g: &mut Gen, f: &Func, insts: &List[Inst], n: usize) {
       } else {
         g.a.movRR(RDI, R15); g.a.movRI(RSI, i.k); g.a.leaRM(RDX, mbase(RSP, 32i32));
       }
-      g.a.callM(mbase(R15, i32.from(CTX_GATE)));
+      if g.mutant == MUT_GATE_ON_NATIVE { g.a.callM(mbase(R15, i32.from(CTX_GATE))); }
+      else { let th = g.gateThunk; g.a.call(th); }
       g.a.testRR(RAX, RAX);
       g.a.jcc(XC_E, stub);
     }
@@ -630,6 +642,7 @@ fn emitFunc(g: &mut Gen, funcs: &Funcs, idx: usize, rf: &RegFile) {
 
   // the frame: shadow space, the outgoing area, the spill slots, rounded to 16
   let frame = (32u32 + 8u32 * f.outSlots + 8u32 * g.al.nSpill + 15u32) & 0xFFFFFFF0u32;
+  g.frames.push(frame + 16u32);        // and the saved rbp and the return address
   let entry = *g.funcLabels[idx];
   g.a.bind(entry);
   g.a.push(RBP);
@@ -674,11 +687,13 @@ fn emitFunc(g: &mut Gen, funcs: &Funcs, idx: usize, rf: &RegFile) {
 
 fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
   let win = g.win;
-  let outBytes = 8u32 * maxArea;
-  let areaOff = 32u32 + outBytes;
-  let nAreaOff = areaOff + 8u32;
-  let mxOff = areaOff + 16u32;
-  let xmmOff = areaOff + 24u32;
+  // The stub's own frame is on the host stack: the area's address, its length, MXCSR (the host's, then ours) and, on Win64,
+  // xmm6-15. The area the function takes is copied onto the native stack, below its top.
+  let areaOff = 0u32;
+  let nAreaOff = 8u32;
+  let mxOff = 16u32;
+  let xmmOff = 24u32;
+  let nativeArea = (32u32 + 8u32 * maxArea + 15u32) & 0xFFFFFFF0u32;
   var raw = xmmOff + if win { 160u32 } else { 0u32 };
   raw = (raw + 15u32) & 0xFFFFFFF0u32;
   // after push rbp and the callee-saved pushes (7 or 5) rsp is 8 mod 16; the frame brings it to 0
@@ -703,9 +718,6 @@ fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
   g.a.mov32MI(mbase(RSP, i32.from(mxOff) + 4i32), 0x1F80u32);
   if g.mutant != MUT_NO_MXCSR_SET { g.a.ldmxcsr(mbase(RSP, i32.from(mxOff) + 4i32)); }
   g.a.movRM(R14, mbase(R15, i32.from(CTX_FUEL)));
-  g.a.leaRM(RCX, mbase(RSP, -262144i32));
-  g.a.movMR(mbase(R15, i32.from(CTX_STACK_LIMIT)), RCX);
-  g.a.movMR(mbase(R15, i32.from(CTX_ENTRY_SP)), RSP);
 
   let epilogue = g.a.newLabel();
   let bad = g.a.newLabel();
@@ -714,6 +726,12 @@ fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
   g.a.leaLabel(R10, table);
   g.a.mov32RM(RCX, mindex(R10, RAX, 8u8, 4i32));
   g.a.movMR(mbase(RSP, i32.from(nAreaOff)), RCX);
+  // the switch: the host's rsp is kept in the context (the unwind and the gate thunk come back to it), and rsp goes to the
+  // top of the native stack, which the host made and put in the context; the callee's incoming area is below that
+  g.a.movMR(mbase(R15, i32.from(CTX_HOST_SP)), RSP);
+  g.a.movRM(RSP, mbase(R15, i32.from(CTX_STACK_TOP)));
+  g.a.movMR(mbase(R15, i32.from(CTX_ENTRY_SP)), RSP);
+  g.a.aluRI(ALU_SUB, RSP, i32.from(nativeArea));
   // copy the area in
   let inLoop = g.a.newLabel();
   let inDone = g.a.newLabel();
@@ -734,8 +752,9 @@ fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
   // and the area back out
   let outLoop = g.a.newLabel();
   let outDone = g.a.newLabel();
-  g.a.movRM(RCX, mbase(RSP, i32.from(nAreaOff)));
-  g.a.movRM(RDI, mbase(RSP, i32.from(areaOff)));
+  g.a.movRM(R9, mbase(R15, i32.from(CTX_HOST_SP)));
+  g.a.movRM(RCX, mbase(R9, i32.from(nAreaOff)));
+  g.a.movRM(RDI, mbase(R9, i32.from(areaOff)));
   g.a.movRI(RDX, 0u64);
   g.a.bind(outLoop);
   g.a.aluRR(ALU_CMP, RDX, RCX);
@@ -745,6 +764,7 @@ fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
   g.a.aluRI(ALU_ADD, RDX, 1);
   g.a.jmp(outLoop);
   g.a.bind(outDone);
+  g.a.movRR(RSP, R9);                  // back on the host stack
   g.a.movRI(RAX, TRAP_NONE);
   g.a.jmp(epilogue);
   g.a.bind(bad);
@@ -764,11 +784,27 @@ fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
   g.a.pop(RBX);
   g.a.pop(RBP);
   g.a.ret();
-  // the unwind every trap stub jumps to: back to the stub's frame, then out
+  // the unwind every trap stub jumps to: the native frames are dropped by going back to the host stack and the stub's
+  // frame there, then out. (The mutant goes back to the native stack's top, which is no frame of the stub's.)
   let u = g.unwind;
   g.a.bind(u);
-  g.a.movRM(RSP, mbase(R15, i32.from(CTX_ENTRY_SP)));
+  if g.mutant == MUT_NO_TRAP_SWITCH { g.a.movRM(RSP, mbase(R15, i32.from(CTX_ENTRY_SP))); }
+  else { g.a.movRM(RSP, mbase(R15, i32.from(CTX_HOST_SP))); }
   g.a.jmp(epilogue);
+  // the gate's thunk: generated code calls it where it would call the gate, and it runs the gate on the host stack, so
+  // the host's imports have the thread's own stack (its guard page, its probes, all the room it has) whatever the
+  // native stack's size. The native rsp is kept on the host stack across the call. Only r10 and r11 are touched before
+  // the call, so the argument registers reach the gate as the generated code set them.
+  let th = g.gateThunk;
+  g.a.bind(th);
+  g.a.movRR(R10, RSP);
+  g.a.movRM(RSP, mbase(R15, i32.from(CTX_HOST_SP)));    // 16-aligned
+  g.a.push(R10);
+  var saved = 8i32;
+  if win { g.a.aluRI(ALU_SUB, RSP, 40); saved = 40i32; } else { g.a.aluRI(ALU_SUB, RSP, 8); }   // (the shadow space) and the alignment
+  g.a.callM(mbase(R15, i32.from(CTX_GATE)));
+  g.a.movRM(RSP, mbase(RSP, saved));
+  g.a.ret();
 }
 
 // ---- the compiler ----
@@ -791,10 +827,11 @@ pub fn compileX64With(funcs: &Funcs, abi: Abi, opts: &Options) Result[MachineCod
   }
   var g = Gen(Asm.make(), abi == Abi.Win64, opts.mutant,
               Allocation(List[Loc](), List[u32](), List[u32](), 0u32), List[u8](), List[u32](), List[u32](), List[u32](),
-              List[Stub](), List[u32](), 0u32, List[TrapSite](), NO_BLOCK);
+              List[Stub](), List[u32](), 0u32, 0u32, List[u32](), List[TrapSite](), NO_BLOCK);
   let base = g.a.newLabel();
   g.a.bind(base);
   g.unwind = g.a.newLabel();
+  g.gateThunk = g.a.newLabel();
   i = 0usize;
   while i < funcs.len() { let l = g.a.newLabel(); g.funcLabels.push(l); i = i + 1usize; }
   let table = g.a.newLabel();
@@ -808,6 +845,9 @@ pub fn compileX64With(funcs: &Funcs, abi: Abi, opts: &Options) Result[MachineCod
     mc.funcOffsets.push(start);
     mc.funcSizes.push(g.a.here() - start);
     mc.nAreas.push(funcs[i].nArea);
+    let fr = *g.frames[i];
+    mc.frameSizes.push(fr);
+    if fr > mc.maxFrame { mc.maxFrame = fr; }
     i = i + 1usize;
   }
   alignTo(&mut g, 16u32);

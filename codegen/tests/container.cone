@@ -86,7 +86,10 @@ fn program2() Funcs {
 fn other(abi: Abi) Abi { if abi == Abi.Win64 { Abi.SysV } else { Abi.Win64 } }
 
 fn same(a: &MachineCode, b: &MachineCode) bool {
-  if a.abi != b.abi || a.entryOffset != b.entryOffset { return false; }
+  if a.abi != b.abi || a.entryOffset != b.entryOffset || a.maxFrame != b.maxFrame { return false; }
+  if a.frameSizes.len() != b.frameSizes.len() { return false; }
+  var f = 0usize;
+  while f < a.frameSizes.len() { if *a.frameSizes[f] != *b.frameSizes[f] { return false; } f = f + 1usize; }
   if a.bytes.len() != b.bytes.len() || a.funcOffsets.len() != b.funcOffsets.len() || a.traps.len() != b.traps.len() { return false; }
   if a.key.len() != b.key.len() { return false; }
   var i = 0usize;
@@ -131,13 +134,23 @@ fn main() i32 {
         case let Ok(back) {
           expect(same(&mc, &back), "the container reads back as it was");
           expectUInt(u64.from(back.funcOffsets.len()), 2u64, "two functions");
+          expectUInt(u64.from(back.frameSizes.len()), 2u64, "their frame sizes");
+          expect(back.maxFrame >= 48u32 && back.maxFrame == (if *back.frameSizes[0usize] > *back.frameSizes[1usize] { *back.frameSizes[0usize] } else { *back.frameSizes[1usize] }), "the largest frame is the larger of them, and at least a shadow space, rbp and a return address");
           expectUInt(u64.from(*back.nAreas[0usize]), 2u64, "their areas");
           expect(back.traps.len() > 0usize, "the trap table is carried");
           // and the decoded one runs
           match load(&back) {
             case let Err(e) { expect(false, "the decoded container loads"); }
             case let Ok(lc) {
-              var ctx = NativeCtx(0usize, 1000u64, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, 0usize);
+              var ctx = newCtx(0usize, 1000u64, 0usize);
+              var area0 = List[u64]();
+              area0.push(6u64); area0.push(7u64);
+              expectUInt(lc.call(&mut ctx, 0u32, area0.viewMut()), TRAP_BADFUNC, "code is not run with no stack bound");
+              let stk = match NativeStack.make(usize.from(nativeStackBytes(back.maxFrame))) {
+                case let Ok(s) { s }
+                case let Err(e) { print <- e, "\n"; return 1i32; }
+              };
+              stk.bind(&mut ctx);
               var area = List[u64]();
               area.push(6u64); area.push(7u64);
               let t = lc.call(&mut ctx, 0u32, area.viewMut());
@@ -193,6 +206,20 @@ fn main() i32 {
       d2.set(6usize, 5u8);
       reseal(&mut d2);
       expect(decode(d2.view()) is Err, "a newer minor version is refused");
+      var d2b = List[u8]();
+      i = 0usize;
+      while i < stored.len() { d2b.push(*stored[i]); i = i + 1usize; }
+      d2b.set(6usize, 0u8);
+      reseal(&mut d2b);
+      expect(decode(d2b.view()) is Err, "an older minor version (no frame sizes, another entry stub) is refused");
+      // the largest frame (after the 3-byte key and the entry offset it is at 20) larger than any the table holds: the stack
+      // would be sized from a lie
+      var d2c = List[u8]();
+      i = 0usize;
+      while i < stored.len() { d2c.push(*stored[i]); i = i + 1usize; }
+      d2c.set(23usize, 0x7Fu8);
+      reseal(&mut d2c);
+      expect(decode(d2c.view()) is Err, "a largest frame that is not the table's largest is refused");
       var d3 = List[u8]();
       i = 0usize;
       while i < stored.len() { d3.push(*stored[i]); i = i + 1usize; }

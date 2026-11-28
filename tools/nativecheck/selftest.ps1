@@ -10,5 +10,11 @@ Remove-Item Env:NATIVECHECK_MUTANT
 & $exe $world | Out-Null
 $clean = $LASTEXITCODE
 "with the fault in the lift: exit $mutant (must be 1); without: exit $clean (must be 0)"
-if ($mutant -eq 1 -and $clean -eq 0) { "nativecheck catches a real difference"; exit 0 }
+# the stack fault: a runner whose native stack is sized for half the depth stops the fat-frame recursion early
+$env:NATIVECHECK_MUTANT = "half-stack"
+& $exe $world | Out-Null
+$half = $LASTEXITCODE
+Remove-Item Env:NATIVECHECK_MUTANT
+"with the stack sized for half the depth: exit $half (must be 1)"
+if ($mutant -eq 1 -and $clean -eq 0 -and $half -eq 1) { "nativecheck catches a real difference, and a stack too small for the depth limit"; exit 0 }
 "SELF-TEST FAILED"; exit 1

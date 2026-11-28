@@ -10,6 +10,7 @@ import testing use *;
 import stdio use *;
 import collections use *;
 import codegen use *;
+import libc;
 
 // ---- the gate the generated code calls ----
 struct Probe {
@@ -55,11 +56,29 @@ struct Res {
   depth: u64;       // the call count left after the run
 }
 
-fn build(funcs: &Funcs, opts: &Options, rep: &mut Rep, name: &str) Option[LoadedCode] {
+// The code and the stack it runs on
+struct Prog {
+  lc: LoadedCode;
+  st: NativeStack;
+}
+
+// The stack the tests give code: the real size (1,024 frames of the largest, and the slack), but at most 256 KiB, so a test
+// can have a frame past the stack (and a test of the real size, suiteDeep, asks for no cap)
+const TEST_STACK_CAP = 262144usize;
+
+// 'divisor' halves the depth the stack is sized for (the mutant), and 'cap' is the most it is given
+fn buildSized(funcs: &Funcs, opts: &Options, rep: &mut Rep, name: &str, cap: usize, divisor: u64) Option[Prog] {
   match compileX64With(funcs, hostAbi(), opts) {
     case let Ok(mc) {
       match load(&mc) {
-        case let Ok(lc) { Some(lc) }
+        case let Ok(lc) {
+          var want = usize.from(nativeStackBytesFor(mc.maxFrame, MAX_CALL_DEPTH / divisor));
+          if want > cap { want = cap; }
+          match NativeStack.make(want) {
+            case let Ok(st) { Some(Prog(lc, st)) }
+            case let Err(e) { print <- "stack failed: ", e, "\n"; ck(rep, false, name); None }
+          }
+        }
         case let Err(e) { ck(rep, false, name); None }
       }
     }
@@ -67,17 +86,26 @@ fn build(funcs: &Funcs, opts: &Options, rep: &mut Rep, name: &str) Option[Loaded
   }
 }
 
+fn build(funcs: &Funcs, opts: &Options, rep: &mut Rep, name: &str) Option[Prog] {
+  buildSized(funcs, opts, rep, name, TEST_STACK_CAP, 1u64)
+}
+
 // Runs function 'func' with the argument slots 'area' (which becomes the result slots) under 'fuel'
-fn exec(lc: &LoadedCode, func: u32, area0: List[u64], fuel: u64, probe: &mut Probe) Res {
+fn exec(p: &Prog, func: u32, area0: List[u64], fuel: u64, probe: &mut Probe) Res {
+  execGate(p, &testGate as usize, func, area0, fuel, probe)
+}
+
+fn execGate(p: &Prog, gate: usize, func: u32, area0: List[u64], fuel: u64, probe: &mut Probe) Res {
   var area = area0;
-  var ctx = NativeCtx(&testGate as usize, fuel, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, (probe as *u8) as usize);
-  let t = lc.call(&mut ctx, func, area.viewMut());
+  var ctx = newCtx(gate, fuel, (probe as *u8) as usize);
+  p.st.bind(&mut ctx);
+  let t = p.lc.call(&mut ctx, func, area.viewMut());
   Res(t, area, ctx.fuel, ctx.trapSite, ctx.depth)
 }
 
 fn noProbe() Probe { Probe(0u64, 0u64, 0u64, false, 0u64, 0u64) }
 
-fn run(lc: &LoadedCode, func: u32, args: List[u64]) Res {
+fn run(lc: &Prog, func: u32, args: List[u64]) Res {
   var p = noProbe();
   exec(lc, func, args, 1000000000u64, &mut p)
 }
@@ -971,9 +999,13 @@ fn suiteGate(o: &Options, rep: &mut Rep) {
 
 // ---- traps ----
 // rec(n): n == 0 gives 0, else 1 + rec(n - 1)
-fn recFn() Func {
+fn recFn() Func { recFnWith(1u32, 0u64) }
+
+// As recFn with a frame of 'slots' outgoing slots (a fat frame), and, when 'gateK' is not 0, the base case calls the gate
+// with that k and gives what it left in slot 0 instead of 0
+fn recFnWith(slots: u32, gateK: u64) Func {
   var bd = FuncBuilder.make("rec", 1u32, 0x0000000500000001u64);
-  bd.needOut(1u32);
+  bd.needOut(slots);
   let n = bd.vreg(CLASS_INT);
   let z = bd.vreg(CLASS_INT);
   let one = bd.vreg(CLASS_INT);
@@ -987,7 +1019,14 @@ fn recFn() Func {
   bd.cmp(IR_ICMP, CC_EQ, c, n, z);
   bd.br(c, base, step);
   bd.at(base);
-  bd.opImm(IR_ARG_SET, NO_REG, z, 0u64);
+  if gateK != 0u64 {
+    let g = bd.vreg(CLASS_INT);
+    bd.sited(IR_GATE, gateK, 0x0000000500000099u64);
+    bd.opImm(IR_OUT_GET, g, NO_REG, 0u64);
+    bd.opImm(IR_ARG_SET, NO_REG, g, 0u64);
+  } else {
+    bd.opImm(IR_ARG_SET, NO_REG, z, 0u64);
+  }
   bd.ret();
   bd.at(step);
   bd.opImm(IR_ICONST, one, NO_REG, 1u64);
@@ -1057,7 +1096,7 @@ fn bigFn(slots: u32) Func {
 }
 
 // Runs 'f' ten thousand times, each time expecting the trap and its site, then a normal function that must give its answer
-fn repeatTrap(lc: &LoadedCode, f: u32, args: &List[u64], fuel: u64, kind: u64, site: u64, leftFuel: u64, normal: u32,
+fn repeatTrap(lc: &Prog, f: u32, args: &List[u64], fuel: u64, kind: u64, site: u64, leftFuel: u64, normal: u32,
               normalArgs: &List[u64], normalWant: u64) bool {
   var i = 0u32;
   var bad = 0u32;
@@ -1069,6 +1108,79 @@ fn repeatTrap(lc: &LoadedCode, f: u32, args: &List[u64], fuel: u64, kind: u64, s
   }
   let after = run(lc, normal, copyOf(normalArgs));
   bad == 0u32 && after.trap == 0u64 && *after.area[0usize] == normalWant
+}
+
+// ---- the stack native code runs on (NB4) ----
+
+// An import with a 64 KiB local array. Its frame is past a page, so the compiler probes it a page at a time, and it needs
+// the room: the gate thunk runs it on the host stack, so neither depends on the native stack's size
+fn @c bigGate(ctx: *u8, k: u64, slots: *u64) u64 {
+  let c = ctx as *NativeCtx;
+  let p = (*c).user as *Probe;
+  (*p).calls = (*p).calls + 1u64;
+  var buf = Array[u8, 65536]() <- fill 7u8;
+  var i = 0usize;
+  while i < 65536usize { buf[i] = u8.from((i * 31usize + usize.from((*p).calls)) & 0xFFusize); i = i + 7usize; }
+  var sum = 0u64;
+  i = 0usize;
+  while i < 65536usize { sum = sum + u64.from(buf[i]); i = i + 1usize; }
+  *slots = sum;
+  1u64
+}
+
+// What bigGate leaves in slot 0 on its first call
+fn bigRef() u64 {
+  var l = List[u8]();
+  var i = 0usize;
+  while i < 65536usize { l.push(7u8); i = i + 1usize; }
+  i = 0usize;
+  while i < 65536usize { l.set(i, u8.from((i * 31usize + 1usize) & 0xFFusize)); i = i + 7usize; }
+  var sum = 0u64;
+  i = 0usize;
+  while i < 65536usize { sum = sum + u64.from(*l[i]); i = i + 1usize; }
+  sum
+}
+
+// Recursion on the host's own stack, with a frame of a few hundred bytes, to be run after traps (it must not crash)
+fn hostDeep(n: u64) u64 {
+  var pad = Array[u8, 256]() <- fill 3u8;
+  if n == 0u64 { return u64.from(pad[0usize]); }
+  let r = hostDeep(n - 1u64);
+  pad[usize.from(n % 256u64)] = u8.from(r & 0xFFu64);
+  r + u64.from(pad[usize.from((n + 1u64) % 256u64)])
+}
+
+// A recursion with fat frames stops where the interpreter does, 1023 calls below the entry, whatever the frame (the stack
+// is sized from the container's largest frame), and the depth count, not the stack guard, stops it. 'divisor' 2 is the
+// mutant: a stack sized for half the depth, which the guard in a prologue then stops early.
+fn suiteStack(o: &Options, rep: &mut Rep, divisor: u64) {
+  var fs = Funcs();
+  fs.push(recFnWith(300u32, 0u64));                    // a frame of about 2.5 KB
+  match buildSized(&fs, o, rep, "build stack", 67108864usize, divisor) { case None { return; } case let Some(p) {
+    var pd = noProbe();
+    let ok = exec(&p, 0u32, l1(1023u64), 10000000u64, &mut pd);
+    ck(rep, ok.trap == 0u64 && *ok.area[0usize] == 1023u64, "a recursion with 2.5 KB frames runs 1023 calls deep");
+    let over = exec(&p, 0u32, l1(1024u64), 10000000u64, &mut pd);
+    ck(rep, over.trap == TRAP_DEPTH && over.site == 0x0000000500000077u64,
+       "the 1024th call with 2.5 KB frames stops at the depth count, at the call");
+    ck(rep, p.lc.maxFrame() > 2400u32, "the container records a frame of 2.4 KB or more");
+  } }
+  // an import with a 64 KiB local array, called from depth 1000
+  suiteBigGate(o, rep, 1000u64);
+}
+
+// An import with a 64 KiB local array, called from 'depth' calls down, then (calls 2) from the deepest the limit allows
+fn suiteBigGate(o: &Options, rep: &mut Rep, depth: u64) {
+  var gs = Funcs();
+  gs.push(recFnWith(1u32, 1u64));
+  match build(&gs, o, rep, "build big gate") { case None { return; } case let Some(p) {
+    var pg = Probe(0u64, 0u64, 0u64, false, 0u64, 0u64);
+    let r = execGate(&p, &bigGate as usize, 0u32, l1(depth), 10000000u64, &mut pg);
+    ck(rep, r.trap == 0u64 && *r.area[0usize] == depth + bigRef(), "an import with a 64 KiB local array, called from depth 1000, runs");
+    if o.mutant == MUT_GATE_ON_NATIVE { print <- "  the first call ran: trap ", r.trap, ", right answer ", *r.area[0usize] == depth + bigRef(), "\n"; print.flush(); }
+    let r2 = execGate(&p, &bigGate as usize, 0u32, l1(1023u64), 10000000u64, &mut pg);
+    ck(rep, r2.trap == 0u64 && pg.calls == 2u64, "and from depth 1023");
+  } }
 }
 
 fn suiteTraps(o: &Options, rep: &mut Rep) {
@@ -1119,6 +1231,8 @@ fn suiteTraps(o: &Options, rep: &mut Rep) {
     ck(rep, over.depth == 0u64, "a refused call leaves the depth count at zero, not below it");
     ck(rep, repeatTrap(&lc, 0u32, &a5000, 1000000u64, TRAP_DEPTH, 0x0000000500000077u64, 1000000u64, 0u32, &a10, 10u64),
        "ten thousand depth traps, a thousand frames each, leak nothing");
+    // after all those traps (each unwound off the native stack) the host's own stack is intact: a deep recursion on it works
+    ck(rep, hostDeep(1000u64) == hostDeep(1000u64), "after ten thousand traps of each kind the host's stack is its own");
     // the gate refusing, ten thousand times
     var bad2 = 0u32;
     var i = 0u32;
@@ -1238,6 +1352,7 @@ fn suite(o: &Options) Rep {
   suiteMemory(o, &mut rep);
   suiteGate(o, &mut rep);
   suiteTraps(o, &mut rep);
+  suiteStack(o, &mut rep, 1u64);
   suiteDeterminism(o, &mut rep);
   suiteRefusal(o, &mut rep);
   rep
@@ -1276,6 +1391,28 @@ fn caught(name: &str, o: &Options) {
 }
 
 fn main() i32 {
+  // CODEGEN_MUTANT: test.ps1 runs the whole suite under a fault that crashes the process (no-trap-switch: a trap's unwind
+  // leaves rsp on the native stack) or that is an experiment (gate-on-native: no gate thunk); it expects the first to fail
+  let mv = libc.getenv("CODEGEN_MUTANT");
+  if (mv as usize) != 0usize {
+    var mo = defaultOptions();
+    var mr = Rep(0u32, List[String]());
+    if *mv == 'n' {
+      mo.mutant = MUT_NO_TRAP_SWITCH;
+      suiteGate(&mo, &mut mr);
+      suiteTraps(&mo, &mut mr);
+    } else {
+      // gate-on-native, then the 64 KiB-array import from a depth the next letter names: a 10, b 100, c 500, d 900, else 1000
+      mo.mutant = MUT_GATE_ON_NATIVE;
+      let ch = *(mv + 1usize);
+      let depth = if ch == 'a' { 10u64 } else if ch == 'b' { 100u64 } else if ch == 'c' { 500u64 } else if ch == 'd' { 900u64 } else { 1000u64 };
+      print <- "gate on the native stack, the 64 KiB import from depth ", depth, "\n"; print.flush();
+      suiteBigGate(&mo, &mut mr, depth);
+    }
+    report("the mutant run", &mr);
+    print <- "CODEGEN_MUTANT run finished: ", mr.total, " checks, ", mr.fails.len(), " failed\n";
+    return done();
+  }
   let full = defaultOptions();
   let rep = suite(&full);
   report("full register files", &rep);
@@ -1310,5 +1447,11 @@ fn main() i32 {
   var m4 = defaultOptions();
   m4.regs.floats.push(14u8);
   caught("allocator given scratch xmm14", &m4);
+  // the stack sized for half the depth: the fat-frame recursion must notice
+  var rh = Rep(0u32, List[String]());
+  suiteStack(&full, &mut rh, 2u64);
+  expect(rh.fails.len() > 0usize, "stack sized for half the depth is caught");
+  var hi = 0usize;
+  while hi < rh.fails.len() && hi < 2usize { print <- "mutant stack sized MAX_CALL_DEPTH / 2 * maxFrame is caught by: ", rh.fails[hi], "\n"; hi = hi + 1usize; }
   done()
 }

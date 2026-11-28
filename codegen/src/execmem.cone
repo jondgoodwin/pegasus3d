@@ -30,11 +30,67 @@ fn releasePages(mem: *u8, size: usize) {
   #if #os == .windows { VirtualFree(mem, 0usize, 0x8000u32); } #else { munmap(mem, size); }
 }
 
+// ---- the stack native code runs on (NB4) ----
+// The runner makes one, keeps it for its life and re-makes it only for a Code that needs a larger one. Its size is 1024
+// frames of the Code's largest, and 64 KiB over: the entry stub's copy of the incoming area (up to 32 KiB) and a margin.
+// Below it lies a page nobody may touch. Imports do not run on it (the gate thunk puts them on the host's stack).
+pub const NATIVE_STACK_SLACK = 65536u64;
+pub const NATIVE_STACK_MAX = 16777216u64;     // a Code that needs more is not run natively
+pub const NATIVE_STACK_MARGIN = 4096u64;      // the prologue's limit lies this far above the stack's bottom
+
+// The bytes of stack for a Code whose largest frame is 'maxFrame', in whole pages; 'frames' is how many of them it must hold
+pub fn nativeStackBytesFor(maxFrame: u32, frames: u64) u64 {
+  let raw = frames * u64.from(maxFrame) + NATIVE_STACK_SLACK;
+  (raw + 4095u64) / 4096u64 * 4096u64
+}
+// What a Code needs to run MAX_CALL_DEPTH frames deep
+pub fn nativeStackBytes(maxFrame: u32) u64 { nativeStackBytesFor(maxFrame, MAX_CALL_DEPTH) }
+
+pub struct NativeStack {
+  mem: *u8;          // the guard page, then the stack
+  total: usize;      // the guard page and the stack
+  size: usize;       // the stack alone
+
+  // Reserves and commits 'size' bytes (whole pages) read-write, with a no-access page below
+  pub fn make(size: usize) Result[NativeStack, String] {
+    if size == 0usize || size % 4096usize != 0usize { return Err(String.from("a native stack is a whole number of pages")); }
+    let total = size + 4096usize;
+    var mem = null as *u8;
+    var guarded = false;
+    #if #os == .windows {
+      mem = VirtualAlloc(null, total, 0x3000u32, 0x04u32);
+      if mem as usize != 0usize { var old = 0u32; guarded = VirtualProtect(mem, 4096usize, 0x01u32, &mut old as *u32) != 0i32; }
+    } #else {
+      mem = mmap(null, total, 3i32, 0x22i32, 0i32 - 1i32, 0i64);
+      if mem as usize == 0xFFFFFFFFFFFFFFFFusize { mem = null; }
+      if mem as usize != 0usize { guarded = mprotect(mem, 4096usize, 0i32) == 0i32; }
+    }
+    if mem as usize == 0usize { return Err(String.from("the system gave no memory for the native stack")); }
+    if !guarded { releasePages(mem, total); return Err(String.from("the system refused the native stack's guard page")); }
+    Ok(NativeStack(mem, total, size))
+  }
+
+  pub fn bytes(self: &) usize { self.size }
+  pub fn bottom(self: &) usize { (self.mem as usize) + 4096usize }
+  pub fn top(self: &) usize { (self.mem as usize) + self.total }
+
+  // Puts this stack in a context for a run: the top the entry stub switches to, and the limit a prologue checks
+  pub fn bind(self: &, ctx: &mut NativeCtx) {
+    ctx.stackTop = self.top();
+    ctx.stackLimit = self.bottom() + usize.from(NATIVE_STACK_MARGIN);
+  }
+
+  fn final(self: &uni) {
+    releasePages(self.mem, self.total);
+  }
+}
+
 pub struct LoadedCode {
   mem: *u8;
   size: usize;
   entry: usize;
   nAreas: List[u32];
+  frameMax: u32;
 
   // Runs function 'func' of the container through the entry stub, with the argument slots in 'area' (results come back in
   // the same slots) and the host's context 'ctx' (its gate, fuel and depth set by the caller). Gives 0 for success, or the
@@ -44,12 +100,17 @@ pub struct LoadedCode {
     if self.mem as usize == 0usize { return TRAP_BADFUNC; }
     if usize.from(func) >= self.nAreas.len() { return TRAP_BADFUNC; }
     if area.len < usize.from(*self.nAreas[usize.from(func)]) { return TRAP_BADFUNC; }
+    // no stack bound (NativeStack.bind), no run: the stub would switch to nothing
+    if ctx.stackTop == 0usize || ctx.stackLimit == 0usize || ctx.stackLimit >= ctx.stackTop { return TRAP_BADFUNC; }
     let f = (self.mem + self.entry) as &fn @c (ctx: *u8, func: u64, area: *u64) u64;
     f(ctx as *u8, u64.from(func), area as *u64)
   }
 
   // The address of the entry stub, for a host that wraps the call itself (the tests do, to check what the stub preserves)
   pub fn entryAddress(self: &) usize { (self.mem as usize) + self.entry }
+
+  // The largest frame of any function in the container, in bytes (it sizes the stack the code needs)
+  pub fn maxFrame(self: &) u32 { self.frameMax }
 
   // Gives the pages back now (a second call, and the finalizer after it, do nothing)
   pub fn free(self: &mut) {
@@ -93,5 +154,5 @@ pub fn load(mc: &MachineCode) Result[LoadedCode, String] {
   var areas = List[u32]();
   i = 0usize;
   while i < mc.nAreas.len() { areas.push(*mc.nAreas[i]); i = i + 1usize; }
-  Ok(LoadedCode(mem, size, usize.from(mc.entryOffset), areas))
+  Ok(LoadedCode(mem, size, usize.from(mc.entryOffset), areas, mc.maxFrame))
 }

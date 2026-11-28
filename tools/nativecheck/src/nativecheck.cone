@@ -503,10 +503,17 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
   }
 
   // ---- compiled natively; the machine code's size and checksum (the same Code gives the same bytes: run it twice) ----
+  // A Code whose 1,024 frames would not fit the 16 MiB native stack is not compiled, by design (NB4): the host keeps the
+  // interpreter, which is the result nativecheck compares against, so it is noted and not counted as a difference
+  var fixedCapped = false;
+  var simCapped = false;
   if fixedOk && fixedN > 0usize {
     match compileNativeWith(&fv[0usize], opts) {
       case let Ok(n) { fnat.push(n); fixedCompiled = String.from("yes"); }
-      case let Err(e) { fixedCompiled = String.from("NO: "); fixedCompiled.append(e.view()); bad = true; }
+      case let Err(e) {
+        fixedCompiled = String.from("NO: "); fixedCompiled.append(e.view());
+        if e.view().contains("over the 16 MiB limit") { fixedCapped = true; } else { bad = true; }
+      }
     }
     let f1 = liftWith(&fv[0usize], opts);
     match codegen.compileX64(&f1, codegen.hostAbi()) {
@@ -517,7 +524,10 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
   if simOk && simN > 0usize {
     match compileNativeWith(&sv[0usize], opts) {
       case let Ok(n) { snat.push(n); simCompiled = String.from("yes"); }
-      case let Err(e) { simCompiled = String.from("NO: "); simCompiled.append(e.view()); bad = true; }
+      case let Err(e) {
+        simCompiled = String.from("NO: "); simCompiled.append(e.view());
+        if e.view().contains("over the 16 MiB limit") { simCapped = true; } else { bad = true; }
+      }
     }
     let f1 = liftWith(&sv[0usize], opts);
     match codegen.compileX64(&f1, codegen.hostAbi()) {
@@ -541,7 +551,7 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
           case let Ok(bb) {
             var ia = ba;
             var ib = bb;
-            if !ib.isNative() && fixedN > 0usize { partsNative = false; bad = true; }
+            if !ib.isNative() && fixedN > 0usize && !fixedCapped { partsNative = false; bad = true; }
             var i = 0usize;
             while i < w.order.len() {
               let slot = *w.order[i];
@@ -642,6 +652,7 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
   print <- "  "; pad("parts built", 22usize); print <- partsN; print <- " ("; print <- madeCount; print <- " made); differ: mesh "; print <- dMesh;
   print <- ", look "; print <- dLook; print <- ", placement "; print <- dPlace; print <- ", notes "; print <- dNotes;
   if !partsNative { print <- "   NOT NATIVE"; }
+  if fixedCapped { print <- "   (parts built by the interpreter: over the stack cap)"; }
   print <- "\n";
   print <- "  "; pad("fixed unit runs", 22usize); print <- ft.runs; print <- " ("; print <- ft.trapped; print <- " trapped); differ "; print <- ft.diffs; print <- "\n";
   print <- "  "; pad("sim unit runs", 22usize); print <- st.runs; print <- " ("; print <- st.trapped; print <- " trapped); differ "; print <- st.diffs; print <- "\n";
@@ -782,11 +793,12 @@ fn checkBuiltin(opts: LiftOpts, tot: &mut Totals) {
 
 // -------- the stack guard on a worker thread --------
 //
-// The entry stub puts the generated code's stack limit 256 KiB below its own rsp, without knowing the thread's stack size.
-// Sim's native runs are on an actors worker thread, whose stack is the default (1 MB reserved on Windows). This runs an
-// endless recursion with a fat frame (60 values live across the call) natively on a worker thread with the default stack:
-// the frames use up the 256 KiB before the 1024th call, so the stack guard (not the depth count) must stop it, with
-// DepthOut, leaving the thread and the process alive.
+// Native code runs on a stack of its own, sized for 1,024 frames of the Code's largest. Sim's native runs are on an actors
+// worker thread, whose stack is the default (1 MB reserved on Windows), and the thread's stack plays no part. This runs an
+// endless recursion with a fat frame (60 values live across the call) natively on the main thread and on a worker thread:
+// the depth count must stop it, with DepthOut at the same call as the interpreter (same trap, offset, message and fuel
+// left), leaving the thread and the process alive. NATIVECHECK_MUTANT=half-stack sizes the stack for half the depth, and
+// the run must then differ (the prologue's guard stops it early).
 
 fn fatCode() CodeWriter {
   let e = List[u32]();
@@ -810,7 +822,7 @@ fn fatCode() CodeWriter {
 
 struct StackResult { room: usize; kind: u32; fuelNative: u64; fuelInterp: u64; same: bool; ok: bool; }
 
-fn deepRun(n: i64) StackResult {
+fn deepRun(n: i64) StackResult {       // n is 1 for the half-sized stack mutant, else 0
   let room = stackHeadroom();
   let w = fatCode();
   let tb = ImportTables[u8].make();
@@ -828,12 +840,15 @@ fn deepRun(n: i64) StackResult {
         case let Err(e) { return StackResult(room, 0u32, 0u64, 0u64, false, false); }
         case let Ok(nc) {
           var rn = NativeRunner.make();
+          if n == 1i64 { rn.stackMutant = 1u32; }
           rn.setFuel(100000u64);
           let tn = rn.run(&nc, &v, &tb, &mut h2, 0u32, none.view(), &mut out);
           var kind = 0u32;
           var same = false;
           match &tn { case let Some(t) { kind = kindNum(t); } case is None {} }
-          match &ti { case let Some(a) { match &tn { case let Some(b) { same = kindNum(a) == kindNum(b) && a.message == b.message; } case is None {} } } case is None {} }
+          match &ti { case let Some(a) { match &tn { case let Some(b) {
+            same = kindNum(a) == kindNum(b) && a.message == b.message && a.unit == b.unit && a.offset == b.offset;
+          } case is None {} } } case is None {} }
           return StackResult(room, kind, rn.fuelLeft(), it.fuelLeft(), same, true);
         }
       }
@@ -841,33 +856,42 @@ fn deepRun(n: i64) StackResult {
   }
 }
 
-fn checkStack(tot: &mut Totals) {
+fn checkStack(tot: &mut Totals, mutant: bool) {
   tot.worlds = tot.worlds + 1u64;
-  let here = deepRun(0i64);
-  let t = thread.start(0i64, &deepRun);
+  let arg = if mutant { 1i64 } else { 0i64 };
+  let here = deepRun(arg);
+  let t = thread.start(arg, &deepRun);
   let there = t.join();
   var bad = false;
   if !here.ok || !there.ok || here.kind != 4u32 || there.kind != 4u32 || !here.same || !there.same { bad = true; }
+  // the same fuel left too: both executors stopped at the same call
+  if here.fuelNative != here.fuelInterp || there.fuelNative != there.fuelInterp { bad = true; }
   print <- "world stack guard  (an endless recursion with 60 values live across the call, run natively)\n";
   print <- "  "; pad("main thread", 22usize); print <- "room below the call "; print <- here.room / 1024usize; print <- " KiB; trap kind "; print <- here.kind;
   print <- " (4 = DepthOut); fuel left native "; print <- here.fuelNative; print <- ", interpreter "; print <- here.fuelInterp; print <- "\n";
   print <- "  "; pad("worker thread", 22usize); print <- "room below the call "; print <- there.room / 1024usize; print <- " KiB; trap kind "; print <- there.kind;
   print <- " (4 = DepthOut); fuel left native "; print <- there.fuelNative; print <- ", interpreter "; print <- there.fuelInterp; print <- "\n";
-  print <- "  "; pad("result", 22usize); print <- (if bad { "FAILED" } else { "stopped by the guard or the depth count, process alive" }); print <- "\n";
+  print <- "  "; pad("result", 22usize); print <- (if bad { "FAILED" } else { "stopped by the depth count at the call the interpreter stops at, process alive" }); print <- "\n";
   if bad { tot.bad = tot.bad + 1u64; }
 }
 
 fn main(argc: i32, argv: **u8) i32 {
   var opts = liftOptsNone();
   let m = libc.getenv("NATIVECHECK_MUTANT");
+  var halfStack = false;
   if (m as usize) != 0usize {
-    opts.addToSub = true;
-    print <- "NATIVECHECK_MUTANT: the first f64.add of each Code is lifted as a subtraction; this run must fail\n";
+    if *m == 'h' {
+      halfStack = true;
+      print <- "NATIVECHECK_MUTANT: the native stack is sized for half the depth; this run must fail\n";
+    } else {
+      opts.addToSub = true;
+      print <- "NATIVECHECK_MUTANT: the first f64.add of each Code is lifted as a subtraction; this run must fail\n";
+    }
   }
   if argc < 2i32 { print <- "usage: nativecheck FILE.ddd...  (tools\\nativecheck\\run.ps1 gives it every guide world and pegasus\\worlds)\n"; return 2i32; }
   var tot = Totals(0u64, 0u64);
   checkBuiltin(opts, &mut tot);
-  checkStack(&mut tot);
+  checkStack(&mut tot, halfStack);
   var a = 1i32;
   while a < argc {
     checkWorld(cstr.fromPtr(*(argv + usize.from(a))).view(), opts, &mut tot);

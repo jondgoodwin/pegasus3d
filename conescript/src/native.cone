@@ -499,6 +499,14 @@ pub fn compileNativeWith(v: &VerifiedCode, opts: LiftOpts) Result[NativeCode, St
   match compileX64(&funcs, hostAbi()) {
     case let Err(e) { Err[NativeCode, String](e) }
     case let Ok(mc) {
+      // 1,024 frames of the largest must fit the native stack, or the interpreter's depth limit and ours would differ
+      let need = nativeStackBytes(mc.maxFrame);
+      if need > NATIVE_STACK_MAX {
+        var s = String.from("the code's largest frame is ");
+        s <- u64.from(mc.maxFrame); s <- " bytes, so 1,024 frames need a ";
+        s <- need / 1048576u64; s <- " MiB stack, over the 16 MiB limit";
+        return Err[NativeCode, String](s);
+      }
       match load(&mc) {
         case let Err(e) { Err[NativeCode, String](e) }
         case let Ok(lc) {
@@ -516,8 +524,8 @@ extern {
 }
 
 // How many bytes of this thread's stack lie below the caller (Windows: from the thread's stack limits; 0 where unknown).
-// The entry stub puts the generated code's stack limit 256 KiB below its own rsp, so a thread that calls native code must
-// have at least that much room below the call: PEGASUS_NATIVE_STACKINFO=1 has Sim print it at its first native run.
+// Since NB4 generated code runs on a stack of its own (the runner's), and only the host's imports run on the thread's, so
+// this is how much the imports and the entry stub's small frame have: PEGASUS_NATIVE_STACKINFO=1 has Sim print it.
 pub fn stackHeadroom() usize {
   var low = 0usize;
   var high = 0usize;
@@ -617,8 +625,16 @@ pub struct NativeRunner {
   pub profile: Profile;
   area: List[u64];          // the slot area of the run in hand, and the window of the import in hand: kept so none allocates
   win: List[u64];
+  // The stack native code runs on: the runner's, kept for its life and re-made larger when a Code needs more (it is working
+  // storage, not traffic). Empty until the first native run. (The runner owns it and not LoadedCode because one runner runs
+  // many Codes, one at a time, and they share it.)
+  stack: List[NativeStack];
+  // Test fault, never set otherwise: 1 sizes the stack for half the depth (nativediff's mutant)
+  pub stackMutant: u32;
 
-  pub fn make() NativeRunner { NativeRunner(0u64, false, Profile(0u64, 0i64, 0u64, 0i64, 0i64), List[u64](), List[u64]()) }
+  pub fn make() NativeRunner {
+    NativeRunner(0u64, false, Profile(0u64, 0i64, 0u64, 0i64, 0i64), List[u64](), List[u64](), List[NativeStack](), 0u32)
+  }
   pub fn setFuel(self: &mut, fuel: u64) { self.fuel = fuel; }
   pub fn fuelLeft(self: &) u64 { self.fuel }
 
@@ -645,9 +661,21 @@ pub struct NativeRunner {
     var i = 0usize;
     while i < args.len { self.area.set(i, args[i]); i = i + 1usize; }
     var g = GateCtx(handles as *u8, tables as *u8, v as *u8, (&mut self.win) as *u8, &dispatch[V]);
-    var ctx = NativeCtx(&nativeGate as usize, self.fuel, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, (&mut g as *u8) as usize);
+    var ctx = newCtx(&nativeGate as usize, self.fuel, (&mut g as *u8) as usize);
     var t = 0u64;
-    if n.native { t = n.loaded[0usize].call(&mut ctx, unit, self.area.viewMut()); }
+    if n.native {
+      let lc = &n.loaded[0usize];
+      let frames = if self.stackMutant == 1u32 { MAX_CALL_DEPTH / 2u64 } else { MAX_CALL_DEPTH };
+      let want = usize.from(nativeStackBytesFor(lc.maxFrame(), frames));
+      if self.stack.len() == 0usize || self.stack[0usize].bytes() < want {
+        match NativeStack.make(want) {
+          case let Ok(s) { self.stack.clear(); self.stack.push(s); }
+          case let Err(e) { return nativeTrap(TrapKind.BadCall, u64.from(unit) << 32u64, e); }
+        }
+      }
+      self.stack[0usize].bind(&mut ctx);
+      t = lc.call(&mut ctx, unit, self.area.viewMut());
+    }
     else { t = evalFuncs(&n.funcs, &mut ctx, unit, self.area.viewMut(), &nativeGate); }
     self.fuel = ctx.fuel;
     if t == TRAP_NONE {
