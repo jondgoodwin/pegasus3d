@@ -23,7 +23,7 @@ State and event traffic and asset traffic never block each other ([Network](netw
 - **The rows the first browser is built to,** taken from the proposed table below. They sit behind one message module, so a name or a kind changes in one place. `[design choice]`
   - Player → client Sim: movement and look samples with a sequence number (state); a press along a ray at the drawn frame's time, and bound world actions (event, carrying an action).
   - Player → Render: inhabiting avatar X with camera Y (event).
-  - Sim → Render, Audio: the snapshot after each step (latest value, never changed after publishing).
+  - Sim → Render, Audio: the snapshot after each step (latest value, never changed after publishing). Lights and the camera's settings travel in it as the looks of their parts ([Render](render.md)); there is no message from the Loader to Render carrying a world's lighting.
   - Render → Player, Sim: the frame's display time and the head and hands as drawn (latest value). Render reads the newest pose itself, last, before drawing.
   - Player → Loader: open world W for Sim S, which Player has started (event). Loader → Sim: the world image and Sim units (move).
   - Sim → Loader: build content K for part P at a priority set by nearness, where K is a mesh key or a material key ([Sim](sim.md)); part P no longer uses K (events).
