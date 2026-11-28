@@ -61,14 +61,30 @@ pub struct ShotView {
 
 const SHOT_SETTLE_FRAMES = 119u32;    // drawn before a shot's own: it is the 120th frame, as the guide browser's shot is
 
-// Content resident on the GPU, by key
+// Meshes and materials resident on the GPU, each by its own key
 struct Resident {
   key: ContentKey;
   mesh: MeshHandle;
-  material: MaterialHandle;
 }
 alias Residents = List[Resident];
 alias Arrivals = List[MeshContent];
+
+struct MaterialResident {
+  key: ContentKey;
+  material: MaterialHandle;
+}
+alias MaterialResidents = List[MaterialResident];
+
+// A part as step 4 draws it (`chooseDrawn`): the mesh and the material chosen, and the keys they are resident under
+pub struct Chosen {
+  pub id: PartId;
+  pub meshKey: ContentKey;
+  pub materialKey: ContentKey;      // the material key drawn: the part's own, or its previous one until its own is resident
+  pub mesh: MeshHandle;
+  pub material: MaterialHandle;
+  pub place: Mat4;
+}
+alias MaterialArrivals = List[MaterialContent];
 
 // What steps 1 and 2 of a frame leave for 3 to 5
 pub struct FramePlan {
@@ -97,6 +113,12 @@ pub struct RenderCore {
   newer: Option[Published];
   arrivals: Arrivals;               // moved by the Loader, not yet uploaded
   residents: Residents;
+  materialArrivals: MaterialArrivals;
+  materials: MaterialResidents;
+  shownMaterial: List[ContentKey];  // by part id: the material key the part was last drawn with (0: none yet)
+  deferred: List[ContentKey];       // material keys the Loader released while a part still drew with them
+  mutantStaleMaterial: bool;        // the material check's mutant: a part keeps its first material for good
+  mutantNoShow: bool;               // the material check's other mutant: a part waits for its new material, drawing nothing
   frame: u64;
   avatar: PartId;
   camera: PartId;
@@ -125,7 +147,8 @@ pub struct RenderCore {
   pub traceDrawn: bool;             // PEGASUS_TRACE_DRAWN is set: a part whose turn changes between snapshots prints its drawn turn
 
   pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
-    RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), 0u64,
+    RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), MaterialArrivals(),
+      MaterialResidents(), List[ContentKey](), List[ContentKey](), mutantIs("material-stale"), mutantIs("material-no-show"), 0u64,
       NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
       None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, false, false, false, ShotView.none(),
       (libc.getenv("PEGASUS_TRACE_DRAWN") as usize) != 0usize)
@@ -184,27 +207,57 @@ pub struct RenderCore {
 
   pub fn takeContent(self: &mut, c: MeshContent) { arrivals.push(c); }
 
-  pub fn residentCount(self: &) usize { residents.len() }
+  pub fn takeMaterial(self: &mut, c: MaterialContent) { materialArrivals.push(c); }
 
-  pub fn isResident(self: &, key: ContentKey) bool {
+  // How many entries are resident: meshes and materials
+  pub fn residentCount(self: &) usize { residents.len() + materials.len() }
+
+  pub fn meshResident(self: &, key: ContentKey) bool {
     each r in &residents { if r.key == key { return true; } }
     false
   }
 
-  // Loader -> Render: nothing uses 'key' now, so its mesh may go: from the
-  // arrivals if not yet uploaded, else from the GPU
+  pub fn materialResident(self: &, key: ContentKey) bool {
+    each r in &materials { if r.key == key { return true; } }
+    false
+  }
+
+  // Whether 'key' (a mesh key or a material key) is resident
+  pub fn isResident(self: &, key: ContentKey) bool { self.meshResident(key) || self.materialResident(key) }
+
+  // The material key part 'id' was last drawn with (0: none yet)
+  pub fn shownMaterialOf(self: &, id: PartId) ContentKey {
+    if usize.from(id) < shownMaterial.len() { *shownMaterial[usize.from(id)] } else { 0u64 }
+  }
+
+  fn drawsWith(self: &, key: ContentKey) bool {
+    each m in &shownMaterial { if *m == key { return true; } }
+    false
+  }
+
+  // Loader -> Render: nothing uses 'key' now, so its mesh or material may go: from the
+  // arrivals if not yet uploaded, else from the GPU. A material a part still draws with, while its new one is not yet
+  // resident, goes when no part draws with it
   pub fn releaseContent(self: &mut, key: ContentKey) {
     var i = 0usize;
     while i < arrivals.len() {
       if arrivals[i].key == key { _ = arrivals.remove(i); } else { i = i + 1usize; }
     }
     i = 0usize;
+    while i < materialArrivals.len() {
+      if materialArrivals[i].key == key { _ = materialArrivals.remove(i); } else { i = i + 1usize; }
+    }
+    if self.materialResident(key) && self.drawsWith(key) {
+      if !deferred.contains(&key) { deferred.push(key); }
+      return;
+    }
+    self.dropMaterial(key);
+    i = 0usize;
     while i < residents.len() {
       if residents[i].key == key {
         match &mut gfx {
           case var &mut Some(g) {
             _ = g.renderer.removeMesh(&mut g.device, residents[i].mesh);
-            _ = g.renderer.removeMaterial(&mut g.device, residents[i].material);
           }
           else {}
         }
@@ -213,6 +266,32 @@ pub struct RenderCore {
       } else {
         i = i + 1usize;
       }
+    }
+  }
+
+  // The material 'key' leaves the GPU (nothing if it is not resident)
+  fn dropMaterial(self: &mut, key: ContentKey) {
+    var i = 0usize;
+    while i < materials.len() {
+      if materials[i].key == key {
+        match &mut gfx {
+          case var &mut Some(g) { _ = g.renderer.removeMaterial(&mut g.device, materials[i].material); }
+          else {}
+        }
+        _ = materials.remove(i);
+        released = released + 1u64;
+      } else {
+        i = i + 1usize;
+      }
+    }
+  }
+
+  // The materials released while a part still drew with them, now that no part does
+  fn dropDeferred(self: &mut) {
+    var i = 0usize;
+    while i < deferred.len() {
+      let key = *deferred[i];
+      if self.drawsWith(key) { i = i + 1usize; } else { self.dropMaterial(key); _ = deferred.remove(i); }
     }
   }
 
@@ -305,19 +384,41 @@ pub struct RenderCore {
   // frame, so a large one is never starved). Each is uploaded, then dropped
   fn upload(self: &mut) {
     var spent = 0usize;
+    // the materials first: a record each, and a part waits for its material as for its mesh
+    var takenMats = 0usize;
+    while takenMats < materialArrivals.len() && (takenMats == 0usize || spent + materialArrivals[takenMats].bytes <= UPLOAD_BUDGET_BYTES) {
+      spent = spent + materialArrivals[takenMats].bytes;
+      takenMats = takenMats + 1usize;
+    }
+    each arrivedMat in materialArrivals.drain(0usize, takenMats) {
+      let c = arrivedMat;
+      // a key that arrives again (released, then asked for anew) replaces what was resident
+      match deferred.indexOf(&c.key) {
+        case let Some(d) { _ = deferred.remove(d); }
+        case is None[usize] {}
+      }
+      var gone = 0usize;
+      while gone < materials.len() {
+        if materials[gone].key == c.key { self.dropMaterial(c.key); gone = 0usize; } else { gone = gone + 1usize; }
+      }
+      match &mut gfx {
+        case var &mut Some(g) { materials.push(MaterialResident(c.key, uploadLook(g, &c.look))); }
+        else { materials.push(MaterialResident(c.key, MaterialHandle.none())); }
+      }
+    }
     var taken = 0usize;
-    while taken < arrivals.len() && (taken == 0usize || spent + arrivals[taken].bytes <= UPLOAD_BUDGET_BYTES) {
+    while taken < arrivals.len() && ((taken == 0usize && takenMats == 0usize) || spent + arrivals[taken].bytes <= UPLOAD_BUDGET_BYTES) {
       spent = spent + arrivals[taken].bytes;
       taken = taken + 1usize;
     }
-    if taken == 0usize { return; }
+    if taken == 0usize && takenMats == 0usize { return; }
     each arrived in arrivals.drain(0usize, taken) {
       var c = arrived;
       match &mut gfx {
         case var &mut Some(g) {
           // a part whose build left it out has no mesh: resident (so it is not asked for again), never drawn
           if c.mesh.positions.len() == 0usize {
-            residents.push(Resident(c.key, MeshHandle.none(), MaterialHandle.none()));
+            residents.push(Resident(c.key, MeshHandle.none()));
             continue;
           }
           // shading needs normals: flat ones when the build gave none
@@ -325,10 +426,9 @@ pub struct RenderCore {
           mesh <-> c.mesh;
           if mesh.normals.len() != mesh.positions.len() { mesh.computeFlatNormals(); }
           let m = g.renderer.addMesh(&mut g.device, &mesh);
-          let mat = uploadLook(g, &c.look);
-          residents.push(Resident(c.key, m, mat));
+          residents.push(Resident(c.key, m));
         }
-        else { residents.push(Resident(c.key, MeshHandle.none(), MaterialHandle.none())); }
+        else { residents.push(Resident(c.key, MeshHandle.none())); }
       }
     }
     uploadedBytes = uploadedBytes + spent;
@@ -382,6 +482,52 @@ pub struct RenderCore {
     place
   }
 
+  // The material to draw part 'p' with: its own once resident, else the one the part was last drawn with, while that is
+  // resident; none when the part has had no material yet (it is not shown until its first is resident)
+  fn materialToDraw(self: &mut, p: &PartState) Option[MaterialResident] {
+    let id = usize.from(p.id);
+    while shownMaterial.len() <= id { shownMaterial.push(0u64); }
+    var want = p.material;
+    if mutantStaleMaterial && *shownMaterial[id] != 0u64 { want = *shownMaterial[id]; }      // the mutant: never changes
+    each m in &materials {
+      if m.key == want { shownMaterial.set(id, want); return Some[MaterialResident](*m); }
+    }
+    if mutantNoShow { return None[MaterialResident]; }                                        // the mutant: waits, drawing nothing
+    let last = *shownMaterial[id];
+    if last != 0u64 {
+      each m in &materials { if m.key == last { return Some[MaterialResident](*m); } }
+    }
+    None[MaterialResident]
+  }
+
+  // What step 4 draws: each part of the newer snapshot whose mesh and a material are resident, as its mesh, its
+  // material and where it stands this frame. A part draws with its own material key once that is resident, and with the
+  // one it showed before until then. (A mesh left out by its build is resident with no handle: chosen, never drawn.)
+  pub fn chooseDrawn(self: &mut) List[Chosen] {
+    var out = List[Chosen]();
+    let snap = newer;
+    match &snap {
+      case let Some(s) {
+        var k = 0usize;
+        each p in &s.parts {
+          let place = self.blendedPlace(k, p);
+          match self.materialToDraw(p) {
+            case let Some(mat) {
+              each r in &residents {
+                if r.key == p.key { out.push(Chosen(p.id, p.key, mat.key, r.mesh, mat.material, place)); }
+              }
+            }
+            case is None[MaterialResident] {}
+          }
+          k = k + 1usize;
+        }
+      }
+      case is None[Published] {}
+    }
+    self.dropDeferred();
+    out
+  }
+
   // Step 4: the newer snapshot's resident parts, from 'eye' looking along
   // 'look'; to the window, or off screen and saved to 'shot' when named
   fn draw(self: &mut, eye: Vec3, look: LookIntent, shot: &str) {
@@ -408,18 +554,9 @@ pub struct RenderCore {
       camera.lookAt(eye, eye + ahead, Vec3(0., 1., 0.));
     }
     g.list.clear();
-    match &newer {
-      case let Some(s) {
-        var k = 0usize;
-        each p in &s.parts {
-          let place = self.blendedPlace(k, p);
-          each r in &residents {
-            if r.key == p.key && !r.mesh.isNone() { g.list.add(r.mesh, r.material, place); }
-          }
-          k = k + 1usize;
-        }
-      }
-      case is None[Published] {}
+    let chosen = self.chooseDrawn();
+    each c in &chosen {
+      if !c.mesh.isNone() { g.list.add(c.mesh, c.material, c.place); }
     }
     if g.xr { self.drawEyes(g); return; }
     var w = g.width;
@@ -522,7 +659,7 @@ pub struct RenderCore {
   pub fn printStats(self: &) {
     print <- "render: "; print <- frame; print <- " frames; longest gap between frames "; printF(msOf(longestGapNs));
     print <- " ms; longest drawing with no new snapshot "; printF(msOf(longestSameNs)); print <- " ms ("; print <- framesDuringSame;
-    print <- " frames); "; print <- u64.from(residents.len()); print <- " keys resident, "; print <- u64.from(uploadedBytes);
+    print <- " frames); "; print <- u64.from(self.residentCount()); print <- " keys resident (meshes and materials), "; print <- u64.from(uploadedBytes);
     print <- " bytes uploaded over "; print <- uploadFrames; print <- " frames; snapshots changed after publishing: ";
     print <- sumMismatches; print <- "\n";
   }
@@ -760,7 +897,10 @@ actor Render {
   // Loader -> Render (bulk move): a key's look, uploaded under the budget
   pub async fn content(self, c: MeshContent) { core.takeContent(c); }
 
-  // Loader -> Render (event): nothing uses 'key' now; its mesh may go
+  // Loader -> Render (bulk move): a material key's material, uploaded under the budget
+  pub async fn material(self, c: MaterialContent) { core.takeMaterial(c); }
+
+  // Loader -> Render (event): nothing uses 'key' now; its mesh or material may go
   pub async fn release(self, key: ContentKey) { core.releaseContent(key); }
 
   // Player -> Render (event): the person inhabits 'avatar', seen from 'camera'

@@ -22,7 +22,8 @@
 // NOT YET: the disk cache, the network fetch, the server-side Loader, the
 // reader and the interpreter.
 
-pub const MOCK_KEYS = 4usize;       // keys resident once either mock world has arrived (the 40-part world's five, less the one it lets go)
+pub const MOCK_KEYS = 8usize;       // keys resident once the small mock world has arrived: four meshes and four materials
+pub const MOCK_KEYS_40 = 9usize;    // the 40-part world's five meshes and five materials, less the mesh it lets go
 const READ_CHUNK = 65536usize;     // a world file is read this much at a time
 const WORKERS = 3usize;            // jobs in flight at once
 const SETTLE_US = 1000i64;          // the burst of requests that follows a world image is gathered for this long
@@ -86,6 +87,19 @@ actor Worker {
   // Loader -> Worker: build 'job'. Pure, so the worker that runs it never changes the bits. A real world's part
   // (shape "cs.") is made by the interpreter from its slot; the mock worlds' content by `buildContent`
   pub async fn build(self, job: BuildJob) PartProducts {
+    if job.recipe.shape.view() == MATERIAL_SHAPE {
+      // a material key: the world's material, run alone from its slot (no mesh is built)
+      match &mut builder {
+        case var &mut Some(b) {
+          var p = b.buildMaterial(usize.from(job.recipe.slot));
+          each note in &p.notes { print <- "build: material of part "; print <- job.recipe.slot; print <- " left grey: "; printStr(note.view()); print <- "\n"; }
+          return p;
+        }
+        else {}
+      }
+      return plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
+    }
+    if job.recipe.shape.view() == MOCK_MATERIAL_SHAPE { return buildMockMaterial(&job); }
     if job.recipe.shape.view().startsWith("cs.") {
       match &mut builder {
         case var &mut Some(b) {
@@ -128,6 +142,7 @@ actor Loader {
     }
     var catalog = LoaderCore.make(offByOne);
     catalog.learn(browserAvatarKey(), browserAvatarRecipe());   // the browser's own avatar needs nothing from a world
+    catalog.learn(browserAvatarMaterialKey(), browserAvatarMaterialRecipe());
     *self = Self(render, None[Sim], catalog, ws, b, false, report, expectBuilds, retire, false, simOnly);
   }
 
@@ -178,10 +193,12 @@ actor Loader {
     var parts = PartDecls();
     each p in &image.parts {
       core.learn(p.key, p.recipe.copy());
-      parts.push(PartDecl(p.path.clone(), p.key, p.placement, p.slot));
+      core.learn(p.material, p.materialRecipe.copy());
+      parts.push(PartDecl(p.path.clone(), p.key, p.material, p.placement, p.slot));
     }
     print <- "loader: world "; printStr(file); print <- ": "; print <- u64.from(image.parts.len()); print <- " parts, ";
-    print <- u64.from(distinctKeys(&image)); print <- " distinct keys, "; print <- u64.from(image.problems.len());
+    print <- u64.from(distinctKeys(&image)); print <- " distinct mesh keys, "; print <- u64.from(distinctMaterials(&image));
+    print <- " distinct material keys, "; print <- u64.from(image.problems.len());
     print <- " problems, "; print <- u64.from(image.dropped.len()); print <- " parts dropped";
     var k = 0usize;
     while k < image.dropped.len() {
@@ -197,8 +214,8 @@ actor Loader {
     WorldImage(image.name.clone(), parts, units, image.startFeet, behaviour)
   }
 
-  // Sim -> Loader (event): part 'req.part' uses key 'req.key'. A key already
-  // built is shared at once (Render holds the mesh, Sim the shapes); a new
+  // Sim -> Loader (event): part 'req.part' uses key 'req.key', a mesh key or a material key. A key already
+  // built is shared at once (Render holds the mesh or the material, Sim the shapes); a new
   // one is queued; the burst is gathered, then built nearest first
   pub async fn build(self, req: ContentRequest) {
     let how = core.ask(&req);
@@ -235,19 +252,25 @@ actor Loader {
   // One job on worker 'w': the products come back moved, and go on to Render and Sim
   pub async fn run(self, w: usize, job: BuildJob) {
     let key = job.key;
+    let isMaterial = isMaterialRecipe(&job.recipe);
     let worker = workers[w].clone();
     let products = await worker.build(job);
-    self.landed(w, key, products);
+    self.landed(w, key, isMaterial, products);
   }
 
-  fn landed(self: &mut, w: usize, key: ContentKey, p: PartProducts) {
+  fn landed(self: &mut, w: usize, key: ContentKey, isMaterial: bool, p: PartProducts) {
     busy.set(w, false);
     if core.done(key) == DONE_DELIVER {
-      let shapes = shapesOf(key, &p);
-      if !simOnly { render.content(meshContentOf(key, p)); }
-      match &sim {
-        case let Some(s) { s.shapes(shapes); }
-        case is None[Sim] {}
+      if isMaterial {
+        // a material key gives Render the material; Sim has no use for it
+        if !simOnly { render.material(materialContentOf(key, &p)); }
+      } else {
+        let shapes = shapesOf(key, &p);
+        if !simOnly { render.content(meshContentOf(key, p)); }
+        match &sim {
+          case let Some(s) { s.shapes(shapes); }
+          case is None[Sim] {}
+        }
       }
     }
     self.pump();
@@ -290,36 +313,45 @@ actor Loader {
 
 fn recipe(shape: &str, args: List[f32]) Recipe { Recipe(String.from(shape), args, 0u32, 0u32) }
 
-fn args6(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) List[f32] {
+fn args3(a: f32, b: f32, c: f32) List[f32] {
   var l = List[f32]();
-  l.push(a); l.push(b); l.push(c); l.push(d); l.push(e); l.push(f);
+  l.push(a); l.push(b); l.push(c);
   l
 }
 
-fn args4(a: f32, b: f32, c: f32, d: f32) List[f32] {
+fn args1(a: f32) List[f32] {
   var l = List[f32]();
-  l.push(a); l.push(b); l.push(c); l.push(d);
+  l.push(a);
   l
 }
 
-// A part of a world: its name, what it is made from (taught to the catalog),
-// and where it stands
-fn declare(core: &mut LoaderCore, parts: &mut PartDecls, name: &str, r: Recipe, at: Vec3) {
+// A part of a world: its name, what its mesh and its material are made from (taught to the catalog), and where it stands
+fn declare(core: &mut LoaderCore, parts: &mut PartDecls, name: &str, r: Recipe, m: Recipe, at: Vec3) {
   let key = keyOf(&r);
+  let material = materialKeyOf(&m);
   core.learn(key, r);
-  parts.push(PartDecl(String.from(name), key, Mat4.fromTranslation(at), 0u32));
+  core.learn(material, m);
+  parts.push(PartDecl(String.from(name), key, material, Mat4.fromTranslation(at), 0u32));
 }
 
-// The five shapes of the 40-part world
+// The five shapes of the 40-part world, and the five colours they are painted
 fn forty(kind: usize) Recipe {
-  if kind == 0usize { return recipe("box", args6(0.5, 0.5, 0.5, 0.8, 0.3, 0.2)); }
-  if kind == 1usize { return recipe("box", args6(0.5, 1.5, 0.5, 0.25, 0.35, 0.8)); }
-  if kind == 2usize { return recipe("box", args6(0.8, 0.4, 0.8, 0.3, 0.7, 0.4)); }
-  if kind == 3usize { return recipe("box", args6(0.3, 1.0, 0.3, 0.9, 0.8, 0.2)); }
-  recipe("rounded", args4(0.6, 0.7, 0.4, 0.8))
+  if kind == 0usize { return recipe("box", args3(0.5, 0.5, 0.5)); }
+  if kind == 1usize { return recipe("box", args3(0.5, 1.5, 0.5)); }
+  if kind == 2usize { return recipe("box", args3(0.8, 0.4, 0.8)); }
+  if kind == 3usize { return recipe("box", args3(0.3, 1.0, 0.3)); }
+  recipe("rounded", args1(0.6))
 }
 
-// The world named 'name': "parts40" is forty parts sharing five keys; any
+fn fortyPaint(kind: usize) Recipe {
+  if kind == 0usize { return plainMaterialRecipe(0.8, 0.3, 0.2); }
+  if kind == 1usize { return plainMaterialRecipe(0.25, 0.35, 0.8); }
+  if kind == 2usize { return plainMaterialRecipe(0.3, 0.7, 0.4); }
+  if kind == 3usize { return plainMaterialRecipe(0.9, 0.8, 0.2); }
+  plainMaterialRecipe(0.7, 0.4, 0.8)
+}
+
+// The world named 'name': "parts40" is forty parts sharing five mesh keys and five material keys; any
 // other name is the small mock (a ground plane and three boxes). Fills 'core'
 // with each key's recipe, as the real world image's code will
 fn mockWorld(name: String, core: &mut LoaderCore) WorldImage {
@@ -335,14 +367,14 @@ fn mockWorld(name: String, core: &mut LoaderCore) WorldImage {
       label.appendByte('0' + u8.from(k / 10usize));
       label.appendByte('0' + u8.from(k % 10usize));
       if k == 3usize { label = String.from("box-a"); }   // the headless run's press aims at box-a: dead ahead of the person
-      declare(core, &mut parts, label.view(), r, Vec3(x, 0.5, z));
+      declare(core, &mut parts, label.view(), r, fortyPaint(kind), Vec3(x, 0.5, z));
       k = k + 1usize;
     }
   } else {
-    declare(core, &mut parts, "ground", recipe("ground", args4(40., 0.35, 0.55, 0.25)), Vec3(0., 0., 0.));
-    declare(core, &mut parts, "box-a", forty(0usize), Vec3(0., 0.5, -8.));
-    declare(core, &mut parts, "box-b", forty(1usize), Vec3(-3., 1.5, -10.));
-    declare(core, &mut parts, "box-c", recipe("rounded", args4(0.7, 0.85, 0.75, 0.3)), Vec3(3., 0.7, -9.));
+    declare(core, &mut parts, "ground", recipe("ground", args1(40.)), plainMaterialRecipe(0.35, 0.55, 0.25), Vec3(0., 0., 0.));
+    declare(core, &mut parts, "box-a", forty(0usize), fortyPaint(0usize), Vec3(0., 0.5, -8.));
+    declare(core, &mut parts, "box-b", forty(1usize), fortyPaint(1usize), Vec3(-3., 1.5, -10.));
+    declare(core, &mut parts, "box-c", recipe("rounded", args1(0.7)), plainMaterialRecipe(0.85, 0.75, 0.3), Vec3(3., 0.7, -9.));
   }
   var units = SimUnits();
   units.push(String.from("mock.zone"));

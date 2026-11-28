@@ -3,17 +3,19 @@
 // what it understood, as guidebrowser\src\build.cone does, but builds no mesh: each shape part becomes a row (its id
 // and path, its parent, where it stands) and a RECIPE for its content, which a Loader worker builds with `buildPart`.
 //
-// THE RECIPE of a part (what a content key hashes, so equal fixed inputs share one build):
-//   shape  "cs." and the name of the vocabulary row at the top of the part's value: "cs.lathe", "cs.difference",
-//          "cs.box" (a function the part calls is followed into: its value is the function's result)
-//   args   the part's shape value as the reader holds it, flattened, then -1, then the part's material value
-//          flattened (a reference to a material part is followed to that part's own value, so two names for one wood
-//          agree). Each node is a tag: 0 absent; 1 number; 2 truth; 3 tuple, count, items; 4 range, count, items;
-//          5 reference, slot; 6 call, its vocabulary row, count, arguments; 7 list, count, items; 8 local, number;
-//          9 function call, count of steps, the steps, the result.
-//   slot   the first part with this recipe: the part a worker builds it from (not part of the key)
-// The material is in the key because Render holds one material per key: two parts of one shape in different woods are
-// two keys and two meshes, until a part may carry its own material. The key holds no colour of its own.
+// THE RECIPES of a part (what a content key hashes, so equal fixed inputs share one build). A part has two: its mesh's
+// and its material's, each with its own key.
+//   MESH   shape  "cs." and the name of the vocabulary row at the top of the part's value: "cs.lathe", "cs.difference",
+//                 "cs.box" (a function the part calls is followed into: its value is the function's result)
+//          args   the part's shape value as the reader holds it, flattened. Each node is a tag: 0 absent; 1 number; 2 truth;
+//                 3 tuple, count, items; 4 range, count, items; 5 reference, slot; 6 call, its vocabulary row, count,
+//                 arguments; 7 list, count, items; 8 local, number; 9 function call, count of steps, the steps, the result.
+//          slot   the first part with this recipe: the part a worker builds it from (not part of the key)
+//   MATERIAL  shape "cm.material" (`MATERIAL_SHAPE`)
+//          args   the part's material value flattened the same way (a reference to a material part is followed to that
+//                 part's own value, so two names for one wood agree)
+//          slot   the first shape part with this material: the part a worker builds the material from (not part of the key)
+// The mesh key is the shape alone: two parts of one shape in different woods share one mesh and have two material keys.
 
 // One shape part of the world
 pub struct ImagePart {
@@ -23,8 +25,10 @@ pub struct ImagePart {
   pub at: Vec3;                     // where it stands in its parent's frame
   pub turn: Quat;                   // how it is turned in its parent's frame
   pub placement: Mat4;              // its frame in the world's
-  pub recipe: Recipe;
-  pub key: ContentKey;
+  pub recipe: Recipe;               // the mesh's
+  pub key: ContentKey;              // the mesh key
+  pub materialRecipe: Recipe;
+  pub material: ContentKey;         // the material key
 }
 alias ImageParts = List[ImagePart];
 
@@ -61,11 +65,20 @@ pub fn readImage(file: &str, text: &Array[u8]) ImageWorld {
   ImageWorld(String.from(file), parts, dropped, problems, feet, behaviourOf(w, keys))
 }
 
-// How many different keys the parts have
+// How many different mesh keys the parts have
 pub fn distinctKeys(image: &ImageWorld) usize {
   var seen = List[ContentKey]();
   each p in &image.parts {
     if !seen.contains(&p.key) { seen.push(p.key); }
+  }
+  seen.len()
+}
+
+// How many different material keys the parts have
+pub fn distinctMaterials(image: &ImageWorld) usize {
+  var seen = List[ContentKey]();
+  each p in &image.parts {
+    if !seen.contains(&p.material) { seen.push(p.material); }
   }
   seen.len()
 }
@@ -94,16 +107,18 @@ fn fillImage(w: &Understood, parts: &mut ImageParts, dropped: &mut List[String],
     if kind == Kind.Shape {
       var args = List[f32]();
       flatten(w, &w.units[slot].make, &mut args);
-      args.push(-1.);               // where the shape ends and its material begins
+      var matArgs = List[f32]();
       match &w.units[slot].options[OPT_MATERIAL] {
-        case let Ref(m) { flatten(w, &w.units[*m].make, &mut args); }
-        else { flatten(w, &w.units[slot].options[OPT_MATERIAL], &mut args); }
+        case let Ref(m) { flatten(w, &w.units[*m].make, &mut matArgs); }
+        else { flatten(w, &w.units[slot].options[OPT_MATERIAL], &mut matArgs); }
       }
       var shape = String.from("cs.");
       appendTopName(w, &w.units[slot].make, &mut shape);
       let recipe = Recipe(shape, args, 0u32, u32.from(slot));
       let key = keyOf(&recipe);
-      parts.push(ImagePart(u32.from(slot), pathOf(w, slot), u32.from(parent), at, turn, *places[slot], recipe, key));
+      let materialRecipe = Recipe(String.from(MATERIAL_SHAPE), matArgs, 0u32, u32.from(slot));
+      let material = materialKeyOf(&materialRecipe);
+      parts.push(ImagePart(u32.from(slot), pathOf(w, slot), u32.from(parent), at, turn, *places[slot], recipe, key, materialRecipe, material));
     }
     else if kind == Kind.Arrival && !standing {
       *feet = *places[parent] * vec3(&w.units[slot].options[OPT_AT]);

@@ -1,0 +1,86 @@
+// The driven check of material keys apart from mesh keys (`pegasus --checks`, W130). It drives RenderCore with no GPU:
+// two parts share one mesh and have two materials; one part changes its material, and Render must draw the old one until
+// the new one is resident, hold the old one's release until then, and then draw the new; a part whose first material has
+// not arrived is not drawn. PEGASUS_MUTANT=material-stale (a part keeps its first material for good) and
+// material-no-show (a part waits for a new material, drawing nothing) are caught by it.
+
+fn snapshotOf(step: u64, parts: PartStates) Published {
+  var s = Snapshot(step, step * STEP_NS, PersonState(Vec3(0., 0., 0.), 0.), parts, OtherPersons(), 0u64);
+  s.sum = snapshotSum(&s);
+  Published(s)
+}
+
+fn partOf(id: u32, mesh: ContentKey, material: ContentKey) PartState {
+  PartState(id, mesh, material, NO_PART, Mat4.identity())
+}
+
+// The material key part 'id' was drawn with in 'chosen' (0: the part was not drawn)
+fn drawnMaterial(chosen: &List[Chosen], id: u32) ContentKey {
+  each c in &*chosen { if c.id == id { return c.materialKey; } }
+  0u64
+}
+
+fn materialContent(key: ContentKey, r: f32) MaterialContent {
+  MaterialContent(key, MaterialRec(Color(r, 0.5, 0.5, 1.), false, 1., 0., 1., 0., 0.05, 0.), MATERIAL_BYTES)
+}
+
+fn checkMaterials() bool {
+  var lw: StateWriter[LookIntent];
+  var lr: StateReader[LookIntent];
+  lw, lr = stateSlot[LookIntent](LookIntent(0., 0.));
+  var dw: StateWriter[DrawnFrame];
+  var dr: StateReader[DrawnFrame];
+  dw, dr = stateSlot[DrawnFrame](zeroFrame());
+  var core = RenderCore.make(lr, dw, false);
+  let mesh = 1000u64;
+  let boxwood = 11u64;
+  let ebony = 12u64;
+  let walnut = 13u64;
+  let unseen = 14u64;
+
+  // two parts of one shape in two woods: one mesh, two materials
+  core.takeContent(MeshContent(mesh, Mesh.cube(1.), 100usize));
+  core.takeMaterial(materialContent(boxwood, 0.9));
+  core.takeMaterial(materialContent(ebony, 0.1));
+  var ps = PartStates();
+  ps.push(partOf(0u32, mesh, boxwood));
+  ps.push(partOf(1u32, mesh, ebony));
+  core.takeSnapshot(snapshotOf(1u64, ps));
+  _ = core.prepare();
+  var chosen = core.chooseDrawn();
+  let firstOk = chosen.len() == 2usize && drawnMaterial(&chosen, 0u32) == boxwood && drawnMaterial(&chosen, 1u32) == ebony
+    && core.residentCount() == 3usize;
+
+  // part 0 changes to walnut, which has not arrived: it is drawn in boxwood still, and boxwood's release waits
+  var ps2 = PartStates();
+  ps2.push(partOf(0u32, mesh, walnut));
+  ps2.push(partOf(1u32, mesh, ebony));
+  core.takeSnapshot(snapshotOf(2u64, ps2));
+  core.releaseContent(boxwood);
+  _ = core.prepare();
+  chosen = core.chooseDrawn();
+  let holdsOld = chosen.len() == 2usize && drawnMaterial(&chosen, 0u32) == boxwood && core.materialResident(boxwood);
+
+  // walnut arrives: part 0 is drawn in it, and boxwood leaves the GPU; part 1 is not touched
+  core.takeMaterial(materialContent(walnut, 0.4));
+  _ = core.prepare();
+  chosen = core.chooseDrawn();
+  let takesNew = chosen.len() == 2usize && drawnMaterial(&chosen, 0u32) == walnut && drawnMaterial(&chosen, 1u32) == ebony
+    && !core.materialResident(boxwood) && core.materialResident(ebony) && core.residentCount() == 3usize;
+
+  // a third part whose first material never arrived is not drawn
+  var ps3 = PartStates();
+  ps3.push(partOf(0u32, mesh, walnut));
+  ps3.push(partOf(1u32, mesh, ebony));
+  ps3.push(partOf(2u32, mesh, unseen));
+  core.takeSnapshot(snapshotOf(3u64, ps3));
+  _ = core.prepare();
+  chosen = core.chooseDrawn();
+  let notYet = chosen.len() == 2usize && drawnMaterial(&chosen, 2u32) == 0u64;
+
+  print <- "check materials: two parts, one mesh, two materials "; print <- firstOk; print <- "; a changed material draws the old until the new is resident "; print <- holdsOld;
+  print <- "; then the new, the old one released "; print <- takesNew; print <- "; no first material, no part drawn "; print <- notYet;
+  let ok = firstOk && holdsOld && takesNew && notYet;
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED (a part drawn with a stale or missing material)\n"; }
+  ok
+}
