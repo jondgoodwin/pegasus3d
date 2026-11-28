@@ -28,8 +28,68 @@ const WORKERS = 3usize;            // jobs in flight at once
 const SETTLE_US = 1000i64;          // the burst of requests that follows a world image is gathered for this long
 
 actor Worker {
-  // Loader -> Worker: build 'job'. Pure, so the worker that runs it never changes the bits
+  // The world's builder: its code lowered and verified, its material parts made. Each worker makes its own (a
+  // PartBuilder is one thread's), and every one is made the same way, so a job gives the same bits on any worker.
+  builder: Option[PartBuilder];
+  leaf: List[String];               // each part's own name, by slot (for the mesh hash lines)
+  hashes: bool;                     // PEGASUS_MESH_HASHES is set
+
+  fn init(self: &new) {
+    let e = libc.getenv("PEGASUS_MESH_HASHES");
+    *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize);
+  }
+
+  // Loader -> Worker: the world's text. 'index' is this worker's number: the first one reports a refusal, for all
+  pub async fn open(self, index: usize, file: String, text: String) {
+    var names = Names.standard();
+    let vocab = vocabulary(&mut names);
+    let reading = read(text.view(), names, vocab);
+    let w = &reading.understood;
+    match PartBuilder.make(w, toolImports(&w.vocab, &w.names)) {
+      case let Ok(made) {
+        var bld = made;
+        var i = 0usize;
+        while i < w.order.len() {
+          let slot = *w.order[i];
+          if w.nodes[slot].kind == Kind.Material { bld.buildPart(slot, Kind.Material); }
+          i = i + 1usize;
+        }
+        self.builder = Some[PartBuilder](bld);
+        i = 0usize;
+        while i < w.nodes.len() { leaf.push(String.from(w.names.text(w.nodes[i].name))); i = i + 1usize; }
+      }
+      case let Err(problems) {
+        // The verifier takes the world's code whole, so a refusal leaves no part built (spec: the code is verified
+        // as one). Each problem names a unit.
+        if index == 0usize {
+          var k = 0usize;
+          while k < problems.len() {
+            print <- "build: "; printStr(file.view()); print <- ": the world's code was refused: "; printStr(problems[k].what.view());
+            print <- " (unit "; print <- problems[k].unit; print <- ", offset "; print <- problems[k].offset; print <- ")\n";
+            k = k + 1usize;
+          }
+        }
+      }
+    }
+  }
+
+  // Loader -> Worker: build 'job'. Pure, so the worker that runs it never changes the bits. A real world's part
+  // (shape "cs.") is made by the interpreter from its slot; the mock worlds' content by `buildContent`
   pub async fn build(self, job: BuildJob) PartProducts {
+    if job.recipe.shape.view().startsWith("cs.") {
+      match &mut builder {
+        case var &mut Some(b) {
+          var p = b.buildPart(usize.from(job.recipe.slot), Kind.Shape);
+          each note in &p.notes { print <- "build: part "; print <- job.recipe.slot; print <- " left out: "; printStr(note.view()); print <- "\n"; }
+          if hashes && p.made {
+            print <- "meshhash "; printStr(leaf[usize.from(job.recipe.slot)].view()); print <- " "; print <- meshHash(&p.mesh); print <- "\n";
+          }
+          return p;
+        }
+        else {}
+      }
+      return plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
+    }
     buildContent(&job)
   }
 }
@@ -88,6 +148,11 @@ actor Loader {
           case var &mut Err(e) { print <- "loader: "; printStr(world.view()); print <- " cannot be read: error "; print <- e.code; print <- "\n"; }
         }
       }
+      var w = 0usize;
+      while w < WORKERS {
+        workers[w].open(w, world.clone(), String.from(text.view()));
+        w = w + 1usize;
+      }
       sim.world(self.imageOfText(world.view(), text.view()));
     }
     self.sim = Some[Sim](sim);
@@ -99,7 +164,7 @@ actor Loader {
     showProblems(file, &image.problems);
     var parts = PartDecls();
     each p in &image.parts {
-      core.learn(p.key, Recipe(p.recipe.shape.clone(), p.recipe.args.clone(), p.recipe.lod));
+      core.learn(p.key, p.recipe.copy());
       parts.push(PartDecl(p.path.clone(), p.key, p.placement));
     }
     print <- "loader: world "; printStr(file); print <- ": "; print <- u64.from(image.parts.len()); print <- " parts, ";
@@ -208,7 +273,7 @@ actor Loader {
 
 // ---- The mock worlds ----
 
-fn recipe(shape: &str, args: List[f32]) Recipe { Recipe(String.from(shape), args, 0u32) }
+fn recipe(shape: &str, args: List[f32]) Recipe { Recipe(String.from(shape), args, 0u32, 0u32) }
 
 fn args6(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) List[f32] {
   var l = List[f32]();

@@ -1,21 +1,19 @@
 // A real world's image: the ConeScript reader's `Understood`, turned into the part table the Loader moves to Sim.
-// Plan step 6, first part. The reader is the `conescript` package (`read`, over the `partbuild` vocabulary); this
-// file only walks what it understood, as guidebrowser\src\build.cone does, but builds no mesh: each shape part becomes
-// a row (its id and path, its parent, where it stands, how big, its colour) and a RECIPE for its content.
+// Plan step 6. The reader is the `conescript` package (`read`, over the `partbuild` vocabulary); this file only walks
+// what it understood, as guidebrowser\src\build.cone does, but builds no mesh: each shape part becomes a row (its id
+// and path, its parent, where it stands) and a RECIPE for its content, which a Loader worker builds with `buildPart`.
 //
 // THE RECIPE of a part (what a content key hashes, so equal fixed inputs share one build):
 //   shape  "cs." and the name of the vocabulary row at the top of the part's value: "cs.lathe", "cs.difference",
 //          "cs.box" (a function the part calls is followed into: its value is the function's result)
-//   args   RECIPE_HEADER numbers, then the value as the reader holds it, flattened:
-//            [0..2] low corner and [3..5] high corner of the shape's box, estimated from its value (a stand-in's size)
-//            [6..8] the part's material colour, linear red, green, blue
-//          then the value in prefix order, each node a tag: 0 absent; 1 number; 2 truth; 3 tuple, count, items;
-//          4 range, count, items; 5 reference, slot; 6 call, its vocabulary row, count, arguments; 7 list, count,
-//          items; 8 local, number; 9 function call, count of steps, the steps, the result.
-// The colour is in the recipe because the mock `buildContent` makes the stand-in's material from it (the real build
-// will take the material from the part's own).
-
-pub const RECIPE_HEADER = 9usize;
+//   args   the part's shape value as the reader holds it, flattened, then -1, then the part's material value
+//          flattened (a reference to a material part is followed to that part's own value, so two names for one wood
+//          agree). Each node is a tag: 0 absent; 1 number; 2 truth; 3 tuple, count, items; 4 range, count, items;
+//          5 reference, slot; 6 call, its vocabulary row, count, arguments; 7 list, count, items; 8 local, number;
+//          9 function call, count of steps, the steps, the result.
+//   slot   the first part with this recipe: the part a worker builds it from (not part of the key)
+// The material is in the key because Render holds one material per key: two parts of one shape in different woods are
+// two keys and two meshes, until a part may carry its own material. The key holds no colour of its own.
 
 // One shape part of the world
 pub struct ImagePart {
@@ -25,8 +23,6 @@ pub struct ImagePart {
   pub at: Vec3;                     // where it stands in its parent's frame
   pub turn: Quat;                   // how it is turned in its parent's frame
   pub placement: Mat4;              // its frame in the world's
-  pub size: Vec3;                   // the shape's box, estimated from its value
-  pub colour: Color;                // its material's colour, linear
   pub recipe: Recipe;
   pub key: ContentKey;
 }
@@ -86,27 +82,18 @@ fn fillImage(w: &Understood, parts: &mut ImageParts, dropped: &mut List[String],
       places.set(slot, *places[parent] * Mat4.fromTrs(at, turn, Vec3(1., 1., 1.)));
     }
     if kind == Kind.Shape {
-      var colour = Color(0.5, 0.5, 0.5, 1.);
-      match &w.units[slot].options[OPT_MATERIAL] {
-        case let Ref(m) { colour = colorOf(w, &w.units[*m].make); }
-        case let Make(made) { colour = colorOf(w, &w.units[slot].options[OPT_MATERIAL]); }
-        else {}
-      }
-      var span = Span(Vec3(0., 0., 0.), Vec3(0., 0., 0.), false);
-      let none = List[Val]();
-      boundsOf(w, &none, &w.units[slot].make, &mut span);
-      if !span.any { span = Span(Vec3(-0.25, -0.25, -0.25), Vec3(0.25, 0.25, 0.25), true); }
       var args = List[f32]();
-      args.push(span.lo.x); args.push(span.lo.y); args.push(span.lo.z);
-      args.push(span.hi.x); args.push(span.hi.y); args.push(span.hi.z);
-      args.push(colour.red); args.push(colour.green); args.push(colour.blue);
       flatten(w, &w.units[slot].make, &mut args);
+      args.push(-1.);               // where the shape ends and its material begins
+      match &w.units[slot].options[OPT_MATERIAL] {
+        case let Ref(m) { flatten(w, &w.units[*m].make, &mut args); }
+        else { flatten(w, &w.units[slot].options[OPT_MATERIAL], &mut args); }
+      }
       var shape = String.from("cs.");
       appendTopName(w, &w.units[slot].make, &mut shape);
-      let recipe = Recipe(shape, args, 0u32);
+      let recipe = Recipe(shape, args, 0u32, u32.from(slot));
       let key = keyOf(&recipe);
-      parts.push(ImagePart(u32.from(slot), pathOf(w, slot), u32.from(parent), at, turn, *places[slot],
-        span.hi - span.lo, colour, recipe, key));
+      parts.push(ImagePart(u32.from(slot), pathOf(w, slot), u32.from(parent), at, turn, *places[slot], recipe, key));
     }
     else if kind == Kind.Arrival && !standing {
       *feet = *places[parent] * vec3(&w.units[slot].options[OPT_AT]);
@@ -148,12 +135,6 @@ fn appendToolName(w: &Understood, tool: u32, out: &mut String) {
   }
 }
 
-// Is row 'tool' the one-name call 'name'?
-fn toolIs(w: &Understood, tool: u32, name: &str) bool {
-  let path = &w.vocab.tools[usize.from(tool)].path;
-  path.len() == 1usize && w.names.text(*path[0usize]) == name
-}
-
 fn appendTopName(w: &Understood, v: &Val, out: &mut String) {
   match v {
     case let Make(m) { appendToolName(w, m.tool, out); }
@@ -187,108 +168,7 @@ fn flatten(w: &Understood, v: &Val, out: &mut List[f32]) {
   }
 }
 
-// ---- the shape's box, estimated from its value ----
-
-struct Span {
-  lo: Vec3;
-  hi: Vec3;
-  any: bool;
-}
-
-fn lesser(a: f32, b: f32) f32 { if a < b { a } else { b } }
-fn greater(a: f32, b: f32) f32 { if a > b { a } else { b } }
-
-fn widen(s: &mut Span, lo: Vec3, hi: Vec3) {
-  if !s.any {
-    s.lo = lo;
-    s.hi = hi;
-    s.any = true;
-    return;
-  }
-  s.lo = Vec3(lesser(s.lo.x, lo.x), lesser(s.lo.y, lo.y), lesser(s.lo.z, lo.z));
-  s.hi = Vec3(greater(s.hi.x, hi.x), greater(s.hi.y, hi.y), greater(s.hi.z, hi.z));
-}
-
-fn endOf(v: &Val, k: usize) f32 {
-  match v {
-    case let Range(ends) { f32.from(numOf(&ends[k])) }
-    else { 0. }
-  }
-}
-
-// Every pair of numbers in a profile: x holds the farthest out, y the lowest, z the highest
-fn scanPoints(v: &Val, out: &mut Vec3, any: &mut bool) {
-  match v {
-    case let Tuple(items) {
-      if items.len() == 2usize {
-        let x = f32.from(numOf(&items[0usize]));
-        let y = f32.from(numOf(&items[1usize]));
-        if !*any { *out = Vec3(x, y, y); *any = true; }
-        else { *out = Vec3(greater(out.x, x), lesser(out.y, y), greater(out.z, y)); }
-      }
-      each it in &*items { scanPoints(it, out, any); }
-    }
-    case let Items(items) { each it in &*items { scanPoints(it, out, any); } }
-    case let Make(m) { each a in &m.args { scanPoints(a, out, any); } }
-    else {}
-  }
-}
-
-fn boundsOf(w: &Understood, lets: &List[Val], v: &Val, s: &mut Span) {
-  match v {
-    case let Make(m) {
-      let t = m.tool;
-      if toolIs(w, t, "box") {
-        widen(s, Vec3(endOf(&m.args[0usize], 0usize), endOf(&m.args[1usize], 0usize), endOf(&m.args[2usize], 0usize)),
-          Vec3(endOf(&m.args[0usize], 1usize), endOf(&m.args[1usize], 1usize), endOf(&m.args[2usize], 1usize)));
-      }
-      else if toolIs(w, t, "lathe") {
-        var far = Vec3(0., 0., 0.);
-        var any = false;
-        scanPoints(&m.args[0usize], &mut far, &mut any);
-        if any { widen(s, Vec3(0. - far.x, far.y, 0. - far.x), Vec3(far.x, far.z, far.x)); }
-      }
-      else if toolIs(w, t, "sphere") {
-        let r = f32.from(numOf(&m.args[0usize]));
-        widen(s, Vec3(0. - r, 0. - r, 0. - r), Vec3(r, r, r));
-      }
-      else if toolIs(w, t, "union") {
-        boundsOf(w, lets, &m.args[0usize], s);
-        boundsOf(w, lets, &m.args[1usize], s);
-      }
-      else if toolIs(w, t, "move") {
-        var inner = Span(Vec3(0., 0., 0.), Vec3(0., 0., 0.), false);
-        boundsOf(w, lets, &m.args[0usize], &mut inner);
-        if inner.any {
-          let shift = vec3(&m.args[1usize]);
-          widen(s, inner.lo + shift, inner.hi + shift);
-        }
-      }
-      else if toolIs(w, t, "join") {
-        boundsOf(w, lets, &m.args[0usize], s);
-      }
-      else if toolIs(w, t, "arrayRadial") {
-        var inner = Span(Vec3(0., 0., 0.), Vec3(0., 0., 0.), false);
-        boundsOf(w, lets, &m.args[0usize], &mut inner);
-        if inner.any {
-          let r = greater(greater(0. - inner.lo.x, inner.hi.x), greater(0. - inner.lo.z, inner.hi.z));
-          widen(s, Vec3(0. - r, inner.lo.y, 0. - r), Vec3(r, inner.hi.y, r));
-        }
-      }
-      else if toolIs(w, t, "difference") || toolIs(w, t, "subdivide") || toolIs(w, t, "smooth") || toolIs(w, t, "carve")
-          || toolIs(w, t, "mirror") || toolIs(w, t, "turn") {
-        boundsOf(w, lets, &m.args[0usize], s);
-      }
-    }
-    case let Items(items) { each it in &*items { boundsOf(w, lets, it, s); } }
-    case let Local(k) { boundsOf(w, lets, &lets[*k], s); }
-    case let Call(n) { boundsOf(w, &w.functions[*n].lets, &w.functions[*n].result, s); }
-    else {}
-  }
-}
-
-// ---- placement and colour, as guidebrowser\src\build.cone reads them (a copy of the little it needs: the
-// browser reads them through the vocabulary's shims, which a stand-in has no use for) ----
+// ---- placement, as guidebrowser\src\build.cone reads it (a copy of the little it needs) ----
 
 fn vec3(v: &Val) Vec3 {
   match v {
@@ -309,32 +189,4 @@ fn turnOf(w: &Understood, rotation: &Val) Quat {
     }
     else { Quat.identity() }
   }
-}
-
-// plain(c), physical(color:, ...), a list of a material and its modifiers, or a colour itself: srgb(r, g, b) with the
-// true sRGB curve, or color(r, g, b), linear already
-fn colorOf(w: &Understood, make: &Val) Color {
-  match make {
-    case let Make(m) {
-      if toolIs(w, m.tool, "plain") || toolIs(w, m.tool, "physical") || m.tool == w.vocab.materialList {
-        return colorOf(w, &m.args[0usize]);
-      }
-      var opacity = 1.;
-      if !(m.args[3usize] is Absent) { opacity = numOf(&m.args[3usize]); }
-      if toolIs(w, m.tool, "srgb") {
-        return Color(srgbToLinear(numOf(&m.args[0usize])), srgbToLinear(numOf(&m.args[1usize])),
-          srgbToLinear(numOf(&m.args[2usize])), f32.from(opacity));
-      }
-      return Color(f32.from(numOf(&m.args[0usize])), f32.from(numOf(&m.args[1usize])), f32.from(numOf(&m.args[2usize])),
-        f32.from(opacity));
-    }
-    else {}
-  }
-  Color(0.5, 0.5, 0.5, 1.)
-}
-
-fn srgbToLinear(n: f64) f32 {
-  let c = n / 255.;
-  if c <= 0.04045 { return f32.from(c / 12.92); }
-  f32.from(libc.pow((c + 0.055) / 1.055, 2.4))
 }
