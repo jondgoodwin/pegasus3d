@@ -48,6 +48,7 @@ Zones are the partition for now. Each zone has its own body cell, the unit the n
 ### Entering a world
 
 - Crossing a portal is the entering sequence as it is settled so far, below; a link, an address and reopening the browser's worlds run the same steps from step 2. Whether the sequence checks an origin rule waits on safety and identity (see Open).
+- **The old world is released once the new world has admitted the person.** Being admitted is enough to release the old; until then the person stays in the old world and the crossing can be cancelled. So the person is in exactly one zone at every step, and never in none.
 
 #### Design choices: crossing a portal
 
@@ -61,7 +62,6 @@ Zones are the partition for now. Each zone has its own body cell, the unit the n
   4. Sim B admits at its next step and answers Player: admitted, avatar X′, camera Y′ (event).
   5. Player tells Render and Audio: inhabiting X′ with camera Y′, in zone B (event). Render draws from B's snapshot from its next frame; Player's samples go to B with a fresh sequence.
   6. Player tells Sim A: release the person (event). A removes the avatar at its next step and fires `Left`. Player then retires Sim A and tells the Loader A no longer uses its content; keys B also uses stay.
-  Sim A is let go only once B has admitted the person, so the person is in exactly one zone at every step, and is never in none.
 - **Cancelling and failing.** Until step 4, the browser's own controls (back, stop, home) cancel the crossing: Player retires B and tells A to let the person move again. If B cannot be reached or does not admit within a time limit (10 s to start), the same happens and Player says why. The browser's home world is the landing when there is no world to return to; until the browser has one, the landing is the world being left. Going back later is a new arrival, not an undo. `[design choice]`
 - **What Render shows across the gap.** If B was ready, nothing: Render changes snapshot between one frame and the next, the head pose carried on, the body moved from the mouth to R. If not, Render fades A out (about 0.2 s) to the browser's own crossing space, a plain lit space drawn from the head pose so the headset never freezes or goes black, with a sign of progress; when the person is admitted and the parts near R are resident, it fades into B. A part of B not yet resident shows when it is, as everywhere ([Arrival](arrival.md)). `[design choice]`
 - **The person's ask, for now, is a click on the portal** (its `Clicked`), which the portal answers with "prepare". Walking into the mouth before it is ready crosses as `mayFade`. The first build prepares only on the ask; proximity is the second case, built after and measured against it. `[design choice]`
