@@ -154,12 +154,13 @@ actor Sim {
   materialChanges: u64;             // material keys a part changed to (`setMaterial`)
   lookChanges: u64;                 // looks a part changed to (`setLook`)
   poseHistory: PoseHistory;         // each part's place at the last POSE_STEPS steps, for picking at a press's drawn time
+  worldAsked: bool;                 // a client with no copy: it asked the Loader for the world at the address the server's Welcome gave
   held: PartDecls;                  // a shared zone's or a client's parts declared before the whole world is in: kept for `world`, which takes them first
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
       Actions(), AimedPresses(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
-      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, 0u64, PoseHistory.make(), PartDecls());
+      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, 0u64, PoseHistory.make(), false, PartDecls());
   }
 
   // Loader -> Sim (move): the next parts of the world, declared before the whole world is in (the Loader read the files that have
@@ -578,7 +579,9 @@ actor Sim {
       if net.clients[i].helloed && !net.clients[i].declared && net.clients[i].hangUpAt == 0u64 {
         var live = 0usize;
         each q in &net.clients { if q.declared { live = live + 1usize; } }
-        if net.clients[i].world.view() != worldName.view() { self.refuse(i, "this server runs another world"); }
+        // a client that names no world has none: it is told this one's address in the Welcome, and gets the world from there
+        if net.clients[i].world.len() > 0usize && net.clients[i].world.view() != worldName.view() { self.refuse(i, "this server runs another world"); }
+        else if net.clients[i].world.len() == 0usize && !isUrl(worldName.view()) { self.refuse(i, "this server's world is a file on its own disk, not at an address a client can fetch from"); }
         else if live >= MOST_PEOPLE { self.refuse(i, "the zone is full"); }
         else { self.admitPerson(i); }
       }
@@ -689,7 +692,8 @@ actor Sim {
 
   // Hello goes once the connection is open and the Loader's image has named the world
   fn maybeHello(self: &mut) {
-    if role != SIM_CLIENT || net.phase != PHASE_DIALLING || !haveImage { return; }
+    // (a client with no copy of the world says Hello with no world's name: the server's Welcome says where the world is)
+    if role != SIM_CLIENT || net.phase != PHASE_DIALLING || (!haveImage && !io.net.fromServer) { return; }
     var sent = false;
     match &mut net.link {
       case var &mut Some(c) { sendReliable(c, &encodeHello(worldName.view())); sent = true; }
@@ -719,6 +723,13 @@ actor Sim {
       net.wantSum = says.sum;
       net.wantKeys = says.keys;
       net.welcomed = true;
+      if io.net.fromServer && !worldAsked {
+        // the world is fetched from the address the server gave, as it would from any address; the definition-sum check at
+        // `clientReady` then holds this copy to the server's
+        worldAsked = true;
+        print <- "sim: the server runs the world at "; printStr(says.world.view()); print <- ": fetching it from there\n";
+        loader.openWorld(says.world.clone(), selfactor);
+      }
     } else if says.tag == S_SHAPES {
       each s in &says.shapes { net.shapesGot.push(*s); }
     } else if says.tag == S_JOINED {
