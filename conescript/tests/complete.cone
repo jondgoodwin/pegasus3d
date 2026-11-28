@@ -103,6 +103,16 @@ fn simpleOp(op: u8, n: u32, arg: u32, res: u32, tables: &ImportTables[u8]) {
   if !refusedBy(&z, tables, 0u32, "empty") { print <- "  empty stack accepted, op "; print <- u32.from(op); print <- "\n"; expect(false, "an op on too few operands is refused"); }
 }
 
+// A unit of the given signature, whose body gives its results, entered as 'kind': accepted or refused as 'ok' says
+fn entryShape(label: &str, kind: u8, params: &Array[u32], results: &Array[u32], ok: bool, tables: &ImportTables[u8]) {
+  var w = unit(params, results);
+  var i = 0usize;
+  while i < results.len { pushOf(&mut w, results[i]); i = i + 1usize; }
+  w.endUnit();
+  w.addEntry(kind, 0u32, 0u32, 0u32);
+  if ok { accepted(label, &w, tables); } else { refused(label, &w, tables, 0u32, "wrong signature"); }
+}
+
 fn main() i32 {
   let e = List[u32]();
   let tables = ImportTables[u8].make();
@@ -779,21 +789,14 @@ fn main() i32 {
   let ia = w.addImport("host", "act", wasig);
   w.beginUnit(wasig, "acts"); w.opU(OP_IMPORT, ia); w.endUnit();
   w.beginUnit(wasig, "mid"); w.opU(OP_CALL, 0u32); w.endUnit();
-  w.beginUnit(wasig, "top"); w.opU(OP_CALL, 1u32); w.endUnit();
+  w.beginUnit(w.code.types.sig(e.view(), &[TY_F64]), "top"); w.opU(OP_CALL, 1u32); w.f64Const(1.0); w.endUnit();
   w.addEntry(ENTRY_DERIVE, 2u32, 0u32, 0u32);
   refused("a derive reaching an acting import through two calls", &w, &ta, 2u32, "acting");
-  w = CodeWriter.make();
-  let wasig2 = w.code.types.sig(e.view(), e.view());
-  let ia2 = w.addImport("host", "act", wasig2);
-  w.beginUnit(wasig2, "acts"); w.opU(OP_IMPORT, ia2); w.endUnit();
-  w.addEntry(ENTRY_HANDLER, 0u32, 0u32, 0u32);
-  w.addEntry(ENTRY_FIXED, 0u32, 1u32, 0u32);
-  refused("a unit that is a handler and also a fixed entry", &w, &ta, 0u32, "acting");
   w = CodeWriter.make();
   let wasig3 = w.code.types.sig(e.view(), e.view());
   let ia3 = w.addImport("host", "act", wasig3);
   w.beginUnit(wasig3, "acts"); w.opU(OP_IMPORT, ia3); w.endUnit();
-  w.beginUnit(wasig3, "calls"); w.opU(OP_CALL, 0u32); w.endUnit();
+  w.beginUnit(w.code.types.sig(e.view(), &[TY_F64]), "calls"); w.opU(OP_CALL, 0u32); w.f64Const(1.0); w.endUnit();
   w.addEntry(ENTRY_FIXED, 1u32, 0u32, 0u32);
   match verifyEach(&w.code, &ta) {
     case let Ok(v) { expect(v.isRefused(1usize), "the fixed caller is refused"); expect(!v.isRefused(0usize), "the acting unit itself is kept"); }
@@ -803,10 +806,49 @@ fn main() i32 {
   w = CodeWriter.make();
   let wasig4 = w.code.types.sig(e.view(), e.view());
   let ia4 = w.addImport("host", "act", wasig4);
-  w.beginUnit(wasig4, "a"); w.opU(OP_CALL, 1u32); w.endUnit();
-  w.beginUnit(wasig4, "b"); w.opU(OP_CALL, 0u32); w.opU(OP_IMPORT, ia4); w.endUnit();
+  w.beginUnit(w.code.types.sig(e.view(), &[TY_F64]), "a"); w.opU(OP_CALL, 1u32); w.f64Const(1.0); w.endUnit();
+  w.beginUnit(wasig4, "b"); w.opU(OP_CALL, 0u32); w.opU(OP_DROP, TY_F64); w.opU(OP_IMPORT, ia4); w.endUnit();
   w.addEntry(ENTRY_DERIVE, 0u32, 0u32, 0u32);
   refused("a derive in a call cycle that reaches an acting import", &w, &ta, 0u32, "acting");
+
+  // ---- an entry's unit has the signature its kind needs (spec 6, rule 5a) ----
+  entryShape("a derive entry whose unit is not () -> f64: it returns nothing", ENTRY_DERIVE, e.view(), e.view(), false, &tables);
+  entryShape("a derive entry whose unit returns a bool", ENTRY_DERIVE, e.view(), &[TY_BOOL], false, &tables);
+  entryShape("a derive entry whose unit returns an i64", ENTRY_DERIVE, e.view(), &[TY_I64], false, &tables);
+  entryShape("a derive entry whose unit takes a parameter", ENTRY_DERIVE, &[TY_F64], &[TY_F64], false, &tables);
+  entryShape("a derive entry whose unit returns two f64", ENTRY_DERIVE, e.view(), &[TY_F64, TY_F64], false, &tables);
+  entryShape("a derive entry whose unit is () -> f64", ENTRY_DERIVE, e.view(), &[TY_F64], true, &tables);
+  entryShape("a handler entry whose unit returns a value", ENTRY_HANDLER, e.view(), &[TY_F64], false, &tables);
+  entryShape("a handler entry whose unit takes a parameter", ENTRY_HANDLER, &[TY_BOOL], e.view(), false, &tables);
+  entryShape("a handler entry whose unit is () -> ()", ENTRY_HANDLER, e.view(), e.view(), true, &tables);
+  entryShape("a fixed entry whose unit returns nothing", ENTRY_FIXED, e.view(), e.view(), false, &tables);
+  entryShape("a fixed entry whose unit returns two values", ENTRY_FIXED, e.view(), &[TY_F64, TY_BOOL], false, &tables);
+  entryShape("a fixed entry whose unit takes a parameter", ENTRY_FIXED, &[TY_F64], &[TY_F64], false, &tables);
+  entryShape("a fixed entry whose unit returns a bool", ENTRY_FIXED, e.view(), &[TY_BOOL], true, &tables);
+  entryShape("a fixed entry whose unit returns an f64", ENTRY_FIXED, e.view(), &[TY_F64], true, &tables);
+  // a tuple result counts as one result
+  w = CodeWriter.make();
+  tt = w.code.types.tuple(&[TY_F64, TY_F64]);
+  w.beginUnit(w.code.types.sig(e.view(), &[tt]), "pair");
+  w.f64Const(1.0); w.f64Const(2.0); w.opU(OP_TUPLE_MAKE, tt); w.endUnit();
+  w.addEntry(ENTRY_FIXED, 0u32, 0u32, 0u32);
+  accepted("a fixed entry whose unit returns a tuple", &w, &tables);
+  // a unit reached only by call is not constrained; a wrong entry refuses its unit and keeps the others
+  w = CodeWriter.make();
+  w.beginUnit(w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_BOOL, TY_F64]), "helper");
+  w.boolConst(true); w.f64Const(1.0); w.endUnit();
+  w.beginUnit(w.code.types.sig(e.view(), e.view()), "badfixed"); w.endUnit();
+  w.beginUnit(w.code.types.sig(e.view(), &[TY_F64]), "goodderive"); w.f64Const(1.0); w.endUnit();
+  w.addEntry(ENTRY_FIXED, 1u32, 0u32, 0u32);
+  w.addEntry(ENTRY_DERIVE, 2u32, 0u32, 0u32);
+  match verifyEach(&w.code, &tables) {
+    case let Ok(v) {
+      expect(!v.isRefused(0usize), "a unit with no entry may have any signature");
+      expect(v.isRefused(1usize), "a unit with a wrong entry is refused");
+      expect(!v.isRefused(2usize), "a unit with a right entry is kept");
+    }
+    case let Err(ps) { expect(false, "verifyEach gives a VerifiedCode for entry faults"); }
+  }
 
   // dead code is typed loosely, and a block that cannot fall through leaves every local "set" after it
   w = CodeWriter.make();
