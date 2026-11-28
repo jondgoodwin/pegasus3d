@@ -1,0 +1,943 @@
+// The native executor against the interpreter, three ways: the interpreter, the lift run on codegen's evaluator
+// (compileNativeEval), and the lift compiled to x64 and run (compileNative). For every unit of the ops table, the
+// control-flow units, the fuzz seeds and their accepted mutants (and the corpus's accepted unit), with a fuel sweep
+// and the call-depth limit, all three must agree on: result slots (every NaN one value), the trap's kind, unit, offset
+// and message, the fuel left, and the handle table's kinds and payloads. Then three faults put into the lift are
+// shown caught.
+
+mod nativediff;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import conescript use *;
+
+// ---- the host's imports ----
+fn impSum(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
+  var t = 0.0;
+  if usize.from(s[0usize]) < h.size() {
+    let p = h.payload(s[0usize]);
+    var i = 0usize;
+    while i < p.len() { t = t + f64.fromBits(*p[i]); i = i + 1usize; }
+  }
+  s[0usize] = t.bits();
+  true
+}
+fn impWide(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
+  let x = f64.fromBits(s[0usize]);
+  s[1usize] = (x + 1.0).bits();
+  s[2usize] = (x + 2.0).bits();
+  true
+}
+fn impAct(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { true }
+fn impFail(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { h.fail = String.from("the host said no"); false }
+fn impFail2(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { false }
+fn impStage(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
+  if h.size() > 1usize { var p = List[u64](); p.push(s[0usize]); h.data.set(1usize, p); }
+  true
+}
+// makes a host object holding the argument, and gives back its handle
+fn impMake(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
+  var p = List[u64]();
+  p.push(s[0usize]);
+  s[0usize] = h.alloc(7u32, p);
+  true
+}
+
+fn tables() ImportTables[u8] {
+  var ti = ImportTables[u8].make();
+  let lf = ti.types.list(TY_F64);
+  let e = List[u32]();
+  ti.add("host", "sum", ti.types.sig(&[lf], &[TY_F64]), false, 3u32, &impSum);
+  ti.add("host", "wide", ti.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]), true, 1u32, &impWide);
+  ti.add("host", "act", ti.types.sig(e.view(), e.view()), true, 1u32, &impAct);
+  ti.add("host", "fail", ti.types.sig(&[TY_F64], &[TY_F64]), false, 1u32, &impFail2);
+  ti.add("host", "fail0", ti.types.sig(e.view(), e.view()), false, 1u32, &impFail);
+  ti.add("host", "set", ti.types.sig(&[TY_F64], e.view()), true, 1u32, &impStage);
+  ti.add("host", "make", ti.types.sig(&[TY_F64], &[TY_F64]), false, 2u32, &impMake);
+  ti
+}
+
+// ---- one run, as a comparable record ----
+struct Snap {
+  trapped: bool;
+  kind: u32;
+  unit: u32;
+  offset: u32;
+  message: String;
+  slots: List[u64];
+  fuel: u64;
+  hkinds: List[u32];
+  hdata: List[u64];     // each handle's payload, then a marker
+}
+
+fn kindNum(t: &Trap) u32 {
+  match t.kind {
+    case FuelOut { 1u32 }
+    case ImportFailed { 2u32 }
+    case Unreachable { 3u32 }
+    case DepthOut { 4u32 }
+    case BadCall { 5u32 }
+    case Refused { 6u32 }
+  }
+}
+
+// Every NaN is one value
+fn canon(x: u64) u64 {
+  let f = f64.fromBits(x);
+  if f != f { return 0x7FF8000000000000u64; }
+  x
+}
+
+fn snap(r: &Option[Trap], out: &List[u64], fuel: u64, h: &HandleTable[u8]) Snap {
+  var s = Snap(false, 0u32, 0u32, 0u32, String(), List[u64](), fuel, List[u32](), List[u64]());
+  match r {
+    case let Some(t) { s.trapped = true; s.kind = kindNum(t); s.unit = t.unit; s.offset = t.offset; s.message = t.message.clone(); }
+    case is None {}
+  }
+  var i = 0usize;
+  while i < out.len() { s.slots.push(canon(*out[i])); i = i + 1usize; }
+  i = 0usize;
+  while i < h.kinds.len() {
+    s.hkinds.push(*h.kinds[i]);
+    let p = &h.data[i];
+    var j = 0usize;
+    while j < p.len() { s.hdata.push(canon(*p[j])); j = j + 1usize; }
+    s.hdata.push(0xABCDEF0123456789u64);
+    i = i + 1usize;
+  }
+  s
+}
+
+// What differs, or an empty string
+fn differ(a: &Snap, b: &Snap) String {
+  if a.trapped != b.trapped { return String.from("trapped or not"); }
+  if a.kind != b.kind { return String.from("trap kind"); }
+  if a.unit != b.unit { return String.from("trap unit"); }
+  if a.offset != b.offset { return String.from("trap offset"); }
+  if !(a.message == b.message) { return String.from("trap message"); }
+  if a.fuel != b.fuel { return String.from("fuel left"); }
+  if !(a.slots == b.slots) { return String.from("result slots"); }
+  if !(a.hkinds == b.hkinds) { return String.from("handle kinds"); }
+  if !(a.hdata == b.hdata) { return String.from("handle payloads"); }
+  String()
+}
+
+fn runInterp(v: &VerifiedCode, tb: &ImportTables[u8], unit: u32, args: &Array[u64], fuel: u64) Snap {
+  var it = Interpreter.make();
+  it.setFuel(fuel);
+  var h = HandleTable[u8].make();
+  h.alloc(77u32, List[u64]());
+  var out = List[u64]();
+  let r = it.run(v, tb, &mut h, unit, args, &mut out);
+  snap(&r, &out, it.fuelLeft(), &h)
+}
+
+fn runNative(nc: &NativeCode, v: &VerifiedCode, tb: &ImportTables[u8], unit: u32, args: &Array[u64], fuel: u64) Snap {
+  var it = NativeRunner.make();
+  it.setFuel(fuel);
+  var h = HandleTable[u8].make();
+  h.alloc(77u32, List[u64]());
+  var out = List[u64]();
+  let r = it.run(nc, v, tb, &mut h, unit, args, &mut out);
+  snap(&r, &out, it.fuelLeft(), &h)
+}
+
+struct Tally {
+  runs: u64;
+  badEval: u64;        // eval mode differs from the interpreter
+  badNative: u64;      // real native differs
+  badBoth: u64;
+  compileFail: u64;
+  printed: u32;
+  trapped: u64;
+}
+
+fn newTally() Tally { Tally(0u64, 0u64, 0u64, 0u64, 0u64, 0u32, 0u64) }
+
+// All units of 'code', each with args (zero, or from 'argSets' where it gives that unit's) and each fuel; the three modes.
+// 'useNative' false skips the real compiler (for the faulty lifts, which only the evaluator runs).
+fn diffAll(label: &str, code: &Code, tb: &ImportTables[u8], fuels: &List[u64], argSets: &List[List[u64]], useNative: bool, t: &mut Tally) {
+  match verifyEach(code, tb) {
+    case let Err(ps) { return; }
+    case let Ok(v) {
+      let ev = compileNativeEval(&v);
+      var natList = List[NativeCode]();
+      var haveNative = false;
+      if useNative {
+        match compileNative(&v) {
+          case let Ok(nc) { natList.push(nc); haveNative = true; }
+          case let Err(e) { t.compileFail = t.compileFail + 1u64; if t.printed < 10u32 { t.printed = t.printed + 1u32; print <- label; print <- ": compileNative failed: "; print <- e.view(); print <- "\n"; } }
+        }
+      }
+      diffWith(label, &v, tb, &ev, &natList, haveNative, fuels, argSets, t);
+    }
+  }
+}
+
+fn diffWith(label: &str, v: &VerifiedCode, tb: &ImportTables[u8], ev: &NativeCode, natList: &List[NativeCode], haveNative: bool,
+            fuels: &List[u64], argSets: &List[List[u64]], t: &mut Tally) {
+  var u = 0usize;
+  while u < v.unitCount() {
+    var args = List[u64]();
+    if u < argSets.len() && argSets[u].len() == usize.from(v.paramSlots(u)) { args = argSets[u].clone(); }
+    else { var q = 0u32; while q < v.paramSlots(u) { args.push(0u64); q = q + 1u32; } }
+    var fi = 0usize;
+    while fi < fuels.len() {
+      let fuel = *fuels[fi];
+      let a = runInterp(v, tb, u32.from(u), args.view(), fuel);
+      let b = runNative(ev, v, tb, u32.from(u), args.view(), fuel);
+      var dn = String();
+      if haveNative { let c = runNative(&natList[0usize], v, tb, u32.from(u), args.view(), fuel); dn = differ(&a, &c); }
+      let de = differ(&a, &b);
+      t.runs = t.runs + 1u64;
+      if a.trapped { t.trapped = t.trapped + 1u64; }
+      if de.len() > 0usize { t.badEval = t.badEval + 1u64; }
+      if dn.len() > 0usize { t.badNative = t.badNative + 1u64; }
+      if (de.len() > 0usize || dn.len() > 0usize) && t.printed < 10u32 {
+        t.printed = t.printed + 1u32;
+        print <- "MISMATCH "; print <- label; print <- " unit "; print <- u; print <- " fuel "; print <- fuel;
+        print <- ": eval differs in '"; print <- de.view(); print <- "', native differs in '"; print <- dn.view(); print <- "'\n";
+      }
+      fi = fi + 1usize;
+    }
+    u = u + 1usize;
+  }
+}
+
+fn fuelsOne(f: u64) List[u64] { var l = List[u64](); l.push(f); l }
+fn fuelsSweep() List[u64] { var l = List[u64](); var i = 0u64; while i <= 50u64 { l.push(i); i = i + 1u64; } l.push(1000u64); l }
+fn noArgs() List[List[u64]] { List[List[u64]]() }
+
+// ---- the ops table ----
+fn binary(op: u8, a: u32, r: u32) CodeWriter {
+  var w = CodeWriter.make();
+  let sig = w.code.types.sig(&[a, a], &[r]);
+  w.beginUnit(sig, "binary");
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 1u32); w.op(op);
+  w.endUnit();
+  w
+}
+fn unary(op: u8, a: u32, r: u32) CodeWriter {
+  var w = CodeWriter.make();
+  let sig = w.code.types.sig(&[a], &[r]);
+  w.beginUnit(sig, "unary");
+  w.opU(OP_LOCAL_GET, 0u32); w.op(op);
+  w.endUnit();
+  w
+}
+
+fn floatInputs() List[u64] {
+  var l = List[u64]();
+  l.push((0.0).bits()); l.push((-0.0).bits()); l.push((1.5).bits()); l.push((-2.25).bits()); l.push((1e300).bits());
+  l.push((-1e300).bits()); l.push((5e-324).bits());
+  l.push(0x7FF0000000000000u64); l.push(0xFFF0000000000000u64); l.push(0x7FF8000000000000u64);
+  l.push(0xFFF8000000000001u64); l.push((3.0).bits()); l.push((-0.5).bits()); l.push((0.1).bits());
+  l
+}
+fn intInputs() List[u64] {
+  var l = List[u64]();
+  l.push(0u64); l.push(1u64); l.push((-1i64) as u64); l.push(7u64); l.push((-9i64) as u64);
+  l.push(0x7FFFFFFFFFFFFFFFu64); l.push(0x8000000000000000u64); l.push(1000000007u64);
+  l
+}
+
+fn opsTable(t: &mut Tally) {
+  let tb = ImportTables[u8].make();
+  let fl = floatInputs();
+  let il = intInputs();
+  var ops = List[u8]();
+  ops.push(OP_F64_ADD); ops.push(OP_F64_SUB); ops.push(OP_F64_MUL); ops.push(OP_F64_DIV); ops.push(OP_F64_MIN); ops.push(OP_F64_MAX);
+  var k = 0usize;
+  while k < ops.len() {
+    let w = binary(*ops[k], TY_F64, TY_F64);
+    pairs(&w, &tb, &fl, "f64 arith", t);
+    k = k + 1usize;
+  }
+  ops = List[u8]();
+  ops.push(OP_F64_EQ); ops.push(OP_F64_NE); ops.push(OP_F64_LT); ops.push(OP_F64_LE); ops.push(OP_F64_GT); ops.push(OP_F64_GE);
+  k = 0usize;
+  while k < ops.len() {
+    let w = binary(*ops[k], TY_F64, TY_BOOL);
+    pairs(&w, &tb, &fl, "f64 compare", t);
+    k = k + 1usize;
+  }
+  ops = List[u8]();
+  ops.push(OP_I64_ADD); ops.push(OP_I64_SUB); ops.push(OP_I64_MUL);
+  k = 0usize;
+  while k < ops.len() {
+    let w = binary(*ops[k], TY_I64, TY_I64);
+    pairs(&w, &tb, &il, "i64 arith", t);
+    k = k + 1usize;
+  }
+  ops = List[u8]();
+  ops.push(OP_I64_EQ); ops.push(OP_I64_NE); ops.push(OP_I64_LT);
+  k = 0usize;
+  while k < ops.len() {
+    let w = binary(*ops[k], TY_I64, TY_BOOL);
+    pairs(&w, &tb, &il, "i64 compare", t);
+    k = k + 1usize;
+  }
+  var bl = List[u64](); bl.push(0u64); bl.push(1u64);
+  ops = List[u8]();
+  ops.push(OP_BOOL_AND); ops.push(OP_BOOL_OR);
+  k = 0usize;
+  while k < ops.len() { let w = binary(*ops[k], TY_BOOL, TY_BOOL); pairs(&w, &tb, &bl, "bool", t); k = k + 1usize; }
+  singles(&unary(OP_F64_NEG, TY_F64, TY_F64), &tb, &fl, "neg", t);
+  singles(&unary(OP_F64_ABS, TY_F64, TY_F64), &tb, &fl, "abs", t);
+  singles(&unary(OP_F64_SQRT, TY_F64, TY_F64), &tb, &fl, "sqrt", t);
+  singles(&unary(OP_BOOL_FROM_F64, TY_F64, TY_BOOL), &tb, &fl, "bool.from_f64", t);
+  singles(&unary(OP_BOOL_NOT, TY_BOOL, TY_BOOL), &tb, &bl, "bool.not", t);
+  singles(&unary(OP_F64_FROM_BOOL, TY_BOOL, TY_F64), &tb, &bl, "f64.from_bool", t);
+  singles(&unary(OP_F64_FROM_I64, TY_I64, TY_F64), &tb, &il, "f64.from_i64", t);
+  singles(&unary(OP_I64_FROM_PART, TY_PART, TY_I64), &tb, &il, "i64.from_part", t);
+}
+
+fn pairs(w: &CodeWriter, tb: &ImportTables[u8], xs: &List[u64], label: &str, t: &mut Tally) {
+  match verify(&w.code, tb) {
+    case let Err(ps) { t.compileFail = t.compileFail + 1u64; }
+    case let Ok(v) {
+      let ev = compileNativeEval(&v);
+      match compileNative(&v) {
+        case let Err(e) { t.compileFail = t.compileFail + 1u64; }
+        case let Ok(nc) {
+          var a = 0usize;
+          while a < xs.len() {
+            var b = 0usize;
+            while b < xs.len() {
+              var args = List[u64](); args.push(*xs[a]); args.push(*xs[b]);
+              cmp3(label, &v, tb, &ev, &nc, args.view(), t);
+              b = b + 1usize;
+            }
+            a = a + 1usize;
+          }
+        }
+      }
+    }
+  }
+}
+
+fn singles(w: &CodeWriter, tb: &ImportTables[u8], xs: &List[u64], label: &str, t: &mut Tally) {
+  match verify(&w.code, tb) {
+    case let Err(ps) { t.compileFail = t.compileFail + 1u64; }
+    case let Ok(v) {
+      let ev = compileNativeEval(&v);
+      match compileNative(&v) {
+        case let Err(e) { t.compileFail = t.compileFail + 1u64; }
+        case let Ok(nc) {
+          var a = 0usize;
+          while a < xs.len() {
+            var args = List[u64](); args.push(*xs[a]);
+            cmp3(label, &v, tb, &ev, &nc, args.view(), t);
+            a = a + 1usize;
+          }
+        }
+      }
+    }
+  }
+}
+
+fn cmp3(label: &str, v: &VerifiedCode, tb: &ImportTables[u8], ev: &NativeCode, nc: &NativeCode, args: &Array[u64], t: &mut Tally) {
+  let a = runInterp(v, tb, 0u32, args, 100u64);
+  let b = runNative(ev, v, tb, 0u32, args, 100u64);
+  let c = runNative(nc, v, tb, 0u32, args, 100u64);
+  let de = differ(&a, &b);
+  let dn = differ(&a, &c);
+  t.runs = t.runs + 1u64;
+  if de.len() > 0usize { t.badEval = t.badEval + 1u64; }
+  if dn.len() > 0usize { t.badNative = t.badNative + 1u64; }
+  if (de.len() > 0usize || dn.len() > 0usize) && t.printed < 10u32 {
+    t.printed = t.printed + 1u32;
+    print <- "MISMATCH "; print <- label; print <- " args "; print <- args[0usize]; print <- ": eval '"; print <- de.view();
+    print <- "' native '"; print <- dn.view(); print <- "'\n";
+  }
+}
+
+// ---- the control-flow units (flow.cone's, as codes to run) ----
+fn flowCodes() List[CodeWriter] {
+  var cs = List[CodeWriter]();
+  let e = List[u32]();
+
+  // nested blocks, br and br_if with junk beneath the carried value
+  var w = CodeWriter.make();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(sigF, "nest");
+  w.opU(OP_BLOCK, btF);
+  w.opU(OP_BLOCK, btF);
+  w.opU(OP_BLOCK, btF);
+  w.f64Const(100.0); w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_LT); w.opU(OP_BR_IF, 0u32);
+  w.opU(OP_DROP, TY_F64);
+  w.f64Const(200.0); w.opU(OP_LOCAL_GET, 0u32); w.f64Const(5.0); w.op(OP_F64_LT); w.opU(OP_BR_IF, 1u32);
+  w.opU(OP_DROP, TY_F64);
+  w.f64Const(7.0); w.f64Const(300.0); w.opU(OP_BR, 2u32);
+  w.op(OP_END);
+  w.f64Const(1.0); w.op(OP_F64_ADD);
+  w.op(OP_END);
+  w.f64Const(2.0); w.op(OP_F64_ADD);
+  w.op(OP_END);
+  w.endUnit();
+  cs.push(w);
+
+  // if / else with results, and an if without else that sets a local
+  w = CodeWriter.make();
+  let bt2 = w.code.types.sig(e.view(), &[TY_F64]);
+  let bt0 = w.code.types.sig(e.view(), e.view());
+  let sig2 = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(sig2, "ifelse");
+  let acc = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, bt2); w.f64Const(10.0); w.op(OP_ELSE); w.f64Const(20.0); w.op(OP_END);
+  w.opU(OP_LOCAL_SET, acc);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(100.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, bt0);
+  w.opU(OP_LOCAL_GET, acc); w.f64Const(1000.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, acc);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, acc);
+  w.endUnit();
+  cs.push(w);
+
+  // a loop: the sum of 1 .. n
+  w = CodeWriter.make();
+  let lbt = w.code.types.sig(e.view(), e.view());
+  let lsig = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(lsig, "sum");
+  let sum = w.local(TY_F64);
+  let ix = w.local(TY_F64);
+  w.f64Const(1.0); w.opU(OP_LOCAL_SET, ix);
+  w.opU(OP_LOOP, lbt);
+  w.opU(OP_LOCAL_GET, sum); w.opU(OP_LOCAL_GET, ix); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, sum);
+  w.opU(OP_LOCAL_GET, ix); w.f64Const(1.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_TEE, ix);
+  w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_LE);
+  w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, sum);
+  w.endUnit();
+  cs.push(w);
+
+  // an infinite loop
+  w = CodeWriter.make();
+  let isig = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(isig, "spin");
+  w.opU(OP_LOOP, isig);
+  w.opU(OP_BR, 0u32);
+  w.op(OP_END);
+  w.endUnit();
+  cs.push(w);
+
+  // return from inside blocks with junk beneath, code after it
+  w = CodeWriter.make();
+  let rbt = w.code.types.sig(e.view(), e.view());
+  let rsig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(rsig, "ret");
+  w.opU(OP_BLOCK, rbt);
+  w.opU(OP_BLOCK, rbt);
+  w.f64Const(1.0); w.f64Const(2.0); w.f64Const(42.0); w.op(OP_RETURN);
+  w.f64Const(5.0); w.opU(OP_DROP, TY_F64);
+  w.op(OP_END);
+  w.op(OP_END);
+  w.f64Const(0.0);
+  w.endUnit();
+  cs.push(w);
+
+  // calls: a unit calling another twice; a callee's locals start at zero whatever an earlier call left
+  w = CodeWriter.make();
+  let csig = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(csig, "main");
+  let tl = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 1u32); w.opU(OP_LOCAL_SET, tl);
+  w.opU(OP_LOCAL_GET, tl); w.opU(OP_CALL, 1u32); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_ADD);
+  w.opU(OP_CALL, 2u32);
+  w.endUnit();
+  w.beginUnit(csig, "double");
+  let junk = w.local(TY_F64);
+  w.f64Const(555.0); w.opU(OP_LOCAL_SET, junk);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(csig, "reader");
+  let dz = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, dz); w.op(OP_F64_ADD);
+  w.endUnit();
+  cs.push(w);
+
+  // tuples: make, get, in a local, a tuple of a tuple, returned whole
+  w = CodeWriter.make();
+  let t3 = w.code.types.tuple(&[TY_F64, TY_F64, TY_F64]);
+  let t2 = w.code.types.tuple(&[TY_F64, TY_F64]);
+  let tn = w.code.types.tuple(&[t2, TY_F64]);
+  let tsig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(tsig, "tuples");
+  let lt = w.local(t3);
+  w.f64Const(1.0); w.f64Const(2.0); w.f64Const(3.0); w.opU(OP_TUPLE_MAKE, t3); w.opU(OP_LOCAL_SET, lt);
+  w.opU(OP_LOCAL_GET, lt); w.opUU(OP_TUPLE_GET, t3, 1u32);
+  w.opU(OP_LOCAL_GET, lt); w.opUU(OP_TUPLE_GET, t3, 2u32); w.f64Const(10.0); w.op(OP_F64_MUL); w.op(OP_F64_ADD);
+  w.f64Const(4.0); w.f64Const(5.0); w.opU(OP_TUPLE_MAKE, t2); w.f64Const(6.0); w.opU(OP_TUPLE_MAKE, tn);
+  w.opUU(OP_TUPLE_GET, tn, 0u32); w.opUU(OP_TUPLE_GET, t2, 1u32);
+  w.f64Const(100.0); w.op(OP_F64_MUL); w.op(OP_F64_ADD);
+  w.endUnit();
+  let tsig3 = w.code.types.sig(e.view(), &[t3]);
+  w.beginUnit(tsig3, "tuple result");
+  w.f64Const(7.0); w.f64Const(8.0); w.f64Const(9.0); w.opU(OP_TUPLE_MAKE, t3);
+  w.endUnit();
+  cs.push(w);
+
+  // select, over a float, a tuple and a bool
+  w = CodeWriter.make();
+  let ssig = w.code.types.sig(&[TY_BOOL], &[TY_F64]);
+  let st2 = w.code.types.tuple(&[TY_F64, TY_I64]);
+  let ssig2 = w.code.types.sig(&[TY_BOOL], &[st2]);
+  w.beginUnit(ssig, "select");
+  w.f64Const(11.0); w.f64Const(22.0); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_SELECT, TY_F64);
+  w.endUnit();
+  w.beginUnit(ssig2, "select tuple");
+  w.f64Const(1.5); w.i64Const(10i64); w.opU(OP_TUPLE_MAKE, st2);
+  w.f64Const(-2.5); w.i64Const(20i64); w.opU(OP_TUPLE_MAKE, st2);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_SELECT, st2);
+  w.endUnit();
+  cs.push(w);
+
+  // unreachable, with dead code after it and after a br
+  w = CodeWriter.make();
+  let usig = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(usig, "boom");
+  w.f64Const(1.0); w.opU(OP_DROP, TY_F64);
+  w.op(OP_UNREACHABLE);
+  w.endUnit();
+  let dsig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(dsig, "dead code");
+  w.opU(OP_BLOCK, dsig);
+  w.f64Const(3.0); w.opU(OP_BR, 0u32);
+  w.op(OP_UNREACHABLE);
+  w.opU(OP_LOOP, usig); w.opU(OP_BR, 0u32); w.op(OP_END);
+  w.opU(OP_IF, usig); w.op(OP_ELSE); w.op(OP_END);
+  w.f64Const(9.0); w.f64Const(9.0); w.op(OP_F64_ADD); w.opU(OP_DROP, TY_F64);
+  w.op(OP_END);
+  w.f64Const(4.0); w.op(OP_F64_ADD);
+  w.endUnit();
+  cs.push(w);
+
+  // imports: a list made and summed by the host; a wide result; a refusal with a message; one without; make
+  w = CodeWriter.make();
+  let wlf = w.code.types.list(TY_F64);
+  let isum = w.addImport("host", "sum", w.code.types.sig(&[wlf], &[TY_F64]));
+  let iwide = w.addImport("host", "wide", w.code.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]));
+  let ifail0 = w.addImport("host", "fail0", w.code.types.sig(e.view(), e.view()));
+  let ifail = w.addImport("host", "fail", w.code.types.sig(&[TY_F64], &[TY_F64]));
+  let imake = w.addImport("host", "make", w.code.types.sig(&[TY_F64], &[TY_F64]));
+  let msig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(msig, "imports");
+  w.f64Const(1.0); w.f64Const(2.0); w.f64Const(4.0); w.opUU(OP_LIST_MAKE, wlf, 3u32); w.opU(OP_IMPORT, isum);
+  w.f64Const(5.0); w.opU(OP_IMPORT, iwide);
+  w.op(OP_F64_ADD); w.op(OP_F64_ADD); w.op(OP_F64_ADD);
+  w.f64Const(6.5); w.opU(OP_IMPORT, imake); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(msig, "refuses with message");
+  w.opU(OP_IMPORT, ifail0);
+  w.f64Const(0.0);
+  w.endUnit();
+  w.beginUnit(msig, "refuses silently");
+  w.f64Const(1.0); w.opU(OP_IMPORT, ifail);
+  w.endUnit();
+  w.beginUnit(msig, "empty list");
+  w.opUU(OP_LIST_MAKE, wlf, 0u32); w.opU(OP_IMPORT, isum);
+  w.endUnit();
+  cs.push(w);
+
+  // subtraction and division, whose operand order shows
+  w = CodeWriter.make();
+  let asig = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(asig, "sub and div");
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(3.0); w.op(OP_F64_SUB); w.f64Const(2.0); w.op(OP_F64_DIV);
+  w.endUnit();
+  cs.push(w);
+  cs
+}
+
+// ---- a recursion, for the depth limit ----
+fn recursion() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let sig00 = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(sigF, "countdown");
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, btF);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(1.0); w.op(OP_F64_SUB); w.opU(OP_CALL, 0u32); w.f64Const(1.0); w.op(OP_F64_ADD);
+  w.op(OP_ELSE);
+  w.f64Const(0.0);
+  w.op(OP_END);
+  w.endUnit();
+  w.beginUnit(sig00, "forever");
+  w.opU(OP_CALL, 1u32);
+  w.endUnit();
+  w
+}
+
+fn fuzzTables() ImportTables[u8] { tables() }
+
+// The first fuzz seed: a bit of everything
+fn rich() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let bt0 = w.code.types.sig(e.view(), e.view());
+  let sigFF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let t2 = w.code.types.tuple(&[TY_F64, TY_F64]);
+  let lf = w.code.types.list(TY_F64);
+  let isum = w.addImport("host", "sum", w.code.types.sig(&[lf], &[TY_F64]));
+  let iwide = w.addImport("host", "wide", w.code.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]));
+  w.beginUnit(sigFF, "main");
+  let acc = w.local(TY_F64);
+  let tl = w.local(t2);
+  w.opU(OP_BLOCK, btF);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_LT);
+  w.opU(OP_IF, btF); w.f64Const(1.0); w.op(OP_ELSE); w.f64Const(2.0); w.op(OP_END);
+  w.opU(OP_BR, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_SET, acc);
+  w.opU(OP_LOOP, bt0);
+  w.opU(OP_LOCAL_GET, acc); w.f64Const(1.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_TEE, acc);
+  w.f64Const(5.0); w.op(OP_F64_LT); w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, acc); w.opU(OP_CALL, 1u32); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_TUPLE_MAKE, t2); w.opU(OP_LOCAL_SET, tl);
+  w.opU(OP_LOCAL_GET, tl); w.opUU(OP_TUPLE_GET, t2, 1u32);
+  w.f64Const(1.0); w.f64Const(2.0); w.opUU(OP_LIST_MAKE, lf, 2u32); w.opU(OP_IMPORT, isum); w.op(OP_F64_ADD);
+  w.f64Const(7.0); w.opU(OP_IMPORT, iwide); w.op(OP_F64_ADD); w.op(OP_F64_ADD); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(sigFF, "double");
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(btF, "one");
+  w.f64Const(1.0);
+  w.endUnit();
+  w.addEntry(ENTRY_FIXED, 2u32, 0u32, 0u32);
+  w.addEntry(ENTRY_DERIVE, 2u32, 3u32, 0u32);
+  w
+}
+
+// The second seed: i64 and bool ops, select, return, nested ifs, br_if with a result, drop, an acting import, a failing
+// import, a call that may recurse
+fn mixed() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let bt0 = w.code.types.sig(e.view(), e.view());
+  let sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let sigB = w.code.types.sig(&[TY_F64, TY_BOOL], &[TY_F64]);
+  let sig00 = w.code.types.sig(e.view(), e.view());
+  let t3 = w.code.types.tuple(&[TY_F64, TY_BOOL, TY_I64]);
+  let iact = w.addImport("host", "act", sig00);
+  let ifail = w.addImport("host", "fail", sigF);
+  w.beginUnit(sigB, "pick");
+  let n = w.local(TY_I64);
+  let tl = w.local(t3);
+  w.i64Const(40i64); w.i64Const(2i64); w.op(OP_I64_ADD); w.opU(OP_LOCAL_SET, n);
+  w.opU(OP_LOCAL_GET, n); w.i64Const(42i64); w.op(OP_I64_EQ); w.opU(OP_LOCAL_GET, 1u32); w.op(OP_BOOL_AND);
+  w.opU(OP_IF, btF);
+    w.opU(OP_LOCAL_GET, 0u32); w.f64Const(2.0); w.op(OP_F64_MUL);
+  w.op(OP_ELSE);
+    w.opU(OP_BLOCK, btF);
+      w.f64Const(9.0); w.opU(OP_LOCAL_GET, 1u32); w.opU(OP_BR_IF, 0u32);
+      w.opU(OP_DROP, TY_F64);
+      w.f64Const(3.0); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_MAX);
+    w.op(OP_END);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 1u32); w.i64Const(7i64); w.opU(OP_TUPLE_MAKE, t3); w.opU(OP_LOCAL_SET, tl);
+  w.opU(OP_LOCAL_GET, tl); w.opUU(OP_TUPLE_GET, t3, 0u32); w.op(OP_F64_ADD);
+  w.f64Const(1.0); w.f64Const(2.0); w.opU(OP_LOCAL_GET, 1u32); w.opU(OP_SELECT, TY_F64); w.op(OP_F64_ADD);
+  w.opU(OP_LOCAL_GET, 1u32); w.opU(OP_IF, bt0); w.f64Const(4.0); w.opU(OP_CALL, 1u32); w.opU(OP_DROP, TY_F64); w.op(OP_END);
+  w.op(OP_RETURN);
+  w.endUnit();
+  w.beginUnit(sigF, "recur");
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, btF);
+    w.opU(OP_LOCAL_GET, 0u32); w.f64Const(1.0); w.op(OP_F64_SUB); w.opU(OP_CALL, 1u32);
+  w.op(OP_ELSE);
+    w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_IMPORT, ifail);
+  w.op(OP_END);
+  w.endUnit();
+  w.beginUnit(sig00, "acts");
+  w.opU(OP_IMPORT, iact); w.op(OP_UNREACHABLE);
+  w.endUnit();
+  w.beginUnit(btF, "one");
+  w.f64Const(1.0);
+  w.endUnit();
+  w.addEntry(ENTRY_FIXED, 3u32, 0u32, 0u32);
+  w.addEntry(ENTRY_HANDLER, 2u32, 1u32, 0u32);
+  w
+}
+
+struct Rng { s: u64;
+  fn next(self: &mut) u64 {
+    var x = self.s;
+    x = x ^ (x << 13u64); x = x ^ (x >> 7u64); x = x ^ (x << 17u64);
+    self.s = x;
+    x
+  }
+  fn below(self: &mut, n: usize) usize { usize.from(self.next() % u64.from(n)) }
+}
+
+fn damageBytes(b: &mut List[u8], rng: &mut Rng) {
+  let kind = rng.below(5usize);
+  if kind == 0usize { b.set(rng.below(b.len()), u8.from(rng.next() & 0xFFu64)); }
+  else if kind == 1usize { let i = rng.below(b.len()); b.set(i, *b[i] ^ u8.from(1u64 << (rng.next() & 7u64))); }
+  else if kind == 2usize { b.insert(rng.below(b.len()), u8.from(rng.next() & 0xFFu64)); }
+  else if kind == 3usize { if b.len() > 9usize { b.remove(rng.below(b.len())); } }
+  else { if b.len() > 9usize && rng.below(40usize) == 0usize { b.truncate(8usize + rng.below(b.len() - 8usize)); } }
+}
+
+fn damageCode(c: &mut Code, rng: &mut Rng) {
+  let which = rng.below(10usize);
+  let nu = c.units.len();
+  let ni = c.imports.len();
+  let nt = c.types.defs.len();
+  let ne = c.entries.len();
+  if which < 5usize && nu > 0usize {
+    let ui = rng.below(nu);
+    let u = &mut c.units[ui];
+    if u.code.len() > 1usize { damageBytes(&mut u.code, rng); }
+  } else if which == 5usize && nu > 0usize {
+    let ui = rng.below(nu);
+    let u = &mut c.units[ui];
+    if u.locals.len() > 0usize { u.locals.set(rng.below(u.locals.len()), u32.from(rng.below(nt + 2usize))); }
+    else { u.locals.push(u32.from(rng.below(nt + 2usize))); }
+  } else if which == 6usize && nu > 0usize {
+    (&mut c.units[rng.below(nu)]).sig = u32.from(rng.below(nt + 2usize));
+  } else if which == 7usize && ni > 0usize {
+    let ii = rng.below(ni);
+    if rng.below(2usize) == 0usize { (&mut c.imports[ii]).sig = u32.from(rng.below(nt + 2usize)); }
+    else { (&mut c.imports[ii]).name = String.from("sum"); }
+  } else if which == 8usize && ne > 0usize {
+    let ei = rng.below(ne);
+    if rng.below(2usize) == 0usize { (&mut c.entries[ei]).unit = u32.from(rng.below(nu + 2usize)); }
+    else { (&mut c.entries[ei]).kind = u8.from(rng.below(4usize)); }
+  } else if nt > 4usize {
+    let ti = 4usize + rng.below(nt - 4usize);
+    let d = &mut c.types.defs[ti];
+    if d.items.len() > 0usize { d.items.set(rng.below(d.items.len()), u32.from(rng.below(nt + 2usize))); }
+    else { d.arg = u32.from(rng.below(nt + 2usize)); }
+  }
+}
+
+fn main() i32 {
+  let tb = tables();
+  var all = newTally();
+
+  // ---- the ops table ----
+  var t = newTally();
+  opsTable(&mut t);
+  print <- "ops table: "; print <- t.runs; print <- " runs, eval differs "; print <- t.badEval; print <- ", native differs "; print <- t.badNative;
+  print <- ", not compiled "; print <- t.compileFail; print <- "\n";
+  expect(t.runs > 2000u64, "the ops table ran");
+  expectInt(i64.from(t.badEval), 0i64, "ops: the lift on the evaluator matches the interpreter");
+  expectInt(i64.from(t.badNative), 0i64, "ops: native code matches the interpreter");
+  expectInt(i64.from(t.compileFail), 0i64, "ops: every unit lifted, compiled and loaded");
+
+  // ---- the control-flow units, with a fuel sweep and several arguments ----
+  t = newTally();
+  let flows = flowCodes();
+  let sweep = fuelsSweep();
+  var fi = 0usize;
+  while fi < flows.len() {
+    let c = &flows[fi].code;
+    var sets = List[List[u64]]();
+    // the unit-0 arguments to try: several floats, then bools
+    var xs = List[u64]();
+    xs.push((-3.0).bits()); xs.push((2.0).bits()); xs.push((9.0).bits()); xs.push((500.0).bits()); xs.push((10.0).bits());
+    xs.push(0x7FF8000000000000u64); xs.push(0u64); xs.push(1u64);
+    var xi = 0usize;
+    while xi < xs.len() {
+      sets = List[List[u64]]();
+      var a0 = List[u64]();
+      a0.push(*xs[xi]);
+      sets.push(a0);
+      diffAll("flow", c, &tb, &sweep, &sets, true, &mut t);
+      xi = xi + 1usize;
+    }
+    diffAll("flow, no args", c, &tb, &sweep, &noArgs(), true, &mut t);
+    fi = fi + 1usize;
+  }
+  print <- "flow units: "; print <- t.runs; print <- " runs ("; print <- t.trapped; print <- " trapped), eval differs "; print <- t.badEval;
+  print <- ", native differs "; print <- t.badNative; print <- ", not compiled "; print <- t.compileFail; print <- "\n";
+  expect(t.runs > 1000u64, "the flow units ran");
+  expectInt(i64.from(t.badEval), 0i64, "flow: the lift on the evaluator matches the interpreter");
+  expectInt(i64.from(t.badNative), 0i64, "flow: native code matches the interpreter");
+  expectInt(i64.from(t.compileFail), 0i64, "flow: every code lifted, compiled and loaded");
+
+  // ---- the fuel sweep on the looping unit, by itself, with what it must say ----
+  {
+    let c = &flows[2usize].code;
+    var cnt = newTally();
+    var args = List[u64]();
+    args.push((10.0).bits());
+    var sets = List[List[u64]]();
+    sets.push(args);
+    diffAll("sweep", c, &tb, &sweep, &sets, true, &mut cnt);
+    expectInt(i64.from(cnt.badEval + cnt.badNative), 0i64, "the fuel sweep 0 to 50 on the loop agrees in all three");
+    match verify(c, &tb) {
+      case let Ok(v) {
+        var a2 = List[u64](); a2.push((10.0).bits());
+        let r8 = runInterp(&v, &tb, 0u32, a2.view(), 8u64);
+        expect(r8.trapped && r8.kind == 1u32, "the interpreter runs out of fuel at 8");
+        match compileNative(&v) {
+          case let Ok(nc) {
+            let n8 = runNative(&nc, &v, &tb, 0u32, a2.view(), 8u64);
+            expect(n8.trapped && n8.kind == 1u32 && n8.offset == r8.offset && n8.fuel == r8.fuel, "native: the same trap, site and fuel left at 8");
+            let n9 = runNative(&nc, &v, &tb, 0u32, a2.view(), 9u64);
+            expect(!n9.trapped && n9.fuel == 0u64, "native: 9 back edges cost exactly 9");
+          }
+          case let Err(e) { expect(false, "the loop compiles"); }
+        }
+      }
+      case let Err(ps) { expect(false, "the loop verifies"); }
+    }
+  }
+
+  // ---- the call-depth limit ----
+  {
+    let rw = recursion();
+    var cnt = newTally();
+    var big = List[u64](); big.push(10000000u64);
+    var sets = List[List[u64]]();
+    var depths = List[u64]();
+    depths.push((1.0).bits()); depths.push((1021.0).bits()); depths.push((1022.0).bits()); depths.push((1023.0).bits());
+    depths.push((1024.0).bits()); depths.push((1025.0).bits()); depths.push((5000.0).bits());
+    var di = 0usize;
+    var fl = List[u64](); fl.push(100000u64); fl.push(1500u64); fl.push(1023u64); fl.push(1022u64);
+    while di < depths.len() {
+      sets = List[List[u64]]();
+      var a0 = List[u64](); a0.push(*depths[di]); sets.push(a0);
+      diffAll("depth", &rw.code, &tb, &fl, &sets, true, &mut cnt);
+      di = di + 1usize;
+    }
+    expect(cnt.runs > 20u64, "the depth runs happened");
+    expectInt(i64.from(cnt.badEval + cnt.badNative), 0i64, "the depth limit: interpreter, evaluator and native agree");
+    match verify(&rw.code, &tb) {
+      case let Ok(v) {
+        var a0 = List[u64](); a0.push((1023.0).bits());
+        let ok = runInterp(&v, &tb, 0u32, a0.view(), 100000u64);
+        expect(!ok.trapped && f64.fromBits(*ok.slots[0usize]) == 1023.0, "1023 nested calls are allowed");
+        var a1 = List[u64](); a1.push((1024.0).bits());
+        let bad = runInterp(&v, &tb, 0u32, a1.view(), 100000u64);
+        expect(bad.trapped && bad.kind == 4u32, "1024 nested calls trap DepthOut");
+        expectStr(bad.message.view(), "call depth exceeded", "with its message");
+        let none = List[u64]();
+        let fv = runInterp(&v, &tb, 1u32, none.view(), 100000u64);
+        expect(fv.trapped && fv.kind == 4u32 && fv.offset == 0u32 && fv.unit == 1u32, "an endless recursion traps DepthOut at the call");
+        expectUInt(fv.fuel, 100000u64 - 1024u64, "having charged each call, the refused one too");
+      }
+      case let Err(ps) { expect(false, "the recursion verifies"); }
+    }
+  }
+
+  // ---- the fuzz seeds and their accepted mutants ----
+  var fz = newTally();
+  let s0 = rich();
+  let s1 = mixed();
+  let f1 = fuelsOne(2000u64);
+  var f2 = List[u64](); f2.push(2000u64); f2.push(9u64); f2.push(3u64);
+  diffAll("seed rich", &s0.code, &tb, &f2, &noArgs(), true, &mut fz);
+  diffAll("seed mixed", &s1.code, &tb, &f2, &noArgs(), true, &mut fz);
+  expect(fz.runs > 0u64, "the seeds ran");
+  var rng = Rng(0x9E3779B97F4A7C15u64);
+  var n = 0u32;
+  var accepted = 0u32;
+  while n < 20000u32 {
+    var b = if (n & 1u32) == 0u32 { encode(&s0.code) } else { encode(&s1.code) };
+    let edits = 1usize + rng.below(3usize);
+    var k = 0usize;
+    while k < edits { damageBytes(&mut b, &mut rng); k = k + 1usize; }
+    match decode(b.view()) {
+      case let Ok(c) {
+        match verifyEach(&c, &tb) { case let Ok(vv) { accepted = accepted + 1u32; } case let Err(ps) {} }
+        diffAll("byte mutant", &c, &tb, &f1, &noArgs(), true, &mut fz);
+      }
+      case let Err(p) {}
+    }
+    n = n + 1u32;
+  }
+  n = 0u32;
+  while n < 20000u32 {
+    var c = if (n & 1u32) == 0u32 { cloneCode(&s0.code) } else { cloneCode(&s1.code) };
+    let edits = 1usize + rng.below(3usize);
+    var k = 0usize;
+    while k < edits { damageCode(&mut c, &mut rng); k = k + 1usize; }
+    diffAll("code mutant", &c, &tb, &f1, &noArgs(), true, &mut fz);
+    n = n + 1u32;
+  }
+  print <- "fuzz: "; print <- fz.runs; print <- " unit runs ("; print <- fz.trapped; print <- " trapped), eval differs "; print <- fz.badEval;
+  print <- ", native differs "; print <- fz.badNative; print <- ", not compiled "; print <- fz.compileFail; print <- "\n";
+  expect(fz.runs > 50000u64, "the fuzz ran many units");
+  expectInt(i64.from(fz.badEval), 0i64, "fuzz: the lift on the evaluator matches the interpreter");
+  expectInt(i64.from(fz.badNative), 0i64, "fuzz: native code matches the interpreter");
+  expectInt(i64.from(fz.compileFail), 0i64, "fuzz: everything accepted was lifted, compiled and loaded");
+
+  // ---- the mutants: faults put into the lift, shown caught (evaluator only) ----
+  var m1 = newTally();
+  var m2 = newTally();
+  var m3 = newTally();
+  var ci = 0usize;
+  while ci < flows.len() {
+    let c = &flows[ci].code;
+    var sets = List[List[u64]]();
+    var xs = List[u64]();
+    xs.push((-3.0).bits()); xs.push((2.0).bits()); xs.push((9.0).bits()); xs.push((500.0).bits()); xs.push((10.0).bits());
+    var xi = 0usize;
+    while xi < xs.len() {
+      sets = List[List[u64]]();
+      var a0 = List[u64](); a0.push(*xs[xi]); sets.push(a0);
+      mutantDiff("mutant: no moves into result vregs", c, &tb, &sweep, &sets, LiftOpts(true, false, false), &mut m1);
+      mutantDiff("mutant: fuel on a forward branch", c, &tb, &sweep, &sets, LiftOpts(false, true, false), &mut m2);
+      mutantDiff("mutant: fsub swapped", c, &tb, &sweep, &sets, LiftOpts(false, false, true), &mut m3);
+      xi = xi + 1usize;
+    }
+    ci = ci + 1usize;
+  }
+  // the ops table catches the swapped FSUB too
+  {
+    let w = binary(OP_F64_SUB, TY_F64, TY_F64);
+    match verify(&w.code, &tb) {
+      case let Ok(v) {
+        let ev = compileNativeEvalWith(&v, LiftOpts(false, false, true));
+        var args = List[u64](); args.push((5.0).bits()); args.push((2.0).bits());
+        let a = runInterp(&v, &tb, 0u32, args.view(), 10u64);
+        let b = runNative(&ev, &v, &tb, 0u32, args.view(), 10u64);
+        expect(differ(&a, &b).len() > 0usize, "the ops table's f64.sub catches the swapped operands");
+      }
+      case let Err(ps) { expect(false, "binary verifies"); }
+    }
+  }
+  print <- "mutant, no moves into result vregs: "; print <- m1.badEval; print <- " of "; print <- m1.runs; print <- " runs differ\n";
+  print <- "mutant, fuel on a forward branch: "; print <- m2.badEval; print <- " of "; print <- m2.runs; print <- " runs differ\n";
+  print <- "mutant, fsub swapped: "; print <- m3.badEval; print <- " of "; print <- m3.runs; print <- " runs differ\n";
+  expect(m1.badEval > 0u64, "caught: no moves into a label's result vregs");
+  expect(m2.badEval > 0u64, "caught: fuel charged on a forward branch");
+  expect(m3.badEval > 0u64, "caught: the operands of f64.sub swapped");
+  done()
+}
+
+// A faulty lift run on the evaluator, tallied as differing from the interpreter (printing nothing)
+fn mutantDiff(label: &str, c: &Code, tb: &ImportTables[u8], fuels: &List[u64], argSets: &List[List[u64]], opts: LiftOpts, t: &mut Tally) {
+  match verifyEach(c, tb) {
+    case let Err(ps) { return; }
+    case let Ok(v) {
+      let ev = compileNativeEvalWith(&v, opts);
+      var u = 0usize;
+      while u < v.unitCount() {
+        var args = List[u64]();
+        if u < argSets.len() && argSets[u].len() == usize.from(v.paramSlots(u)) { args = argSets[u].clone(); }
+        else { var q = 0u32; while q < v.paramSlots(u) { args.push(0u64); q = q + 1u32; } }
+        var fi = 0usize;
+        while fi < fuels.len() {
+          let a = runInterp(&v, tb, u32.from(u), args.view(), *fuels[fi]);
+          let b = runNative(&ev, &v, tb, u32.from(u), args.view(), *fuels[fi]);
+          t.runs = t.runs + 1u64;
+          if differ(&a, &b).len() > 0usize { t.badEval = t.badEval + 1u64; }
+          fi = fi + 1usize;
+        }
+        u = u + 1usize;
+      }
+    }
+  }
+}

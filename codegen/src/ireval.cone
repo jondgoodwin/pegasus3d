@@ -1,0 +1,149 @@
+// An evaluator of the lower form (ir.cone): the oracle for the lift and for the x64 backend. It runs Funcs the way the
+// machine code does, vreg by vreg, and sets the same results: the trap kind it returns, ctx.trapSite, ctx.fuel (the
+// fuel left, after a trap too) and ctx.depth. It is slow and simple on purpose: each vreg is a slot of a List, a float
+// held as its bits. The float ops are the meanings ir.cone writes down (the ConeScript interpreter's).
+
+fn fbits(x: f64) u64 { x.bits() }
+fn fval(x: u64) f64 { f64.fromBits(x) }
+fn b2u(b: bool) u64 { if b { 1u64 } else { 0u64 } }
+
+fn irFmin(x: u64, y: u64) u64 {
+  let a = fval(x);
+  let b = fval(y);
+  if a != a || b != b { return fbits(a + b); }
+  if a < b { return x; }
+  if b < a { return y; }
+  x | y
+}
+
+fn irFmax(x: u64, y: u64) u64 {
+  let a = fval(x);
+  let b = fval(y);
+  if a != a || b != b { return fbits(a + b); }
+  if a > b { return x; }
+  if b > a { return y; }
+  x & y
+}
+
+fn irFcmp(cc: u8, x: u64, y: u64) u64 {
+  let a = fval(x);
+  let b = fval(y);
+  if cc == CC_EQ { return b2u(a == b); }
+  if cc == CC_NE { return b2u(a != b); }
+  if cc == CC_LT { return b2u(a < b); }
+  if cc == CC_LE { return b2u(a <= b); }
+  if cc == CC_GT { return b2u(a > b); }
+  b2u(a >= b)
+}
+
+fn irIcmp(cc: u8, x: u64, y: u64) u64 {
+  let a = x as i64;
+  let b = y as i64;
+  if cc == CC_EQ { return b2u(a == b); }
+  if cc == CC_NE { return b2u(a != b); }
+  if cc == CC_LT { return b2u(a < b); }
+  if cc == CC_LE { return b2u(a <= b); }
+  if cc == CC_GT { return b2u(a > b); }
+  b2u(a >= b)
+}
+
+// Runs function 'func' with 'area' as its incoming area. Gives 0 or a trap kind (TRAP_*); a trap's site goes in ctx.trapSite.
+fn evalOne(funcs: &Funcs, ctx: &mut NativeCtx, func: u32, area: &mut Array[u64],
+           gate: &fn @c (ctx: *u8, k: u64, slots: *u64) u64) u64 {
+  if usize.from(func) >= funcs.len() { return TRAP_BADFUNC; }
+  let f = &funcs[usize.from(func)];
+  var regs = List[u64]();
+  regs.resize(f.classes.len() + 1usize, 0u64);
+  var outs = List[u64]();
+  outs.resize(usize.from(f.outSlots) + 1usize, 0u64);
+  var b = 0usize;
+  var i = 0usize;
+  while true {
+    if b >= f.blocks.len() { return TRAP_BADFUNC; }
+    let blk = &f.blocks[b];
+    if i >= blk.insts.len() { return TRAP_BADFUNC; }
+    let n = &blk.insts[i];
+    i = i + 1usize;
+    let op = n.op;
+    let a = *regs[usize.from(n.a)];
+    let bb = *regs[usize.from(n.b)];
+    var r = 0u64;
+    var wr = true;
+    match op {
+      case IR_MOV { r = a; }
+      case IR_ICONST { r = n.k; }
+      case IR_FCONST { r = n.k; }
+      case IR_IADD { r = ((a as i64) + (bb as i64)) as u64; }
+      case IR_ISUB { r = ((a as i64) - (bb as i64)) as u64; }
+      case IR_IMUL { r = ((a as i64) * (bb as i64)) as u64; }
+      case IR_IAND { r = a & bb; }
+      case IR_IOR { r = a | bb; }
+      case IR_IXOR { r = a ^ bb; }
+      case IR_ICMP { r = irIcmp(n.cc, a, bb); }
+      case IR_FADD { r = fbits(fval(a) + fval(bb)); }
+      case IR_FSUB { r = fbits(fval(a) - fval(bb)); }
+      case IR_FMUL { r = fbits(fval(a) * fval(bb)); }
+      case IR_FDIV { r = fbits(fval(a) / fval(bb)); }
+      case IR_FSQRT { r = fbits(fval(a).sqrt()); }
+      case IR_FNEG { r = a ^ 0x8000000000000000u64; }
+      case IR_FABS { r = a & 0x7FFFFFFFFFFFFFFFu64; }
+      case IR_FMIN { r = irFmin(a, bb); }
+      case IR_FMAX { r = irFmax(a, bb); }
+      case IR_FCMP { r = irFcmp(n.cc, a, bb); }
+      case IR_I2F { r = fbits(f64.from(a as i64)); }
+      case IR_SELECT { r = if *regs[usize.from(n.c)] != 0u64 { a } else { bb }; }
+      case IR_ARG_GET { r = area[usize.from(n.k)]; }
+      case IR_OUT_GET { r = *outs[usize.from(n.k)]; }
+      case IR_ARG_SET { area[usize.from(n.k)] = a; wr = false; }
+      case IR_OUT_SET { outs.set(usize.from(n.k), a); wr = false; }
+      case IR_CALL {
+        wr = false;
+        if ctx.depth == 0u64 { ctx.trapSite = n.site; return TRAP_DEPTH; }
+        ctx.depth = ctx.depth - 1u64;
+        let cf = usize.from(n.k);
+        if cf >= funcs.len() { return TRAP_BADFUNC; }
+        let na = usize.from(funcs[cf].nArea);
+        var ca = List[u64]();
+        var q = 0usize;
+        while q < na { ca.push(if q < outs.len() { *outs[q] } else { 0u64 }); q = q + 1usize; }
+        let t = evalOne(funcs, ctx, u32.from(cf), ca.viewMut(), gate);
+        if t != TRAP_NONE { return t; }
+        q = 0usize;
+        while q < na && q < outs.len() { outs.set(q, *ca[q]); q = q + 1usize; }
+        ctx.depth = ctx.depth + 1u64;
+      }
+      case IR_GATE {
+        wr = false;
+        let ov = outs.viewMut();
+        let ok = gate(ctx as *u8, n.k, ov as *u64);
+        if ok == 0u64 { ctx.trapSite = n.site; return TRAP_GATE; }
+      }
+      case IR_FUEL {
+        wr = false;
+        if ctx.fuel < n.k { ctx.trapSite = n.site; return TRAP_FUEL; }
+        ctx.fuel = ctx.fuel - n.k;
+      }
+      case IR_JMP { wr = false; b = usize.from(n.t); i = 0usize; }
+      case IR_BR {
+        wr = false;
+        b = if a != 0u64 { usize.from(n.t) } else { usize.from(n.f) };
+        i = 0usize;
+      }
+      case IR_RET { return TRAP_NONE; }
+      case IR_TRAP { ctx.trapSite = n.site; return n.k; }
+      else { return TRAP_BADFUNC; }
+    }
+    if wr { regs.set(usize.from(n.dst), r); }
+  }
+  TRAP_NONE
+}
+
+// Runs function 'func' of 'funcs' as the machine code would, with 'area' holding its arguments on the way in and its
+// results on the way out. The context's fuel and depth are set by the caller, as for LoadedCode.call; the fuel left, and
+// the site of a trap, are in it afterwards. Gives 0 or a trap kind.
+pub fn evalFuncs(funcs: &Funcs, ctx: &mut NativeCtx, func: u32, area: &mut Array[u64],
+                 gate: &fn @c (ctx: *u8, k: u64, slots: *u64) u64) u64 {
+  if usize.from(func) >= funcs.len() { return TRAP_BADFUNC; }
+  if area.len < usize.from(funcs[usize.from(func)].nArea) { return TRAP_BADFUNC; }
+  evalOne(funcs, ctx, func, area, gate)
+}

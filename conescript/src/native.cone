@@ -1,0 +1,581 @@
+// The native executor: verified code lifted to codegen's lower form (ir.cone), compiled to machine code and run. The
+// twin of VerifiedCode and the interpreter: 'NativeRunner.run' takes the same arguments and gives the same results,
+// traps (kind, unit, offset and message) and fuel left as 'Interpreter.run' (design section 4).
+//
+//   lift(v)               one Func per unit of the verified code (a refused unit gets a Func that traps unreachable)
+//   compileNative(v)      lift, then codegen.compileX64 and codegen.load
+//   compileNativeEval(v)  lift only: the runner then runs the lower form on codegen's evaluator (ireval.cone). Kept as
+//                         the lift's test oracle: it is the interpreter's meaning, run on the same Funcs the machine sees.
+//
+// The lift keeps a compile-time stack of vregs in place of the interpreter's slots; tuples are n vregs; locals are
+// vregs (the non-parameter ones zeroed); a block's, loop's or if's result is a set of vregs that each branch to it
+// writes before it jumps.
+
+// What the lift can be told to do wrongly, so that tests can show the differential catches it (never set outside tests)
+pub struct LiftOpts {
+  pub noMoves: bool;        // do not move values into a label's result vregs
+  pub fuelForward: bool;    // charge fuel on a taken forward branch too
+  pub swapFsub: bool;       // f64.sub with its operands swapped
+}
+
+pub fn liftOptsNone() LiftOpts { LiftOpts(false, false, false) }
+
+struct LCtrl {
+  kind: u8;               // 0 function, 1 block, 2 loop, 3 if, 4 else
+  label: u32;             // where a br goes: a loop's header, else the end block
+  endBlk: u32;
+  elseBlk: u32;
+  res: List[u32];         // the result vregs
+  base: usize;            // the vreg stack's depth at entry
+}
+
+struct Lifter {
+  fb: FuncBuilder;
+  stack: List[u32];
+  ctrls: List[LCtrl];
+  unit: u64;
+  opts: LiftOpts;
+
+  fn site(self: &, at: usize) u64 { (self.unit << 32u64) | u64.from(at) }
+  fn push(self: &mut, cls: u8) u32 { let r = self.fb.vreg(cls); self.stack.push(r); r }
+  fn pop(self: &mut) u32 { self.stack.pop().unwrap() }
+  fn mov(self: &mut, dst: u32, src: u32) { self.fb.op3(IR_MOV, dst, src, NO_REG); }
+
+  // The top n vregs moved into the result vregs 'res' (not popped)
+  fn carry(self: &mut, res: &List[u32], n: usize) {
+    if self.opts.noMoves { return; }
+    var j = 0usize;
+    while j < n { let s = *self.stack[self.stack.len() - n + j]; self.mov(*res[j], s); j = j + 1usize; }
+  }
+
+  fn bin(self: &mut, op: u8, cls: u8) {
+    let b = self.pop();
+    let a = self.pop();
+    let d = self.push(cls);
+    self.fb.op3(op, d, a, b);
+  }
+  fn cmpf(self: &mut, op: u8, cc: u8) {
+    let b = self.pop();
+    let a = self.pop();
+    let d = self.push(CLASS_INT);
+    self.fb.cmp(op, cc, d, a, b);
+  }
+  fn una(self: &mut, op: u8, cls: u8) {
+    let a = self.pop();
+    let d = self.push(cls);
+    self.fb.op3(op, d, a, NO_REG);
+  }
+  fn iconst(self: &mut, k: u64) u32 {
+    let d = self.push(CLASS_INT);
+    self.fb.opImm(IR_ICONST, d, NO_REG, k);
+    d
+  }
+
+  // A branch to the construct 'd' out; 'cond' is NO_REG for br, else br_if's condition (already popped)
+  fn branch(self: &mut, d: usize, at: usize, cond: u32) {
+    let ci = self.ctrls.len() - 1usize - d;
+    let isLoop = self.ctrls[ci].kind == 2u8;
+    let target = self.ctrls[ci].label;
+    let res = self.ctrls[ci].res.clone();
+    let keep = if isLoop { 0usize } else { res.len() };
+    let fuel = isLoop || (self.opts.fuelForward && !isLoop);
+    if cond == NO_REG {
+      if fuel { let s = self.site(at); self.fb.sited(IR_FUEL, 1u64, s); }
+      self.carry(&res, keep);
+      self.fb.jmp(target);
+    } else if !fuel && (keep == 0usize || self.opts.noMoves) {
+      let cont = self.fb.block();
+      self.fb.br(cond, target, cont);
+      self.fb.at(cont);
+    } else {
+      let tb = self.fb.block();
+      let cont = self.fb.block();
+      self.fb.br(cond, tb, cont);
+      self.fb.at(tb);
+      if fuel { let s = self.site(at); self.fb.sited(IR_FUEL, 1u64, s); }
+      self.carry(&res, keep);
+      self.fb.jmp(target);
+      self.fb.at(cont);
+    }
+  }
+}
+
+// The class of each slot of a type
+fn typeClasses(types: &TypeTable, t: u32, out: &mut List[u8]) {
+  let d = &types.defs[usize.from(t)];
+  if d.kind == T_F64 { out.push(CLASS_F64); return; }
+  if d.kind == T_TUPLE {
+    var i = 0usize;
+    while i < d.items.len() { typeClasses(types, *d.items[i], out); i = i + 1usize; }
+    return;
+  }
+  if d.kind == T_SIG { return; }
+  out.push(CLASS_INT);
+}
+
+fn classesOf(types: &TypeTable, ts: &List[u32]) List[u8] {
+  var out = List[u8]();
+  var i = 0usize;
+  while i < ts.len() { typeClasses(types, *ts[i], &mut out); i = i + 1usize; }
+  out
+}
+
+// The Func a builder wrote, taken out of it
+fn takeFunc(fb: &mut FuncBuilder) Func {
+  var f = Func(String(), List[u8](), List[Block](), 0u32, 0u32, 0u64);
+  f <-> fb.func;
+  f
+}
+
+fn areaOf(v: &VerifiedCode, u: usize) u32 {
+  let p = v.units[u].paramSlots;
+  let r = v.units[u].resultSlots;
+  if p > r { p } else { r }
+}
+
+fn liftUnit(v: &VerifiedCode, u: usize, opts: LiftOpts) Func {
+  let cu = &v.code.units[u];
+  let name = cu.name.view();
+  let unitSite = u64.from(u) << 32u64;
+  if *v.refused[u] {
+    var fb = FuncBuilder.make(name, areaOf(v, u), unitSite);
+    fb.trap(TRAP_UNREACHABLE, unitSite);
+    return takeFunc(&mut fb);
+  }
+  let info = &v.units[u];
+  let types = &v.code.types;
+  let sig = &types.defs[usize.from(cu.sig)];
+  var lf = Lifter(FuncBuilder.make(name, areaOf(v, u), unitSite), List[u32](), List[LCtrl](), u64.from(u), opts);
+
+  // The locals: the parameters, then the unit's own; each slot a vreg
+  var localTy = List[u32]();
+  var i = 0usize;
+  while i < sig.items.len() { localTy.push(*sig.items[i]); i = i + 1usize; }
+  i = 0usize;
+  while i < cu.locals.len() { localTy.push(*cu.locals[i]); i = i + 1usize; }
+  let lcls = classesOf(types, &localTy);
+  var lv = List[u32]();
+  i = 0usize;
+  while i < lcls.len() {
+    let r = lf.fb.vreg(*lcls[i]);
+    lv.push(r);
+    if u32.from(i) < info.paramSlots { lf.fb.opImm(IR_ARG_GET, r, NO_REG, u64.from(i)); }
+    else if *lcls[i] == CLASS_F64 { lf.fb.opImm(IR_FCONST, r, NO_REG, 0u64); }
+    else { lf.fb.opImm(IR_ICONST, r, NO_REG, 0u64); }
+    i = i + 1usize;
+  }
+
+  // The function's own construct: its results are written to the area at its end block
+  var rcls = classesOf(types, &sig.results);
+  var res0 = List[u32]();
+  i = 0usize;
+  while i < rcls.len() { res0.push(lf.fb.vreg(*rcls[i])); i = i + 1usize; }
+  let endBlk0 = lf.fb.block();
+  lf.ctrls.push(LCtrl(0u8, endBlk0, endBlk0, NO_BLOCK, res0, 0usize));
+
+  let cb = cu.code.view();
+  var pos = 0usize;
+  var dead = false;
+  var deadDepth = 0usize;
+  var finished = false;
+  while pos < cb.len && !finished {
+    let at = pos;
+    let op = cb[pos];
+    pos = pos + 1usize;
+    // the immediates
+    var a1 = 0u64;
+    var a2 = 0u64;
+    var bad = false;
+    if op == OP_BLOCK || op == OP_LOOP || op == OP_IF || op == OP_BR || op == OP_BR_IF || op == OP_LOCAL_GET
+       || op == OP_LOCAL_SET || op == OP_LOCAL_TEE || op == OP_PART_CONST || op == OP_TUPLE_MAKE || op == OP_SELECT
+       || op == OP_DROP || op == OP_CALL || op == OP_IMPORT {
+      a1 = getU(cb, &mut pos, cb.len, &mut bad);
+    } else if op == OP_TUPLE_GET || op == OP_LIST_MAKE {
+      a1 = getU(cb, &mut pos, cb.len, &mut bad);
+      a2 = getU(cb, &mut pos, cb.len, &mut bad);
+    } else if op == OP_F64_CONST {
+      var j = 0u64;
+      while j < 8u64 { a1 = a1 | (u64.from(cb[pos + usize.from(j)]) << (j * 8u64)); j = j + 1u64; }
+      pos = pos + 8usize;
+    } else if op == OP_I64_CONST {
+      a1 = getS(cb, &mut pos, cb.len, &mut bad) as u64;
+    } else if op == OP_BOOL_CONST {
+      a1 = u64.from(cb[pos]);
+      pos = pos + 1usize;
+    }
+    let site = lf.site(at);
+
+    // Dead code (after br, return or unreachable, up to its construct's else or end) is skipped, with its nesting counted
+    if dead {
+      if op == OP_BLOCK || op == OP_LOOP || op == OP_IF { deadDepth = deadDepth + 1usize; continue; }
+      if op == OP_END && deadDepth > 0usize { deadDepth = deadDepth - 1usize; continue; }
+      if !(deadDepth == 0usize && (op == OP_END || op == OP_ELSE)) { continue; }
+    }
+
+    match op {
+      case OP_UNREACHABLE { lf.fb.trap(TRAP_UNREACHABLE, site); dead = true; }
+      case OP_BLOCK {
+        let bt = &types.defs[usize.from(a1)];
+        let rcl = classesOf(types, &bt.results);
+        var res = List[u32]();
+        var j = 0usize;
+        while j < rcl.len() { res.push(lf.fb.vreg(*rcl[j])); j = j + 1usize; }
+        let e = lf.fb.block();
+        lf.ctrls.push(LCtrl(1u8, e, e, NO_BLOCK, res, lf.stack.len()));
+      }
+      case OP_LOOP {
+        let bt = &types.defs[usize.from(a1)];
+        let rcl = classesOf(types, &bt.results);
+        var res = List[u32]();
+        var j = 0usize;
+        while j < rcl.len() { res.push(lf.fb.vreg(*rcl[j])); j = j + 1usize; }
+        let h = lf.fb.block();
+        let e = lf.fb.block();
+        lf.ctrls.push(LCtrl(2u8, h, e, NO_BLOCK, res, lf.stack.len()));
+        lf.fb.jmp(h);
+        lf.fb.at(h);
+      }
+      case OP_IF {
+        let c = lf.pop();
+        let bt = &types.defs[usize.from(a1)];
+        let rcl = classesOf(types, &bt.results);
+        var res = List[u32]();
+        var j = 0usize;
+        while j < rcl.len() { res.push(lf.fb.vreg(*rcl[j])); j = j + 1usize; }
+        let tb = lf.fb.block();
+        let eb = lf.fb.block();
+        let e = lf.fb.block();
+        lf.ctrls.push(LCtrl(3u8, e, e, eb, res, lf.stack.len()));
+        lf.fb.br(c, tb, eb);
+        lf.fb.at(tb);
+      }
+      case OP_ELSE {
+        let ci = lf.ctrls.len() - 1usize;
+        let res = lf.ctrls[ci].res.clone();
+        let e = lf.ctrls[ci].endBlk;
+        if !dead { lf.carry(&res, res.len()); lf.fb.jmp(e); }
+        lf.stack.truncate(lf.ctrls[ci].base);
+        lf.fb.at(lf.ctrls[ci].elseBlk);
+        (&mut lf.ctrls[ci]).kind = 4u8;
+        dead = false;
+      }
+      case OP_END {
+        let c = lf.ctrls.pop().unwrap();
+        if !dead { lf.carry(&c.res, c.res.len()); lf.fb.jmp(c.endBlk); }
+        if c.kind == 3u8 { lf.fb.at(c.elseBlk); lf.fb.jmp(c.endBlk); }
+        lf.fb.at(c.endBlk);
+        lf.stack.truncate(c.base);
+        dead = false;
+        if c.kind == 0u8 {
+          var j = 0usize;
+          while j < c.res.len() { lf.fb.opImm(IR_ARG_SET, NO_REG, *c.res[j], u64.from(j)); j = j + 1usize; }
+          lf.fb.ret();
+          finished = true;
+        } else {
+          var j = 0usize;
+          while j < c.res.len() { lf.stack.push(*c.res[j]); j = j + 1usize; }
+        }
+      }
+      case OP_BR { lf.branch(usize.from(a1), at, NO_REG); dead = true; }
+      case OP_BR_IF { let c = lf.pop(); lf.branch(usize.from(a1), at, c); }
+      case OP_RETURN { let top = lf.ctrls.len() - 1usize; lf.branch(top, at, NO_REG); dead = true; }
+      case OP_LOCAL_GET {
+        let l = usize.from(a1);
+        let o = usize.from(*info.localOff[l]);
+        let n = usize.from(*info.localLen[l]);
+        var j = 0usize;
+        while j < n { let d = lf.push(*lcls[o + j]); lf.mov(d, *lv[o + j]); j = j + 1usize; }
+      }
+      case OP_LOCAL_SET {
+        let l = usize.from(a1);
+        let o = usize.from(*info.localOff[l]);
+        let n = usize.from(*info.localLen[l]);
+        var j = 0usize;
+        while j < n { let s = *lf.stack[lf.stack.len() - n + j]; lf.mov(*lv[o + j], s); j = j + 1usize; }
+        lf.stack.truncate(lf.stack.len() - n);
+      }
+      case OP_LOCAL_TEE {
+        let l = usize.from(a1);
+        let o = usize.from(*info.localOff[l]);
+        let n = usize.from(*info.localLen[l]);
+        var j = 0usize;
+        while j < n { let s = *lf.stack[lf.stack.len() - n + j]; lf.mov(*lv[o + j], s); j = j + 1usize; }
+      }
+      case OP_F64_CONST { let d = lf.push(CLASS_F64); lf.fb.opImm(IR_FCONST, d, NO_REG, a1); }
+      case OP_I64_CONST { lf.iconst(a1); }
+      case OP_BOOL_CONST { lf.iconst(a1); }
+      case OP_PART_CONST { lf.iconst(a1); }
+      case OP_F64_ADD { lf.bin(IR_FADD, CLASS_F64); }
+      case OP_F64_SUB {
+        if lf.opts.swapFsub {
+          let b = lf.pop();
+          let a = lf.pop();
+          let d = lf.push(CLASS_F64);
+          lf.fb.op3(IR_FSUB, d, b, a);
+        } else { lf.bin(IR_FSUB, CLASS_F64); }
+      }
+      case OP_F64_MUL { lf.bin(IR_FMUL, CLASS_F64); }
+      case OP_F64_DIV { lf.bin(IR_FDIV, CLASS_F64); }
+      case OP_F64_MIN { lf.bin(IR_FMIN, CLASS_F64); }
+      case OP_F64_MAX { lf.bin(IR_FMAX, CLASS_F64); }
+      case OP_F64_NEG { lf.una(IR_FNEG, CLASS_F64); }
+      case OP_F64_ABS { lf.una(IR_FABS, CLASS_F64); }
+      case OP_F64_SQRT { lf.una(IR_FSQRT, CLASS_F64); }
+      case OP_F64_EQ { lf.cmpf(IR_FCMP, CC_EQ); }
+      case OP_F64_NE { lf.cmpf(IR_FCMP, CC_NE); }
+      case OP_F64_LT { lf.cmpf(IR_FCMP, CC_LT); }
+      case OP_F64_LE { lf.cmpf(IR_FCMP, CC_LE); }
+      case OP_F64_GT { lf.cmpf(IR_FCMP, CC_GT); }
+      case OP_F64_GE { lf.cmpf(IR_FCMP, CC_GE); }
+      case OP_BOOL_NOT {
+        let a = lf.pop();
+        let one = lf.fb.vreg(CLASS_INT);
+        lf.fb.opImm(IR_ICONST, one, NO_REG, 1u64);
+        let d = lf.push(CLASS_INT);
+        lf.fb.op3(IR_IXOR, d, a, one);
+      }
+      case OP_BOOL_AND { lf.bin(IR_IAND, CLASS_INT); }
+      case OP_BOOL_OR { lf.bin(IR_IOR, CLASS_INT); }
+      case OP_BOOL_FROM_F64 {
+        let a = lf.pop();
+        let z = lf.fb.vreg(CLASS_F64);
+        lf.fb.opImm(IR_FCONST, z, NO_REG, 0u64);
+        let d = lf.push(CLASS_INT);
+        lf.fb.cmp(IR_FCMP, CC_NE, d, a, z);
+      }
+      case OP_F64_FROM_BOOL { lf.una(IR_I2F, CLASS_F64); }
+      case OP_I64_ADD { lf.bin(IR_IADD, CLASS_INT); }
+      case OP_I64_SUB { lf.bin(IR_ISUB, CLASS_INT); }
+      case OP_I64_MUL { lf.bin(IR_IMUL, CLASS_INT); }
+      case OP_I64_EQ { lf.cmpf(IR_ICMP, CC_EQ); }
+      case OP_I64_NE { lf.cmpf(IR_ICMP, CC_NE); }
+      case OP_I64_LT { lf.cmpf(IR_ICMP, CC_LT); }
+      case OP_I64_FROM_PART { }
+      case OP_F64_FROM_I64 { lf.una(IR_I2F, CLASS_F64); }
+      case OP_TUPLE_MAKE { }
+      case OP_TUPLE_GET {
+        let t = usize.from(a1);
+        let f = usize.from(a2);
+        let d = &types.defs[t];
+        let total = usize.from(*v.slots[t]);
+        var skip = 0usize;
+        var k = 0usize;
+        while k < f { skip = skip + usize.from(*v.slots[usize.from(*d.items[k])]); k = k + 1usize; }
+        let n = usize.from(*v.slots[usize.from(*d.items[f])]);
+        let from = lf.stack.len() - total + skip;
+        var keep = List[u32]();
+        k = 0usize;
+        while k < n { keep.push(*lf.stack[from + k]); k = k + 1usize; }
+        lf.stack.truncate(lf.stack.len() - total);
+        k = 0usize;
+        while k < n { lf.stack.push(*keep[k]); k = k + 1usize; }
+      }
+      case OP_LIST_MAKE {
+        let t = usize.from(a1);
+        let n = usize.from(a2);
+        let e = usize.from(*v.slots[usize.from(types.defs[t].arg)]);
+        let total = n * e;
+        let base = lf.stack.len() - total;
+        var k = 0usize;
+        while k < total { lf.fb.opImm(IR_OUT_SET, NO_REG, *lf.stack[base + k], u64.from(k)); k = k + 1usize; }
+        lf.stack.truncate(base);
+        lf.fb.needOut(u32.from(if total > 1usize { total } else { 1usize }));
+        lf.fb.sited(IR_GATE, (1u64 << 32u64) | u64.from(total), site);
+        let d = lf.push(CLASS_INT);
+        lf.fb.opImm(IR_OUT_GET, d, NO_REG, 0u64);
+      }
+      case OP_SELECT {
+        let n = usize.from(*v.slots[usize.from(a1)]);
+        let c = lf.pop();
+        let base = lf.stack.len() - 2usize * n;
+        var outv = List[u32]();
+        var k = 0usize;
+        while k < n {
+          let x = *lf.stack[base + k];
+          let y = *lf.stack[base + n + k];
+          let d = lf.fb.vreg(*lf.fb.func.classes[usize.from(x)]);
+          lf.fb.select(d, c, x, y);
+          outv.push(d);
+          k = k + 1usize;
+        }
+        lf.stack.truncate(base);
+        k = 0usize;
+        while k < n { lf.stack.push(*outv[k]); k = k + 1usize; }
+      }
+      case OP_DROP {
+        let n = usize.from(*v.slots[usize.from(a1)]);
+        lf.stack.truncate(lf.stack.len() - n);
+      }
+      case OP_CALL {
+        let c = usize.from(a1);
+        let np = usize.from(v.units[c].paramSlots);
+        let nr = usize.from(v.units[c].resultSlots);
+        lf.fb.sited(IR_FUEL, 1u64, site);
+        let base = lf.stack.len() - np;
+        var k = 0usize;
+        while k < np { lf.fb.opImm(IR_OUT_SET, NO_REG, *lf.stack[base + k], u64.from(k)); k = k + 1usize; }
+        lf.stack.truncate(base);
+        lf.fb.needOut(areaOf(v, c));
+        lf.fb.sited(IR_CALL, u64.from(c), site);
+        let rc = classesOf(types, &types.defs[usize.from(v.code.units[c].sig)].results);
+        k = 0usize;
+        while k < nr { let d = lf.push(*rc[k]); lf.fb.opImm(IR_OUT_GET, d, NO_REG, u64.from(k)); k = k + 1usize; }
+      }
+      case OP_IMPORT {
+        let k = usize.from(a1);
+        let ri = &v.imports[k];
+        let np = usize.from(ri.paramSlots);
+        let nr = usize.from(ri.resultSlots);
+        lf.fb.sited(IR_FUEL, u64.from(ri.weight), site);
+        let base = lf.stack.len() - np;
+        var q = 0usize;
+        while q < np { lf.fb.opImm(IR_OUT_SET, NO_REG, *lf.stack[base + q], u64.from(q)); q = q + 1usize; }
+        lf.stack.truncate(base);
+        lf.fb.needOut(u32.from(if np > nr { np } else { nr }));
+        lf.fb.sited(IR_GATE, u64.from(k), site);
+        let rc = classesOf(types, &types.defs[usize.from(v.code.imports[k].sig)].results);
+        q = 0usize;
+        while q < nr { let d = lf.push(*rc[q]); lf.fb.opImm(IR_OUT_GET, d, NO_REG, u64.from(q)); q = q + 1usize; }
+      }
+      else { lf.fb.trap(TRAP_UNREACHABLE, site); dead = true; }
+    }
+  }
+  takeFunc(&mut lf.fb)
+}
+
+// One Func per unit
+pub fn liftWith(v: &VerifiedCode, opts: LiftOpts) Funcs {
+  var fs = List[Func]();
+  var u = 0usize;
+  while u < v.units.len() { fs.push(liftUnit(v, u, opts)); u = u + 1usize; }
+  fs
+}
+
+pub fn lift(v: &VerifiedCode) Funcs { liftWith(v, liftOptsNone()) }
+
+// ---------------------------------------------------------------------------------------------------------------
+// The runner
+
+// Verified code, lifted and (unless it is the evaluator's copy) compiled for this machine
+pub struct NativeCode {
+  funcs: Funcs;
+  loaded: List[LoadedCode];     // none when the code is run by the evaluator
+  pub native: bool;
+
+  pub fn isNative(self: &) bool { self.native }
+  pub fn funcCount(self: &) usize { self.funcs.len() }
+}
+
+// The lift's output run by the evaluator (the test oracle), with the lift's faults on when 'opts' says
+pub fn compileNativeEvalWith(v: &VerifiedCode, opts: LiftOpts) NativeCode {
+  NativeCode(liftWith(v, opts), List[LoadedCode](), false)
+}
+pub fn compileNativeEval(v: &VerifiedCode) NativeCode { compileNativeEvalWith(v, liftOptsNone()) }
+
+pub fn compileNative(v: &VerifiedCode) Result[NativeCode, String] {
+  let funcs = lift(v);
+  match compileX64(&funcs, hostAbi()) {
+    case let Err(e) { Err[NativeCode, String](e) }
+    case let Ok(mc) {
+      match load(&mc) {
+        case let Err(e) { Err[NativeCode, String](e) }
+        case let Ok(lc) {
+          var l = List[LoadedCode]();
+          l.push(lc);
+          Ok[NativeCode, String](NativeCode(funcs, l, true))
+        }
+      }
+    }
+  }
+}
+
+// What the gate finds through NativeCtx.user: the run's table and handles, erased, and the generic dispatcher
+struct GateCtx {
+  handles: *u8;
+  tables: *u8;
+  code: *u8;
+  dispatch: &fn(handles: *u8, tables: *u8, code: *u8, k: u64, slots: *u64) u64;
+}
+
+// list.make's runtime entry and every import: what the interpreter's OP_LIST_MAKE and OP_IMPORT do
+fn dispatch[V](hp: *u8, tp: *u8, cp: *u8, k: u64, slots: *u64) u64 {
+  let handles = hp as *HandleTable[V];
+  if (k >> 32u64) == 1u64 {
+    let total = usize.from(k & 0xFFFFFFFFu64);
+    var payload = List[u64]();
+    var i = 0usize;
+    while i < total { payload.push(*(slots + i)); i = i + 1usize; }
+    let hm = &mut *handles;
+    let h = hm.alloc(HANDLE_LIST, payload);
+    *slots = h;
+    return 1u64;
+  }
+  let tables = tp as *ImportTables[V];
+  let code = cp as *VerifiedCode;
+  let ri = &(*code).imports[usize.from(k)];
+  let n = usize.from(ri.paramSlots);
+  let r = usize.from(ri.resultSlots);
+  let w = if n > r { n } else { r };
+  let f = (*tables).entries[usize.from(ri.table)].call;
+  (*handles).fail = String();
+  var win = List[u64]();
+  var q = 0usize;
+  while q < w { win.push(*(slots + q)); q = q + 1usize; }
+  let ok = f(&mut *handles, win.viewMut());
+  q = 0usize;
+  while q < w { *(slots + q) = *win[q]; q = q + 1usize; }
+  if ok { 1u64 } else { 0u64 }
+}
+
+fn @c nativeGate(ctx: *u8, k: u64, slots: *u64) u64 {
+  let nc = ctx as *NativeCtx;
+  let g = (*nc).user as *GateCtx;
+  let d = (*g).dispatch;
+  d((*g).handles, (*g).tables, (*g).code, k, slots)
+}
+
+fn nativeTrap(kind: TrapKind, site: u64, message: String) Option[Trap] {
+  Some(Trap(kind, u32.from(site >> 32u64), u32.from(site & 0xFFFFFFFFu64), message))
+}
+
+// Runs verified code natively: the interpreter's twin, with the same 'run'
+pub struct NativeRunner {
+  fuel: u64;
+
+  pub fn make() NativeRunner { NativeRunner(0u64) }
+  pub fn setFuel(self: &mut, fuel: u64) { self.fuel = fuel; }
+  pub fn fuelLeft(self: &) u64 { self.fuel }
+
+  pub fn run[V](self: &mut, n: &NativeCode, v: &VerifiedCode, tables: &ImportTables[V], handles: &mut HandleTable[V],
+             unit: u32, args: &Array[u64], out: &mut List[u64]) Option[Trap] {
+    out.clear();
+    let cur = usize.from(unit);
+    if cur >= v.units.len() || cur >= n.funcs.len() || args.len != usize.from(v.units[cur].paramSlots) {
+      return nativeTrap(TrapKind.BadCall, u64.from(unit) << 32u64, String.from("a unit that does not exist, or the wrong number of arguments"));
+    }
+    if *v.refused[cur] { return nativeTrap(TrapKind.Refused, u64.from(unit) << 32u64, String.from("the unit's code was refused")); }
+    var area = List[u64]();
+    area.resize(usize.from(n.funcs[cur].nArea), 0u64);
+    var i = 0usize;
+    while i < args.len { area.set(i, args[i]); i = i + 1usize; }
+    var g = GateCtx(handles as *u8, tables as *u8, v as *u8, &dispatch[V]);
+    var ctx = NativeCtx(&nativeGate as usize, self.fuel, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, (&mut g as *u8) as usize);
+    var t = 0u64;
+    if n.native { t = n.loaded[0usize].call(&mut ctx, unit, area.viewMut()); }
+    else { t = evalFuncs(&n.funcs, &mut ctx, unit, area.viewMut(), &nativeGate); }
+    self.fuel = ctx.fuel;
+    if t == TRAP_NONE {
+      var j = 0usize;
+      while j < usize.from(v.units[cur].resultSlots) { out.push(*area[j]); j = j + 1usize; }
+      return None;
+    }
+    if t == TRAP_FUEL { return nativeTrap(TrapKind.FuelOut, ctx.trapSite, String.from("out of fuel")); }
+    if t == TRAP_GATE {
+      let m = if handles.fail.len() == 0usize { String.from("an import refused") } else { handles.fail.clone() };
+      return nativeTrap(TrapKind.ImportFailed, ctx.trapSite, m);
+    }
+    if t == TRAP_UNREACHABLE { return nativeTrap(TrapKind.Unreachable, ctx.trapSite, String.from("unreachable executed")); }
+    if t == TRAP_DEPTH { return nativeTrap(TrapKind.DepthOut, ctx.trapSite, String.from("call depth exceeded")); }
+    nativeTrap(TrapKind.BadCall, u64.from(unit) << 32u64, String.from("the native code refused the call"))
+  }
+}
