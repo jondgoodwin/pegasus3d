@@ -31,15 +31,12 @@
 //                              connected play's reconciliation, stale snapshots and wire)
 //
 // Connected play (plan step 8, W117; netplay.cone, the roles in simactor.cone):
-//   pegasus --serve PORT --world FILE [--steps N] [--loopback] [--until-empty] [--impair LOSS LATENCY JITTER]
-//                              a server Sim (no window, no Render) with a Loader that builds Sim's products only. It listens on
-//                              UDP PORT (0: the system chooses); --impair puts a lossy relay in front (loss per 1000, ms, ms) and
-//                              prints the relay's port; --until-empty ends it once a client has joined and none is left
+//   (the server is its own program, pegasusserver/ : pegasus-server --port PORT --world FILE [...]; `pegasus --serve` is retired)
 //   pegasus --join HOST:PORT --world FILE [--steps N] [--stand]
 //                              Player, a client Sim and Render; headless with --steps (scripted: walks 2 s, presses at box-a;
 //                              --stand stays still). The world file is the client's own, for its own Loader
 //
-// PEGASUS_MUTANT=pick-ignores-turn, manifest-skip-hash, stale-pose, mutate-snapshot, no-replay, stale-personal, stale-shared, delta-vs-sent, blend-lerp-matrix, walk-mouse-yaw, material-stale, material-no-show, material-missed, light-stale or look-missed runs a check's mutant, which
+// PEGASUS_MUTANT=pick-ignores-turn, manifest-skip-hash, stale-pose, mutate-snapshot, no-replay, stale-personal, stale-shared, delta-vs-sent, blend-lerp-matrix, walk-mouse-yaw, material-stale, material-no-show, material-missed, light-stale, look-missed, tint-deaf, step-never, step-twice or step-drop runs a check's mutant, which
 // the check must catch. The shell (this file) owns the window and the main
 // thread, as SDL wants: it pumps the devices and hands Player each sample.
 
@@ -59,6 +56,9 @@ import window use *;
 import actors;
 import aio use File, IoLimits;
 import actorhttp use HttpClient;
+import httpclient;
+import http use Version;
+import tls;
 import iobuf use IoBuf, Bytes;
 import iocore use Access, SocketAddr;
 import netmsg use NetEvent, EventHandler, Connection, Endpoint, NetConfig, LinkConfig, LossyRelay, eventHandler, mustListen, mustConnect, startLossyRelay;
@@ -68,36 +68,23 @@ import conescript use Understood, Val, Kind, Problem, Names, read, showProblems,
   Code, CodeWriter, CodeProblem, VerifiedCode, ImportTables, HandleTable, HANDLE_HOST, Interpreter, verify, verifyEach, lowerSim, entryUnit,
   ENTRY_DERIVE, ENTRY_HANDLER, ENTRY_MOVE_FLAG, NS_HOST, HOST_FIELD, HOST_OCCUPIED, HOST_SET_FIELD, HOST_START_ANIM, HOST_GLIDE,
   fieldSignature, occupiedSignature, setFieldSignature, startAnimSignature, glideSignature, P_FIELD, OP_IMPORT, OP_UNREACHABLE,
-  KeysInfo, P_ROTATION, P_OFFSET, NativeCode, NativeRunner, Trap, nativeIfAsked, stackHeadroom;
+  KeysInfo, P_ROTATION, P_OFFSET, P_TINT,
+  ENTRY_FIXED, ENTRY_STEP, HOST_PLACE, HOST_PLACE_FIELD, HOST_CHILD, HOST_SET_PLACE, HOST_SET_PLACE_FIELD, HOST_SET_FACING,
+  placeSignature, placeFieldSignature, childSignature, setPlaceSignature, setPlaceFieldSignature, setFacingSignature;
 import tweenstack use Anim, Animators;                                                 // the keys rules' animators (simanim.cone)
 import keyframetracks use Track, Clip, TK_QUAT, TK_VEC3, INTERP_LINEAR;
 import analyticdaylight use PreethamSky;
 import partbuild use srgbToLinear, vocabulary, PartProducts, PartBuilder, toolImports, plainProducts, MaterialRec, LIGHT_SUN;
 import sync use Arc, Channel, Sender, Receiver, LatestWriter, LatestReader, latestCell, CellRead;
 import time use Instant, Duration;
+import pegasuscore use *;                                                              // Sim, the Loader, connected play, the messages (pegasuscore/)
+import env;
+import format;
+import openxr;
 
 const STALL_AT_STEP = 300u64;
 const SHOT_W = 640u32;
 const SHOT_H = 360u32;
-
-fn argIs(a: *u8, b: &str) bool {
-  var i = 0usize;
-  while i < b.len() {
-    if *(a + i) != b[i] { return false; }
-    i = i + 1usize;
-  }
-  *(a + b.len()) == 0u8
-}
-
-fn argNumber(s: *u8) u64 {
-  var n = 0u64;
-  var i = 0usize;
-  while *(s + i) >= '0' && *(s + i) <= '9' {
-    n = n * 10u64 + u64.from(*(s + i) - '0');
-    i = i + 1usize;
-  }
-  n
-}
 
 // "STEP,XCM,ZCM": a whole number of steps, then the place to press straight down on, in whole centimetres (may be negative)
 fn parsePress(text: &str) Option[ScriptPress] {
@@ -170,26 +157,9 @@ fn parseShotView(text: &str) Option[ShotView] {
     Vec3(f32.from(*got[3usize]) * c, f32.from(*got[4usize]) * c, f32.from(*got[5usize]) * c), f32.from(*got[6usize])))
 }
 
-fn argString(s: *u8) String {
-  var out = String();
-  var i = 0usize;
-  while *(s + i) != 0u8 {
-    out.appendByte(*(s + i));
-    i = i + 1usize;
-  }
-  out
-}
-
-// The mutant asked for in PEGASUS_MUTANT is 'name'
-fn mutantIs(name: &str) bool {
-  let e = libc.getenv("PEGASUS_MUTANT");
-  if (e as usize) == 0usize { return false; }
-  argIs(e, name)
-}
-
 fn zeroFrame() DrawnFrame { DrawnFrame(0u64, 0u64, 0u64, Vec3(0., EYE_HEIGHT, 0.), 0., 0., 0u64) }
 
-fn noRay() HandRay { HandRay(false, Vec3(0., 0., 0.), Vec3(0., 0., -1.), 0u64, 0u64) }
+fn noRay() HandRay { HandRay(false, Vec3(0., 0., 0.), Vec3(0., 0., -1.), 0u64, 0u64, 0., 0.) }
 
 // ---- The driven check: the head pose is read last ----
 
@@ -227,7 +197,6 @@ fn main(argc: i32, argv: **u8) i32 {
   var parts40 = false;
   var worldFile = String();
   var keysFrom = String();
-  var serving = false;
   var netStart = NetStart.whole();
   var shotAfter = 0u64;
   var shotView = ShotView.none();
@@ -258,27 +227,17 @@ fn main(argc: i32, argv: **u8) i32 {
     } else if argIs(arg, "--keys-from") && a + 1 < argc {
       keysFrom = argString(*(argv + usize.from(a + 1)));       // a world fetched from a URL: a copy on this disk the key count is read from
       a = a + 1;
-    } else if argIs(arg, "--serve") && a + 1 < argc {
-      serving = true;
-      headless = true;
-      netStart.role = SIM_SERVER;
-      netStart.port = u32.from(argNumber(*(argv + usize.from(a + 1))));
-      a = a + 1;
+    } else if argIs(arg, "--world-from-server") {
+      netStart.fromServer = true;                              // a client with no copy: the server says where the world is, and this client fetches it from there
+    } else if argIs(arg, "--serve") {
+      print <- "pegasus: --serve is retired: the server is its own program, pegasus-server (pegasusserver\\build.ps1); run it as `pegasus-server --port PORT --world FILE`\n";
+      return 2;
     } else if argIs(arg, "--join") && a + 1 < argc {
       netStart.role = SIM_CLIENT;
       netStart.address = argString(*(argv + usize.from(a + 1)));
       a = a + 1;
-    } else if argIs(arg, "--loopback") {
-      netStart.loopback = true;
-    } else if argIs(arg, "--until-empty") {
-      netStart.untilEmpty = true;
     } else if argIs(arg, "--stand") {
       netStart.walks = false;
-    } else if argIs(arg, "--impair") && a + 3 < argc {
-      netStart.impairLoss = u32.from(argNumber(*(argv + usize.from(a + 1))));
-      netStart.impairLatency = u32.from(argNumber(*(argv + usize.from(a + 2))));
-      netStart.impairJitter = u32.from(argNumber(*(argv + usize.from(a + 3))));
-      a = a + 3;
     } else if argIs(arg, "--shot-after") && a + 1 < argc {
       shotAfter = argNumber(*(argv + usize.from(a + 1)));
       a = a + 1;
@@ -311,23 +270,23 @@ fn main(argc: i32, argv: **u8) i32 {
     each p in &presses { if p.step + 120u64 > shotAfter { shotAfter = p.step + 120u64; } }
   }
   if netStart.role == SIM_CLIENT && steps != 0u64 { headless = true; }
-  if xr && (headless || shot.len() > 0usize || serving) {
-    print <- "pegasus: --xr needs the window's mirror and a live run: not with --steps, --shot, --serve or a headless client\n";
+  if netStart.fromServer && (netStart.role != SIM_CLIENT || worldFile.len() > 0usize) {
+    print <- "pegasus: --world-from-server is for a client (--join) with no --world\n";
     return 2;
   }
+  if xr && (headless || shot.len() > 0usize) {
+    print <- "pegasus: --xr needs the window's mirror and a live run: not with --steps, --shot or a headless client\n";
+    return 2;
+  }
+  if xr { _ = xrLogStart(); }   // pegasus-xr.log beside the executable (xrhands.cone)
   if checksOnly {
     let poseOk = checkHeadPose(mutantIs("stale-pose"));
     let loaderOk = checkLoader(mutantIs("unused-off-by-one"));
-    let netOk = checkConnected();
-    let rulesOk = checkRules(mutantIs("trapped-writes"));
-    let pickOk = checkPick(mutantIs("pick-ignores-turn"));
-    let blendOk = checkBlend(mutantIs("blend-lerp-matrix"));
+    let sharedOk = checkShared();
     let steerOk = checkSteerYaw(mutantIs("walk-mouse-yaw"));
     let materialsOk = checkMaterials();
     let lightsOk = checkLights();
-    let cacheOk = checkMeshCache(cacheLax());
-    let fetchOk = checkWorldFetch(mutantIs("manifest-skip-hash"));
-    let ok = poseOk && loaderOk && cacheOk && fetchOk && rulesOk && pickOk && netOk && blendOk && steerOk && materialsOk && lightsOk;
+    let ok = poseOk && loaderOk && sharedOk && steerOk && materialsOk && lightsOk;
     finalAll();
     return if ok { 0 } else { 1 };
   }
@@ -386,7 +345,13 @@ fn main(argc: i32, argv: **u8) i32 {
     var wantKeys = MOCK_KEYS;
     var wantBuilds = u64.from(MOCK_KEYS);
     if parts40 { wantBuilds = 10u64; }
-    if worldFile.len() > 0usize {
+    // a client with no copy of the world has nothing to count its keys from: the checks of the count are not made
+    if netStart.fromServer { exactKeys = 0usize; wantKeys = 0usize; wantBuilds = 0u64; }
+    if worldFile.len() > 0usize && isUrl(worldFile.view()) && keysFrom.len() == 0usize {
+      // A world at an address: main does not fetch it (the Loader does), so it has nothing to count the keys from, and the checks of
+      // the count are not made (as for a client that took its world from the server). --keys-from names a copy to count from
+      exactKeys = 0usize; wantKeys = 0usize; wantBuilds = 0u64;
+    } else if worldFile.len() > 0usize {
       // A real world: how many keys it makes is what the run checks (the Loader reads it again, when it opens it)
       var keys = 0usize;
       let countFrom = if keysFrom.len() > 0usize { keysFrom.clone() } else { worldFile.clone() };
@@ -395,8 +360,7 @@ fn main(argc: i32, argv: **u8) i32 {
       {
         let img = readImage(worldFile.view(), text.view());
         keys = distinctKeys(&img);
-        // a server's Sim asks for no materials: it never draws
-        if !serving { keys = keys + distinctMaterials(&img); }
+        keys = keys + distinctMaterials(&img);
         // a client of a world that declares no avatars also builds the browser's own figure and its material
         if netStart.role == SIM_CLIENT && img.behaviour.avatar == NO_AVATAR { keys = keys + 2usize; }
       }
@@ -404,31 +368,31 @@ fn main(argc: i32, argv: **u8) i32 {
       if headless { exactKeys = keys; }
       wantBuilds = u64.from(keys);
     }
-    // A server has no Render to run: it is never started, and its Loader sends it nothing
-    if serving { exactKeys = 0usize; }
     let render = Render(handle, w, h, !headless, lookForRender, drawnW, shot.clone(), wantKeys, exactKeys, stoppedS,
       finishedS.clone(), stallMs, mutantIs("stale-pose"), shotAfter, xr, rayW, shotView);
     let audio = Audio();
-    let loader = Loader(render, loaderS, wantBuilds, parts40 && headless, mutantIs("unused-off-by-one"), serving);
+    let loader = Loader(render, loaderS, wantBuilds, parts40 && headless, mutantIs("unused-off-by-one"), false);
     let player = Player(render, loader, audio, moveW, lookW, drawnR, rayR, mutantIs("mutate-snapshot"), xr);
     var stallAt = 0u64;
     if stallMs > 0u64 { stallAt = STALL_AT_STEP; }
     var worldName = String.from("mock");
     if parts40 { worldName = String.from("parts40"); }
     if worldFile.len() > 0usize { worldName = worldFile.clone(); }
+    if netStart.fromServer { worldName = String(); }          // Player does not open a world: Sim does, once the server's Welcome names it
     let walks = netStart.walks;
     player.start(worldName,SimStart(moveR, lookR, drawnForSim, steps, stallAt, stallMs, finishedS, netStart));
-    if !serving { render.run(); }
+    render.run();
     var scriptS: Sender[bool];
     var scriptR: Receiver[bool];
     scriptS, scriptR = Channel[bool].make();
-    // the script runs headless, and in a shot told to press (a shot of a rook moved); a server has none
+    // the script runs headless, and in a shot told to press (a shot of a rook moved)
     let scripted = headless || presses.len() > 0usize;
-    if scripted && !serving { player.presses(presses, !headless); player.script(scriptS, walks); }
+    if scripted { player.presses(presses, !headless); player.script(scriptS, walks); }
 
     var renderEnded = false;      // --xr: Render's loop ended (no headset, or its session is over) before the window was closed
     if windowed {
       var held = 0u32;
+      var pad = Gamepad.make();
       while win.running {
         if xr {
           match stoppedR.tryRecv() {
@@ -437,7 +401,7 @@ fn main(argc: i32, argv: **u8) i32 {
           }
           if renderEnded { break; }
         }
-        var sample = InputSample(0u32, 0., 0., false);
+        var sample = InputSample(0u32, 0., 0., false, 0., 0.);
         var event = sdl.Event();
         while win.pollEvent(&mut event) {
           if event.type == sdl.EVENT_KEY_DOWN || event.type == sdl.EVENT_KEY_UP {
@@ -457,6 +421,12 @@ fn main(argc: i32, argv: **u8) i32 {
           }
         }
         sample.keys = held;
+        pad.poll();                 // (the gamepad, read whether or not the window has focus: gamepad.cone)
+        sample.walk = pad.forward;
+        sample.strafe = pad.strafe;
+        sample.dx = sample.dx + pad.lookX * PAD_LOOK_PIXELS;
+        sample.dy = sample.dy + pad.lookY * PAD_LOOK_PIXELS;
+        if pad.pressed { sample.pressed = true; }
         player.input(sample);
         sdl.Delay(2u32);
       }
@@ -467,7 +437,7 @@ fn main(argc: i32, argv: **u8) i32 {
       }
     }
     player.quit();
-    if !serving && !renderEnded {
+    if !renderEnded {
       match stoppedR.recv() {
         case let Some(clean) { if !clean { verdict = 1; } }
         case is None[bool] {}
@@ -478,7 +448,7 @@ fn main(argc: i32, argv: **u8) i32 {
         case let Some(clean) { if !clean { verdict = 1; } }
         case is None[bool] {}
       }
-      if !serving { _ = scriptR.recv(); }
+      _ = scriptR.recv();
     }   // the script's last sleep ends before the program does
   }
   finalAll();

@@ -1,0 +1,282 @@
+// The controllers in the headset (--xr): the log that shows the input path, and the hands and beams Render draws.
+//
+// THE LOG, pegasus-xr.log beside the executable, is made empty when an --xr run starts (`xrLogStart`), and its path is
+// left in PEGASUS_XR_LOG, so that any actor's `xrLog` adds a line to it (Render's frames, Sim's picks) without being
+// handed it. Each line starts with the time in seconds on time.Instant's clock (the clock of the "arrival:" lines). It
+// holds every session state change; while the session is FOCUSED, every tenth frame and every frame that differs, the
+// input's state (were the actions synced, each hand's interaction profile, active, aim pose valid, trigger); every
+// trigger pull (crossing XR_TRIGGER_UP upward) with its aim pose, its ray in the world and what the beam meets; and
+// Sim's pick for each press (the part's name, or nothing).
+//
+// THE HANDS are read with the head pose, last (`RenderCore.readHeadPose`), and drawn as the island browser draws them
+// (`browser\src\renderactor.cone`, drawHands): a box at each tracked controller's grip pose (blue the left, orange the
+// right), and from its aim pose a thin beam ahead, to the first part whose drawn bounds it meets (at most XR_BEAM_MAX),
+// with a dot where it meets one. Either trigger past XR_TRIGGER_DOWN presses along its own hand's ray, as the island's do.
+
+const XR_LOG_FILE = "pegasus-xr.log";
+const XR_LOG_EVERY = 10u64;                   // the focused input's state is logged every this many frames (and on change)
+const XR_BEAM_MAX: f32 = 10.;                 // a beam that meets nothing is drawn this long, in metres
+const XR_DEAD_ZONE: f32 = 0.2;                // the island's stick conventions (browser\src\xrhands.cone)
+const XR_SNAP_PUSH: f32 = 0.7;
+const XR_SNAP_REARM: f32 = 0.3;
+const XR_SNAP_ANGLE: f32 = 0.5235988;         // 30 degrees
+
+// A stick's axis with the dead zone taken out, -1 to 1
+fn deadZoned(v: f32) f32 {
+  if v > XR_DEAD_ZONE { return (v - XR_DEAD_ZONE) / (1. - XR_DEAD_ZONE); }
+  if v < 0. - XR_DEAD_ZONE { return (v + XR_DEAD_ZONE) / (1. - XR_DEAD_ZONE); }
+  0.
+}
+
+// Make the log empty beside the executable and leave its path for `xrLog`. False (with a message) when it can't be made
+pub fn xrLogStart() bool {
+  match process.currentExe() {
+    case let Ok(exe) {
+      let file = exe.parent().join(XR_LOG_FILE);
+      var head = String();
+      head <- format.fixed(f64.from(Instant.now().nanos()) * 1.0e-9, 3), " pegasus --xr: the log begins\n";
+      match fs.writeFile(&file, head.view()) {
+        case is Ok {
+          env.set(XR_LOG_VAR, file.view());
+          print <- "pegasus: the headset's log is "; printStr(file.view()); print <- "\n";
+          return true;
+        }
+        else {}
+      }
+      print <- "pegasus: the headset's log could not be made at "; printStr(file.view()); print <- "\n";
+    }
+    else { print <- "pegasus: the executable's folder is not known: no headset log\n"; }
+  }
+  false
+}
+
+// (`xrLog` and `vecText` are in pegasuscore\src\xrlog.cone: Sim writes to the log too)
+
+// OpenXR's name of a session state
+pub fn sessionStateName(state: i32) &str {
+  if state == 0i32 { return "(none yet)"; }
+  if state == openxr.SESSION_STATE_IDLE { return "IDLE"; }
+  if state == openxr.SESSION_STATE_READY { return "READY"; }
+  if state == openxr.SESSION_STATE_SYNCHRONIZED { return "SYNCHRONIZED"; }
+  if state == openxr.SESSION_STATE_VISIBLE { return "VISIBLE"; }
+  if state == openxr.SESSION_STATE_FOCUSED { return "FOCUSED"; }
+  if state == openxr.SESSION_STATE_STOPPING { return "STOPPING"; }
+  if state == openxr.SESSION_STATE_LOSS_PENDING { return "LOSS_PENDING"; }
+  if state == openxr.SESSION_STATE_EXITING { return "EXITING"; }
+  "UNKNOWN"
+}
+
+// Log the headset's session state when it is not 'last'; the state now
+pub fn logSessionState(headset: &Headset, last: i32) i32 {
+  let now = headset.sessionState;
+  if now != last {
+    var line = String();
+    line <- "session: ", sessionStateName(last), " -> ", sessionStateName(now);
+    xrLog(line.view());
+  }
+  now
+}
+
+// What the controllers are drawn with: a unit cube (scaled to a hand's box and a beam), a ball for the dot where a beam
+// meets a part, and their materials; made on the first frame that draws them
+struct XrArt {
+  made: bool;
+  cube: MeshHandle;
+  ball: MeshHandle;
+  leftBody: MaterialHandle;
+  rightBody: MaterialHandle;
+  beam: MaterialHandle;
+  dot: MaterialHandle;
+
+  fn empty() XrArt {
+    XrArt(false, MeshHandle.none(), MeshHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none(), MaterialHandle.none())
+  }
+
+  // (the island's colours and noon glows: the beam a pale yellow a little under the noon sky's 25 000 nits, the dot brighter)
+  fn make(renderer: &mut Renderer, device: &mut Device) XrArt {
+    let cube = Mesh.cube(1.);
+    let ball = Mesh.sphere(0.5, 12);
+    let left = Material.shiny(Color(0.15, 0.35, 0.9, 1.), 0.3, 24.).glowing(Color(0.15, 0.35, 0.9, 1.), 1500.);
+    let right = Material.shiny(Color(0.9, 0.4, 0.12, 1.), 0.3, 24.).glowing(Color(0.9, 0.4, 0.12, 1.), 1500.);
+    let beam = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 12000.);
+    let dot = Material.plain(Color(1., 0.9, 0.4, 1.)).glowing(Color(1., 0.9, 0.4, 1.), 40000.);
+    XrArt(true, renderer.addMesh(device, &cube), renderer.addMesh(device, &ball), renderer.addMaterial(device, &left),
+      renderer.addMaterial(device, &right), renderer.addMaterial(device, &beam), renderer.addMaterial(device, &dot))
+  }
+}
+
+// Render's controllers between frames (--xr): the hands as the head pose's read found them, each beam's length and what
+// it meets, the triggers' state, and what the log last said
+struct XrHands {
+  hands: Array[HeadsetHand, 2];    // left, right, in the headset's space, read with the head pose (readHeadPose)
+  beam: Array[f32, 2];             // how long each beam was drawn: to the part it meets, else XR_BEAM_MAX
+  hit: Array[u32, 2];           // the part each beam meets (NO_PART: none)
+  down: Array[bool, 2];            // the trigger is held past XR_TRIGGER_DOWN (a press, until it is back under XR_TRIGGER_UP)
+  half: Array[bool, 2];            // the trigger is past XR_TRIGGER_UP (the log's pull)
+  pulledNow: u32;                  // the hands (bit 0 left, 1 right) whose trigger crossed XR_TRIGGER_UP upward this frame
+  art: XrArt;
+  state: i32;                      // the session state last logged
+  said: String;                    // the input's state as last logged (a frame that differs is logged)
+  focusedFrames: u64;
+  walk: f32;                       // the left stick, past the dead zone: forward (+) and to the right (+), -1 to 1
+  strafe: f32;
+  snapArmed: bool;                 // the right stick has come back under XR_SNAP_REARM since its last turn
+  turn: f32;                       // the snap turns so far: how far the headset's space is turned about up in the world (radians)
+  shift: Vec3;                     // and where its origin moved to, from the person's feet, so that each turn was about the head
+
+  fn make() XrHands {
+    XrHands([HeadsetHand.none(), HeadsetHand.none()], [XR_BEAM_MAX, XR_BEAM_MAX], [NO_PART, NO_PART], [false, false], [false, false],
+      0u32, XrArt.empty(), 0i32, String(), 0u64, 0., 0., true, 0., Vec3(0., 0., 0.))
+  }
+
+  // The headset's space turned into the world's directions
+  fn turned(self: &) Quat { Quat.angleAxis(turn, Vec3(0., 1., 0.)) }
+
+  // The sticks of this frame's hands: the left one's walk, and a snap turn of the right one about 'head' (the head in the
+  // headset's space), as the island browser turns: past XR_SNAP_PUSH to a side, once, armed again under XR_SNAP_REARM
+  fn steer(self: &mut, head: Vec3) {
+    walk = 0.; strafe = 0.;
+    let l = hands[0usize];
+    if l.active {
+      walk = deadZoned(l.stickY);
+      strafe = deadZoned(l.stickX);
+    }
+    let r = hands[1usize];
+    let tx = if r.active { r.stickX } else { 0. };
+    if snapArmed && tx.abs() > XR_SNAP_PUSH {
+      snapArmed = false;
+      let before = self.turned();
+      turn = turn + (if tx > 0. { 0. - XR_SNAP_ANGLE } else { XR_SNAP_ANGLE });   // (to the right is a negative turn)
+      let flat = Vec3(head.x, 0., head.z);
+      shift = shift + before * flat - self.turned() * flat;
+      var line = String();
+      line <- "snap turn ", if tx > 0. { "right" } else { "left" }, ": the space is turned ", format.fixed(f64.from(turn * 57.29578), 0), " degrees";
+      xrLog(line.view());
+    } else if !snapArmed && tx.abs() < XR_SNAP_REARM {
+      snapArmed = true;
+    }
+  }
+
+  // Take this frame's hands (from readHeadPose): count the presses and note the pulls for the log. The hand whose trigger
+  // went down past XR_TRIGGER_DOWN this frame (the right first, if both did), else -1
+  fn take(self: &mut, read: &Array[HeadsetHand, 2]) i32 {
+    var pressed = -1i32;
+    pulledNow = 0u32;
+    var h = 1usize;
+    while true {
+      hands[h] = read[h];
+      let t = if hands[h].active { hands[h].trigger } else { 0. };
+      if !down[h] && t > XR_TRIGGER_DOWN { down[h] = true; if pressed < 0i32 { pressed = i32.from(h); } }
+      else if down[h] && t < XR_TRIGGER_UP { down[h] = false; }
+      if !half[h] && t > XR_TRIGGER_UP { half[h] = true; pulledNow = pulledNow | (1u32 << u32.from(h)); }
+      else if half[h] && t < XR_TRIGGER_UP { half[h] = false; }
+      if h == 0usize { break; }
+      h = h - 1usize;
+    }
+    pressed
+  }
+
+  // Each beam's length this frame: along the hand's aim ray from 'base' (where the headset's space stands in the world) to
+  // the nearest of the drawn parts' bounds it meets
+  fn aimBeams(self: &mut, base: Vec3, chosen: &List[Chosen], bounds: &Residents) {
+    var h = 0usize;
+    while h < 2usize {
+      beam[h] = XR_BEAM_MAX;
+      hit[h] = NO_PART;
+      let hd = hands[h];
+      if hd.active && hd.aim.valid {
+        let from = base + self.turned() * hd.aim.position;
+        let along = (self.turned() * hd.aim.forward()).normalize();
+        each c in chosen {
+          each r in bounds {
+            if r.key == c.meshKey {
+              let t = rayPlaced(from, along, &c.place, &r.bounds, false);
+              if t >= 0. && t < beam[h] { beam[h] = t; hit[h] = c.id; }
+            }
+          }
+        }
+      }
+      h = h + 1usize;
+    }
+  }
+
+  // Both controllers into the draw list, placed from 'base'
+  fn draw(self: &mut, list: &mut DrawList, renderer: &mut Renderer, device: &mut Device, base: Vec3) {
+    if !art.made { art = XrArt.make(renderer, device); }
+    let q = self.turned();
+    var h = 0usize;
+    while h < 2usize {
+      let hd = hands[h];
+      if hd.active {
+        if hd.grip.valid {
+          list.add(art.cube, if h == 0usize { art.leftBody } else { art.rightBody },
+            Mat4.fromTrs(base + q * hd.grip.position, q * hd.grip.orientation, Vec3(0.05, 0.05, 0.12)));
+          list.dontCastShadow();
+        }
+        if hd.aim.valid {
+          let from = base + q * hd.aim.position;
+          let along = (q * hd.aim.forward()).normalize();
+          let len = beam[h];
+          list.add(art.cube, art.beam, Mat4.fromTrs(from + along * (len * 0.5), q * hd.aim.orientation, Vec3(0.004, 0.004, len)));
+          list.dontCastShadow();
+          if hit[h] != NO_PART {
+            list.add(art.ball, art.dot, Mat4.fromTrs(from + along * len, Quat(0., 0., 0., 1.), Vec3(0.02, 0.02, 0.02)));
+            list.dontCastShadow();
+          }
+        }
+      }
+      h = h + 1usize;
+    }
+  }
+
+  // The log's lines for this frame: while the session is focused, the input's state every XR_LOG_EVERY frames and when
+  // it differs; and each pull, with its ray in the world from 'base' (the session's changes are logged as they are polled)
+  fn log(self: &mut, headset: &Headset, frame: u64, base: Vec3) {
+    if headset.sessionState != openxr.SESSION_STATE_FOCUSED { return; }
+    focusedFrames = focusedFrames + 1u64;
+    var now = String();
+    now <- "input ", if headset.hasInput() { "attached" } else { "NOT attached" }, ", sync failures ", headset.inputSyncFailures();
+    var h = 0usize;
+    while h < 2usize {
+      let hd = hands[h];
+      now <- "; ", if h == 0usize { "left " } else { "right " };
+      let profile = headset.profileName(h);
+      now <- if profile.len() == 0usize { "no profile" } else { profile };
+      now <- if hd.active { ", active" } else { ", inactive" }, ", aim ", if hd.aim.valid { "valid" } else { "not valid" },
+        ", grip ", if hd.grip.valid { "valid" } else { "not valid" }, ", trigger ", format.fixed(f64.from(hd.trigger), 1),
+        ", squeeze ", format.fixed(f64.from(hd.squeeze), 1), ", stick ", format.fixed(f64.from(hd.stickX), 1), " ",
+        format.fixed(f64.from(hd.stickY), 1), if hd.stickClick.down { " clicked" } else { "" },
+        if hd.primary.down { if h == 0usize { ", X" } else { ", A" } } else { "" },
+        if hd.secondary.down { if h == 0usize { ", Y" } else { ", B" } } else { "" }, if hd.menu.down { ", menu" } else { "" };
+      h = h + 1usize;
+    }
+    // (the synced count changes every frame: it is written, not compared)
+    if focusedFrames % XR_LOG_EVERY == 1u64 || now != said {
+      var line = String();
+      line <- "frame ", frame, ": ", now.view(), "; synced ", headset.inputSyncs();
+      xrLog(line.view());
+      said = now;
+    }
+    h = 0usize;
+    while h < 2usize {
+      if (pulledNow & (1u32 << u32.from(h))) != 0u32 {
+        let hd = hands[h];
+        var line = String();
+        line <- "pull: ", if h == 0usize { "left" } else { "right" }, " trigger ", format.fixed(f64.from(hd.trigger), 2), ", frame ", frame;
+        if hd.aim.valid {
+          let from = base + self.turned() * hd.aim.position;
+          line <- ", aim at ", vecText(hd.aim.position).view(), " in the room; ray from ", vecText(from).view(), " along ",
+            vecText((self.turned() * hd.aim.forward()).normalize()).view(), " in the world; the beam ";
+          if hit[h] == NO_PART { line <- "meets nothing"; }
+          else { line <- "meets part ", hit[h], " at ", format.fixed(f64.from(beam[h]), 2), " m"; }
+        } else {
+          line <- ", the aim pose NOT valid: no press";
+        }
+        line <- if down[h] { " (a press)" } else { " (not yet past the press threshold)" };
+        xrLog(line.view());
+      }
+      h = h + 1usize;
+    }
+  }
+}
+

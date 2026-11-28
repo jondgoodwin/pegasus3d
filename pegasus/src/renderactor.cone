@@ -22,7 +22,6 @@
 
 pub const UPLOAD_BUDGET_BYTES = 4194304usize;  // a frame's uploads (the island's 4 MB)
 pub const HEADLESS_HZ = 72u64;                 // a headless Render's frame rate (a Quest's display)
-pub const EYE_HEIGHT: f32 = 1.6;
 const XR_TRIGGER_DOWN: f32 = 0.75;             // the right trigger counts as pulled past this, and as let go below the next
 const XR_TRIGGER_UP: f32 = 0.5;
 const XR_FLOOR_MIN: f32 = 0.8;                 // a first head height above this means the room's floor is the space's origin
@@ -97,7 +96,17 @@ const SHOT_SETTLE_FRAMES = 119u32;    // drawn before a shot's own: it is the 12
 struct Resident {
   key: ContentKey;
   mesh: MeshHandle;
+  bounds: BoxShape;                 // the mesh's bounds in its own frame: what a controller's beam meets (--xr)
 }
+
+// A resident mesh, with its bounds
+fn residentOf(key: ContentKey, mesh: MeshHandle, cpu: &Mesh) Resident {
+  if cpu.positions.len() == 0usize { return noResident(key); }
+  let b = cpu.bounds();
+  Resident(key, mesh, BoxShape((b.max - b.min) * 0.5, (b.max + b.min) * 0.5))
+}
+
+fn noResident(key: ContentKey) Resident { Resident(key, MeshHandle.none(), BoxShape(Vec3(0., 0., 0.), Vec3(0., 0., 0.))) }
 alias Residents = List[Resident];
 alias Arrivals = List[MeshContent];
 
@@ -177,7 +186,7 @@ pub struct RenderCore {
   xrStand: f32;                     // --xr: added to the head's height when the space's origin is the head, not the floor
   xrBase: Vec3;                     // --xr: where the headset's space origin is in the world this frame
   xrPulls: u64;
-  xrPulled: bool;                   // the trigger is held past XR_TRIGGER_DOWN
+  xrHands: XrHands;                 // both controllers as the head pose's read found them, their beams and the log (xrhands.cone)
   xrStarted: bool;                  // the first located frame decided xrStand
   pub xrEnded: bool;                // the headset's session is over: the run ends
   pub view: ShotView;               // the shot's own camera, if --shot-view named one
@@ -191,7 +200,7 @@ pub struct RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), MaterialArrivals(),
       MaterialResidents(), List[ContentKey](), List[ContentKey](), mutantIs("material-stale"), mutantIs("material-no-show"), 0u64,
       NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
-      0u64, 0u64, 0u64, 0u64, 0usize, None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, false, false, false, ShotView.none(),
+      0u64, 0u64, 0u64, 0u64, 0usize, None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, XrHands.make(), false, false, ShotView.none(),
       (libc.getenv("PEGASUS_TRACE_DRAWN") as usize) != 0usize,
       List[f32](), List[f32](), List[PartLook](), mutantIs("light-stale"))
   }
@@ -269,7 +278,9 @@ pub struct RenderCore {
     match &mut gfx {
       case var &mut Some(g) {
         if !g.xr { return; }
-        if !g.headset.pollEvents() { xrEnded = true; return; }
+        let going = g.headset.pollEvents();
+        xrHands.state = logSessionState(&g.headset, xrHands.state);
+        if !going { xrEnded = true; return; }
         let f = g.headset.beginFrame(&mut g.device);
         if !f.active { sdl.Delay(5u32); }     // (a session between READY and STOPPING only: not a spin)
         xrFrame = Some[HeadsetFrame](f);
@@ -432,10 +443,15 @@ pub struct RenderCore {
     if stalePose { head.look = plan.earlyLook; seq = plan.earlySeq; }
     let look = head.look;
     let eye = plan.feet + head.offset;
-    xrBase = plan.feet + Vec3(0., xrStand, 0.);
+    xrBase = plan.feet + Vec3(0., xrStand, 0.) + xrHands.shift;
     self.noteArrival();
     self.draw(eye, look, "");
-    if head.hand.pulls != xrPulls || head.hand.valid {
+    var inHeadset = false;
+    match &gfx {
+      case let Some(g) { if g.xr { inHeadset = true; xrHands.log(&g.headset, frame, xrBase); } }
+      else {}
+    }
+    if head.hand.pulls != xrPulls || head.hand.valid || inHeadset {     // (in the headset every frame: the sticks walk)
       xrPulls = head.hand.pulls;
       match &mut rays {
         case var &mut Some(w) { var ray = head.hand; ray.atNs = plan.nowNs; ray.from = ray.from + plan.feet; w.put(&ray); }
@@ -454,7 +470,7 @@ pub struct RenderCore {
   // runtime gives): the midpoint of the eyes from the floor, and the way the
   // left eye faces. The right controller's ray is read with it.
   fn readHeadPose(self: &mut) HeadRead {
-    var head = HeadRead(looks.newest(), Vec3(0., EYE_HEIGHT, 0.), HandRay(false, Vec3(0., 0., 0.), Vec3(0., 0., -1.), xrPulls, 0u64));
+    var head = HeadRead(looks.newest(), Vec3(0., EYE_HEIGHT, 0.), HandRay(false, Vec3(0., 0., 0.), Vec3(0., 0., -1.), xrPulls, 0u64, 0., 0.));
     match &xrFrame {
       case let Some(f) {
         if f.active && f.shouldRender && f.located {
@@ -465,19 +481,26 @@ pub struct RenderCore {
             xrStarted = true;
             xrStand = if mid.y > XR_FLOOR_MIN { 0. } else { EYE_HEIGHT };
           }
-          head.offset = mid + Vec3(0., xrStand, 0.);
-          let fwd = Quat(a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w) * Vec3(0., 0., -1.);
+          // both controllers, read with the head (drawn from these; xrhands.cone). The trigger's presses are counted here,
+          // with hysteresis; the ray published is the hand that pressed (else the right, else the left). The right stick's
+          // snap turn turns the headset's space about the head before the head is placed
+          let pressed = xrHands.take(&f.hands);
+          xrHands.steer(mid);
+          let q = xrHands.turned();
+          head.offset = xrHands.shift + Vec3(0., xrStand, 0.) + q * mid;
+          let fwd = q * (Quat(a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w) * Vec3(0., 0., -1.));
           head.look = LookIntent(atan2(0. - fwd.x, 0. - fwd.z), asin(fwd.y));
-          // the right controller: its aim pose is the ray, and the trigger's pulls are counted here, with hysteresis
-          let h = f.hands[1usize];
+          head.hand.walk = xrHands.walk;
+          head.hand.strafe = xrHands.strafe;
+          if pressed >= 0i32 { head.hand.pulls = head.hand.pulls + 1u64; }
+          var which = 1usize;
+          if pressed >= 0i32 { which = usize.from(pressed); }
+          else if !(f.hands[1usize].active && f.hands[1usize].aim.valid) { which = 0usize; }
+          let h = f.hands[which];
           if h.active && h.aim.valid {
             head.hand.valid = true;
-            head.hand.from = Vec3(0., xrStand, 0.) + h.aim.position;    // (relative to the feet; made absolute below)
-            head.hand.along = h.aim.forward().normalize();
-          }
-          if h.active {
-            if !xrPulled && h.trigger > XR_TRIGGER_DOWN { xrPulled = true; head.hand.pulls = head.hand.pulls + 1u64; }
-            else if xrPulled && h.trigger < XR_TRIGGER_UP { xrPulled = false; }
+            head.hand.from = xrHands.shift + Vec3(0., xrStand, 0.) + q * h.aim.position;    // (relative to the feet; made absolute below)
+            head.hand.along = (q * h.aim.forward()).normalize();
           }
         }
       }
@@ -524,7 +547,7 @@ pub struct RenderCore {
         case var &mut Some(g) {
           // a part whose build left it out has no mesh: resident (so it is not asked for again), never drawn
           if c.mesh.positions.len() == 0usize {
-            residents.push(Resident(c.key, MeshHandle.none()));
+            residents.push(noResident(c.key));
             continue;
           }
           // shading needs normals: flat ones when the build gave none
@@ -532,9 +555,9 @@ pub struct RenderCore {
           mesh <-> c.mesh;
           if mesh.normals.len() != mesh.positions.len() { mesh.computeFlatNormals(); }
           let m = g.renderer.addMesh(&mut g.device, &mesh);
-          residents.push(Resident(c.key, m));
+          residents.push(residentOf(c.key, m, &mesh));
         }
-        else { residents.push(Resident(c.key, MeshHandle.none())); }
+        else { residents.push(noResident(c.key)); }
       }
     }
     uploadedBytes = uploadedBytes + spent;
@@ -702,7 +725,12 @@ pub struct RenderCore {
     each c in &chosen {
       if !c.mesh.isNone() { g.list.add(c.mesh, c.material, c.place); }
     }
-    if g.xr { self.drawEyes(g); return; }
+    if g.xr {
+      xrHands.aimBeams(xrBase, &chosen, &residents);
+      xrHands.draw(&mut g.list, &mut g.renderer, &mut g.device, xrBase);
+      self.drawEyes(g);
+      return;
+    }
     var w = g.width;
     var h = g.height;
     match &mut g.swapchain {
@@ -770,7 +798,9 @@ pub struct RenderCore {
               var camera = g.headset.eyeCamera(f, eye);
               camera.far = 500.;
               camera.background = Color(0.5, 0.7, 0.9, 1.);
-              camera.origin = camera.origin + self.xrBase;
+              let q = self.xrHands.turned();       // (the headset's space, snap turned, on the feet)
+              camera.origin = self.xrBase + q * camera.origin;
+              camera.orientation = q * camera.orientation;
               let started = Instant.now().nanos();
               g.headset.swapEye(eye, &mut g.target);
               var encoder = g.device.createCommandEncoder();
@@ -1046,8 +1076,11 @@ fn makeGfxXr(window: usize, w: u32, h: u32) Option[Gfx] {
   }
   // The session begins when the runtime says READY, a moment after it was made: the first frame waits for it
   var waited = 0;
+  var said = 0i32;
   while !headset.isRunning() && waited < 1000 {
-    if !headset.pollEvents() { break; }
+    let going = headset.pollEvents();
+    said = logSessionState(&headset, said);
+    if !going { break; }
     sdl.Delay(10u32);
     waited = waited + 1;
   }
@@ -1095,6 +1128,9 @@ actor Render {
     var failed = false;
     if xr {
       core.gfx = makeGfxXr(window, w, h);
+      var logged = 0i32;          // (the states makeGfxXr logged while it waited for the session)
+      match &core.gfx { case let Some(g) { logged = g.headset.sessionState; } else {} }
+      core.xrHands.state = logged;
       core.rays = Some[StateWriter[HandRay]](rays);
       failed = !core.isXr();
     } else if gpu { core.gfx = makeGfx(window, w, h); }
