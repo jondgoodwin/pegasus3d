@@ -49,6 +49,38 @@ struct Gfx {
   instance: Instance;
 }
 
+// One lamp as Render sets it, standing where its part stands this frame (the world's frame): the guide browser's LampInfo
+struct WorldLamp {
+  position: Vec3;
+  aim: Vec3;                        // a spot light's axis, unit length
+  color: Color;                     // linear
+  candela: f32;
+  reach: f32;                       // metres
+  source: f32;                      // the radius of the glowing source, metres
+  cone: f32;                        // a spot light's: where it ends, radians from the axis
+  softEdge: f32;                    // how far inside the cone it begins to fade
+  spot: bool;
+  shadows: bool;
+}
+alias WorldLamps = List[WorldLamp];
+
+// How the world is lit and its picture taken, put together each frame from the snapshot's parts that carry a light, the sky or
+// a camera (`RenderCore.sceneLook`)
+struct WorldLook {
+  hasSun: bool;                     // a part carries a sun: when none, Render keeps its own
+  hasSky: bool;                     // the root part carries the sky (made from the sun)
+  toSun: Vec3;                      // points to the sun
+  sunColor: Color;
+  lux: f32;
+  shadows: bool;
+  lamps: WorldLamps;
+  hasCamera: bool;                  // a camera part: it says the lens and the stops the exposure is opened by
+  lens: f32;                        // metres of focal length, 0 none
+  aperture: f32;                    // an f-number, 0 everything in focus
+  focus: f32;                       // the distance in focus, metres
+  exposure: f32;                    // stops the exposure is opened by
+}
+
 // A shot's own camera (--shot-view): where the eye is, what it looks at, and its vertical field of view in degrees
 pub struct ShotView {
   pub set: bool;
@@ -149,14 +181,74 @@ pub struct RenderCore {
   pub xrEnded: bool;                // the headset's session is over: the run ends
   pub view: ShotView;               // the shot's own camera, if --shot-view named one
   pub traceDrawn: bool;             // PEGASUS_TRACE_DRAWN is set: a part whose turn changes between snapshots prints its drawn turn
-  waitingLook: Option[WorldLook];   // the world's light and camera, arrived and not yet set on the GPU side
+  appliedLights: List[f32];         // the sun, sky and lamps as last set on the GPU side (`lightNumbers`; empty: none set yet)
+  appliedCamera: List[f32];         // the camera's settings as last set (`cameraNumbers`)
+  firstLooks: List[PartLook];       // by part id: the look first seen (only the light-stale mutant reads it)
+  mutantStaleLight: bool;           // the light check's mutant: a part keeps its first light for good
 
   pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), MaterialArrivals(),
       MaterialResidents(), List[ContentKey](), List[ContentKey](), mutantIs("material-stale"), mutantIs("material-no-show"), 0u64,
       NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
       0u64, 0u64, 0u64, 0u64, None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, false, false, false, ShotView.none(),
-      (libc.getenv("PEGASUS_TRACE_DRAWN") as usize) != 0usize, None[WorldLook])
+      (libc.getenv("PEGASUS_TRACE_DRAWN") as usize) != 0usize,
+      List[f32](), List[f32](), List[PartLook](), mutantIs("light-stale"))
+  }
+
+  // How the world is lit and its picture taken, as the newer snapshot's parts say: the sun, each lamp (where its part stands
+  // this frame), the sky of the root part, and the camera of the inhabited camera part (else the first camera part)
+  pub fn sceneLook(self: &mut) WorldLook {
+    var look = WorldLook(false, false, Vec3(0., 1., 0.), Color(1., 1., 1., 1.), 0., false, WorldLamps(), false, 0., 0., 2., 0.);
+    var cameraTaken = false;
+    let snap = newer;
+    match &snap {
+      case let Some(s) {
+        var k = 0usize;
+        each p in &s.parts {
+          if p.look.kind != LOOK_NONE {
+            var l = p.look;
+            let id = usize.from(p.id);
+            if mutantStaleLight {
+              while firstLooks.len() <= id { firstLooks.push(noLook()); }
+              if firstLooks[id].kind == LOOK_NONE { firstLooks.set(id, l); }
+              l = *firstLooks[id];
+            }
+            let place = self.blendedPlace(k, p);
+            if l.kind == LOOK_SUN {
+              look.hasSun = true;
+              look.toSun = l.dir;
+              look.sunColor = Color(l.color.x, l.color.y, l.color.z, 1.);
+              look.lux = l.amount;
+              look.shadows = l.shadows;
+            } else if l.kind == LOOK_POINT || l.kind == LOOK_SPOT {
+              var lamp = WorldLamp(place * Vec3(0., 0., 0.), Vec3(0., -1., 0.), Color(l.color.x, l.color.y, l.color.z, 1.), l.amount,
+                l.reach, l.source, 0., 0., false, l.shadows);
+              if l.kind == LOOK_SPOT {
+                lamp.spot = true;
+                lamp.aim = place.transformVector(l.dir).normalize();
+                lamp.cone = l.cone;
+                lamp.softEdge = l.softEdge;
+              }
+              look.lamps.push(lamp);
+            } else if l.kind == LOOK_SKY {
+              look.hasSky = true;
+            } else if l.kind == LOOK_CAMERA {
+              if !cameraTaken || p.id == camera {
+                cameraTaken = true;
+                look.hasCamera = true;
+                look.lens = l.lens;
+                look.aperture = l.aperture;
+                look.focus = l.focus;
+                look.exposure = l.exposure;
+              }
+            }
+          }
+          k = k + 1usize;
+        }
+      }
+      case is None[Published] {}
+    }
+    look
   }
 
   // Whether the picture is the headset's
@@ -211,6 +303,12 @@ pub struct RenderCore {
   }
 
   pub fn takeContent(self: &mut, c: MeshContent) { arrivals.push(c); }
+
+  // Player's word: the person inhabits 'avatar', seen from the camera part 'cam' (NO_PART: the first camera part)
+  pub fn inhabited(self: &mut, av: PartId, cam: PartId) {
+    avatar = av;
+    camera = cam;
+  }
 
   pub fn takeMaterial(self: &mut, c: MaterialContent) { materialArrivals.push(c); }
 
@@ -517,6 +615,7 @@ pub struct RenderCore {
       case let Some(s) {
         var k = 0usize;
         each p in &s.parts {
+          if p.key == NO_CONTENT { k = k + 1usize; continue; }       // a light, a camera or the sky: nothing to draw
           let place = self.blendedPlace(k, p);
           match self.materialToDraw(p) {
             case let Some(mat) {
@@ -545,8 +644,9 @@ pub struct RenderCore {
     let snap = newer;
     match &snap {
       case let Some(s) {
-        total = s.parts.len();
         each p in &s.parts {
+          if p.key == NO_CONTENT { continue; }
+          total = total + 1usize;
           match self.materialToDraw(p) {
             case is Some { if self.meshResident(p.key) { drawn = drawn + 1usize; } }
             case is None[MaterialResident] {}
@@ -578,12 +678,12 @@ pub struct RenderCore {
   }
 
   fn drawWith(self: &mut, g: &mut Gfx, eye: Vec3, look: LookIntent, shot: &str) {
-    var arrived = None[WorldLook];
-    arrived <-> waitingLook;
-    match &arrived {
-      case let Some(l) { applyLook(g, l); }
-      else {}
-    }
+    // the world's light and camera, as the snapshot's parts say: set on the GPU side when they changed
+    let scene = self.sceneLook();
+    let lights = lightNumbers(&scene);
+    if !sameNumbers(&lights, &appliedLights) { applyLights(g, &scene); appliedLights = lights; }
+    let cameraSet = cameraNumbers(&scene);
+    if !sameNumbers(&cameraSet, &appliedCamera) { applyCamera(g, &scene); appliedCamera = cameraSet; }
     var camera = Camera.make();
     camera.fov = radians(60.);
     camera.near = 0.1;
@@ -699,6 +799,16 @@ pub struct RenderCore {
     self.draw(plan.feet + head.offset, head.look, file);
   }
 
+  // The light as the newest snapshot has Render draw it (a connected client prints it, the server's Sim prints its own: the two are compared)
+  pub fn printLight(self: &mut) {
+    let l = self.sceneLook();
+    print <- "render: light: sun "; print <- l.hasSun; print <- " lux "; printF(l.lux); print <- " shadows "; print <- l.shadows;
+    print <- ", sky "; print <- l.hasSky; print <- ", "; print <- u64.from(l.lamps.len()); print <- " lamps";
+    var first: f32 = 0.;
+    if l.lamps.len() > 0usize { first = l.lamps[0usize].candela; }
+    print <- " (first "; printF(first); print <- " cd), camera "; print <- l.hasCamera; print <- " exposure "; printF(l.exposure); print <- "\n";
+  }
+
   pub fn printStats(self: &) {
     print <- "render: "; print <- frame; print <- " frames; longest gap between frames "; printF(msOf(longestGapNs));
     print <- " ms; longest drawing with no new snapshot "; printF(msOf(longestSameNs)); print <- " ms ("; print <- framesDuringSame;
@@ -764,16 +874,49 @@ fn hued(radiance: Vec3, r: f32, g: f32, b: f32) Color {
 }
 fn fmaxZero(x: f32) f32 { if x > 0. { x } else { 0. } }
 
-// A world's light and camera set as the guide browser sets them when its Sun, Lamp and Stand arrive (guidebrowser.cone): the sun
-// with its shadows, the sky from that sun, the world's lamps (the earlier world's gone), the exposure opened by the camera's
-// stops (on top of the exposure compensation makeFx measured) and the depth of field of its aperture. A world without a sun
-// keeps the sun and sky Render started with; one without an arrival keeps the image passes as they were.
-fn applyLook(g: &mut Gfx, l: &WorldLook) {
+// The numbers of the scene's light (sun, sky, lamps) and of its camera: what `applyLights` and `applyCamera` set from, so a
+// frame sets the GPU side only when they changed from the last
+fn lightNumbers(l: &WorldLook) List[f32] {
+  var n = List[f32]();
+  n.push(if l.hasSun { 1. } else { 0. }); n.push(if l.hasSky { 1. } else { 0. });
+  n.push(l.toSun.x); n.push(l.toSun.y); n.push(l.toSun.z);
+  n.push(l.sunColor.red); n.push(l.sunColor.green); n.push(l.sunColor.blue); n.push(l.lux); n.push(if l.shadows { 1. } else { 0. });
+  each lamp in &l.lamps {
+    n.push(lamp.position.x); n.push(lamp.position.y); n.push(lamp.position.z);
+    n.push(lamp.aim.x); n.push(lamp.aim.y); n.push(lamp.aim.z);
+    n.push(lamp.color.red); n.push(lamp.color.green); n.push(lamp.color.blue);
+    n.push(lamp.candela); n.push(lamp.reach); n.push(lamp.source); n.push(lamp.cone); n.push(lamp.softEdge);
+    n.push(if lamp.spot { 1. } else { 0. }); n.push(if lamp.shadows { 1. } else { 0. });
+  }
+  n
+}
+
+fn cameraNumbers(l: &WorldLook) List[f32] {
+  var n = List[f32]();
+  n.push(if l.hasCamera { 1. } else { 0. });
+  n.push(l.lens); n.push(l.aperture); n.push(l.focus); n.push(l.exposure);
+  n
+}
+
+fn sameNumbers(a: &List[f32], b: &List[f32]) bool {
+  if a.len() != b.len() { return false; }
+  var i = 0usize;
+  while i < a.len() {
+    if (*a[i]).bits() != (*b[i]).bits() { return false; }
+    i = i + 1usize;
+  }
+  true
+}
+
+// The world's light set as the guide browser sets it when its Sun and Lamp arrive (guidebrowser.cone): the sun with its
+// shadows, the sky from that sun (when the root part carries one), and the world's lamps (the earlier ones gone). A world
+// without a sun keeps the sun and sky Render started with.
+fn applyLights(g: &mut Gfx, l: &WorldLook) {
   if l.hasSun {
     let lux = l.lux;
     let sky = f32.from(SKY_NITS);
     g.renderer.setShadows(&mut g.device, &ShadowSettings(enabled: l.shadows));
-    g.renderer.setSky(&mut g.device, &clearDaySky(l.toSun.normalize(), lux));
+    if l.hasSky { g.renderer.setSky(&mut g.device, &clearDaySky(l.toSun.normalize(), lux)); }
     g.light = Light.directional(Vec3(0., 0., 0.) - l.toSun, Color(l.sunColor.red * lux, l.sunColor.green * lux, l.sunColor.blue * lux, 1.),
       Color(0.80 * sky, 0.88 * sky, 1.0 * sky, 1.));
   }
@@ -788,6 +931,12 @@ fn applyLook(g: &mut Gfx, l: &WorldLook) {
     g.renderer.lights.setSourceRadius(h, lamp.source);
     if lamp.shadows { g.renderer.lights.setCastsShadow(h, true); }
   }
+}
+
+// The camera part's settings set as the guide browser sets them when its Stand arrives: the exposure opened by the camera's
+// stops (on top of the exposure compensation makeFx measured) and the depth of field of its aperture. A world without a
+// camera part keeps the image passes as they were.
+fn applyCamera(g: &mut Gfx, l: &WorldLook) {
   if l.hasCamera {
     var settings = FxSettings.high();
     settings.exposure.compensationEv = MEASURED_COMPENSATION_EV + l.exposure;
@@ -984,16 +1133,12 @@ actor Render {
   // Loader -> Render (bulk move): a material key's material, uploaded under the budget
   pub async fn material(self, c: MaterialContent) { core.takeMaterial(c); }
 
-  // Loader -> Render (event): how the world is lit and its picture taken (its sun, lamps and camera), taken up at the next frame
-  pub async fn look(self, l: WorldLook) { core.waitingLook = Some[WorldLook](l); }
-
   // Loader -> Render (event): nothing uses 'key' now; its mesh or material may go
   pub async fn release(self, key: ContentKey) { core.releaseContent(key); }
 
   // Player -> Render (event): the person inhabits 'avatar', seen from 'camera'
   pub async fn inhabit(self, avatar: PartId, camera: PartId) {
-    core.avatar = avatar;
-    core.camera = camera;
+    core.inhabited(avatar, camera);
   }
 
   pub async fn stop(self) { running = false; }
@@ -1036,6 +1181,7 @@ actor Render {
     }
     core.endHeadset();
     core.printStats();
+    core.printLight();
     let ok = self.checks();
     var s = stopped.clone();
     s <- ok;

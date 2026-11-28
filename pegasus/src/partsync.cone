@@ -14,27 +14,40 @@
 // applied; the server never assumes a snapshot arrived (a lost one is simply sent again with the next).
 // The fields a part's state holds are named by the mask: the placement, and the material key (a look field: one key per
 // material slot, the first browser has one slot). A field has its own versions, so a change of the material alone is a
-// delta that says FIELD_MATERIAL and nothing else, and a client lacking only that gets only that.
+// delta that says FIELD_MATERIAL and nothing else, and a client lacking only that gets only that. The look (a light's, a
+// camera's settings, the sky: `PartLook`) is a third field in the same way, so a lamp turned on at dusk is one delta of
+// 73 bytes and a light at rest costs nothing after it was acknowledged.
 
 pub const FIELD_PLACEMENT = 1u32;
 pub const FIELD_MATERIAL = 2u32;
+pub const FIELD_LOOK = 4u32;
 pub const PLACEMENT_DELTA_BYTES = 69usize;   // a changed part on the wire, placement alone: its id (4), the mask (1) and 16 floats
 pub const MATERIAL_DELTA_BYTES = 13usize;    // material alone: id, mask and the key (8)
-pub const DELTA_BYTES = 77usize;             // the most one part takes: both fields
+pub const LOOK_DELTA_BYTES = 73usize;        // look alone: id, mask and LOOK_WORDS floats
+pub const DELTA_BYTES = 145usize;            // the most one part takes: all three fields
 
 // The wire size of one delta
 pub fn deltaBytes(d: &PartDelta) usize {
   var n = 5usize;
   if (d.mask & FIELD_PLACEMENT) != 0u32 { n = n + 64usize; }
   if (d.mask & FIELD_MATERIAL) != 0u32 { n = n + 8usize; }
+  if (d.mask & FIELD_LOOK) != 0u32 { n = n + 4usize * LOOK_WORDS; }
   n
+}
+
+// The wire size of one field of a delta, beyond its id and mask
+fn fieldBytes(field: u32) usize {
+  if field == FIELD_PLACEMENT { return 64usize; }
+  if field == FIELD_MATERIAL { return 8usize; }
+  4usize * LOOK_WORDS
 }
 
 pub struct PartDelta {
   pub id: u32;
-  pub mask: u32;                    // FIELD_...: which fields follow (the placement as a Mat4, the material key)
+  pub mask: u32;                    // FIELD_...: which fields follow (the placement as a Mat4, the material key, the look)
   pub placement: Mat4;
   pub material: ContentKey;
+  pub look: PartLook;
 }
 
 // One change of one field of one part, as the tracker numbers it
@@ -59,19 +72,37 @@ pub struct PartTracker {
   changed: List[u64];               // by part id: the version of its newest placement change (0: as defined)
   lastMat: List[ContentKey];        // by part id: the material key as last observed
   changedMat: List[u64];            // by part id: the version of its newest material change (0: as defined)
-  pub version: u64;                 // the newest version given
+  lastLook: List[PartLook];         // by part id: the look as last observed
+  changedLook: List[u64];           // by part id: the version of its newest look change (0: as defined)
+  pub version: u64;                // the newest version given
   sentThrough: u64;                 // the newest version a snapshot ended at (the mutant's wrong base)
   vsSent: bool;                     // the mutant (PEGASUS_MUTANT=delta-vs-sent): the base is what was last SENT, not what was acknowledged
   missMaterial: bool;               // the mutant (PEGASUS_MUTANT=material-missed): a change of material is never noticed
+  missLook: bool;                   // the mutant (PEGASUS_MUTANT=look-missed): a change of look is never noticed
 
-  pub fn make(defined: &List[Mat4], definedMat: &List[ContentKey], vsSent: bool) PartTracker {
+  pub fn make(defined: &List[Mat4], definedMat: &List[ContentKey], definedLook: &List[PartLook], vsSent: bool) PartTracker {
     var l = List[Mat4]();
     var c = List[u64]();
     var lm = List[ContentKey]();
     var cm = List[u64]();
+    var ll = List[PartLook]();
+    var cl = List[u64]();
     each m in &*defined { l.push(*m); c.push(0u64); }
     each k in &*definedMat { lm.push(*k); cm.push(0u64); }
-    PartTracker(l, c, lm, cm, 0u64, 0u64, vsSent, mutantIs("material-missed"))
+    each k in &*definedLook { ll.push(*k); cl.push(0u64); }
+    PartTracker(l, c, lm, cm, ll, cl, 0u64, 0u64, vsSent, mutantIs("material-missed"), mutantIs("look-missed"))
+  }
+
+  // Every part's look as the server holds it now, by id
+  pub fn looks(self: &) List[PartLook] { lastLook.clone() }
+
+  // Part 'id' has look 'look' this step: a change if it is not the one it had
+  pub fn observeLook(self: &mut, id: usize, look: &PartLook) bool {
+    if missLook || id >= lastLook.len() || sameLook(&lastLook[id], look) { return false; }
+    lastLook.set(id, *look);
+    version = version + 1u64;
+    changedLook.set(id, version);
+    true
   }
 
   // Every part's placement as the server holds it now, by id
@@ -85,6 +116,7 @@ pub struct PartTracker {
     var v = 0u64;
     if id < changed.len() { v = *changed[id]; }
     if id < changedMat.len() && *changedMat[id] > v { v = *changedMat[id]; }
+    if id < changedLook.len() && *changedLook[id] > v { v = *changedLook[id]; }
     v
   }
 
@@ -106,8 +138,8 @@ pub struct PartTracker {
     true
   }
 
-  // The parts changed after what the client acknowledged ('ack'), oldest change first, at most 'room' of them, with
-  // their placements now. Returns the version the snapshot is complete through: the client may acknowledge it
+  // The parts changed after what the client acknowledged ('ack'), oldest change first, as many as fit in 'room' bytes on the
+  // wire (`deltaBytes`), with their fields now. Returns the version the snapshot is complete through: the client may acknowledge it
   // 'full': the client asked for a fresh baseline (its hash differed), so every part changed since the definition is sent,
   // whatever it acknowledged and whatever was sent before
   pub fn select(self: &mut, ack: u64, room: usize, full: bool, out: &mut PartDeltas) u64 {
@@ -120,6 +152,7 @@ pub struct PartTracker {
     while i < changed.len() {
       if *changed[i] > base { order.push(FieldChange(i, FIELD_PLACEMENT, *changed[i])); }
       if *changedMat[i] > base { order.push(FieldChange(i, FIELD_MATERIAL, *changedMat[i])); }
+      if *changedLook[i] > base { order.push(FieldChange(i, FIELD_LOOK, *changedLook[i])); }
       i = i + 1usize;
     }
     var sorted = List[FieldChange]();
@@ -133,20 +166,22 @@ pub struct PartTracker {
     var parts = List[usize]();      // the parts of the deltas so far, by their place in 'out'
     var firstOut = out.len();
     var stop = false;
+    var used = 0usize;
     while taken < sorted.len() && !stop {
       let c = &sorted[taken];
       var slot = parts.len();
       var k = 0usize;
       while k < parts.len() { if *parts[k] == c.id { slot = k; } k = k + 1usize; }
-      if slot == parts.len() {
-        if parts.len() >= room { stop = true; } else {
+      var cost = fieldBytes(c.field);
+      if slot == parts.len() { cost = cost + 5usize; }
+      if used + cost > room { stop = true; } else {
+        if slot == parts.len() {
           parts.push(c.id);
-          out.push(PartDelta(u32.from(c.id), 0u32, *last[c.id], *lastMat[c.id]));
+          out.push(PartDelta(u32.from(c.id), 0u32, *last[c.id], *lastMat[c.id], *lastLook[c.id]));
         }
-      }
-      if !stop {
         let d = &mut out[firstOut + slot];
         d.mask = d.mask | c.field;
+        used = used + cost;
         taken = taken + 1usize;
       }
     }
@@ -172,6 +207,8 @@ struct PartTrack {
   cur: PartAt;
   material: ContentKey;             // the newest material key the server sent (valid when 'hasMaterial')
   hasMaterial: bool;
+  look: PartLook;                   // the newest look the server sent (valid when 'hasLook')
+  hasLook: bool;
 }
 
 pub struct PartView {
@@ -183,7 +220,7 @@ pub struct PartView {
     var t = List[PartTrack]();
     var i = 0usize;
     while i < count {
-      t.push(PartTrack(0u32, PartAt(0u64, Mat4.identity()), PartAt(0u64, Mat4.identity()), 0u64, false));
+      t.push(PartTrack(0u32, PartAt(0u64, Mat4.identity()), PartAt(0u64, Mat4.identity()), 0u64, false, noLook(), false));
       i = i + 1usize;
     }
     PartView(t, 0u64, 0u64)
@@ -205,6 +242,12 @@ pub struct PartView {
         t.hasMaterial = true;
         applied = applied + 1u64;
       }
+      if k < tracks.len() && (d.mask & FIELD_LOOK) != 0u32 {
+        let t = &mut tracks[k];
+        t.look = d.look;
+        t.hasLook = true;
+        applied = applied + 1u64;
+      }
     }
     if deltas.len() > 0usize && through > ack { ack = through; }
   }
@@ -216,6 +259,18 @@ pub struct PartView {
     var i = 0usize;
     while i < tracks.len() {
       if tracks[i].hasMaterial { out.push(tracks[i].material); } else { out.push(*defined[i]); }
+      i = i + 1usize;
+    }
+    out
+  }
+
+  // Every part's look as this client holds it, by id: the newest the server sent, or 'defined' (the looks its own copy of
+  // the description gave) if the server never changed it
+  pub fn looks(self: &, defined: &List[PartLook]) List[PartLook] {
+    var out = List[PartLook]();
+    var i = 0usize;
+    while i < tracks.len() {
+      if tracks[i].hasLook { out.push(tracks[i].look); } else { out.push(*defined[i]); }
       i = i + 1usize;
     }
     out
@@ -265,6 +320,8 @@ pub fn definitionSum(parts: &SimParts) u64 {
   each p in &*parts {
     h = (h ^ p.key) * 1099511628211u64;
     h = (h ^ p.definedMaterial) * 1099511628211u64;
+    let ws = lookWords(&p.definedLook);
+    each w in &ws { h = (h ^ u64.from((*w).bits())) * 1099511628211u64; }
     h = (h ^ u64.from(p.slot)) * 1099511628211u64;
   }
   h
@@ -272,8 +329,8 @@ pub fn definitionSum(parts: &SimParts) u64 {
 
 // THE SHARED-STATE HASH. One function, for the shared snapshot's check now and the determinism test later: FNV-1a over
 // the count, then every part's sixteen floats, each by its bits (`fnvWord`, meshhash.cone, the word hash the mesh hash
-// uses), then every part's material key as two words. Never 0 (0 means "no claim" on the wire)
-pub fn statesHash(states: &List[Mat4], materials: &List[ContentKey]) u64 {
+// uses), then every part's material key as two words, then every part's look words. Never 0 (0 means "no claim" on the wire)
+pub fn statesHash(states: &List[Mat4], materials: &List[ContentKey], looks: &List[PartLook]) u64 {
   var h = fnvWord(14695981039346656037u64, u32.from(states.len()));
   each m in &*states {
     var k = 0usize;
@@ -282,6 +339,10 @@ pub fn statesHash(states: &List[Mat4], materials: &List[ContentKey]) u64 {
   each key in &*materials {
     h = fnvWord(h, u32.from(*key & 0xFFFFFFFFu64));
     h = fnvWord(h, u32.from(*key >> 32u64));
+  }
+  each look in &*looks {
+    let ws = lookWords(look);
+    each w in &ws { h = fnvWord(h, (*w).bits()); }
   }
   if h == 0u64 { 1u64 } else { h }
 }
