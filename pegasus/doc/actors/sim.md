@@ -25,7 +25,11 @@ The server Sim is the same program in the server role, run by the server with a 
 
 **What the shared snapshot carries:** every part whose state the server has changed (placement, visibility, the fields that set its look), not only people, measured against the last snapshot this client acknowledged, so a part at rest costs nothing after the first. A part moved by a rule (a rook gliding) travels this way and is interpolated like a person. Events are kept for what happens once: creation, removal, a change of who steers, a world event. `[design choice]`
 
+**Each shared snapshot carries a hash of the shared part states it describes,** at the step it was taken. A client that finds its own state at that step hashes differently asks for a full snapshot (a fresh baseline) and reports the mismatch. Acknowledged deltas should never miss a change, so a mismatch is a defect made visible, and the same hash serves the determinism test. `[design choice]`
+
 **Other people's avatars** are parts of the world, like any other. A person admitted to a zone becomes a part of the avatar design the world declares, with a content key both sides' Loaders build from the world's description; Render draws it as a part. A person's own avatar from their store, lending its look where the world allows it, comes later ([Parts and imports](../design/parts-and-imports.md)). `[design choice]`
+
+**A world declares its avatars** as the manual's avatars page describes, on the world's root part (`worldAvatars(cast: [...])`, spelling not yet chosen), the first browser taking only a cast of one design. A world that declares none gets the browser's own plain avatar design, never one of the world's other parts. `[design choice]`
 
 **Rules on the client, at first: none.** Every rule runs on the server; a click goes to the server and its effect comes back in the snapshot. Rules that live on the client, for an effect shown at once, follow where the language says a rule lives. `[design choice]`
 
