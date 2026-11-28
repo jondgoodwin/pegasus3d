@@ -106,11 +106,18 @@ actor Sim {
   startedNs: i64;
   zoneKeys: usize;                  // a server: the distinct keys of its parts
   finishedSent: bool;
+  avatarKey: ContentKey;            // a client: the design other people are drawn as (`standIn`)
+  hasAvatar: bool;
+  shown: List[Mat4];                // a client: where each part is shown now, by id (its picks run against these)
+  wasGliding: bool;                 // a server: a glide was under way last step
+  landedNs: i64;                    // a server: when its last glide ended (steady clock)
+  movedFirstNs: i64;                // a client: when it first showed a part displaced from where it showed it before
+  movedLastNs: i64;                 // ... and the last time it did
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
       Actions(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
-      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false);
+      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, List[Mat4](), false, 0i64, 0i64, 0i64);
   }
 
   // Loader -> Sim (move): the world image. Each part is given its id now,
@@ -120,16 +127,16 @@ actor Sim {
     worldName = img.name.clone();
     person.feet = img.startFeet;
     haveImage = true;
-    if role == SIM_CLIENT {
-      // The server declares the parts; this image only taught the Loader its keys
-      print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(img.parts.len());
-      print <- " parts (the server's declarations are awaited)\n";
-      self.maybeHello();
-      return;
-    }
     var behaviour = Behaviour.none();
     behaviour <-> img.behaviour;
-    rules = SimRules.make(behaviour, false);
+    if role == SIM_CLIENT {
+      // A client builds the world from its own copy of the description, as any world arrives: nothing is declared over
+      // the wire. It runs no rules, so the world's rules are not made, only read for the stand-in avatar
+      avatarKey = standIn(&behaviour, &img.parts);
+      hasAvatar = avatarKey != 0u64;
+    } else {
+      rules = SimRules.make(behaviour, false);
+    }
     var keys = List[ContentKey]();
     each d in &img.parts {
       let id = u32.from(parts.len());
@@ -139,6 +146,19 @@ actor Sim {
       if !keys.contains(&d.key) { keys.push(d.key); }
     }
     zoneKeys = keys.len();
+    if role == SIM_SERVER {
+      var defined = List[Mat4]();
+      each p in &parts { defined.push(self.placeOf(p)); }
+      net.tracker = PartTracker.make(&defined, mutantIs("delta-vs-sent"));
+    }
+    if role == SIM_CLIENT {
+      net.view = PartView.make(parts.len());
+      print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(parts.len());
+      print <- " parts from its own copy of the description; other people are drawn as ";
+      if hasAvatar { print <- "the design of the first part a rule moves, scaled up\n"; } else { print <- "nothing (no rule of the world moves a part)\n"; }
+      self.maybeHello();
+      return;
+    }
     print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(parts.len());
     print <- " parts, "; print <- u64.from(img.units.len()); print <- " world file(s), "; print <- u64.from(rules.moveCount());
     print <- " pick-and-place rules, "; print <- u64.from(rules.keysRuleCount());
@@ -194,7 +214,7 @@ actor Sim {
     step = step + 1u64;
     if role == SIM_SERVER { self.serveJoins(); }
     if role == SIM_CLIENT { self.admitClient(); } else { self.admit(); }
-    if role == SIM_CLIENT { self.moveClient(); }
+    if role == SIM_CLIENT { self.moveClient(); self.mergeParts(); }
     else if role == SIM_SERVER { self.moveServer(); }
     else { self.move(); }
     self.sense();
@@ -360,8 +380,10 @@ actor Sim {
     let k = net.row(id);
     if k == NO_ROW || u32.from(stream) != STREAM_INPUT || !net.clients[k].declared { return; }
     var got = BodySamples();
-    if !decodeInput(data, &mut got) { net.malformed = net.malformed + 1u64; return; }
+    var ack = 0u64;
+    if !decodeInput(data, &mut got, &mut ack) { net.malformed = net.malformed + 1u64; return; }
     net.clients[k].take(&got);
+    if ack > net.clients[k].partsAck { net.clients[k].partsAck = ack; }
   }
 
   fn refuse(self: &mut, k: usize, why: &str) {
@@ -393,16 +415,14 @@ actor Sim {
   fn admitPerson(self: &mut, i: usize) {
     let r = &mut net.clients[i];
     r.person = PersonState(person.feet, 0.);
-    sendReliable(&mut r.conn, &encodeWelcome(r.id, worldName.view(), person.feet, parts.len(), heldShapes.len()));
-    var msgs = encodeParts(&parts);
-    each m in &msgs { sendReliable(&mut r.conn, m); }
+    sendReliable(&mut r.conn, &encodeWelcome(r.id, worldName.view(), person.feet, parts.len(), definitionSum(&parts), heldShapes.len()));
     var sh = encodeShapes(&heldShapes);
     each m in &sh { sendReliable(&mut r.conn, m); }
     sendReliable(&mut r.conn, &encodeJoined());
     r.declared = true;
     net.joins = net.joins + 1u64;
     net.everJoined = true;
-    print <- "sim: person "; print <- r.id; print <- " joined at step "; print <- step; print <- ": "; print <- u64.from(msgs.len() + sh.len() + 2usize);
+    print <- "sim: person "; print <- r.id; print <- " joined at step "; print <- step; print <- ": "; print <- u64.from(sh.len() + 2usize);
     print <- " declaration messages\n";
   }
 
@@ -416,12 +436,29 @@ actor Sim {
   // SNAPSHOT_EVERY steps: 30 a second)
   fn sendSnapshots(self: &mut) {
     if step % SNAPSHOT_EVERY != 0u64 || net.clients.len() == 0usize { return; }
-    let shared = bytesOfList(&encodeShared(step, &net.clients));
-    net.sharedBytes = net.sharedBytes + u64.from(shared.len());
-    if shared.len() > net.largestShared { net.largestShared = shared.len(); }
+    let people = personsOf(&net.clients);
+    let head = encodePeople(step, &people);        // the people half is the same for all, encoded once
+    var first = true;
     each r in &mut net.clients {
       if r.declared {
-        sendLatest(&mut r.conn, STREAM_SHARED, shared.clone());
+        // the parts half is this client's: what changed after the last change it acknowledged
+        var deltas = PartDeltas();
+        let through = net.tracker.select(r.partsAck, partRoom(people.len()), &mut deltas);
+        var full = List[u8]();
+        full.appendSlice(head.view());
+        full.appendList(encodePartTail(through, &deltas));
+        let shared = bytesOfList(&full);
+        net.sharedBytes = net.sharedBytes + u64.from(shared.len());
+        net.partEntries = net.partEntries + u64.from(deltas.len());
+        r.lastShared = shared.len();
+        if shared.len() > net.largestShared { net.largestShared = shared.len(); }
+        if first && shared.len() != net.sizeShown {
+          net.sizeShown = shared.len();
+          print <- "net server: step "; print <- step; print <- ": shared snapshot to person "; print <- r.id; print <- " is "; print <- u64.from(shared.len());
+          print <- " bytes ("; print <- u64.from(deltas.len()); print <- " changed parts, acknowledged through version "; print <- r.partsAck; print <- ")\n";
+        }
+        first = false;
+        sendLatest(&mut r.conn, STREAM_SHARED, shared);
         net.sharedSent = net.sharedSent + 1u64;
         let personal = bytesOfList(&encodePersonal(step, r));
         if personal.len() > net.largestPersonal { net.largestPersonal = personal.len(); }
@@ -499,15 +536,13 @@ actor Sim {
       net.worldName = says.world.clone();
       net.startFeet = says.feet;
       net.wantParts = says.parts;
+      net.wantSum = says.sum;
       net.wantKeys = says.keys;
       net.welcomed = true;
-    } else if says.tag == S_PARTS {
-      if says.firstId != u32.from(net.declared.len()) { net.malformed = net.malformed + 1u64; return; }
-      each d in &says.declared { net.declared.push(PartDecl(d.name.clone(), d.key, d.placement, d.slot)); }
     } else if says.tag == S_SHAPES {
       each s in &says.shapes { net.shapesGot.push(*s); }
     } else if says.tag == S_JOINED {
-      if u32.from(net.declared.len()) == net.wantParts && u32.from(net.shapesGot.len()) == net.wantKeys {
+      if u32.from(net.shapesGot.len()) == net.wantKeys {
         net.joinedMsg = true;
       } else {
         net.malformed = net.malformed + 1u64;
@@ -520,10 +555,16 @@ actor Sim {
     if u32.from(stream) == STREAM_SHARED {
       var s = 0u64;
       var all = OtherPersons();
-      if !decodeShared(data, &mut s, &mut all) { net.malformed = net.malformed + 1u64; return; }
+      var through = 0u64;
+      var deltas = PartDeltas();
+      if !decodeShared(data, &mut s, &mut all, &mut through, &mut deltas) { net.malformed = net.malformed + 1u64; return; }
       var others = OtherPersons();
       each p in &all { if p.id != net.myId { others.push(*p); } }
-      _ = net.interp.add(s, Instant.now().nanos(), others);
+      // an older snapshot than one held is dropped whole: its parts too, and its acknowledgement is never given
+      if net.interp.add(s, Instant.now().nanos(), others) {
+        net.view.apply(s, through, &deltas);
+        if deltas.len() > 0usize { net.partsGot = net.partsGot + 1u64; }
+      }
       net.sharedGot = net.sharedGot + 1u64;
     } else if u32.from(stream) == STREAM_PERSONAL {
       var p = PersonalSnap(0u64, 0u32, Vec3(0., 0., 0.), 0.);
@@ -538,19 +579,23 @@ actor Sim {
   fn clientReady(self: &mut) bool {
     if declaredFromServer { return true; }
     if net.joinedMsg && haveImage {
-      person.feet = net.startFeet;
-      each d in &net.declared {
-        let id = u32.from(parts.len());
-        parts.push(SimPart(id, d.name.clone(), d.key, d.placement, d.slot, true));
-        loader.build(ContentRequest(d.key, id, (d.placement.translation() - person.feet).length()));
+      // the server's definition must be the one this client built from: the same parts, by count and by their keys
+      if u32.from(parts.len()) != net.wantParts || definitionSum(&parts) != net.wantSum {
+        net.phase = PHASE_REFUSED;
+        net.refusedWhy = String.from("the world's description differs from the server's");
+        print <- "sim: the world's description differs from the server's ("; print <- u64.from(parts.len()); print <- " parts here, ";
+        print <- u64.from(net.wantParts); print <- " there)\n";
+        self.endRun();
+        return false;
       }
+      person.feet = net.startFeet;
       var gotShapes = ShapeTable();
       gotShapes <-> net.shapesGot;
       each s in &gotShapes { heldShapes.push(*s); }
       net.predictor = Predictor.make(net.startFeet, mutantIs("no-replay"), mutantIs("stale-personal"));
       net.phase = PHASE_JOINED;
       declaredFromServer = true;
-      print <- "sim: joined as person "; print <- net.myId; print <- ": "; print <- u64.from(parts.len()); print <- " parts and ";
+      print <- "sim: joined as person "; print <- net.myId; print <- ": "; print <- u64.from(parts.len()); print <- " parts from its own copy of the world and ";
       print <- u64.from(heldShapes.len()); print <- " shapes from the server\n";
       return true;
     }
@@ -603,7 +648,7 @@ actor Sim {
       walkSteps = walkSteps + 1u64;
       walked = walked + walkDelta(look.yaw, m.forward, m.strafe).length();
     }
-    let bytes = bytesOfList(&net.predictor.encodeInput());
+    let bytes = bytesOfList(&net.predictor.encodeInput(net.view.ack));
     match &mut net.link {
       case var &mut Some(c) { sendLatest(c, STREAM_INPUT, bytes); }
       else {}
@@ -663,11 +708,46 @@ actor Sim {
   fn derive(self: &mut) {
     rules.derive(step);
     rules.slots.tick();
+    if role == SIM_SERVER {
+      // what a rule moved is a change for the clients (partsync.cone)
+      rules.slots.refresh();
+      if wasGliding && !rules.slots.gliding() { landedNs = Instant.now().nanos(); }
+      wasGliding = rules.slots.gliding();
+      var i = 0usize;
+      while i < parts.len() {
+        let here = self.placeOf(&parts[i]);
+        _ = net.tracker.observe(i, &here);
+        i = i + 1usize;
+      }
+    }
   }
 
-  // Where a part stands now: its frame in the world once a rule has moved it, else where the image put it
+  // Where a part stands now: its frame in the world once a rule has moved it, else where the image put it. A client
+  // runs no rules: it stands where the server's snapshots show it
   fn placeOf(self: &, p: &SimPart) Mat4 {
+    if role == SIM_CLIENT {
+      if usize.from(p.id) < shown.len() { return *shown[usize.from(p.id)]; }
+      return p.placement;
+    }
     if usize.from(p.slot) < rules.slots.count() { rules.slots.place(p.slot) } else { p.placement }
+  }
+
+  // A client's merge, second part: each part of the world between its two newest states from the server, shown the
+  // same fixed delay in the past as the other people
+  fn mergeParts(self: &mut) {
+    let nowNs = Instant.now().nanos();
+    let x = net.interp.shownAt(nowNs);
+    let newest = net.interp.newestStep();
+    var before = List[Mat4]();
+    before <-> shown;
+    each p in &parts {
+      let at = net.view.placeAt(usize.from(p.id), x, newest, &p.placement);
+      if usize.from(p.id) < before.len() && !sameMat(&at, &before[usize.from(p.id)]) {
+        if movedFirstNs == 0i64 { movedFirstNs = nowNs; }
+        movedLastNs = nowNs;
+      }
+      shown.push(at);
+    }
   }
 
   // Publish: the zone's parts and the person, as a snapshot nothing changes
@@ -679,6 +759,14 @@ actor Sim {
     each p in &parts { ps.push(PartState(p.id, p.key, NO_PART, self.placeOf(p))); }
     var others = OtherPersons();
     if role == SIM_CLIENT { others = self.mergeOthers(); }
+    // Other people are parts of the stand-in design, standing where the server's snapshots put them (the id: after the world's)
+    if role == SIM_CLIENT && hasAvatar {
+      each o in &others {
+        let turn = Quat.angleAxis(o.yaw, Vec3(0., 1., 0.));
+        ps.push(PartState(u32.from(parts.len()) + o.id, avatarKey, NO_PART,
+          Mat4.fromTrs(o.feet, turn, Vec3(AVATAR_SCALE, AVATAR_SCALE, AVATAR_SCALE))));
+      }
+    }
     var s = Snapshot(step, atNs, person, ps, others, 0u64);
     s.sum = snapshotSum(&s);
     let out = Published(s);
@@ -762,6 +850,18 @@ actor Sim {
     print <- " refused; shared part sent "; print <- net.sharedSent; print <- " times (largest "; print <- u64.from(net.largestShared);
     print <- " bytes), personal part "; print <- net.personalSent; print <- " (largest "; print <- u64.from(net.largestPersonal);
     print <- " bytes); "; print <- net.malformed; print <- " messages did not parse\n";
+    print <- "net server: "; print <- net.partEntries; print <- " changed-part states sent, in all; "; print <- net.tracker.version; print <- " part changes\n";
+    each q in &parts {
+      let at = self.placeOf(q);
+      if net.tracker.changedAt(usize.from(q.id)) > 0u64 {
+        print <- "net server: final part "; printStr(q.name.view()); print <- " at ("; printF(at.m[12]); print <- ", "; printF(at.m[13]);
+        print <- ", "; printF(at.m[14]); print <- ")\n";
+      }
+    }
+    each l in &landings {
+      print <- "net server: a glide was sent to ("; printF(l.goal.x); print <- ", "; printF(l.goal.z); print <- ")\n";
+    }
+    print <- "net server: the last glide ended at ns "; print <- landedNs; print <- "\n";
     let ok = net.malformed == 0u64 && net.joins > 0u64;
     print <- "check server: "; if ok { print <- "ok\n"; } else { print <- "FAILED\n"; }
     print <- "sim: "; print <- step; print <- " steps, "; print <- lateSteps; print <- " dropped as late\n";
@@ -774,8 +874,8 @@ actor Sim {
     var ok = true;
     print <- "check join: ";
     if declaredFromServer {
-      print <- "person "; print <- net.myId; print <- ", "; print <- u64.from(parts.len()); print <- " parts and "; print <- u64.from(heldShapes.len());
-      print <- " shapes taken from the server, none rebuilt: ok\n";
+      print <- "person "; print <- net.myId; print <- ", "; print <- u64.from(parts.len()); print <- " parts built from its own copy of the world, ";
+      print <- u64.from(heldShapes.len()); print <- " shapes taken from the server, none rebuilt: ok\n";
     } else {
       print <- "FAILED (never joined"; if net.phase == PHASE_REFUSED { print <- ": "; printStr(net.refusedWhy.view()); } print <- ")\n";
       ok = false;
@@ -806,6 +906,21 @@ actor Sim {
         if net.pressesSent >= 1u64 { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
       }
     }
+    // The parts the server moved, as this client shows them at the end
+    var movedParts = 0u64;
+    let newestStep = net.interp.newestStep();
+    each q in &parts {
+      let at = net.view.placeAt(usize.from(q.id), 0., newestStep, &q.placement);
+      if !sameMat(&at, &q.placement) {
+        movedParts = movedParts + 1u64;
+        print <- "net client: person "; print <- net.myId; print <- " final part "; printStr(q.name.view()); print <- " at (";
+        printF(at.m[12]); print <- ", "; printF(at.m[13]); print <- ", "; printF(at.m[14]); print <- ")\n";
+      }
+    }
+    print <- "check parts: "; print <- net.partsGot; print <- " shared snapshots carried parts, "; print <- net.view.applied;
+    print <- " part states applied, acknowledged through version "; print <- net.view.ack; print <- ", "; print <- movedParts;
+    print <- " parts end away from the definition, no rule ran here\n";
+    print <- "net client: person "; print <- net.myId; print <- " showed a part move first at ns "; print <- movedFirstNs; print <- ", last at ns "; print <- movedLastNs; print <- "\n";
     print <- "sim: "; print <- step; print <- " steps, "; print <- lateSteps; print <- " dropped as late\n";
     if ok { 0 } else { 1 }
   }
@@ -897,4 +1012,30 @@ fn printF(x: f32) {
   if frac < 100u64 { print <- "0"; }
   if frac < 10u64 { print <- "0"; }
   print <- frac;
+}
+
+// The design other people are drawn as. The world declares no avatar design (sim.md: "a part of the avatar design the
+// world declares"), so the stand-in is the closest thing it does declare: the design of the first part one of its rules
+// moves, which is a thing that stands on the ground and is moved about, shown at AVATAR_SCALE. 0: the world moves nothing
+fn standIn(b: &Behaviour, decls: &PartDecls) ContentKey {
+  if b.moves.len() == 0usize { return 0u64; }
+  let piece = b.moves[0usize].part;
+  each d in &*decls {
+    if frameWithin(&b.frames, d.slot, piece) { return d.key; }
+  }
+  0u64
+}
+
+// Is the slot 'slot' the slot 'holder', or inside it?
+fn frameWithin(frames: &SlotFrames, slot: u32, holder: u32) bool {
+  var s = slot;
+  var guard = frames.len();
+  while guard > 0usize && usize.from(s) < frames.len() {
+    if s == holder { return true; }
+    let p = frames[usize.from(s)].parent;
+    if p == s { return false; }
+    s = p;
+    guard = guard - 1usize;
+  }
+  false
 }

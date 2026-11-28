@@ -19,7 +19,7 @@
 // Every number is written most significant byte first. A message that does not
 // parse is dropped whole and counted: nothing from outside is trusted.
 
-pub const NET_VERSION = 1u32;       // the wire's version: bump it when anything here changes
+pub const NET_VERSION = 2u32;       // the wire's version: bump it when anything here changes
 
 // netmsg's latest-wins streams, by number
 pub const STREAM_INPUT = 1u32;      // client -> server: the unacknowledged input samples
@@ -31,7 +31,6 @@ pub const C_HELLO = 1u32;
 pub const C_PRESS = 2u32;
 pub const S_REFUSED = 1u32;
 pub const S_WELCOME = 2u32;
-pub const S_PARTS = 3u32;
 pub const S_SHAPES = 4u32;
 pub const S_JOINED = 5u32;
 pub const NO_ROW = 0xFFFFFFFFusize;
@@ -261,8 +260,10 @@ pub struct Predictor {
 
   // The unacknowledged samples as a latest-wins value, oldest first, at most
   // MOST_SENT_SAMPLES of the newest
-  pub fn encodeInput(self: &) List[u8] {
+  // 'ackParts' (the newest part version the client has applied) goes first
+  pub fn encodeInput(self: &, ackParts: u64) List[u8] {
     var out = List[u8]();
+    putU64(&mut out, ackParts);
     var from = 0usize;
     if history.len() > MOST_SENT_SAMPLES { from = history.len() - MOST_SENT_SAMPLES; }
     putU8(&mut out, u32.from(history.len() - from));
@@ -318,6 +319,17 @@ pub struct Interpolator {
       if first || o < best { best = o; first = false; }
     }
     best
+  }
+
+  // The time everything is shown at, in steps from the newest snapshot's step (zero or less): INTERP_STEPS before the
+  // server's step now, as this client estimates it
+  pub fn shownAt(self: &, nowNs: i64) f32 {
+    if ring.len() == 0usize { return 0.; }
+    let newest = &ring[ring.len() - 1usize];
+    let sinceNewest = f32.from(nowNs - self.clockOffsetNs() - i64.from(newest.step) * i64.from(STEP_NS)) / f32.from(STEP_NS);
+    var x = sinceNewest - INTERP_STEPS;
+    if x > 0. { x = 0.; }
+    x
   }
 
   // The people as they were 'INTERP_STEPS' steps before the server's step now
@@ -387,9 +399,11 @@ pub struct ClientRow {
   pub gaps: u64;                    // sample numbers that never arrived
   pub firstMoveNs: i64;             // when its first moving sample was applied (0: none yet)
   pub presses: u64;
+  pub partsAck: u64;                // the newest part version it said it applied
+  pub lastShared: usize;            // the bytes of the shared snapshot last sent it
 
   pub fn make(id: u32, conn: Connection) ClientRow {
-    ClientRow(id, conn, PersonState(Vec3(0., 0., 0.), 0.), 0u32, BodySamples(), false, String(), false, 0u64, 0u64, 0u64, 0i64, 0u64)
+    ClientRow(id, conn, PersonState(Vec3(0., 0., 0.), 0.), 0u32, BodySamples(), false, String(), false, 0u64, 0u64, 0u64, 0i64, 0u64, 0u64, 0usize)
   }
 
   // The samples a packet carried: those newer than any held are kept
@@ -468,8 +482,9 @@ pub fn decodeClientSays(data: Bytes) ClientSays {
   out
 }
 
-pub fn decodeInput(data: Bytes, out: &mut BodySamples) bool {
+pub fn decodeInput(data: Bytes, out: &mut BodySamples, ackParts: &mut u64) bool {
   var t = Take.make(data);
+  *ackParts = t.r64();
   let n = t.r8();
   var i = 0u32;
   while i < n && t.ok {
@@ -491,10 +506,10 @@ pub fn encodeRefused(why: &str) List[u8] {
   out
 }
 
-pub fn encodeWelcome(yourId: u32, world: &str, feet: Vec3, parts: usize, keys: usize) List[u8] {
+pub fn encodeWelcome(yourId: u32, world: &str, feet: Vec3, parts: usize, sum: u64, keys: usize) List[u8] {
   var out = List[u8]();
   putU8(&mut out, S_WELCOME); putU32(&mut out, NET_VERSION); putU32(&mut out, yourId); putStr(&mut out, world);
-  putVec3(&mut out, feet); putU32(&mut out, u32.from(parts)); putU32(&mut out, u32.from(keys));
+  putVec3(&mut out, feet); putU32(&mut out, u32.from(parts)); putU64(&mut out, sum); putU32(&mut out, u32.from(keys));
   out
 }
 
@@ -502,31 +517,6 @@ pub fn encodeJoined() List[u8] {
   var out = List[u8]();
   putU8(&mut out, S_JOINED);
   out
-}
-
-// The parts as messages of at most MOST_RELIABLE_BYTES each
-pub fn encodeParts(parts: &SimParts) List[List[u8]] {
-  var msgs = List[List[u8]]();
-  var body = List[u8]();
-  var n = 0u32;
-  var i = 0usize;
-  while i < parts.len() {
-    let p = &parts[i];
-    var one = List[u8]();
-    putU32(&mut one, p.id); putU64(&mut one, p.key); putStr(&mut one, p.name.view()); putU32(&mut one, p.slot);
-    var m = 0usize;
-    while m < 16usize { putF32(&mut one, p.placement.m[m]); m = m + 1usize; }
-    if n > 0u32 && body.len() + one.len() + 2usize > MOST_RELIABLE_BYTES {
-      msgs.push(framed(S_PARTS, n, &body));
-      body = List[u8]();
-      n = 0u32;
-    }
-    body.appendList(one);
-    n = n + 1u32;
-    i = i + 1usize;
-  }
-  if n > 0u32 { msgs.push(framed(S_PARTS, n, &body)); }
-  msgs
 }
 
 pub fn encodeShapes(shapes: &ShapeTable) List[List[u8]] {
@@ -558,15 +548,40 @@ fn framed(tag: u32, n: u32, body: &List[u8]) List[u8] {
   out
 }
 
-// The shared part: every person's body, encoded once for everyone
-pub fn encodeShared(step: u64, rows: &ClientRows) List[u8] {
+// Every person's body, as the shared snapshot lists them
+pub fn personsOf(rows: &ClientRows) OtherPersons {
+  var l = OtherPersons();
+  each r in &*rows { if r.declared { l.push(OtherPerson(r.id, r.person.feet, r.person.yaw)); } }
+  l
+}
+
+// The shared snapshot's first half, the same for everyone, encoded once: the step and every person's body
+pub fn encodePeople(step: u64, people: &OtherPersons) List[u8] {
   var out = List[u8]();
   putU64(&mut out, step);
-  var n = 0u32;
-  each r in &*rows { if r.declared { n = n + 1u32; } }
-  putU8(&mut out, n);
-  each r in &*rows {
-    if r.declared { putU32(&mut out, r.id); putVec3(&mut out, r.person.feet); putF32(&mut out, r.person.yaw); }
+  putU8(&mut out, u32.from(people.len()));
+  each p in &*people { putU32(&mut out, p.id); putVec3(&mut out, p.feet); putF32(&mut out, p.yaw); }
+  out
+}
+
+// How many changed parts fit in a packet beside the people
+pub fn partRoom(people: usize) usize {
+  let used = 9usize + 20usize * people + 1usize + 8usize;
+  if used >= MOST_RELIABLE_BYTES { 0usize } else { (MOST_RELIABLE_BYTES - used) / DELTA_BYTES }
+}
+
+// The shared snapshot's second half, for one client: the parts that changed since what it last acknowledged. A
+// part at rest adds only the count byte, 0
+pub fn encodePartTail(through: u64, deltas: &PartDeltas) List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, u32.from(deltas.len()));
+  if deltas.len() > 0usize {
+    putU64(&mut out, through);
+    each d in &*deltas {
+      putU32(&mut out, d.id); putU8(&mut out, d.mask);
+      var m = 0usize;
+      while m < 16usize { putF32(&mut out, d.placement.m[m]); m = m + 1usize; }
+    }
   }
   out
 }
@@ -589,36 +604,20 @@ pub struct ServerSays {
   pub yourId: u32;
   pub world: String;
   pub feet: Vec3;
-  pub parts: u32;
+  pub parts: u32;                   // how many parts the server's definition has, and the sum of their keys
+  pub sum: u64;
   pub keys: u32;
-  pub declared: PartDecls;          // S_PARTS (ids in order from the first sent)
-  pub firstId: u32;
   pub shapes: ShapeTable;           // S_SHAPES
 }
 
 pub fn decodeServerSays(data: Bytes) ServerSays {
   var t = Take.make(data);
   let tag = t.r8();
-  var out = ServerSays(0u32, String(), 0u32, 0u32, String(), Vec3(0., 0., 0.), 0u32, 0u32, PartDecls(), 0u32, ShapeTable());
+  var out = ServerSays(0u32, String(), 0u32, 0u32, String(), Vec3(0., 0., 0.), 0u32, 0u64, 0u32, ShapeTable());
   if tag == S_REFUSED {
     out.why = t.rstr();
   } else if tag == S_WELCOME {
-    out.version = t.r32(); out.yourId = t.r32(); out.world = t.rstr(); out.feet = t.rvec3(); out.parts = t.r32(); out.keys = t.r32();
-  } else if tag == S_PARTS {
-    let n = t.r8();
-    var i = 0u32;
-    while i < n && t.ok {
-      let id = t.r32();
-      if i == 0u32 { out.firstId = id; }
-      let key = t.r64();
-      let name = t.rstr();
-      let slot = t.r32();
-      var m = Mat4.identity();
-      var k = 0usize;
-      while k < 16usize { m.m[k] = t.rf32(); k = k + 1usize; }
-      out.declared.push(PartDecl(name, key, m, slot));
-      i = i + 1u32;
-    }
+    out.version = t.r32(); out.yourId = t.r32(); out.world = t.rstr(); out.feet = t.rvec3(); out.parts = t.r32(); out.sum = t.r64(); out.keys = t.r32();
   } else if tag == S_SHAPES {
     let n = t.r8();
     var i = 0u32;
@@ -638,7 +637,7 @@ pub fn decodeServerSays(data: Bytes) ServerSays {
   out
 }
 
-pub fn decodeShared(data: Bytes, step: &mut u64, out: &mut OtherPersons) bool {
+pub fn decodeShared(data: Bytes, step: &mut u64, out: &mut OtherPersons, through: &mut u64, deltas: &mut PartDeltas) bool {
   var t = Take.make(data);
   *step = t.r64();
   let n = t.r8();
@@ -648,6 +647,18 @@ pub fn decodeShared(data: Bytes, step: &mut u64, out: &mut OtherPersons) bool {
     let feet = t.rvec3();
     let yaw = t.rf32();
     out.push(OtherPerson(id, feet, yaw));
+    i = i + 1u32;
+  }
+  let parts = t.r8();
+  if parts > 0u32 { *through = t.r64(); }
+  i = 0u32;
+  while i < parts && t.ok {
+    let id = t.r32();
+    let mask = t.r8();
+    var m = Mat4.identity();
+    var k = 0usize;
+    while k < 16usize { m.m[k] = t.rf32(); k = k + 1usize; }
+    deltas.push(PartDelta(id, mask, m));
     i = i + 1u32;
   }
   t.ok
@@ -749,7 +760,7 @@ pub struct NetState {
   pub startFeet: Vec3;
   pub wantParts: u32;
   pub wantKeys: u32;
-  pub declared: PartDecls;          // the parts, as the server declared them
+  pub wantSum: u64;                 // the sum of the keys of the server's definition
   pub shapesGot: ShapeTable;
   pub joinedMsg: bool;              // the Joined message came: the client Sim may act on the declarations
   pub predictor: Predictor;
@@ -764,13 +775,20 @@ pub struct NetState {
   pub otherFirst: Vec3;
   pub otherFirstId: u32;
   pub firstSeen: bool;
+  // the world's parts (partsync.cone)
+  pub tracker: PartTracker;         // server: what changed, by version
+  pub view: PartView;               // client: the parts' newest states
+  pub partEntries: u64;             // server: changed parts sent, in all
+  pub sizeShown: usize;             // server: the shared snapshot size last printed
+  pub partsGot: u64;                // client: shared snapshots that carried parts
 
   pub fn make(skipReplay: bool, takeStalePersonal: bool, takeStaleShared: bool) NetState {
     NetState(None[Endpoint], None[LossyRelay], 0u32, 0u32,
       ClientRows(), 0u64, 0u64, 0u64, 0u64, false, 0u64, 0u64, 0u64, 0usize, 0usize, 0u64,
-      None[Connection], PHASE_DIALLING, 0u32, false, String(), String(), Vec3(0., 0., 0.), 0u32, 0u32, PartDecls(), ShapeTable(), false,
+      None[Connection], PHASE_DIALLING, 0u32, false, String(), String(), Vec3(0., 0., 0.), 0u32, 0u32, 0u64, ShapeTable(), false,
       Predictor.make(Vec3(0., 0., 0.), skipReplay, takeStalePersonal), Interpolator.make(takeStaleShared), None[PersonalSnap],
-      0u64, 0u64, 0u64, 0u64, 0usize, 0i64, Vec3(0., 0., 0.), 0u32, false)
+      0u64, 0u64, 0u64, 0u64, 0usize, 0i64, Vec3(0., 0., 0.), 0u32, false,
+      PartTracker.make(&List[Mat4](), false), PartView.make(0usize), 0u64, 0usize, 0u64)
   }
 
   pub fn row(self: &, id: u32) usize {
