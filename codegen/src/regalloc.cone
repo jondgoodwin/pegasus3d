@@ -106,7 +106,10 @@ fn extend(lo: &mut List[u32], hi: &mut List[u32], v: u32, p: u32) {
 }
 
 // Liveness, intervals, then the scan. The function must be well formed (validate in x64.cone checks that).
-pub fn allocate(f: &Func, rf: &RegFile) Allocation {
+pub fn allocate(f: &Func, rf: &RegFile) Allocation { allocateWith(f, rf, true) }
+
+// As 'allocate'; 'reuse' false gives every spilled vreg its own slot (a test mutant)
+pub fn allocateWith(f: &Func, rf: &RegFile, reuse: bool) Allocation {
   let nv = f.classes.len();
   let nb = f.blocks.len();
   let nw = nv / 64usize + 1usize;
@@ -286,5 +289,31 @@ pub fn allocate(f: &Func, rf: &RegFile) Allocation {
     }
     cls = cls + 1u8;
   }
+  // Spill slots: every spilled vreg holds its slot for its whole interval (a victim gives up its register for good), so the
+  // slots are an interval colouring of the spilled vregs, by start (ties by vreg number): the lowest slot whose last
+  // occupant ended before this interval starts, else a new one. Slots are 8 bytes and any value fits any slot. With 'reuse'
+  // off (a test mutant) every spilled vreg gets a slot of its own.
+  var sp = List[u64]();
+  var sv = 1usize;
+  while sv < nv {
+    if locs[sv].kind == LOC_SPILL { sp.push((u64.from(*lo[sv]) << 32u64) | u64.from(sv)); }
+    sv = sv + 1usize;
+  }
+  sp.sortBy((x, y) => x <=> y);
+  var slotHi = List[u32]();          // by slot: the end of the interval that last held it
+  var si = 0usize;
+  while si < sp.len() {
+    let vr = usize.from(*sp[si] & 0xFFFFFFFFu64);
+    let l = *lo[vr];
+    var pick = slotHi.len();
+    if reuse {
+      var s = 0usize;
+      while s < slotHi.len() { if *slotHi[s] < l { pick = s; break; } s = s + 1usize; }
+    }
+    if pick == slotHi.len() { slotHi.push(*hi[vr]); } else { slotHi.set(pick, *hi[vr]); }
+    locs.set(vr, Loc(LOC_SPILL, u32.from(pick)));
+    si = si + 1usize;
+  }
+  nSpill = u32.from(slotHi.len());
   Allocation(locs, lo, hi, nSpill)
 }

@@ -466,6 +466,19 @@ fn pad(s: &str, w: usize) {
   while k < w { print <- " "; k = k + 1usize; }
 }
 
+// Where the largest frame of a Code comes from: its unit, and what the frame holds
+fn frameLine(label: &str, funcs: &codegen.Funcs, mc: &codegen.MachineCode) {
+  var big = 0usize;
+  var i = 0usize;
+  while i < mc.frameSizes.len() { if *mc.frameSizes[i] > *mc.frameSizes[big] { big = i; } i = i + 1usize; }
+  let f = &funcs[big];
+  let al = codegen.allocate(f, &codegen.x64RegFile());
+  print <- "  "; pad("largest frame", 22usize); print <- label; print <- " unit "; print <- big; print <- ": "; print <- *mc.frameSizes[big];
+  print <- " B = spills "; print <- al.nSpill; print <- " x 8, outgoing "; print <- f.outSlots; print <- " x 8, shadow 32, rbp and return 16 (rounded to 16); vregs ";
+  print <- f.classes.len(); print <- ", incoming slots "; print <- f.nArea;
+  print <- "; the Code's stack need "; print <- mc.stackNeed; print <- " B\n";
+}
+
 fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
   var text = String();
   match fs.readFile(&Path.from(file)) {
@@ -503,8 +516,8 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
   }
 
   // ---- compiled natively; the machine code's size and checksum (the same Code gives the same bytes: run it twice) ----
-  // A Code whose 1,024 frames would not fit the 16 MiB native stack is not compiled, by design (NB4): the host keeps the
-  // interpreter, which is the result nativecheck compares against, so it is noted and not counted as a difference
+  // A Code that needs more than 16 MiB of native stack is not compiled, by design (NB4), but no guide or pegasus world may be
+  // one (NB5: frames are small, and a Code with no recursion needs only its heaviest call chain), so it counts as a failure
   var fixedCapped = false;
   var simCapped = false;
   if fixedOk && fixedN > 0usize {
@@ -512,12 +525,16 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
       case let Ok(n) { fnat.push(n); fixedCompiled = String.from("yes"); }
       case let Err(e) {
         fixedCompiled = String.from("NO: "); fixedCompiled.append(e.view());
-        if e.view().contains("over the 16 MiB limit") { fixedCapped = true; } else { bad = true; }
+        if e.view().contains("over the 16 MiB limit") { fixedCapped = true; }
+        bad = true;
       }
     }
     let f1 = liftWith(&fv[0usize], opts);
     match codegen.compileX64(&f1, codegen.hostAbi()) {
-      case let Ok(mc) { fixedBytes = mc.bytes.len(); fixedSum = codegen.checksum(mc.bytes.view(), mc.bytes.len()); }
+      case let Ok(mc) {
+        fixedBytes = mc.bytes.len(); fixedSum = codegen.checksum(mc.bytes.view(), mc.bytes.len());
+        frameLine("fixed", &f1, &mc);
+      }
       case let Err(e) { bad = true; }
     }
   }
@@ -526,7 +543,8 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
       case let Ok(n) { snat.push(n); simCompiled = String.from("yes"); }
       case let Err(e) {
         simCompiled = String.from("NO: "); simCompiled.append(e.view());
-        if e.view().contains("over the 16 MiB limit") { simCapped = true; } else { bad = true; }
+        if e.view().contains("over the 16 MiB limit") { simCapped = true; }
+        bad = true;
       }
     }
     let f1 = liftWith(&sv[0usize], opts);
@@ -551,7 +569,7 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
           case let Ok(bb) {
             var ia = ba;
             var ib = bb;
-            if !ib.isNative() && fixedN > 0usize && !fixedCapped { partsNative = false; bad = true; }
+            if !ib.isNative() && fixedN > 0usize { partsNative = false; bad = true; }
             var i = 0usize;
             while i < w.order.len() {
               let slot = *w.order[i];
@@ -652,7 +670,7 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
   print <- "  "; pad("parts built", 22usize); print <- partsN; print <- " ("; print <- madeCount; print <- " made); differ: mesh "; print <- dMesh;
   print <- ", look "; print <- dLook; print <- ", placement "; print <- dPlace; print <- ", notes "; print <- dNotes;
   if !partsNative { print <- "   NOT NATIVE"; }
-  if fixedCapped { print <- "   (parts built by the interpreter: over the stack cap)"; }
+  if fixedCapped || simCapped { print <- "   (over the stack cap)"; }
   print <- "\n";
   print <- "  "; pad("fixed unit runs", 22usize); print <- ft.runs; print <- " ("; print <- ft.trapped; print <- " trapped); differ "; print <- ft.diffs; print <- "\n";
   print <- "  "; pad("sim unit runs", 22usize); print <- st.runs; print <- " ("; print <- st.trapped; print <- " trapped); differ "; print <- st.diffs; print <- "\n";

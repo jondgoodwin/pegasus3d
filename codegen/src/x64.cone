@@ -31,6 +31,8 @@ pub const MUT_NO_MXCSR_RESTORE = 4u32;  // the way out leaves our MXCSR for the 
 pub const MUT_NO_R12_RESTORE = 5u32;  // the way out leaves r12 as the generated code last used it
 pub const MUT_NO_TRAP_SWITCH = 6u32;  // a trap's unwind does not switch back to the host stack (it crashes: tests run it in a child)
 pub const MUT_GATE_ON_NATIVE = 7u32;  // the gate is called on the native stack, with no thunk (to see what the system does)
+pub const MUT_NO_SLOT_REUSE = 8u32;   // the allocator never frees a spill slot (frames grow)
+pub const MUT_ALL_ACYCLIC = 9u32;     // the stack bound treats a call graph with a cycle as if it had none (the stack comes out too small)
 
 const XMM_SCRATCH = 14u8;
 const XMM_SCRATCH2 = 15u8;
@@ -611,7 +613,7 @@ fn alignTo(g: &mut Gen, n: u32) {
 
 fn emitFunc(g: &mut Gen, funcs: &Funcs, idx: usize, rf: &RegFile) {
   let f = &funcs[idx];
-  g.al = allocate(f, rf);
+  g.al = allocateWith(f, rf, g.mutant != MUT_NO_SLOT_REUSE);
   g.cls = List[u8]();
   var c = 0usize;
   while c < f.classes.len() { g.cls.push(*f.classes[c]); c = c + 1usize; }
@@ -807,6 +809,96 @@ fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
   g.a.ret();
 }
 
+// ---- the stack the code needs ----
+
+// The most stack, in bytes, any function of the container can take when it is run as the entry (each is a possible entry).
+// For one entry, over the functions reachable from it by calls:
+//   the call graph has no cycle:  the heaviest chain, the sum of the frames along it (the depth limit cannot be reached
+//                                 unless the chain is longer than MAX_CALL_DEPTH frames, which the next line covers);
+//   in every case:                at most MAX_CALL_DEPTH frames of the largest reachable frame, which is the whole bound when
+//                                 there is a cycle (the simple bound, not the largest frame on a cycle plus the acyclic part:
+//                                 it costs a few lines, where the finer one needs the cycles found).
+// 'treatAllAcyclic' is a test mutant: a cycle is ignored, and only the chain Kahn's order reaches is summed.
+fn stackNeed(funcs: &Funcs, frames: &List[u32], treatAllAcyclic: bool) u64 {
+  let n = funcs.len();
+  var calls = List[List[u32]]();
+  var i = 0usize;
+  while i < n {
+    var cs = List[u32]();
+    let f = &funcs[i];
+    var b = 0usize;
+    while b < f.blocks.len() {
+      let insts = &f.blocks[b].insts;
+      var k = 0usize;
+      while k < insts.len() { if insts[k].op == IR_CALL { cs.push(u32.from(insts[k].k)); } k = k + 1usize; }
+      b = b + 1usize;
+    }
+    calls.push(cs);
+    i = i + 1usize;
+  }
+  var best = 0u64;
+  var e = 0usize;
+  while e < n {
+    // what is reachable from e
+    var seen = List[bool]();
+    seen.resize(n, false);
+    var order = List[u32]();
+    var stack = List[u32]();
+    stack.push(u32.from(e));
+    seen.set(e, true);
+    var maxF = 0u64;
+    while stack.len() > 0usize {
+      let u = usize.from(stack.pop().unwrap());
+      order.push(u32.from(u));
+      let fu = u64.from(*frames[u]);
+      if fu > maxF { maxF = fu; }
+      var c = 0usize;
+      while c < calls[u].len() {
+        let t = usize.from(*calls[u][c]);
+        if !*seen[t] { seen.set(t, true); stack.push(u32.from(t)); }
+        c = c + 1usize;
+      }
+    }
+    // Kahn's order over them: the longest chain of frames, and whether every function was reached (no cycle)
+    var indeg = List[u32]();
+    indeg.resize(n, 0u32);
+    var o = 0usize;
+    while o < order.len() {
+      let u = usize.from(*order[o]);
+      var c = 0usize;
+      while c < calls[u].len() { let t = usize.from(*calls[u][c]); indeg.set(t, *indeg[t] + 1u32); c = c + 1usize; }
+      o = o + 1usize;
+    }
+    var longest = List[u64]();
+    longest.resize(n, 0u64);
+    var queue = List[u32]();
+    o = 0usize;
+    while o < order.len() { let u = usize.from(*order[o]); if *indeg[u] == 0u32 { queue.push(u32.from(u)); longest.set(u, u64.from(*frames[u])); } o = o + 1usize; }
+    var head = 0usize;
+    var chain = u64.from(*frames[e]);
+    while head < queue.len() {
+      let u = usize.from(*queue[head]);
+      head = head + 1usize;
+      if *longest[u] > chain { chain = *longest[u]; }
+      var c = 0usize;
+      while c < calls[u].len() {
+        let t = usize.from(*calls[u][c]);
+        let through = *longest[u] + u64.from(*frames[t]);
+        if through > *longest[t] { longest.set(t, through); }
+        indeg.set(t, *indeg[t] - 1u32);
+        if *indeg[t] == 0u32 { queue.push(u32.from(t)); }
+        c = c + 1usize;
+      }
+    }
+    let acyclic = head == order.len() || treatAllAcyclic;
+    var need = MAX_CALL_DEPTH * maxF;
+    if acyclic && chain < need { need = chain; }
+    if need > best { best = need; }
+    e = e + 1usize;
+  }
+  best
+}
+
 // ---- the compiler ----
 
 pub fn compileX64(funcs: &Funcs, abi: Abi) Result[MachineCode, String] {
@@ -850,6 +942,7 @@ pub fn compileX64With(funcs: &Funcs, abi: Abi, opts: &Options) Result[MachineCod
     if fr > mc.maxFrame { mc.maxFrame = fr; }
     i = i + 1usize;
   }
+  mc.stackNeed = stackNeed(funcs, &mc.frameSizes, g.mutant == MUT_ALL_ACYCLIC);
   alignTo(&mut g, 16u32);
   mc.entryOffset = g.a.here();
   emitEntry(&mut g, funcs.len(), maxArea, base, table);

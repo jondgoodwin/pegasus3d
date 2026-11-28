@@ -72,7 +72,7 @@ fn buildSized(funcs: &Funcs, opts: &Options, rep: &mut Rep, name: &str, cap: usi
     case let Ok(mc) {
       match load(&mc) {
         case let Ok(lc) {
-          var want = usize.from(nativeStackBytesFor(mc.maxFrame, MAX_CALL_DEPTH / divisor));
+          var want = usize.from(nativeStackBytes(mc.stackNeed / divisor));
           if want > cap { want = cap; }
           match NativeStack.make(want) {
             case let Ok(st) { Some(Prog(lc, st)) }
@@ -1183,6 +1183,115 @@ fn suiteBigGate(o: &Options, rep: &mut Rep, depth: u64) {
   } }
 }
 
+// ---- frame sizes and the stack the code needs (NB5) ----
+
+// k short-lived values, each held across a gate call and then added to an accumulator that is also held across it: every
+// value is spilled (it spans a call), but no two are live together, so one slot serves them all, and the accumulator has one
+fn spillsFn(k: u32) Func {
+  var bd = FuncBuilder.make("spills", 1u32, 0x0000000700000001u64);
+  bd.needOut(1u32);
+  let acc = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ICONST, acc, NO_REG, 0u64);
+  var i = 0u32;
+  while i < k {
+    let v = bd.vreg(CLASS_INT);
+    bd.opImm(IR_ICONST, v, NO_REG, u64.from(i));
+    bd.sited(IR_GATE, 1u64, 0x0000000700000002u64);
+    bd.op3(IR_IADD, acc, acc, v);
+    i = i + 1u32;
+  }
+  bd.opImm(IR_ARG_SET, NO_REG, acc, 0u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+// A function of the given outgoing area that calls each of 'callees' in turn (so its frame is the size it is told)
+fn callerFn(slots: u32, callees: &List[u64]) Func {
+  var bd = FuncBuilder.make("caller", 1u32, 0u64);
+  bd.needOut(slots);
+  var i = 0usize;
+  while i < callees.len() {
+    bd.sited(IR_CALL, *callees[i], 0x0000000900000000u64 + u64.from(i));
+    i = i + 1usize;
+  }
+  bd.ret();
+  take(&mut bd)
+}
+
+fn calls1(a: u64) List[u64] { var l = List[u64](); l.push(a); l }
+fn calls2(a: u64, b: u64) List[u64] { var l = List[u64](); l.push(a); l.push(b); l }
+
+fn suiteFrames(o: &Options, rep: &mut Rep) {
+  // spill slots are reused: 300 short-lived spilled values and an accumulator need two slots, not 301
+  var fs = Funcs();
+  fs.push(spillsFn(300u32));
+  match compileX64With(&fs, hostAbi(), o) {
+    case let Err(e) { ck(rep, false, "build frames"); }
+    case let Ok(mc) {
+      ck(rep, *mc.frameSizes[0usize] <= 96u32, "300 short-lived spilled values share slots: the frame stays under 96 bytes");
+      var run1 = noProbe();
+      match build(&fs, o, rep, "build spills") { case None { return; } case let Some(p) {
+        let r = exec(&p, 0u32, l1(0u64), 1000000u64, &mut run1);
+        ck(rep, r.trap == 0u64 && *r.area[0usize] == 300u64 * 299u64 / 2u64, "values sharing a spill slot keep their own contents");
+      } }
+    }
+  }
+  // the same functions compile to the same frames and the same stack need, every time
+  var same = true;
+  var round = 0u32;
+  var first = 0u64;
+  var firstFrame = 0u32;
+  while round < 3u32 {
+    var gs = Funcs();
+    gs.push(spillsFn(40u32));
+    gs.push(callerFn(30u32, &calls1(0u64)));
+    gs.push(callerFn(5u32, &calls2(0u64, 1u64)));
+    match compileX64With(&gs, hostAbi(), o) {
+      case let Err(e) { same = false; }
+      case let Ok(mc) {
+        if round == 0u32 { first = mc.stackNeed; firstFrame = mc.maxFrame; }
+        else if mc.stackNeed != first || mc.maxFrame != firstFrame { same = false; }
+      }
+    }
+    round = round + 1u32;
+  }
+  ck(rep, same, "the frame sizes and the stack need are the same on every compile");
+  // an acyclic graph: the heaviest chain, not 1,024 frames. 0 -> 1 -> 2 and 0 -> 3 -> 2 with different frames, and 4 alone
+  var ds = Funcs();
+  ds.push(callerFn(10u32, &calls2(1u64, 3u64)));      // 0
+  ds.push(callerFn(100u32, &calls1(2u64)));           // 1
+  ds.push(callerFn(1000u32, &List[u64]()));           // 2
+  ds.push(callerFn(300u32, &calls1(2u64)));           // 3
+  ds.push(callerFn(50u32, &List[u64]()));             // 4
+  match compileX64With(&ds, hostAbi(), o) {
+    case let Err(e) { ck(rep, false, "compile the acyclic graph"); }
+    case let Ok(mc) {
+      let f0 = u64.from(*mc.frameSizes[0usize]);
+      let f2 = u64.from(*mc.frameSizes[2usize]);
+      let f3 = u64.from(*mc.frameSizes[3usize]);
+      ck(rep, mc.stackNeed == f0 + f3 + f2, "an acyclic call graph needs its heaviest chain: 0, 3, 2");
+      ck(rep, mc.stackNeed < MAX_CALL_DEPTH * u64.from(mc.maxFrame) / 100u64, "and that is far less than 1,024 frames");
+      // run it on a stack of exactly that need and the slack: the bound is enough
+      match buildSized(&ds, o, rep, "build chain", 67108864usize, 1u64) { case None { return; } case let Some(p) {
+        let r = run(&p, 0u32, l1(0u64));
+        ck(rep, r.trap == 0u64, "the heaviest chain runs on a stack of that need");
+      } }
+    }
+  }
+  // a cycle: 1,024 frames of the largest reachable. 0 -> 1 -> 0 and 2 -> 0; 3 is reachable from none of them, and bigger
+  var cs = Funcs();
+  cs.push(callerFn(10u32, &calls1(1u64)));            // 0
+  cs.push(callerFn(200u32, &calls1(0u64)));           // 1
+  cs.push(callerFn(5u32, &calls1(0u64)));             // 2
+  cs.push(callerFn(400u32, &List[u64]()));            // 3
+  match compileX64With(&cs, hostAbi(), o) {
+    case let Err(e) { ck(rep, false, "compile the cyclic graph"); }
+    case let Ok(mc) {
+      ck(rep, mc.stackNeed == MAX_CALL_DEPTH * u64.from(*mc.frameSizes[1usize]), "a graph with a cycle needs 1,024 of the largest frame reachable");
+    }
+  }
+}
+
 fn suiteTraps(o: &Options, rep: &mut Rep) {
   var fs = Funcs();
   fs.push(recFn());                                   // 0
@@ -1353,6 +1462,7 @@ fn suite(o: &Options) Rep {
   suiteGate(o, &mut rep);
   suiteTraps(o, &mut rep);
   suiteStack(o, &mut rep, 1u64);
+  suiteFrames(o, &mut rep);
   suiteDeterminism(o, &mut rep);
   suiteRefusal(o, &mut rep);
   rep
@@ -1450,6 +1560,20 @@ fn main() i32 {
   // the stack sized for half the depth: the fat-frame recursion must notice
   var rh = Rep(0u32, List[String]());
   suiteStack(&full, &mut rh, 2u64);
+  // the allocator never frees a spill slot: the frame-size test must notice
+  var m5 = defaultOptions();
+  m5.mutant = MUT_NO_SLOT_REUSE;
+  var r5 = Rep(0u32, List[String]());
+  suiteFrames(&m5, &mut r5);
+  expect(r5.fails.len() > 0usize, "a spill slot never freed is caught");
+  if r5.fails.len() > 0usize { print <- "mutant spill slots never freed is caught by: ", r5.fails[0usize], "\n"; }
+  // a call graph with a cycle taken for one without: the stack comes out one frame, and the fat recursion must notice
+  var m6 = defaultOptions();
+  m6.mutant = MUT_ALL_ACYCLIC;
+  var r6 = Rep(0u32, List[String]());
+  suiteStack(&m6, &mut r6, 1u64);
+  expect(r6.fails.len() > 0usize, "a cyclic call graph taken for an acyclic one is caught");
+  if r6.fails.len() > 0usize { print <- "mutant cyclic graph taken for acyclic is caught by: ", r6.fails[0usize], "\n"; }
   expect(rh.fails.len() > 0usize, "stack sized for half the depth is caught");
   var hi = 0usize;
   while hi < rh.fails.len() && hi < 2usize { print <- "mutant stack sized MAX_CALL_DEPTH / 2 * maxFrame is caught by: ", rh.fails[hi], "\n"; hi = hi + 1usize; }
