@@ -26,8 +26,8 @@ State and event traffic and asset traffic never block each other ([Network](netw
   - Sim → Render, Audio: the snapshot after each step (latest value, never changed after publishing).
   - Render → Player, Sim: the frame's display time and the head and hands as drawn (latest value). Render reads the newest pose itself, last, before drawing.
   - Player → Loader: open world W for Sim S, which Player has started (event). Loader → Sim: the world image and Sim units (move).
-  - Sim → Loader: build content K for part P at a priority set by nearness; part P no longer uses K (events).
-  - Loader → Sim: collision and pick shapes for K (move). Loader → Render: mesh, texture, material for K (bulk move, under Render's upload budget). Loader → Render: release K, sent when K's last user leaves, so Render may drop its GPU content (event).
+  - Sim → Loader: build content K for part P at a priority set by nearness, where K is a mesh key or a material key ([Sim](sim.md)); part P no longer uses K (events).
+  - Loader → Sim: collision and pick shapes for a mesh key (move). Loader → Render: the mesh for a mesh key; the material, with its textures, for a material key (bulk moves, under Render's upload budget). Loader → Render: release K, sent when K's last user leaves, so Render may drop its GPU content (event).
   - Client Sim ↔ server Sim, when connected: as in [Sim](sim.md), connected play.
 - **An action in a message is small:** a verb, a receiver handle, its parameters, the time it was made and where it came from. The fuller record in the actions proposal waits until that proposal is judged. `[design choice]`
 
@@ -80,7 +80,7 @@ The rows listed under Design choices are decided; the others are proposed, and a
 | Loader → Sim | the world image and Sim units | move | |
 | Loader → Sim | collision shape, pick shape, navigation mesh, behaviour code for K | move | T (`Arrived` on P) |
 | Loader → Sim | the origin's file changed (local worlds): new content for K | move | T (`Changed`) |
-| Loader → Render | mesh, texture, material for K | bulk (move) | |
+| Loader → Render | the mesh for a mesh key; the material and its textures for a material key | bulk (move) | |
 | Render → Loader | K dropped (eviction, device lost): re-supply if still used; memory budget left | event; state | |
 | Loader → Audio | decoded samples for K | bulk (move) | |
 | Surface → Render | newest picture, with its changed rectangle (open: [Surfaces](surfaces.md)) | latest value | |
