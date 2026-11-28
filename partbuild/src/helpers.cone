@@ -1,0 +1,477 @@
+// Helpers of the tools, moved from the guide browser's build.cone with their arithmetic untouched: smoothing a mesh by angle,
+// offsetting an outline, putting a stroke onto a surface, inflating an outline, a curve through points, sRGB.
+
+// A faceted mesh (each corner its own vertex, with its face's normal) made
+// smooth where faces meet at less than 'angle': each corner's normal becomes
+// the mean of the normals of the corners at the same place whose faces turn
+// from its own by less than the angle. Corners at the same place are found by
+// their position rounded to 0.1 mm.
+pub fn smoothByAngle(mesh: &mut Mesh, angle: f32) {
+  let n = mesh.positions.len();
+  if mesh.normals.len() != n { return; }
+  let limit = cos(angle);
+  var group = Dict[u64, usize]();     // a place's key -> its group
+  var members = List[List[usize]]();  // each group's corners
+  var k = 0usize;
+  while k < n {
+    let key = placeKey(*mesh.positions[k]);
+    match group.getCopy(&key) {
+      case let Some(g) { (&mut members[g]).push(k); }
+      case is None {
+        group.insert(key, members.len());
+        var one = List[usize]();
+        one.push(k);
+        members.push(one);
+      }
+    }
+    k = k + 1usize;
+  }
+  var smoothed = List[Vec3]();
+  k = 0usize;
+  while k < n { smoothed.push(*mesh.normals[k]); k = k + 1usize; }
+  var g = 0usize;
+  while g < members.len() {
+    let m = &members[g];
+    var i = 0usize;
+    while i < m.len() {
+      let own = *mesh.normals[*m[i]];
+      var sum = Vec3(0., 0., 0.);
+      var j = 0usize;
+      while j < m.len() {
+        let other = *mesh.normals[*m[j]];
+        if own.dot(other) >= limit { sum = sum + other; }
+        j = j + 1usize;
+      }
+      if sum.length() > 0.000001 { smoothed.set(*m[i], sum.normalize()); }
+      i = i + 1usize;
+    }
+    g = g + 1usize;
+  }
+  mesh.normals <-> smoothed;
+}
+
+// A position's place, rounded to 0.1 mm: 21 bits a coordinate, +-100 m
+fn placeKey(p: Vec3) u64 {
+  let x = u64.from(i64.from(libc.floor(f64.from(p.x) * 10000.0 + 0.5)) + 1048576i64) & 0x1FFFFFu64;
+  let y = u64.from(i64.from(libc.floor(f64.from(p.y) * 10000.0 + 0.5)) + 1048576i64) & 0x1FFFFFu64;
+  let z = u64.from(i64.from(libc.floor(f64.from(p.z) * 10000.0 + 0.5)) + 1048576i64) & 0x1FFFFFu64;
+  (x << 42u64) | (y << 21u64) | z
+}
+
+// outline.offset: each point moved 'distance' outward (inward when negative)
+// along the mean of its two pieces' outward directions, lengthened as a mitre
+// is but never past twice 'distance', so a sharp corner is cut rather than
+// spiked. A STAND-IN for the manual's (rounded corners, no self-crossing): it
+// is right while 'distance' is small beside the outline's narrowest part.
+fn offsetOutline(o: &sculpt.Profile, distance: f32) sculpt.Profile {
+  let n = o.points.len();
+  var out = List[Vec2]();
+  if n < 2usize { return sculpt.Profile(out, o.closed); }
+  // Outward is to the right of the way round for a counterclockwise outline
+  let turn: f32 = if o.isCounterClockwise() { 1. } else { -1. };
+  var i = 0usize;
+  while i < n {
+    let p = *o.points[i];
+    let hasPrev = o.closed || i > 0usize;
+    let hasNext = o.closed || i + 1usize < n;
+    let prev = if i > 0usize { *o.points[i - 1usize] } else { *o.points[n - 1usize] };
+    let next = if i + 1usize < n { *o.points[i + 1usize] } else { *o.points[0usize] };
+    var sum = Vec2(0., 0.);
+    var count = 0u32;
+    if hasPrev { sum = sum + outwardOf(prev, p, turn); count = count + 1u32; }
+    if hasNext { sum = sum + outwardOf(p, next, turn); count = count + 1u32; }
+    let len = sum.length();
+    if count == 0u32 || len < 0.000001 { out.push(p); }
+    else {
+      let dir = sum * (1. / len);
+      // The mitre: 1 / cos of half the turn, from one piece's direction
+      let one = if hasPrev { outwardOf(prev, p, turn) } else { outwardOf(p, next, turn) };
+      var c = dir.x * one.x + dir.y * one.y;
+      if c < 0.5 { c = 0.5; }
+      out.push(p + dir * (distance / c));
+    }
+    i = i + 1usize;
+  }
+  sculpt.Profile(out, o.closed)
+}
+
+// The outward direction of the piece a to b
+fn outwardOf(a: Vec2, b: Vec2, turn: f32) Vec2 {
+  let d = b - a;
+  let len = d.length();
+  if len < 0.000001 { return Vec2(0., 0.); }
+  Vec2(d.y * turn / len, -d.x * turn / len)
+}
+
+// The place on the shape's surface facing 'onto' (front or back, along z)
+// over the flat point p: of the points within 4 mm of the line through p,
+// the one farthest that way; with none so near, the nearest
+fn ontoSurface(shape: &PolyMesh, p: Vec2, onto: Vec3) Vec3 {
+  let way: f32 = if onto.z < 0. { -1. } else { 1. };
+  var best = Vec3(p.x, p.y, 0.);
+  var bestZ: f32 = -1.0e30;
+  var nearest: f32 = 1.0e30;
+  var nearestAt = Vec3(p.x, p.y, 0.);
+  var i = 0usize;
+  while i < shape.positions.len() {
+    let q = *shape.positions[i];
+    let dx = q.x - p.x;
+    let dy = q.y - p.y;
+    let d2 = dx * dx + dy * dy;
+    if d2 < 0.000016 && q.z * way > bestZ { bestZ = q.z * way; best = Vec3(p.x, p.y, q.z); }
+    if d2 < nearest && q.z * way >= 0. { nearest = d2; nearestAt = q; }
+    i = i + 1usize;
+  }
+  if bestZ > -1.0e29 { best } else { nearestAt }
+}
+
+// -------- inflate --------
+//
+// inflate(outline, thickness:, cell:): a closed outline in (x, y) blown up
+// into a rounded solid across z, as Teddy and Monster Mash inflate a drawn
+// outline. Every point of the outline's middle (its ridge: where the distance
+// to the outline stops growing) is the center of a ball as wide as the
+// outline is there; the solid is the outside of all the balls, so every part
+// is round in section, a thin muzzle thin and a thick neck thick, then
+// flattened across to 'thickness' of that. It is worked out on a flat grid of
+// 'cell' squares: the front is the grid's squares inside the outline, cut
+// where the outline crosses them, raised; the back the same, lowered; the two
+// meet on the outline itself. All the work is flat, so it is cheap.
+fn inflateOutline(o: &sculpt.Profile, thickness: f32, cell: f32, fullness: f32) PolyMesh {
+  let pts = &o.points;
+  var low = Vec2(1.0e30f, 1.0e30f);
+  var high = Vec2(-1.0e30f, -1.0e30f);
+  var k = 0usize;
+  while k < pts.len() {
+    let p = *pts[k];
+    if p.x < low.x { low.x = p.x; }
+    if p.y < low.y { low.y = p.y; }
+    if p.x > high.x { high.x = p.x; }
+    if p.y > high.y { high.y = p.y; }
+    k = k + 1usize;
+  }
+  let h = if cell < 0.0005 { 0.0005f } else { cell };
+  let x0 = low.x - h;
+  let y0 = low.y - h;
+  let nx = usize.from(i64.from(libc.floor(f64.from((high.x - x0) / h)))) + 2usize;
+  let ny = usize.from(i64.from(libc.floor(f64.from((high.y - y0) / h)))) + 2usize;
+  let count = nx * ny;
+  // Each grid point: inside or not, and its distance to the outline
+  var inside = List[bool].withCapacity(count);
+  var dist = List[f32].withCapacity(count);
+  var j = 0usize;
+  while j < ny {
+    var i = 0usize;
+    while i < nx {
+      let p = Vec2(x0 + f32.from(i) * h, y0 + f32.from(j) * h);
+      let isIn = insideOutline(pts, p);
+      inside.push(isIn);
+      dist.push(if isIn { distanceToOutline(pts, p) } else { 0. });
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  // The ridge: inside points no nearer the outline than both neighbors
+  // across them, in some direction
+  var ridgeAt = List[Vec2]();
+  var ridgeR = List[f32]();
+  j = 1usize;
+  while j + 1usize < ny {
+    var i = 1usize;
+    while i + 1usize < nx {
+      let v = j * nx + i;
+      if *inside[v] {
+        let d = *dist[v];
+        // Strictly above one neighbor, so a flat run of equal distances is
+        // not all ridge
+        let across = (d > *dist[v - 1usize] && d >= *dist[v + 1usize])
+          || (d > *dist[v - nx] && d >= *dist[v + nx])
+          || (d > *dist[v - nx - 1usize] && d >= *dist[v + nx + 1usize])
+          || (d > *dist[v - nx + 1usize] && d >= *dist[v + nx - 1usize]);
+        if across {
+          ridgeAt.push(Vec2(x0 + f32.from(i) * h, y0 + f32.from(j) * h));
+          ridgeR.push(d);
+        }
+      }
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  // Each inside point's height: the highest of the ridge's balls over it
+  var height = List[f32].withCapacity(count);
+  j = 0usize;
+  while j < ny {
+    var i = 0usize;
+    while i < nx {
+      let v = j * nx + i;
+      var top: f32 = 0.;
+      var radius: f32 = 0.;               // the ball that gave it
+      if *inside[v] {
+        let p = Vec2(x0 + f32.from(i) * h, y0 + f32.from(j) * h);
+        top = *dist[v];
+        radius = top;
+        var r = 0usize;
+        while r < ridgeAt.len() {
+          let q = *ridgeAt[r];
+          let rr = *ridgeR[r];
+          let dx = p.x - q.x;
+          let dy = p.y - q.y;
+          if rr > top && dx < rr && dx > -rr && dy < rr && dy > -rr {
+            let s = rr * rr - dx * dx - dy * dy;
+            if s > top * top { top = s.sqrt(); radius = rr; }
+          }
+          r = r + 1usize;
+        }
+      }
+      height.push(radius);
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  // 'height' holds, for now, how thick each place is: the radius of the ball
+  // over it. Taking the highest ball leaves creases where balls meet, so the
+  // radius is eased across the grid instead (outside points keep their
+  // neighbors' value), and each point's height worked out from its own
+  // distance to the outline: off its section's middle by 1 - distance /
+  // radius, a superellipse of power 2 x fullness (2, a circle; higher, flatter
+  // sides turning over firmer edges) is (1 - off^p)^(1/p) of the radius high
+  var spread = 0u32;
+  while spread < 12u32 {
+    var eased = List[f32].withCapacity(count);
+    k = 0usize;
+    while k < count {
+      if *inside[k] && k > nx && k + nx < count {
+        var sum = *height[k] * 2.;
+        var n: f32 = 2.;
+        if *inside[k - 1usize] { sum = sum + *height[k - 1usize]; n = n + 1.; }
+        if *inside[k + 1usize] { sum = sum + *height[k + 1usize]; n = n + 1.; }
+        if *inside[k - nx] { sum = sum + *height[k - nx]; n = n + 1.; }
+        if *inside[k + nx] { sum = sum + *height[k + nx]; n = n + 1.; }
+        eased.push(sum / n);
+      } else {
+        eased.push(*height[k]);
+      }
+      k = k + 1usize;
+    }
+    height <-> eased;
+    spread = spread + 1u32;
+  }
+  let pw = 2. * f64.from(fullness);
+  k = 0usize;
+  while k < count {
+    if *inside[k] {
+      let radius = *height[k];
+      var z: f32 = 0.;
+      if radius > 0. {
+        var off = 1. - *dist[k] / radius;
+        if off < 0. { off = 0.; }
+        z = radius * f32.from(libc.pow(1. - libc.pow(f64.from(off), pw), 1. / pw));
+      }
+      height.set(k, z * thickness);
+    }
+    k = k + 1usize;
+  }
+  // The balls meet in creases a cell apart: eased by averaging each inside
+  // point with its four neighbors (outside ones 0, so the rim stays on the
+  // outline), a few times
+  var pass = 0u32;
+  while pass < 3u32 {
+    var eased = List[f32].withCapacity(count);
+    k = 0usize;
+    while k < count {
+      if *inside[k] && k > nx && k + nx < count {
+        eased.push((*height[k] * 4. + *height[k - 1usize] + *height[k + 1usize] + *height[k - nx] + *height[k + nx]) / 8.);
+      } else {
+        eased.push(*height[k]);
+      }
+      k = k + 1usize;
+    }
+    height <-> eased;
+    pass = pass + 1u32;
+  }
+  // The points: the front's grid points, the back's, then the outline's
+  // crossings of the grid's edges, shared by front and back
+  var positions = List[Vec3]();
+  var frontId = List[u32].withCapacity(count);
+  var backId = List[u32].withCapacity(count);
+  k = 0usize;
+  while k < count {
+    if *inside[k] {
+      let p = Vec3(x0 + f32.from(k % nx) * h, y0 + f32.from(k / nx) * h, 0.);
+      frontId.push(u32.from(positions.len()));
+      positions.push(Vec3(p.x, p.y, *height[k]));
+      backId.push(u32.from(positions.len()));
+      positions.push(Vec3(p.x, p.y, -*height[k]));
+    } else {
+      frontId.push(0xFFFFFFFFu32);
+      backId.push(0xFFFFFFFFu32);
+    }
+    k = k + 1usize;
+  }
+  var crossing = Dict[u64, u32]();   // a grid edge, as its two points' numbers -> the point where the outline crosses it
+  var counts = List[u32]();
+  var indices = List[u32]();
+  j = 0usize;
+  while j + 1usize < ny {
+    var i = 0usize;
+    while i + 1usize < nx {
+      // The square's corners counterclockwise from its lower left
+      var corners = Array[usize, 4]() <- fill 0usize;
+      corners[0] = j * nx + i;
+      corners[1] = j * nx + i + 1usize;
+      corners[2] = (j + 1usize) * nx + i + 1usize;
+      corners[3] = (j + 1usize) * nx + i;
+      var front = List[u32]();
+      var back = List[u32]();
+      var c = 0usize;
+      while c < 4usize {
+        let a = corners[c];
+        let b = corners[(c + 1usize) % 4usize];
+        if *inside[a] { front.push(*frontId[a]); back.push(*backId[a]); }
+        if *inside[a] != *inside[b] {
+          let key = if a < b { (u64.from(a) << 32u64) | u64.from(b) } else { (u64.from(b) << 32u64) | u64.from(a) };
+          var id = 0u32;
+          match crossing.getCopy(&key) {
+            case let Some(x) { id = x; }
+            case is None {
+              let pa = Vec2(x0 + f32.from(a % nx) * h, y0 + f32.from(a / nx) * h);
+              let pb = Vec2(x0 + f32.from(b % nx) * h, y0 + f32.from(b / nx) * h);
+              let at = crossingOf(pts,if *inside[a] { pa } else { pb }, if *inside[a] { pb } else { pa });
+              id = u32.from(positions.len());
+              positions.push(Vec3(at.x, at.y, 0.));
+              crossing.insert(key, id);
+            }
+          }
+          front.push(id);
+          back.push(id);
+        }
+        c = c + 1usize;
+      }
+      if front.len() >= 3usize {
+        counts.push(u32.from(front.len()));
+        var f = 0usize;
+        while f < front.len() { indices.push(*front[f]); f = f + 1usize; }
+        // The back faces -z: its corners the other way round
+        counts.push(u32.from(back.len()));
+        f = back.len();
+        while f > 0usize { f = f - 1usize; indices.push(*back[f]); }
+      }
+      i = i + 1usize;
+    }
+    j = j + 1usize;
+  }
+  var problems = List[String]();
+  PolyMesh.fromPolygons(positions.view(), counts.view(), indices.view(), &mut problems)
+}
+
+// Whether p is inside the closed outline (even-odd)
+fn insideOutline(pts: &List[Vec2], p: Vec2) bool {
+  let n = pts.len();
+  var isIn = false;
+  var i = 0usize;
+  var j = n - 1usize;
+  while i < n {
+    let a = *pts[i];
+    let b = *pts[j];
+    if (a.y > p.y) != (b.y > p.y) {
+      if p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x { isIn = !isIn; }
+    }
+    j = i;
+    i = i + 1usize;
+  }
+  isIn
+}
+
+// The distance from p to the closed outline
+fn distanceToOutline(pts: &List[Vec2], p: Vec2) f32 {
+  let n = pts.len();
+  var best: f32 = 1.0e30;
+  var i = 0usize;
+  while i < n {
+    let a = *pts[i];
+    let b = *pts[(i + 1usize) % n];
+    let ab = b - a;
+    let len2 = ab.x * ab.x + ab.y * ab.y;
+    var t: f32 = 0.;
+    if len2 > 0. { t = ((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2; }
+    if t < 0. { t = 0.; }
+    if t > 1. { t = 1.; }
+    let dx = p.x - (a.x + ab.x * t);
+    let dy = p.y - (a.y + ab.y * t);
+    let d2 = dx * dx + dy * dy;
+    if d2 < best { best = d2; }
+    i = i + 1usize;
+  }
+  best.sqrt()
+}
+
+// Where the outline crosses the grid edge from an inside point to an outside
+// one, found by halving
+fn crossingOf(pts: &List[Vec2], from: Vec2, to: Vec2) Vec2 {
+  var a = from;
+  var b = to;
+  var k = 0u32;
+  while k < 16u32 {
+    let m = Vec2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+    if insideOutline(pts, m) { a = m; } else { b = m; }
+    k = k + 1u32;
+  }
+  Vec2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)
+}
+
+// The points of spine.through: a centripetal Catmull-Rom curve through every
+// point given, 'segments' pieces between each two, its ends carried on by a
+// point mirrored past the first and the last (the manual's defaults)
+fn throughPoints(given: &List[Vec3], segments: u32) List[Vec3] {
+  var out = List[Vec3]();
+  let n = given.len();
+  if n < 2usize {
+    if n == 1usize { out.push(*given[0]); }
+    return out;
+  }
+  let pieces = if segments < 1u32 { 1u32 } else { segments };
+  var i = 0usize;
+  while i + 1usize < n {
+    let p1 = *given[i];
+    let p2 = *given[i + 1usize];
+    let p0 = if i == 0usize { p1 + (p1 - p2) } else { *given[i - 1usize] };
+    let p3 = if i + 2usize < n { *given[i + 2usize] } else { p2 + (p2 - p1) };
+    let t0: f32 = 0.;
+    let t1 = t0 + knotStep(p0, p1);
+    let t2 = t1 + knotStep(p1, p2);
+    let t3 = t2 + knotStep(p2, p3);
+    var k = 0u32;
+    while k < pieces {
+      let t = t1 + (t2 - t1) * f32.from(k) / f32.from(pieces);
+      let a1 = knotMix(p0, p1, t0, t1, t);
+      let a2 = knotMix(p1, p2, t1, t2, t);
+      let a3 = knotMix(p2, p3, t2, t3, t);
+      let b1 = knotMix(a1, a2, t0, t2, t);
+      let b2 = knotMix(a2, a3, t1, t3, t);
+      out.push(knotMix(b1, b2, t1, t2, t));
+      k = k + 1u32;
+    }
+    i = i + 1usize;
+  }
+  out.push(*given[n - 1usize]);
+  out
+}
+
+// The centripetal knot spacing: the square root of the distance, never 0
+fn knotStep(a: Vec3, b: Vec3) f32 {
+  let d = (b - a).length().sqrt();
+  if d < 0.0001 { 0.0001 } else { d }
+}
+
+// a at ta to b at tb, at t
+fn knotMix(a: Vec3, b: Vec3, ta: f32, tb: f32, t: f32) Vec3 {
+  a * ((tb - t) / (tb - ta)) + b * ((t - ta) / (tb - ta))
+}
+
+// The sRGB curve: 0 to 255 as a paint program shows a channel, to linear
+pub fn srgbToLinear(n: f64) f32 {
+  let c = n / 255.;
+  if c <= 0.04045 { return f32.from(c / 12.92); }
+  f32.from(libc.pow((c + 0.055) / 1.055, 2.4))
+}
+
