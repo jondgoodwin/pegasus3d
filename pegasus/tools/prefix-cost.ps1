@@ -30,6 +30,7 @@ try {
   if ($port -eq 0) { Write-Output 'the server did not start'; exit 3 }
   $cacheDir = Join-Path $env:TEMP "prefixcost-cache-$PID"
   $env:PEGASUS_MESH_CACHE = $cacheDir
+  $env:PEGASUS_READ_TIMES = '1'      # the Reader prints each read's time
   $rows = @()
   for ($r = 0; $r -lt $Runs; $r++) {
     Remove-Item -Recurse -Force $cacheDir -ErrorAction SilentlyContinue
@@ -43,6 +44,7 @@ try {
     $row = [pscustomobject]@{
       prefixReads = $pre.Count; prefixMs = [math]::Round($preUs / 1000, 1); wholeMs = [math]::Round($whoUs / 1000, 1)
       firstMs = [math]::Round(((& $ns 'arrival: first part drawn at (\d+) ns') - $t0) / 1e6, 1)
+      tenMs = [math]::Round(((& $ns 'arrival: ten parts drawn at (\d+) ns') - $t0) / 1e6, 1)
       allMs = [math]::Round(((& $ns 'arrival: all parts drawn at (\d+) ns') - $t0) / 1e6, 1)
       gapMs = [math]::Round((& $ns 'longest gap between frames up to then (\d+) us') / 1000, 1)
       textInMs = & $ns 'arrival: \d+ bytes of world in at \+(\d+) ms'
@@ -50,7 +52,7 @@ try {
     $rows += $row
     Write-Output ("run {0}: prefix reads {1} = {2} ms, whole read {3} ms, first {4}, all {5}, gap {6}, text in {7}, declared {8}" -f ($r + 1), $row.prefixReads, $row.prefixMs, $row.wholeMs, $row.firstMs, $row.allMs, $row.gapMs, $row.textInMs, $row.declaredMs)
   }
-  foreach ($c in 'prefixReads', 'prefixMs', 'wholeMs', 'firstMs', 'allMs', 'gapMs', 'textInMs', 'declaredMs') {
+  foreach ($c in 'prefixReads', 'prefixMs', 'wholeMs', 'firstMs', 'tenMs', 'allMs', 'gapMs', 'textInMs', 'declaredMs') {
     $v = @($rows.$c | Where-Object { -not [double]::IsNaN($_) } | Sort-Object)
     if ($v.Count) { Write-Output ("{0,-12} min {1}  median {2}  max {3}" -f $c, $v[0], $v[[int][math]::Floor(($v.Count - 1) / 2)], $v[-1]) }
   }
