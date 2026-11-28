@@ -7,11 +7,15 @@
 // detail. What it cannot hash is the code that interprets those: the geometry kernel and the interpreter. Those are covered by
 // VOCAB_VERSION (bumped when the vocabulary's output changes) and CACHE_FORMAT here (bumped when the entry's layout changes);
 // both are in the entry's header, and an entry with another of either is a clean miss, rebuilt and replaced. A change to the
-// kernel that changes a product without bumping VOCAB_VERSION would leave stale entries: PEGASUS_MESH_CACHE=off, or deleting the
-// folder, is the remedy, and the rule is to bump the version.
+// kernel that changes a product without bumping VOCAB_VERSION is caught by the build stamp below.
 //
-// THE FILE. header (40 bytes, little-endian): magic, CACHE_FORMAT, kind (mesh or material), VOCAB_VERSION, the key (u64), the
-// payload's length (u64), the payload's checksum (u64); then the payload. The reader checks all of them, the exact length and
+// THE BUILD STAMP. VOCAB_VERSION is bumped by hand, which is forgotten while a library is under change. So every entry carries the
+// stamp of the build that wrote it (`buildStamp`: a hash of the running executable's bytes, which hold partbuild, sculpt and every
+// package linked); an entry of another stamp is a clean miss, rebuilt and replaced. The stamp is not in the key, so a stale file
+// is overwritten, not left beside the new one.
+//
+// THE FILE. header (48 bytes, little-endian): magic, CACHE_FORMAT, kind (mesh or material), VOCAB_VERSION, the key (u64), the
+// build stamp (u64), the payload's length (u64), the payload's checksum (u64); then the payload. The reader checks all of them, the exact length and
 // the payload's inside counts, and a file that fails any is a miss; an unreadable or damaged one is reported (once: the rebuilt
 // product replaces it). Nothing is read back that this key's builder did not write, and nothing here can crash on a bad file.
 //
@@ -30,7 +34,7 @@
 // or tangents (the worlds' meshes have neither; the entry does not carry them). Mock worlds' content is not cached: it is cheaper
 // to make than to read.
 
-pub const CACHE_FORMAT = 1u32;
+pub const CACHE_FORMAT = 2u32;
 pub const CACHE_MESH = 1u32;        // an entry of a mesh key: the mesh, its box, its half sizes
 pub const CACHE_MATERIAL = 2u32;    // an entry of a material key: the material's record
 
@@ -43,10 +47,14 @@ pub const CACHE_CAP_BYTES = 536870912u64;
 pub const LOAD_HIT = 1u32;          // the product was read back
 pub const LOAD_MISS = 2u32;         // no entry
 pub const LOAD_CORRUPT = 3u32;      // an entry that is damaged, truncated or unreadable: rebuilt, and reported
-pub const LOAD_OLD = 4u32;          // an entry of another format or vocabulary version: rebuilt, nothing to report
+pub const LOAD_OLD = 4u32;          // an entry of another format, vocabulary version or build: rebuilt, nothing to report
+
+// What a check's mutant makes `readEntry` trust (flags in `lax`; 0 is the real reader)
+pub const LAX_SUM = 1u32;           // the payload's checksum is not checked
+pub const LAX_STAMP = 2u32;         // the build stamp is not compared
 
 const CACHE_MAGIC = 0x4d474550u32;  // "PEGM"
-const HEADER_BYTES = 40usize;
+const HEADER_BYTES = 48usize;
 const CACHE_MAX_ITEMS = 268435456usize;
 const FNV_OFFSET = 14695981039346656037u64;
 const FNV_PRIME = 1099511628211u64;
@@ -85,6 +93,33 @@ pub fn entryPath(dir: &Path, key: ContentKey) Path {
   var name = cacheHex(key);
   name.append(CACHE_EXTENSION);
   dir.join(name.view())
+}
+
+fn sumOfBytes(b: &Array[u8]) u64 { cacheSum(b as *u8, b.len) }
+
+// The mutants asked for in PEGASUS_MUTANT: cache-skip-checksum and cache-ignore-stamp
+pub fn cacheLax() u32 {
+  var lax = 0u32;
+  if mutantIs("cache-skip-checksum") { lax = lax | LAX_SUM; }
+  if mutantIs("cache-ignore-stamp") { lax = lax | LAX_STAMP; }
+  lax
+}
+
+// The stamp of this build: a hash of the running executable's bytes (0: the file could not be read). Chosen over a hash of the
+// sources taken when building because a source hash needs a build script that every way of building would have to run, and a
+// build that skipped it would be stale without saying so; the executable cannot be stale. It over-misses (a change to code that
+// makes no mesh changes it too), which costs one rebuild of the cache.
+pub fn buildStamp() u64 {
+  match process.currentExe() {
+    case let Ok(exe) {
+      match fs.readFile(&exe) {
+        case let Ok(bytes) { return sumOfBytes(bytes.view()); }
+        else {}
+      }
+    }
+    else {}
+  }
+  0u64
 }
 
 // ---- Bytes in and out ----
@@ -197,7 +232,7 @@ pub fn cacheable(kind: u32, p: &PartProducts) bool {
 }
 
 // The entry of 'p' under 'key', as the file's bytes
-pub fn entryBytes(key: ContentKey, kind: u32, p: &PartProducts) List[u8] {
+pub fn entryBytes(key: ContentKey, kind: u32, stamp: u64, p: &PartProducts) List[u8] {
   var body = List[u8]();
   if kind == CACHE_MESH {
     cachePutVec3(&mut body, p.low); cachePutVec3(&mut body, p.high); cachePutVec3(&mut body, p.half);
@@ -225,6 +260,7 @@ pub fn entryBytes(key: ContentKey, kind: u32, p: &PartProducts) List[u8] {
   cachePutU32(&mut out, kind);
   cachePutU32(&mut out, VOCAB_VERSION);
   cachePutU64(&mut out, key);
+  cachePutU64(&mut out, stamp);
   cachePutU64(&mut out, u64.from(body.len()));
   cachePutU64(&mut out, cacheSum(body.view() as *u8, body.len()));
   out.appendSlice(body.view());
@@ -233,13 +269,14 @@ pub fn entryBytes(key: ContentKey, kind: u32, p: &PartProducts) List[u8] {
 
 // The products an entry's bytes hold, into 'out' (whose mesh is empty). LOAD_HIT, LOAD_CORRUPT or LOAD_OLD. 'skipSum' is the
 // mutant that does not check the payload's checksum
-pub fn readEntry(b: &Array[u8], key: ContentKey, kind: u32, skipSum: bool, out: &mut PartProducts) u32 {
+pub fn readEntry(b: &Array[u8], key: ContentKey, kind: u32, stamp: u64, lax: u32, out: &mut PartProducts) u32 {
   if b.len < HEADER_BYTES { return LOAD_CORRUPT; }
   if getU32(b, 0usize) != CACHE_MAGIC { return LOAD_CORRUPT; }
   if getU32(b, 4usize) != CACHE_FORMAT || getU32(b, 12usize) != VOCAB_VERSION { return LOAD_OLD; }
   if getU32(b, 8usize) != kind || getU64(b, 16usize) != key { return LOAD_CORRUPT; }
-  if getU64(b, 24usize) != u64.from(b.len - HEADER_BYTES) { return LOAD_CORRUPT; }
-  if !skipSum && cacheSum((b as *u8) + HEADER_BYTES, b.len - HEADER_BYTES) != getU64(b, 32usize) { return LOAD_CORRUPT; }
+  if (lax & LAX_STAMP) == 0u32 && getU64(b, 24usize) != stamp { return LOAD_OLD; }
+  if getU64(b, 32usize) != u64.from(b.len - HEADER_BYTES) { return LOAD_CORRUPT; }
+  if (lax & LAX_SUM) == 0u32 && cacheSum((b as *u8) + HEADER_BYTES, b.len - HEADER_BYTES) != getU64(b, 40usize) { return LOAD_CORRUPT; }
   var at = HEADER_BYTES;
   if kind == CACHE_MESH {
     var low = Vec3(0., 0., 0.);
@@ -300,10 +337,10 @@ pub fn readEntry(b: &Array[u8], key: ContentKey, kind: u32, skipSum: bool, out: 
 }
 
 // Read the entry of 'key' from 'dir' into 'out'. No file is a miss; a file that cannot be read is corrupt
-pub fn loadEntry(dir: &Path, key: ContentKey, kind: u32, skipSum: bool, out: &mut PartProducts) u32 {
+pub fn loadEntry(dir: &Path, key: ContentKey, kind: u32, stamp: u64, lax: u32, out: &mut PartProducts) u32 {
   let file = entryPath(dir, key);
   match fs.readFile(&file) {
-    case let Ok(text) { return readEntry(text.view(), key, kind, skipSum, out); }
+    case let Ok(text) { return readEntry(text.view(), key, kind, stamp, lax, out); }
     case let Err(e) { if e.notFound() { return LOAD_MISS; } }
   }
   LOAD_CORRUPT
@@ -322,11 +359,12 @@ struct Found {
 pub struct MeshCache {
   pub dir: Path;                    // empty: no cache
   pub cap: u64;
+  pub stamp: u64;                   // the build that writes: its entries carry this (`buildStamp`)
   used: List[ContentKey];           // oldest first
   pub stored: u64;
   pub evicted: u64;
 
-  pub fn make(dir: Path, cap: u64) MeshCache { MeshCache(dir, cap, List[ContentKey](), 0u64, 0u64) }
+  pub fn make(dir: Path, stamp: u64, cap: u64) MeshCache { MeshCache(dir, cap, stamp, List[ContentKey](), 0u64, 0u64) }
 
   pub fn on(self: &) bool { !dir.isEmpty() }
 
@@ -351,7 +389,7 @@ pub struct MeshCache {
   pub fn store(self: &mut, key: ContentKey, kind: u32, p: &PartProducts) bool {
     if !self.on() || !cacheable(kind, p) { return false; }
     match fs.makeDirAll(&dir) { else {} }
-    let bytes = entryBytes(key, kind, p);
+    let bytes = entryBytes(key, kind, stamp, p);
     var tmpName = cacheHex(key);
     tmpName.append(CACHE_TMP_EXTENSION);
     tmpName.append(cacheHex(u64.from(time.Instant.now().nanos())).view());

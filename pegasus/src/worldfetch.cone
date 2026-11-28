@@ -1,0 +1,150 @@
+// Fetching a world's text: from a path on disk, or from a URL (http://), by the Loader's own connection.
+//
+// THE MANIFEST (a choice of the smallest kind; browser-arch may change it). A world is named by one location. If the name ends in
+// ".world" it is a MANIFEST: a text file with one file name on each line (blank lines and lines starting "//" are left out), each
+// name relative to the manifest's own folder or URL. The world's text is the files' texts in the manifest's order, one after the
+// other (a newline between two when the first does not end in one). Any other name is the world's one file.
+// The language has no way for one file to add to a part another file made, so the files are cut at part boundaries and the order
+// is the world's order; the first cut is the text's, not the language's.
+//
+// THE FETCH. `Fetcher` is an actor of the Loader's own, holding the Loader's own HttpClient (Sim's connections are another's:
+// asset traffic and state traffic never share one). A fetch awaits, so the Loader's other messages run while the bytes come; a
+// fetch of a file that fails prints what went wrong and is empty. Several files are asked for at once; the client's pool decides
+// how many connections that is.
+
+pub const FETCH_LIMIT_SECONDS = 30i64;
+
+// What `Fetcher.text` came back with
+pub struct Fetched {
+  pub text: String;
+  pub ok: bool;
+}
+
+// "PREFIX N SUFFIX" as one string, so a line one actor prints is never broken by another's (the arrival lines)
+pub fn numberLine(prefix: &str, n: u64, suffix: &str) String {
+  var digits = List[u8]();
+  var v = n;
+  if v == 0u64 { digits.push('0'); }
+  while v > 0u64 {
+    digits.push('0' + u8.from(v % 10u64));
+    v = v / 10u64;
+  }
+  var s = String.from(prefix);
+  var i = digits.len();
+  while i > 0usize {
+    i = i - 1usize;
+    s.appendByte(*digits[i]);
+  }
+  s.append(suffix);
+  s
+}
+
+// The location is a URL the Loader fetches (and not a path on this disk)
+pub fn isUrl(loc: &str) bool { loc.startsWith("http://") || loc.startsWith("https://") }
+
+// The location names a manifest
+pub fn isManifest(loc: &str) bool { loc.endsWith(".world") }
+
+// The file names a manifest's text lists, in order
+pub fn manifestFiles(text: &str) List[String] {
+  var out = List[String]();
+  var it = text.lines();
+  while true {
+    match it.next() {
+      case let Some(line) {
+        let t = line.trim();
+        if t.len() > 0usize && !t.startsWith("//") { out.push(String.from(t)); }
+      }
+      else { break; }
+    }
+  }
+  out
+}
+
+// The location of 'name' beside 'loc': 'loc' up to and including its last '/' (or '\'), then 'name'
+pub fn siblingOf(loc: &str, name: &str) String {
+  let b: &Array[u8] = loc;
+  var cut = 0usize;
+  var i = 0usize;
+  while i < b.len {
+    if b[i] == '/' || b[i] == '\\' { cut = i + 1usize; }
+    i = i + 1usize;
+  }
+  var out = String();
+  out.appendBytes(&b[..<cut]);
+  out.append(name);
+  out
+}
+
+// A world's whole text read from disk by the caller's own thread (the key count the headless run checks): the file, or a manifest's
+// files in order. Empty if one cannot be read
+pub fn readWorldNow(loc: &str) String {
+  var out = String();
+  match fs.readFile(&Path.from(loc)) {
+    case let Ok(text) {
+      if !isManifest(loc) { out.appendBytes(text.view()); return out; }
+      let names = manifestFiles(String.from(text.view()).view());
+      each n in &names {
+        match fs.readFile(&Path.from(siblingOf(loc, n.view()).view())) {
+          case let Ok(part) { out.appendBytes(part.view()); out.append(joinAfter(part.view()).view()); }
+          else { return String(); }
+        }
+      }
+    }
+    else {}
+  }
+  out
+}
+
+// "\n" if 'text' does not end in one, else nothing: files join without running two lines together
+pub fn joinAfter(text: &Array[u8]) String {
+  var s = String();
+  if text.len > 0usize && text[text.len - 1usize] != '\n' { s.append("\n"); }
+  s
+}
+
+actor Fetcher {
+  client: HttpClient;
+
+  fn init(self: &new) { *self = Self(HttpClient.standard()); }
+
+  // The text at 'loc': a URL by the client, else a path on disk read in chunks
+  pub async fn text(self, loc: String) Fetched {
+    var text = String();
+    var ok = false;
+    if isUrl(loc.view()) {
+      let r = await client.getIn(loc.view(), IoLimits.until(Instant.now() + Duration.fromSeconds(FETCH_LIMIT_SECONDS)));
+      match r {
+        case let Ok(res) {
+          if res.status == 200u16 { text.append(res.body.view()); ok = true; }
+          else { print <- "fetch: "; printStr(loc.view()); print <- " answered status "; print <- u64.from(res.status); print <- "\n"; }
+        }
+        case let Err(e) { print <- "fetch: "; printStr(loc.view()); print <- " cannot be fetched: "; print <- e; print <- "\n"; }
+      }
+      return Fetched(text, ok);
+    }
+    let path = Path.from(loc.view());
+    var f = File.none();
+    var opened = await aio.openFile(&path, Access.Read);
+    match &mut opened {
+      case var &mut Ok(good) { f <-> *good; }
+      case var &mut Err(e) { print <- "loader: "; printStr(loc.view()); print <- " cannot be opened: error "; print <- e.code; print <- "\n"; }
+    }
+    var offset = 0u64;
+    var going = !f.isNone();
+    ok = going;
+    while going {
+      var read = await f.readAt(offset, IoBuf(READ_CHUNK));
+      going = false;
+      match &mut read {
+        case var &mut Ok(buf) {
+          text.appendBytes(buf.view());
+          offset = offset + u64.from(buf.len());
+          going = buf.len() == READ_CHUNK;
+        }
+        case var &mut Err(e) { print <- "loader: "; printStr(loc.view()); print <- " cannot be read: error "; print <- e.code; print <- "\n"; ok = false; }
+      }
+    }
+    Fetched(text, ok)
+  }
+}
