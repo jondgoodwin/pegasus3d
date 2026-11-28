@@ -5,8 +5,14 @@
 // design choices, all proposed).
 //
 // One program, three roles: 'role' chooses which parts of the step run.
-// Only SIM_WHOLE (local play) is built; SIM_SERVER and SIM_CLIENT are named so
-// the step's switches have somewhere to go.
+//   whole    local play: admit, move the person from its intents, react, publish.
+//   server   (W117, plan step 8) a shared zone's truth: admit and apply each
+//            client's input samples (netplay.cone), react, send the shared and
+//            personal snapshots every other step; no Render or Audio.
+//   client   predicts its own person from its intents, reconciles on the
+//            server's acknowledgement, interpolates the others from the shared
+//            snapshots, and publishes one merged snapshot.
+// The wire and the cores are in netplay.cone; this file is the step.
 //
 // The step, in its order: admit (actions that arrived, stamped for this
 // step), move (the person from its intents), sense (stub), react (the action
@@ -20,8 +26,11 @@
 //   stop()            the run ends after the step under way
 
 pub const SIM_WHOLE = 0u32;         // local play: the truth, every rule
-pub const SIM_SERVER = 1u32;        // a shared zone's truth (not built)
-pub const SIM_CLIENT = 2u32;        // predicts its person, follows a server (not built)
+pub const SIM_SERVER = 1u32;        // a shared zone's truth
+pub const SIM_CLIENT = 2u32;        // predicts its person, follows a server
+
+const JOIN_WAIT_STEPS = 900u64;     // a client not in this many steps (15 s) after it started gives up
+const EMPTY_STEPS = 30u64;          // a server with --until-empty ends this long after its last client left
 
 pub const STEP_HZ = 60u64;
 pub const STEP_NS = 16666667u64;    // 1 / 60 s
@@ -57,6 +66,7 @@ pub struct SimStart {
   pub stallAtStep: u64;             // a check: at this step, busy for 'stallMs' (0: never)
   pub stallMs: u64;
   pub finished: Sender[i32];        // told the run's verdict when 'steps' are done
+  pub net: NetStart;                // the role, and what a server or a client needs of the network
 }
 
 actor Sim {
@@ -79,10 +89,18 @@ actor Sim {
   lateSteps: u64;                   // steps dropped because the loop fell behind
   mutateAfterPublish: bool;         // the snapshot check's mutant (PEGASUS_MUTANT=mutate-snapshot)
   lastPublished: Option[Published];
+  net: NetState;                    // connected play (netplay.cone): the server's rows, the client's link, predictor and interpolator
+  haveImage: bool;                  // the Loader's world image arrived
+  declaredFromServer: bool;         // a client: the server's declarations were taken
+  idleSteps: u64;                   // a client: steps waited to join
+  startedNs: i64;
+  zoneKeys: usize;                  // a server: the distinct keys of its parts
+  finishedSent: bool;
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
-      Actions(), Actions(), Actions(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published]);
+      Actions(), Actions(), Actions(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
+      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false);
   }
 
   // Loader -> Sim (move): the world image. Each part is given its id now,
@@ -90,18 +108,31 @@ actor Sim {
   pub async fn world(self, image: WorldImage) {
     worldName = image.name.clone();
     person.feet = image.startFeet;
+    haveImage = true;
+    if role == SIM_CLIENT {
+      // The server declares the parts; this image only taught the Loader its keys
+      print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(image.parts.len());
+      print <- " parts (the server's declarations are awaited)\n";
+      self.maybeHello();
+      return;
+    }
+    var keys = List[ContentKey]();
     each d in &image.parts {
       let id = u32.from(parts.len());
       parts.push(SimPart(id, d.name.clone(), d.key, d.placement, true));
       let at = d.placement.translation();
       loader.build(ContentRequest(d.key, id, (at - person.feet).length()));
+      if !keys.contains(&d.key) { keys.push(d.key); }
     }
+    zoneKeys = keys.len();
     print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(parts.len());
     print <- " parts, "; print <- u64.from(image.units.len()); print <- " Sim units (mock)\n";
   }
 
   // Loader -> Sim (move): the shapes of a key
   pub async fn shapes(self, s: ContentShapes) {
+    // A client never rebuilds shapes: the server's are the truth (procgen is not bit-identical across machines)
+    if role == SIM_CLIENT { return; }
     heldShapes.push(s);
   }
 
@@ -119,6 +150,7 @@ actor Sim {
   pub async fn run(self) {
     running = true;
     print <- "sim: role "; printStr(simRoleName(role)); print <- ", "; print <- STEP_HZ; print <- " Hz\n";
+    self.openNet();
     var next = Instant.now().nanos() + i64.from(STEP_NS);
     while running {
       _ = await aio.sleepUntil(Instant.fromNanos(next));
@@ -133,27 +165,47 @@ actor Sim {
         next = next + i64.from(STEP_NS);
       }
     }
+    self.leaveNet();
+    _ = await aio.sleep(Duration.fromMillis(150i64));   // the goodbye leaves before the socket does
+    self.closeNet();
     render.stop();
     audio.stop();
     loader.stop();
   }
 
   fn stepOnce(self: &mut, atNs: u64) {
+    if role == SIM_CLIENT && !self.clientReady() { return; }   // before it is in, a client's steps are not counted
     step = step + 1u64;
-    if role == SIM_WHOLE || role == SIM_SERVER { self.admit(); }
-    self.move();
+    if role == SIM_SERVER { self.serveJoins(); }
+    if role == SIM_CLIENT { self.admitClient(); } else { self.admit(); }
+    if role == SIM_CLIENT { self.moveClient(); }
+    else if role == SIM_SERVER { self.moveServer(); }
+    else { self.move(); }
     self.sense();
     self.react();
     self.derive();
+    if role == SIM_SERVER { self.sendSnapshots(); self.hangUps(); }
     self.publish(atNs);
     if step % STEP_HZ == 0u64 { self.printLine(); }
     if io.stallAtStep != 0u64 && step == io.stallAtStep { busyFor(io.stallMs); }
-    if io.steps != 0u64 && step == io.steps {
-      running = false;
-      let verdict = self.checks();
-      var f = io.finished.clone();
-      f <- verdict;
+    if io.steps != 0u64 && step == io.steps { self.endRun(); }
+    if role == SIM_SERVER && io.net.untilEmpty && net.everJoined && net.clients.len() == 0usize && step >= net.emptySince + EMPTY_STEPS {
+      self.endRun();
     }
+    if role == SIM_CLIENT && net.phase == PHASE_GONE && !finishedSent {
+      print <- "sim: the server's connection ended\n";
+      self.endRun();
+    }
+  }
+
+  // The run is over: its checks, printed, and the verdict told once
+  fn endRun(self: &mut) {
+    running = false;
+    if finishedSent { return; }
+    finishedSent = true;
+    let verdict = self.checks();
+    var f = io.finished.clone();
+    f <- verdict;
   }
 
   // Admit: the actions that arrived, in the order they came, stamped for
@@ -175,17 +227,372 @@ actor Sim {
     let m = io.moves.newest();
     let look = io.looks.newest();
     person.yaw = look.yaw;
-    let ahead = Vec3(0. - sin(look.yaw), 0., 0. - cos(look.yaw));
-    let right = Vec3(cos(look.yaw), 0., 0. - sin(look.yaw));
-    var dir = ahead * clampUnit(m.forward) + right * clampUnit(m.strafe);
-    let len = dir.length();
-    if len > 1. { dir = dir * (1. / len); }
-    let d = dir * (WALK_SPEED * STEP_SECONDS);
+    let d = walkDelta(look.yaw, m.forward, m.strafe);   // the body rule the server runs too (netplay.cone)
     person.feet = person.feet + d;
     if m.forward > 0.5 {
       walkSteps = walkSteps + 1u64;
       walked = walked + d.length();
     }
+  }
+
+  // ---- Connected play: the network ----
+
+  // The endpoint of a server (listening, with a lossy relay in front if asked) or of a client (dialling)
+  fn openNet(self: &mut) {
+    if role == SIM_WHOLE { return; }
+    let me = selfactor;
+    let handler = eventHandler(Uni[fn(ev: NetEvent) + Sendable](fn(ev: NetEvent) [me] { me.onNet(ev); }));
+    if role == SIM_SERVER {
+      let bindTo = if io.net.loopback { SocketAddr.localhost(u16.from(io.net.port)) } else { SocketAddr.v4(0u8, 0u8, 0u8, 0u8, u16.from(io.net.port)) };
+      let bound = mustListen(bindTo, NetConfig.defaults(), handler);
+      net.port = u32.from(bound.port);
+      print <- "Serving on UDP port "; print <- net.port; print <- "\n";
+      if io.net.impairLoss > 0u32 || io.net.impairLatency > 0u32 || io.net.impairJitter > 0u32 {
+        let link = LinkConfig.lossy(io.net.impairLoss, i64.from(io.net.impairLatency), i64.from(io.net.impairJitter));
+        var relay = startLossyRelay(SocketAddr.localhost(bound.port), link, link, 1u64);
+        net.relayPort = u32.from(relay.port);
+        print <- "Relay: port "; print <- net.relayPort; print <- " ("; print <- io.net.impairLoss; print <- " per 1000 lost, ";
+        print <- io.net.impairLatency; print <- " ms and up to "; print <- io.net.impairJitter; print <- " more each way)\n";
+        net.relay = Some[LossyRelay](relay);
+      }
+      net.endpoint = Some[Endpoint](bound.endpoint);
+      print.flush();
+    } else {
+      let bound = mustConnect(parseAddress(io.net.address.view()), NetConfig.defaults(), handler);
+      net.endpoint = Some[Endpoint](bound.endpoint);
+    }
+  }
+
+  // The run is over: a client tells the server it is leaving (its connection closes)
+  fn leaveNet(self: &mut) {
+    if role == SIM_CLIENT {
+      match &mut net.link {
+        case var &mut Some(c) { c.close(); }
+        else {}
+      }
+    }
+  }
+
+  fn closeNet(self: &mut) {
+    match &mut net.relay {
+      case var &mut Some(r) { r.stop(); }
+      else {}
+    }
+    match &net.endpoint {
+      case let Some(e) { e.shutdown(); }
+      else {}
+    }
+  }
+
+  // netmsg -> Sim (event): a connection joined or left, a message came, a stream's newest value came
+  pub async fn onNet(self, ev: NetEvent) {
+    if role == SIM_SERVER { self.serverEvent(ev); }
+    else if role == SIM_CLIENT { self.clientEvent(ev); }
+  }
+
+  // ---- Connected play: the server ----
+
+  fn serverEvent(self: &mut, event: NetEvent) {
+    var ev = event;
+    match ev {
+      case let Joined(j) {
+        if net.row(j.id) == NO_ROW { net.clients.push(ClientRow.make(j.id, j.conn)); }
+        print <- "sim: connection "; print <- j.id; print <- " opened\n";
+      }
+      case let Left(l) {
+        let k = net.row(l.id);
+        if k != NO_ROW {
+          self.printRow(k, "left");
+          net.clients.remove(k);
+          net.leaves = net.leaves + 1u64;
+          if net.clients.len() == 0usize { net.emptySince = step; }
+        }
+      }
+      case var Message(m) {
+        let data = m.data;
+        self.serverMessage(m.id, data);
+      }
+      case var Update(u) {
+        let data = u.data;
+        self.serverUpdate(u.id, u.stream, data);
+      }
+      else {}
+    }
+  }
+
+  fn serverMessage(self: &mut, id: u32, data: Bytes) {
+    let k = net.row(id);
+    if k == NO_ROW { return; }
+    let says = decodeClientSays(data);
+    if says.tag == 0u32 { net.malformed = net.malformed + 1u64; return; }
+    if says.tag == C_HELLO {
+      if net.clients[k].helloed { net.malformed = net.malformed + 1u64; return; }
+      if says.version != NET_VERSION { self.refuse(k, "the wire version differs"); return; }
+      // (the world's name is checked once the zone is loaded: serveJoins)
+      net.clients[k].world = says.world.clone();
+      net.clients[k].helloed = true;
+    } else if says.tag == C_PRESS {
+      if !net.clients[k].declared { net.malformed = net.malformed + 1u64; return; }
+      var a = says.action;
+      if a.receiver != NO_PART && usize.from(a.receiver) >= parts.len() { a.receiver = NO_PART; }
+      arrived.push(a);
+      net.clients[k].presses = net.clients[k].presses + 1u64;
+    }
+  }
+
+  fn serverUpdate(self: &mut, id: u32, stream: u16, data: Bytes) {
+    let k = net.row(id);
+    if k == NO_ROW || u32.from(stream) != STREAM_INPUT || !net.clients[k].declared { return; }
+    var got = BodySamples();
+    if !decodeInput(data, &mut got) { net.malformed = net.malformed + 1u64; return; }
+    net.clients[k].take(&got);
+  }
+
+  fn refuse(self: &mut, k: usize, why: &str) {
+    let r = &mut net.clients[k];
+    sendReliable(&mut r.conn, &encodeRefused(why));
+    r.hangUpAt = step + 30u64;
+    net.refusals = net.refusals + 1u64;
+    print <- "sim: connection "; print <- r.id; print <- " refused: "; printStr(why); print <- "\n";
+  }
+
+  // The clients that said Hello are let in once the zone is ready: its shapes
+  // are all built. The declarations go as bulk (reliable, in order)
+  fn serveJoins(self: &mut) {
+    if !haveImage || heldShapes.len() < zoneKeys { return; }
+    var i = 0usize;
+    while i < net.clients.len() {
+      if net.clients[i].helloed && !net.clients[i].declared && net.clients[i].hangUpAt == 0u64 {
+        var live = 0usize;
+        each q in &net.clients { if q.declared { live = live + 1usize; } }
+        if net.clients[i].world.view() != worldName.view() { self.refuse(i, "this server runs another world"); }
+        else if live >= MOST_PEOPLE { self.refuse(i, "the zone is full"); }
+        else { self.admitPerson(i); }
+      }
+      i = i + 1usize;
+    }
+  }
+
+  // Row 'i' is let in: its welcome, the declarations as bulk, and Joined
+  fn admitPerson(self: &mut, i: usize) {
+    let r = &mut net.clients[i];
+    r.person = PersonState(person.feet, 0.);
+    sendReliable(&mut r.conn, &encodeWelcome(r.id, worldName.view(), person.feet, parts.len(), heldShapes.len()));
+    var msgs = encodeParts(&parts);
+    each m in &msgs { sendReliable(&mut r.conn, m); }
+    var sh = encodeShapes(&heldShapes);
+    each m in &sh { sendReliable(&mut r.conn, m); }
+    sendReliable(&mut r.conn, &encodeJoined());
+    r.declared = true;
+    net.joins = net.joins + 1u64;
+    net.everJoined = true;
+    print <- "sim: person "; print <- r.id; print <- " joined at step "; print <- step; print <- ": "; print <- u64.from(msgs.len() + sh.len() + 2usize);
+    print <- " declaration messages\n";
+  }
+
+  // Move, on the server: every client's body, from the samples it sent
+  fn moveServer(self: &mut) {
+    let now = Instant.now().nanos();
+    each r in &mut net.clients { if r.declared { r.applyAll(now); } }
+  }
+
+  // The shared part, once, to everyone; each client's personal part (every
+  // SNAPSHOT_EVERY steps: 30 a second)
+  fn sendSnapshots(self: &mut) {
+    if step % SNAPSHOT_EVERY != 0u64 || net.clients.len() == 0usize { return; }
+    let shared = bytesOfList(&encodeShared(step, &net.clients));
+    net.sharedBytes = net.sharedBytes + u64.from(shared.len());
+    if shared.len() > net.largestShared { net.largestShared = shared.len(); }
+    each r in &mut net.clients {
+      if r.declared {
+        sendLatest(&mut r.conn, STREAM_SHARED, shared.clone());
+        net.sharedSent = net.sharedSent + 1u64;
+        let personal = bytesOfList(&encodePersonal(step, r));
+        if personal.len() > net.largestPersonal { net.largestPersonal = personal.len(); }
+        sendLatest(&mut r.conn, STREAM_PERSONAL, personal);
+        net.personalSent = net.personalSent + 1u64;
+      }
+    }
+  }
+
+  fn hangUps(self: &mut) {
+    each r in &mut net.clients {
+      if r.hangUpAt != 0u64 && step >= r.hangUpAt { r.hangUpAt = 0u64; r.conn.close(); }
+    }
+  }
+
+  fn printRow(self: &, k: usize, when: &str) {
+    let r = &net.clients[k];
+    print <- "net server: person "; print <- r.id; print <- " "; printStr(when); print <- ": applied "; print <- r.applied;
+    print <- " samples (last "; print <- r.lastApplied; print <- ", "; print <- r.gaps; print <- " never arrived), feet (";
+    printF(r.person.feet.x); print <- ", "; printF(r.person.feet.y); print <- ", "; printF(r.person.feet.z); print <- "), ";
+    print <- r.presses; print <- " presses, first moved at ns "; print <- r.firstMoveNs; print <- "\n";
+  }
+
+  // ---- Connected play: the client ----
+
+  fn clientEvent(self: &mut, event: NetEvent) {
+    var ev = event;
+    match ev {
+      case let Joined(j) {
+        net.link = Some[Connection](j.conn);
+        self.maybeHello();
+      }
+      case let Left(l) {
+        if net.phase != PHASE_REFUSED { net.phase = PHASE_GONE; }
+        print <- "sim: the connection ended\n";
+      }
+      case var Message(m) {
+        let data = m.data;
+        self.clientMessage(data);
+      }
+      case var Update(u) {
+        let data = u.data;
+        self.clientUpdate(u.stream, data);
+      }
+      else {}
+    }
+  }
+
+  // Hello goes once the connection is open and the Loader's image has named the world
+  fn maybeHello(self: &mut) {
+    if role != SIM_CLIENT || net.phase != PHASE_DIALLING || !haveImage { return; }
+    var sent = false;
+    match &mut net.link {
+      case var &mut Some(c) { sendReliable(c, &encodeHello(worldName.view())); sent = true; }
+      else {}
+    }
+    if sent { net.phase = PHASE_ASKED; }
+  }
+
+  fn clientMessage(self: &mut, data: Bytes) {
+    let says = decodeServerSays(data);
+    if says.tag == 0u32 { net.malformed = net.malformed + 1u64; return; }
+    if says.tag == S_REFUSED {
+      net.refusedWhy = says.why.clone();
+      net.phase = PHASE_REFUSED;
+      print <- "REFUSED by the server: "; printStr(says.why.view()); print <- "\n";
+    } else if says.tag == S_WELCOME {
+      if says.version != NET_VERSION {
+        net.phase = PHASE_REFUSED;
+        net.refusedWhy = String.from("the wire version differs");
+        print <- "sim: the server's wire version differs\n";
+        return;
+      }
+      net.myId = says.yourId;
+      net.worldName = says.world.clone();
+      net.startFeet = says.feet;
+      net.wantParts = says.parts;
+      net.wantKeys = says.keys;
+      net.welcomed = true;
+    } else if says.tag == S_PARTS {
+      if says.firstId != u32.from(net.declared.len()) { net.malformed = net.malformed + 1u64; return; }
+      each d in &says.declared { net.declared.push(PartDecl(d.name.clone(), d.key, d.placement)); }
+    } else if says.tag == S_SHAPES {
+      each s in &says.shapes { net.shapesGot.push(*s); }
+    } else if says.tag == S_JOINED {
+      if u32.from(net.declared.len()) == net.wantParts && u32.from(net.shapesGot.len()) == net.wantKeys {
+        net.joinedMsg = true;
+      } else {
+        net.malformed = net.malformed + 1u64;
+        print <- "sim: the declarations were incomplete\n";
+      }
+    }
+  }
+
+  fn clientUpdate(self: &mut, stream: u16, data: Bytes) {
+    if u32.from(stream) == STREAM_SHARED {
+      var s = 0u64;
+      var all = OtherPersons();
+      if !decodeShared(data, &mut s, &mut all) { net.malformed = net.malformed + 1u64; return; }
+      var others = OtherPersons();
+      each p in &all { if p.id != net.myId { others.push(*p); } }
+      _ = net.interp.add(s, Instant.now().nanos(), others);
+      net.sharedGot = net.sharedGot + 1u64;
+    } else if u32.from(stream) == STREAM_PERSONAL {
+      var p = PersonalSnap(0u64, 0u32, Vec3(0., 0., 0.), 0.);
+      if !decodePersonal(data, &mut p) { net.malformed = net.malformed + 1u64; return; }
+      net.personal = Some[PersonalSnap](p);
+      net.personalGot = net.personalGot + 1u64;
+    }
+  }
+
+  // Whether the client is in and its steps may run. Once the server has said Joined and the Loader has
+  // named the world, the parts are declared at once and their content asked of the Loader, nearest first
+  fn clientReady(self: &mut) bool {
+    if declaredFromServer { return true; }
+    if net.joinedMsg && haveImage {
+      person.feet = net.startFeet;
+      each d in &net.declared {
+        let id = u32.from(parts.len());
+        parts.push(SimPart(id, d.name.clone(), d.key, d.placement, true));
+        loader.build(ContentRequest(d.key, id, (d.placement.translation() - person.feet).length()));
+      }
+      var gotShapes = ShapeTable();
+      gotShapes <-> net.shapesGot;
+      each s in &gotShapes { heldShapes.push(*s); }
+      net.predictor = Predictor.make(net.startFeet, mutantIs("no-replay"), mutantIs("stale-personal"));
+      net.phase = PHASE_JOINED;
+      declaredFromServer = true;
+      print <- "sim: joined as person "; print <- net.myId; print <- ": "; print <- u64.from(parts.len()); print <- " parts and ";
+      print <- u64.from(heldShapes.len()); print <- " shapes from the server\n";
+      return true;
+    }
+    idleSteps = idleSteps + 1u64;
+    if net.phase == PHASE_REFUSED || net.phase == PHASE_GONE || idleSteps > JOIN_WAIT_STEPS {
+      print <- "sim: not joined after "; print <- idleSteps; print <- " steps\n";
+      self.endRun();
+    }
+    false
+  }
+
+  // Admit, on a client: a press is resolved against the pick shapes the server sent (where things were in the frame
+  // the person saw) and forwarded as an event; nothing joins the local queue
+  fn admitClient(self: &mut) {
+    var got = Actions();
+    got <-> arrived;
+    each a in &got {
+      var b = *a;
+      if b.verb == VERB_PRESS && b.receiver == NO_PART { b.receiver = self.pick(b.from, b.along); }
+      match &mut net.link {
+        case var &mut Some(c) { sendReliable(c, &encodePress(&b)); }
+        else {}
+      }
+      net.pressesSent = net.pressesSent + 1u64;
+    }
+    got.clear();
+    got <-> arrived;
+  }
+
+  // Move, on a client: the server's word first (the acknowledged sample, and the body after it), then this step's
+  // sample moves the predicted body at once and goes to the server with every sample not yet acknowledged
+  fn moveClient(self: &mut) {
+    var have = false;
+    var snap = PersonalSnap(0u64, 0u32, Vec3(0., 0., 0.), 0.);
+    match &net.personal {
+      case let Some(p) { snap = *p; have = true; }
+      else {}
+    }
+    if have {
+      net.predictor.acknowledge(snap.ack, snap.feet, snap.yaw);
+      net.personal = None[PersonalSnap];
+    }
+    let m = io.moves.newest();
+    let look = io.looks.newest();
+    _ = net.predictor.sample(m.forward, m.strafe, look.yaw);
+    net.predictor.smooth();
+    person.feet = net.predictor.shown();
+    person.yaw = look.yaw;
+    if m.forward > 0.5 {
+      walkSteps = walkSteps + 1u64;
+      walked = walked + walkDelta(look.yaw, m.forward, m.strafe).length();
+    }
+    let bytes = bytesOfList(&net.predictor.encodeInput());
+    match &mut net.link {
+      case var &mut Some(c) { sendLatest(c, STREAM_INPUT, bytes); }
+      else {}
+    }
+    net.inputSent = net.inputSent + 1u64;
   }
 
   // Sense: areas crossed, contacts, timers due. None in the mock world
@@ -221,9 +628,12 @@ actor Sim {
   // Publish: the zone's parts and the person, as a snapshot nothing changes
   // after this
   fn publish(self: &mut, atNs: u64) {
+    if role == SIM_SERVER { return; }   // a server's zone is sent to its clients (sendSnapshots), not drawn
     var ps = PartStates();
     each p in &parts { ps.push(PartState(p.id, p.key, NO_PART, p.placement)); }
-    var s = Snapshot(step, atNs, person, ps, 0u64);
+    var others = OtherPersons();
+    if role == SIM_CLIENT { others = self.mergeOthers(); }
+    var s = Snapshot(step, atNs, person, ps, others, 0u64);
     s.sum = snapshotSum(&s);
     let out = Published(s);
     if mutateAfterPublish {
@@ -258,7 +668,32 @@ actor Sim {
     best
   }
 
+  // The client's merge, third part: the other people, from the server's shared snapshots a fixed delay in the past.
+  // Notes when it first sees one displaced from where it first saw it
+  fn mergeOthers(self: &mut) OtherPersons {
+    let now = Instant.now().nanos();
+    let others = net.interp.at(now);
+    if others.len() > net.othersSeen { net.othersSeen = others.len(); }
+    if others.len() > 0usize {
+      if !net.firstSeen {
+        net.firstSeen = true;
+        net.otherFirst = others[0usize].feet;
+        net.otherFirstId = others[0usize].id;
+      } else if net.firstOtherMovedNs == 0i64 {
+        each o in &others {
+          if o.id == net.otherFirstId && (o.feet - net.otherFirst).length() > 0.01 { net.firstOtherMovedNs = now; }
+        }
+      }
+    }
+    others
+  }
+
   fn printLine(self: &mut) {
+    if role == SIM_SERVER {
+      print <- "step "; print <- step; print <- " people "; print <- u64.from(net.clients.len()); print <- " joined "; print <- net.joins;
+      print <- " left "; print <- net.leaves; print <- "\n";
+      return;
+    }
     let d = io.drawn.newest();
     print <- "step "; print <- step; print <- " feet ("; printF(person.feet.x); print <- ", "; printF(person.feet.y);
     print <- ", "; printF(person.feet.z); print <- ") yaw "; printF(person.yaw); print <- " shapes ";
@@ -269,6 +704,67 @@ actor Sim {
 
   // The run's checks, printed: 0 if all passed, 1 if not
   fn checks(self: &mut) i32 {
+    if role == SIM_SERVER { return self.serverChecks(); }
+    if role == SIM_CLIENT { return self.clientChecks(); }
+    self.wholeChecks()
+  }
+
+  fn serverChecks(self: &mut) i32 {
+    var k = 0usize;
+    while k < net.clients.len() { self.printRow(k, "at the end"); k = k + 1usize; }
+    print <- "net server: "; print <- net.joins; print <- " joined, "; print <- net.leaves; print <- " left, "; print <- net.refusals;
+    print <- " refused; shared part sent "; print <- net.sharedSent; print <- " times (largest "; print <- u64.from(net.largestShared);
+    print <- " bytes), personal part "; print <- net.personalSent; print <- " (largest "; print <- u64.from(net.largestPersonal);
+    print <- " bytes); "; print <- net.malformed; print <- " messages did not parse\n";
+    let ok = net.malformed == 0u64 && net.joins > 0u64;
+    print <- "check server: "; if ok { print <- "ok\n"; } else { print <- "FAILED\n"; }
+    print <- "sim: "; print <- step; print <- " steps, "; print <- lateSteps; print <- " dropped as late\n";
+    if ok { 0 } else { 1 }
+  }
+
+  // A client's checks: it joined and took the server's declarations; its prediction matched the server's body at every
+  // acknowledged sample, within PREDICT_TOLERANCE; and, when it walks, it walked as a whole Sim's person does
+  fn clientChecks(self: &mut) i32 {
+    var ok = true;
+    print <- "check join: ";
+    if declaredFromServer {
+      print <- "person "; print <- net.myId; print <- ", "; print <- u64.from(parts.len()); print <- " parts and "; print <- u64.from(heldShapes.len());
+      print <- " shapes taken from the server, none rebuilt: ok\n";
+    } else {
+      print <- "FAILED (never joined"; if net.phase == PHASE_REFUSED { print <- ": "; printStr(net.refusedWhy.view()); } print <- ")\n";
+      ok = false;
+    }
+    let p = &net.predictor;
+    print <- "check prediction: "; print <- p.samples; print <- " samples, "; print <- p.acks; print <- " acknowledged, worst difference from the server at an acknowledged sample ";
+    printF(p.worstMismatch * 1000.); print <- " mm (tolerance "; printF(PREDICT_TOLERANCE * 1000.); print <- " mm), "; print <- p.mismatches;
+    print <- " mismatches; "; print <- p.corrections; print <- " corrections (worst "; printF(p.worstCorrection * 1000.); print <- " mm, ";
+    print <- p.snaps; print <- " snapped), "; print <- p.replayed; print <- " samples replayed, "; print <- p.stale; print <- " stale acknowledgements dropped";
+    if declaredFromServer && p.acks > 0u64 && p.worstMismatch <= PREDICT_TOLERANCE { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+    print <- "net client: person "; print <- net.myId; print <- " shared "; print <- net.sharedGot; print <- " personal "; print <- net.personalGot;
+    print <- " input "; print <- net.inputSent; print <- " stale shared dropped "; print <- net.interp.stale; print <- " malformed "; print <- net.malformed;
+    print <- "; saw up to "; print <- u64.from(net.othersSeen); print <- " others; first other moved at ns "; print <- net.firstOtherMovedNs;
+    print <- "; final feet ("; printF(net.predictor.person.feet.x); print <- ", "; printF(net.predictor.person.feet.y); print <- ", ";
+    printF(net.predictor.person.feet.z); print <- ")\n";
+    if net.malformed > 0u64 { ok = false; }
+    if io.net.walks {
+      let expected = f32.from(walkSteps) * STEP_SECONDS * WALK_SPEED;
+      print <- "check walk: "; print <- walkSteps; print <- " steps forward moved "; printF(walked); print <- " m";
+      let good = walkSteps >= 110u64 && walkSteps <= 130u64 && absf(walked - expected) < 0.01;
+      if good { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+      var boxA = NO_PART;
+      each q in &parts { if q.name.view() == "box-a" { boxA = q.id; } }
+      if boxA == NO_PART {
+        print <- "check pointer: skipped, this world has no part named box-a\n";
+      } else {
+        print <- "check pointer: "; print <- net.pressesSent; print <- " press sent to the server aimed at part "; print <- boxA;
+        if net.pressesSent >= 1u64 { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+      }
+    }
+    print <- "sim: "; print <- step; print <- " steps, "; print <- lateSteps; print <- " dropped as late\n";
+    if ok { 0 } else { 1 }
+  }
+
+  fn wholeChecks(self: &mut) i32 {
     var ok = true;
     let expected = f32.from(walkSteps) * STEP_SECONDS * WALK_SPEED;
     let seconds = f32.from(walkSteps) * STEP_SECONDS;

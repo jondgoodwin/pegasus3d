@@ -1,0 +1,787 @@
+// Connected play (plan step 8): what the client Sim and the server Sim say to
+// each other over netmsg, and the pure cores each side keeps, apart from the
+// actor so a check can drive them with no threads (as RenderCore is Render's).
+//
+// THE DESIGN is `Browser\doc\actors\sim.md`, "Connected play"; all of it is
+// proposed. What is built here:
+//   - the wire: tags and bytes of Hello, Welcome, the declarations (parts and
+//     shapes as bulk), Joined, Refused, a press, the input samples, the shared
+//     and the personal snapshot;
+//   - Predictor (client): the person's own body, predicted from its samples,
+//     reconciled on the server's acknowledged sequence number by replaying the
+//     samples after it, the difference blended away (or snapped, if large);
+//   - Interpolator (client): the other people from the server's shared
+//     snapshots, a fixed delay in the past;
+//   - ClientRow (server): one client's body, its pending samples, what it sent.
+//
+// THE FLOW is in `simactor.cone` (the steps); this file has no actor.
+//
+// Every number is written most significant byte first. A message that does not
+// parse is dropped whole and counted: nothing from outside is trusted.
+
+pub const NET_VERSION = 1u32;       // the wire's version: bump it when anything here changes
+
+// netmsg's latest-wins streams, by number
+pub const STREAM_INPUT = 1u32;      // client -> server: the unacknowledged input samples
+pub const STREAM_SHARED = 2u32;     // server -> every client: every person's body
+pub const STREAM_PERSONAL = 4u32;   // server -> one client: the last input it applied, and the body after
+
+// Reliable message tags (a byte)
+pub const C_HELLO = 1u32;
+pub const C_PRESS = 2u32;
+pub const S_REFUSED = 1u32;
+pub const S_WELCOME = 2u32;
+pub const S_PARTS = 3u32;
+pub const S_SHAPES = 4u32;
+pub const S_JOINED = 5u32;
+pub const NO_ROW = 0xFFFFFFFFusize;
+pub const PREDICT_TOLERANCE: f32 = 0.001;   // metres: how far the server's body may be from the predicted one at an acknowledged sample (same code, same machine: exact)
+
+const MOST_RELIABLE_BYTES = 1100usize;  // a reliable message stays under this (netmsg's limit is 1173)
+pub const MOST_PEOPLE = 16usize;           // clients one zone's server carries (the shared part must fit one packet)
+const MOST_SENT_SAMPLES = 30usize;      // the unacknowledged samples one packet carries (0.5 s)
+const MOST_HELD_SAMPLES = 240usize;     // the samples a client keeps unacknowledged (4 s); older are given up
+pub const SNAPSHOT_EVERY = 2u64;        // the server sends a snapshot every this many steps: 30 a second
+pub const INTERP_STEPS: f32 = 6.;       // others are shown this many steps (100 ms) in the past
+const RING = 16usize;                   // shared snapshots a client keeps
+const EPSILON: f32 = 0.0005;            // metres: below this a prediction was right
+const SNAP_AT: f32 = 1.;                // metres: a correction this large is snapped, not blended
+const BLEND: f32 = 0.8333333;           // the part of a blended error left after each step (0.1 s)
+
+// ---- Bytes ----
+
+fn putU8(out: &mut List[u8], v: u32) { out.push(u8.from(v & 255u32)); }
+
+fn putU32(out: &mut List[u8], v: u32) {
+  putU8(out, v >> 24u32); putU8(out, v >> 16u32); putU8(out, v >> 8u32); putU8(out, v);
+}
+
+fn putU64(out: &mut List[u8], v: u64) {
+  putU32(out, u32.from(v >> 32u64));
+  putU32(out, u32.from(v & 0xFFFFFFFFu64));
+}
+
+fn putF32(out: &mut List[u8], f: f32) { putU32(out, f.bits()); }
+
+fn putVec3(out: &mut List[u8], v: Vec3) { putF32(out, v.x); putF32(out, v.y); putF32(out, v.z); }
+
+fn putStr(out: &mut List[u8], s: &str) {
+  let b: &Array[u8] = s;
+  var n = b.len();
+  if n > 200usize { n = 200usize; }
+  putU8(out, u32.from(n));
+  var i = 0usize;
+  while i < n { out.push(b[i]); i = i + 1usize; }
+}
+
+// Some bytes as a message payload (netmsg's take Bytes): one copy into a pooled buffer
+fn bytesOfList(b: &List[u8]) Bytes {
+  var buf = IoBuf(b.len().max(1usize));
+  _ = buf.append(b.view());
+  buf.freeze()
+}
+
+// A message being read: where it is, and whether every read so far stayed inside it
+struct Take {
+  data: Bytes;
+  pos: usize;
+  ok: bool;
+
+  fn make(d: Bytes) Take { Take(d, 0usize, true) }
+
+  fn r8(self: &mut) u32 {
+    if !ok || pos >= data.len() { ok = false; return 0u32; }
+    let v = u32.from(data.view()[pos]);
+    pos = pos + 1usize;
+    v
+  }
+
+  fn r32(self: &mut) u32 {
+    let a = self.r8();
+    let b = self.r8();
+    let c = self.r8();
+    (a << 24u32) | (b << 16u32) | (c << 8u32) | self.r8()
+  }
+
+  fn r64(self: &mut) u64 {
+    let hi = u64.from(self.r32());
+    (hi << 32u64) | u64.from(self.r32())
+  }
+
+  fn rf32(self: &mut) f32 { f32.fromBits(self.r32()) }
+
+  fn rvec3(self: &mut) Vec3 {
+    let x = self.rf32();
+    let y = self.rf32();
+    let z = self.rf32();
+    Vec3(x, y, z)
+  }
+
+  fn rstr(self: &mut) String {
+    var s = String();
+    let n = self.r8();
+    var i = 0u32;
+    while i < n && ok { s.appendByte(u8.from(self.r8())); i = i + 1u32; }
+    s
+  }
+}
+
+// ---- The body: one rule for whole, server and client ----
+
+// How far one step of the walk moves the feet, facing 'yaw'. The one body
+// code the server runs and the client replays (sim.md: "with the same body
+// code the server ran")
+pub fn walkDelta(yaw: f32, forward: f32, strafe: f32) Vec3 {
+  let ahead = Vec3(0. - sin(yaw), 0., 0. - cos(yaw));
+  let right = Vec3(cos(yaw), 0., 0. - sin(yaw));
+  var dir = ahead * clampUnit(forward) + right * clampUnit(strafe);
+  let len = dir.length();
+  if len > 1. { dir = dir * (1. / len); }
+  dir * (WALK_SPEED * STEP_SECONDS)
+}
+
+pub fn applyBody(p: &mut PersonState, forward: f32, strafe: f32, yaw: f32) {
+  p.yaw = yaw;
+  p.feet = p.feet + walkDelta(yaw, forward, strafe);
+}
+
+// One input sample: the person's wish for one step, numbered from 1. 'after'
+// is where the client's body was when it made the sample (the client's own
+// record; it is not sent)
+pub struct BodySample {
+  pub seq: u32;
+  pub forward: f32;
+  pub strafe: f32;
+  pub yaw: f32;
+  pub after: Vec3;
+}
+alias BodySamples = List[BodySample];
+
+fn maxf(a: f32, b: f32) f32 { if a > b { a } else { b } }
+
+// ---- The client's own body: prediction and reconciliation ----
+
+pub struct Predictor {
+  pub person: PersonState;          // the predicted body now
+  pub history: BodySamples;         // the samples not yet acknowledged, oldest first
+  pub nextSeq: u32;
+  pub ackedSeq: u32;                // the newest acknowledgement taken
+  pub offset: Vec3;                 // the error being blended away: shown = person.feet + offset
+  pub samples: u64;                 // samples made
+  pub acks: u64;                    // acknowledgements taken
+  pub corrections: u64;             // the present moved by more than EPSILON because of one
+  pub snaps: u64;                   // ... of them by more than SNAP_AT, not blended
+  pub mismatches: u64;              // the server's body at an acknowledged number was not what was predicted for it
+  pub replayed: u64;                // samples replayed over the server's state, in all
+  pub stale: u64;                   // acknowledgements older than one taken: dropped
+  pub gaveUp: u64;                  // samples dropped unacknowledged after MOST_HELD_SAMPLES
+  pub worstMismatch: f32;           // metres: the largest difference at an acknowledged number
+  pub worstCorrection: f32;         // metres: the largest the present moved
+  skipReplay: bool;                 // the mutant: the unacknowledged samples are never replayed
+  takeStale: bool;                  // the mutant: an older acknowledgement is taken as if it were newest
+
+  pub fn make(start: Vec3, skipReplay: bool, takeStale: bool) Predictor {
+    Predictor(PersonState(start, 0.), BodySamples(), 1u32, 0u32, Vec3(0., 0., 0.), 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+      0., 0., skipReplay, takeStale)
+  }
+
+  // The person's wish for this step: the body moves at once (prediction) and
+  // the sample is kept until acknowledged. Returns its number
+  pub fn sample(self: &mut, forward: f32, strafe: f32, yaw: f32) u32 {
+    applyBody(&mut person, forward, strafe, yaw);
+    let seq = nextSeq;
+    nextSeq = nextSeq + 1u32;
+    history.push(BodySample(seq, forward, strafe, yaw, person.feet));
+    if history.len() > MOST_HELD_SAMPLES {
+      history.remove(0usize);
+      gaveUp = gaveUp + 1u64;
+    }
+    samples = samples + 1u64;
+    seq
+  }
+
+  // Where the body is drawn: the prediction, less the error still being blended away
+  pub fn shown(self: &) Vec3 { person.feet + offset }
+
+  // One step: the error blends away
+  pub fn smooth(self: &mut) { offset = offset * BLEND; }
+
+  // The server's body 'feet' after it applied sample 'ack': start from it and
+  // replay the samples since, with the body code the server ran. Where that
+  // differs from where the body was, the difference is blended away unless
+  // large
+  pub fn acknowledge(self: &mut, ack: u32, feet: Vec3, yaw: f32) {
+    if ack < ackedSeq && !takeStale {
+      stale = stale + 1u64;
+      return;
+    }
+    acks = acks + 1u64;
+    // what was predicted for the number the server answers
+    var i = 0usize;
+    while i < history.len() {
+      if history[i].seq == ack {
+        let m = (history[i].after - feet).length();
+        worstMismatch = maxf(worstMismatch, m);
+        if m > EPSILON { mismatches = mismatches + 1u64; }
+      }
+      i = i + 1usize;
+    }
+    // the samples the server has applied are done with
+    var keep = 0usize;
+    while keep < history.len() && history[keep].seq <= ack { keep = keep + 1usize; }
+    if keep > 0usize { history.removeRange(0usize, keep); }
+    ackedSeq = ack;
+    // replay the rest over the server's body
+    let before = person.feet;
+    var p = PersonState(feet, yaw);
+    if !skipReplay {
+      var k = 0usize;
+      while k < history.len() {
+        let s = &mut history[k];
+        applyBody(&mut p, s.forward, s.strafe, s.yaw);
+        s.after = p.feet;
+        k = k + 1usize;
+      }
+      replayed = replayed + u64.from(history.len());
+    }
+    let diff = p.feet - before;
+    let d = diff.length();
+    if d > EPSILON {
+      corrections = corrections + 1u64;
+      worstCorrection = maxf(worstCorrection, d);
+      if d > SNAP_AT {
+        snaps = snaps + 1u64;
+        offset = Vec3(0., 0., 0.);
+      } else {
+        offset = offset - diff;
+      }
+    }
+    person = p;
+  }
+
+  // The unacknowledged samples as a latest-wins value, oldest first, at most
+  // MOST_SENT_SAMPLES of the newest
+  pub fn encodeInput(self: &) List[u8] {
+    var out = List[u8]();
+    var from = 0usize;
+    if history.len() > MOST_SENT_SAMPLES { from = history.len() - MOST_SENT_SAMPLES; }
+    putU8(&mut out, u32.from(history.len() - from));
+    var i = from;
+    while i < history.len() {
+      let s = &history[i];
+      putU32(&mut out, s.seq); putF32(&mut out, s.forward); putF32(&mut out, s.strafe); putF32(&mut out, s.yaw);
+      i = i + 1usize;
+    }
+    out
+  }
+}
+
+// ---- The other people: interpolated from the server's shared snapshots ----
+
+struct SharedSnap {
+  step: u64;                        // the server's step
+  arrivalNs: i64;                   // when it arrived here, on time.Instant's clock
+  persons: OtherPersons;
+}
+
+pub struct Interpolator {
+  ring: List[SharedSnap];           // the newest RING, oldest first
+  pub added: u64;
+  pub stale: u64;                   // snapshots older than one held: dropped, never merged
+  takeStale: bool;                  // the mutant: an older snapshot is merged as if it were newest
+
+  pub fn make(takeStale: bool) Interpolator { Interpolator(List[SharedSnap](), 0u64, 0u64, takeStale) }
+
+  pub fn newestStep(self: &) u64 {
+    if ring.len() == 0usize { 0u64 } else { ring[ring.len() - 1usize].step }
+  }
+
+  // A shared snapshot arrived. False if it was older than one held
+  pub fn add(self: &mut, step: u64, arrivalNs: i64, persons: OtherPersons) bool {
+    if ring.len() > 0usize && step <= self.newestStep() && !takeStale {
+      stale = stale + 1u64;
+      return false;
+    }
+    if ring.len() >= RING { ring.remove(0usize); }
+    ring.push(SharedSnap(step, arrivalNs, persons));
+    added = added + 1u64;
+    true
+  }
+
+  // The lowest delay a snapshot arrived with: the server's clock in ours,
+  // read as the earliest arrival against the step it was made at
+  fn clockOffsetNs(self: &) i64 {
+    var best = 0i64;
+    var first = true;
+    each s in &ring {
+      let o = s.arrivalNs - i64.from(s.step) * i64.from(STEP_NS);
+      if first || o < best { best = o; first = false; }
+    }
+    best
+  }
+
+  // The people as they were 'INTERP_STEPS' steps before the server's step now
+  // (as this client estimates it): between the two snapshots that surround
+  // that time, or the newest if the time is past it
+  pub fn at(self: &, nowNs: i64) OtherPersons {
+    var out = OtherPersons();
+    if ring.len() == 0usize { return out; }
+    let newest = &ring[ring.len() - 1usize];
+    let sinceNewest = f32.from(nowNs - self.clockOffsetNs() - i64.from(newest.step) * i64.from(STEP_NS)) / f32.from(STEP_NS);
+    var x = sinceNewest - INTERP_STEPS;       // in steps, from the newest snapshot's
+    if x > 0. { x = 0.; }
+    // the pair: a is the newest at or before x, b the one after it
+    var b = ring.len() - 1usize;
+    var a = b;
+    var i = ring.len();
+    while i > 0usize {
+      i = i - 1usize;
+      let r = f32.from(i64.from(ring[i].step) - i64.from(newest.step));
+      if r <= x { a = i; break; }
+      b = i;
+      a = i;
+    }
+    if a == b {
+      each p in &ring[b].persons { out.push(*p); }
+      return out;
+    }
+    let ra = f32.from(i64.from(ring[a].step) - i64.from(newest.step));
+    let rb = f32.from(i64.from(ring[b].step) - i64.from(newest.step));
+    var f = (x - ra) / (rb - ra);
+    if f < 0. { f = 0.; }
+    if f > 1. { f = 1.; }
+    each pb in &ring[b].persons {
+      var shown = *pb;
+      each pa in &ring[a].persons {
+        if pa.id == pb.id {
+          shown = OtherPerson(pb.id, pa.feet + (pb.feet - pa.feet) * f, turnBetween(pa.yaw, pb.yaw, f));
+        }
+      }
+      out.push(shown);
+    }
+    out
+  }
+}
+
+// An angle 'f' of the way from 'a' to 'b', by the shorter turn
+fn turnBetween(a: f32, b: f32, f: f32) f32 {
+  var d = b - a;
+  while d > 3.1415927 { d = d - 6.2831855; }
+  while d < -3.1415927 { d = d + 6.2831855; }
+  a + d * f
+}
+
+// ---- The server's row for one client ----
+
+pub struct ClientRow {
+  pub id: u32;                      // the connection's id
+  pub conn: Connection;
+  pub person: PersonState;
+  pub lastApplied: u32;             // the newest input sample number applied
+  pub pending: BodySamples;         // samples received, not yet applied, oldest first
+  pub helloed: bool;                // its Hello was taken (the join runs once the zone is ready)
+  pub world: String;                // the world its Hello named
+  pub declared: bool;               // the declarations were sent: it is in
+  pub hangUpAt: u64;                // the step to end its connection at (0: not refused)
+  pub applied: u64;                 // samples applied
+  pub gaps: u64;                    // sample numbers that never arrived
+  pub firstMoveNs: i64;             // when its first moving sample was applied (0: none yet)
+  pub presses: u64;
+
+  pub fn make(id: u32, conn: Connection) ClientRow {
+    ClientRow(id, conn, PersonState(Vec3(0., 0., 0.), 0.), 0u32, BodySamples(), false, String(), false, 0u64, 0u64, 0u64, 0i64, 0u64)
+  }
+
+  // The samples a packet carried: those newer than any held are kept
+  pub fn take(self: &mut, got: &BodySamples) {
+    var newest = lastApplied;
+    if pending.len() > 0usize { newest = pending[pending.len() - 1usize].seq; }
+    var k = 0usize;
+    while k < got.len() {
+      let seq = got[k].seq;
+      if seq > newest {
+        pending.push(BodySample(seq, got[k].forward, got[k].strafe, got[k].yaw, Vec3(0., 0., 0.)));
+        newest = seq;
+      }
+      k = k + 1usize;
+    }
+  }
+
+  // Apply every pending sample, in order, with the body code
+  pub fn applyAll(self: &mut, nowNs: i64) {
+    var i = 0usize;
+    while i < pending.len() {
+      let s = &pending[i];
+      if s.seq > lastApplied + 1u32 { gaps = gaps + u64.from(s.seq - lastApplied - 1u32); }
+      applyBody(&mut person, s.forward, s.strafe, s.yaw);
+      if firstMoveNs == 0i64 && (s.forward != 0. || s.strafe != 0.) { firstMoveNs = nowNs; }
+      lastApplied = s.seq;
+      applied = applied + 1u64;
+      i = i + 1usize;
+    }
+    pending.clear();
+  }
+}
+alias ClientRows = List[ClientRow];
+
+// ---- Encoding: client to server ----
+
+pub fn encodeHello(world: &str) List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, C_HELLO); putU32(&mut out, NET_VERSION); putStr(&mut out, world);
+  out
+}
+
+pub fn encodePress(a: &Action) List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, C_PRESS); putU32(&mut out, a.verb); putU32(&mut out, a.receiver);
+  putVec3(&mut out, a.from); putVec3(&mut out, a.along); putU64(&mut out, a.madeNs);
+  out
+}
+
+// What a client's reliable message was
+pub struct ClientSays {
+  pub tag: u32;                     // C_HELLO, C_PRESS, or 0: it did not parse
+  pub version: u32;
+  pub world: String;
+  pub action: Action;
+}
+
+pub fn decodeClientSays(data: Bytes) ClientSays {
+  var t = Take.make(data);
+  let tag = t.r8();
+  var out = ClientSays(0u32, 0u32, String(), Action(0u32, NO_PART, Vec3(0., 0., 0.), Vec3(0., 0., 0.), 0u64, 0u32));
+  if tag == C_HELLO {
+    out.version = t.r32();
+    out.world = t.rstr();
+  } else if tag == C_PRESS {
+    let verb = t.r32();
+    let receiver = t.r32();
+    let from = t.rvec3();
+    let along = t.rvec3();
+    let made = t.r64();
+    out.action = Action(verb, receiver, from, along, made, ORIGIN_PERSON);
+  } else {
+    return out;
+  }
+  if t.ok { out.tag = tag; }
+  out
+}
+
+pub fn decodeInput(data: Bytes, out: &mut BodySamples) bool {
+  var t = Take.make(data);
+  let n = t.r8();
+  var i = 0u32;
+  while i < n && t.ok {
+    let seq = t.r32();
+    let f = t.rf32();
+    let s = t.rf32();
+    let y = t.rf32();
+    out.push(BodySample(seq, f, s, y, Vec3(0., 0., 0.)));
+    i = i + 1u32;
+  }
+  t.ok
+}
+
+// ---- Encoding: server to client ----
+
+pub fn encodeRefused(why: &str) List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, S_REFUSED); putStr(&mut out, why);
+  out
+}
+
+pub fn encodeWelcome(yourId: u32, world: &str, feet: Vec3, parts: usize, keys: usize) List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, S_WELCOME); putU32(&mut out, NET_VERSION); putU32(&mut out, yourId); putStr(&mut out, world);
+  putVec3(&mut out, feet); putU32(&mut out, u32.from(parts)); putU32(&mut out, u32.from(keys));
+  out
+}
+
+pub fn encodeJoined() List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, S_JOINED);
+  out
+}
+
+// The parts as messages of at most MOST_RELIABLE_BYTES each
+pub fn encodeParts(parts: &SimParts) List[List[u8]] {
+  var msgs = List[List[u8]]();
+  var body = List[u8]();
+  var n = 0u32;
+  var i = 0usize;
+  while i < parts.len() {
+    let p = &parts[i];
+    var one = List[u8]();
+    putU32(&mut one, p.id); putU64(&mut one, p.key); putStr(&mut one, p.name.view());
+    var m = 0usize;
+    while m < 16usize { putF32(&mut one, p.placement.m[m]); m = m + 1usize; }
+    if n > 0u32 && body.len() + one.len() + 2usize > MOST_RELIABLE_BYTES {
+      msgs.push(framed(S_PARTS, n, &body));
+      body = List[u8]();
+      n = 0u32;
+    }
+    body.appendList(one);
+    n = n + 1u32;
+    i = i + 1usize;
+  }
+  if n > 0u32 { msgs.push(framed(S_PARTS, n, &body)); }
+  msgs
+}
+
+pub fn encodeShapes(shapes: &ShapeTable) List[List[u8]] {
+  var msgs = List[List[u8]]();
+  var body = List[u8]();
+  var n = 0u32;
+  var i = 0usize;
+  while i < shapes.len() {
+    let s = &shapes[i];
+    var one = List[u8]();
+    putU64(&mut one, s.key); putVec3(&mut one, s.collide.half); putVec3(&mut one, s.pick.half);
+    if n > 0u32 && body.len() + one.len() + 2usize > MOST_RELIABLE_BYTES {
+      msgs.push(framed(S_SHAPES, n, &body));
+      body = List[u8]();
+      n = 0u32;
+    }
+    body.appendList(one);
+    n = n + 1u32;
+    i = i + 1usize;
+  }
+  if n > 0u32 { msgs.push(framed(S_SHAPES, n, &body)); }
+  msgs
+}
+
+fn framed(tag: u32, n: u32, body: &List[u8]) List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, tag); putU8(&mut out, n);
+  out.appendSlice(body.view());
+  out
+}
+
+// The shared part: every person's body, encoded once for everyone
+pub fn encodeShared(step: u64, rows: &ClientRows) List[u8] {
+  var out = List[u8]();
+  putU64(&mut out, step);
+  var n = 0u32;
+  each r in &*rows { if r.declared { n = n + 1u32; } }
+  putU8(&mut out, n);
+  each r in &*rows {
+    if r.declared { putU32(&mut out, r.id); putVec3(&mut out, r.person.feet); putF32(&mut out, r.person.yaw); }
+  }
+  out
+}
+
+// The personal part: the last input number the server applied for this
+// client, and its body after it
+pub fn encodePersonal(step: u64, r: &ClientRow) List[u8] {
+  var out = List[u8]();
+  putU64(&mut out, step);
+  putU32(&mut out, r.lastApplied);
+  putVec3(&mut out, r.person.feet); putF32(&mut out, r.person.yaw);
+  out
+}
+
+// What the server sent a client in a reliable message, as far as the join goes
+pub struct ServerSays {
+  pub tag: u32;                     // S_..., or 0: it did not parse
+  pub why: String;                  // S_REFUSED
+  pub version: u32;                 // S_WELCOME
+  pub yourId: u32;
+  pub world: String;
+  pub feet: Vec3;
+  pub parts: u32;
+  pub keys: u32;
+  pub declared: PartDecls;          // S_PARTS (ids in order from the first sent)
+  pub firstId: u32;
+  pub shapes: ShapeTable;           // S_SHAPES
+}
+
+pub fn decodeServerSays(data: Bytes) ServerSays {
+  var t = Take.make(data);
+  let tag = t.r8();
+  var out = ServerSays(0u32, String(), 0u32, 0u32, String(), Vec3(0., 0., 0.), 0u32, 0u32, PartDecls(), 0u32, ShapeTable());
+  if tag == S_REFUSED {
+    out.why = t.rstr();
+  } else if tag == S_WELCOME {
+    out.version = t.r32(); out.yourId = t.r32(); out.world = t.rstr(); out.feet = t.rvec3(); out.parts = t.r32(); out.keys = t.r32();
+  } else if tag == S_PARTS {
+    let n = t.r8();
+    var i = 0u32;
+    while i < n && t.ok {
+      let id = t.r32();
+      if i == 0u32 { out.firstId = id; }
+      let key = t.r64();
+      let name = t.rstr();
+      var m = Mat4.identity();
+      var k = 0usize;
+      while k < 16usize { m.m[k] = t.rf32(); k = k + 1usize; }
+      out.declared.push(PartDecl(name, key, m));
+      i = i + 1u32;
+    }
+  } else if tag == S_SHAPES {
+    let n = t.r8();
+    var i = 0u32;
+    while i < n && t.ok {
+      let key = t.r64();
+      let c = t.rvec3();
+      let p = t.rvec3();
+      out.shapes.push(ContentShapes(key, BoxShape(c), BoxShape(p)));
+      i = i + 1u32;
+    }
+  } else if tag != S_JOINED {
+    return out;
+  }
+  if t.ok { out.tag = tag; }
+  out
+}
+
+pub fn decodeShared(data: Bytes, step: &mut u64, out: &mut OtherPersons) bool {
+  var t = Take.make(data);
+  *step = t.r64();
+  let n = t.r8();
+  var i = 0u32;
+  while i < n && t.ok {
+    let id = t.r32();
+    let feet = t.rvec3();
+    let yaw = t.rf32();
+    out.push(OtherPerson(id, feet, yaw));
+    i = i + 1u32;
+  }
+  t.ok
+}
+
+// What the personal part says
+pub struct PersonalSnap {
+  pub step: u64;
+  pub ack: u32;
+  pub feet: Vec3;
+  pub yaw: f32;
+}
+
+pub fn decodePersonal(data: Bytes, out: &mut PersonalSnap) bool {
+  var t = Take.make(data);
+  out.step = t.r64();
+  out.ack = t.r32();
+  out.feet = t.rvec3();
+  out.yaw = t.rf32();
+  t.ok
+}
+
+// ---- An address: HOST:PORT, HOST a.b.c.d or localhost (no name lookup) ----
+
+pub fn parseAddress(text: &str) SocketAddr {
+  let b: &Array[u8] = text;
+  var octets = List[u32]();
+  var cur = 0u32;
+  var port = 0u32;
+  var inPort = false;
+  var i = 0usize;
+  while i < b.len {
+    let c = b[i];
+    if c >= 48u8 && c <= 57u8 {
+      if inPort { port = port * 10u32 + u32.from(c - 48u8); } else { cur = cur * 10u32 + u32.from(c - 48u8); }
+    } else if c == 46u8 && !inPort {
+      octets.push(cur);
+      cur = 0u32;
+    } else if c == 58u8 && !inPort {
+      octets.push(cur);
+      inPort = true;
+    }
+    i = i + 1usize;
+  }
+  if octets.len() == 4usize {
+    return SocketAddr.v4(u8.from(*octets[0usize]), u8.from(*octets[1usize]), u8.from(*octets[2usize]), u8.from(*octets[3usize]), u16.from(port));
+  }
+  SocketAddr.localhost(u16.from(port))
+}
+
+// ---- What a Sim holds of connected play ----
+
+pub const PHASE_DIALLING = 0u32;    // client: connecting
+pub const PHASE_ASKED = 1u32;       // client: Hello sent, waiting for the welcome and the declarations
+pub const PHASE_JOINED = 2u32;      // client: in
+pub const PHASE_REFUSED = 3u32;     // client: the server said no
+pub const PHASE_GONE = 4u32;        // client: the connection ended
+
+// How a Sim is started for connected play (SimStart.net)
+pub struct NetStart {
+  pub role: u32;                    // SIM_WHOLE, SIM_SERVER or SIM_CLIENT
+  pub address: String;              // client: the server's HOST:PORT
+  pub port: u32;                    // server: the UDP port to listen on (0: the system chooses)
+  pub loopback: bool;               // server: this machine only
+  pub impairLoss: u32;              // server: a lossy relay in front, when any is non-zero (loss per 1000, delay ms, jitter ms)
+  pub impairLatency: u32;
+  pub impairJitter: u32;
+  pub untilEmpty: bool;             // server: ends once a client has joined and none are left
+  pub walks: bool;                  // client, headless: the scripted person walks (else it stands)
+
+  pub fn whole() NetStart { NetStart(SIM_WHOLE, String(), 0u32, false, 0u32, 0u32, 0u32, false, true) }
+}
+
+pub struct NetState {
+  pub endpoint: Option[Endpoint];
+  pub relay: Option[LossyRelay];
+  pub port: u32;                    // server: the port bound; the relay's, if there is one, is 'relayPort'
+  pub relayPort: u32;
+  // server
+  pub clients: ClientRows;
+  pub joins: u64;
+  pub leaves: u64;
+  pub refusals: u64;
+  pub malformed: u64;               // messages that did not parse, or came before Hello
+  pub everJoined: bool;
+  pub sharedSent: u64;
+  pub personalSent: u64;
+  pub sharedBytes: u64;             // payload bytes of the shared part, once per snapshot (not per client)
+  pub largestShared: usize;
+  pub largestPersonal: usize;
+  pub emptySince: u64;              // the step the last client left (0: not empty)
+  // client
+  pub link: Option[Connection];
+  pub phase: u32;
+  pub myId: u32;
+  pub welcomed: bool;
+  pub refusedWhy: String;
+  pub worldName: String;            // what the server said it runs
+  pub startFeet: Vec3;
+  pub wantParts: u32;
+  pub wantKeys: u32;
+  pub declared: PartDecls;          // the parts, as the server declared them
+  pub shapesGot: ShapeTable;
+  pub joinedMsg: bool;              // the Joined message came: the client Sim may act on the declarations
+  pub predictor: Predictor;
+  pub interp: Interpolator;
+  pub personal: Option[PersonalSnap];   // the newest personal part, until a step takes it
+  pub inputSent: u64;
+  pub pressesSent: u64;
+  pub personalGot: u64;
+  pub sharedGot: u64;
+  pub othersSeen: usize;            // the most other people in one merged snapshot
+  pub firstOtherMovedNs: i64;       // the client's first sight of another person displaced from where it first saw them (0: none)
+  pub otherFirst: Vec3;
+  pub otherFirstId: u32;
+  pub firstSeen: bool;
+
+  pub fn make(skipReplay: bool, takeStalePersonal: bool, takeStaleShared: bool) NetState {
+    NetState(None[Endpoint], None[LossyRelay], 0u32, 0u32,
+      ClientRows(), 0u64, 0u64, 0u64, 0u64, false, 0u64, 0u64, 0u64, 0usize, 0usize, 0u64,
+      None[Connection], PHASE_DIALLING, 0u32, false, String(), String(), Vec3(0., 0., 0.), 0u32, 0u32, PartDecls(), ShapeTable(), false,
+      Predictor.make(Vec3(0., 0., 0.), skipReplay, takeStalePersonal), Interpolator.make(takeStaleShared), None[PersonalSnap],
+      0u64, 0u64, 0u64, 0u64, 0usize, 0i64, Vec3(0., 0., 0.), 0u32, false)
+  }
+
+  pub fn row(self: &, id: u32) usize {
+    var i = 0usize;
+    while i < clients.len() {
+      if clients[i].id == id { return i; }
+      i = i + 1usize;
+    }
+    NO_ROW
+  }
+}
+
+// A reliable message to a connection
+pub fn sendReliable(c: &mut Connection, data: &List[u8]) { c.sendReliable(bytesOfList(data)); }
+
+// A latest-wins value on a stream of a connection
+pub fn sendLatest(c: &mut Connection, stream: u32, data: Bytes) { c.sendLatest(u16.from(stream), data); }
