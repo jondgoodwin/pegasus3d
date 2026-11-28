@@ -21,7 +21,13 @@ Sim is everything that changes the parts of one zone: physics, triggered behavio
 
 The server Sim is the same program in the server role, run by the server with a Loader that builds only what Sim needs (the world image, Sim units, shapes; no meshes or textures).
 
-**Joining.** Player hands the client Sim the person's admission for the world; the client Sim sends it to the server Sim, which admits or refuses and then sends the declarations (ids, places, platforms, areas, content keys) as bulk. The client Sim declares the parts at once and asks its Loader for their content, nearest first.
+**Joining.** Player hands the client Sim the person's admission for the world; the client Sim sends it to the server Sim, which admits or refuses. The world's description reaches the client as every world arrives: its Loader fetches it from the world's origin and builds it, so the client Sim starts its instance from the same definition the server did. The server then sends only what its live instance holds that the definition does not: parts created since, and every part's changed state, as the first shared snapshot. Nothing the size of a world crosses the Sims' reliable channel, so its window bounds only events. The client Sim declares the parts at once and asks its Loader for their content, nearest first.
+
+**What the shared snapshot carries:** every part whose state the server has changed (placement, visibility, the fields that set its look), not only people, measured against the last snapshot this client acknowledged, so a part at rest costs nothing after the first. A part moved by a rule (a rook gliding) travels this way and is interpolated like a person. Events are kept for what happens once: creation, removal, a change of who steers, a world event. `[design choice]`
+
+**Other people's avatars** are parts of the world, like any other. A person admitted to a zone becomes a part of the avatar design the world declares, with a content key both sides' Loaders build from the world's description; Render draws it as a part. A person's own avatar from their store, lending its look where the world allows it, comes later ([Parts and imports](../design/parts-and-imports.md)). `[design choice]`
+
+**Rules on the client, at first: none.** Every rule runs on the server; a click goes to the server and its effect comes back in the snapshot. Rules that live on the client, for an effect shown at once, follow where the language says a rule lives. `[design choice]`
 
 **Client to server, each step:**
 - the person's input samples, each with a sequence number; each packet carries the last several so a lost packet costs nothing (state, latest wins);
@@ -122,6 +128,8 @@ Each zone is simulated by its own Sim. How a Sim spreads its work over cores is 
 - **Where an AI character acts.** A world's character sends the same actions as a person through the same door; where its mind runs is open in [The person](../design/person.md).
 - **Compiled code's budget check.** The check a drop needs does not exist in compiled code today; options are checks at loops and calls, or a separate means of stopping a handler. Recommended: checks at loops and calls.
 - **Scale and admission** (how many people a zone's Sim can carry, what the server checks at joining) are open in [Network](network.md) and [Server](server.md).
+- **Quantising the snapshot.** Positions and rotations travel as floats at first. Quantising them (the island used millimetres) is left until a zone's bandwidth is measured with more people; it changes only the encoding.
+- **A large first snapshot.** If a live instance's changes since its definition grow past what a burst of state packets carries well, the network library gains a bulk stream with its own flow control ([Network](network.md)); the Sims' reliable channel stays for events.
 
 ## What lives elsewhere
 
