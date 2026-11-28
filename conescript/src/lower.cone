@@ -1,0 +1,361 @@
+// Lowering: a checked world's fixed values (understand's Val) as code of the intermediate form.
+//
+// What is lowered is every live part's own values: its 'make' and each option that is not Absent (its 'at',
+// 'rotation', 'material', 'facing', 'eye', 'camera'), each keys(...) value of a live rule, and every function. Each is
+// one unit that takes nothing and gives the value; a part's entry says which (slot, then 0 for 'make' or 1 + the option's
+// number; a rule's keys value is 'ENTRY_KEYS_FLAG | rule' and the value's number). A function is a unit of its own whose
+// number is the function's, so a call needs no look-up; its steps (lets) are locals set once, in order.
+//
+// A call of the vocabulary is an import: namespace "vocabulary", the row's name, a signature made from the row's
+// parameters (see formTypeOf). A value left out is filled from the row's default, so the code always passes every
+// argument. The host offers two kinds of import beside the rows: "host.part_value" (the value another part made: a
+// material named by a shape) and "host.none.<type>" (handle 0 of a type: no stroke path, no list).
+//
+// The caller's import table must offer what lowering names, with the signatures this file makes: toolName,
+// toolSignature, noneName, noneSignature and partValueSignature give them, so the two sides cannot differ.
+
+// Entry numbers: the part's own 'make' is value 0, option i is value 1 + i
+pub const ENTRY_KEYS_FLAG = 0x80000000u32;
+
+pub const NS_VOCABULARY = "vocabulary";
+pub const NS_HOST = "host";
+pub const HOST_PART_VALUE = "part_value";
+
+// The library kind a ConeScript type has when it is held as a handle (0: it is not one)
+fn kindNumber(ty: Ty) u32 {
+  if ty == Ty.Shape { return 1u32; }
+  if ty == Ty.Material { return 2u32; }
+  if ty == Ty.Light { return 3u32; }
+  if ty == Ty.Volume { return 4u32; }
+  if ty == Ty.Outline { return 5u32; }
+  if ty == Ty.Spine { return 6u32; }
+  if ty == Ty.Modifier { return 7u32; }
+  if ty == Ty.Camera { return 8u32; }
+  if ty == Ty.Stroke { return 9u32; }
+  0u32
+}
+
+fn isListTy(ty: Ty) bool {
+  ty == Ty.Outlines || ty == Ty.Shapes || ty == Ty.Strokes || ty == Ty.Modifiers || ty == Ty.Points || ty == Ty.Points2 ||
+    ty == Ty.Numbers
+}
+
+// What a list of this type holds, one item's type
+fn itemOf(ty: Ty) Ty {
+  if ty == Ty.Outlines { return Ty.Outline; }
+  if ty == Ty.Shapes { return Ty.Shape; }
+  if ty == Ty.Strokes { return Ty.Stroke; }
+  if ty == Ty.Modifiers { return Ty.Modifier; }
+  if ty == Ty.Points { return Ty.Point; }
+  if ty == Ty.Points2 { return Ty.Point2; }
+  Ty.Pure
+}
+
+fn tupleOfNumbers(tt: &mut TypeTable, n: usize) u32 {
+  var fields = List[u32]();
+  var i = 0usize;
+  while i < n { fields.push(TY_F64); i = i + 1usize; }
+  tt.tuple(fields.view())
+}
+
+// The form's type of a ConeScript type: numbers and everything measured are f64; a truth is bool; a point, a range, a
+// color and a rotation are tuples of f64 (the slots slotsOf counts); a shape, an outline, a material ... is a handle of
+// its kind; a list is a list of its item
+pub fn formTypeOf(tt: &mut TypeTable, ty: Ty) u32 {
+  if ty == Ty.Truth { return TY_BOOL; }
+  if ty == Ty.Point || ty == Ty.Direction { return tupleOfNumbers(tt, 3usize); }
+  if ty == Ty.Point2 || ty == Ty.LengthRange { return tupleOfNumbers(tt, 2usize); }
+  if ty == Ty.Color || ty == Ty.Rotation { return tupleOfNumbers(tt, 4usize); }
+  if isListTy(ty) { return tt.list(formTypeOf(tt, itemOf(ty))); }
+  let k = kindNumber(ty);
+  if k != 0u32 { return tt.handle(k); }
+  TY_F64
+}
+
+// The type kinds a host offers 'none' for: every handle and every list
+pub fn noneTypes() List[Ty] {
+  var l = List[Ty]();
+  l.push(Ty.Shape); l.push(Ty.Material); l.push(Ty.Light); l.push(Ty.Volume); l.push(Ty.Outline); l.push(Ty.Spine);
+  l.push(Ty.Modifier); l.push(Ty.Camera); l.push(Ty.Stroke);
+  l.push(Ty.Outlines); l.push(Ty.Shapes); l.push(Ty.Strokes); l.push(Ty.Modifiers); l.push(Ty.Points); l.push(Ty.Points2);
+  l.push(Ty.Numbers);
+  l
+}
+
+fn noneNamed(ty: Ty) &str {
+  if ty == Ty.Shape { return "none.shape"; }
+  if ty == Ty.Material { return "none.material"; }
+  if ty == Ty.Light { return "none.light"; }
+  if ty == Ty.Volume { return "none.volume"; }
+  if ty == Ty.Outline { return "none.outline"; }
+  if ty == Ty.Spine { return "none.spine"; }
+  if ty == Ty.Modifier { return "none.modifier"; }
+  if ty == Ty.Camera { return "none.camera"; }
+  if ty == Ty.Stroke { return "none.stroke"; }
+  if ty == Ty.Outlines { return "none.outlines"; }
+  if ty == Ty.Shapes { return "none.shapes"; }
+  if ty == Ty.Strokes { return "none.strokes"; }
+  if ty == Ty.Modifiers { return "none.modifiers"; }
+  if ty == Ty.Points { return "none.points"; }
+  if ty == Ty.Points2 { return "none.points2"; }
+  "none.numbers"
+}
+
+// The name of the import that stands for 'no value' of a handle or list type, in namespace "host"
+pub fn noneName(ty: Ty) String { String.from(noneNamed(ty)) }
+
+// () -> the type
+pub fn noneSignature(tt: &mut TypeTable, ty: Ty) u32 {
+  let r = formTypeOf(tt, ty);
+  let none = List[u32]();
+  tt.sig(none.view(), &[r])
+}
+
+// (part) -> handle(Material): the material another part made
+pub fn partValueSignature(tt: &mut TypeTable) u32 {
+  let r = tt.handle(kindNumber(Ty.Material));
+  tt.sig(&[TY_PART], &[r])
+}
+
+// The name a vocabulary row is imported by: its path with dots ("outline.rectangle"); the two forms no path spells are
+// "[outline]" and "[material]"
+pub fn toolName(vocab: &Vocabulary, names: &Names, row: u32) String {
+  var s = String();
+  let p = &vocab.tools[usize.from(row)].path;
+  if p.len() == 0usize {
+    s.append(if row == vocab.outlineList { "[outline]" } else if row == vocab.materialList { "[material]" } else { "[form]" });
+    return s;
+  }
+  var i = 0usize;
+  while i < p.len() {
+    if i > 0usize { s.append("."); }
+    s.append(names.text(*p[i]));
+    i = i + 1usize;
+  }
+  s
+}
+
+// (the row's parameters in order) -> what it makes
+pub fn toolSignature(tt: &mut TypeTable, sig: &ToolSignature) u32 {
+  var ps = List[u32]();
+  var i = 0usize;
+  while i < sig.params.len() { ps.push(formTypeOf(tt, sig.params[i].ty)); i = i + 1usize; }
+  let r = formTypeOf(tt, sig.makes);
+  tt.sig(ps.view(), &[r])
+}
+
+// A function's number as a "no function" marker for values written in a part's own line
+const NO_FN = 0xFFFFFFFFusize;
+
+struct Lowering {
+  cw: CodeWriter;
+  keys: List[String];     // the imports made so far, by "namespace.name": its position is the import's number
+
+  fn imp(self: &mut, ns: &str, name: &str, sig: u32) u32 {
+    var key = String.from(ns);
+    key.append(".");
+    key.append(name);
+    var i = 0usize;
+    while i < self.keys.len() {
+      if self.keys[i].view() == key.view() { return u32.from(i); }
+      i = i + 1usize;
+    }
+    self.keys.push(key);
+    self.cw.addImport(ns, name, sig)
+  }
+
+  // The form's type of a value as it will be lowered ('want' says what a list's items or an absent value are)
+  fn valTy(self: &mut, w: &Understood, within: usize, v: &Val, want: Ty) u32 {
+    match v {
+      case is Absent { formTypeOf(&mut self.cw.code.types, want) }
+      case let Num(x) { TY_F64 }
+      case let Truth(b) { TY_BOOL }
+      case let Tuple(items) { self.tupleTy(w, within, items) }
+      case let Range(ends) { self.tupleTy(w, within, ends) }
+      case let Ref(s) { self.cw.code.types.handle(kindNumber(Ty.Material)) }
+      case let Make(m) { formTypeOf(&mut self.cw.code.types, w.vocab.tools[usize.from(m.tool)].makes) }
+      case let Items(items) {
+        let e = formTypeOf(&mut self.cw.code.types, itemOf(want));
+        self.cw.code.types.list(e)
+      }
+      case let Local(k) { self.valTy(w, within, &w.functions[within].lets[*k], Ty.Pure) }
+      case let Call(f) { formTypeOf(&mut self.cw.code.types, w.functions[*f].ty) }
+    }
+  }
+
+  fn tupleTy(self: &mut, w: &Understood, within: usize, items: &List[Val]) u32 {
+    var fields = List[u32]();
+    var i = 0usize;
+    while i < items.len() { fields.push(self.valTy(w, within, &items[i], Ty.Pure)); i = i + 1usize; }
+    self.cw.code.types.tuple(fields.view())
+  }
+
+  // A value left out: the row's default as constants, or 'none' for a handle or a list
+  fn absent(self: &mut, want: Ty, dflt: &List[u64]) {
+    let k = kindNumber(want);
+    if k != 0u32 || isListTy(want) {
+      let sig = noneSignature(&mut self.cw.code.types, want);
+      let n = self.imp(NS_HOST, noneNamed(want), sig);
+      self.cw.opU(OP_IMPORT, n);
+      return;
+    }
+    if want == Ty.Truth {
+      self.cw.boolConst(dflt.len() > 0usize && *dflt[0usize] != 0u64);
+      return;
+    }
+    let n = slotsOf(want);
+    if n == 1u32 {
+      self.cw.f64Const(if dflt.len() > 0usize { f64.fromBits(*dflt[0usize]) } else { 0. });
+      return;
+    }
+    var i = 0usize;
+    while i < usize.from(n) {
+      self.cw.f64Const(if i < dflt.len() { f64.fromBits(*dflt[i]) } else { 0. });
+      i = i + 1usize;
+    }
+    let t = tupleOfNumbers(&mut self.cw.code.types, usize.from(n));
+    self.cw.opU(OP_TUPLE_MAKE, t);
+  }
+
+  fn val(self: &mut, w: &Understood, within: usize, v: &Val, want: Ty, dflt: &List[u64]) {
+    match v {
+      case is Absent { self.absent(want, dflt); }
+      case let Num(x) { self.cw.f64Const(*x); }
+      case let Truth(b) { self.cw.boolConst(*b); }
+      case let Tuple(items) { self.tuple(w, within, items); }
+      case let Range(ends) { self.tuple(w, within, ends); }
+      case let Ref(s) {
+        self.cw.opU(OP_PART_CONST, u32.from(*s));
+        let sig = partValueSignature(&mut self.cw.code.types);
+        let n = self.imp(NS_HOST, HOST_PART_VALUE, sig);
+        self.cw.opU(OP_IMPORT, n);
+      }
+      case let Make(m) { self.make(w, within, m); }
+      case let Items(items) {
+        let item = itemOf(want);
+        var i = 0usize;
+        while i < items.len() { self.val(w, within, &items[i], item, &List[u64]()); i = i + 1usize; }
+        let lt = self.valTy(w, within, v, want);
+        self.cw.opUU(OP_LIST_MAKE, lt, u32.from(items.len()));
+      }
+      case let Local(k) { self.cw.opU(OP_LOCAL_GET, u32.from(*k)); }
+      case let Call(f) { self.cw.opU(OP_CALL, u32.from(*f)); }
+    }
+  }
+
+  fn tuple(self: &mut, w: &Understood, within: usize, items: &List[Val]) {
+    var i = 0usize;
+    while i < items.len() { self.val(w, within, &items[i], Ty.Pure, &List[u64]()); i = i + 1usize; }
+    let t = self.tupleTy(w, within, items);
+    self.cw.opU(OP_TUPLE_MAKE, t);
+  }
+
+  // A call of the vocabulary: its arguments in the row's order, then the import
+  fn make(self: &mut, w: &Understood, within: usize, m: &Made) {
+    let row = usize.from(m.tool);
+    let sig = &w.vocab.tools[row];
+    if m.tool == w.vocab.outlineList {
+      // [(x, y), ...]: the items are the one list argument
+      var i = 0usize;
+      while i < m.args.len() { self.val(w, within, &m.args[i], Ty.Point2, &List[u64]()); i = i + 1usize; }
+      let e = formTypeOf(&mut self.cw.code.types, Ty.Point2);
+      let lt = self.cw.code.types.list(e);
+      self.cw.opUU(OP_LIST_MAKE, lt, u32.from(m.args.len()));
+    }
+    else if m.tool == w.vocab.materialList {
+      // [material, modifier, ...]: the material, then the modifiers as one list
+      self.val(w, within, &m.args[0usize], Ty.Material, &List[u64]());
+      var i = 1usize;
+      while i < m.args.len() { self.val(w, within, &m.args[i], Ty.Modifier, &List[u64]()); i = i + 1usize; }
+      let e = formTypeOf(&mut self.cw.code.types, Ty.Modifier);
+      let lt = self.cw.code.types.list(e);
+      self.cw.opUU(OP_LIST_MAKE, lt, u32.from(m.args.len() - 1usize));
+    }
+    else {
+      var i = 0usize;
+      while i < sig.params.len() {
+        self.val(w, within, &m.args[i], sig.params[i].ty, &sig.params[i].fallback);
+        i = i + 1usize;
+      }
+    }
+    let name = toolName(&w.vocab, &w.names, m.tool);
+    let st = toolSignature(&mut self.cw.code.types, sig);
+    let n = self.imp(NS_VOCABULARY, name.view(), st);
+    self.cw.opU(OP_IMPORT, n);
+  }
+
+  // One unit that gives a value, with its entry
+  fn entry(self: &mut, w: &Understood, a: u32, b: u32, v: &Val, name: &str) {
+    let t = self.valTy(w, NO_FN, v, Ty.Pure);
+    let none = List[u32]();
+    let sig = self.cw.code.types.sig(none.view(), &[t]);
+    let u = self.cw.beginUnit(sig, name);
+    self.val(w, NO_FN, v, Ty.Pure, &List[u64]());
+    self.cw.endUnit();
+    self.cw.addEntry(ENTRY_FIXED, u, a, b);
+  }
+
+  // A function's unit: each step set once, in order, then its result
+  fn function(self: &mut, w: &Understood, f: usize) {
+    let info = &w.functions[f];
+    let rt = formTypeOf(&mut self.cw.code.types, info.ty);
+    let none = List[u32]();
+    let sig = self.cw.code.types.sig(none.view(), &[rt]);
+    let u = self.cw.beginUnit(sig, w.names.text(info.name));
+    if !*w.alive[info.slot] {
+      // a part left out for a mistake: its functions are never called
+      self.cw.op(OP_UNREACHABLE);
+      self.cw.endUnit();
+      return;
+    }
+    var k = 0usize;
+    while k < info.lets.len() {
+      let t = self.valTy(w, f, &info.lets[k], Ty.Pure);
+      self.cw.local(t);
+      k = k + 1usize;
+    }
+    k = 0usize;
+    while k < info.lets.len() {
+      self.val(w, f, &info.lets[k], Ty.Pure, &List[u64]());
+      self.cw.opU(OP_LOCAL_SET, u32.from(k));
+      k = k + 1usize;
+    }
+    self.val(w, f, &info.result, info.ty, &List[u64]());
+    self.cw.endUnit();
+  }
+}
+
+// The checked world's fixed values as code: one unit per function (unit number = function number), then one per value
+// of each live part and each live rule's keys
+pub fn lower(w: &Understood) Code {
+  var lw = Lowering(CodeWriter.make(), List[String]());
+  var f = 0usize;
+  while f < w.functions.len() { lw.function(w, f); f = f + 1usize; }
+  var s = 0usize;
+  while s < w.nodes.len() {
+    if *w.alive[s] {
+      let name = w.names.text(w.nodes[s].name);
+      if !(w.units[s].make is Absent) { lw.entry(w, u32.from(s), 0u32, &w.units[s].make, name); }
+      var o = 0usize;
+      while o < w.units[s].options.len() {
+        if !(w.units[s].options[o] is Absent) { lw.entry(w, u32.from(s), u32.from(o) + 1u32, &w.units[s].options[o], name); }
+        o = o + 1usize;
+      }
+    }
+    s = s + 1usize;
+  }
+  var r = 0usize;
+  while r < w.rules.len() {
+    if w.rules[r].live {
+      var v = 0usize;
+      while v < w.rules[r].keys.values.len() {
+        lw.entry(w, ENTRY_KEYS_FLAG | u32.from(r), u32.from(v), &w.rules[r].keys.values[v], "keys");
+        v = v + 1usize;
+      }
+    }
+    r = r + 1usize;
+  }
+  var done = Code.empty();
+  done <-> lw.cw.code;
+  done
+}

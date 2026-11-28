@@ -31,7 +31,7 @@ fn verdict(failed: &mut u32, name: &str, ok: bool) {
 
 // A shim that always declines, standing in for a row (never in the table)
 fn refusing(handles: &mut ToolHandles, slots: &mut Array[u64]) bool {
-  handles.refuse("the tool declined (a check)");
+  refuse(handles, "the tool declined (a check)");
   false
 }
 
@@ -39,7 +39,7 @@ fn checkTools() bool {
   var names = Names.standard();
   let vocab = vocabulary(&mut names);
   let shims = toolShims();
-  var hs = ToolHandles.make();
+  var hs = HandleTable[ToolValue].make();
   var failed = 0u32;
 
   // the table
@@ -103,7 +103,7 @@ fn checkTools() bool {
   u.push(word(50000.)); u.push(1u64);
   let sunShim = *shims[sun];
   let okSun = sunShim(&mut hs, u.viewMut().sliceMut(0usize, 9usize));
-  let sr2 = hs.sun(*u[0usize]);
+  let sr2 = readSun(&mut hs, *u[0usize]);
   verdict(&mut failed, "sunLight: direction, color, lux and shadows read from their slots", okSun && sr2.toSun.x == f32.from(-0.5)
     && sr2.toSun.y == f32.from(0.7) && sr2.toSun.z == f32.from(0.5) && sr2.color.green == 0.5 && sr2.color.blue == 0.75
     && sr2.lux == f32.from(50000.) && sr2.shadows);
@@ -114,7 +114,7 @@ fn checkTools() bool {
   b.push(word(-1.)); b.push(word(3.)); b.push(word(0.)); b.push(word(2.)); b.push(word(-0.5)); b.push(word(0.5));
   let boxShim = *shims[box];
   let okBox = boxShim(&mut hs, b.viewMut().sliceMut(0usize, 6usize));
-  let pieces = hs.pieces(*b[0usize]);
+  let pieces = readPieces(&mut hs, *b[0usize]);
   var lo = Vec3(1.0e30f, 1.0e30f, 1.0e30f);
   var hi = Vec3(-1.0e30f, -1.0e30f, -1.0e30f);
   var k = 0usize;
@@ -132,7 +132,7 @@ fn checkTools() bool {
   l.push(word(0.)); l.push(word(0.)); l.push(word(-1.)); l.push(word(0.)); l.push(word(0.)); l.push(word(1.)); l.push(word(4.));
   let spShim = *shims[sp];
   let okSp = spShim(&mut hs, l.viewMut().sliceMut(0usize, 7usize));
-  let path = hs.spine(*l[0usize]);
+  let path = readSpine(&mut hs, *l[0usize]);
   verdict(&mut failed, "spine.line: two points and a count of segments", okSp && path.points.len() == 5usize && path.points[0].z == -1.
     && path.points[4].z == 1.);
 
@@ -144,17 +144,17 @@ fn checkTools() bool {
   let okPlain = plainShim(&mut hs, m.viewMut().sliceMut(0usize, 4usize));
   var asList = List[u64]();
   asList.push(*m[0usize]);
-  let listHandle = hs.newList(1u32, asList.view());
+  let listHandle = hs.alloc(HANDLE_LIST, asList.clone());
   let join = rowNamed(&vocab, &mut names, "join");
   var j = List[u64]();
   j.push(listHandle);
   let joinShim = *shims[join];
-  var fresh = ToolHandles.make();
-  let freshList = fresh.newList(1u32, asList.view());
+  var fresh = HandleTable[ToolValue].make();
+  let freshList = fresh.alloc(HANDLE_LIST, asList.clone());
   j.set(0usize, freshList);
   let okJoin = joinShim(&mut fresh, j.viewMut().sliceMut(0usize, 1usize));
-  verdict(&mut failed, "a shim given the wrong kind of handle declines, saying why", okPlain && !okJoin && fresh.refused()
-    && fresh.why().startsWith("expected a shape"));
+  verdict(&mut failed, "a shim given the wrong kind of handle declines, saying why", okPlain && !okJoin && refused(&fresh)
+    && fresh.fail.view().startsWith("expected a shape"));
 
   // a world built with a refusing tool loses exactly that part
   var world = String.from("part w\n  part materials\n    part grey: plain(color: color(0.5, 0.5, 0.5))\n  part pieces\n");
@@ -164,10 +164,17 @@ fn checkTools() bool {
   var tx: Sender[Arrival];
   var rx: Receiver[Arrival];
   tx, rx = Channel[Arrival].make();
-  var withRefusal = toolShims();
-  let lathe = rowNamed(&made.understood.vocab, &mut made.understood.names, "lathe");
-  withRefusal.set(lathe, &refusing);
-  let built = buildWith(withRefusal, &made.understood, &tx, true);
+  var tables = toolImports(&made.understood.vocab, &made.understood.names);
+  var swapped = false;
+  var ei = 0usize;
+  while ei < tables.entries.len() {
+    if tables.entries[ei].ns.view() == NS_VOCABULARY && tables.entries[ei].name.view() == "lathe" {
+      (&mut tables.entries[ei]).call = &refusing;
+      swapped = true;
+    }
+    ei = ei + 1usize;
+  }
+  let built = buildWith(tables, &made.understood, &tx, true);
   var sent = 0u32;
   while true {
     match rx.tryRecv() {
@@ -175,7 +182,8 @@ fn checkTools() bool {
       else { break; }
     }
   }
-  verdict(&mut failed, "a world with a refusing tool: the part is left out, the other built", made.problems.len() == 0usize && built == 1u64 && sent == 1u32);
+  verdict(&mut failed, "a world with a refusing tool: the part is left out, the other built", swapped && made.problems.len() == 0usize && built == 1u64 && sent == 1u32);
+  checkLetOnce(&mut failed);
   failed == 0u32
 }
 
@@ -187,4 +195,57 @@ fn rowNamed2(v: &Vocabulary, names: &mut Names, a: &str, b: &str) usize {
     case let Some(t) { usize.from(t) }
     case is None { 0xFFFFFFFFusize }
   }
+}
+
+// How many times the box row was called (a counting stand-in for its shim)
+var @threadlocal boxCalls = 0u32;
+
+fn countingBox(handles: &mut ToolHandles, slots: &mut Array[u64]) bool {
+  boxCalls = boxCalls + 1u32;
+  let real = toolShims();
+  let f = *real[0usize];
+  f(handles, slots)
+}
+
+// The vocabulary import of this name now calls 'call'; false if there is none
+fn swapImport(tables: &mut ImportTables[ToolValue], name: &str, call: ToolShim) bool {
+  var e = 0usize;
+  while e < tables.entries.len() {
+    if tables.entries[e].ns.view() == NS_VOCABULARY && tables.entries[e].name.view() == name {
+      (&mut tables.entries[e]).call = call;
+      return true;
+    }
+    e = e + 1usize;
+  }
+  false
+}
+
+// A step (let) used twice is made once: the one behaviour change of lowering (a let was rebuilt at every mention)
+fn checkLetOnce(failed: &mut u32) {
+  var world = String.from("part w\n  part materials\n    part grey: plain(color: color(0.5, 0.5, 0.5))\n  part pieces\n");
+  world.append("    fn doubled() shape {\n      let b = box(x: 0 ..= 1, y: 0 ..= 1, z: 0 ..= 1);\n");
+  world.append("      join([b, move(b, by: (2, 0, 0))])\n    }\n");
+  world.append("    part two: doubled(), material: materials.grey\n");
+  var made = readWorld(world.view());
+  var tx: Sender[Arrival];
+  var rx: Receiver[Arrival];
+  tx, rx = Channel[Arrival].make();
+  var tables = toolImports(&made.understood.vocab, &made.understood.names);
+  let swapped = swapImport(&mut tables, "box", &countingBox);
+  boxCalls = 0u32;
+  let built = buildWith(tables, &made.understood, &tx, true);
+  var meshVerts = 0usize;
+  while true {
+    match rx.tryRecv() {
+      case let Some(a) {
+        match &a {
+          case let Part(p) { meshVerts = p.built.mesh.positions.len(); }
+          else {}
+        }
+      }
+      else { break; }
+    }
+  }
+  verdict(failed, "a let used twice is made once (box called once, both boxes in the part)", swapped
+    && made.problems.len() == 0usize && built == 1u64 && boxCalls == 1u32 && meshVerts > 0usize);
 }

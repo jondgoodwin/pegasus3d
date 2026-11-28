@@ -26,9 +26,9 @@ NUMBERS = {"Pure", "Length", "Angle", "Illuminance", "Duration", "Intensity"}
 SLOTS = {"Truth": 1, "SimTime": 1, "Point": 3, "Direction": 3, "Point2": 2, "LengthRange": 2, "Color": 4, "Rotation": 4}
 # list and handle types: one slot, read through the handles
 HANDLES = {
-    "Shape": "pieces", "Shapes": "shapes", "Outline": "outline", "Outlines": "outlines", "Spine": "spine",
-    "Stroke": "stroke", "Strokes": "strokes", "Material": "material", "Modifier": "modifier",
-    "Modifiers": "modifiers", "Points": "points", "Points2": "flatPoints", "Numbers": "numbers",
+    "Shape": "readPieces", "Shapes": "readShapes", "Outline": "readOutline", "Outlines": "readOutlines", "Spine": "readSpine",
+    "Stroke": "readStroke", "Strokes": "readStrokes", "Material": "readMaterial", "Modifier": "readModifier",
+    "Modifiers": "readModifiers", "Points": "readPoints", "Points2": "readFlatPoints", "Numbers": "readNumbers",
 }
 RESULTS = {"Shape", "Material", "Color", "Rotation", "Light", "Volume", "SimTime", "Outline", "Spine", "Modifier",
            "Camera", "Stroke"}
@@ -137,7 +137,7 @@ def unpack(p, offset):
         return "Color", f"Color(f32.from({num(o)}), f32.from({num(o + 1)}), f32.from({num(o + 2)}), f32.from({num(o + 3)}))"
     if cast == "handle":
         return "u64", f"slots[{o}usize]"
-    return "", f"handles.{HANDLES[ty]}(slots[{o}usize])"
+    return "", f"{HANDLES[ty]}(handles, slots[{o}usize])"
 
 
 def result_code(makes):
@@ -149,7 +149,7 @@ def result_code(makes):
                 "slots[2usize] = f64.from(result.z).bits();", "slots[3usize] = f64.from(result.w).bits();"]
     if makes == "SimTime":
         return ["slots[0usize] = result.bits();"]
-    return ["slots[0usize] = handles.add(result);"]
+    return ["slots[0usize] = handles.allocValue(result);"]
 
 
 def generate():
@@ -206,11 +206,11 @@ def generate():
             cty, code = unpack(p, off)
             out.append(f"  let p_{p['name']}{': ' + cty if cty else ''} = {code};")
             off += slots_of(p["ty"])
-        out.append("  if handles.refused() { return false; }")
+        out.append("  if refused(handles) { return false; }")
         import re
         expr = re.sub(r"\{(\w+)\}", lambda m: "p_" + m.group(1), expr)
         out.append(f"  let result = {expr};")
-        out.append("  if handles.refused() { return false; }")
+        out.append("  if refused(handles) { return false; }")
         for line in result_code(r["makes"]):
             out.append("  " + line)
         out.append("  true")
