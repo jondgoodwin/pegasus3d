@@ -1,97 +1,218 @@
-// The Loader, a MOCK until plan step 4's real one replaces it. It answers
-// "open world W for Sim S" with one fixed world image (a ground plane and a
-// few boxes; the sky is Render's fixed default), and "build K" with a mesh
-// moved to Render and the pick and collision shapes moved to Sim. The real
-// Loader's catalog, content keys, two-phase arrival, workers and cache plug
-// in behind the same behaviours (messages.cone, rows 3, 4 and 6).
+// The Loader: the catalog of built content, content keys, and a pool of
+// worker actors that build jobs nearest first. Plan step 4, first part.
+//
+//   openWorld(world, sim)  Player -> Loader: the world image moves to Sim first (two-phase
+//                          arrival, phase 1: the declarations); then Sim's build requests
+//                          queue by nearness (phase 2)
+//   build(req)             Sim -> Loader: part req.part uses key req.key, req.nearness off
+//   unused(key, part)      Sim -> Loader: the part no longer uses the key; at no users the
+//                          mesh goes from Render (Render.release, a message this adds)
+//   stop()
+//
+// The work is `buildContent` (partproducts.cone), run by a Worker. Today's
+// mock content sits behind it; lane B's `partbuild.buildPart` replaces it.
+//
+// WORKERS AND PRIORITY. The actors package runs every actor on one
+// work-stealing pool and has no priority. So "low priority" is kept by how the
+// Loader hands out work: at most WORKERS jobs run at once, one per Worker,
+// each job one message turn, so Sim's and Render's loops, which wait on a
+// timer or the display, find a free pool thread. A real low-priority class
+// waits for the runtime.
+//
+// NOT YET: the disk cache, the network fetch, the server-side Loader, the
+// reader and the interpreter.
 
-pub const KEY_GROUND = 1u64;
-pub const KEY_BOX_SMALL = 2u64;
-pub const KEY_BOX_TALL = 3u64;
-pub const KEY_BOX_ROUND = 4u64;      // a box rounded by sculpt's subdivision
-pub const MOCK_KEYS = 4usize;
+pub const MOCK_KEYS = 4usize;       // keys resident once either mock world has arrived (the 40-part world's five, less the one it lets go)
+const WORKERS = 3usize;            // jobs in flight at once
+const SETTLE_US = 1000i64;          // the burst of requests that follows a world image is gathered for this long
 
-const GROUND_HALF: f32 = 40.;
+actor Worker {
+  // Loader -> Worker: build 'job'. Pure, so the worker that runs it never changes the bits
+  pub async fn build(self, job: BuildJob) PartProducts {
+    buildContent(&job)
+  }
+}
 
 actor Loader {
   render: Render;
   sim: Option[Sim];
-  built: u64;
-  unusedSeen: u64;
+  core: LoaderCore;
+  workers: List[Worker];
+  busy: List[bool];                 // a job is running on worker i
+  settling: bool;                   // a `settle` is waiting for the burst to end
+  report: Sender[bool];             // told at stop whether the Loader's checks passed
+  expectBuilds: u64;                // a check: how many keys the world makes
+  retire: bool;                     // a check: once all are built, let go of the first key's parts
+  retired: bool;
 
-  fn init(self: &new, render: Render) {
-    *self = Self(render, None[Sim], 0u64, 0u64);
+  fn init(self: &new, render: Render, report: Sender[bool], expectBuilds: u64, retire: bool, offByOne: bool) {
+    var ws = List[Worker]();
+    var b = List[bool]();
+    var i = 0usize;
+    while i < WORKERS {
+      ws.push(Worker());
+      b.push(false);
+      i = i + 1usize;
+    }
+    *self = Self(render, None[Sim], LoaderCore.make(offByOne), ws, b, false, report, expectBuilds, retire, false);
   }
 
   // Player -> Loader (event): open world 'world' for 'sim', which Player has
-  // started. The world image and its Sim units are moved to that Sim
+  // started. Phase 1: the world image is moved to that Sim; its parts name
+  // their keys, and Sim then asks for each
   pub async fn openWorld(self, world: String, sim: Sim) {
-    sim.world(mockWorld(world));
+    sim.world(mockWorld(world, &mut core));
     self.sim = Some[Sim](sim);
   }
 
-  // Sim -> Loader (event): build content 'req.key' for part 'req.part'. The
-  // mock builds at once, in the order asked, whatever the nearness
+  // Sim -> Loader (event): part 'req.part' uses key 'req.key'. A key already
+  // built is shared at once (Render holds the mesh, Sim the shapes); a new
+  // one is queued; the burst is gathered, then built nearest first
   pub async fn build(self, req: ContentRequest) {
-    var half = Vec3(0.5, 0.5, 0.5);
-    var mesh = Mesh.cube(0.5);
-    var colour = Color(0.8, 0.3, 0.2, 1.);
-    if req.key == KEY_GROUND {
-      mesh = groundMesh();
-      half = Vec3(GROUND_HALF, 0.01, GROUND_HALF);
-      colour = Color(0.35, 0.55, 0.25, 1.);
-    } else if req.key == KEY_BOX_TALL {
-      mesh = boxMesh(Vec3(0.5, 1.5, 0.5));
-      half = Vec3(0.5, 1.5, 0.5);
-      colour = Color(0.25, 0.35, 0.8, 1.);
-    } else if req.key == KEY_BOX_ROUND {
-      let cube = PolyMesh.cube(0.7);
-      let lods = subdivisionLevels(&cube, 2u32);
-      mesh = lods[2usize].triangulate(true);
-      half = Vec3(0.7, 0.7, 0.7);
-      colour = Color(0.85, 0.75, 0.3, 1.);
+    let how = core.ask(&req);
+    if how == ASK_QUEUED && !settling {
+      settling = true;
+      selfactor.settle();
     }
-    let bytes = mesh.vertexCount() * 32usize + mesh.triangleCount() * 12usize;
-    render.content(MeshContent(req.key, mesh, Material.plain(colour), bytes));
-    match &sim {
-      case let Some(s) { s.shapes(ContentShapes(req.key, BoxShape(half), BoxShape(half))); }
-      case is None[Sim] {}
-    }
-    built = built + 1u64;
   }
 
-  // Sim -> Loader (event): part 'part' no longer uses 'key'. The mock keeps nothing to drop
+  // The end of the gathering window: start the jobs
+  pub async fn settle(self) {
+    _ = await aio.sleep(Duration.fromMicros(SETTLE_US));
+    settling = false;
+    self.pump();
+  }
+
+  // Hand the nearest jobs to the idle workers
+  fn pump(self: &mut) {
+    var w = 0usize;
+    while w < WORKERS {
+      if !busy[w] {
+        match core.next() {
+          case let Some(job) {
+            busy.set(w, true);
+            selfactor.run(w, job);
+          }
+          case is None[BuildJob] { break; }
+        }
+      }
+      w = w + 1usize;
+    }
+  }
+
+  // One job on worker 'w': the products come back moved, and go on to Render and Sim
+  pub async fn run(self, w: usize, job: BuildJob) {
+    let key = job.key;
+    let worker = workers[w].clone();
+    let products = await worker.build(job);
+    self.landed(w, key, products);
+  }
+
+  fn landed(self: &mut, w: usize, key: ContentKey, p: PartProducts) {
+    busy.set(w, false);
+    if core.done(key) == DONE_DELIVER {
+      let shapes = shapesOf(key, &p);
+      render.content(meshContentOf(key, p));
+      match &sim {
+        case let Some(s) { s.shapes(shapes); }
+        case is None[Sim] {}
+      }
+    }
+    self.pump();
+    if retire && !retired && core.started == expectBuilds && core.inFlight() == 0usize && core.queued() == 0usize {
+      retired = true;
+      self.letGoOfFirst();
+    }
+  }
+
+  // The check's own exercise of `unused`: the first key's users leave
+  fn letGoOfFirst(self: &mut) {
+    let key = core.firstKey();
+    let parts = core.usersOf(key);
+    each p in &parts { selfactor.unused(key, *p); }
+  }
+
+  // Sim -> Loader (event): part 'part' no longer uses 'key'. At no users the
+  // mesh may go from Render (and the entry from the catalog)
   pub async fn unused(self, key: ContentKey, part: PartId) {
-    unusedSeen = unusedSeen + 1u64;
+    if core.unused(key, part) == UNUSED_FREED { render.release(key); }
   }
 
   pub async fn stop(self) {
     self.sim = None[Sim];
+    let ordered = core.startedNearestFirst();
+    var wantFreed = 0u64;
+    if retire { wantFreed = 1u64; }
+    let ok = core.started == expectBuilds && core.freed == wantFreed && ordered && core.unknown == 0u64;
+    print <- "loader: "; print <- core.started; print <- " keys built (want "; print <- expectBuilds; print <- "), ";
+    print <- core.shared; print <- " asks shared a built key, "; print <- core.freed; print <- " freed, ";
+    print <- core.discarded; print <- " discarded; jobs started nearest first: ";
+    if ordered { print <- "yes"; } else { print <- "NO"; }
+    if ok { print <- ": ok\n"; } else { print <- ": FAILED\n"; }
+    var r = report.clone();
+    r <- ok;
   }
 }
 
-// The fixed world: a ground plane, three boxes ahead of the person
-fn mockWorld(name: String) WorldImage {
+// ---- The mock worlds ----
+
+fn recipe(shape: &str, args: List[f32]) Recipe { Recipe(String.from(shape), args, 0u32) }
+
+fn args6(a: f32, b: f32, c: f32, d: f32, e: f32, f: f32) List[f32] {
+  var l = List[f32]();
+  l.push(a); l.push(b); l.push(c); l.push(d); l.push(e); l.push(f);
+  l
+}
+
+fn args4(a: f32, b: f32, c: f32, d: f32) List[f32] {
+  var l = List[f32]();
+  l.push(a); l.push(b); l.push(c); l.push(d);
+  l
+}
+
+// A part of a world: its name, what it is made from (taught to the catalog),
+// and where it stands
+fn declare(core: &mut LoaderCore, parts: &mut PartDecls, name: &str, r: Recipe, at: Vec3) {
+  let key = keyOf(&r);
+  core.learn(key, r);
+  parts.push(PartDecl(String.from(name), key, Mat4.fromTranslation(at)));
+}
+
+// The five shapes of the 40-part world
+fn forty(kind: usize) Recipe {
+  if kind == 0usize { return recipe("box", args6(0.5, 0.5, 0.5, 0.8, 0.3, 0.2)); }
+  if kind == 1usize { return recipe("box", args6(0.5, 1.5, 0.5, 0.25, 0.35, 0.8)); }
+  if kind == 2usize { return recipe("box", args6(0.8, 0.4, 0.8, 0.3, 0.7, 0.4)); }
+  if kind == 3usize { return recipe("box", args6(0.3, 1.0, 0.3, 0.9, 0.8, 0.2)); }
+  recipe("rounded", args4(0.6, 0.7, 0.4, 0.8))
+}
+
+// The world named 'name': "parts40" is forty parts sharing five keys; any
+// other name is the small mock (a ground plane and three boxes). Fills 'core'
+// with each key's recipe, as the real world image's code will
+fn mockWorld(name: String, core: &mut LoaderCore) WorldImage {
   var parts = PartDecls();
-  parts.push(PartDecl(String.from("ground"), KEY_GROUND, Mat4.identity()));
-  parts.push(PartDecl(String.from("box-a"), KEY_BOX_SMALL, Mat4.fromTranslation(Vec3(0., 0.5, -8.))));
-  parts.push(PartDecl(String.from("box-b"), KEY_BOX_TALL, Mat4.fromTranslation(Vec3(-3., 1.5, -10.))));
-  parts.push(PartDecl(String.from("box-c"), KEY_BOX_ROUND, Mat4.fromTranslation(Vec3(3., 0.7, -9.))));
+  if name.view() == "parts40" {
+    var k = 0usize;
+    while k < 40usize {
+      let kind = k % 5usize;
+      let r = forty(kind);
+      let x = f32.from(k % 7usize) * 1.5 - 4.5;
+      let z = 0. - (6. + f32.from(k) * 0.9);
+      var label = String.from("part-");
+      label.appendByte('0' + u8.from(k / 10usize));
+      label.appendByte('0' + u8.from(k % 10usize));
+      if k == 3usize { label = String.from("box-a"); }   // the headless run's press aims at box-a: dead ahead of the person
+      declare(core, &mut parts, label.view(), r, Vec3(x, 0.5, z));
+      k = k + 1usize;
+    }
+  } else {
+    declare(core, &mut parts, "ground", recipe("ground", args4(40., 0.35, 0.55, 0.25)), Vec3(0., 0., 0.));
+    declare(core, &mut parts, "box-a", forty(0usize), Vec3(0., 0.5, -8.));
+    declare(core, &mut parts, "box-b", forty(1usize), Vec3(-3., 1.5, -10.));
+    declare(core, &mut parts, "box-c", recipe("rounded", args4(0.7, 0.85, 0.75, 0.3)), Vec3(3., 0.7, -9.));
+  }
   var units = SimUnits();
   units.push(String.from("mock.zone"));
   WorldImage(name, parts, units, Vec3(0., 0., 0.))
-}
-
-// The ground: render's unit plane, scaled to GROUND_HALF each way
-fn groundMesh() Mesh {
-  var m = Mesh.plane(16, 16.);
-  each p in m.positions.mutItems() { p.x = p.x * GROUND_HALF; p.z = p.z * GROUND_HALF; }
-  m
-}
-
-// A box of half sizes 'half', centred on its origin
-fn boxMesh(half: Vec3) Mesh {
-  var m = Mesh.cube(1.);
-  each p in m.positions.mutItems() { p.x = p.x * half.x; p.y = p.y * half.y; p.z = p.z * half.z; }
-  m
 }

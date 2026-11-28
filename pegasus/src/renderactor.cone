@@ -75,6 +75,7 @@ pub struct RenderCore {
   camera: PartId;
   stalePose: bool;                  // the head-pose check's mutant
   pub uploadedBytes: usize;
+  pub released: u64;                // keys whose mesh was dropped on the Loader's word
   pub uploadFrames: u64;            // frames that uploaded anything
   pub sumMismatches: u64;           // snapshots found changed after publishing
   pub lastFrameNs: u64;
@@ -87,7 +88,7 @@ pub struct RenderCore {
 
   pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), 0u64,
-      NO_PART, NO_PART, stalePose, 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+      NO_PART, NO_PART, stalePose, 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
   }
 
   // The newest snapshot: kept with the one before it
@@ -100,6 +101,36 @@ pub struct RenderCore {
   pub fn takeContent(self: &mut, c: MeshContent) { arrivals.push(c); }
 
   pub fn residentCount(self: &) usize { residents.len() }
+
+  pub fn isResident(self: &, key: ContentKey) bool {
+    each r in &residents { if r.key == key { return true; } }
+    false
+  }
+
+  // Loader -> Render: nothing uses 'key' now, so its mesh may go: from the
+  // arrivals if not yet uploaded, else from the GPU
+  pub fn releaseContent(self: &mut, key: ContentKey) {
+    var i = 0usize;
+    while i < arrivals.len() {
+      if arrivals[i].key == key { _ = arrivals.remove(i); } else { i = i + 1usize; }
+    }
+    i = 0usize;
+    while i < residents.len() {
+      if residents[i].key == key {
+        match &mut gfx {
+          case var &mut Some(g) {
+            _ = g.renderer.removeMesh(&mut g.device, residents[i].mesh);
+            _ = g.renderer.removeMaterial(&mut g.device, residents[i].material);
+          }
+          else {}
+        }
+        _ = residents.remove(i);
+        released = released + 1u64;
+      } else {
+        i = i + 1usize;
+      }
+    }
+  }
 
   // Steps 1 and 2
   pub fn prepare(self: &mut) FramePlan {
@@ -327,16 +358,17 @@ actor Render {
   headless: bool;                   // no window: paced by a timer
   shot: String;                     // --shot FILE: one frame off screen, once its content is resident
   wantKeys: usize;                  // how many keys a shot waits for
+  exactKeys: usize;                 // a check: how many keys are resident at the end (0: not checked)
   stopped: Sender[bool];            // told, once the loop has ended, whether Render's checks passed (the shell then lets the window go)
   finished: Sender[i32];            // a shot's verdict
   stallMs: u64;                     // the stall check: Sim is busy this long once (0: no stall)
 
   fn init(self: &new, window: usize, w: u32, h: u32, gpu: bool, looks: StateReader[LookIntent],
-      drawnOut: StateWriter[DrawnFrame], shot: String, wantKeys: usize, stopped: Sender[bool], finished: Sender[i32],
+      drawnOut: StateWriter[DrawnFrame], shot: String, wantKeys: usize, exactKeys: usize, stopped: Sender[bool], finished: Sender[i32],
       stallMs: u64, stalePose: bool) {
     var core = RenderCore.make(looks, drawnOut, stalePose);
     if gpu { core.gfx = makeGfx(window, w, h); }
-    *self = Self(core, false, window == 0usize, shot, wantKeys, stopped, finished, stallMs);
+    *self = Self(core, false, window == 0usize, shot, wantKeys, exactKeys, stopped, finished, stallMs);
   }
 
   // Render's checks at the end of a run: no snapshot changed after it was
@@ -345,6 +377,11 @@ actor Render {
     var ok = true;
     print <- "check snapshots unchanged after publishing: "; print <- core.sumMismatches; print <- " changed";
     if core.sumMismatches == 0u64 { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+    if exactKeys > 0usize {
+      print <- "check resident keys: "; print <- u64.from(core.residentCount()); print <- " (want "; print <- u64.from(exactKeys);
+      print <- "), "; print <- core.released; print <- " released";
+      if core.residentCount() == exactKeys { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+    }
     if stallMs > 0u64 {
       let gapMs = msOf(core.longestGapNs);
       let sameMs = msOf(core.longestSameNs);
@@ -362,6 +399,9 @@ actor Render {
 
   // Loader -> Render (bulk move): a key's look, uploaded under the budget
   pub async fn content(self, c: MeshContent) { core.takeContent(c); }
+
+  // Loader -> Render (event): nothing uses 'key' now; its mesh may go
+  pub async fn release(self, key: ContentKey) { core.releaseContent(key); }
 
   // Player -> Render (event): the person inhabits 'avatar', seen from 'camera'
   pub async fn inhabit(self, avatar: PartId, camera: PartId) {
