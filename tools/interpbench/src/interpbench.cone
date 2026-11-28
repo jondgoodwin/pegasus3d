@@ -1,0 +1,306 @@
+// interpbench: how fast the form interpreter is (W136).
+//
+//   interpbench build REPS FILE...   each world built REPS times with no window: the whole build's time (min, median, max),
+//                                    then, from a profiled pass, how much of a run was the host's call, the copying of
+//                                    each import's window, and the interpreter itself
+//   interpbench micro                a tight loop run in the form, against the same loop in Cone
+//   interpbench import              an import called in a loop, against the same call made directly
+//
+// Times are the steady clock's nanoseconds; run it with nothing else heavy going and say what else was.
+
+mod interpbench;
+
+import stdio use *;
+import libc;
+import collections use *;
+import fs;
+import path use Path;
+import conescript use *;
+import partbuild use *;
+import time use Instant;
+
+fn argIs(a: *u8, b: &str) bool {
+  var i = 0usize;
+  while i < b.len() {
+    if *(a + i) != b[i] { return false; }
+    i = i + 1usize;
+  }
+  *(a + b.len()) == 0u8
+}
+
+fn argNumber(s: *u8) u64 {
+  var n = 0u64;
+  var i = 0usize;
+  while *(s + i) >= '0' && *(s + i) <= '9' {
+    n = n * 10u64 + u64.from(*(s + i) - '0');
+    i = i + 1usize;
+  }
+  n
+}
+
+fn sorted(xs: &List[i64]) List[i64] {
+  var out = List[i64]();
+  var i = 0usize;
+  while i < xs.len() {
+    out.push(*xs[i]);
+    var j = out.len() - 1usize;
+    while j > 0usize && *out[j - 1usize] > *out[j] {
+      let t = *out[j];
+      out.set(j, *out[j - 1usize]);
+      out.set(j - 1usize, t);
+      j = j - 1usize;
+    }
+    i = i + 1usize;
+  }
+  out
+}
+
+fn us(ns: i64) f64 { f64.from(ns) / 1000. }
+
+// ---- build ----
+
+// One world made and built, every part in order; the interpreter's profile if 'profile'. The make's own time (lowering
+// and verifying) is returned apart from the parts'.
+struct Built { makeNs: i64; partsNs: i64; parts: u64; prof: Profile; ok: bool; }
+
+fn buildOnce(text: &Array[u8], profile: bool) Built {
+  let reading = readWorld(text);
+  let w = &reading.understood;
+  let none = Profile(0u64, 0i64, 0u64, 0i64, 0i64);
+  let t0 = Instant.now().nanos();
+  match PartBuilder.make(w, toolImports(&w.vocab, &w.names)) {
+    case let Ok(b) {
+      var bld = b;
+      (&mut bld.interpreter()).profiling = profile;
+      let t1 = Instant.now().nanos();
+      var parts = 0u64;
+      var i = 0usize;
+      while i < w.order.len() {
+        let slot = *w.order[i];
+        let p = bld.buildPart(slot, w.nodes[slot].kind);
+        if p.made { parts = parts + 1u64; }
+        i = i + 1usize;
+      }
+      let t2 = Instant.now().nanos();
+      let pr = (&mut bld.interpreter()).profile;
+      Built(t1 - t0, t2 - t1, parts, pr, true)
+    }
+    case let Err(ps) { Built(0i64, 0i64, 0u64, none, false) }
+  }
+}
+
+fn world(file: &str) {
+  match fs.readFile(&Path.from(file)) {
+    case let Ok(text) {
+      printStr(file); print <- "\n";
+    }
+    case let Err(e) { printStr(file); print <- ": cannot be read\n"; }
+  }
+}
+
+fn buildWorld(file: &str, reps: u64) {
+  match fs.readFile(&Path.from(file)) {
+    case let Ok(text) {
+      var makes = List[i64]();
+      var totals = List[i64]();
+      var k = 0u64;
+      var parts = 0u64;
+      var ok = true;
+      _ = buildOnce(text.view(), false);      // warm up: pages, caches
+      while k < reps {
+        let b = buildOnce(text.view(), false);
+        ok = b.ok;
+        parts = b.parts;
+        makes.push(b.makeNs);
+        totals.push(b.partsNs);
+        k = k + 1u64;
+      }
+      // the profiled pass: the same builds, with the clock read around each import
+      var runNs = 0i64; var callNs = 0i64; var copyNs = 0i64; var imports = 0u64; var runs = 0u64; var profTotal = 0i64;
+      k = 0u64;
+      while k < reps {
+        let b = buildOnce(text.view(), true);
+        runNs = runNs + b.prof.runNs; callNs = callNs + b.prof.callNs; copyNs = copyNs + b.prof.copyNs;
+        imports = imports + b.prof.imports; runs = runs + b.prof.runs; profTotal = profTotal + b.partsNs;
+        k = k + 1u64;
+      }
+      let st = sorted(&totals);
+      let sm = sorted(&makes);
+      let n = st.len();
+      printStr(file); print <- ": ";
+      if !ok { print <- "refused\n"; return; }
+      print <- parts; print <- " parts; make (lower+verify) median "; print <- us(*sm[n / 2usize]); print <- " us; build min/median/max ";
+      print <- us(*st[0usize]); print <- " / "; print <- us(*st[n / 2usize]); print <- " / "; print <- us(*st[n - 1usize]); print <- " us\n";
+      let r = f64.from(reps);
+      let ru = f64.from(runNs) / r;
+      let ca = f64.from(callNs) / r;
+      let co = f64.from(copyNs) / r;
+      print <- "    per build, profiled: runs "; print <- runs / reps; print <- ", imports "; print <- imports / reps;
+      print <- "; inside runs "; print <- ru / 1000.; print <- " us = host calls "; print <- ca / 1000.;
+      print <- " + window copies "; print <- co / 1000.; print <- " + interpreter and clock reads "; print <- (ru - ca - co) / 1000.;
+      print <- " us; outside runs (part products, mapping) "; print <- (f64.from(profTotal) / r - ru) / 1000.; print <- " us\n";
+    }
+    case let Err(e) { printStr(file); print <- ": cannot be read\n"; }
+  }
+}
+
+// ---- micro ----
+
+fn noImports() ImportTables[u8] { ImportTables[u8].make() }
+
+// A unit that runs 'n' turns of: x = x * 1.0000001 + 0.5; i = i + 1; loop while i < n. Thirteen ops a turn, one fuel.
+fn loopCode(n: i64) CodeWriter {
+  let e = List[u32]();
+  var w = CodeWriter.make();
+  let bt = w.code.types.sig(e.view(), e.view());
+  let msig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(msig, "loop");
+  let x = w.local(TY_F64);
+  let i = w.local(TY_I64);
+  w.opU(OP_BLOCK, bt);
+  w.opU(OP_LOOP, bt);
+  w.opU(OP_LOCAL_GET, x); w.f64Const(1.0000001); w.op(OP_F64_MUL); w.f64Const(0.5); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, x);
+  w.opU(OP_LOCAL_GET, i); w.i64Const(1i64); w.op(OP_I64_ADD); w.opU(OP_LOCAL_TEE, i); w.i64Const(n); w.op(OP_I64_LT);
+  w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, x);
+  w.endUnit();
+  w
+}
+
+fn nativeLoop(n: i64, seed: f64) f64 {
+  var x = seed;
+  var i = 0i64;
+  while i < n {
+    x = x * 1.0000001 + 0.5;
+    i = i + 1i64;
+  }
+  x
+}
+
+fn impInc(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
+  let x = f64.fromBits(s[0usize]);
+  s[0usize] = (x + 1.0).bits();
+  true
+}
+
+fn micro() {
+  let tables = noImports();
+  var h = HandleTable[u8].make();
+  let n = 5000000i64;
+  let w = loopCode(n);
+  match verify(&w.code, &tables) {
+    case let Ok(v) {
+      var it = Interpreter.make();
+      var out = List[u64]();
+      let none = List[u64]();
+      var times = List[i64]();
+      var r = 0;
+      var answer = 0.;
+      while r < 7 {
+        it.setFuel(1000000000u64);
+        let t0 = Instant.now().nanos();
+        let t = it.run(&v, &tables, &mut h, 0u32, none.view(), &mut out);
+        let t1 = Instant.now().nanos();
+        if t is Some { print <- "the loop trapped\n"; return; }
+        answer = f64.fromBits(*out[0usize]);
+        times.push(t1 - t0);
+        r = r + 1;
+      }
+      var ntimes = List[i64]();
+      var nanswer = 0.;
+      r = 0;
+      while r < 7 {
+        let t0 = Instant.now().nanos();
+        nanswer = nativeLoop(n * 40i64 + i64.from(r), nanswer);
+        let t1 = Instant.now().nanos();
+        ntimes.push(t1 - t0);
+        r = r + 1;
+      }
+      let st = sorted(&times);
+      let sn = sorted(&ntimes);
+      let perTurn = f64.from(*st[3usize]) / f64.from(n);
+      let perTurnNative = f64.from(*sn[3usize]) / f64.from(n * 40i64);
+      print <- "form loop: "; print <- n; print <- " turns, 13 ops each; run min/median/max "; print <- f64.from(*st[0usize]) / 1e6; print <- " / ";
+      print <- f64.from(*st[3usize]) / 1e6; print <- " / "; print <- f64.from(*st[6usize]) / 1e6; print <- " ms; answer "; print <- answer; print <- "\n";
+      print <- "  per turn "; print <- perTurn; print <- " ns, per op "; print <- perTurn / 13.; print <- " ns\n";
+      print <- "native loop: "; print <- n * 40i64; print <- " turns; median "; print <- f64.from(*sn[3usize]) / 1e6; print <- " ms (min "; print <- f64.from(*sn[0usize]) / 1e6;
+      print <- ", max "; print <- f64.from(*sn[6usize]) / 1e6; print <- "); answer "; print <- nanswer; print <- "\n";
+      print <- "  per turn "; print <- perTurnNative; print <- " ns\n";
+      print <- "  interpreted to native, per turn: "; print <- perTurn / perTurnNative; print <- "x\n";
+    }
+    case let Err(ps) { print <- "the loop code was refused\n"; }
+  }
+}
+
+// A unit that calls one import 'n' times in a loop (x = host.inc(x))
+fn importLoopCode(n: i64, imp: &fn(handles: &mut HandleTable[u8], slots: &mut Array[u64]) bool, tables: &mut ImportTables[u8]) CodeWriter {
+  let e = List[u32]();
+  let incSigT = tables.types.sig(&[TY_F64], &[TY_F64]);
+  tables.add("host", "inc", incSigT, false, 1u32, imp);
+  var w = CodeWriter.make();
+  let incSig = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let ii = w.addImport("host", "inc", incSig);
+  let bt = w.code.types.sig(e.view(), e.view());
+  let msig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(msig, "imports");
+  let x = w.local(TY_F64);
+  let i = w.local(TY_I64);
+  w.opU(OP_BLOCK, bt);
+  w.opU(OP_LOOP, bt);
+  w.opU(OP_LOCAL_GET, x); w.opU(OP_IMPORT, ii); w.opU(OP_LOCAL_SET, x);
+  w.opU(OP_LOCAL_GET, i); w.i64Const(1i64); w.op(OP_I64_ADD); w.opU(OP_LOCAL_TEE, i); w.i64Const(n); w.op(OP_I64_LT);
+  w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, x);
+  w.endUnit();
+  w
+}
+
+fn importMicro() {
+  var tables = ImportTables[u8].make();
+  var h = HandleTable[u8].make();
+  let n = 2000000i64;
+  let w = importLoopCode(n, &impInc, &mut tables);
+  match verify(&w.code, &tables) {
+    case let Ok(v) {
+      var it = Interpreter.make();
+      var out = List[u64]();
+      let none = List[u64]();
+      var times = List[i64]();
+      var r = 0;
+      while r < 7 {
+        it.setFuel(1000000000u64);
+        let t0 = Instant.now().nanos();
+        let t = it.run(&v, &tables, &mut h, 0u32, none.view(), &mut out);
+        let t1 = Instant.now().nanos();
+        if t is Some { print <- "the loop trapped\n"; return; }
+        times.push(t1 - t0);
+        r = r + 1;
+      }
+      let st = sorted(&times);
+      print <- "import loop: "; print <- n; print <- " turns (8 ops and one import each); run min/median/max "; print <- f64.from(*st[0usize]) / 1e6;
+      print <- " / "; print <- f64.from(*st[3usize]) / 1e6; print <- " / "; print <- f64.from(*st[6usize]) / 1e6; print <- " ms; per turn ";
+      print <- f64.from(*st[3usize]) / f64.from(n); print <- " ns; answer "; print <- f64.fromBits(*out[0usize]); print <- "\n";
+    }
+    case let Err(ps) { print <- "the import loop's code was refused: "; print <- ps[0usize].what.view(); print <- "\n"; }
+  }
+}
+
+fn main(argc: i32, argv: **u8) i32 {
+  if argc > 1i32 && argIs(*(argv + 1usize), "micro") { micro(); return 0i32; }
+  if argc > 1i32 && argIs(*(argv + 1usize), "import") { importMicro(); return 0i32; }
+  if argc > 3i32 && argIs(*(argv + 1usize), "build") {
+    let reps = argNumber(*(argv + 2usize));
+    var a = 3i32;
+    while a < argc {
+      buildWorld(cstr.fromPtr(*(argv + usize.from(a))).view(), reps);
+      a = a + 1i32;
+    }
+    return 0i32;
+  }
+  print <- "usage: interpbench build REPS FILE... | micro | import\n";
+  2i32
+}
