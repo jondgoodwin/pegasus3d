@@ -23,6 +23,9 @@
 pub const UPLOAD_BUDGET_BYTES = 4194304usize;  // a frame's uploads (the island's 4 MB)
 pub const HEADLESS_HZ = 72u64;                 // a headless Render's frame rate (a Quest's display)
 pub const EYE_HEIGHT: f32 = 1.6;
+const XR_TRIGGER_DOWN: f32 = 0.75;             // the right trigger counts as pulled past this, and as let go below the next
+const XR_TRIGGER_UP: f32 = 0.5;
+const XR_FLOOR_MIN: f32 = 0.8;                 // a first head height above this means the room's floor is the space's origin
 
 // The GPU side. Made first, ended last: fields end in order, so what was
 // made on the device comes before it.
@@ -36,6 +39,9 @@ struct Gfx {
   depth: Option[Texture];
   width: u32;
   height: u32;
+  xr: bool;                         // --xr: the headset's eyes are drawn, not a window
+  target: SurfaceTexture;           // --xr: a stand-in the eye's images are swapped into while an eye is drawn
+  headset: Headset;                 // --xr: ends before the device it draws on
   light: Light;
   device: Device;
   adapter: Adapter;
@@ -73,6 +79,14 @@ pub struct FramePlan {
   pub earlySeq: u64;
 }
 
+// The head as read (readHeadPose): where the eye is from the person's feet, and which way it looks. In the headset the eyes
+// themselves are in the frame the runtime located at the display time, which this read took.
+pub struct HeadRead {
+  pub look: LookIntent;
+  pub offset: Vec3;                 // the eye from the person's feet
+  pub hand: HandRay;                // the right controller's ray at the same moment (--xr)
+}
+
 // Render's work, apart from the actor, so a check can drive a frame step by
 // step without a GPU or a thread
 pub struct RenderCore {
@@ -99,11 +113,64 @@ pub struct RenderCore {
   pub longestSameNs: u64;           // the longest time drawing without a new snapshot
   pub framesDuringSame: u64;        // frames drawn in that time
   pub framesNow: u64;
+  xrFrame: Option[HeadsetFrame];    // --xr: the runtime's frame this Render frame draws, begun (waited for) when it was prepared
+  rays: Option[StateWriter[HandRay]];   // --xr: where the controller's ray is published
+  xrStand: f32;                     // --xr: added to the head's height when the space's origin is the head, not the floor
+  xrBase: Vec3;                     // --xr: where the headset's space origin is in the world this frame
+  xrPulls: u64;
+  xrPulled: bool;                   // the trigger is held past XR_TRIGGER_DOWN
+  xrStarted: bool;                  // the first located frame decided xrStand
+  pub xrEnded: bool;                // the headset's session is over: the run ends
   pub view: ShotView;               // the shot's own camera, if --shot-view named one
 
   pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), 0u64,
-      NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, ShotView.none())
+      NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+      None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, false, false, false, ShotView.none())
+  }
+
+  // Whether the picture is the headset's
+  pub fn isXr(self: &) bool {
+    var on = false;
+    match &gfx {
+      case let Some(g) { on = g.xr; }
+      case is None[Gfx] {}
+    }
+    on
+  }
+
+  // --xr: begin the runtime's frame. This waits until the runtime wants one (the headset's pace), so it is done before the
+  // snapshots are blended: the display time is then the time the wait ended, and the eyes the runtime located for it.
+  fn awaitHeadsetFrame(self: &mut) {
+    xrFrame = None[HeadsetFrame];
+    match &mut gfx {
+      case var &mut Some(g) {
+        if !g.xr { return; }
+        if !g.headset.pollEvents() { xrEnded = true; return; }
+        let f = g.headset.beginFrame(&mut g.device);
+        if !f.active { sdl.Delay(5u32); }     // (a session between READY and STOPPING only: not a spin)
+        xrFrame = Some[HeadsetFrame](f);
+      }
+      else {}
+    }
+  }
+
+  // --xr, the end of the run: the session ends as OpenXR has it end (asked to exit, STOPPING answered by pollEvents)
+  pub fn endHeadset(self: &mut) {
+    match &mut gfx {
+      case var &mut Some(g) {
+        if !g.xr { return; }
+        g.headset.requestExit();
+        var waited = 0;
+        while g.headset.isRunning() && waited < 400 {
+          g.headset.pollEvents();
+          sdl.Delay(5u32);
+          waited = waited + 1;
+        }
+        g.device.waitIdle();
+      }
+      else {}
+    }
   }
 
   // The newest snapshot: kept with the one before it
@@ -149,6 +216,7 @@ pub struct RenderCore {
 
   // Steps 1 and 2
   pub fn prepare(self: &mut) FramePlan {
+    self.awaitHeadsetFrame();     // (in the headset only: the runtime's wait is the frame's clock, so it comes first)
     let now = u64.from(Instant.now().nanos());
     frame = frame + 1u64;
     if lastFrameNs != 0u64 && now - lastFrameNs > longestGapNs { longestGapNs = now - lastFrameNs; }
@@ -173,22 +241,62 @@ pub struct RenderCore {
 
   // Steps 3 to 5: the head pose read last, the picture, the frame as drawn
   pub fn finish(self: &mut, plan: &FramePlan) DrawnFrame {
-    var look = self.readHeadPose();
+    var head = self.readHeadPose();
     var seq = looks.seq();
-    if stalePose { look = plan.earlyLook; seq = plan.earlySeq; }
-    let eye = plan.feet + Vec3(0., EYE_HEIGHT, 0.);
+    if stalePose { head.look = plan.earlyLook; seq = plan.earlySeq; }
+    let look = head.look;
+    let eye = plan.feet + head.offset;
+    xrBase = plan.feet + Vec3(0., xrStand, 0.);
     self.draw(eye, look, "");
+    if head.hand.pulls != xrPulls || head.hand.valid {
+      xrPulls = head.hand.pulls;
+      match &mut rays {
+        case var &mut Some(w) { var ray = head.hand; ray.atNs = plan.nowNs; ray.from = ray.from + plan.feet; w.put(&ray); }
+        else {}
+      }
+    }
     let d = DrawnFrame(frame, plan.nowNs, plan.step, eye, look.yaw, look.pitch, seq);
     drawnOut.put(&d);
     d
   }
 
   // THE HEAD POSE, read in this one function only, last before drawing. On
-  // the desktop it is Player's mouse look; in the headset it would be
-  // OpenXR's pose at the predicted display time (who reads the device is
-  // still open, B4).
-  fn readHeadPose(self: &mut) LookIntent {
-    looks.newest()
+  // the desktop it is Player's mouse look. In the headset it is the pose the
+  // runtime located for this frame's display time (beginFrame, which
+  // prepare called; it returns the pose with the wait's end, the latest the
+  // runtime gives): the midpoint of the eyes from the floor, and the way the
+  // left eye faces. The right controller's ray is read with it.
+  fn readHeadPose(self: &mut) HeadRead {
+    var head = HeadRead(looks.newest(), Vec3(0., EYE_HEIGHT, 0.), HandRay(false, Vec3(0., 0., 0.), Vec3(0., 0., -1.), xrPulls, 0u64));
+    match &xrFrame {
+      case let Some(f) {
+        if f.active && f.shouldRender && f.located {
+          let a = f.views[0usize].pose;
+          let b = f.views[1usize].pose;
+          let mid = Vec3((a.position.x + b.position.x) * 0.5, (a.position.y + b.position.y) * 0.5, (a.position.z + b.position.z) * 0.5);
+          if !xrStarted {
+            xrStarted = true;
+            xrStand = if mid.y > XR_FLOOR_MIN { 0. } else { EYE_HEIGHT };
+          }
+          head.offset = mid + Vec3(0., xrStand, 0.);
+          let fwd = Quat(a.orientation.x, a.orientation.y, a.orientation.z, a.orientation.w) * Vec3(0., 0., -1.);
+          head.look = LookIntent(atan2(0. - fwd.x, 0. - fwd.z), asin(fwd.y));
+          // the right controller: its aim pose is the ray, and the trigger's pulls are counted here, with hysteresis
+          let h = f.hands[1usize];
+          if h.active && h.aim.valid {
+            head.hand.valid = true;
+            head.hand.from = Vec3(0., xrStand, 0.) + h.aim.position;    // (relative to the feet; made absolute below)
+            head.hand.along = h.aim.forward().normalize();
+          }
+          if h.active {
+            if !xrPulled && h.trigger > XR_TRIGGER_DOWN { xrPulled = true; head.hand.pulls = head.hand.pulls + 1u64; }
+            else if xrPulled && h.trigger < XR_TRIGGER_UP { xrPulled = false; }
+          }
+        }
+      }
+      case is None[HeadsetFrame] {}
+    }
+    head
   }
 
   // Step 1: what the Loader moved, under the budget (at least one item a
@@ -287,7 +395,7 @@ pub struct RenderCore {
     var camera = Camera.make();
     camera.fov = radians(60.);
     camera.near = 0.1;
-    camera.far = 1000.;
+    camera.far = 500.;
     camera.background = Color(0.5, 0.7, 0.9, 1.);
     let ahead = Vec3(0. - sin(look.yaw) * cos(look.pitch), sin(look.pitch), 0. - cos(look.yaw) * cos(look.pitch));
     if shot.len() > 0usize && self.view.set {     // --shot-view: the shot's camera named, to be set beside another browser's
@@ -310,6 +418,7 @@ pub struct RenderCore {
       }
       case is None[Published] {}
     }
+    if g.xr { self.drawEyes(g); return; }
     var w = g.width;
     var h = g.height;
     match &mut g.swapchain {
@@ -340,7 +449,7 @@ pub struct RenderCore {
               var warm = g.device.createCommandEncoder();
               g.fx.render(&mut g.device, &mut warm, &mut g.renderer, &mut g.post, &camera, &g.light, &g.list, color);
               _ = g.device.queue.submit(warm.finish());
-              g.device.endFrame();      // each is a frame of its own: the frame's command buffers are a few, and past them drew black
+              g.device.endFrame();      // each is a frame of its own: a frame has a few command buffers, and past them drew black
               settle = settle + 1u32;
             }
             var encoder = g.device.createCommandEncoder();
@@ -361,11 +470,50 @@ pub struct RenderCore {
     }
   }
 
+  // --xr: the draw list 'drawWith' built, drawn once for each eye into that eye's swapchain image, as the runtime located the
+  // eyes for the frame's display time; the window shows the left eye; then the frame goes back to the runtime. The headset's
+  // space is placed at the person's feet (its floor is the ground), not turned (the mouse look and the headset's turn are not
+// joined; see render.md)
+  fn drawEyes(self: &mut, g: &mut Gfx) {
+    match &self.xrFrame {
+      case let Some(f) {
+        if !f.active { return; }
+        if f.shouldRender && f.located {
+          g.post.resize(&mut g.device, g.headset.eyeWidth, g.headset.eyeHeight);
+          var eye = 0usize;
+          while eye < 2usize {
+            if g.headset.acquireEye(f, eye) {
+              var camera = g.headset.eyeCamera(f, eye);
+              camera.far = 500.;
+              camera.background = Color(0.5, 0.7, 0.9, 1.);
+              camera.origin = camera.origin + self.xrBase;
+              let started = Instant.now().nanos();
+              g.headset.swapEye(eye, &mut g.target);
+              var encoder = g.device.createCommandEncoder();
+              g.headset.eyeStart(&mut encoder, eye);
+              g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &g.target.depth, &camera, &g.light, &g.list);
+              g.post.apply(&mut encoder, &g.target.texture);
+              g.headset.eyeEnd(&mut encoder, eye, &g.target.texture);
+              _ = g.device.queue.submit(encoder.finish());
+              g.headset.swapEye(eye, &mut g.target);
+              g.headset.eyeSubmitted(&g.device, eye, f64.from(Instant.now().nanos() - started) * 1.0e-9);
+              if eye == 0usize && g.headset.hasMirror() { _ = g.headset.mirrorEye(&mut g.device, 0usize); }
+              _ = g.headset.releaseEye(eye);
+            }
+            eye = eye + 1usize;
+          }
+        }
+        g.headset.endFrame(&mut g.device, f);
+      }
+      case is None[HeadsetFrame] {}
+    }
+  }
+
   // --shot: one frame off screen, from where the person stands
   pub fn shoot(self: &mut, file: &str) {
     let plan = self.prepare();
-    let look = self.readHeadPose();
-    self.draw(plan.feet + Vec3(0., EYE_HEIGHT, 0.), look, file);
+    let head = self.readHeadPose();
+    self.draw(plan.feet + head.offset, head.look, file);
   }
 
   pub fn printStats(self: &) {
@@ -397,6 +545,15 @@ fn worldLight() Light {
     Color(0.80 * sky, 0.88 * sky, 1.0 * sky, 1.))
 }
 
+// The scene is in physical units (nits, lux), seen by a camera set for a sunny day, with the world's sun, its shadows and
+// its sky, as the guide browser sets them; the light is returned
+fn worldLook(renderer: &mut Renderer, device: &mut Device) Light {
+  renderer.exposure = exposureFromEv100(15.);
+  renderer.setShadows(device, &ShadowSettings(enabled: true));
+  renderer.setSky(device, &clearDaySky(worldToSun().normalize(), f32.from(WORLD_SUN_LUX)));
+  worldLight()
+}
+
 // What is drawn behind everything, and what a clear coat mirrors: the guide browser's clearDaySky (guidebrowser.cone),
 // copied: a robin's-egg blue overhead, a pale haze at the horizon, each as bright as Preetham's clear day is there for
 // this sun (turbidity 2.5), in the hue of the named sRGB colour; a mid-grey ground; no sun disc
@@ -423,6 +580,20 @@ fn hued(radiance: Vec3, r: f32, g: f32, b: f32) Color {
   Color(lr * y / ly, lg * y / ly, lb * y / ly, 1.)
 }
 fn fmaxZero(x: f32) f32 { if x > 0. { x } else { 0. } }
+
+// The image passes, as the guide browser sets them for a window or a shot: rays, temporal anti-aliasing, ambient occlusion
+// and auto-exposure
+fn makeFx(renderer: &mut Renderer, post: &mut Post, device: &mut Device) ImageFx {
+  _ = renderer.setRayTracing(device, true);     // glass and reflections by rays where the GPU has them
+  var fx = ImageFx.create(device, renderer, post);
+  var settings = FxSettings.high();
+  // Brightness measured against the guide browser's shot of this world (first.ddd, 120th frame): the same passes, light and sky
+  // in Render gave a picture 1.4 stops darker (the guide's auto-exposure drifts up over its first seconds and Render's did not;
+  // cause not found), so the exposure is opened by that much until the world's own camera exposure reaches Render
+  settings.exposure.compensationEv = 1.4;
+  fx.configure(&settings);
+  fx
+}
 
 // The GPU for a window ('window': its SDL handle as a number, since a raw
 // pointer is not Sendable), or off screen at 'w' x 'h' when 'window' is 0
@@ -467,20 +638,66 @@ fn makeGfx(window: usize, w: u32, h: u32) Option[Gfx] {
   var post = Post.create(&mut device, outFormat, w, h);
   if !renderer.isValid() || !post.isValid() { print <- "render: the renderer could not be made\n"; return None[Gfx]; }
   // The world's sky and sun, fixed for now (the world's own `sun` part reaching Render is a message change for later)
-  // In the guide browser's order: rays, the image passes, the exposure, then the world's sun with its shadows and sky
-  _ = renderer.setRayTracing(&mut device, true); // glass and reflections by rays where the GPU has them
-  var fx = ImageFx.create(&mut device, &renderer, &mut post);
-  var settings = FxSettings.high();
-  // Brightness measured against the guide browser's shot of this world (first.ddd, 120th frame): the same passes, light and sky
-  // in Render gave a picture 1.4 stops darker (the guide's auto-exposure drifts up over its first seconds and Render's did not;
-  // cause not found), so the exposure is opened by that much until the world's own camera exposure reaches Render
-  settings.exposure.compensationEv = 1.4;
-  fx.configure(&settings);
-  renderer.exposure = exposureFromEv100(15.);   // the scene is in physical units (nits, lux)
-  renderer.setShadows(&mut device, &ShadowSettings(enabled: true));
-  renderer.setSky(&mut device, &clearDaySky(worldToSun().normalize(), f32.from(WORLD_SUN_LUX)));
-  let light = worldLight();
-  Some[Gfx](Gfx(DrawList(), renderer, post, fx, swapchain, color, depth, w, h, light, device, adapter, surface, instance))
+  // The guide browser's order: rays and the image passes, then the exposure, the sun with its shadows and the sky
+  let fx = makeFx(&mut renderer, &mut post, &mut device);
+  let light = worldLook(&mut renderer, &mut device);
+  let target = standInTarget(&mut device, 2u32, 2u32, TEXTURE_FORMAT_RGBA8_UNORM);
+  Some[Gfx](Gfx(DrawList(), renderer, post, fx, swapchain, color, depth, w, h, false, target, Headset.none(), light, device, adapter,
+    surface, instance))
+}
+
+// The eye's format with a depth texture: what the XR target is until an eye's images are swapped into it
+fn standInTarget(device: &mut Device, width: u32, height: u32, format: u32) SurfaceTexture {
+  let colorDesc = TextureDescriptor(width, height, format, TEXTURE_USAGE_RENDER_ATTACHMENT | TEXTURE_USAGE_COPY_SRC);
+  let color = device.createTexture(&colorDesc);
+  let depthDesc = TextureDescriptor(width, height, TEXTURE_FORMAT_DEPTH32_FLOAT, TEXTURE_USAGE_RENDER_ATTACHMENT);
+  let depth = device.createTexture(&depthDesc);
+  SurfaceTexture(color, depth, SURFACE_TEXTURE_SUCCESS_OPTIMAL)
+}
+
+// The GPU for the headset (--xr): the runtime makes the Vulkan instance and device; the window (when 'window' is not 0)
+// mirrors the left eye. None, with a message, when there is no OpenXR runtime or headset, or its session does not begin.
+fn makeGfxXr(window: usize, w: u32, h: u32) Option[Gfx] {
+  // (declared in this order: the headset ends before the GPU it draws on)
+  var gpu = HeadsetGpu.none();
+  var options = HeadsetOptions();
+  options.far = 500.;
+  options.mirrorWindow = window;
+  options.mirrorWidth = w;
+  options.mirrorHeight = h;
+  var headset = Headset.open("pegasus", &options, &mut gpu);
+  if !headset.isValid() {
+    print <- "pegasus: no headset could be opened (is an OpenXR runtime running, and a headset connected? see above)\n";
+    return None[Gfx];
+  }
+  // The session begins when the runtime says READY, a moment after it was made: the first frame waits for it
+  var waited = 0;
+  while !headset.isRunning() && waited < 1000 {
+    if !headset.pollEvents() { break; }
+    sdl.Delay(10u32);
+    waited = waited + 1;
+  }
+  if !headset.isRunning() {
+    print <- "pegasus: the headset's session did not begin\n";
+    return None[Gfx];
+  }
+  print <- "Adapter: "; printStr(gpu.adapterName()); print <- "; headset "; printStr(headset.systemName.view()); print <- " by ";
+  printStr(headset.runtimeName.view()); print <- ", each eye "; print <- u64.from(headset.eyeWidth); print <- " x ";
+  print <- u64.from(headset.eyeHeight); print <- if headset.hasMirror() { ", the left eye in the window\n" } else { ", no window\n" };
+  var renderer = Renderer.create(&mut gpu.device, TEXTURE_FORMAT_RGBA16_FLOAT, TEXTURE_FORMAT_DEPTH32_FLOAT);
+  var post = Post.create(&mut gpu.device, headset.colorFormat, headset.eyeWidth, headset.eyeHeight);
+  if !renderer.isValid() || !post.isValid() { print <- "render: the renderer could not be made\n"; return None[Gfx]; }
+  // The eyes are drawn by the renderer alone (no image passes), under the same sun, sky and exposure as a window's
+  let fx = ImageFx.create(&mut gpu.device, &renderer, &mut post);
+  let light = worldLook(&mut renderer, &mut gpu.device);
+  let target = standInTarget(&mut gpu.device, 16u32, 16u32, headset.colorFormat);
+  var made = Gfx(DrawList(), renderer, post, fx, None[SwapChain], None[Texture], None[Texture], w, h, true, target, Headset.none(), light,
+    Device.none(), Adapter.none(), Surface.none(), Instance.none());
+  made.headset <-> headset;
+  made.device <-> gpu.device;
+  made.adapter <-> gpu.adapter;
+  made.instance <-> gpu.instance;
+  Some[Gfx](made)
 }
 
 actor Render {
@@ -494,15 +711,21 @@ actor Render {
   finished: Sender[i32];            // a shot's verdict
   stallMs: u64;                     // the stall check: Sim is busy this long once (0: no stall)
   shotAfter: u64;                   // a shot waits for this step (--shot-after N; at least 10)
+  headsetFailed: bool;              // --xr was asked and no headset opened: the run ends at once, not clean
 
   fn init(self: &new, window: usize, w: u32, h: u32, gpu: bool, looks: StateReader[LookIntent],
       drawnOut: StateWriter[DrawnFrame], shot: String, wantKeys: usize, exactKeys: usize, stopped: Sender[bool], finished: Sender[i32],
-      stallMs: u64, stalePose: bool, shotAfter: u64, view: ShotView) {
+      stallMs: u64, stalePose: bool, shotAfter: u64, xr: bool, rays: StateWriter[HandRay], view: ShotView) {
     var core = RenderCore.make(looks, drawnOut, stalePose);
-    if gpu { core.gfx = makeGfx(window, w, h); }
     core.view = view;
+    var failed = false;
+    if xr {
+      core.gfx = makeGfxXr(window, w, h);
+      core.rays = Some[StateWriter[HandRay]](rays);
+      failed = !core.isXr();
+    } else if gpu { core.gfx = makeGfx(window, w, h); }
     *self = Self(core, false, window == 0usize, shot, wantKeys, exactKeys, stopped, finished, stallMs,
-      if shotAfter > 10u64 { shotAfter } else { 10u64 });
+      if shotAfter > 10u64 { shotAfter } else { 10u64 }, failed);
   }
 
   // Render's checks at the end of a run: no snapshot changed after it was
@@ -549,6 +772,11 @@ actor Render {
   // short sleep after it only lets the other messages in. Headless, a timer
   // at HEADLESS_HZ stands in for the display.
   pub async fn run(self) {
+    if headsetFailed {
+      var s = stopped.clone();
+      s <- false;
+      return;
+    }
     running = true;
     let period = i64.from(1000000000u64 / HEADLESS_HZ);
     var next = Instant.now().nanos() + period;
@@ -572,9 +800,11 @@ actor Render {
         }
       } else {
         let plan = core.prepare();
+        if core.xrEnded { break; }
         _ = core.finish(&plan);
       }
     }
+    core.endHeadset();
     core.printStats();
     let ok = self.checks();
     var s = stopped.clone();

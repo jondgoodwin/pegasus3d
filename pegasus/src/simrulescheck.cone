@@ -35,7 +35,7 @@ fn tinyBehaviour(trap: bool) Behaviour {
   fields.push(FieldDecl(String.from("held"), 0.));
   var moves = MoveDecls();
   moves.push(MoveDecl(1u32, 0u32));
-  Behaviour(setTwiceCode(trap), frames, fields, DeriveDecls(), moves, 0usize, NO_AVATAR)
+  Behaviour(setTwiceCode(trap), frames, fields, DeriveDecls(), moves, KeysDecls(), AreaDecls(), NO_AVATAR)
 }
 
 // Two handlers: rule 0 (slot 1) sets field 0 to 5; rule 1 (slot 2) is code the verifier refuses (a call with no
@@ -65,7 +65,7 @@ fn oneBadRuleBehaviour() Behaviour {
   var moves = MoveDecls();
   moves.push(MoveDecl(1u32, 0u32));
   moves.push(MoveDecl(2u32, 1u32));
-  Behaviour(code, frames, fields, DeriveDecls(), moves, 0usize, NO_AVATAR)
+  Behaviour(code, frames, fields, DeriveDecls(), moves, KeysDecls(), AreaDecls(), NO_AVATAR)
 }
 
 fn rulesVerdict(ok: bool, what: &str) bool {
@@ -73,8 +73,73 @@ fn rulesVerdict(ok: bool, what: &str) bool {
   ok
 }
 
+// A world with a block that turns, started at creation, one 120 degree turn in four seconds; a field 'near' that a derive
+// sets from the area round the block
+const ANIM_WORLD = "
+part hello
+  part materials
+    part stone: plain(srgb(140, 140, 135))
+  part block: box(x: -0.3 ..= 0.3, y: 0.4 ..= 1, z: -0.3 ..= 0.3), material: materials.stone, at: (0, 0, 0)
+    field near: bool = false
+    area(self, sphere(radius: 2 m, at: (0, 0.7, 0)))
+    derive(near, occupied(self, by: me))
+  part arrivals
+    part start, at: (0, 0, 3), facing: (0, 0, -1)
+  on(created, start(keys(block.rotation,
+      [key(sim(0 s), rotation(0 deg)), key(sim(4 s), rotation(120 deg))],
+      loop: loop, ease: linear)))
+";
+
+// The slot named 'name' (or the world's, 0)
+fn slotNamed(r: &SimRules, name: &str) u32 {
+  var s = 0usize;
+  while s < r.slots.count() {
+    if r.slots.nameOf(u32.from(s)) == name { return u32.from(s); }
+    s = s + 1usize;
+  }
+  0u32
+}
+
+// The animators and the areas, driven. After 30 steps (half a second) the block has turned 15 degrees of its 120 in
+// four seconds: its turn's w is cos(7.5 deg) = 0.99144. An animator that never advances leaves w 1; one that advances
+// twice a step is at 30 degrees, w 0.96593. 'mutant' is the check's: PEGASUS_MUTANT=anim-never or anim-twice
+fn checkAnimators(mutant: u32) bool {
+  var all = true;
+  var image = readImage("anim.ddd", ANIM_WORLD);
+  var behaviour = Behaviour.none();
+  behaviour <-> image.behaviour;
+  var r = SimRules.make(behaviour, false);
+  r.anim.mutant = mutant;
+  let block = slotNamed(&r, "block");
+  var step = 1u64;
+  while step <= 31u64 { r.animate(step, STEP_NS); step = step + 1u64; }
+  let q = r.slots.turnOf(block);
+  let d = q.w - 0.991445;
+  all = rulesVerdict(r.keysRuleCount() == 1usize && r.anim.started == 1u64 && r.anim.ticks == 31u64 && block != 0u32,
+    "the world's created keys rule is started once and the clock is ticked once a step") && all;
+  all = rulesVerdict(d < 0.0005 && d > -0.0005 && q.y > 0.1,
+    "after half a second the block has turned 15 of its 120 degrees") && all;
+  // the places Sim publishes are the animated ones
+  r.slots.refresh();
+  let place = r.slots.place(block);
+  all = rulesVerdict(place.translation().y == 0., "an animated turn leaves the block where it stood") && all;
+  // areas: host.occupied now gives the area's value
+  r.sense(Vec3(0., 1.6, 3.));
+  r.derive(32u64);
+  let far = r.fieldValue(0usize);
+  r.sense(Vec3(0., 1.6, 1.));
+  r.derive(33u64);
+  all = rulesVerdict(far == 0. && r.fieldValue(0usize) == 1. && r.inside(block),
+    "host.occupied is false with the visitor 3 m off, true at 1.3 m, and the derive says so") && all;
+  all
+}
+
 pub fn checkRules(applyOnTrap: bool) bool {
   var all = true;
+  var animMutant = ANIM_MUTANT_NONE;
+  if mutantIs("anim-never") { animMutant = ANIM_MUTANT_NEVER; }
+  if mutantIs("anim-twice") { animMutant = ANIM_MUTANT_TWICE; }
+  all = checkAnimators(animMutant) && all;
   {
     var r = SimRules.make(tinyBehaviour(false), applyOnTrap);
     var asks = GlideAsks();
