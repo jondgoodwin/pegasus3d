@@ -21,7 +21,7 @@ The avatar is a part in the world, and Sim's; its camera is a part of the avatar
 The kinds of handshake are those of [Messages](messages.md). The kinds of the rows the first browser is built to are decided there; the kinds of the rest are in the proposed table of messages there.
 
 **The devices** (keyboard, mouse, controllers, hands, headset).
-- In: what the person does on them, of four kinds ([Actions and triggers](../design/actions-and-triggers.md)). The reserved keys stay live while text goes to a focused field. The owner of raw streams (the microphone) is open (see Open).
+- In: what the person does on them, of four kinds ([Actions and triggers](../design/actions-and-triggers.md)). The browser's own controls stay live while text goes to a focused field ([Actions and triggers](../design/actions-and-triggers.md)); which inputs are reserved from worlds is deferred (see Open). The owner of raw streams (the microphone) is open (see Open).
 - Bindings are triggers ([Actions and triggers](../design/actions-and-triggers.md)); a world sees the actions, never the devices.
 
 **The client Sim of the zone the person is in.**
