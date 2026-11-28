@@ -1,0 +1,74 @@
+// ConeScript is resilient: a container with one bad unit among good ones. The good units verify and run; the bad one
+// is refused and reported once; a unit that calls it is refused with no line of its own; the strict 'verify' still
+// refuses the whole container.
+
+mod resilient;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import conescript use *;
+
+fn impOk(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { s[0usize] = 5.0.bits(); true }
+
+fn tables() ImportTables[u8] {
+  var ti = ImportTables[u8].make();
+  let e = List[u32]();
+  ti.add("host", "five", ti.types.sig(e.view(), &[TY_F64]), false, 1u32, &impOk);
+  ti
+}
+
+// Unit 0 "good" returns 1; unit 1 "bad" returns a bool where an f64 is wanted; unit 2 "caller" calls the bad one;
+// unit 3 "good2" calls the good one and adds the import; unit 4 "lost" uses an import the host does not offer.
+fn container() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let sigF = w.code.types.sig(e.view(), &[TY_F64]);
+  let five = w.addImport("host", "five", sigF);
+  let gone = w.addImport("host", "absent", sigF);
+  w.beginUnit(sigF, "good");   w.f64Const(1.0); w.endUnit();
+  w.beginUnit(sigF, "bad");    w.boolConst(true); w.endUnit();
+  w.beginUnit(sigF, "caller"); w.opU(OP_CALL, 1u32); w.endUnit();
+  w.beginUnit(sigF, "good2");  w.opU(OP_CALL, 0u32); w.opU(OP_IMPORT, five); w.op(OP_F64_ADD); w.endUnit();
+  w.beginUnit(sigF, "lost");   w.opU(OP_IMPORT, gone); w.endUnit();
+  w
+}
+
+fn runOne(v: &VerifiedCode, tb: &ImportTables[u8], unit: u32, out: &mut List[u64]) bool {
+  var it = Interpreter.make();
+  it.setFuel(1000u64);
+  var h = HandleTable[u8].make();
+  let a = List[u64]();
+  it.run(v, tb, &mut h, unit, a.view(), out) is None
+}
+
+fn main() i32 {
+  let tb = tables();
+  let w = container();
+  match verifyEach(&w.code, &tb) {
+    case let Ok(v) {
+      var out = List[u64]();
+      expect(!v.isRefused(0usize), "the good unit is kept");
+      expect(v.isRefused(1usize), "the bad unit is refused");
+      expect(v.isRefused(2usize), "a caller of the bad unit is refused");
+      expect(!v.isRefused(3usize), "a second good unit is kept");
+      expect(v.isRefused(4usize), "a unit using a missing import is refused");
+      expect(runOne(&v, &tb, 0u32, &mut out), "the good unit runs");
+      expectFloat(f64.fromBits(*out[0usize]), 1.0, 0.0, "the good unit's answer");
+      expect(runOne(&v, &tb, 3u32, &mut out), "the second good unit runs, calling the first");
+      expectFloat(f64.fromBits(*out[0usize]), 6.0, 0.0, "the second good unit's answer");
+      expect(!runOne(&v, &tb, 1u32, &mut out), "the bad unit does not run");
+      expect(!runOne(&v, &tb, 2u32, &mut out), "the caller does not run");
+      // one line for the bad unit and one for the lost import; the caller has none
+      expectInt(i64.from(v.problems().len()), 2i64, "two problems, one per unit wrong in itself");
+      expectInt(i64.from(v.problems()[0usize].unit), 1i64, "the first names the bad unit");
+      expectInt(i64.from(v.problems()[1usize].unit), 4i64, "the second names the lost-import unit");
+    }
+    case let Err(ps) { expect(false, "a bad unit is not fatal to the container"); }
+  }
+  match verify(&w.code, &tb) {
+    case let Ok(v) { expect(false, "the strict verify refuses a container with a bad unit"); }
+    case let Err(ps) { expectInt(i64.from(ps.len()), 2i64, "the strict verify gives the same two problems"); }
+  }
+  done()
+}
