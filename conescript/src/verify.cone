@@ -21,6 +21,7 @@ struct ResolvedImport {
   paramSlots: u32;
   resultSlots: u32;
   weight: u32;
+  why: String;            // empty if the host offers it as declared; else what is wrong (a unit that uses it is refused)
 }
 
 // Code that has passed 'verify'; the only thing the interpreter runs
@@ -29,7 +30,13 @@ pub struct VerifiedCode {
   slots: List[u32];       // slots of each type
   units: List[UnitInfo];
   imports: List[ResolvedImport];
+  refused: List[bool];            // by unit: its code did not verify, or it calls a unit that did not
+  found: List[CodeProblem];       // what 'verifyEach' found, one per unit it refused
 
+  // True if the unit was refused: it has no side tables, and 'run' will not run it
+  pub fn isRefused(self: &, unit: usize) bool { *self.refused[unit] }
+  // What was refused, once for each unit that is wrong in itself (a caller of one is refused without a line of its own)
+  pub fn problems(self: &) &List[CodeProblem] { &self.found }
   pub fn unitCount(self: &) usize { self.units.len() }
   pub fn maxDepth(self: &, unit: usize) u32 { self.units[unit].maxDepth }
   // How many argument slots a unit takes (the length of the 'args' that 'run' wants)
@@ -552,6 +559,8 @@ fn checkUnit[V](code: &Code, canon: &List[u32], slots: &List[u32], imps: &List[R
         let c = ps.immed(cb, &mut pos);
         if !ps.failed {
           if usize.from(c) >= code.units.len() { ps.fail("a call to a unit that does not exist"); }
+          else if usize.from(code.units[usize.from(c)].sig) >= code.types.defs.len()
+                  || code.types.defs[usize.from(code.units[usize.from(c)].sig)].kind != T_SIG { ps.fail("a call to a unit whose type is not a signature"); }
           else {
             facts.callees.push(c);
             let cs = &code.types.defs[usize.from(code.units[usize.from(c)].sig)];
@@ -566,6 +575,7 @@ fn checkUnit[V](code: &Code, canon: &List[u32], slots: &List[u32], imps: &List[R
         let k = ps.immed(cb, &mut pos);
         if !ps.failed {
           if usize.from(k) >= code.imports.len() { ps.fail("an import that does not exist"); }
+          else if imps[usize.from(k)].why.len() > 0usize { ps.fail(imps[usize.from(k)].why.view()); }
           else {
             facts.imports.push(k);
             let cs = &code.types.defs[usize.from(code.imports[usize.from(k)].sig)];
@@ -618,9 +628,11 @@ fn enterBlock(ps: &mut Pass, code: &Code, canon: &List[u32], slots: &List[u32], 
 
 // ---- the whole verification ----
 
-// Checks code against the imports a host offers. Everything wrong is reported, each as a CodeProblem naming the
-// unit and the op's offset. On success the VerifiedCode holds the side tables the interpreter reads.
-pub fn verify[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode, List[CodeProblem]] {
+// Checks code against the imports a host offers, one unit at a time (ConeScript is resilient). A unit that is wrong
+// is refused, with one CodeProblem naming the unit and the op's offset, and so is a unit that calls it; every
+// other unit is checked and kept. Only a fault in the container's shared tables (its version, its types) is an Err.
+// The VerifiedCode holds the side tables the interpreter reads, 'isRefused' and 'problems'.
+pub fn verifyEach[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode, List[CodeProblem]] {
   var problems = List[CodeProblem]();
   if code.major != FORM_MAJOR {
     problems.push(problemAt(NO_UNIT, 0u32, "the form's major version is not one this verifier knows"));
@@ -638,22 +650,21 @@ pub fn verify[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode, Lis
     let m = &code.imports[i];
     var found = false;
     if usize.from(m.sig) >= code.types.defs.len() || code.types.defs[usize.from(m.sig)].kind != T_SIG {
-      problems.push(problemAt(NO_UNIT, u32.from(i), "an import whose type is not a signature"));
-      imps.push(ResolvedImport(0u32, 0u32, 0u32, 1u32));
+      imps.push(ResolvedImport(0u32, 0u32, 0u32, 1u32, String.from("an import whose type is not a signature")));
     } else {
       var k = 0usize;
-      var ri = ResolvedImport(0u32, 0u32, 0u32, 1u32);
+      var ri = ResolvedImport(0u32, 0u32, 0u32, 1u32, String());
       while k < tables.entries.len() && !found {
         let e = &tables.entries[k];
         if e.ns == m.ns && e.name == m.name {
           found = true;
           if sameType(&code.types, m.sig, &tables.types, e.sig) {
             ri = ResolvedImport(u32.from(k), slotsOfList(&slots, &code.types.defs[usize.from(m.sig)].items),
-                                slotsOfList(&slots, &code.types.defs[usize.from(m.sig)].results), if e.weight == 0u32 { 1u32 } else { e.weight });
+                                slotsOfList(&slots, &code.types.defs[usize.from(m.sig)].results), if e.weight == 0u32 { 1u32 } else { e.weight }, String());
           } else {
             var w = String.from("the import ");
             w.append(m.ns.view()); w.append("."); w.append(m.name.view()); w.append(" has a different signature from the host's");
-            problems.push(CodeProblem(NO_UNIT, u32.from(i), w));
+            ri.why = w;
           }
         }
         k = k + 1usize;
@@ -661,41 +672,24 @@ pub fn verify[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode, Lis
       if !found {
         var w = String.from("the import ");
         w.append(m.ns.view()); w.append("."); w.append(m.name.view()); w.append(" is not offered by the host");
-        problems.push(CodeProblem(NO_UNIT, u32.from(i), w));
+        ri.why = w;
       }
       imps.push(ri);
     }
     i = i + 1usize;
   }
 
-  // A bad import would let the units' checks read a signature that is not there
-  if problems.len() > 0usize { return Err[VerifiedCode, List[CodeProblem]](problems); }
+  // A bad import is not fatal: a unit that uses one is refused (see OP_IMPORT), and the rest go on
 
-  // Every unit's signature and locals first: a call reads the callee's signature before the callee is checked
-  var pre = 0usize;
-  while pre < code.units.len() {
-    let pu = &code.units[pre];
-    if usize.from(pu.sig) >= code.types.defs.len() || code.types.defs[usize.from(pu.sig)].kind != T_SIG {
-      problems.push(CodeProblem(u32.from(pre), 0u32, String.from("the unit's type is not a signature")));
-    } else {
-      var pj = 0usize;
-      while pj < pu.locals.len() {
-        if usize.from(*pu.locals[pj]) >= code.types.defs.len() || !isValue(code.types.defs[usize.from(*pu.locals[pj])].kind) {
-          problems.push(CodeProblem(u32.from(pre), 0u32, String.from("a local's type is not a value type")));
-        }
-        pj = pj + 1usize;
-      }
-    }
-    pre = pre + 1usize;
-  }
-  if problems.len() > 0usize { return Err[VerifiedCode, List[CodeProblem]](problems); }
-
-  // Units
+  // Units, each checked alone: a unit that is wrong is refused and the others go on. (A call reads the callee's
+  // signature, so OP_CALL checks it is one.)
   var infos = List[UnitInfo]();
   var allFacts = List[UnitFacts]();
+  var refused = List[bool]();
   i = 0usize;
   while i < code.units.len() {
     let u = &code.units[i];
+    let problemsBefore = problems.len();
     var info = UnitInfo(List[u32](), List[u32](), List[u32](), 0u32, List[u32](), List[u32](), 0u32, 0u32, 0u32);
     var facts = UnitFacts(List[u32](), List[u32]());
     var ok = true;
@@ -716,6 +710,7 @@ pub fn verify[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode, Lis
     if ok { checkUnit(code, &canon, &slots, &imps, tables, i, &mut info, &mut facts, &mut problems); }
     infos.push(info);
     allFacts.push(facts);
+    refused.push(problems.len() > problemsBefore);
     i = i + 1usize;
   }
 
@@ -752,13 +747,45 @@ pub fn verify[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode, Lis
   while i < code.entries.len() {
     let e = &code.entries[i];
     if usize.from(e.unit) >= code.units.len() { problems.push(CodeProblem(NO_UNIT, u32.from(i), String.from("an entry names a unit that does not exist"))); }
-    else if e.kind > ENTRY_HANDLER { problems.push(CodeProblem(e.unit, 0u32, String.from("an entry of unknown kind"))); }
-    else if e.kind != ENTRY_HANDLER && *reach[usize.from(e.unit)] {
+    else if e.kind > ENTRY_HANDLER { problems.push(CodeProblem(e.unit, 0u32, String.from("an entry of unknown kind"))); refused.set(usize.from(e.unit), true); }
+    else if e.kind != ENTRY_HANDLER && *reach[usize.from(e.unit)] && !*refused[usize.from(e.unit)] {
       problems.push(CodeProblem(e.unit, 0u32, String.from("a fixed or derive unit reaches an acting import")));
+      refused.set(usize.from(e.unit), true);
     }
     i = i + 1usize;
   }
 
-  if problems.len() > 0usize { return Err[VerifiedCode, List[CodeProblem]](problems); }
-  Ok[VerifiedCode, List[CodeProblem]](VerifiedCode(cloneCode(code), slots, infos, imps))
+  // A unit that calls a refused one is refused too, with no line of its own: the cause is already told
+  changed = true;
+  while changed {
+    changed = false;
+    i = 0usize;
+    while i < code.units.len() {
+      if !*refused[i] {
+        var j = 0usize;
+        while j < allFacts[i].callees.len() {
+          if *refused[usize.from(*allFacts[i].callees[j])] { refused.set(i, true); changed = true; break; }
+          j = j + 1usize;
+        }
+      }
+      i = i + 1usize;
+    }
+  }
+  Ok[VerifiedCode, List[CodeProblem]](VerifiedCode(cloneCode(code), slots, infos, imps, refused, problems))
+}
+
+// The strict form: any problem refuses the whole code. For a caller that has nothing to do with part of it.
+pub fn verify[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode, List[CodeProblem]] {
+  match verifyEach(code, tables) {
+    case let Ok(v) {
+      if v.found.len() > 0usize {
+        var ps = List[CodeProblem]();
+        var i = 0usize;
+        while i < v.found.len() { ps.push(CodeProblem(v.found[i].unit, v.found[i].offset, v.found[i].what.clone())); i = i + 1usize; }
+        Err[VerifiedCode, List[CodeProblem]](ps)
+      }
+      else { Ok[VerifiedCode, List[CodeProblem]](v) }
+    }
+    case let Err(ps) { Err[VerifiedCode, List[CodeProblem]](ps) }
+  }
 }

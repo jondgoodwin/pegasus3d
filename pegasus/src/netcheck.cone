@@ -3,6 +3,8 @@
 //   no-replay        the samples after the acknowledged one are never replayed over the server's body
 //   stale-personal   an older acknowledgement is taken as if it were the newest
 //   stale-shared     an older shared snapshot is merged as if it were the newest
+//   delta-vs-sent    a part change is measured against the last snapshot SENT, not the last one the client acknowledged,
+//                    so a change in a lost snapshot is never sent again (the server's tracker, partsync.cone)
 // The wire check has no mutant: it is a round trip of every message.
 
 const CHECK_STEPS = 120u32;
@@ -100,32 +102,41 @@ fn checkSharedInterp(takeStale: bool) bool {
 // The wire: every message encoded, taken apart again, and a message cut short refused
 fn checkWire() bool {
   var ok = true;
-  // parts and shapes, as many as one world holds, in messages that fit a packet
-  var parts = SimParts();
+  // the shared snapshot: the people, and the changed parts after them, in a packet; a snapshot with no part changed
+  // carries the count byte only
+  var people = OtherPersons();
+  people.push(OtherPerson(3u32, Vec3(1., 0., 2.), 0.5));
+  var deltas = PartDeltas();
   var i = 0u32;
-  while i < 100u32 {
-    var name = String.from("a/part/path-");
-    name.appendByte('0' + u8.from(i / 10u32));
-    name.appendByte('0' + u8.from(i % 10u32));
-    parts.push(SimPart(i, name, 7000u64 + u64.from(i), Mat4.fromTranslation(Vec3(f32.from(i), 0.5, -8.)), i, true));
-    i = i + 1u32;
-  }
-  let msgs = encodeParts(&parts);
-  var most = 0usize;
-  var got = PartDecls();
-  var idsOk = true;
-  each m in &msgs {
-    if m.len() > most { most = m.len(); }
-    let says = decodeServerSays(bytesOfList(m));
-    if says.tag != S_PARTS || says.firstId != u32.from(got.len()) { idsOk = false; }
-    each d in &says.declared { got.push(PartDecl(d.name.clone(), d.key, d.placement, d.slot)); }
-  }
-  var partsOk = idsOk && got.len() == 100usize && most <= 1173usize && msgs.len() > 1usize;
-  if partsOk {
-    let k = 57usize;
-    partsOk = got[k].key == 7057u64 && got[k].name.view() == "a/part/path-57" && got[k].placement.m[12] == 57.;
-  }
-  print <- "check wire parts: 100 parts in "; print <- u64.from(msgs.len()); print <- " messages, the largest "; print <- u64.from(most); print <- " bytes";
+  while i < 12u32 { deltas.push(PartDelta(i * 5u32, FIELD_PLACEMENT, Mat4.fromTranslation(Vec3(f32.from(i), 0.5, -8.)))); i = i + 1u32; }
+  let head = encodePeople(77u64, &people);
+  var full = List[u8]();
+  full.appendSlice(head.view());
+  full.appendList(encodePartTail(41u64, &deltas, 0xABCDEF0123456789u64));
+  var gotStep = 0u64;
+  var gotPeople = OtherPersons();
+  var gotThrough = 0u64;
+  var gotDeltas = PartDeltas();
+  var gotHash = 0u64;
+  let sharedBytes = bytesOfList(&full);
+  var partsOk = decodeShared(sharedBytes, &mut gotStep, &mut gotPeople, &mut gotThrough, &mut gotDeltas, &mut gotHash)
+    && gotStep == 77u64 && gotPeople.len() == 1usize && gotPeople[0usize].id == 3u32 && gotThrough == 41u64 && gotDeltas.len() == 12usize
+    && gotDeltas[7usize].id == 35u32 && gotDeltas[7usize].placement.m[12] == 7. && full.len() <= 1173usize
+    && gotHash == 0xABCDEF0123456789u64
+    && partRoom(1usize) >= 12usize && full.len() == head.len() + 1usize + 8usize + 12usize * DELTA_BYTES + 9usize;
+  let atRest = bytesOfList(&encodePartTail(41u64, &PartDeltas(), 0u64));
+  partsOk = partsOk && atRest.len() == 2usize && head.len() + atRest.len() == 9usize + 20usize + 2usize;
+  // the hash: the same states hash alike, one part moved a hair hashes differently, and the order matters
+  var hs = List[Mat4]();
+  hs.push(Mat4.fromTranslation(Vec3(1., 2., 3.))); hs.push(Mat4.identity());
+  var hs2 = List[Mat4]();
+  hs2.push(Mat4.fromTranslation(Vec3(1., 2., 3.))); hs2.push(Mat4.identity());
+  let h1 = statesHash(&hs);
+  let sameHash = h1 == statesHash(&hs2) && h1 != 0u64;
+  hs2.set(1usize, Mat4.fromTranslation(Vec3(0., 0., 0.0001)));
+  partsOk = partsOk && sameHash && statesHash(&hs2) != h1;
+  print <- "check wire snapshot: "; print <- u64.from(head.len()); print <- " bytes of people, 12 changed parts in "; print <- u64.from(full.len());
+  print <- " bytes, none changed adds "; print <- u64.from(atRest.len()); print <- " byte";
   if partsOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
   var shapes = ShapeTable();
   i = 0u32;
@@ -144,9 +155,10 @@ fn checkWire() bool {
   var p = Predictor.make(Vec3(0., 0., 0.), false, false);
   i = 1u32;
   while i <= 45u32 { _ = p.sample(1., 0.5, walkYaw(i)); i = i + 1u32; }
-  let inb = bytesOfList(&p.encodeInput());
+  let inb = bytesOfList(&p.encodeInput(9u64));
   var back = BodySamples();
-  let inOk = decodeInput(inb, &mut back) && back.len() == 30usize && back[0usize].seq == 16u32 && back[29usize].seq == 45u32 && back[29usize].strafe == 0.5;
+  var backAck = 0u64;
+  let inOk = decodeInput(inb, &mut back, &mut backAck) && backAck == 9u64 && back.len() == 30usize && back[0usize].seq == 16u32 && back[29usize].seq == 45u32 && back[29usize].strafe == 0.5;
   print <- "check wire input: "; print <- u64.from(back.len()); print <- " samples in "; print <- u64.from(inb.len()); print <- " bytes, the newest 30";
   if inOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
   // hello and a press
@@ -164,7 +176,8 @@ fn checkWire() bool {
   let unknown = decodeClientSays(bytesOfList(&junk));
   var shortInput = encodeHelloOnlyHeader();
   var none = BodySamples();
-  let badInput = decodeInput(bytesOfList(&shortInput), &mut none);
+  var noAck = 0u64;
+  let badInput = decodeInput(bytesOfList(&shortInput), &mut none, &mut noAck);
   let refusalOk = bad.tag == 0u32 && unknown.tag == 0u32 && !badInput;
   print <- "check wire refuses a message cut short or unknown"; if refusalOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
   ok
@@ -173,8 +186,76 @@ fn checkWire() bool {
 // An input message that says 3 samples and holds half of one
 fn encodeHelloOnlyHeader() List[u8] {
   var out = List[u8]();
+  var k = 0usize;
+  while k < 8usize { out.push(0u8); k = k + 1usize; }       // the part acknowledgement
   out.push(3u8); out.push(0u8); out.push(0u8); out.push(0u8); out.push(1u8); out.push(0u8);
   out
+}
+
+// The server moves part 1 at steps 3 and 4 and part 2 at step 9; a shared snapshot goes every 2 steps, each through the
+// wire, and the one at step 4 is lost; the client acknowledges the newest version it applied, which reaches the server 2
+// steps later. Passes if the client ends with every part where the server has it (the lost snapshot's change was sent
+// again, because only an acknowledged change counts as delivered) and the parts at rest cost nothing at the end
+fn checkPartDelta(vsSent: bool) bool {
+  var defined = List[Mat4]();
+  var now = List[Mat4]();
+  var i = 0usize;
+  while i < 3usize {
+    defined.push(Mat4.fromTranslation(Vec3(f32.from(i), 0., 0.)));
+    now.push(Mat4.fromTranslation(Vec3(f32.from(i), 0., 0.)));
+    i = i + 1usize;
+  }
+  var tracker = PartTracker.make(&defined, vsSent);
+  var view = PartView.make(3usize);
+  var ackAtServer = 0u64;
+  var due = 0u64;                   // the step the client's newest acknowledgement reaches the server
+  var dueAck = 0u64;
+  var sent = 0u64;
+  var lastBytes = 0usize;
+  var sentLate = 0u64;              // parts sent in the last ten snapshots
+  var firstBytes = 0usize;
+  var step = 1u64;
+  while step <= 40u64 {
+    if step == 3u64 || step == 4u64 { now.set(1usize, Mat4.fromTranslation(Vec3(10. + f32.from(step), 0., 0.))); _ = tracker.observe(1usize, &now[1usize]); }
+    if step == 9u64 { now.set(2usize, Mat4.fromTranslation(Vec3(50., 0., 0.))); _ = tracker.observe(2usize, &now[2usize]); }
+    if due != 0u64 && step >= due { if dueAck > ackAtServer { ackAtServer = dueAck; } due = 0u64; }
+    if step % 2u64 == 0u64 {
+      var deltas = PartDeltas();
+      let through = tracker.select(ackAtServer, 8usize, false, &mut deltas);
+      var full = List[u8]();
+      full.appendSlice(encodePeople(step, &OtherPersons()).view());
+      full.appendList(encodePartTail(through, &deltas, 0u64));
+      lastBytes = full.len();
+      if firstBytes == 0usize && deltas.len() > 0usize { firstBytes = full.len(); }
+      sent = sent + u64.from(deltas.len());
+      if step > 20u64 { sentLate = sentLate + u64.from(deltas.len()); }
+      if step != 4u64 {              // the snapshot at step 4 never arrives
+        var gotStep = 0u64;
+        var people = OtherPersons();
+        var gotThrough = 0u64;
+        var got = PartDeltas();
+        var gotHash = 0u64;
+        if decodeShared(bytesOfList(&full), &mut gotStep, &mut people, &mut gotThrough, &mut got, &mut gotHash) {
+          view.apply(gotStep, gotThrough, &got);
+          if view.ack > dueAck { dueAck = view.ack; due = step + 2u64; }
+        }
+      }
+    }
+    step = step + 1u64;
+  }
+  var same = true;
+  i = 0usize;
+  while i < 3usize {
+    let shown = view.placeAt(i, 0., 40u64, &defined[i]);
+    if !sameMat(&shown, &now[i]) { same = false; }
+    i = i + 1usize;
+  }
+  print <- "check part deltas (the snapshot at step 4 lost): "; print <- sent; print <- " part states sent in all, "; print <- sentLate;
+  print <- " in the last twenty steps, the snapshot "; print <- u64.from(firstBytes); print <- " bytes with a part and "; print <- u64.from(lastBytes);
+  print <- " at rest; the client's parts "; if same { print <- "match"; } else { print <- "DIFFER from"; } print <- " the server's";
+  let ok = same && sentLate == 0u64 && sent >= 3u64;
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED (a change was lost, or a part at rest was resent)\n"; }
+  ok
 }
 
 pub fn checkConnected() bool {
@@ -182,5 +263,6 @@ pub fn checkConnected() bool {
   let b = checkStalePersonal(mutantIs("stale-personal"));
   let c = checkSharedInterp(mutantIs("stale-shared"));
   let d = checkWire();
-  a && b && c && d
+  let e = checkPartDelta(mutantIs("delta-vs-sent"));
+  a && b && c && d && e
 }

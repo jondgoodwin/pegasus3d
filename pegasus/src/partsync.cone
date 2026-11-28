@@ -1,0 +1,202 @@
+// The world's parts in connected play (plan step 8, second part; `Browser\doc\actors\sim.md`, "Connected play").
+//
+// The client builds the world from its own copy of the description, as any world arrives, so no part is declared over
+// the wire. The server then sends only what its live instance changed since the definition: each shared snapshot
+// carries, for one client, every part whose state changed after the last change that client acknowledged. A part at
+// rest costs nothing after it was acknowledged once.
+//
+//   PartTracker (server)  watches each part's state, numbers every change with a version (1, 2, ...), and picks what
+//                         one client lacks: the parts changed after the version it acknowledged
+//   PartView (client)     holds the two newest states of each part and shows it between them, as the people are
+//
+// A VERSION, not the step, orders the changes: a change gets its own number, so a snapshot too small for every change
+// can end exactly at one and the client acknowledges that one. What a client acknowledges is the newest version it has
+// applied; the server never assumes a snapshot arrived (a lost one is simply sent again with the next).
+// The fields a part's state holds are named by the mask; today only the placement exists in Sim (visibility and the
+// look fields are not yet part state), so every delta says FIELD_PLACEMENT.
+
+pub const FIELD_PLACEMENT = 1u32;
+pub const DELTA_BYTES = 69usize;    // a changed part on the wire: its id (4), the mask (1) and 16 floats
+
+pub struct PartDelta {
+  pub id: u32;
+  pub mask: u32;                    // FIELD_...: which fields follow (only the placement, as a Mat4)
+  pub placement: Mat4;
+}
+alias PartDeltas = List[PartDelta];
+
+pub fn sameMat(a: &Mat4, b: &Mat4) bool {
+  var i = 0usize;
+  while i < 16usize {
+    if a.m[i] != b.m[i] { return false; }
+    i = i + 1usize;
+  }
+  true
+}
+
+pub struct PartTracker {
+  last: List[Mat4];                 // by part id: the placement as last observed
+  changed: List[u64];               // by part id: the version of its newest change (0: as defined)
+  pub version: u64;                 // the newest version given
+  sentThrough: u64;                 // the newest version a snapshot ended at (the mutant's wrong base)
+  vsSent: bool;                     // the mutant (PEGASUS_MUTANT=delta-vs-sent): the base is what was last SENT, not what was acknowledged
+
+  pub fn make(defined: &List[Mat4], vsSent: bool) PartTracker {
+    var l = List[Mat4]();
+    var c = List[u64]();
+    each m in &*defined { l.push(*m); c.push(0u64); }
+    PartTracker(l, c, 0u64, 0u64, vsSent)
+  }
+
+  // Every part's placement as the server holds it now, by id
+  pub fn states(self: &) List[Mat4] { last.clone() }
+
+  // The version of part 'id's newest change (0: never changed since the definition)
+  pub fn changedAt(self: &, id: usize) u64 { if id < changed.len() { *changed[id] } else { 0u64 } }
+
+  // Part 'id' stands at 'now' this step: a change if it is not where it stood
+  pub fn observe(self: &mut, id: usize, now: &Mat4) bool {
+    if id >= last.len() || sameMat(&last[id], now) { return false; }
+    last.set(id, *now);
+    version = version + 1u64;
+    changed.set(id, version);
+    true
+  }
+
+  // The parts changed after what the client acknowledged ('ack'), oldest change first, at most 'room' of them, with
+  // their placements now. Returns the version the snapshot is complete through: the client may acknowledge it
+  // 'full': the client asked for a fresh baseline (its hash differed), so every part changed since the definition is sent,
+  // whatever it acknowledged and whatever was sent before
+  pub fn select(self: &mut, ack: u64, room: usize, full: bool, out: &mut PartDeltas) u64 {
+    var base = ack;
+    if vsSent { base = sentThrough; }
+    if full { base = 0u64; }
+    var order = List[usize]();
+    var i = 0usize;
+    while i < changed.len() {
+      if *changed[i] > base {
+        // insert by version, oldest first
+        var at = order.len();
+        while at > 0usize && *changed[*order[at - 1usize]] > *changed[i] { at = at - 1usize; }
+        order.insert(at, i);
+      }
+      i = i + 1usize;
+    }
+    var take = order.len();
+    if take > room { take = room; }
+    i = 0usize;
+    while i < take {
+      let id = *order[i];
+      out.push(PartDelta(u32.from(id), FIELD_PLACEMENT, *last[id]));
+      i = i + 1usize;
+    }
+    var through = version;
+    if take < order.len() {
+      through = base;
+      if take > 0usize { through = *changed[*order[take - 1usize]]; }
+    }
+    sentThrough = through;
+    through
+  }
+}
+
+// One state of a part, as of the snapshot of server step 'step'
+struct PartAt {
+  step: u64;
+  placement: Mat4;
+}
+
+struct PartTrack {
+  seen: u32;                        // 0: nothing yet, 1: 'cur' only, 2: both
+  prev: PartAt;
+  cur: PartAt;
+}
+
+pub struct PartView {
+  tracks: List[PartTrack];          // by part id
+  pub ack: u64;                     // the newest version applied
+  pub applied: u64;                 // deltas applied
+
+  pub fn make(count: usize) PartView {
+    var t = List[PartTrack]();
+    var i = 0usize;
+    while i < count {
+      t.push(PartTrack(0u32, PartAt(0u64, Mat4.identity()), PartAt(0u64, Mat4.identity())));
+      i = i + 1usize;
+    }
+    PartView(t, 0u64, 0u64)
+  }
+
+  // A shared snapshot of server step 'step' (not older than one applied) said these parts changed, complete through 'through'
+  pub fn apply(self: &mut, step: u64, through: u64, deltas: &PartDeltas) {
+    each d in &*deltas {
+      let k = usize.from(d.id);
+      if k < tracks.len() && (d.mask & FIELD_PLACEMENT) != 0u32 {
+        let t = &mut tracks[k];
+        if t.seen > 0u32 { t.prev = t.cur; t.seen = 2u32; } else { t.seen = 1u32; }
+        t.cur = PartAt(step, d.placement);
+        applied = applied + 1u64;
+      }
+    }
+    if deltas.len() > 0usize && through > ack { ack = through; }
+  }
+
+  // Every part's placement as this client holds it, by id: the newest state the server sent it, or 'defined' (the
+  // placements its own copy of the description gave) if the server never changed it
+  pub fn states(self: &, defined: &List[Mat4]) List[Mat4] {
+    var out = List[Mat4]();
+    var i = 0usize;
+    while i < tracks.len() {
+      if tracks[i].seen == 0u32 { out.push(*defined[i]); } else { out.push(tracks[i].cur.placement); }
+      i = i + 1usize;
+    }
+    out
+  }
+
+  // Part 'id' as shown 'x' steps (zero or less) from the snapshot of step 'newest': between its two newest states, or
+  // 'defined' if the server never changed it. A part that rested long before its newest state moves over the
+  // snapshot interval before it, not over all the rest
+  pub fn placeAt(self: &, id: usize, x: f32, newest: u64, defined: &Mat4) Mat4 {
+    if id >= tracks.len() { return *defined; }
+    let t = &tracks[id];
+    if t.seen == 0u32 { return *defined; }
+    if t.seen == 1u32 { return t.cur.placement; }
+    let rc = f32.from(i64.from(t.cur.step) - i64.from(newest));
+    var rp = f32.from(i64.from(t.prev.step) - i64.from(newest));
+    let nearest = rc - f32.from(2u64 * SNAPSHOT_EVERY);
+    if rp < nearest { rp = nearest; }
+    if x >= rc { return t.cur.placement; }
+    if x <= rp { return t.prev.placement; }
+    let f = (x - rp) / (rc - rp);
+    var out = t.cur.placement;
+    var i = 0usize;
+    while i < 16usize {
+      out.m[i] = t.prev.placement.m[i] + (t.cur.placement.m[i] - t.prev.placement.m[i]) * f;
+      i = i + 1usize;
+    }
+    out
+  }
+}
+
+// A sum of the world's definition as a Sim holds it: each part's content key and slot, in order. A client that built the
+// world from its own copy of the description must hold the server's definition, or part ids would mean different parts
+pub fn definitionSum(parts: &SimParts) u64 {
+  var h = 1469598103934665603u64;
+  each p in &*parts {
+    h = (h ^ p.key) * 1099511628211u64;
+    h = (h ^ u64.from(p.slot)) * 1099511628211u64;
+  }
+  h
+}
+
+// THE SHARED-STATE HASH. One function, for the shared snapshot's check now and the determinism test later: FNV-1a over
+// the count, then every part's sixteen floats, each by its bits (`fnvWord`, meshhash.cone, the word hash the mesh hash
+// uses). Never 0 (0 means "no claim" on the wire)
+pub fn statesHash(states: &List[Mat4]) u64 {
+  var h = fnvWord(14695981039346656037u64, u32.from(states.len()));
+  each m in &*states {
+    var k = 0usize;
+    while k < 16usize { h = fnvWord(h, m.m[k].bits()); k = k + 1usize; }
+  }
+  if h == 0u64 { 1u64 } else { h }
+}

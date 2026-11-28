@@ -23,6 +23,23 @@ pub struct InputSample {
   pub pressed: bool;                // the left button went down
 }
 
+// The way the person walks and faces (the yaw Sim takes): on the desktop the mouse look's; in the headset (--xr) the head's,
+// as Render drew it last frame, so the body walks where the head turns and the mouse, which has no part in a headset, does
+// not steer. PEGASUS_MUTANT=walk-mouse-yaw ignores the headset; checkSteerYaw must catch it.
+pub fn steerYaw(xr: bool, mouseYaw: f32, headYaw: f32) f32 {
+  if xr { headYaw } else { mouseYaw }
+}
+
+fn checkSteerYaw(mutant: bool) bool {
+  let desk = steerYaw(false, 0.5, 2.);
+  var head = steerYaw(true, 0.5, 2.);
+  if mutant { head = steerYaw(false, 0.5, 2.); }
+  let ok = desk == 0.5 && head == 2.;
+  print <- "check steer yaw: desktop follows the mouse look "; print <- desk; print <- ", the headset the head "; print <- head;
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED\n"; }
+  ok
+}
+
 // The script of a headless run, by the step the drawn frame shows
 const WALK_FROM = 60u64;            // walk forward from this step
 const WALK_TO = 180u64;             // to this one: 2 s
@@ -54,10 +71,14 @@ actor Player {
   plan: ScriptPresses;              // the presses a headless run was told to make, in step order (none: the box-a press)
   planned: usize;                   // how many of them are made
   still: bool;                      // the person stays where it arrived (a shot told to press)
+  rays: StateReader[HandRay];       // --xr: the right controller's ray, as Render drew it
+  seenPulls: u64;                   // the trigger pulls already made into presses
+  xr: bool;                         // --xr: the head's yaw is the walking direction (steerYaw)
 
   fn init(self: &new, render: Render, loader: Loader, audio: Audio, moves: StateWriter[MoveIntent],
-      looks: StateWriter[LookIntent], drawn: StateReader[DrawnFrame], mutant: bool) {
-    *self = Self(render, loader, audio, moves, looks, drawn, None[Sim], 0., -0.15, true, false, mutant, ScriptPresses(), 0usize, false);
+      looks: StateWriter[LookIntent], drawn: StateReader[DrawnFrame], rays: StateReader[HandRay], mutant: bool, xr: bool) {
+    *self = Self(render, loader, audio, moves, looks, drawn, None[Sim], 0., -0.15, true, false, mutant, ScriptPresses(), 0usize, false,
+      rays, 0u64, xr);
   }
 
   // The presses a headless run makes instead of the one at box-a; 'still': and the person does not walk
@@ -90,7 +111,10 @@ actor Player {
     pitch = pitch - i.dy * LOOK_PER_PIXEL;
     if pitch > MOST_PITCH { pitch = MOST_PITCH; }
     if pitch < 0. - MOST_PITCH { pitch = 0. - MOST_PITCH; }
-    if i.dx != 0. || i.dy != 0. { looks.put(&LookIntent(yaw, pitch)); }
+    if xr {
+      // the head's turn steers the walk, every poll (the mouse look is not read in a headset)
+      looks.put(&LookIntent(steerYaw(xr, yaw, drawn.newest().yaw), pitch));
+    } else if i.dx != 0. || i.dy != 0. { looks.put(&LookIntent(yaw, pitch)); }
     var f: f32 = 0.;
     var r: f32 = 0.;
     if (i.keys & HOLD_W) != 0u32 { f = f + 1.; }
@@ -102,6 +126,13 @@ actor Player {
       let d = drawn.newest();
       let along = Vec3(0. - sin(d.yaw) * cos(d.pitch), sin(d.pitch), 0. - cos(d.yaw) * cos(d.pitch));
       self.press(d.eye, along, d.displayNs);
+    }
+    // In the headset: the trigger's pulls Render counted since the last look become presses along the controller's ray
+    // (the ray is the one Render drew, the same pointer action as a mouse press; on the desktop the count stays 0)
+    let ray = rays.newest();
+    if ray.pulls != seenPulls {
+      seenPulls = ray.pulls;
+      if ray.valid { self.press(ray.from, ray.along, ray.atNs); }
     }
   }
 

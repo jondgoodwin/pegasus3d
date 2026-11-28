@@ -103,7 +103,9 @@ pub struct RuleHost {
   // The host for code, with 'fields' fields (each starting at 0) and 'slots' slots; or what the verifier refused
   pub fn make(code: &Code, fields: usize, slots: usize, applyOnTrap: bool) Result[RuleHost, List[CodeProblem]] {
     let tables = ruleImports();
-    match verify(code, &tables) {
+    // verifyEach: a rule that does not verify is refused alone (its handler or derive is left out), so one bad rule
+    // does not drop the rest. Only a fault in the code's shared tables is an Err
+    match verifyEach(code, &tables) {
       case let Ok(v) {
         var hs = RuleHandles.make();
         var f = List[u64]();
@@ -121,11 +123,26 @@ pub struct RuleHost {
     }
   }
 
+  pub fn setInside(self: &mut, slot: usize, inside: bool) {
+    if slot < self.hs.payload(RULE_INSIDE).len() { (&mut self.hs.data[RULE_INSIDE]).set(slot, if inside { 1u64 } else { 0u64 }); }
+  }
+  pub fn isInside(self: &, slot: usize) bool {
+    slot < self.hs.payload(RULE_INSIDE).len() && *self.hs.payload(RULE_INSIDE)[slot] != 0u64
+  }
   pub fn setValue(self: &mut, i: usize, v: f64) { (&mut self.hs.data[RULE_FIELDS]).set(i, v.bits()); }
   pub fn value(self: &, i: usize) f64 { f64.fromBits(*self.hs.payload(RULE_FIELDS)[i]) }
 
   // The unit an entry names, if the code has one
-  pub fn unitFor(self: &, kind: u8, a: u32, b: u32) Option[u32] { entryUnit(self.code.source(), kind, a, b) }
+  // (a refused unit is none: its rule does nothing)
+  pub fn unitFor(self: &, kind: u8, a: u32, b: u32) Option[u32] {
+    match entryUnit(self.code.source(), kind, a, b) {
+      case let Some(u) { if self.code.isRefused(usize.from(u)) { None[u32] } else { Some[u32](u) } }
+      case is None { None[u32] }
+    }
+  }
+
+  // The units the verifier refused, one problem each
+  pub fn refusals(self: &) &List[CodeProblem] { self.code.problems() }
 
   // Runs a unit, leaving its result slots in 'out' and its staged writes in the write list; the trap's message if it stopped
   fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
@@ -183,12 +200,19 @@ pub struct SimRules {
   moveUnits: List[u32];             // by pick-and-place rule: its unit (NO_UNIT: none)
   derives: DeriveDecls;
   deriveUnits: List[u32];
-  keysRules: usize;
+  keys: KeysDecls;                  // the keys rules (animators), by their number among the live rules
+  keyUnits: List[u32];
+  areas: AreaDecls;
+  pub anim: SimAnim;                // the animators running (simanim.cone)
+  begun: bool;                      // the world's first step has come: its `created` rules have run
+  first: u64;                       // that step
+  traceSlot: u32;                   // the part whose frame `trace` prints (NO_UNIT: none)
   pub stopped: u64;                 // handlers and derives stopped, their writes dropped
   pub fired: u64;                   // handlers run to their end
 
   pub fn none() SimRules {
-    SimRules(None[RuleHost], Slots.none(), List[String](), MoveDecls(), List[u32](), DeriveDecls(), List[u32](), 0usize, 0u64, 0u64)
+    SimRules(None[RuleHost], Slots.none(), List[String](), MoveDecls(), List[u32](), DeriveDecls(), List[u32](),
+      KeysDecls(), List[u32](), AreaDecls(), SimAnim.make(), false, 0u64, NO_UNIT, 0u64, 0u64)
   }
 
   // The rules of a behaviour: its code verified now. 'applyOnTrap' is the check's mutant
@@ -200,8 +224,9 @@ pub struct SimRules {
     r.slots = Slots.make(frames);
     r.moves <-> behaviour.moves;
     r.derives <-> behaviour.derives;
-    r.keysRules = behaviour.keysRules;
-    if r.moves.len() == 0usize && r.derives.len() == 0usize { return r; }
+    r.keys <-> behaviour.keys;
+    r.areas <-> behaviour.areas;
+    if r.moves.len() == 0usize && r.derives.len() == 0usize && r.keys.len() == 0usize { return r; }
     match RuleHost.make(&behaviour.code, behaviour.fields.len(), r.slots.count(), applyOnTrap) {
       case let Ok(host) {
         var h = host;
@@ -221,6 +246,17 @@ pub struct SimRules {
           r.deriveUnits.push(unitOrNone(h.unitFor(ENTRY_DERIVE, r.derives[i].number, 0u32)));
           i = i + 1usize;
         }
+        i = 0usize;
+        while i < r.keys.len() {
+          r.keyUnits.push(unitOrNone(h.unitFor(ENTRY_HANDLER, u32.from(i), 0u32)));
+          i = i + 1usize;
+        }
+        var k = 0usize;
+        while k < h.refusals().len() {
+          print <- "sim: a rule of the world was refused and left out: "; printStr(h.refusals()[k].what.view());
+          print <- " (unit "; print <- h.refusals()[k].unit; print <- ")\n";
+          k = k + 1usize;
+        }
         r.host = Some[RuleHost](h);
       }
       case let Err(problems) {
@@ -232,13 +268,18 @@ pub struct SimRules {
         }
         r.moves = MoveDecls();
         r.derives = DeriveDecls();
+        r.keys = KeysDecls();
       }
     }
     r
   }
 
   pub fn live(self: &) bool { host is Some }
-  pub fn keysRuleCount(self: &) usize { keysRules }
+  // How many of the world's rules the verifier refused (each left out; the rest run)
+  pub fn refusedCount(self: &) usize {
+    match &host { case let Some(h) { h.refusals().len() } else { 0usize } }
+  }
+  pub fn keysRuleCount(self: &) usize { keys.len() }
   pub fn moveCount(self: &) usize { moves.len() }
 
   pub fn fieldValue(self: &, i: usize) f64 {
@@ -258,7 +299,78 @@ pub struct SimRules {
       }
       m = m + 1usize;
     }
+    // then the keys rules a click on the part starts
+    var k = 0usize;
+    while k < keys.len() {
+      if keys[k].clicked && slots.within(slot, keys[k].part) {
+        any = true;
+        self.runHandler(*keyUnits[k], step, slot, asks);
+      }
+      k = k + 1usize;
+    }
     any
+  }
+
+  // MOVE, the animators' part (sim.md: animators belong to move). The world's first step starts its `created` rules,
+  // then the animators' clock moves to 'step' (seconds since that first step, 'stepNs' to a step) and each animated part
+  // takes its value. Called once a step, on every Sim that runs the rules
+  pub fn animate(self: &mut, step: u64, stepNs: u64) {
+    if !begun {
+      begun = true;
+      first = step;
+      var asks = GlideAsks();
+      var k = 0usize;
+      while k < keys.len() {
+        if !keys[k].clicked { self.runHandler(*keyUnits[k], step, 0u32, &mut asks); }
+        k = k + 1usize;
+      }
+    }
+    if keys.len() == 0usize { return; }
+    let now = f64.from(step - first) * f64.from(stepNs) / 1.0e9f64;
+    anim.tick(now, &keys, &mut slots);
+  }
+
+  // SENSE, the areas: which parts the visitor, with its eye at 'eye', is inside (host.occupied reads these)
+  pub fn sense(self: &mut, eye: Vec3) {
+    if areas.len() == 0usize { return; }
+    match &mut host {
+      case var &mut Some(h) {
+        var a = 0usize;
+        while a < areas.len() { h.setInside(usize.from(areas[a].slot), false); a = a + 1usize; }
+        a = 0usize;
+        while a < areas.len() {
+          let ar = &areas[a];
+          let middle = slots.worldPoint(ar.slot, ar.centre);
+          if (eye - middle).length() <= ar.radius { h.setInside(usize.from(ar.slot), true); }
+          a = a + 1usize;
+        }
+      }
+      else {}
+    }
+  }
+
+  // Trace the frame of the part named 'name' (a part's own name) each step, for comparing with the guide browser
+  pub fn traceFor(self: &mut, name: *u8) {
+    var s = 0usize;
+    while s < slots.count() {
+      if argIs(name, slots.nameOf(u32.from(s))) { traceSlot = u32.from(s); }
+      s = s + 1usize;
+    }
+  }
+
+  // One line: the traced part's turn and offset in its parent's frame, 'step - first' steps into the world
+  pub fn trace(self: &, step: u64) {
+    if traceSlot == NO_UNIT || !begun { return; }
+    let q = slots.turnOf(traceSlot);
+    let o = slots.offsetOf(traceSlot);
+    print <- "trace: step "; print <- step - first; print <- " rot ";
+    print <- f64.from(q.x); print <- " "; print <- f64.from(q.y); print <- " "; print <- f64.from(q.z); print <- " "; print <- f64.from(q.w);
+    print <- " off "; print <- f64.from(o.x); print <- " "; print <- f64.from(o.y); print <- " "; print <- f64.from(o.z); print <- "\n";
+  }
+
+  // Is the visitor inside an area of the part at 'slot' (what host.occupied gives)
+  pub fn inside(self: &, slot: u32) bool {
+    match &host { case let Some(h) { h.isInside(usize.from(slot)) } else { false } }
   }
 
   // Runs a unit (none: nothing); a unit that traps or runs out of fuel is dropped whole, writes and all, and the world
@@ -294,7 +406,14 @@ pub struct SimRules {
         print <- "\n";
       }
       else if w.kind == WRITE_ANIM {
-        print <- "sim: step "; print <- step; print <- ", a keys rule started (not run in this browser yet)\n";
+        let r = usize.from(w.a);
+        if r < keys.len() {
+          anim.start(&keys[r].anim);
+          print <- "sim: step "; print <- step; print <- ", ";
+          if !keys[r].clicked { print <- "created: "; }
+          else { printStr(slots.nameOf(clicked)); print <- " clicked: "; }
+          printStr(keys[r].what.view()); print <- " started\n";
+        }
       }
       else {
         // a glide: the part the field holds goes to stand over the middle of the part 'to'

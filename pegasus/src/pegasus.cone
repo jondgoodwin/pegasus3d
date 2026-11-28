@@ -15,10 +15,16 @@
 //                              and Sim busy for MS ms at step 300: Render must keep drawing
 //   pegasus --shot FILE        one frame off screen, to FILE (a BMP), once its content is resident; with --press, after the
 //                              last press's step + 120 (its glide done), or after the step --shot-after N names
+//   pegasus --shot FILE --shot-view EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG
+//                              the shot from this eye, looking at this point (whole centimetres), vertical field of view in
+//                              degrees: to set it beside the guide browser's shot of the same world (it settles 119 frames first)
 //   pegasus --steps N --parts40
 //                              the 40-part world sharing five keys; the Loader lets go of one
 //   pegasus --world FILE       a real world's .ddd file read by the conescript package (with --steps or --shot); its
 //                              parts get stand-in boxes until the interpreter builds them
+//   pegasus --xr --world FILE  in the headset (OpenXR): both eyes drawn at the runtime's display time, the window mirroring the left
+//                              eye; the right controller's trigger presses along its ray. Fails with a message when there is no
+//                              runtime or headset
 //   pegasus --checks          the driven checks (the head pose read last; the Loader's key, sharing, order, unused;
 //                              connected play's reconciliation, stale snapshots and wire)
 //
@@ -31,7 +37,7 @@
 //                              Player, a client Sim and Render; headless with --steps (scripted: walks 2 s, presses at box-a;
 //                              --stand stays still). The world file is the client's own, for its own Loader
 //
-// PEGASUS_MUTANT=stale-pose, mutate-snapshot, no-replay, stale-personal or stale-shared runs a check's mutant, which
+// PEGASUS_MUTANT=stale-pose, mutate-snapshot, no-replay, stale-personal, stale-shared, delta-vs-sent, blend-lerp-matrix or walk-mouse-yaw runs a check's mutant, which
 // the check must catch. The shell (this file) owns the window and the main
 // thread, as SDL wants: it pumps the devices and hands Player each sample.
 
@@ -55,10 +61,14 @@ import iocore use Access, SocketAddr;
 import netmsg use NetEvent, EventHandler, Connection, Endpoint, NetConfig, LinkConfig, LossyRelay, eventHandler, mustListen, mustConnect, startLossyRelay;
 import fs;
 import conescript use Understood, Val, Kind, Problem, Names, read, showProblems, numOf, OPT_AT, OPT_ROTATION, OPT_MATERIAL,
-  Code, CodeWriter, CodeProblem, VerifiedCode, ImportTables, HandleTable, HANDLE_HOST, Interpreter, verify, lowerSim, entryUnit,
+  Code, CodeWriter, CodeProblem, VerifiedCode, ImportTables, HandleTable, HANDLE_HOST, Interpreter, verify, verifyEach, lowerSim, entryUnit,
   ENTRY_DERIVE, ENTRY_HANDLER, ENTRY_MOVE_FLAG, NS_HOST, HOST_FIELD, HOST_OCCUPIED, HOST_SET_FIELD, HOST_START_ANIM, HOST_GLIDE,
-  fieldSignature, occupiedSignature, setFieldSignature, startAnimSignature, glideSignature, P_FIELD, OP_IMPORT, OP_UNREACHABLE;
-import partbuild use vocabulary, PartProducts, PartBuilder, toolImports, plainProducts, MaterialRec;
+  fieldSignature, occupiedSignature, setFieldSignature, startAnimSignature, glideSignature, P_FIELD, OP_IMPORT, OP_UNREACHABLE,
+  KeysInfo, P_ROTATION, P_OFFSET;
+import tweenstack use Anim, Animators;                                                 // the keys rules' animators (simanim.cone)
+import keyframetracks use Track, Clip, TK_QUAT, TK_VEC3, INTERP_LINEAR;
+import analyticdaylight use PreethamSky;
+import partbuild use srgbToLinear, vocabulary, PartProducts, PartBuilder, toolImports, plainProducts, MaterialRec;
 import sync use Arc, Channel, Sender, Receiver, LatestWriter, LatestReader, latestCell, CellRead;
 import time use Instant, Duration;
 
@@ -110,6 +120,34 @@ fn parsePress(text: &str) Option[ScriptPress] {
   Some[ScriptPress](ScriptPress(u64.from(*got[0usize]), f32.from(*got[1usize]) * 0.01, f32.from(*got[2usize]) * 0.01))
 }
 
+// "EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG": a shot's eye, the point it looks at (whole centimetres, may be negative), and its
+// vertical field of view in whole degrees
+fn parseShotView(text: &str) Option[ShotView] {
+  var at = 0usize;
+  var got = List[i64]();
+  while got.len() < 7usize {
+    var neg = false;
+    if at < text.len() && text[at] == '-' { neg = true; at = at + 1usize; }
+    var n = 0i64;
+    var digits = 0usize;
+    while at < text.len() && text[at] >= '0' && text[at] <= '9' {
+      n = n * 10i64 + i64.from(text[at] - '0');
+      at = at + 1usize;
+      digits = digits + 1usize;
+    }
+    if digits == 0usize { return None[ShotView]; }
+    got.push(if neg { 0i64 - n } else { n });
+    if got.len() < 7usize {
+      if at >= text.len() || text[at] != ',' { return None[ShotView]; }
+      at = at + 1usize;
+    }
+  }
+  if at != text.len() || *got[6usize] <= 0i64 || *got[6usize] >= 180i64 { return None[ShotView]; }
+  let c: f32 = 0.01;
+  Some[ShotView](ShotView(true, Vec3(f32.from(*got[0usize]) * c, f32.from(*got[1usize]) * c, f32.from(*got[2usize]) * c),
+    Vec3(f32.from(*got[3usize]) * c, f32.from(*got[4usize]) * c, f32.from(*got[5usize]) * c), f32.from(*got[6usize])))
+}
+
 fn argString(s: *u8) String {
   var out = String();
   var i = 0usize;
@@ -128,6 +166,8 @@ fn mutantIs(name: &str) bool {
 }
 
 fn zeroFrame() DrawnFrame { DrawnFrame(0u64, 0u64, 0u64, Vec3(0., EYE_HEIGHT, 0.), 0., 0., 0u64) }
+
+fn noRay() HandRay { HandRay(false, Vec3(0., 0., 0.), Vec3(0., 0., -1.), 0u64, 0u64) }
 
 // ---- The driven check: the head pose is read last ----
 
@@ -167,7 +207,9 @@ fn main(argc: i32, argv: **u8) i32 {
   var serving = false;
   var netStart = NetStart.whole();
   var shotAfter = 0u64;
+  var shotView = ShotView.none();
   var presses = ScriptPresses();
+  var xr = false;
   var a = 1;
   while a < argc {
     let arg = *(argv + usize.from(a));
@@ -183,6 +225,8 @@ fn main(argc: i32, argv: **u8) i32 {
       a = a + 1;
     } else if argIs(arg, "--checks") {
       checksOnly = true;
+    } else if argIs(arg, "--xr") {
+      xr = true;
     } else if argIs(arg, "--parts40") {
       parts40 = true;
     } else if argIs(arg, "--world") && a + 1 < argc {
@@ -212,6 +256,12 @@ fn main(argc: i32, argv: **u8) i32 {
     } else if argIs(arg, "--shot-after") && a + 1 < argc {
       shotAfter = argNumber(*(argv + usize.from(a + 1)));
       a = a + 1;
+    } else if argIs(arg, "--shot-view") && a + 1 < argc {
+      match parseShotView(argString(*(argv + usize.from(a + 1))).view()) {
+        case let Some(v) { shotView = v; }
+        case is None[ShotView] { print <- "pegasus: --shot-view wants EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG (whole numbers; the eye and the point looked at, in centimetres)\n"; return 2; }
+      }
+      a = a + 1;
     } else if argIs(arg, "--press") && a + 1 < argc {
       match parsePress(argString(*(argv + usize.from(a + 1))).view()) {
         case let Some(p) { presses.push(p); }
@@ -219,7 +269,7 @@ fn main(argc: i32, argv: **u8) i32 {
       }
       a = a + 1;
     } else {
-      print <- "pegasus: unknown argument; use --steps N, --stall-sim MS, --parts40, --world FILE, --press STEP,XCM,ZCM, --shot FILE [--shot-after N], --checks, --serve PORT or --join HOST:PORT\n";
+      print <- "pegasus: unknown argument; use --xr, --steps N, --stall-sim MS, --parts40, --world FILE, --press STEP,XCM,ZCM, --shot FILE [--shot-after N] [--shot-view EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG], --checks, --serve PORT or --join HOST:PORT\n";
       return 2;
     }
     a = a + 1;
@@ -229,12 +279,18 @@ fn main(argc: i32, argv: **u8) i32 {
     each p in &presses { if p.step + 120u64 > shotAfter { shotAfter = p.step + 120u64; } }
   }
   if netStart.role == SIM_CLIENT && steps != 0u64 { headless = true; }
+  if xr && (headless || shot.len() > 0usize || serving) {
+    print <- "pegasus: --xr needs the window's mirror and a live run: not with --steps, --shot, --serve or a headless client\n";
+    return 2;
+  }
   if checksOnly {
     let poseOk = checkHeadPose(mutantIs("stale-pose"));
     let loaderOk = checkLoader(mutantIs("unused-off-by-one"));
     let netOk = checkConnected();
     let rulesOk = checkRules(mutantIs("trapped-writes"));
-    let ok = poseOk && loaderOk && rulesOk && netOk;
+    let blendOk = checkBlend(mutantIs("blend-lerp-matrix"));
+    let steerOk = checkSteerYaw(mutantIs("walk-mouse-yaw"));
+    let ok = poseOk && loaderOk && rulesOk && netOk && blendOk && steerOk;
     finalAll();
     return if ok { 0 } else { 1 };
   }
@@ -252,6 +308,9 @@ fn main(argc: i32, argv: **u8) i32 {
   var drawnR: StateReader[DrawnFrame];
   drawnW, drawnR = stateSlot[DrawnFrame](zeroFrame());
   let drawnForSim = drawnW.reader(zeroFrame());
+  var rayW: StateWriter[HandRay];
+  var rayR: StateReader[HandRay];
+  rayW, rayR = stateSlot[HandRay](noRay());
 
   var finishedS: Sender[i32];
   var finishedR: Receiver[i32];
@@ -276,7 +335,7 @@ fn main(argc: i32, argv: **u8) i32 {
     let size = win.size();
     w = u32.from(size.w);
     h = u32.from(size.h);
-    _ = sdl.SetWindowRelativeMouseMode(win.sdlHandle(), true);
+    if !xr { _ = sdl.SetWindowRelativeMouseMode(win.sdlHandle(), true); }
   }
 
   var verdict = 0;
@@ -292,7 +351,12 @@ fn main(argc: i32, argv: **u8) i32 {
       // A real world: how many keys it makes is what the run checks (the Loader reads it again, when it opens it)
       var keys = 0usize;
       match fs.readFile(&Path.from(worldFile.view())) {
-        case let Ok(text) { keys = distinctKeys(&readImage(worldFile.view(), text.view())); }
+        case let Ok(text) {
+          let img = readImage(worldFile.view(), text.view());
+          keys = distinctKeys(&img);
+          // a client of a world that declares no avatars also builds the browser's own figure
+          if netStart.role == SIM_CLIENT && img.behaviour.avatar == NO_AVATAR { keys = keys + 1usize; }
+        }
         case let Err(e) { print <- "pegasus: "; printStr(worldFile.view()); print <- " cannot be read: "; print <- e; print <- "\n"; return 1; }
       }
       wantKeys = keys;
@@ -302,10 +366,10 @@ fn main(argc: i32, argv: **u8) i32 {
     // A server has no Render to run: it is never started, and its Loader sends it nothing
     if serving { exactKeys = 0usize; }
     let render = Render(handle, w, h, !headless, lookForRender, drawnW, shot.clone(), wantKeys, exactKeys, stoppedS,
-      finishedS.clone(), stallMs, mutantIs("stale-pose"), shotAfter);
+      finishedS.clone(), stallMs, mutantIs("stale-pose"), shotAfter, xr, rayW, shotView);
     let audio = Audio();
     let loader = Loader(render, loaderS, wantBuilds, parts40 && headless, mutantIs("unused-off-by-one"), serving);
-    let player = Player(render, loader, audio, moveW, lookW, drawnR, mutantIs("mutate-snapshot"));
+    let player = Player(render, loader, audio, moveW, lookW, drawnR, rayR, mutantIs("mutate-snapshot"), xr);
     var stallAt = 0u64;
     if stallMs > 0u64 { stallAt = STALL_AT_STEP; }
     var worldName = String.from("mock");
@@ -321,9 +385,17 @@ fn main(argc: i32, argv: **u8) i32 {
     let scripted = headless || presses.len() > 0usize;
     if scripted && !serving { player.presses(presses, !headless); player.script(scriptS, walks); }
 
+    var renderEnded = false;      // --xr: Render's loop ended (no headset, or its session is over) before the window was closed
     if windowed {
       var held = 0u32;
       while win.running {
+        if xr {
+          match stoppedR.tryRecv() {
+            case let Some(clean) { renderEnded = true; if !clean { verdict = 1; } }
+            case is None[bool] {}
+          }
+          if renderEnded { break; }
+        }
         var sample = InputSample(0u32, 0., 0., false);
         var event = sdl.Event();
         while win.pollEvent(&mut event) {
@@ -354,7 +426,7 @@ fn main(argc: i32, argv: **u8) i32 {
       }
     }
     player.quit();
-    if !serving {
+    if !serving && !renderEnded {
       match stoppedR.recv() {
         case let Some(clean) { if !clean { verdict = 1; } }
         case is None[bool] {}
