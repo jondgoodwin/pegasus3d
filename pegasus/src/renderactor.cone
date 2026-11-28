@@ -30,6 +30,7 @@ struct Gfx {
   list: DrawList;
   renderer: Renderer;
   post: Post;
+  fx: ImageFx;                      // the image-quality passes the guide browser draws through: anti-aliasing, ambient occlusion, auto-exposure
   swapchain: Option[SwapChain];     // a window's; none off screen
   color: Option[Texture];           // off screen (--shot): the picture and its depth
   depth: Option[Texture];
@@ -41,6 +42,18 @@ struct Gfx {
   surface: Surface;
   instance: Instance;
 }
+
+// A shot's own camera (--shot-view): where the eye is, what it looks at, and its vertical field of view in degrees
+pub struct ShotView {
+  pub set: bool;
+  pub eye: Vec3;
+  pub look: Vec3;
+  pub fovDegrees: f32;
+
+  pub fn none() ShotView { ShotView(false, Vec3(0., 0., 0.), Vec3(0., 0., 0.), 60.) }
+}
+
+const SHOT_SETTLE_FRAMES = 119u32;    // drawn before a shot's own: it is the 120th frame, as the guide browser's shot is
 
 // Content resident on the GPU, by key
 struct Resident {
@@ -86,10 +99,11 @@ pub struct RenderCore {
   pub longestSameNs: u64;           // the longest time drawing without a new snapshot
   pub framesDuringSame: u64;        // frames drawn in that time
   pub framesNow: u64;
+  pub view: ShotView;               // the shot's own camera, if --shot-view named one
 
   pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), 0u64,
-      NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+      NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, ShotView.none())
   }
 
   // The newest snapshot: kept with the one before it
@@ -273,10 +287,15 @@ pub struct RenderCore {
     var camera = Camera.make();
     camera.fov = radians(60.);
     camera.near = 0.1;
-    camera.far = 500.;
+    camera.far = 1000.;
     camera.background = Color(0.5, 0.7, 0.9, 1.);
     let ahead = Vec3(0. - sin(look.yaw) * cos(look.pitch), sin(look.pitch), 0. - cos(look.yaw) * cos(look.pitch));
-    camera.lookAt(eye, eye + ahead, Vec3(0., 1., 0.));
+    if shot.len() > 0usize && self.view.set {     // --shot-view: the shot's camera named, to be set beside another browser's
+      camera.fov = radians(self.view.fovDegrees);
+      camera.lookAt(self.view.eye, self.view.look, Vec3(0., 1., 0.));
+    } else {
+      camera.lookAt(eye, eye + ahead, Vec3(0., 1., 0.));
+    }
     g.list.clear();
     match &newer {
       case let Some(s) {
@@ -301,8 +320,7 @@ pub struct RenderCore {
         h = target.texture.height;
         g.post.resize(&mut g.device, w, h);
         var encoder = g.device.createCommandEncoder();
-        g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, &target.depth, &camera, &g.light, &g.list);
-        g.post.apply(&mut encoder, &target.texture);
+        g.fx.render(&mut g.device, &mut encoder, &mut g.renderer, &mut g.post, &camera, &g.light, &g.list, &target.texture);
         _ = g.device.queue.submit(encoder.finish());
         _ = sc.present(&mut g.device);
         return;
@@ -315,9 +333,18 @@ pub struct RenderCore {
       case let Some(color) {
         match &g.depth {
           case let Some(depth) {
+            // The passes adapt over frames (the exposure to the scene, the anti-aliasing's history): the same frame is drawn
+            // SHOT_SETTLE_FRAMES times first, as the guide browser's shot is its 120th
+            var settle = 0u32;
+            while settle < SHOT_SETTLE_FRAMES {
+              var warm = g.device.createCommandEncoder();
+              g.fx.render(&mut g.device, &mut warm, &mut g.renderer, &mut g.post, &camera, &g.light, &g.list, color);
+              _ = g.device.queue.submit(warm.finish());
+              g.device.endFrame();      // each is a frame of its own: the frame's command buffers are a few, and past them drew black
+              settle = settle + 1u32;
+            }
             var encoder = g.device.createCommandEncoder();
-            g.renderer.render(&mut g.device, &mut encoder, &g.post.hdr, depth, &camera, &g.light, &g.list);
-            g.post.apply(&mut encoder, color);
+            g.fx.render(&mut g.device, &mut encoder, &mut g.renderer, &mut g.post, &camera, &g.light, &g.list, color);
             var readback = g.device.createBuffer(u64.from(w) * u64.from(h) * 4u64, BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST);
             encoder.copyTextureToBuffer(color, &readback);
             _ = g.device.queue.submit(encoder.finish());
@@ -352,18 +379,50 @@ pub struct RenderCore {
 
 fn msOf(ns: u64) f32 { f32.from(ns) / 1000000. }
 
-// A clear day: the sun high in the south-east, a blue zenith fading to a pale horizon, a faint haze round the sun
-fn daySky() Sky {
-  var sky = Sky.dusk(radians(52.), radians(40.));
-  sky.sunColor = Color(40., 36., 30., 1.);
-  sky.zenith = Color(0.23, 0.44, 0.48, 1.);    // the guide browser's hues (a pale, greenish blue), at this sky's brightness
-  sky.horizon = Color(0.98, 1.12, 1.12, 1.);   // a pale haze: a clear coat at a glancing angle mirrors it; a blue one turned brown squares purple
-  sky.horizonSharpness = 3.;
-  sky.glow = Color(0.25, 0.20, 0.12, 1.);
-  sky.glowSharpness = 12.;
-  sky.ground = Color(0.10, 0.13, 0.08, 1.);
-  sky
+// The world's sun, until its own `sun` part reaches Render (a message change for later): first.ddd's, as the guide
+// browser reads it (the way to the sun, its colour, its lux). The sky and light below are the guide browser's, made the
+// same way, so the same world looks the same in both.
+fn worldToSun() Vec3 { Vec3(-0.4, 0.8, 0.45) }
+fn worldSunColor() Color { Color(1., 0.95, 0.88, 1.) }
+const WORLD_SUN_LUX = 70000.;
+const SKY_NITS = 4000.;    // the sky's even light on everything, as the guide browser's (build.cone)
+
+// The sun as the guide browser's sunOf makes it: its colour times its lux, with the sky's even light on everything
+fn worldLight() Light {
+  let toSun = worldToSun();
+  let c = worldSunColor();
+  let lux = f32.from(WORLD_SUN_LUX);
+  let sky = f32.from(SKY_NITS);
+  Light.directional(Vec3(0., 0., 0.) - toSun, Color(c.red * lux, c.green * lux, c.blue * lux, 1.),
+    Color(0.80 * sky, 0.88 * sky, 1.0 * sky, 1.))
 }
+
+// What is drawn behind everything, and what a clear coat mirrors: the guide browser's clearDaySky (guidebrowser.cone),
+// copied: a robin's-egg blue overhead, a pale haze at the horizon, each as bright as Preetham's clear day is there for
+// this sun (turbidity 2.5), in the hue of the named sRGB colour; a mid-grey ground; no sun disc
+fn clearDaySky(toSun: Vec3, lux: f32) Sky {
+  let model = PreethamSky.make(2.5, toSun);
+  let flat = Vec3(toSun.x, 0., toSun.z);
+  let towardSun = if flat.length() > 0.001 { flat.normalize() } else { Vec3(1., 0., 0.) };
+  let zenith = hued(model.radiance(Vec3(0., 1., 0.), toSun), 160., 212., 222.);
+  let haze = hued(model.radiance((Vec3(0., 0.05, 0.) - towardSun).normalize(), toSun), 224., 238., 238.);
+  let glow = hued(model.radiance((towardSun + Vec3(0., 0.05, 0.)).normalize(), toSun), 244., 236., 222.);
+  let g = 0.25 * lux / 3.14159265;
+  Sky(toSun, 0.0047, Color(0., 0., 0., 1.), zenith, haze, 5.,
+    Color(fmaxZero(glow.red - haze.red), fmaxZero(glow.green - haze.green), fmaxZero(glow.blue - haze.blue), 1.), 8.,
+    Color(g * 0.55, g * 0.62, g * 0.45, 1.), 10., Color(0., 0., 0., 1.), 0., Color(0., 0., 0., 1.), 0., 1., 1., 0., 0u32)
+}
+
+// A radiance's brightness (its luminance) in the hue of the sRGB colour (r, g, b)
+fn hued(radiance: Vec3, r: f32, g: f32, b: f32) Color {
+  let y = 0.2126 * radiance.x + 0.7152 * radiance.y + 0.0722 * radiance.z;
+  let lr = srgbToLinear(f64.from(r));
+  let lg = srgbToLinear(f64.from(g));
+  let lb = srgbToLinear(f64.from(b));
+  let ly = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
+  Color(lr * y / ly, lg * y / ly, lb * y / ly, 1.)
+}
+fn fmaxZero(x: f32) f32 { if x > 0. { x } else { 0. } }
 
 // The GPU for a window ('window': its SDL handle as a number, since a raw
 // pointer is not Sendable), or off screen at 'w' x 'h' when 'window' is 0
@@ -408,10 +467,20 @@ fn makeGfx(window: usize, w: u32, h: u32) Option[Gfx] {
   var post = Post.create(&mut device, outFormat, w, h);
   if !renderer.isValid() || !post.isValid() { print <- "render: the renderer could not be made\n"; return None[Gfx]; }
   // The world's sky and sun, fixed for now (the world's own `sun` part reaching Render is a message change for later)
-  let sky = daySky();
-  renderer.setSky(&mut device, &sky);
-  let light = sky.sunLight(Color(6.0, 5.6, 5.0, 1.), Color(0.4, 0.5, 0.7, 1.));
-  Some[Gfx](Gfx(DrawList(), renderer, post, swapchain, color, depth, w, h, light, device, adapter, surface, instance))
+  // In the guide browser's order: rays, the image passes, the exposure, then the world's sun with its shadows and sky
+  _ = renderer.setRayTracing(&mut device, true); // glass and reflections by rays where the GPU has them
+  var fx = ImageFx.create(&mut device, &renderer, &mut post);
+  var settings = FxSettings.high();
+  // Brightness measured against the guide browser's shot of this world (first.ddd, 120th frame): the same passes, light and sky
+  // in Render gave a picture 1.4 stops darker (the guide's auto-exposure drifts up over its first seconds and Render's did not;
+  // cause not found), so the exposure is opened by that much until the world's own camera exposure reaches Render
+  settings.exposure.compensationEv = 1.4;
+  fx.configure(&settings);
+  renderer.exposure = exposureFromEv100(15.);   // the scene is in physical units (nits, lux)
+  renderer.setShadows(&mut device, &ShadowSettings(enabled: true));
+  renderer.setSky(&mut device, &clearDaySky(worldToSun().normalize(), f32.from(WORLD_SUN_LUX)));
+  let light = worldLight();
+  Some[Gfx](Gfx(DrawList(), renderer, post, fx, swapchain, color, depth, w, h, light, device, adapter, surface, instance))
 }
 
 actor Render {
@@ -428,9 +497,10 @@ actor Render {
 
   fn init(self: &new, window: usize, w: u32, h: u32, gpu: bool, looks: StateReader[LookIntent],
       drawnOut: StateWriter[DrawnFrame], shot: String, wantKeys: usize, exactKeys: usize, stopped: Sender[bool], finished: Sender[i32],
-      stallMs: u64, stalePose: bool, shotAfter: u64) {
+      stallMs: u64, stalePose: bool, shotAfter: u64, view: ShotView) {
     var core = RenderCore.make(looks, drawnOut, stalePose);
     if gpu { core.gfx = makeGfx(window, w, h); }
+    core.view = view;
     *self = Self(core, false, window == 0usize, shot, wantKeys, exactKeys, stopped, finished, stallMs,
       if shotAfter > 10u64 { shotAfter } else { 10u64 });
   }
