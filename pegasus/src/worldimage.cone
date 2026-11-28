@@ -1,16 +1,16 @@
 // A real world's image: the ConeScript reader's `Understood`, turned into the part table the Loader moves to Sim.
-// Plan step 6, first part. The reader is the `conescript` package (`read`); this file only walks what it understood,
-// as guidebrowser\src\build.cone does, but builds no mesh: each shape part becomes a row (its id and path, its parent,
-// where it stands, how big, its colour) and a RECIPE for its content.
+// Plan step 6, first part. The reader is the `conescript` package (`read`, over the `partbuild` vocabulary); this
+// file only walks what it understood, as guidebrowser\src\build.cone does, but builds no mesh: each shape part becomes
+// a row (its id and path, its parent, where it stands, how big, its colour) and a RECIPE for its content.
 //
 // THE RECIPE of a part (what a content key hashes, so equal fixed inputs share one build):
-//   shape  "cs." and the name of the builder at the top of the part's value: "cs.lathe", "cs.difference", "cs.box"
-//          (a function the part calls is followed into: its value is the function's result)
+//   shape  "cs." and the name of the vocabulary row at the top of the part's value: "cs.lathe", "cs.difference",
+//          "cs.box" (a function the part calls is followed into: its value is the function's result)
 //   args   RECIPE_HEADER numbers, then the value as the reader holds it, flattened:
 //            [0..2] low corner and [3..5] high corner of the shape's box, estimated from its value (a stand-in's size)
 //            [6..8] the part's material colour, linear red, green, blue
 //          then the value in prefix order, each node a tag: 0 absent; 1 number; 2 truth; 3 tuple, count, items;
-//          4 range, count, items; 5 reference, slot; 6 builder call, builder number, count, arguments; 7 list, count,
+//          4 range, count, items; 5 reference, slot; 6 call, its vocabulary row, count, arguments; 7 list, count,
 //          items; 8 local, number; 9 function call, count of steps, the steps, the result.
 // The colour is in the recipe because the mock `buildContent` makes the stand-in's material from it (the real build
 // will take the material from the part's own).
@@ -43,7 +43,9 @@ pub struct ImageWorld {
 
 // The text of a world read into its image
 pub fn readImage(file: &str, text: &Array[u8]) ImageWorld {
-  var reading = read(text);
+  var names = Names.standard();
+  let vocab = vocabulary(&mut names);
+  var reading = read(text, names, vocab);
   var problems = List[Problem]();
   problems <-> reading.problems;
   var parts = ImageParts();
@@ -80,14 +82,14 @@ fn fillImage(w: &Understood, parts: &mut ImageParts, dropped: &mut List[String],
     var turn = Quat.identity();
     if kind == Kind.Group || kind == Kind.Shape || kind == Kind.Light {
       if !(w.units[slot].options[OPT_AT] is Absent) { at = vec3(&w.units[slot].options[OPT_AT]); }
-      turn = turnOf(&w.units[slot].options[OPT_ROTATION]);
+      turn = turnOf(w, &w.units[slot].options[OPT_ROTATION]);
       places.set(slot, *places[parent] * Mat4.fromTrs(at, turn, Vec3(1., 1., 1.)));
     }
     if kind == Kind.Shape {
       var colour = Color(0.5, 0.5, 0.5, 1.);
       match &w.units[slot].options[OPT_MATERIAL] {
-        case let Ref(m) { colour = colorOf(&w.units[*m].make); }
-        case let Make(made) { colour = colorOf(&w.units[slot].options[OPT_MATERIAL]); }
+        case let Ref(m) { colour = colorOf(w, &w.units[*m].make); }
+        case let Make(made) { colour = colorOf(w, &w.units[slot].options[OPT_MATERIAL]); }
         else {}
       }
       var span = Span(Vec3(0., 0., 0.), Vec3(0., 0., 0.), false);
@@ -135,81 +137,29 @@ fn pathOf(w: &Understood, slot: usize) String {
 
 // ---- the recipe's values ----
 
-fn appendTopName(w: &Understood, v: &Val, out: &mut String) {
-  match v {
-    case let Make(m) { out.append(builderName(m.builder)); }
-    case let Call(n) { appendTopName(w, &w.functions[*n].result, out); }
-    else { out.append("shape"); }
+// The name of vocabulary row 'tool', the names of its path joined by dots ("lathe", "outline.rectangle")
+fn appendToolName(w: &Understood, tool: u32, out: &mut String) {
+  let path = &w.vocab.tools[usize.from(tool)].path;
+  var k = 0usize;
+  while k < path.len() {
+    if k > 0usize { out.appendByte('.'); }
+    out.append(w.names.text(*path[k]));
+    k = k + 1usize;
   }
 }
 
-// The builder's number in its enum, as the key hashes it (an enum is not a number in Cone)
-fn builderNumber(b: Builder) f32 {
-  if b == Builder.Box { return 1.; }
-  if b == Builder.Plain { return 2.; }
-  if b == Builder.Srgb { return 3.; }
-  if b == Builder.LinearColor { return 4.; }
-  if b == Builder.Turn { return 5.; }
-  if b == Builder.SunLight { return 6.; }
-  if b == Builder.Physical { return 7.; }
-  if b == Builder.Sphere { return 8.; }
-  if b == Builder.Sim { return 9.; }
-  if b == Builder.Lathe { return 10.; }
-  if b == Builder.LoftAlong { return 11.; }
-  if b == Builder.Join { return 12.; }
-  if b == Builder.ArrayRadial { return 13.; }
-  if b == Builder.OutlineRect { return 14.; }
-  if b == Builder.SpineLine { return 15.; }
-  if b == Builder.Translucent { return 16.; }
-  if b == Builder.Layered { return 17.; }
-  if b == Builder.OutlinePoints { return 18.; }
-  if b == Builder.Union { return 19.; }
-  if b == Builder.Difference { return 20.; }
-  if b == Builder.SpotLight { return 21.; }
-  if b == Builder.PointLight { return 22.; }
-  if b == Builder.ClearCoat { return 23.; }
-  if b == Builder.Reflective { return 24.; }
-  if b == Builder.CameraLens { return 25.; }
-  if b == Builder.OutlineGiven { return 26.; }
-  if b == Builder.OutlineEllipse { return 27.; }
-  if b == Builder.SpineThrough { return 28.; }
-  if b == Builder.Subdivide { return 29.; }
-  if b == Builder.Move { return 30.; }
-  if b == Builder.TurnShape { return 31.; }
-  if b == Builder.OutlineOffset { return 32.; }
-  if b == Builder.Inflate { return 33.; }
-  if b == Builder.Smooth { return 34.; }
-  if b == Builder.Carve { return 35.; }
-  if b == Builder.Mirror { return 36.; }
-  if b == Builder.BrushDraw { return 37.; }
-  if b == Builder.BrushClay { return 38.; }
-  if b == Builder.BrushClayStrips { return 39.; }
-  if b == Builder.BrushCrease { return 40.; }
-  if b == Builder.BrushInflate { return 41.; }
-  if b == Builder.BrushPinch { return 42.; }
-  if b == Builder.BrushSmooth { return 43.; }
-  if b == Builder.BrushFlatten { return 44.; }
-  if b == Builder.BrushLayer { return 45.; }
-  if b == Builder.BrushBlob { return 46.; }
-  0.
+// Is row 'tool' the one-name call 'name'?
+fn toolIs(w: &Understood, tool: u32, name: &str) bool {
+  let path = &w.vocab.tools[usize.from(tool)].path;
+  path.len() == 1usize && w.names.text(*path[0usize]) == name
 }
 
-fn builderName(b: Builder) &str {
-  if b == Builder.Box { return "box"; }
-  if b == Builder.Lathe { return "lathe"; }
-  if b == Builder.LoftAlong { return "loftAlong"; }
-  if b == Builder.Join { return "join"; }
-  if b == Builder.ArrayRadial { return "arrayRadial"; }
-  if b == Builder.Union { return "union"; }
-  if b == Builder.Difference { return "difference"; }
-  if b == Builder.Subdivide { return "subdivide"; }
-  if b == Builder.Move { return "move"; }
-  if b == Builder.TurnShape { return "turn"; }
-  if b == Builder.Mirror { return "mirror"; }
-  if b == Builder.Carve { return "carve"; }
-  if b == Builder.Smooth { return "smooth"; }
-  if b == Builder.Sphere { return "sphere"; }
-  "shape"
+fn appendTopName(w: &Understood, v: &Val, out: &mut String) {
+  match v {
+    case let Make(m) { appendToolName(w, m.tool, out); }
+    case let Call(n) { appendTopName(w, &w.functions[*n].result, out); }
+    else { out.append("shape"); }
+  }
 }
 
 // The value as numbers, in prefix order (see the top of this file)
@@ -221,7 +171,7 @@ fn flatten(w: &Understood, v: &Val, out: &mut List[f32]) {
     case let Range(items) { out.push(4.); out.push(f32.from(items.len())); each it in &*items { flatten(w, it, out); } }
     case let Ref(slot) { out.push(5.); out.push(f32.from(*slot)); }
     case let Make(m) {
-      out.push(6.); out.push(builderNumber(m.builder)); out.push(f32.from(m.args.len()));
+      out.push(6.); out.push(f32.from(m.tool)); out.push(f32.from(m.args.len()));
       each a in &m.args { flatten(w, a, out); }
     }
     case let Items(items) { out.push(7.); out.push(f32.from(items.len())); each it in &*items { flatten(w, it, out); } }
@@ -287,26 +237,26 @@ fn scanPoints(v: &Val, out: &mut Vec3, any: &mut bool) {
 fn boundsOf(w: &Understood, lets: &List[Val], v: &Val, s: &mut Span) {
   match v {
     case let Make(m) {
-      let b = m.builder;
-      if b == Builder.Box {
+      let t = m.tool;
+      if toolIs(w, t, "box") {
         widen(s, Vec3(endOf(&m.args[0usize], 0usize), endOf(&m.args[1usize], 0usize), endOf(&m.args[2usize], 0usize)),
           Vec3(endOf(&m.args[0usize], 1usize), endOf(&m.args[1usize], 1usize), endOf(&m.args[2usize], 1usize)));
       }
-      else if b == Builder.Lathe {
+      else if toolIs(w, t, "lathe") {
         var far = Vec3(0., 0., 0.);
         var any = false;
         scanPoints(&m.args[0usize], &mut far, &mut any);
         if any { widen(s, Vec3(0. - far.x, far.y, 0. - far.x), Vec3(far.x, far.z, far.x)); }
       }
-      else if b == Builder.Sphere {
+      else if toolIs(w, t, "sphere") {
         let r = f32.from(numOf(&m.args[0usize]));
         widen(s, Vec3(0. - r, 0. - r, 0. - r), Vec3(r, r, r));
       }
-      else if b == Builder.Union {
+      else if toolIs(w, t, "union") {
         boundsOf(w, lets, &m.args[0usize], s);
         boundsOf(w, lets, &m.args[1usize], s);
       }
-      else if b == Builder.Move {
+      else if toolIs(w, t, "move") {
         var inner = Span(Vec3(0., 0., 0.), Vec3(0., 0., 0.), false);
         boundsOf(w, lets, &m.args[0usize], &mut inner);
         if inner.any {
@@ -314,10 +264,10 @@ fn boundsOf(w: &Understood, lets: &List[Val], v: &Val, s: &mut Span) {
           widen(s, inner.lo + shift, inner.hi + shift);
         }
       }
-      else if b == Builder.Join {
+      else if toolIs(w, t, "join") {
         boundsOf(w, lets, &m.args[0usize], s);
       }
-      else if b == Builder.ArrayRadial {
+      else if toolIs(w, t, "arrayRadial") {
         var inner = Span(Vec3(0., 0., 0.), Vec3(0., 0., 0.), false);
         boundsOf(w, lets, &m.args[0usize], &mut inner);
         if inner.any {
@@ -325,8 +275,8 @@ fn boundsOf(w: &Understood, lets: &List[Val], v: &Val, s: &mut Span) {
           widen(s, Vec3(0. - r, inner.lo.y, 0. - r), Vec3(r, inner.hi.y, r));
         }
       }
-      else if b == Builder.Difference || b == Builder.Subdivide || b == Builder.Smooth || b == Builder.Carve
-          || b == Builder.Mirror || b == Builder.TurnShape {
+      else if toolIs(w, t, "difference") || toolIs(w, t, "subdivide") || toolIs(w, t, "smooth") || toolIs(w, t, "carve")
+          || toolIs(w, t, "mirror") || toolIs(w, t, "turn") {
         boundsOf(w, lets, &m.args[0usize], s);
       }
     }
@@ -337,7 +287,8 @@ fn boundsOf(w: &Understood, lets: &List[Val], v: &Val, s: &mut Span) {
   }
 }
 
-// ---- placement and colour, as guidebrowser\src\build.cone reads them (a copy: that file is not the reader's) ----
+// ---- placement and colour, as guidebrowser\src\build.cone reads them (a copy of the little it needs: the
+// browser reads them through the vocabulary's shims, which a stand-in has no use for) ----
 
 fn vec3(v: &Val) Vec3 {
   match v {
@@ -349,7 +300,8 @@ fn vec3(v: &Val) Vec3 {
   Vec3(0., 0., 0.)
 }
 
-fn turnOf(rotation: &Val) Quat {
+// rotation(angle, about:), about the upright axis when 'about' is left out
+fn turnOf(w: &Understood, rotation: &Val) Quat {
   match rotation {
     case let Make(m) {
       let axis = if m.args[1usize] is Absent { Vec3(0., 1., 0.) } else { vec3(&m.args[1usize]).normalize() };
@@ -359,17 +311,17 @@ fn turnOf(rotation: &Val) Quat {
   }
 }
 
-// plain(c), physical(color:, ...), a layered material, or a colour itself: srgb(r, g, b) with the true sRGB curve, or
-// color(r, g, b), linear already
-fn colorOf(make: &Val) Color {
+// plain(c), physical(color:, ...), a list of a material and its modifiers, or a colour itself: srgb(r, g, b) with the
+// true sRGB curve, or color(r, g, b), linear already
+fn colorOf(w: &Understood, make: &Val) Color {
   match make {
     case let Make(m) {
-      if m.builder == Builder.Plain || m.builder == Builder.Physical || m.builder == Builder.Layered {
-        return colorOf(&m.args[0usize]);
+      if toolIs(w, m.tool, "plain") || toolIs(w, m.tool, "physical") || m.tool == w.vocab.materialList {
+        return colorOf(w, &m.args[0usize]);
       }
       var opacity = 1.;
       if !(m.args[3usize] is Absent) { opacity = numOf(&m.args[3usize]); }
-      if m.builder == Builder.Srgb {
+      if toolIs(w, m.tool, "srgb") {
         return Color(srgbToLinear(numOf(&m.args[0usize])), srgbToLinear(numOf(&m.args[1usize])),
           srgbToLinear(numOf(&m.args[2usize])), f32.from(opacity));
       }
