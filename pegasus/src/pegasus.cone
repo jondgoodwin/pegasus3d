@@ -13,6 +13,8 @@
 //   pegasus --steps N          headless: N steps with scripted intents, no drawing; a line a second
 //   pegasus --steps N --stall-sim MS
 //                              and Sim busy for MS ms at step 300: Render must keep drawing
+//   pegasus --press-part STEP,PATH   at STEP, press along the ray from the eye to the middle of the part whose dotted path holds
+//                              PATH's whole segments ("pieces.whiteRook1"); picking decides what the ray reaches. Several allowed
 //   pegasus --shot FILE        one frame off screen, to FILE (a BMP), once its content is resident; with --press, after the
 //                              last press's step + 120 (its glide done), or after the step --shot-after N names
 //   pegasus --shot FILE --shot-view EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG
@@ -37,7 +39,7 @@
 //                              Player, a client Sim and Render; headless with --steps (scripted: walks 2 s, presses at box-a;
 //                              --stand stays still). The world file is the client's own, for its own Loader
 //
-// PEGASUS_MUTANT=stale-pose, mutate-snapshot, no-replay, stale-personal, stale-shared, delta-vs-sent, blend-lerp-matrix or walk-mouse-yaw runs a check's mutant, which
+// PEGASUS_MUTANT=pick-ignores-turn, stale-pose, mutate-snapshot, no-replay, stale-personal, stale-shared, delta-vs-sent, blend-lerp-matrix, walk-mouse-yaw, material-stale, material-no-show or material-missed runs a check's mutant, which
 // the check must catch. The shell (this file) owns the window and the main
 // thread, as SDL wants: it pumps the devices and hands Player each sample.
 
@@ -48,7 +50,7 @@ import libc;
 import sdl;
 import collections use *;
 import geomath use *;
-import mesh use Mesh, PolyMesh;
+import mesh use Mesh, PolyMesh, Group;
 import sculpt use subdivisionLevels;
 import gpu use *;
 import render use *;
@@ -117,7 +119,25 @@ fn parsePress(text: &str) Option[ScriptPress] {
     }
   }
   if at != text.len() || *got[0usize] < 0i64 { return None[ScriptPress]; }
-  Some[ScriptPress](ScriptPress(u64.from(*got[0usize]), f32.from(*got[1usize]) * 0.01, f32.from(*got[2usize]) * 0.01))
+  Some[ScriptPress](ScriptPress(u64.from(*got[0usize]), f32.from(*got[1usize]) * 0.01, f32.from(*got[2usize]) * 0.01, String()))
+}
+
+// "STEP,PATH": a whole number of steps, then the name of the part to press (everything after the first comma)
+fn parsePressPart(text: &str) Option[ScriptPress] {
+  var at = 0usize;
+  var n = 0u64;
+  while at < text.len() && text[at] >= '0' && text[at] <= '9' {
+    n = n * 10u64 + u64.from(text[at] - '0');
+    at = at + 1usize;
+  }
+  if at == 0usize || at + 1usize >= text.len() || text[at] != ',' { return None[ScriptPress]; }
+  var name = String();
+  at = at + 1usize;
+  while at < text.len() {
+    name.appendByte(text[at]);
+    at = at + 1usize;
+  }
+  Some[ScriptPress](ScriptPress(n, 0., 0., name))
 }
 
 // "EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG": a shot's eye, the point it looks at (whole centimetres, may be negative), and its
@@ -268,8 +288,14 @@ fn main(argc: i32, argv: **u8) i32 {
         case is None[ScriptPress] { print <- "pegasus: --press wants STEP,XCM,ZCM (whole numbers; centimetres)\n"; return 2; }
       }
       a = a + 1;
+    } else if argIs(arg, "--press-part") && a + 1 < argc {
+      match parsePressPart(argString(*(argv + usize.from(a + 1))).view()) {
+        case let Some(p) { presses.push(p); }
+        case is None[ScriptPress] { print <- "pegasus: --press-part wants STEP,PATH (a whole number of steps, then the part's name)\n"; return 2; }
+      }
+      a = a + 1;
     } else {
-      print <- "pegasus: unknown argument; use --xr, --steps N, --stall-sim MS, --parts40, --world FILE, --press STEP,XCM,ZCM, --shot FILE [--shot-after N] [--shot-view EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG], --checks, --serve PORT or --join HOST:PORT\n";
+      print <- "pegasus: unknown argument; use --xr, --steps N, --stall-sim MS, --parts40, --world FILE, --press STEP,XCM,ZCM, --press-part STEP,PATH,--shot FILE [--shot-after N] [--shot-view EXCM,EYCM,EZCM,LXCM,LYCM,LZCM,FOVDEG], --checks, --serve PORT or --join HOST:PORT\n";
       return 2;
     }
     a = a + 1;
@@ -288,9 +314,12 @@ fn main(argc: i32, argv: **u8) i32 {
     let loaderOk = checkLoader(mutantIs("unused-off-by-one"));
     let netOk = checkConnected();
     let rulesOk = checkRules(mutantIs("trapped-writes"));
+    let pickOk = checkPick(mutantIs("pick-ignores-turn"));
     let blendOk = checkBlend(mutantIs("blend-lerp-matrix"));
     let steerOk = checkSteerYaw(mutantIs("walk-mouse-yaw"));
-    let ok = poseOk && loaderOk && rulesOk && netOk && blendOk && steerOk;
+    let materialsOk = checkMaterials();
+    let cacheOk = checkMeshCache(mutantIs("cache-skip-checksum"));
+    let ok = poseOk && loaderOk && cacheOk && rulesOk && pickOk && netOk && blendOk && steerOk && materialsOk;
     finalAll();
     return if ok { 0 } else { 1 };
   }
@@ -342,11 +371,13 @@ fn main(argc: i32, argv: **u8) i32 {
   {
     // A headless run checks what is resident at its end: the mock's four keys, or
     // the 40-part world's five less the one its Loader lets go of
+    // (each key is a mesh key or a material key: the mock's four meshes and four materials, or the 40-part world's five
+    // and five, less the mesh it lets go of)
     var exactKeys = 0usize;
-    if headless { exactKeys = MOCK_KEYS; }
+    if headless { exactKeys = if parts40 { MOCK_KEYS_40 } else { MOCK_KEYS }; }
     var wantKeys = MOCK_KEYS;
-    var wantBuilds = 4u64;
-    if parts40 { wantBuilds = 5u64; }
+    var wantBuilds = u64.from(MOCK_KEYS);
+    if parts40 { wantBuilds = 10u64; }
     if worldFile.len() > 0usize {
       // A real world: how many keys it makes is what the run checks (the Loader reads it again, when it opens it)
       var keys = 0usize;
@@ -354,8 +385,10 @@ fn main(argc: i32, argv: **u8) i32 {
         case let Ok(text) {
           let img = readImage(worldFile.view(), text.view());
           keys = distinctKeys(&img);
-          // a client of a world that declares no avatars also builds the browser's own figure
-          if netStart.role == SIM_CLIENT && img.behaviour.avatar == NO_AVATAR { keys = keys + 1usize; }
+          // a server's Sim asks for no materials: it never draws
+          if !serving { keys = keys + distinctMaterials(&img); }
+          // a client of a world that declares no avatars also builds the browser's own figure and its material
+          if netStart.role == SIM_CLIENT && img.behaviour.avatar == NO_AVATAR { keys = keys + 2usize; }
         }
         case let Err(e) { print <- "pegasus: "; printStr(worldFile.view()); print <- " cannot be read: "; print <- e; print <- "\n"; return 1; }
       }

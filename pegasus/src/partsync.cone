@@ -12,16 +12,36 @@
 // A VERSION, not the step, orders the changes: a change gets its own number, so a snapshot too small for every change
 // can end exactly at one and the client acknowledges that one. What a client acknowledges is the newest version it has
 // applied; the server never assumes a snapshot arrived (a lost one is simply sent again with the next).
-// The fields a part's state holds are named by the mask; today only the placement exists in Sim (visibility and the
-// look fields are not yet part state), so every delta says FIELD_PLACEMENT.
+// The fields a part's state holds are named by the mask: the placement, and the material key (a look field: one key per
+// material slot, the first browser has one slot). A field has its own versions, so a change of the material alone is a
+// delta that says FIELD_MATERIAL and nothing else, and a client lacking only that gets only that.
 
 pub const FIELD_PLACEMENT = 1u32;
-pub const DELTA_BYTES = 69usize;    // a changed part on the wire: its id (4), the mask (1) and 16 floats
+pub const FIELD_MATERIAL = 2u32;
+pub const PLACEMENT_DELTA_BYTES = 69usize;   // a changed part on the wire, placement alone: its id (4), the mask (1) and 16 floats
+pub const MATERIAL_DELTA_BYTES = 13usize;    // material alone: id, mask and the key (8)
+pub const DELTA_BYTES = 77usize;             // the most one part takes: both fields
+
+// The wire size of one delta
+pub fn deltaBytes(d: &PartDelta) usize {
+  var n = 5usize;
+  if (d.mask & FIELD_PLACEMENT) != 0u32 { n = n + 64usize; }
+  if (d.mask & FIELD_MATERIAL) != 0u32 { n = n + 8usize; }
+  n
+}
 
 pub struct PartDelta {
   pub id: u32;
-  pub mask: u32;                    // FIELD_...: which fields follow (only the placement, as a Mat4)
+  pub mask: u32;                    // FIELD_...: which fields follow (the placement as a Mat4, the material key)
   pub placement: Mat4;
+  pub material: ContentKey;
+}
+
+// One change of one field of one part, as the tracker numbers it
+struct FieldChange {
+  id: usize;
+  field: u32;
+  version: u64;
 }
 alias PartDeltas = List[PartDelta];
 
@@ -36,23 +56,37 @@ pub fn sameMat(a: &Mat4, b: &Mat4) bool {
 
 pub struct PartTracker {
   last: List[Mat4];                 // by part id: the placement as last observed
-  changed: List[u64];               // by part id: the version of its newest change (0: as defined)
+  changed: List[u64];               // by part id: the version of its newest placement change (0: as defined)
+  lastMat: List[ContentKey];        // by part id: the material key as last observed
+  changedMat: List[u64];            // by part id: the version of its newest material change (0: as defined)
   pub version: u64;                 // the newest version given
   sentThrough: u64;                 // the newest version a snapshot ended at (the mutant's wrong base)
   vsSent: bool;                     // the mutant (PEGASUS_MUTANT=delta-vs-sent): the base is what was last SENT, not what was acknowledged
+  missMaterial: bool;               // the mutant (PEGASUS_MUTANT=material-missed): a change of material is never noticed
 
-  pub fn make(defined: &List[Mat4], vsSent: bool) PartTracker {
+  pub fn make(defined: &List[Mat4], definedMat: &List[ContentKey], vsSent: bool) PartTracker {
     var l = List[Mat4]();
     var c = List[u64]();
+    var lm = List[ContentKey]();
+    var cm = List[u64]();
     each m in &*defined { l.push(*m); c.push(0u64); }
-    PartTracker(l, c, 0u64, 0u64, vsSent)
+    each k in &*definedMat { lm.push(*k); cm.push(0u64); }
+    PartTracker(l, c, lm, cm, 0u64, 0u64, vsSent, mutantIs("material-missed"))
   }
 
   // Every part's placement as the server holds it now, by id
   pub fn states(self: &) List[Mat4] { last.clone() }
 
-  // The version of part 'id's newest change (0: never changed since the definition)
-  pub fn changedAt(self: &, id: usize) u64 { if id < changed.len() { *changed[id] } else { 0u64 } }
+  // Every part's material key as the server holds it now, by id
+  pub fn materials(self: &) List[ContentKey] { lastMat.clone() }
+
+  // The version of part 'id's newest change of either field (0: never changed since the definition)
+  pub fn changedAt(self: &, id: usize) u64 {
+    var v = 0u64;
+    if id < changed.len() { v = *changed[id]; }
+    if id < changedMat.len() && *changedMat[id] > v { v = *changedMat[id]; }
+    v
+  }
 
   // Part 'id' stands at 'now' this step: a change if it is not where it stood
   pub fn observe(self: &mut, id: usize, now: &Mat4) bool {
@@ -60,6 +94,15 @@ pub struct PartTracker {
     last.set(id, *now);
     version = version + 1u64;
     changed.set(id, version);
+    true
+  }
+
+  // Part 'id' has material key 'key' this step: a change if it is not the one it had
+  pub fn observeMaterial(self: &mut, id: usize, key: ContentKey) bool {
+    if missMaterial || id >= lastMat.len() || *lastMat[id] == key { return false; }
+    lastMat.set(id, key);
+    version = version + 1u64;
+    changedMat.set(id, version);
     true
   }
 
@@ -71,29 +114,46 @@ pub struct PartTracker {
     var base = ack;
     if vsSent { base = sentThrough; }
     if full { base = 0u64; }
-    var order = List[usize]();
+    // every change of every field after the base, oldest first (a version belongs to one change)
+    var order = List[FieldChange]();
     var i = 0usize;
     while i < changed.len() {
-      if *changed[i] > base {
-        // insert by version, oldest first
-        var at = order.len();
-        while at > 0usize && *changed[*order[at - 1usize]] > *changed[i] { at = at - 1usize; }
-        order.insert(at, i);
-      }
+      if *changed[i] > base { order.push(FieldChange(i, FIELD_PLACEMENT, *changed[i])); }
+      if *changedMat[i] > base { order.push(FieldChange(i, FIELD_MATERIAL, *changedMat[i])); }
       i = i + 1usize;
     }
-    var take = order.len();
-    if take > room { take = room; }
-    i = 0usize;
-    while i < take {
-      let id = *order[i];
-      out.push(PartDelta(u32.from(id), FIELD_PLACEMENT, *last[id]));
-      i = i + 1usize;
+    var sorted = List[FieldChange]();
+    each c in &order {
+      var at = sorted.len();
+      while at > 0usize && sorted[at - 1usize].version > c.version { at = at - 1usize; }
+      sorted.insert(at, *c);
+    }
+    // a prefix of them, in as many deltas as there is room for (a part's fields share one delta)
+    var taken = 0usize;
+    var parts = List[usize]();      // the parts of the deltas so far, by their place in 'out'
+    var firstOut = out.len();
+    var stop = false;
+    while taken < sorted.len() && !stop {
+      let c = &sorted[taken];
+      var slot = parts.len();
+      var k = 0usize;
+      while k < parts.len() { if *parts[k] == c.id { slot = k; } k = k + 1usize; }
+      if slot == parts.len() {
+        if parts.len() >= room { stop = true; } else {
+          parts.push(c.id);
+          out.push(PartDelta(u32.from(c.id), 0u32, *last[c.id], *lastMat[c.id]));
+        }
+      }
+      if !stop {
+        let d = &mut out[firstOut + slot];
+        d.mask = d.mask | c.field;
+        taken = taken + 1usize;
+      }
     }
     var through = version;
-    if take < order.len() {
+    if taken < sorted.len() {
       through = base;
-      if take > 0usize { through = *changed[*order[take - 1usize]]; }
+      if taken > 0usize { through = sorted[taken - 1usize].version; }
     }
     sentThrough = through;
     through
@@ -110,6 +170,8 @@ struct PartTrack {
   seen: u32;                        // 0: nothing yet, 1: 'cur' only, 2: both
   prev: PartAt;
   cur: PartAt;
+  material: ContentKey;             // the newest material key the server sent (valid when 'hasMaterial')
+  hasMaterial: bool;
 }
 
 pub struct PartView {
@@ -121,7 +183,7 @@ pub struct PartView {
     var t = List[PartTrack]();
     var i = 0usize;
     while i < count {
-      t.push(PartTrack(0u32, PartAt(0u64, Mat4.identity()), PartAt(0u64, Mat4.identity())));
+      t.push(PartTrack(0u32, PartAt(0u64, Mat4.identity()), PartAt(0u64, Mat4.identity()), 0u64, false));
       i = i + 1usize;
     }
     PartView(t, 0u64, 0u64)
@@ -137,8 +199,26 @@ pub struct PartView {
         t.cur = PartAt(step, d.placement);
         applied = applied + 1u64;
       }
+      if k < tracks.len() && (d.mask & FIELD_MATERIAL) != 0u32 {
+        let t = &mut tracks[k];
+        t.material = d.material;
+        t.hasMaterial = true;
+        applied = applied + 1u64;
+      }
     }
     if deltas.len() > 0usize && through > ack { ack = through; }
+  }
+
+  // Every part's material key as this client holds it, by id: the newest the server sent, or 'defined' (the keys its own
+  // copy of the description gave) if the server never changed it
+  pub fn materials(self: &, defined: &List[ContentKey]) List[ContentKey] {
+    var out = List[ContentKey]();
+    var i = 0usize;
+    while i < tracks.len() {
+      if tracks[i].hasMaterial { out.push(tracks[i].material); } else { out.push(*defined[i]); }
+      i = i + 1usize;
+    }
+    out
   }
 
   // Every part's placement as this client holds it, by id: the newest state the server sent it, or 'defined' (the
@@ -184,6 +264,7 @@ pub fn definitionSum(parts: &SimParts) u64 {
   var h = 1469598103934665603u64;
   each p in &*parts {
     h = (h ^ p.key) * 1099511628211u64;
+    h = (h ^ p.definedMaterial) * 1099511628211u64;
     h = (h ^ u64.from(p.slot)) * 1099511628211u64;
   }
   h
@@ -191,12 +272,16 @@ pub fn definitionSum(parts: &SimParts) u64 {
 
 // THE SHARED-STATE HASH. One function, for the shared snapshot's check now and the determinism test later: FNV-1a over
 // the count, then every part's sixteen floats, each by its bits (`fnvWord`, meshhash.cone, the word hash the mesh hash
-// uses). Never 0 (0 means "no claim" on the wire)
-pub fn statesHash(states: &List[Mat4]) u64 {
+// uses), then every part's material key as two words. Never 0 (0 means "no claim" on the wire)
+pub fn statesHash(states: &List[Mat4], materials: &List[ContentKey]) u64 {
   var h = fnvWord(14695981039346656037u64, u32.from(states.len()));
   each m in &*states {
     var k = 0usize;
     while k < 16usize { h = fnvWord(h, m.m[k].bits()); k = k + 1usize; }
+  }
+  each key in &*materials {
+    h = fnvWord(h, u32.from(*key & 0xFFFFFFFFu64));
+    h = fnvWord(h, u32.from(*key >> 32u64));
   }
   if h == 0u64 { 1u64 } else { h }
 }

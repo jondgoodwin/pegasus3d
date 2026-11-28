@@ -5,7 +5,7 @@
 // the catalog free a key one user too soon; the unused check must catch it.
 
 // The key of the first box below, pinned: the same on every run and machine
-const GOLDEN_KEY = 6434191302331313117u64;
+const GOLDEN_KEY = 16015584685159890188u64;     // (a box of half sizes 0.5: its colour is no part of the mesh key)
 
 fn verdictLine(name: &str, good: bool) bool {
   print <- "check loader "; printStr(name);
@@ -14,16 +14,16 @@ fn verdictLine(name: &str, good: bool) bool {
 }
 
 fn checkContentKey() bool {
-  let a = args6(0.5, 0.5, 0.5, 0.8, 0.3, 0.2);
+  let a = args3(0.5, 0.5, 0.5);
   let k = contentKey("box", &a, VOCAB_VERSION, 0u32);
-  let again = contentKey("box", &args6(0.5, 0.5, 0.5, 0.8, 0.3, 0.2), VOCAB_VERSION, 0u32);
+  let again = contentKey("box", &args3(0.5, 0.5, 0.5), VOCAB_VERSION, 0u32);
   var other = a.clone();
   other.set(1usize, 0.6);
   let diffArg = contentKey("box", &other, VOCAB_VERSION, 0u32);
   let diffLod = contentKey("box", &a, VOCAB_VERSION, 1u32);
   let diffVocab = contentKey("box", &a, VOCAB_VERSION + 1u32, 0u32);
   let diffShape = contentKey("rounded", &a, VOCAB_VERSION, 0u32);
-  let same = k == again && k == keyOf(&recipe("box", args6(0.5, 0.5, 0.5, 0.8, 0.3, 0.2)));
+  let same = k == again && k == keyOf(&recipe("box", args3(0.5, 0.5, 0.5)));
   let differs = diffArg != k && diffLod != k && diffVocab != k && diffShape != k && diffArg != diffLod;
   print <- "loader: key of the small box = "; print <- k; print <- "\n";
   let pinned = k == GOLDEN_KEY;
@@ -37,6 +37,7 @@ fn requestsOf(image: &WorldImage) List[ContentRequest] {
   while i < image.parts.len() {
     let d = &image.parts[i];
     out.push(ContentRequest(d.key, u32.from(i), d.placement.translation().length()));
+    out.push(ContentRequest(d.material, u32.from(i), d.placement.translation().length()));
     i = i + 1usize;
   }
   out
@@ -54,7 +55,7 @@ fn checkSharing(offByOne: bool) bool {
   let image = mockWorld(String.from("parts40"), &mut cat);
   let reqs = requestsOf(&image);
 
-  // 40 parts ask; five keys are queued, the rest join them
+  // 40 parts ask for a mesh and a material each; five mesh keys and five material keys are queued, the rest join them
   var queued = 0usize;
   var joined = 0usize;
   each r in &reqs {
@@ -66,7 +67,7 @@ fn checkSharing(offByOne: bool) bool {
   // The order the keys should be built in: nearest user first, worked out apart from the catalog
   var want = List[ContentKey]();
   var round = 0usize;
-  while round < 5usize {
+  while round < 10usize {
     var best = reqs.len();
     var i = 0usize;
     while i < reqs.len() {
@@ -85,8 +86,13 @@ fn checkSharing(offByOne: bool) bool {
     match cat.next() {
       case let Some(job) {
         order.push(job.key);
-        let p = buildContent(&job);
-        if cat.done(job.key) == DONE_DELIVER { render.takeContent(meshContentOf(job.key, p)); }
+        if isMaterialRecipe(&job.recipe) {
+          let p = buildMockMaterial(&job);
+          if cat.done(job.key) == DONE_DELIVER { render.takeMaterial(materialContentOf(job.key, &p)); }
+        } else {
+          let p = buildContent(&job);
+          if cat.done(job.key) == DONE_DELIVER { render.takeContent(meshContentOf(job.key, p)); }
+        }
       }
       case is None[BuildJob] { break; }
     }
@@ -95,17 +101,18 @@ fn checkSharing(offByOne: bool) bool {
   while f < 8 { _ = render.prepare(); f = f + 1; }
   let sameOrder = order.len() == want.len() && order == want;
   var allResident = true;
-  each d in &image.parts { if !render.isResident(d.key) { allResident = false; } }
+  each d in &image.parts { if !render.isResident(d.key) || !render.isResident(d.material) { allResident = false; } }
 
   // A part asking later for a built key shares it: no new build
   let late = cat.ask(&reqs[0usize]);
-  let againShared = cat.ask(&ContentRequest(reqs[1usize].key, 99u32, 1.)) == ASK_SHARED;
+  let againShared = cat.ask(&ContentRequest(reqs[2usize].key, 99u32, 1.)) == ASK_SHARED
+    && cat.ask(&ContentRequest(reqs[3usize].key, 99u32, 1.)) == ASK_SHARED;
 
   print <- "loader: 40 parts asked; "; print <- u64.from(queued); print <- " keys queued, "; print <- u64.from(joined);
   print <- " joined; "; print <- cat.started; print <- " built; "; print <- u64.from(render.residentCount());
-  print <- " meshes resident\n";
-  var ok = verdictLine("40 parts sharing 5 keys build 5 meshes, each part's mesh resident",
-    queued == 5usize && joined == 35usize && cat.started == 5u64 && render.residentCount() == 5usize && allResident
+  print <- " meshes and materials resident\n";
+  var ok = verdictLine("40 parts sharing 5 meshes and 5 materials build 5 meshes and 5 materials, each part's mesh and material resident",
+    queued == 10usize && joined == 70usize && cat.started == 10u64 && render.residentCount() == 10usize && allResident
     && late == ASK_SHARED && againShared);
   ok = verdictLine("jobs run nearest first", sameOrder && cat.startedNearestFirst()) && ok;
 
@@ -129,7 +136,7 @@ fn checkSharing(offByOne: bool) bool {
   let doubleOk = cat.unused(key, users[0usize]) == UNUSED_NOT_USER;
   let freedHow = cat.unused(key, users[users.len() - 1usize]);
   if freedHow == UNUSED_FREED { render.releaseContent(key); }
-  let gone = freedHow == UNUSED_FREED && !render.isResident(key) && cat.userCount(key) == 0usize && render.residentCount() == 4usize;
+  let gone = freedHow == UNUSED_FREED && !render.isResident(key) && cat.userCount(key) == 0usize && render.residentCount() == 9usize;
   ok = verdictLine("unused to zero frees the mesh in Render, and not before",
     stillOk && lastUserHeld && doubleOk && gone) && ok;
   ok

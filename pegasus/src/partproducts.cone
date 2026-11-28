@@ -60,40 +60,50 @@ pub fn contentKey(shape: &str, args: &List[f32], vocab: u32, lod: u32) ContentKe
 
 pub fn keyOf(r: &Recipe) ContentKey { contentKey(r.shape.view(), &r.args, VOCAB_VERSION, r.lod) }
 
+// ---- Material keys ----
+
+// A material recipe's shape starts with this. Its args are the material's description (a world's: the part's material
+// value as the world image flattens it, `worldimage.cone`; a mock world's: a colour), its slot a shape part whose material
+// it is, which the worker builds it from (no input to the key)
+pub const MATERIAL_SHAPE = "cm.material";   // a world's material, built from its slot by the interpreter
+pub const MOCK_MATERIAL_SHAPE = "cm.plain"; // the mock worlds' material: args r, g, b
+
+// Whether 'r' makes a material (a material key's recipe), not a mesh
+pub fn isMaterialRecipe(r: &Recipe) bool { r.shape.view().startsWith("cm.") }
+
+// A material key: the same hash as a mesh key, over the material's description
+pub fn materialKeyOf(r: &Recipe) ContentKey { keyOf(r) }
+
 // ---- The mock content ----
 
 const GROUND_SEGMENTS = 16;
 
-// THE BUILD CALL. Pure: key's recipe in, products out. Today's shapes:
-//   "ground"  args: half, r, g, b           a plane of half size 'half' each way
-//   "box"     args: hx, hy, hz, r, g, b     a box of those half sizes
-//   "rounded" args: size, r, g, b           a cube rounded by subdivision, 2 + lod levels
-//   "figure"  args: r, g, b                 the browser's own avatar: a person 1.7 m tall, feet at the origin, made of
+// THE BUILD CALL. Pure: key's recipe in, products out. Today's shapes (the shape alone: a colour is a material's):
+//   "ground"  args: half                    a plane of half size 'half' each way
+//   "box"     args: hx, hy, hz              a box of those half sizes
+//   "rounded" args: size                    a cube rounded by subdivision, 2 + lod levels
+//   "figure"  args: none                    the browser's own avatar: a person 1.7 m tall, feet at the origin, made of
 //                                           an ellipsoid body and a ball for a head (`browserAvatarRecipe`)
 pub fn buildContent(job: &BuildJob) PartProducts {
   let args = &job.recipe.args;
   var mesh = Mesh.cube(0.5);
   var half = Vec3(0.5, 0.5, 0.5);
-  var colour = Color(0.7, 0.7, 0.7, 1.);
-  if job.recipe.shape.view() == "ground" && args.len() >= 4usize {
+  if job.recipe.shape.view() == "ground" && args.len() >= 1usize {
     let h = args[0usize];
     mesh = Mesh.plane(GROUND_SEGMENTS, 16.);
     each p in mesh.positions.mutItems() { p.x = p.x * h; p.z = p.z * h; }
     half = Vec3(h, 0.01, h);
-    colour = Color(args[1usize], args[2usize], args[3usize], 1.);
-  } else if job.recipe.shape.view() == "box" && args.len() >= 6usize {
+  } else if job.recipe.shape.view() == "box" && args.len() >= 3usize {
     half = Vec3(args[0usize], args[1usize], args[2usize]);
     mesh = Mesh.cube(1.);
     each p in mesh.positions.mutItems() { p.x = p.x * half.x; p.y = p.y * half.y; p.z = p.z * half.z; }
-    colour = Color(args[3usize], args[4usize], args[5usize], 1.);
-  } else if job.recipe.shape.view() == "rounded" && args.len() >= 4usize {
+  } else if job.recipe.shape.view() == "rounded" && args.len() >= 1usize {
     let s = args[0usize];
     let cube = PolyMesh.cube(s);
     let lods = subdivisionLevels(&cube, 2u32 + job.recipe.lod);
     mesh = lods[usize.from(2u32 + job.recipe.lod)].triangulate(true);
     half = Vec3(s, s, s);
-    colour = Color(args[1usize], args[2usize], args[3usize], 1.);
-  } else if job.recipe.shape.view() == "figure" && args.len() >= 3usize {
+  } else if job.recipe.shape.view() == "figure" {
     var body = Mesh.sphere(0.5, 16);
     body.transform(Mat4.fromTrs(Vec3(0., 0.75, 0.), Quat.identity(), Vec3(0.52, 1.3, 0.34)));
     var head = Mesh.sphere(0.14, 16);
@@ -101,17 +111,29 @@ pub fn buildContent(job: &BuildJob) PartProducts {
     body.append(&head);
     mesh = body;
     half = Vec3(0.26, 0.85, 0.17);
-    colour = Color(args[0usize], args[1usize], args[2usize], 1.);
   }
-  plainProducts(mesh, colour, half)
+  plainProducts(mesh, Color(0.7, 0.7, 0.7, 1.), half)
+}
+
+// The mock worlds' material for 'job' (shape MOCK_MATERIAL_SHAPE, args r, g, b): a plain colour, no mesh
+pub fn buildMockMaterial(job: &BuildJob) PartProducts {
+  let args = &job.recipe.args;
+  var colour = Color(0.7, 0.7, 0.7, 1.);
+  if args.len() >= 3usize { colour = Color(args[0usize], args[1usize], args[2usize], 1.); }
+  plainProducts(Mesh(), colour, Vec3(0., 0., 0.))
+}
+
+// The recipe of a mock plain material of this colour
+pub fn plainMaterialRecipe(r: f32, g: f32, b: f32) Recipe {
+  var a = List[f32]();
+  a.push(r); a.push(g); a.push(b);
+  Recipe(String.from(MOCK_MATERIAL_SHAPE), a, 0u32, 0u32)
 }
 
 // The browser's own avatar design: what a person is drawn as in a world that declares no avatars. It belongs to the
-// browser, so every Loader knows its recipe and key without the world's description
-pub fn browserAvatarRecipe() Recipe {
-  var a = List[f32]();
-  a.push(0.55); a.push(0.62); a.push(0.78);
-  Recipe(String.from("figure"), a, 0u32, 0u32)
-}
+// browser, so every Loader knows its recipes and keys without the world's description
+pub fn browserAvatarRecipe() Recipe { Recipe(String.from("figure"), List[f32](), 0u32, 0u32) }
+pub fn browserAvatarMaterialRecipe() Recipe { plainMaterialRecipe(0.55, 0.62, 0.78) }
 
 pub fn browserAvatarKey() ContentKey { keyOf(&browserAvatarRecipe()) }
+pub fn browserAvatarMaterialKey() ContentKey { materialKeyOf(&browserAvatarMaterialRecipe()) }
