@@ -546,6 +546,53 @@ fn sOccupied(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
 }
 fn sNothing(hs: &mut SimHandles, slots: &mut Array[u64]) bool { true }
 
+// the step functions' imports (the same as pegasuscore\src\simrules.cone's; the staged writes are appended to handle 9)
+fn sPlace(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let p = hs.payload(4usize);
+  if 3usize * s + 2usize >= p.len() { hs.fail = String.from("host.place: no such part"); return false; }
+  slots[0usize] = *p[3usize * s]; slots[1usize] = *p[3usize * s + 1usize]; slots[2usize] = *p[3usize * s + 2usize];
+  true
+}
+fn sPlaceField(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let has = hs.payload(8usize);
+  let kk = if has.len() > 0usize { usize.from(*has[0usize]) } else { 0usize };
+  let i = s * kk + k;
+  if k >= kk || 1usize + i >= has.len() || *has[1usize + i] == 0u64 { hs.fail = String.from("host.place_field: no such place field"); return false; }
+  let p = hs.payload(7usize);
+  slots[0usize] = *p[3usize * i]; slots[1usize] = *p[3usize * i + 1usize]; slots[2usize] = *p[3usize * i + 2usize];
+  true
+}
+fn sChild(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let at = hs.payload(5usize);
+  if s + 1usize >= at.len() { hs.fail = String.from("host.child: no such part"); return false; }
+  let from = usize.from(*at[s]);
+  let to = usize.from(*at[s + 1usize]);
+  if from + k >= to { hs.fail = String.from("host.child: the part holds fewer parts"); return false; }
+  slots[0usize] = *hs.payload(6usize)[from + k];
+  true
+}
+fn stageStep(hs: &mut SimHandles, kind: u64, slot: u64, k: u64, x: u64, y: u64, z: u64) {
+  let w = &mut hs.data[9usize];
+  w.push(kind); w.push(slot); w.push(k); w.push(x); w.push(y); w.push(z);
+}
+fn sSetPlace(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  stageStep(hs, 0u64, slots[0usize], 0u64, slots[1usize], slots[2usize], slots[3usize]);
+  true
+}
+fn sSetPlaceField(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  stageStep(hs, 1u64, slots[0usize], slots[1usize], slots[2usize], slots[3usize], slots[4usize]);
+  true
+}
+fn sSetFacing(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  stageStep(hs, 2u64, slots[0usize], 0u64, slots[1usize], slots[2usize], slots[3usize]);
+  true
+}
+
 fn simTables() ImportTables[u8] {
   var t = ImportTables[u8].make();
   let f = fieldSignature(&mut t.types);
@@ -558,6 +605,18 @@ fn simTables() ImportTables[u8] {
   t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &sNothing);
   let g = glideSignature(&mut t.types);
   t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &sNothing);
+  let p = placeSignature(&mut t.types);
+  t.add(NS_HOST, HOST_PLACE, p, false, 1u32, &sPlace);
+  let pf = placeFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_PLACE_FIELD, pf, false, 1u32, &sPlaceField);
+  let c = childSignature(&mut t.types);
+  t.add(NS_HOST, HOST_CHILD, c, false, 1u32, &sChild);
+  let sp = setPlaceSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_PLACE, sp, true, 1u32, &sSetPlace);
+  let spf = setPlaceFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_PLACE_FIELD, spf, true, 1u32, &sSetPlaceField);
+  let sf = setFacingSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FACING, sf, true, 1u32, &sSetFacing);
   t
 }
 
@@ -574,7 +633,7 @@ fn simBench(file: &str, steps: u64) {
         case let Ok(v) {
           var units = List[u32]();
           var u = 0usize;
-          while u < v.unitCount() { if !v.isRefused(u) && v.paramSlots(u) == 0u32 { units.push(u32.from(u)); } u = u + 1usize; }
+          while u < v.unitCount() { if !v.isRefused(u) && v.paramSlots(u) <= 1u32 { units.push(u32.from(u)); } u = u + 1usize; }
           var h = SimHandles.make();
           var fields = List[u64]();
           var i = 0usize;
@@ -585,6 +644,37 @@ fn simBench(file: &str, steps: u64) {
           h.alloc(HANDLE_HOST, fields);
           h.alloc(HANDLE_HOST, inside);
           h.alloc(HANDLE_HOST, List[u64]());
+          // the step functions' view of the parts: their places (a few metres apart), the parts of each, K place fields on all
+          let n = w.nodes.len();
+          var kk = 0usize;
+          i = 0usize;
+          while i < code.entries.len() { if code.entries[i].kind == ENTRY_FIXED && usize.from(code.entries[i].b) + 1usize > kk { kk = usize.from(code.entries[i].b) + 1usize; } i = i + 1usize; }
+          var places = List[u64]();
+          i = 0usize;
+          while i < n { places.push((f64.from(i % 10usize) * 2.0).bits()); places.push((14.0 + f64.from(i % 7usize) * 0.6).bits()); places.push((f64.from(i / 10usize) * 2.0).bits()); i = i + 1usize; }
+          var at = List[u64]();
+          var kids = List[u64]();
+          at.push(0u64);
+          i = 0usize;
+          while i < n {
+            var c = 0usize;
+            while c < w.nodes[i].children.len() { kids.push(u64.from(*w.nodes[i].children[c])); c = c + 1usize; }
+            at.push(u64.from(kids.len()));
+            i = i + 1usize;
+          }
+          var has = List[u64]();
+          var vals = List[u64]();
+          has.push(u64.from(kk));
+          i = 0usize;
+          while i < n * kk { has.push(1u64); vals.push((0.0).bits()); vals.push((0.0).bits()); vals.push((5.0).bits()); i = i + 1usize; }
+          h.alloc(HANDLE_HOST, places);
+          h.alloc(HANDLE_HOST, at);
+          h.alloc(HANDLE_HOST, kids);
+          h.alloc(HANDLE_HOST, vals);
+          h.alloc(HANDLE_HOST, has);
+          h.alloc(HANDLE_HOST, List[u64]());
+          var dt = List[u64]();
+          dt.push((1.0 / 60.0).bits());
           let none = List[u64]();
           var out = List[u64]();
           let nat = nativeAlways(&v, "sim", liftOptsNone());
@@ -599,10 +689,12 @@ fn simBench(file: &str, steps: u64) {
             let t0 = Instant.now().nanos();
             var s = 0u64;
             while s < steps {
+              (&mut h.data[9usize]).clear();
               var k = 0usize;
               while k < units.len() {
                 it.setFuel(100000u64);
-                let t = it.run(&v, &tb, &mut h, *units[k], none.view(), &mut out);
+                let a = if v.paramSlots(usize.from(*units[k])) == 1u32 { dt.view() } else { none.view() };
+                let t = it.run(&v, &tb, &mut h, *units[k], a, &mut out);
                 if t is Some { print <- "a derive trapped\n"; return; }
                 if out.len() > 0usize { sumI = sumI + *out[0usize]; }
                 k = k + 1usize;
@@ -615,10 +707,12 @@ fn simBench(file: &str, steps: u64) {
               let t2 = Instant.now().nanos();
               s = 0u64;
               while s < steps {
+                (&mut h.data[9usize]).clear();
                 var k = 0usize;
                 while k < units.len() {
                   rn.setFuel(100000u64);
-                  let t = rn.run(&nat[0usize], &v, &tb, &mut h, *units[k], none.view(), &mut out);
+                  let a = if v.paramSlots(usize.from(*units[k])) == 1u32 { dt.view() } else { none.view() };
+                  let t = rn.run(&nat[0usize], &v, &tb, &mut h, *units[k], a, &mut out);
                   if t is Some { print <- "a derive trapped natively\n"; return; }
                   if out.len() > 0usize { sumN = sumN + *out[0usize]; }
                   k = k + 1usize;
@@ -681,7 +775,7 @@ fn compileRow(label: &str, sim: bool, text: &Array[u8], reps: u64) {
     let w = &reading.understood;
     let t0 = Instant.now().nanos();
     var tfixed = toolImports(&w.vocab, &w.names);
-    var tsim = simTablesForVerify();
+    var tsim = simTables();
     let code = if sim { lowerSim(w) } else { lower(w) };
     var vv = List[VerifiedCode]();
     if sim {

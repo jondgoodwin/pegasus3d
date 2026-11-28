@@ -170,13 +170,151 @@ fn ruleImports() ImportTables[u8] {
   t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &hostStartAnim);
   let g = glideSignature(&mut t.types);
   t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &hostGlide);
+  let p = placeSignature(&mut t.types);
+  t.add(NS_HOST, HOST_PLACE, p, false, 1u32, &hostPlace);
+  let pf = placeFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_PLACE_FIELD, pf, false, 1u32, &hostPlaceField);
+  let c = childSignature(&mut t.types);
+  t.add(NS_HOST, HOST_CHILD, c, false, 1u32, &hostChild);
+  let sp = setPlaceSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_PLACE, sp, true, 1u32, &hostSetPlace);
+  let spf = setPlaceFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_PLACE_FIELD, spf, true, 1u32, &hostSetPlaceField);
+  let sf = setFacingSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FACING, sf, true, 1u32, &hostSetFacing);
   t
 }
 
-fn ruleHandles(fields: &List[u64], inside: &List[u64]) RuleHandles {
+// -------- the step functions' imports (W148; pegasuscore\src\simrules.cone's) --------
+
+const RULE_PLACES = 4usize;
+const RULE_CHILD_AT = 5usize;
+const RULE_CHILDREN = 6usize;
+const RULE_PFIELDS = 7usize;
+const RULE_PHAS = 8usize;
+const RULE_STEP_WRITES = 9usize;
+const STEP_PLACE = 0u64;
+const STEP_FIELD = 1u64;
+const STEP_FACING = 2u64;
+
+fn hostPlace(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let p = hs.payload(RULE_PLACES);
+  if 3usize * s + 2usize >= p.len() { hs.fail = String.from("host.place: no such part"); return false; }
+  slots[0usize] = *p[3usize * s]; slots[1usize] = *p[3usize * s + 1usize]; slots[2usize] = *p[3usize * s + 2usize];
+  true
+}
+
+fn hostPlaceField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let has = hs.payload(RULE_PHAS);
+  let kk = if has.len() > 0usize { usize.from(*has[0usize]) } else { 0usize };
+  let i = s * kk + k;
+  if k >= kk || 1usize + i >= has.len() || *has[1usize + i] == 0u64 {
+    hs.fail = String.from("host.place_field: that part has no such place field");
+    return false;
+  }
+  let p = hs.payload(RULE_PFIELDS);
+  slots[0usize] = *p[3usize * i]; slots[1usize] = *p[3usize * i + 1usize]; slots[2usize] = *p[3usize * i + 2usize];
+  true
+}
+
+fn hostChild(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let at = hs.payload(RULE_CHILD_AT);
+  if s + 1usize >= at.len() { hs.fail = String.from("host.child: no such part"); return false; }
+  let from = usize.from(*at[s]);
+  let to = usize.from(*at[s + 1usize]);
+  if from + k >= to { hs.fail = String.from("host.child: the part holds fewer parts"); return false; }
+  slots[0usize] = *hs.payload(RULE_CHILDREN)[from + k];
+  true
+}
+
+fn stageStep(hs: &mut RuleHandles, kind: u64, slot: u64, k: u64, x: u64, y: u64, z: u64) {
+  let w = &mut hs.data[RULE_STEP_WRITES];
+  w.push(kind); w.push(slot); w.push(k); w.push(x); w.push(y); w.push(z);
+}
+
+fn hostSetPlace(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  if usize.from(slots[0usize]) + 1usize >= hs.payload(RULE_CHILD_AT).len() { hs.fail = String.from("host.set_place: no such part"); return false; }
+  stageStep(hs, STEP_PLACE, slots[0usize], 0u64, slots[1usize], slots[2usize], slots[3usize]);
+  true
+}
+
+fn hostSetPlaceField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  let k = usize.from(slots[1usize]);
+  let has = hs.payload(RULE_PHAS);
+  let kk = if has.len() > 0usize { usize.from(*has[0usize]) } else { 0usize };
+  if k >= kk || 1usize + s * kk + k >= has.len() || *has[1usize + s * kk + k] == 0u64 {
+    hs.fail = String.from("host.set_place_field: that part has no such place field");
+    return false;
+  }
+  stageStep(hs, STEP_FIELD, slots[0usize], slots[1usize], slots[2usize], slots[3usize], slots[4usize]);
+  true
+}
+
+fn hostSetFacing(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  if usize.from(slots[0usize]) + 1usize >= hs.payload(RULE_CHILD_AT).len() { hs.fail = String.from("host.set_facing: no such part"); return false; }
+  stageStep(hs, STEP_FACING, slots[0usize], 0u64, slots[1usize], slots[2usize], slots[3usize]);
+  true
+}
+
+// What the step functions read, made from the world's parts and a spread of values: each part's place, the parts of each part,
+// and K place fields on every part. 'k' turns the spread.
+struct StepEnv {
+  n: usize;
+  kk: usize;
+  at: List[u64];
+  kids: List[u64];
+}
+
+fn stepEnv(w: &Understood, code: &Code) StepEnv {
+  let n = w.nodes.len();
+  var at = List[u64]();
+  var kids = List[u64]();
+  at.push(0u64);
+  var s = 0usize;
+  while s < n {
+    var c = 0usize;
+    while c < w.nodes[s].children.len() { kids.push(u64.from(*w.nodes[s].children[c])); c = c + 1usize; }
+    at.push(u64.from(kids.len()));
+    s = s + 1usize;
+  }
+  var kk = 0usize;
+  var e = 0usize;
+  while e < code.entries.len() {
+    if code.entries[e].kind == ENTRY_FIXED && usize.from(code.entries[e].b) + 1usize > kk { kk = usize.from(code.entries[e].b) + 1usize; }
+    e = e + 1usize;
+  }
+  StepEnv(n, kk, at, kids)
+}
+
+fn ruleHandles(fields: &List[u64], inside: &List[u64], env: &StepEnv, k: usize) RuleHandles {
   var hs = RuleHandles.make();
   hs.alloc(HANDLE_HOST, fields.clone());
   hs.alloc(HANDLE_HOST, inside.clone());
+  hs.alloc(HANDLE_HOST, List[u64]());
+  let sp = spread();
+  var places = List[u64]();
+  var i = 0usize;
+  while i < 3usize * env.n { places.push((*sp[(k + i) % sp.len()]).bits()); i = i + 1usize; }
+  var has = List[u64]();
+  var vals = List[u64]();
+  has.push(u64.from(env.kk));
+  i = 0usize;
+  while i < env.n * env.kk {
+    has.push(1u64);
+    vals.push((*sp[(k + 2usize * i) % sp.len()]).bits()); vals.push((*sp[(k + 2usize * i + 1usize) % sp.len()]).bits()); vals.push((*sp[(k + i + 5usize) % sp.len()]).bits());
+    i = i + 1usize;
+  }
+  hs.alloc(HANDLE_HOST, places);
+  hs.alloc(HANDLE_HOST, env.at.clone());
+  hs.alloc(HANDLE_HOST, env.kids.clone());
+  hs.alloc(HANDLE_HOST, vals);
+  hs.alloc(HANDLE_HOST, has);
   hs.alloc(HANDLE_HOST, List[u64]());
   hs
 }
@@ -192,19 +330,19 @@ fn spread() List[f64] {
 
 // -------- executors --------
 
-fn runSim(v: &VerifiedCode, tb: &ImportTables[u8], nc: &NativeCode, native: bool, unit: u32, fuel: u64, fields: &List[u64], inside: &List[u64]) Snap {
-  var h = ruleHandles(fields, inside);
+fn runSim(v: &VerifiedCode, tb: &ImportTables[u8], nc: &NativeCode, native: bool, unit: u32, fuel: u64, fields: &List[u64], inside: &List[u64],
+          env: &StepEnv, k: usize, args: &Array[u64]) Snap {
+  var h = ruleHandles(fields, inside, env, k);
   var out = List[u64]();
-  let none = List[u64]();
   if native {
     var r = NativeRunner.make();
     r.setFuel(fuel);
-    let t = r.run(nc, v, tb, &mut h, unit, none.view(), &mut out);
+    let t = r.run(nc, v, tb, &mut h, unit, args, &mut out);
     return snapOf(&t, &out, r.fuelLeft(), &h);
   }
   var it = Interpreter.make();
   it.setFuel(fuel);
-  let t = it.run(v, tb, &mut h, unit, none.view(), &mut out);
+  let t = it.run(v, tb, &mut h, unit, args, &mut out);
   snapOf(&t, &out, it.fuelLeft(), &h)
 }
 
@@ -453,6 +591,9 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
   var st = newTally();
   if simOk && snat.len() > 0usize {
     let sp = spread();
+    let env = stepEnv(w, &simCode);
+    var dts = List[f64]();
+    dts.push(1.0 / 60.0); dts.push(0.); dts.push(1.); dts.push(-0.5); dts.push(1.0e300); dts.push(f64.fromBits(0x7FF8000000000000u64));
     let nf = w.fields.len();
     let ns = w.nodes.len();
     var k = 0usize;
@@ -465,13 +606,16 @@ fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
       while s < ns { inside.push(u64.from((k + s) & 1usize)); s = s + 1usize; }
       var u = 0usize;
       while u < simN {
-        if !sv[0usize].isRefused(u) && sv[0usize].paramSlots(u) == 0u32 {
+        // derives and handlers take nothing; a step function takes the step's length (a spread of them too)
+        if !sv[0usize].isRefused(u) && sv[0usize].paramSlots(u) <= 1u32 {
           var fuels = List[u64]();
           fuels.push(RULE_FUEL); fuels.push(u64.from(k));
+          var sargs = List[u64]();
+          if sv[0usize].paramSlots(u) == 1u32 { sargs.push((*dts[k % dts.len()]).bits()); }
           var q = 0usize;
           while q < fuels.len() {
-            let a = runSim(&sv[0usize], &stables, &snat[0usize], false, u32.from(u), *fuels[q], &fields, &inside);
-            let b = runSim(&sv[0usize], &stables, &snat[0usize], true, u32.from(u), *fuels[q], &fields, &inside);
+            let a = runSim(&sv[0usize], &stables, &snat[0usize], false, u32.from(u), *fuels[q], &fields, &inside, &env, k, sargs.view());
+            let b = runSim(&sv[0usize], &stables, &snat[0usize], true, u32.from(u), *fuels[q], &fields, &inside, &env, k, sargs.view());
             st.runs = st.runs + 1u64;
             if a.trapped { st.trapped = st.trapped + 1u64; }
             let why = differ(&a, &b);
