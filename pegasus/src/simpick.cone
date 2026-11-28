@@ -14,8 +14,99 @@ fn rayPlaced(from: Vec3, along: Vec3, place: &Mat4, shape: &BoxShape, ignoreTurn
   if ignoreTurn {
     return rayBox(from, along, place.translation() + shape.centre, shape.half);
   }
+  if flatPlacement(place) { return -1.; }   // a part scaled to nothing along an axis has no inverse and nothing to hit
   let inv = place.inverse();
   rayBox(inv.transformPoint(from), inv.transformVector(along), shape.centre, shape.half)
+}
+
+// True if one of the placement's three columns has no length (a zero scale), so the placement cannot be inverted
+fn flatPlacement(p: &Mat4) bool {
+  var c = 0usize;
+  while c < 3usize {
+    let x = p.m[c * 4usize]; let y = p.m[c * 4usize + 1usize]; let z = p.m[c * 4usize + 2usize];
+    if x * x + y * y + z * z < 0.000000000001 { return true; }
+    c = c + 1usize;
+  }
+  false
+}
+
+// ---- Picking against what the person saw ----
+//
+// Render draws a part between two of Sim's snapshots, at the frame's display time less one step (renderactor `blend`).
+// A press carries that display time, so Sim picks against the poses as Render blended them for it: it keeps each step's
+// poses for POSE_STEPS steps and blends the two around the press's time with `blendPlacement`, as Render does.
+//
+// POSE_STEPS = 16 (267 ms): Render shows a part at most one step behind its newest snapshot, the press reaches Sim within
+// one more step, and the rest (13 steps, 217 ms) is room for a slow frame, the queue and a Sim stall. A press older than the
+// history is picked at the oldest poses held. The ring is made once with its slots and each slot's list keeps its block:
+// refilled each step, never grown past the world's part count.
+pub const POSE_STEPS = 16usize;
+
+struct PoseFrame {
+  atNs: u64;                        // the step's snapshot time (the same value Render blends by)
+  poses: List[Mat4];                // each part's place, by id
+}
+alias PoseFrames = List[PoseFrame];
+
+pub struct PoseHistory {
+  frames: PoseFrames;
+  next: usize;                      // the slot the next step writes
+  count: usize;                     // slots holding a step (at most POSE_STEPS)
+
+  pub fn make() PoseHistory {
+    var f = PoseFrames();
+    var i = 0usize;
+    while i < POSE_STEPS { f.push(PoseFrame(0u64, List[Mat4]())); i = i + 1usize; }
+    PoseHistory(f, 0usize, 0usize)
+  }
+
+  // Start the poses of the step whose snapshot is at 'atNs'; `add` then gives each part's place, by id
+  pub fn begin(self: &mut, atNs: u64) {
+    let f = &mut frames[next];
+    f.atNs = atNs;
+    f.poses.clear();
+    next = (next + 1usize) % POSE_STEPS;
+    if count < POSE_STEPS { count = count + 1usize; }
+  }
+
+  pub fn add(self: &mut, place: Mat4) {
+    let last = (next + POSE_STEPS - 1usize) % POSE_STEPS;
+    let f = &mut frames[last];
+    f.poses.push(place);
+  }
+
+  // The slot of the k-th held step, oldest first
+  fn slotOf(self: &, k: usize) usize { (next + POSE_STEPS - count + k) % POSE_STEPS }
+
+  // Part 'id' as Render blended it at 'target' (a display time less a step): between the two held steps around it; the
+  // oldest if 'target' is older than all held, the newest if newer. 'fallback' if no step holds the part
+  pub fn poseAt(self: &, target: u64, id: usize, fallback: &Mat4) Mat4 {
+    if count == 0usize { return *fallback; }
+    var i = 0usize;
+    var found = false;
+    var k = 0usize;
+    while k < count {
+      if frames[self.slotOf(k)].atNs <= target { i = k; found = true; }
+      k = k + 1usize;
+    }
+    let a = &frames[self.slotOf(i)];
+    if id >= a.poses.len() { return *fallback; }
+    if !found || i + 1usize >= count { return *a.poses[id]; }
+    let b = &frames[self.slotOf(i + 1usize)];
+    if id >= b.poses.len() { return *a.poses[id]; }
+    var alpha: f32 = 1.;
+    if b.atNs > a.atNs { alpha = f32.from(target - a.atNs) / f32.from(b.atNs - a.atNs); }
+    blendPlacement(&*a.poses[id], &*b.poses[id], alpha)
+  }
+}
+
+// Where along the ray a press drawn at display time 'madeNs' meets part 'id' ('current' is where it stands now). A press
+// without a time (0), or a history with no step, is picked at the current place. 'atCurrent' is the mutant
+// (PEGASUS_MUTANT=pick-at-current): the current place always
+fn rayPlacedAt(hist: &PoseHistory, madeNs: u64, id: usize, current: &Mat4, from: Vec3, along: Vec3, shape: &BoxShape, atCurrent: bool) f32 {
+  var place = *current;
+  if !atCurrent && madeNs > STEP_NS { place = hist.poseAt(madeNs - STEP_NS, id, current); }
+  rayPlaced(from, along, &place, shape, mutantIs("pick-ignores-turn"))
 }
 
 fn pickVerdict(ok: bool, what: &str) bool {
@@ -45,5 +136,49 @@ fn checkPick(ignoreTurn: bool) bool {
   // the parameter is the world's: the box's top is 0.05 m up, so the hit is 2.95 m along a unit ray from 3 m
   let d = hitsTurned - 2.95;
   all = pickVerdict(d < 0.001 && d > -0.001, "the hit's distance is in world metres") && all;
+  // a zero scale has no inverse: no hit, whatever the ray
+  let flat = Mat4.fromTrs(Vec3(0., 0., 0.), Quat.identity(), Vec3(0., 1., 1.));
+  let hitFlat = rayPlaced(Vec3(0., 3., 0.), down, &flat, &shape, ignoreTurn);
+  all = pickVerdict(hitFlat < 0., "a part scaled to zero along x is never hit") && all;
+  all = checkPickDrawn(mutantIs("pick-at-current")) && all;
+  all
+}
+
+// A part moving 1 m/s along x, its poses kept for 40 steps (the ring of 16 wraps), and a press drawn when the newest step
+// was 3 steps on. The press hits the part where it was then and misses where it is now; between two steps it hits between.
+fn checkPickDrawn(atCurrent: bool) bool {
+  var all = true;
+  var hist = PoseHistory.make();
+  let shape = BoxShape(Vec3(0.02, 0.05, 0.05), Vec3(0., 0., 0.));
+  let down = Vec3(0., -1., 0.);
+  var k = 1u64;
+  var now = Mat4.identity();
+  while k <= 40u64 {
+    let t = k * STEP_NS;
+    now = Mat4.fromTrs(Vec3(f32.from(t) / 1000000000., 0., 0.), Quat.identity(), Vec3(1., 1., 1.));
+    hist.begin(t);
+    hist.add(now);
+    k = k + 1u64;
+  }
+  // drawn 3 steps ago: Render showed it at display time less a step, so the display time was step 38's, plus a step
+  let madeNs = 38u64 * STEP_NS + STEP_NS;
+  let xThen = f32.from(37u64 * STEP_NS) / 1000000000.;
+  let xNow = f32.from(40u64 * STEP_NS) / 1000000000.;
+  let then = rayPlacedAt(&hist, madeNs, 0usize, &now, Vec3(xThen, 3., 0.), down, &shape, atCurrent);
+  all = pickVerdict(then >= 0., "a press drawn 3 steps ago hits where the part was then") && all;
+  let nowHit = rayPlacedAt(&hist, madeNs, 0usize, &now, Vec3(xNow, 3., 0.), down, &shape, atCurrent);
+  all = pickVerdict(nowHit < 0., "... and misses where it stands now") && all;
+  // half way between steps 37 and 38
+  let madeMid = 37u64 * STEP_NS + STEP_NS / 2u64 + STEP_NS;
+  let xMid = f32.from(37u64 * STEP_NS + STEP_NS / 2u64) / 1000000000.;
+  let mid = rayPlacedAt(&hist, madeMid, 0usize, &now, Vec3(xMid, 3., 0.), down, &shape, atCurrent);
+  all = pickVerdict(mid >= 0., "a press between two steps hits where Render blended the part") && all;
+  // no time on the press: the current place
+  let untimed = rayPlacedAt(&hist, 0u64, 0usize, &now, Vec3(xNow, 3., 0.), down, &shape, atCurrent);
+  all = pickVerdict(untimed >= 0., "a press without a time picks at the current place") && all;
+  // older than the ring holds (the oldest held is step 25): the oldest place
+  let xOld = f32.from(25u64 * STEP_NS) / 1000000000.;
+  let old = rayPlacedAt(&hist, 5u64 * STEP_NS, 0usize, &now, Vec3(xOld, 3., 0.), down, &shape, atCurrent);
+  all = pickVerdict(old >= 0., "a press older than the history picks at the oldest held place") && all;
   all
 }
