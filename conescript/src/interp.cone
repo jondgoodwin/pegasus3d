@@ -1,0 +1,325 @@
+// The interpreter: verified code run, one op at a time, through memory slots.
+//
+// One stack of 8-byte slots serves every frame: a frame is the unit's locals (its parameters first, which are the
+// caller's argument slots, copied nowhere) and then its operand stack. Branches read the side table the verifier
+// built. Fuel is charged at every taken branch back to a loop and at every call and import (an import may weigh
+// more). The run stops at the first trap and unwinds to the caller with the unit, the offset and the kind; nothing
+// the trapped run was making is handed back.
+
+pub enum TrapKind {
+  FuelOut;
+  ImportFailed;
+  Unreachable;
+  BadCall;         // 'run' was given a unit that does not exist, or the wrong number of argument slots
+}
+
+pub struct Trap {
+  pub kind: TrapKind;
+  pub unit: u32;
+  pub offset: u32;
+  pub message: String;
+}
+
+struct Frame {
+  unit: usize;
+  pc: usize;
+  base: usize;
+}
+
+fn trap(kind: TrapKind, unit: usize, offset: usize, message: &str) Option[Trap] {
+  Some(Trap(kind, u32.from(unit), u32.from(offset), String.from(message)))
+}
+
+pub struct Interpreter {
+  stack: List[u64];
+  frames: List[Frame];
+  fuel: u64;
+
+  pub fn make() Interpreter { Interpreter(List[u64](), List[Frame](), 0u64) }
+
+  // The fuel the next run may spend
+  pub fn setFuel(self: &mut, fuel: u64) { self.fuel = fuel; }
+  pub fn fuelLeft(self: &) u64 { self.fuel }
+
+  fn charge(self: &mut, n: u64) bool {
+    if self.fuel < n { return false; }
+    self.fuel = self.fuel - n;
+    true
+  }
+
+  fn ensure(self: &mut, n: usize) {
+    if self.stack.len() < n { self.stack.resize(n + n / 2usize + 64usize, 0u64); }
+  }
+
+  fn rd(self: &, i: usize) u64 { *self.stack[i] }
+  fn wr(self: &mut, i: usize, x: u64) { self.stack.set(i, x); }
+  fn rdf(self: &, i: usize) f64 { f64.fromBits(*self.stack[i]) }
+  fn wrf(self: &mut, i: usize, x: f64) { self.stack.set(i, x.bits()); }
+
+  // Runs a unit with the argument slots given; on success the result slots are in 'out' and the answer is None
+  pub fn run(self: &mut, v: &VerifiedCode, tables: &ImportTables, handles: &mut HandleTable, unit: u32,
+             args: &Array[u64], out: &mut List[u64]) Option[Trap] {
+    out.clear();
+    self.frames.clear();
+    var cur = usize.from(unit);
+    if cur >= v.units.len() || args.len != usize.from(v.units[cur].paramSlots) {
+      return trap(TrapKind.BadCall, cur, 0usize, "a unit that does not exist, or the wrong number of arguments");
+    }
+    var base = 0usize;
+    var pc = 0usize;
+    self.ensure(usize.from(v.units[cur].localSlots) + usize.from(v.units[cur].maxDepth) + 8usize);
+    var i = 0usize;
+    while i < usize.from(v.units[cur].localSlots) { self.wr(i, if i < args.len { args[i] } else { 0u64 }); i = i + 1usize; }
+    var sp = base + usize.from(v.units[cur].localSlots);
+    while true {
+      let at = pc;
+      let cb = v.code.units[cur].code.view();
+      let op = cb[pc];
+      pc = pc + 1usize;
+      match op {
+        case OP_UNREACHABLE { return trap(TrapKind.Unreachable, cur, at, "unreachable executed"); }
+        case OP_BLOCK { var bad = false; getU(cb, &mut pc, cb.len, &mut bad); }
+        case OP_LOOP { var bad = false; getU(cb, &mut pc, cb.len, &mut bad); }
+        case OP_IF {
+          var bad = false;
+          getU(cb, &mut pc, cb.len, &mut bad);
+          sp = sp - 1usize;
+          if self.rd(sp) == 0u64 { pc = usize.from(*v.units[cur].tgt[at]); }
+        }
+        case OP_ELSE { pc = usize.from(*v.units[cur].tgt[at]); }
+        case OP_END {
+          if pc == cb.len {
+            let r = usize.from(v.units[cur].resultSlots);
+            var j = 0usize;
+            while j < r { let x = self.rd(sp - r + j); self.wr(base + j, x); j = j + 1usize; }
+            sp = base + r;
+            if self.frames.len() == 0usize {
+              j = 0usize;
+              while j < r { out.push(self.rd(j)); j = j + 1usize; }
+              return None;
+            }
+            let f = self.frames.pop().unwrap();
+            cur = f.unit; pc = f.pc; base = f.base;
+          }
+        }
+        case OP_BR {
+          var bad = false;
+          getU(cb, &mut pc, cb.len, &mut bad);
+          let tg = usize.from(*v.units[cur].tgt[at]);
+          if tg <= at && !self.charge(1u64) { return trap(TrapKind.FuelOut, cur, at, "out of fuel"); }
+          sp = self.branchTo(v, cur, at, sp);
+          pc = tg;
+        }
+        case OP_BR_IF {
+          var bad = false;
+          getU(cb, &mut pc, cb.len, &mut bad);
+          sp = sp - 1usize;
+          if self.rd(sp) != 0u64 {
+            let tg = usize.from(*v.units[cur].tgt[at]);
+            if tg <= at && !self.charge(1u64) { return trap(TrapKind.FuelOut, cur, at, "out of fuel"); }
+            sp = self.branchTo(v, cur, at, sp);
+            pc = tg;
+          }
+        }
+        case OP_RETURN {
+          sp = self.branchTo(v, cur, at, sp);
+          pc = usize.from(*v.units[cur].tgt[at]);
+        }
+        case OP_LOCAL_GET {
+          var bad = false;
+          let l = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let n = usize.from(*v.units[cur].localLen[l]);
+          let o = base + usize.from(*v.units[cur].localOff[l]);
+          var j = 0usize;
+          while j < n { let x = self.rd(o + j); self.wr(sp + j, x); j = j + 1usize; }
+          sp = sp + n;
+        }
+        case OP_LOCAL_SET {
+          var bad = false;
+          let l = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let n = usize.from(*v.units[cur].localLen[l]);
+          let o = base + usize.from(*v.units[cur].localOff[l]);
+          var j = 0usize;
+          while j < n { let x = self.rd(sp - n + j); self.wr(o + j, x); j = j + 1usize; }
+          sp = sp - n;
+        }
+        case OP_LOCAL_TEE {
+          var bad = false;
+          let l = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let n = usize.from(*v.units[cur].localLen[l]);
+          let o = base + usize.from(*v.units[cur].localOff[l]);
+          var j = 0usize;
+          while j < n { let x = self.rd(sp - n + j); self.wr(o + j, x); j = j + 1usize; }
+        }
+        case OP_F64_CONST {
+          var bits = 0u64;
+          var j = 0u64;
+          while j < 8u64 { bits = bits | (u64.from(cb[pc + usize.from(j)]) << (j * 8u64)); j = j + 1u64; }
+          pc = pc + 8usize;
+          self.wr(sp, bits);
+          sp = sp + 1usize;
+        }
+        case OP_I64_CONST {
+          var bad = false;
+          let x = getS(cb, &mut pc, cb.len, &mut bad);
+          self.wr(sp, x as u64);
+          sp = sp + 1usize;
+        }
+        case OP_BOOL_CONST {
+          self.wr(sp, u64.from(cb[pc]));
+          pc = pc + 1usize;
+          sp = sp + 1usize;
+        }
+        case OP_PART_CONST {
+          var bad = false;
+          let x = getU(cb, &mut pc, cb.len, &mut bad);
+          self.wr(sp, x);
+          sp = sp + 1usize;
+        }
+        case OP_F64_ADD { sp = sp - 1usize; let r = self.rdf(sp - 1usize) + self.rdf(sp); self.wrf(sp - 1usize, r); }
+        case OP_F64_SUB { sp = sp - 1usize; let r = self.rdf(sp - 1usize) - self.rdf(sp); self.wrf(sp - 1usize, r); }
+        case OP_F64_MUL { sp = sp - 1usize; let r = self.rdf(sp - 1usize) * self.rdf(sp); self.wrf(sp - 1usize, r); }
+        case OP_F64_DIV { sp = sp - 1usize; let r = self.rdf(sp - 1usize) / self.rdf(sp); self.wrf(sp - 1usize, r); }
+        case OP_F64_MIN {
+          sp = sp - 1usize;
+          let a = self.rdf(sp - 1usize);
+          let b = self.rdf(sp);
+          // NaN if either is; the negative of two equal zeros
+          let r = if a != a || b != b { a + b } else if a < b { a } else if b < a { b } else { f64.fromBits(a.bits() | b.bits()) };
+          self.wrf(sp - 1usize, r);
+        }
+        case OP_F64_MAX {
+          sp = sp - 1usize;
+          let a = self.rdf(sp - 1usize);
+          let b = self.rdf(sp);
+          let r = if a != a || b != b { a + b } else if a > b { a } else if b > a { b } else { f64.fromBits(a.bits() & b.bits()) };
+          self.wrf(sp - 1usize, r);
+        }
+        case OP_F64_NEG { let x = self.rd(sp - 1usize); self.wr(sp - 1usize, x ^ 0x8000000000000000u64); }
+        case OP_F64_ABS { let x = self.rd(sp - 1usize); self.wr(sp - 1usize, x & 0x7FFFFFFFFFFFFFFFu64); }
+        case OP_F64_SQRT { let x = self.rdf(sp - 1usize); self.wrf(sp - 1usize, x.sqrt()); }
+        case OP_F64_EQ { sp = sp - 1usize; let r = self.rdf(sp - 1usize) == self.rdf(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_F64_NE { sp = sp - 1usize; let r = self.rdf(sp - 1usize) != self.rdf(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_F64_LT { sp = sp - 1usize; let r = self.rdf(sp - 1usize) < self.rdf(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_F64_LE { sp = sp - 1usize; let r = self.rdf(sp - 1usize) <= self.rdf(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_F64_GT { sp = sp - 1usize; let r = self.rdf(sp - 1usize) > self.rdf(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_F64_GE { sp = sp - 1usize; let r = self.rdf(sp - 1usize) >= self.rdf(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_BOOL_NOT { let x = self.rd(sp - 1usize); self.wr(sp - 1usize, x ^ 1u64); }
+        case OP_BOOL_AND { sp = sp - 1usize; let r = self.rd(sp - 1usize) & self.rd(sp); self.wr(sp - 1usize, r); }
+        case OP_BOOL_OR { sp = sp - 1usize; let r = self.rd(sp - 1usize) | self.rd(sp); self.wr(sp - 1usize, r); }
+        case OP_BOOL_FROM_F64 { let r = self.rdf(sp - 1usize) != 0.0; self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_F64_FROM_BOOL { let r = self.rd(sp - 1usize); self.wrf(sp - 1usize, if r != 0u64 { 1.0 } else { 0.0 }); }
+        case OP_I64_ADD { sp = sp - 1usize; let r = (self.rd(sp - 1usize) as i64) + (self.rd(sp) as i64); self.wr(sp - 1usize, r as u64); }
+        case OP_I64_SUB { sp = sp - 1usize; let r = (self.rd(sp - 1usize) as i64) - (self.rd(sp) as i64); self.wr(sp - 1usize, r as u64); }
+        case OP_I64_MUL { sp = sp - 1usize; let r = (self.rd(sp - 1usize) as i64) * (self.rd(sp) as i64); self.wr(sp - 1usize, r as u64); }
+        case OP_I64_EQ { sp = sp - 1usize; let r = self.rd(sp - 1usize) == self.rd(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_I64_NE { sp = sp - 1usize; let r = self.rd(sp - 1usize) != self.rd(sp); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_I64_LT { sp = sp - 1usize; let r = (self.rd(sp - 1usize) as i64) < (self.rd(sp) as i64); self.wr(sp - 1usize, if r { 1u64 } else { 0u64 }); }
+        case OP_I64_FROM_PART { }
+        case OP_F64_FROM_I64 { let r = f64.from(self.rd(sp - 1usize) as i64); self.wrf(sp - 1usize, r); }
+        case OP_TUPLE_MAKE { var bad = false; getU(cb, &mut pc, cb.len, &mut bad); }
+        case OP_TUPLE_GET {
+          var bad = false;
+          let t = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let f = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let d = &v.code.types.defs[t];
+          let total = usize.from(*v.slots[t]);
+          var skip = 0usize;
+          var k = 0usize;
+          while k < f { skip = skip + usize.from(*v.slots[usize.from(*d.items[k])]); k = k + 1usize; }
+          let n = usize.from(*v.slots[usize.from(*d.items[f])]);
+          k = 0usize;
+          while k < n { let x = self.rd(sp - total + skip + k); self.wr(sp - total + k, x); k = k + 1usize; }
+          sp = sp - total + n;
+        }
+        case OP_LIST_MAKE {
+          var bad = false;
+          let t = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let n = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let e = usize.from(*v.slots[usize.from(v.code.types.defs[t].arg)]);
+          let total = n * e;
+          var payload = List[u64]();
+          var k = 0usize;
+          while k < total { payload.push(self.rd(sp - total + k)); k = k + 1usize; }
+          sp = sp - total;
+          self.wr(sp, handles.alloc(HANDLE_LIST, payload));
+          sp = sp + 1usize;
+        }
+        case OP_SELECT {
+          var bad = false;
+          let t = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let n = usize.from(*v.slots[t]);
+          sp = sp - 1usize;
+          let c = self.rd(sp);
+          // a b cond: the first if cond is set, else the second
+          if c != 0u64 {
+            var k = 0usize;
+            while k < n { let x = self.rd(sp - 2usize * n + k); self.wr(sp - 2usize * n + k, x); k = k + 1usize; }
+          } else {
+            var k = 0usize;
+            while k < n { let x = self.rd(sp - n + k); self.wr(sp - 2usize * n + k, x); k = k + 1usize; }
+          }
+          sp = sp - n;
+        }
+        case OP_DROP {
+          var bad = false;
+          let t = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          sp = sp - usize.from(*v.slots[t]);
+        }
+        case OP_CALL {
+          var bad = false;
+          let c = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          if !self.charge(1u64) { return trap(TrapKind.FuelOut, cur, at, "out of fuel"); }
+          self.frames.push(Frame(cur, pc, base));
+          let ci = &v.units[c];
+          let nb = sp - usize.from(ci.paramSlots);
+          self.ensure(nb + usize.from(ci.localSlots) + usize.from(ci.maxDepth) + 8usize);
+          var k = usize.from(ci.paramSlots);
+          while k < usize.from(ci.localSlots) { self.wr(nb + k, 0u64); k = k + 1usize; }
+          base = nb;
+          sp = nb + usize.from(ci.localSlots);
+          cur = c;
+          pc = 0usize;
+        }
+        case OP_IMPORT {
+          var bad = false;
+          let k = usize.from(getU(cb, &mut pc, cb.len, &mut bad));
+          let ri = &v.imports[k];
+          let w = u64.from(ri.weight);
+          if !self.charge(w) { return trap(TrapKind.FuelOut, cur, at, "out of fuel"); }
+          let n = usize.from(ri.paramSlots);
+          let r = usize.from(ri.resultSlots);
+          let lo = sp - n;
+          let hi = lo + if n > r { n } else { r };
+          let f = tables.entries[usize.from(ri.table)].call;
+          handles.fail = String();
+          // The window is copied out and back: the host may reshape lists the compiler cannot tell from the stack
+          var win = List[u64]();
+          var q = lo;
+          while q < hi { win.push(self.rd(q)); q = q + 1usize; }
+          let ok = f(handles, win.viewMut());
+          q = lo;
+          while q < hi { self.wr(q, *win[q - lo]); q = q + 1usize; }
+          if !ok {
+            let mut_msg = if handles.fail.len() == 0usize { String.from("an import refused") } else { handles.fail.clone() };
+            return Some(Trap(TrapKind.ImportFailed, u32.from(cur), u32.from(at), mut_msg));
+          }
+          sp = lo + r;
+        }
+        else { return trap(TrapKind.Unreachable, cur, at, "an op the verifier should have refused"); }
+      }
+    }
+    None
+  }
+
+  // A branch's stack effect: the slots it carries move down over the ones it drops; returns the new top
+  fn branchTo(self: &mut, v: &VerifiedCode, cur: usize, at: usize, sp: usize) usize {
+    let keep = usize.from(*v.units[cur].keep[at]);
+    let drop = usize.from(*v.units[cur].drop[at]);
+    if drop > 0usize {
+      var k = 0usize;
+      while k < keep { let x = self.rd(sp - keep + k); self.wr(sp - keep - drop + k, x); k = k + 1usize; }
+    }
+    sp - drop
+  }
+}

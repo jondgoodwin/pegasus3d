@@ -1,0 +1,69 @@
+// The seam to libraries and to Sim: what a verifier resolves imports against and what the interpreter calls.
+//
+// An import is an entry in the code's import table: namespace, name, signature. ImportTables is the other side:
+// the entries a host offers, each with its signature, whether it acts (writes the world), its fuel weight, and the
+// function that runs it. The function is handed the caller's HandleTable and a window of the interpreter's own
+// operand slots: the arguments in signature order on the way in, the results written over them on the way out.
+// It returns false to refuse; what it says goes in HandleTable.fail and becomes the trap's message.
+
+// The kind recorded for a runtime list in a HandleTable
+pub const HANDLE_LIST = 0xFFFFFFFFu32;
+
+// The objects a run owns, by handle (an index; 0 is 'none'). Each has a kind and a payload of slots. Lists made
+// by 'list.make' live here, as do the library objects the imports make. The caller makes one per evaluation and
+// releases back to a mark when it has what it wants.
+pub struct HandleTable {
+  pub kinds: List[u32];
+  pub data: List[List[u64]];
+  pub fail: String;           // why the last import refused
+
+  pub fn make() HandleTable {
+    var t = HandleTable(List[u32](), List[List[u64]](), String());
+    t.kinds.push(0u32);
+    t.data.push(List[u64]());
+    t
+  }
+
+  // A new object of a kind, holding a payload; returns its handle
+  pub fn alloc(self: &mut, kind: u32, payload: List[u64]) u64 {
+    self.kinds.push(kind);
+    self.data.push(payload);
+    u64.from(self.kinds.len() - 1usize)
+  }
+
+  pub fn size(self: &) usize { self.kinds.len() }
+
+  // Drops every handle made since the table had this size
+  pub fn release(self: &mut, size: usize) {
+    if size >= 1usize && size < self.kinds.len() {
+      self.kinds.truncate(size);
+      self.data.truncate(size);
+    }
+  }
+
+  pub fn kindOf(self: &, h: u64) u32 { *self.kinds[usize.from(h)] }
+  pub fn payload(self: &, h: u64) &List[u64] { &self.data[usize.from(h)] }
+}
+
+pub alias ImportFn = &fn(handles: &mut HandleTable, slots: &mut Array[u64]) bool;
+
+pub struct ImportEntry {
+  pub ns: String;
+  pub name: String;
+  pub sig: u32;               // a signature type in the tables' own TypeTable
+  pub acting: bool;
+  pub weight: u32;            // fuel charged per call (a weight of 0 charges 1)
+  pub call: ImportFn;
+}
+
+pub struct ImportTables {
+  pub types: TypeTable;
+  pub entries: List[ImportEntry];
+
+  pub fn make() ImportTables { ImportTables(TypeTable.make(), List[ImportEntry]()) }
+
+  pub fn add(self: &mut, ns: &str, name: &str, sig: u32, acting: bool, weight: u32, call: ImportFn) u32 {
+    self.entries.push(ImportEntry(String.from(ns), String.from(name), sig, acting, weight, call));
+    u32.from(self.entries.len() - 1usize)
+  }
+}

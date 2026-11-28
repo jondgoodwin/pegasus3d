@@ -1,0 +1,155 @@
+// A Code written out as text, for '--show-code' and for trap messages: each unit, its signature, its locals and
+// its ops with offsets, one to a line.
+
+struct OpInfo { name: &str; operands: u8; }     // operands: 0 none, 1 one LEB, 2 two LEBs, 3 f64, 4 signed LEB, 5 one byte
+
+fn opInfo(op: u8) OpInfo {
+  match op {
+    case OP_UNREACHABLE { OpInfo("unreachable", 0u8) }
+    case OP_BLOCK { OpInfo("block", 1u8) }
+    case OP_LOOP { OpInfo("loop", 1u8) }
+    case OP_IF { OpInfo("if", 1u8) }
+    case OP_ELSE { OpInfo("else", 0u8) }
+    case OP_END { OpInfo("end", 0u8) }
+    case OP_BR { OpInfo("br", 1u8) }
+    case OP_BR_IF { OpInfo("br_if", 1u8) }
+    case OP_RETURN { OpInfo("return", 0u8) }
+    case OP_LOCAL_GET { OpInfo("local.get", 1u8) }
+    case OP_LOCAL_SET { OpInfo("local.set", 1u8) }
+    case OP_LOCAL_TEE { OpInfo("local.tee", 1u8) }
+    case OP_F64_CONST { OpInfo("f64.const", 3u8) }
+    case OP_I64_CONST { OpInfo("i64.const", 4u8) }
+    case OP_BOOL_CONST { OpInfo("bool.const", 5u8) }
+    case OP_PART_CONST { OpInfo("part.const", 1u8) }
+    case OP_F64_ADD { OpInfo("f64.add", 0u8) }
+    case OP_F64_SUB { OpInfo("f64.sub", 0u8) }
+    case OP_F64_MUL { OpInfo("f64.mul", 0u8) }
+    case OP_F64_DIV { OpInfo("f64.div", 0u8) }
+    case OP_F64_NEG { OpInfo("f64.neg", 0u8) }
+    case OP_F64_MIN { OpInfo("f64.min", 0u8) }
+    case OP_F64_MAX { OpInfo("f64.max", 0u8) }
+    case OP_F64_ABS { OpInfo("f64.abs", 0u8) }
+    case OP_F64_SQRT { OpInfo("f64.sqrt", 0u8) }
+    case OP_F64_EQ { OpInfo("f64.eq", 0u8) }
+    case OP_F64_NE { OpInfo("f64.ne", 0u8) }
+    case OP_F64_LT { OpInfo("f64.lt", 0u8) }
+    case OP_F64_LE { OpInfo("f64.le", 0u8) }
+    case OP_F64_GT { OpInfo("f64.gt", 0u8) }
+    case OP_F64_GE { OpInfo("f64.ge", 0u8) }
+    case OP_BOOL_NOT { OpInfo("bool.not", 0u8) }
+    case OP_BOOL_AND { OpInfo("bool.and", 0u8) }
+    case OP_BOOL_OR { OpInfo("bool.or", 0u8) }
+    case OP_BOOL_FROM_F64 { OpInfo("bool.from_f64", 0u8) }
+    case OP_F64_FROM_BOOL { OpInfo("f64.from_bool", 0u8) }
+    case OP_I64_ADD { OpInfo("i64.add", 0u8) }
+    case OP_I64_SUB { OpInfo("i64.sub", 0u8) }
+    case OP_I64_MUL { OpInfo("i64.mul", 0u8) }
+    case OP_I64_EQ { OpInfo("i64.eq", 0u8) }
+    case OP_I64_NE { OpInfo("i64.ne", 0u8) }
+    case OP_I64_LT { OpInfo("i64.lt", 0u8) }
+    case OP_I64_FROM_PART { OpInfo("i64.from_part", 0u8) }
+    case OP_F64_FROM_I64 { OpInfo("f64.from_i64", 0u8) }
+    case OP_TUPLE_MAKE { OpInfo("tuple.make", 1u8) }
+    case OP_TUPLE_GET { OpInfo("tuple.get", 2u8) }
+    case OP_LIST_MAKE { OpInfo("list.make", 2u8) }
+    case OP_SELECT { OpInfo("select", 1u8) }
+    case OP_CALL { OpInfo("call", 1u8) }
+    case OP_IMPORT { OpInfo("import", 1u8) }
+    case OP_DROP { OpInfo("drop", 1u8) }
+    else { OpInfo("?", 0u8) }
+  }
+}
+
+fn typeName(t: &TypeTable, i: u32, out: &mut String) {
+  let d = &t.defs[usize.from(i)];
+  if d.kind == T_F64 { out.append("f64"); }
+  else if d.kind == T_BOOL { out.append("bool"); }
+  else if d.kind == T_I64 { out.append("i64"); }
+  else if d.kind == T_PART { out.append("part"); }
+  else if d.kind == T_HANDLE { out.append("handle("); out.appendUInt(u64.from(d.arg)); out.append(")"); }
+  else if d.kind == T_LIST { out.append("list("); typeName(t, d.arg, out); out.append(")"); }
+  else {
+    out.append(if d.kind == T_TUPLE { "tuple(" } else { "(" });
+    var j = 0usize;
+    while j < d.items.len() { if j > 0usize { out.append(", "); } typeName(t, *d.items[j], out); j = j + 1usize; }
+    out.append(")");
+    if d.kind == T_SIG {
+      out.append(" -> (");
+      j = 0usize;
+      while j < d.results.len() { if j > 0usize { out.append(", "); } typeName(t, *d.results[j], out); j = j + 1usize; }
+      out.append(")");
+    }
+  }
+}
+
+// The code as text. Takes any Code, verified or not: an op it cannot read is shown as '?' and the listing of that
+// unit stops there.
+pub fn showCode(code: &Code) String {
+  var s = String();
+  s.append("form "); s.appendUInt(u64.from(code.major)); s.append("."); s.appendUInt(u64.from(code.minor)); s.append("\n");
+  var i = 0usize;
+  while i < code.imports.len() {
+    let m = &code.imports[i];
+    s.append("import "); s.appendUInt(u64.from(i)); s.append(" "); s.append(m.ns.view()); s.append("."); s.append(m.name.view());
+    if usize.from(m.sig) < code.types.defs.len() { s.append(" : "); typeName(&code.types, m.sig, &mut s); }
+    s.append("\n");
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < code.units.len() {
+    let u = &code.units[i];
+    s.append("unit "); s.appendUInt(u64.from(i));
+    if u.name.len() > 0usize { s.append(" "); s.append(u.name.view()); }
+    if usize.from(u.sig) < code.types.defs.len() { s.append(" : "); typeName(&code.types, u.sig, &mut s); }
+    s.append("\n");
+    var j = 0usize;
+    while j < u.locals.len() {
+      s.append("  local "); s.appendUInt(u64.from(j)); s.append(" : ");
+      if usize.from(*u.locals[j]) < code.types.defs.len() { typeName(&code.types, *u.locals[j], &mut s); }
+      s.append("\n");
+      j = j + 1usize;
+    }
+    let cb = u.code.view();
+    var pos = 0usize;
+    var stop = false;
+    while pos < cb.len && !stop {
+      s.append("  "); s.appendUInt(u64.from(pos)); s.append(": ");
+      let info = opInfo(cb[pos]);
+      s.append(info.name);
+      pos = pos + 1usize;
+      var bad = false;
+      if info.operands == 1u8 { s.append(" "); s.appendUInt(getU(cb, &mut pos, cb.len, &mut bad)); }
+      else if info.operands == 2u8 {
+        s.append(" "); s.appendUInt(getU(cb, &mut pos, cb.len, &mut bad));
+        s.append(" "); s.appendUInt(getU(cb, &mut pos, cb.len, &mut bad));
+      }
+      else if info.operands == 3u8 {
+        if pos + 8usize > cb.len { bad = true; }
+        else {
+          var bits = 0u64;
+          var k = 0u64;
+          while k < 8u64 { bits = bits | (u64.from(cb[pos + usize.from(k)]) << (k * 8u64)); k = k + 1u64; }
+          pos = pos + 8usize;
+          s.append(" "); s.appendF64(f64.fromBits(bits));
+        }
+      }
+      else if info.operands == 4u8 { s.append(" "); s.appendInt(getS(cb, &mut pos, cb.len, &mut bad)); }
+      else if info.operands == 5u8 {
+        if pos >= cb.len { bad = true; } else { s.append(" "); s.appendUInt(u64.from(cb[pos])); pos = pos + 1usize; }
+      }
+      if bad || info.name == "?" { s.append(" <unreadable>"); stop = true; }
+      s.append("\n");
+    }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < code.entries.len() {
+    let e = &code.entries[i];
+    s.append("entry "); s.append(if e.kind == ENTRY_FIXED { "fixed" } else if e.kind == ENTRY_DERIVE { "derive" } else { "handler" });
+    s.append(" unit "); s.appendUInt(u64.from(e.unit));
+    s.append(" subject "); s.appendUInt(u64.from(e.a)); s.append(" "); s.appendUInt(u64.from(e.b));
+    s.append("\n");
+    i = i + 1usize;
+  }
+  s
+}

@@ -1,0 +1,409 @@
+// The intermediate form, part 2: the compiled form of one world (Code), its writer, and its stored encoding.
+//
+// The container: magic 'CSF\0', major and minor version (u16 each, little-endian), then sections, each
+// 'id (u8) . length (LEB128) . contents', in increasing id order: 1 types, 2 imports, 3 constants (reserved,
+// empty), 4 units, 5 entries, 6 names (optional). A reader refuses another major version and skips sections it
+// does not know (ids above 6) of a newer minor. The four primitive types are not stored: every table starts
+// with them.
+
+pub const FORM_MAJOR = 1u16;
+pub const FORM_MINOR = 0u16;
+
+// What is wrong with a piece of code, or with its bytes: the unit (NO_UNIT for the container), the offset in the
+// unit's code, and what
+pub const NO_UNIT = 0xFFFFFFFFu32;
+
+pub struct CodeProblem {
+  pub unit: u32;
+  pub offset: u32;
+  pub what: String;
+}
+
+// An entry of the import table: the namespace and name it is looked up by, and its signature (a type)
+pub struct ImportDecl {
+  pub ns: String;
+  pub name: String;
+  pub sig: u32;
+}
+
+// One function body of a Code: its signature, its locals (after its parameters, which are the first locals), and
+// its code bytes, ending with 'end'
+pub struct CodeUnit {
+  pub sig: u32;
+  pub locals: List[u32];
+  pub code: List[u8];
+  pub name: String;
+}
+
+// What a unit is for (ENTRY_*), and its subject: a part's slot and value index, a derive's or a rule's number
+pub struct EntryDecl {
+  pub kind: u8;
+  pub unit: u32;
+  pub a: u32;
+  pub b: u32;
+}
+
+// The compiled form of one world
+pub struct Code {
+  pub types: TypeTable;
+  pub imports: List[ImportDecl];
+  pub units: List[CodeUnit];
+  pub entries: List[EntryDecl];
+  pub major: u16;
+  pub minor: u16;
+
+  pub fn empty() Code {
+    Code(TypeTable.make(), List[ImportDecl](), List[CodeUnit](), List[EntryDecl](), FORM_MAJOR, FORM_MINOR)
+  }
+}
+
+// -------- the writer --------
+
+// Builds a Code: types and imports first, then each unit's ops in order. Lowering uses this.
+pub struct CodeWriter {
+  pub code: Code;
+  cur: usize;       // the unit being written
+
+  pub fn make() CodeWriter { CodeWriter(Code.empty(), 0usize) }
+
+  pub fn addImport(self: &mut, ns: &str, name: &str, sig: u32) u32 {
+    self.code.imports.push(ImportDecl(String.from(ns), String.from(name), sig));
+    u32.from(self.code.imports.len() - 1usize)
+  }
+
+  // Starts a unit; its parameters are locals 0 ... Returns the unit's number
+  pub fn beginUnit(self: &mut, sig: u32, name: &str) u32 {
+    self.code.units.push(CodeUnit(sig, List[u32](), List[u8](), String.from(name)));
+    self.cur = self.code.units.len() - 1usize;
+    u32.from(self.cur)
+  }
+
+  // Declares a local of the unit being written; returns its index (parameters count first)
+  pub fn local(self: &mut, ty: u32) u32 {
+    (&mut self.code.units[self.cur]).locals.push(ty);
+    let sig = &self.code.types.defs[usize.from(self.code.units[self.cur].sig)];
+    u32.from(sig.items.len() + self.code.units[self.cur].locals.len() - 1usize)
+  }
+
+  // Where the next op goes, as an offset in the unit's code
+  pub fn here(self: &) u32 { u32.from(self.code.units[self.cur].code.len()) }
+
+  pub fn op(self: &mut, o: u8) { (&mut self.code.units[self.cur]).code.push(o); }
+  pub fn opU(self: &mut, o: u8, arg: u32) {
+    (&mut self.code.units[self.cur]).code.push(o);
+    putU(&mut (&mut self.code.units[self.cur]).code, u64.from(arg));
+  }
+  pub fn opUU(self: &mut, o: u8, a: u32, b: u32) {
+    self.opU(o, a);
+    putU(&mut (&mut self.code.units[self.cur]).code, u64.from(b));
+  }
+  pub fn f64Const(self: &mut, x: f64) {
+    let bits = x.bits();
+    var c = &mut (&mut self.code.units[self.cur]).code;
+    c.push(OP_F64_CONST);
+    var i = 0u64;
+    while i < 8u64 { c.push(u8.from((bits >> (i * 8u64)) & 0xFFu64)); i = i + 1u64; }
+  }
+  pub fn i64Const(self: &mut, x: i64) {
+    (&mut self.code.units[self.cur]).code.push(OP_I64_CONST);
+    putS(&mut (&mut self.code.units[self.cur]).code, x);
+  }
+  pub fn boolConst(self: &mut, b: bool) {
+    (&mut self.code.units[self.cur]).code.push(OP_BOOL_CONST);
+    (&mut self.code.units[self.cur]).code.push(if b { 1u8 } else { 0u8 });
+  }
+  // Ends the unit: its final 'end'
+  pub fn endUnit(self: &mut) { self.op(OP_END); }
+
+  pub fn addEntry(self: &mut, kind: u8, unit: u32, a: u32, b: u32) {
+    self.code.entries.push(EntryDecl(kind, unit, a, b));
+  }
+}
+
+// -------- the stored encoding --------
+
+fn putStr(out: &mut List[u8], s: &String) {
+  putU(out, u64.from(s.len()));
+  putBytes(out, s.view());
+}
+
+fn section(out: &mut List[u8], id: u8, body: &List[u8]) {
+  out.push(id);
+  putU(out, u64.from(body.len()));
+  var i = 0usize;
+  while i < body.len() { out.push(*body[i]); i = i + 1usize; }
+}
+
+// A Code as bytes
+pub fn encode(code: &Code) List[u8] {
+  var out = List[u8]();
+  out.push('C'); out.push('S'); out.push('F'); out.push(0u8);
+  out.push(u8.from(code.major & 0xFFu16)); out.push(u8.from(code.major >> 8u16));
+  out.push(u8.from(code.minor & 0xFFu16)); out.push(u8.from(code.minor >> 8u16));
+
+  var s = List[u8]();
+  putU(&mut s, u64.from(code.types.defs.len() - 4usize));
+  var i = 4usize;
+  while i < code.types.defs.len() {
+    let d = &code.types.defs[i];
+    s.push(d.kind);
+    if d.kind == T_HANDLE || d.kind == T_LIST { putU(&mut s, u64.from(d.arg)); }
+    if d.kind == T_TUPLE || d.kind == T_SIG {
+      putU(&mut s, u64.from(d.items.len()));
+      var j = 0usize;
+      while j < d.items.len() { putU(&mut s, u64.from(*d.items[j])); j = j + 1usize; }
+    }
+    if d.kind == T_SIG {
+      putU(&mut s, u64.from(d.results.len()));
+      var j = 0usize;
+      while j < d.results.len() { putU(&mut s, u64.from(*d.results[j])); j = j + 1usize; }
+    }
+    i = i + 1usize;
+  }
+  section(&mut out, 1u8, &s);
+
+  s = List[u8]();
+  putU(&mut s, u64.from(code.imports.len()));
+  i = 0usize;
+  while i < code.imports.len() {
+    let m = &code.imports[i];
+    putStr(&mut s, &m.ns); putStr(&mut s, &m.name); putU(&mut s, u64.from(m.sig));
+    i = i + 1usize;
+  }
+  section(&mut out, 2u8, &s);
+
+  s = List[u8]();
+  putU(&mut s, 0u64);
+  section(&mut out, 3u8, &s);
+
+  s = List[u8]();
+  putU(&mut s, u64.from(code.units.len()));
+  i = 0usize;
+  while i < code.units.len() {
+    let u = &code.units[i];
+    putU(&mut s, u64.from(u.sig));
+    putU(&mut s, u64.from(u.locals.len()));
+    var j = 0usize;
+    while j < u.locals.len() { putU(&mut s, u64.from(*u.locals[j])); j = j + 1usize; }
+    putU(&mut s, u64.from(u.code.len()));
+    putBytes(&mut s, u.code.view());
+    i = i + 1usize;
+  }
+  section(&mut out, 4u8, &s);
+
+  s = List[u8]();
+  putU(&mut s, u64.from(code.entries.len()));
+  i = 0usize;
+  while i < code.entries.len() {
+    let e = &code.entries[i];
+    s.push(e.kind); putU(&mut s, u64.from(e.unit)); putU(&mut s, u64.from(e.a)); putU(&mut s, u64.from(e.b));
+    i = i + 1usize;
+  }
+  section(&mut out, 5u8, &s);
+
+  s = List[u8]();
+  putU(&mut s, u64.from(code.units.len()));
+  i = 0usize;
+  while i < code.units.len() { putStr(&mut s, &code.units[i].name); i = i + 1usize; }
+  section(&mut out, 6u8, &s);
+  out
+}
+
+// Where a read is, and whether it has gone wrong
+struct Cursor {
+  pos: usize;
+  bad: bool;
+  why: String;
+
+  fn fail(self: &mut, why: &str) {
+    if !self.bad { self.bad = true; self.why = String.from(why); }
+  }
+  fn byte(self: &mut, d: &Array[u8], end: usize) u8 {
+    if self.pos >= end { self.fail("a section ends inside a value"); return 0u8; }
+    let b = d[self.pos];
+    self.pos = self.pos + 1usize;
+    b
+  }
+  fn num(self: &mut, d: &Array[u8], end: usize) u64 {
+    var bad = false;
+    let v = getU(d, &mut self.pos, end, &mut bad);
+    if bad { self.fail("a number is cut short or too long"); }
+    v
+  }
+  fn u32v(self: &mut, d: &Array[u8], end: usize) u32 {
+    let v = self.num(d, end);
+    if v > 0xFFFFFFFFu64 { self.fail("a number does not fit 32 bits"); return 0u32; }
+    u32.from(v)
+  }
+  // A count of items that each take at least one byte: it cannot exceed what is left
+  fn count(self: &mut, d: &Array[u8], end: usize) u32 {
+    let n = self.u32v(d, end);
+    if !self.bad && usize.from(n) > end - self.pos { self.fail("a count is larger than the bytes left"); return 0u32; }
+    n
+  }
+  fn text(self: &mut, d: &Array[u8], end: usize) String {
+    let n = self.count(d, end);
+    if self.bad { return String(); }
+    var s = String.fromBytes(&d[self.pos ..< self.pos + usize.from(n)]);
+    self.pos = self.pos + usize.from(n);
+    s
+  }
+}
+
+fn refuse(unit: u32, offset: u32, what: &str) Result[Code, CodeProblem] {
+  Err[Code, CodeProblem](CodeProblem(unit, offset, String.from(what)))
+}
+
+// Reads bytes as a Code: the magic, the version, the order and lengths of the sections, and that each section's
+// contents are whole. (That the code in the units is sound is 'verify''s.) Never crashes on any bytes.
+pub fn decode(d: &Array[u8]) Result[Code, CodeProblem] {
+  if d.len < 8usize { return refuse(NO_UNIT, 0u32, "too short to be a ConeScript form"); }
+  if d[0usize] != 'C' || d[1usize] != 'S' || d[2usize] != 'F' || d[3usize] != 0u8 {
+    return refuse(NO_UNIT, 0u32, "the magic is not CSF");
+  }
+  var code = Code.empty();
+  code.major = u16.from(d[4usize]) | (u16.from(d[5usize]) << 8u16);
+  code.minor = u16.from(d[6usize]) | (u16.from(d[7usize]) << 8u16);
+  if code.major != FORM_MAJOR { return refuse(NO_UNIT, 0u32, "the form's major version is not one this reader knows"); }
+  var c = Cursor(8usize, false, String());
+  var last = 0u8;
+  var seen = 0u32;
+  while c.pos < d.len {
+    let at = u32.from(c.pos);
+    let id = c.byte(d, d.len);
+    let len = c.u32v(d, d.len);
+    if c.bad { return refuse(NO_UNIT, at, c.why.view()); }
+    if usize.from(len) > d.len - c.pos { return refuse(NO_UNIT, at, "a section runs past the end of the bytes"); }
+    let end = c.pos + usize.from(len);
+    if id <= last { return refuse(NO_UNIT, at, "sections are out of order"); }
+    last = id;
+    if id > 6u8 {
+      if code.minor <= FORM_MINOR { return refuse(NO_UNIT, at, "an unknown section"); }
+      c.pos = end;
+      continue;
+    }
+    seen = seen | (1u32 << u32.from(id));
+    if id == 1u8 { readTypes(&mut code, d, &mut c, end); }
+    else if id == 2u8 { readImports(&mut code, d, &mut c, end); }
+    else if id == 3u8 {
+      if c.num(d, end) != 0u64 { c.fail("the constants section is reserved and must be empty"); }
+    }
+    else if id == 4u8 { readUnits(&mut code, d, &mut c, end); }
+    else if id == 5u8 { readEntries(&mut code, d, &mut c, end); }
+    else { readNames(&mut code, d, &mut c, end); }
+    if c.bad { return refuse(NO_UNIT, at, c.why.view()); }
+    if c.pos != end { return refuse(NO_UNIT, at, "a section's contents do not fill its length"); }
+  }
+  if (seen & 0x3Eu32) != 0x3Eu32 { return refuse(NO_UNIT, u32.from(d.len), "a required section is missing"); }
+  Ok[Code, CodeProblem](code)
+}
+
+fn readTypes(code: &mut Code, d: &Array[u8], c: &mut Cursor, end: usize) {
+  let n = c.count(d, end);
+  var i = 0u32;
+  while i < n && !c.bad {
+    let kind = c.byte(d, end);
+    var def = TypeDef(kind, 0u32, List[u32](), List[u32]());
+    if kind < T_HANDLE || kind > T_SIG { c.fail("a type of unknown kind"); }
+    else if kind == T_HANDLE || kind == T_LIST { def.arg = c.u32v(d, end); }
+    else {
+      let np = c.count(d, end);
+      var j = 0u32;
+      while j < np && !c.bad { def.items.push(c.u32v(d, end)); j = j + 1u32; }
+      if kind == T_SIG {
+        let nr = c.count(d, end);
+        j = 0u32;
+        while j < nr && !c.bad { def.results.push(c.u32v(d, end)); j = j + 1u32; }
+      }
+    }
+    code.types.defs.push(def);
+    i = i + 1u32;
+  }
+}
+
+fn readImports(code: &mut Code, d: &Array[u8], c: &mut Cursor, end: usize) {
+  let n = c.count(d, end);
+  var i = 0u32;
+  while i < n && !c.bad {
+    let ns = c.text(d, end);
+    let name = c.text(d, end);
+    let sig = c.u32v(d, end);
+    code.imports.push(ImportDecl(ns, name, sig));
+    i = i + 1u32;
+  }
+}
+
+fn readUnits(code: &mut Code, d: &Array[u8], c: &mut Cursor, end: usize) {
+  let n = c.count(d, end);
+  var i = 0u32;
+  while i < n && !c.bad {
+    let sig = c.u32v(d, end);
+    var u = CodeUnit(sig, List[u32](), List[u8](), String());
+    let nl = c.count(d, end);
+    var j = 0u32;
+    while j < nl && !c.bad { u.locals.push(c.u32v(d, end)); j = j + 1u32; }
+    let nc = c.count(d, end);
+    if !c.bad {
+      putBytes(&mut u.code, &d[c.pos ..< c.pos + usize.from(nc)]);
+      c.pos = c.pos + usize.from(nc);
+    }
+    code.units.push(u);
+    i = i + 1u32;
+  }
+}
+
+fn readEntries(code: &mut Code, d: &Array[u8], c: &mut Cursor, end: usize) {
+  let n = c.count(d, end);
+  var i = 0u32;
+  while i < n && !c.bad {
+    let kind = c.byte(d, end);
+    let unit = c.u32v(d, end);
+    let a = c.u32v(d, end);
+    let b = c.u32v(d, end);
+    code.entries.push(EntryDecl(kind, unit, a, b));
+    i = i + 1u32;
+  }
+}
+
+fn readNames(code: &mut Code, d: &Array[u8], c: &mut Cursor, end: usize) {
+  let n = c.count(d, end);
+  if !c.bad && usize.from(n) != code.units.len() { c.fail("the names section does not match the units"); return; }
+  var i = 0usize;
+  while i < usize.from(n) && !c.bad {
+    let s = c.text(d, end);
+    (&mut code.units[i]).name = s;
+    i = i + 1usize;
+  }
+}
+
+// A copy of a Code (the verified code keeps its own)
+pub fn cloneCode(c: &Code) Code {
+  var r = Code.empty();
+  r.major = c.major;
+  r.minor = c.minor;
+  var i = 4usize;
+  while i < c.types.defs.len() {
+    let d = &c.types.defs[i];
+    r.types.defs.push(TypeDef(d.kind, d.arg, d.items.clone(), d.results.clone()));
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < c.imports.len() {
+    let m = &c.imports[i];
+    r.imports.push(ImportDecl(m.ns.clone(), m.name.clone(), m.sig));
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < c.units.len() {
+    let u = &c.units[i];
+    r.units.push(CodeUnit(u.sig, u.locals.clone(), u.code.clone(), u.name.clone()));
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < c.entries.len() {
+    let e = &c.entries[i];
+    r.entries.push(EntryDecl(e.kind, e.unit, e.a, e.b));
+    i = i + 1usize;
+  }
+  r
+}

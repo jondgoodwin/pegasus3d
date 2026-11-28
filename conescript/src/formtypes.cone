@@ -1,0 +1,242 @@
+// The intermediate form, part 1: its types, its opcodes and the byte-level helpers.
+//
+// A value is a whole number of 8-byte slots, and nothing at run time carries a tag. The types are kept in a table;
+// the first four entries are always the four primitives, so their numbers are fixed (TY_F64 ...), and every other
+// type refers only to types before it, so the table cannot loop.
+
+// Type kinds, as stored
+pub const T_F64 = 0u8;
+pub const T_BOOL = 1u8;
+pub const T_I64 = 2u8;
+pub const T_PART = 3u8;
+pub const T_HANDLE = 4u8;      // arg: the library kind
+pub const T_LIST = 5u8;        // arg: the element's type
+pub const T_TUPLE = 6u8;       // items: the fields' types
+pub const T_SIG = 7u8;         // items: the parameters' types; results: the results'
+
+// The primitives' numbers in every table
+pub const TY_F64 = 0u32;
+pub const TY_BOOL = 1u32;
+pub const TY_I64 = 2u32;
+pub const TY_PART = 3u32;
+
+// Stands for any type on a stack below an unconditional branch (the verifier's, never stored)
+pub const TY_ANY = 0xFFFFFFFFu32;
+
+pub struct TypeDef {
+  pub kind: u8;
+  pub arg: u32;
+  pub items: List[u32];
+  pub results: List[u32];
+}
+
+pub struct TypeTable {
+  pub defs: List[TypeDef];
+
+  // A table holding the four primitives
+  pub fn make() TypeTable {
+    var t = TypeTable(List[TypeDef]());
+    var k = 0u8;
+    while k < 4u8 {
+      t.defs.push(TypeDef(k, 0u32, List[u32](), List[u32]()));
+      k = k + 1u8;
+    }
+    t
+  }
+
+  // The number of an equal type already in the table, else of a new one
+  pub fn intern(self: &mut, d: TypeDef) u32 {
+    var i = 0usize;
+    while i < self.defs.len() {
+      let e = &self.defs[i];
+      if e.kind == d.kind && e.arg == d.arg && e.items == d.items && e.results == d.results { return u32.from(i); }
+      i = i + 1usize;
+    }
+    self.defs.push(d);
+    u32.from(self.defs.len() - 1usize)
+  }
+
+  pub fn handle(self: &mut, kind: u32) u32 { self.intern(TypeDef(T_HANDLE, kind, List[u32](), List[u32]())) }
+  pub fn list(self: &mut, elem: u32) u32 { self.intern(TypeDef(T_LIST, elem, List[u32](), List[u32]())) }
+  pub fn tuple(self: &mut, fields: &Array[u32]) u32 {
+    var items = List[u32]();
+    items.appendSlice(fields);
+    self.intern(TypeDef(T_TUPLE, 0u32, items, List[u32]()))
+  }
+  pub fn sig(self: &mut, params: &Array[u32], results: &Array[u32]) u32 {
+    var p = List[u32]();
+    p.appendSlice(params);
+    var r = List[u32]();
+    r.appendSlice(results);
+    self.intern(TypeDef(T_SIG, 0u32, p, r))
+  }
+
+  // Slots a value of type t takes (a table built by the writer is well formed; the verifier checks a read one)
+  pub fn slots(self: &, t: u32) u32 {
+    let d = &self.defs[usize.from(t)];
+    if d.kind == T_TUPLE {
+      var n = 0u32;
+      var i = 0usize;
+      while i < d.items.len() { n = n + self.slots(*d.items[i]); i = i + 1usize; }
+      return n;
+    }
+    if d.kind == T_SIG { return 0u32; }
+    1u32
+  }
+}
+
+// Whether type a of table ta and type b of table tb are the same type, field by field. Both tables must be well
+// formed (every reference to an earlier entry).
+pub fn sameType(ta: &TypeTable, a: u32, tb: &TypeTable, b: u32) bool {
+  let x = &ta.defs[usize.from(a)];
+  let y = &tb.defs[usize.from(b)];
+  if x.kind != y.kind { return false; }
+  if x.kind == T_HANDLE { return x.arg == y.arg; }
+  if x.kind == T_LIST { return sameType(ta, x.arg, tb, y.arg); }
+  if x.kind == T_TUPLE || x.kind == T_SIG {
+    if x.items.len() != y.items.len() || x.results.len() != y.results.len() { return false; }
+    var i = 0usize;
+    while i < x.items.len() {
+      if !sameType(ta, *x.items[i], tb, *y.items[i]) { return false; }
+      i = i + 1usize;
+    }
+    i = 0usize;
+    while i < x.results.len() {
+      if !sameType(ta, *x.results[i], tb, *y.results[i]) { return false; }
+      i = i + 1usize;
+    }
+  }
+  true
+}
+
+// -------- opcodes --------
+// One byte each. (Cone's enum tags cannot be read as numbers, so the opcodes are constants.)
+
+pub const OP_UNREACHABLE = 0x00u8;
+pub const OP_BLOCK = 0x01u8;       // bt
+pub const OP_LOOP = 0x02u8;        // bt
+pub const OP_IF = 0x03u8;          // bt
+pub const OP_ELSE = 0x04u8;
+pub const OP_END = 0x05u8;
+pub const OP_BR = 0x06u8;          // depth
+pub const OP_BR_IF = 0x07u8;       // depth
+pub const OP_RETURN = 0x08u8;
+
+pub const OP_LOCAL_GET = 0x10u8;   // local
+pub const OP_LOCAL_SET = 0x11u8;
+pub const OP_LOCAL_TEE = 0x12u8;
+
+pub const OP_F64_CONST = 0x20u8;   // 8 raw bytes, little-endian
+pub const OP_I64_CONST = 0x21u8;   // signed LEB128
+pub const OP_BOOL_CONST = 0x22u8;  // one byte, 0 or 1
+pub const OP_PART_CONST = 0x23u8;  // slot
+
+pub const OP_F64_ADD = 0x30u8;
+pub const OP_F64_SUB = 0x31u8;
+pub const OP_F64_MUL = 0x32u8;
+pub const OP_F64_DIV = 0x33u8;
+pub const OP_F64_NEG = 0x34u8;
+pub const OP_F64_MIN = 0x35u8;
+pub const OP_F64_MAX = 0x36u8;
+pub const OP_F64_ABS = 0x37u8;
+pub const OP_F64_SQRT = 0x38u8;
+pub const OP_F64_EQ = 0x39u8;
+pub const OP_F64_NE = 0x3Au8;
+pub const OP_F64_LT = 0x3Bu8;
+pub const OP_F64_LE = 0x3Cu8;
+pub const OP_F64_GT = 0x3Du8;
+pub const OP_F64_GE = 0x3Eu8;
+
+pub const OP_BOOL_NOT = 0x40u8;
+pub const OP_BOOL_AND = 0x41u8;
+pub const OP_BOOL_OR = 0x42u8;
+pub const OP_BOOL_FROM_F64 = 0x43u8;
+pub const OP_F64_FROM_BOOL = 0x44u8;
+
+pub const OP_I64_ADD = 0x50u8;
+pub const OP_I64_SUB = 0x51u8;
+pub const OP_I64_MUL = 0x52u8;
+pub const OP_I64_EQ = 0x53u8;
+pub const OP_I64_NE = 0x54u8;
+pub const OP_I64_LT = 0x55u8;
+pub const OP_I64_FROM_PART = 0x56u8;
+pub const OP_F64_FROM_I64 = 0x57u8;
+
+pub const OP_TUPLE_MAKE = 0x60u8;  // tuple type
+pub const OP_TUPLE_GET = 0x61u8;   // tuple type, field
+pub const OP_LIST_MAKE = 0x62u8;   // list type, count
+pub const OP_SELECT = 0x68u8;      // type
+pub const OP_CALL = 0x70u8;        // unit
+pub const OP_IMPORT = 0x71u8;      // import
+pub const OP_DROP = 0x78u8;        // type
+
+// What kinds of entry a unit can be for
+pub const ENTRY_FIXED = 0u8;
+pub const ENTRY_DERIVE = 1u8;
+pub const ENTRY_HANDLER = 2u8;
+
+// -------- LEB128 --------
+
+pub fn putU(out: &mut List[u8], x: u64) {
+  var v = x;
+  while v >= 0x80u64 {
+    out.push(u8.from((v & 0x7Fu64) | 0x80u64));
+    v = v >> 7u64;
+  }
+  out.push(u8.from(v));
+}
+
+pub fn putS(out: &mut List[u8], x: i64) {
+  var v = x;
+  var more = true;
+  while more {
+    let b = u8.from(v & 0x7Fi64);
+    v = v >> 7i64;
+    if (v == 0i64 && (b & 0x40u8) == 0u8) || (v == -1i64 && (b & 0x40u8) != 0u8) {
+      more = false;
+      out.push(b);
+    } else {
+      out.push(b | 0x80u8);
+    }
+  }
+}
+
+// Reads an unsigned LEB128 at pos (up to end); sets bad if it is cut short or longer than 10 bytes
+pub fn getU(d: &Array[u8], pos: &mut usize, end: usize, bad: &mut bool) u64 {
+  var r = 0u64;
+  var shift = 0u64;
+  while true {
+    if *pos >= end || *pos >= d.len || shift >= 70u64 { *bad = true; return 0u64; }
+    let b = d[*pos];
+    *pos = *pos + 1usize;
+    if shift == 63u64 && (b & 0x7Eu8) != 0u8 { *bad = true; return 0u64; }
+    r = r | (u64.from(b & 0x7Fu8) << shift);
+    if (b & 0x80u8) == 0u8 { return r; }
+    shift = shift + 7u64;
+  }
+  r
+}
+
+// Reads a signed LEB128 (of at most 10 bytes)
+pub fn getS(d: &Array[u8], pos: &mut usize, end: usize, bad: &mut bool) i64 {
+  var r = 0u64;
+  var shift = 0u64;
+  while true {
+    if *pos >= end || *pos >= d.len || shift >= 70u64 { *bad = true; return 0i64; }
+    let b = d[*pos];
+    *pos = *pos + 1usize;
+    if shift < 64u64 { r = r | (u64.from(b & 0x7Fu8) << shift); }
+    shift = shift + 7u64;
+    if (b & 0x80u8) == 0u8 {
+      if shift < 64u64 && (b & 0x40u8) != 0u8 { r = r | (0xFFFFFFFFFFFFFFFFu64 << shift); }
+      return r as i64;
+    }
+  }
+  0i64
+}
+
+// Appends bytes one at a time (a list and a view of another cannot be proved apart, so appendSlice is refused)
+pub fn putBytes(out: &mut List[u8], b: &Array[u8]) {
+  var i = 0usize;
+  while i < b.len { out.push(b[i]); i = i + 1usize; }
+}

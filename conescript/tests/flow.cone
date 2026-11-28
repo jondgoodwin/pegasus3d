@@ -1,0 +1,326 @@
+// Control flow, calls, tuples, lists, select, imports, fuel and traps, on hand-assembled units. Each path of the
+// branching units returns a distinct value, so a branch that lands one op off shows.
+
+mod flow;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import conescript use *;
+
+struct Ran {
+  trapped: bool;
+  kind: u32;              // 0 none, 1 FuelOut, 2 ImportFailed, 3 Unreachable, 4 BadCall
+  message: String;
+  offset: u32;
+  slots: List[u64];
+  fuelLeft: u64;
+}
+
+fn kindNum(t: &Trap) u32 {
+  match t.kind {
+    case FuelOut { 1u32 }
+    case ImportFailed { 2u32 }
+    case Unreachable { 3u32 }
+    case BadCall { 4u32 }
+  }
+}
+
+// Verifies and runs a unit; a verification failure panics the test
+fn go(w: &CodeWriter, tables: &ImportTables, h: &mut HandleTable, unit: u32, args: &Array[u64], fuel: u64) Ran {
+  match verify(&w.code, tables) {
+    case let Ok(v) {
+      var it = Interpreter.make();
+      it.setFuel(fuel);
+      var out = List[u64]();
+      let t = it.run(&v, tables, h, unit, args, &mut out);
+      match t {
+        case let Some(tr) { Ran(true, kindNum(&tr), tr.message.clone(), tr.offset, out, it.fuelLeft()) }
+        case is None { Ran(false, 0u32, String(), 0u32, out, it.fuelLeft()) }
+      }
+    }
+    case let Err(ps) {
+      print <- "verify refused: "; print <- ps[0usize].what.view(); print <- " at "; print <- ps[0usize].offset; print <- "\n";
+      Ran(true, 99u32, String(), 0u32, List[u64](), 0u64)
+    }
+  }
+}
+
+fn args1(x: f64) List[u64] { var l = List[u64](); l.push(x.bits()); l }
+fn none() List[u64] { List[u64]() }
+fn f(r: &Ran) f64 { if r.slots.len() > 0usize { f64.fromBits(*r.slots[0usize]) } else { -999.0 } }
+
+fn main() i32 {
+  let e = List[u32]();
+  let tables = ImportTables.make();
+  var h = HandleTable.make();
+
+  // ---- nested blocks with br and br_if, junk beneath the carried value ----
+  var w = CodeWriter.make();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let sigF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(sigF, "nest");
+  w.opU(OP_BLOCK, btF);                       // a
+  w.opU(OP_BLOCK, btF);                       //   b
+  w.opU(OP_BLOCK, btF);                       //     c
+  w.f64Const(100.0); w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_LT); w.opU(OP_BR_IF, 0u32);   // x < 0: c yields 100
+  w.opU(OP_DROP, TY_F64);
+  w.f64Const(200.0); w.opU(OP_LOCAL_GET, 0u32); w.f64Const(5.0); w.op(OP_F64_LT); w.opU(OP_BR_IF, 1u32);   // x < 5: b yields 200
+  w.opU(OP_DROP, TY_F64);
+  w.f64Const(7.0); w.f64Const(300.0); w.opU(OP_BR, 2u32);                                                   // else a yields 300, 7 dropped
+  w.op(OP_END);                               //     end c
+  w.f64Const(1.0); w.op(OP_F64_ADD);
+  w.op(OP_END);                               //   end b
+  w.f64Const(2.0); w.op(OP_F64_ADD);
+  w.op(OP_END);                               // end a
+  w.endUnit();
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, args1(-3.0).view(), 1000u64)), 103.0, 0.0, "x < 0: 100 + 1 + 2");
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, args1(2.0).view(), 1000u64)), 202.0, 0.0, "0 <= x < 5: 200 + 2");
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, args1(9.0).view(), 1000u64)), 300.0, 0.0, "x >= 5: 300");
+
+  // ---- if / else with results, and an if without else that sets a local ----
+  w = CodeWriter.make();
+  let bt2 = w.code.types.sig(e.view(), &[TY_F64]);
+  let bt0 = w.code.types.sig(e.view(), e.view());
+  let sig2 = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(sig2, "ifelse");
+  let acc = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, bt2);
+  w.f64Const(10.0);
+  w.op(OP_ELSE);
+  w.f64Const(20.0);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_SET, acc);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(100.0); w.op(OP_F64_GT);
+  w.opU(OP_IF, bt0);
+  w.opU(OP_LOCAL_GET, acc); w.f64Const(1000.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, acc);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, acc);
+  w.endUnit();
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, args1(5.0).view(), 1000u64)), 10.0, 0.0, "if: then");
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, args1(-5.0).view(), 1000u64)), 20.0, 0.0, "if: else");
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, args1(500.0).view(), 1000u64)), 1010.0, 0.0, "if without else, taken");
+
+  // ---- a loop: the sum of 1 .. n, and the fuel it costs (one per back edge taken) ----
+  w = CodeWriter.make();
+  let lbt = w.code.types.sig(e.view(), e.view());
+  let lsig = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(lsig, "sum");
+  let sum = w.local(TY_F64);
+  let ix = w.local(TY_F64);
+  w.f64Const(1.0); w.opU(OP_LOCAL_SET, ix);
+  w.opU(OP_LOOP, lbt);
+  w.opU(OP_LOCAL_GET, sum); w.opU(OP_LOCAL_GET, ix); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, sum);
+  w.opU(OP_LOCAL_GET, ix); w.f64Const(1.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_TEE, ix);
+  w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_LE);
+  w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, sum);
+  w.endUnit();
+  let r10 = go(&w, &tables, &mut h, 0u32, args1(10.0).view(), 9u64);
+  expectFloat(f(&r10), 55.0, 0.0, "sum 1..10");
+  expectUInt(r10.fuelLeft, 0u64, "9 back edges cost exactly 9 fuel");
+  let r10b = go(&w, &tables, &mut h, 0u32, args1(10.0).view(), 8u64);
+  expect(r10b.trapped && r10b.kind == 1u32, "8 fuel is one short: FuelOut");
+
+  // ---- an infinite loop traps within its budget ----
+  w = CodeWriter.make();
+  let isig = w.code.types.sig(e.view(), e.view());
+  let ibt = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(isig, "spin");
+  w.opU(OP_LOOP, ibt);
+  w.opU(OP_BR, 0u32);
+  w.op(OP_END);
+  w.endUnit();
+  let spin = go(&w, &tables, &mut h, 0u32, none().view(), 1000u64);
+  expect(spin.trapped && spin.kind == 1u32, "an infinite loop traps FuelOut");
+  expectUInt(spin.fuelLeft, 0u64, "all the fuel was spent");
+  expect(spin.slots.len() == 0usize, "a trapped run hands back no results");
+
+  // ---- return from inside blocks with junk beneath ----
+  w = CodeWriter.make();
+  let rbt = w.code.types.sig(e.view(), e.view());
+  let rsig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(rsig, "ret");
+  w.opU(OP_BLOCK, rbt);
+  w.opU(OP_BLOCK, rbt);
+  w.f64Const(1.0); w.f64Const(2.0); w.f64Const(42.0); w.op(OP_RETURN);
+  w.op(OP_END);
+  w.op(OP_END);
+  w.f64Const(0.0);
+  w.endUnit();
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, none().view(), 100u64)), 42.0, 0.0, "return carries its value and drops the junk");
+
+  // ---- calls: a unit calling another twice; locals and frames do not mix ----
+  w = CodeWriter.make();
+  let csig = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(csig, "main");
+  let t = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 1u32); w.opU(OP_LOCAL_SET, t);
+  w.opU(OP_LOCAL_GET, t); w.opU(OP_CALL, 1u32); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(csig, "double");
+  let junk = w.local(TY_F64);
+  w.f64Const(555.0); w.opU(OP_LOCAL_SET, junk);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_ADD);
+  w.endUnit();
+  let rc = go(&w, &tables, &mut h, 0u32, args1(3.0).view(), 10u64);
+  expectFloat(f(&rc), 15.0, 0.0, "double(double(3)) + 3");
+  expectUInt(rc.fuelLeft, 8u64, "two calls cost two fuel");
+
+  // ---- a callee's locals start at zero, whatever an earlier call left in the same slots ----
+  w = CodeWriter.make();
+  let zsig = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  w.beginUnit(zsig, "main");
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 1u32); w.opU(OP_DROP, TY_F64);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_CALL, 2u32);
+  w.endUnit();
+  w.beginUnit(zsig, "dirty");
+  let dj = w.local(TY_F64);
+  w.f64Const(555.0); w.opU(OP_LOCAL_SET, dj);
+  w.opU(OP_LOCAL_GET, 0u32);
+  w.endUnit();
+  w.beginUnit(zsig, "reader");
+  let dz = w.local(TY_F64);
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, dz); w.op(OP_F64_ADD);
+  w.endUnit();
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, args1(4.0).view(), 100u64)), 4.0, 0.0, "a callee's locals start at zero");
+
+  // ---- tuples: make, get, a tuple in a local, a tuple of a tuple ----
+  w = CodeWriter.make();
+  let t3 = w.code.types.tuple(&[TY_F64, TY_F64, TY_F64]);
+  let t2 = w.code.types.tuple(&[TY_F64, TY_F64]);
+  let tn = w.code.types.tuple(&[t2, TY_F64]);
+  let tsig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(tsig, "tuples");
+  let lt = w.local(t3);
+  w.f64Const(1.0); w.f64Const(2.0); w.f64Const(3.0); w.opU(OP_TUPLE_MAKE, t3); w.opU(OP_LOCAL_SET, lt);
+  w.opU(OP_LOCAL_GET, lt); w.opUU(OP_TUPLE_GET, t3, 1u32);                         // 2
+  w.opU(OP_LOCAL_GET, lt); w.opUU(OP_TUPLE_GET, t3, 2u32); w.f64Const(10.0); w.op(OP_F64_MUL); w.op(OP_F64_ADD);   // 2 + 30
+  w.f64Const(4.0); w.f64Const(5.0); w.opU(OP_TUPLE_MAKE, t2); w.f64Const(6.0); w.opU(OP_TUPLE_MAKE, tn);
+  w.opUU(OP_TUPLE_GET, tn, 0u32); w.opUU(OP_TUPLE_GET, t2, 1u32);                  // 5
+  w.f64Const(100.0); w.op(OP_F64_MUL); w.op(OP_F64_ADD);                           // 32 + 500
+  w.endUnit();
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, none().view(), 100u64)), 532.0, 0.0, "tuples");
+
+  // ---- select: a b cond gives a when cond holds ----
+  w = CodeWriter.make();
+  let ssig = w.code.types.sig(&[TY_BOOL], &[TY_F64]);
+  w.beginUnit(ssig, "select");
+  w.f64Const(11.0); w.f64Const(22.0); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_SELECT, TY_F64);
+  w.endUnit();
+  var one = List[u64](); one.push(1u64);
+  var zero = List[u64](); zero.push(0u64);
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, one.view(), 100u64)), 11.0, 0.0, "select, true");
+  expectFloat(f(&go(&w, &tables, &mut h, 0u32, zero.view(), 100u64)), 22.0, 0.0, "select, false");
+
+  // ---- unreachable ----
+  w = CodeWriter.make();
+  let usig = w.code.types.sig(e.view(), e.view());
+  w.beginUnit(usig, "boom");
+  w.f64Const(1.0); w.opU(OP_DROP, TY_F64);
+  w.op(OP_UNREACHABLE);
+  w.endUnit();
+  let boom = go(&w, &tables, &mut h, 0u32, none().view(), 100u64);
+  expect(boom.trapped && boom.kind == 3u32, "unreachable traps");
+  expectInt(i64.from(boom.offset), 11i64, "and says where");
+
+  // ---- imports: a list made and summed by the host; a result wider than the argument; a refusal ----
+  var ti = ImportTables.make();
+  let lf = ti.types.list(TY_F64);
+  let sumSig = ti.types.sig(&[lf], &[TY_F64]);
+  let wideSig = ti.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]);
+  let failSig = ti.types.sig(e.view(), e.view());
+  ti.add("host", "sum", sumSig, false, 3u32, &impSum);
+  ti.add("host", "wide", wideSig, false, 1u32, &impWide);
+  ti.add("host", "fail", failSig, false, 1u32, &impFail);
+  w = CodeWriter.make();
+  let wlf = w.code.types.list(TY_F64);
+  let wsum = w.code.types.sig(&[wlf], &[TY_F64]);
+  let wwide = w.code.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]);
+  let wfail = w.code.types.sig(e.view(), e.view());
+  let isum = w.addImport("host", "sum", wsum);
+  let iwide = w.addImport("host", "wide", wwide);
+  let ifail = w.addImport("host", "fail", wfail);
+  let msig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(msig, "imports");
+  w.f64Const(1.0); w.f64Const(2.0); w.f64Const(4.0); w.opUU(OP_LIST_MAKE, wlf, 3u32); w.opU(OP_IMPORT, isum);     // 7
+  w.f64Const(5.0); w.opU(OP_IMPORT, iwide);                                                                        // 5 6 7 on top of 7
+  w.op(OP_F64_ADD); w.op(OP_F64_ADD); w.op(OP_F64_ADD);                                                            // 7+5+6+7 = 25
+  w.endUnit();
+  w.beginUnit(msig, "refuses");
+  w.opU(OP_IMPORT, ifail);
+  w.f64Const(0.0);
+  w.endUnit();
+  let ri = go(&w, &ti, &mut h, 0u32, none().view(), 100u64);
+  expectFloat(f(&ri), 25.0, 0.0, "list.make, an import reading it, a wide result");
+  expectUInt(ri.fuelLeft, 100u64 - 3u64 - 1u64, "imports charge their weights");
+  let rf = go(&w, &ti, &mut h, 1u32, none().view(), 100u64);
+  expect(rf.trapped && rf.kind == 2u32, "a refusing import traps ImportFailed");
+  expectStr(rf.message.view(), "the host said no", "with the import's own message");
+
+  // ---- a trapped handler's writes: the host stages them and applies only if the run did not trap ----
+  var ti2 = ImportTables.make();
+  let setSig = ti2.types.sig(&[TY_F64], e.view());
+  ti2.add("host", "set", setSig, true, 1u32, &impStage);
+  w = CodeWriter.make();
+  let wset = w.code.types.sig(&[TY_F64], e.view());
+  let iset = w.addImport("host", "set", wset);
+  let hsig = w.code.types.sig(&[TY_BOOL], e.view());
+  w.beginUnit(hsig, "handler");
+  w.f64Const(9.0); w.opU(OP_IMPORT, iset);
+  w.opU(OP_LOCAL_GET, 0u32);
+  let hb = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_IF, hb);
+  w.op(OP_UNREACHABLE);
+  w.op(OP_END);
+  w.endUnit();
+  w.addEntry(ENTRY_HANDLER, 0u32, 0u32, 0u32);
+  var field = 1.0;
+  var h2 = HandleTable.make();
+  h2.alloc(77u32, List[u64]());                  // handle 1 is the staging list
+  let ok = go(&w, &ti2, &mut h2, 0u32, zero.view(), 100u64);
+  if !ok.trapped { field = f64.fromBits(*h2.payload(1u64)[0usize]); }
+  expectFloat(field, 9.0, 0.0, "a handler that returns has its write applied");
+  var h3 = HandleTable.make();
+  h3.alloc(77u32, List[u64]());
+  field = 1.0;
+  let bad = go(&w, &ti2, &mut h3, 0u32, one.view(), 100u64);
+  if !bad.trapped { field = f64.fromBits(*h3.payload(1u64)[0usize]); }
+  expect(bad.trapped, "the handler trapped");
+  expectFloat(field, 1.0, 0.0, "a trapped handler's write is not applied");
+  done()
+}
+
+// host.sum(list(f64)) -> f64
+fn impSum(h: &mut HandleTable, s: &mut Array[u64]) bool {
+  let p = h.payload(s[0usize]);
+  var t = 0.0;
+  var i = 0usize;
+  while i < p.len() { t = t + f64.fromBits(*p[i]); i = i + 1usize; }
+  s[0usize] = t.bits();
+  true
+}
+
+// host.wide(x) -> (x, x + 1, x + 2)
+fn impWide(h: &mut HandleTable, s: &mut Array[u64]) bool {
+  let x = f64.fromBits(s[0usize]);
+  s[0usize] = x.bits();
+  s[1usize] = (x + 1.0).bits();
+  s[2usize] = (x + 2.0).bits();
+  true
+}
+
+fn impFail(h: &mut HandleTable, s: &mut Array[u64]) bool {
+  h.fail = String.from("the host said no");
+  false
+}
+
+// host.set(x): stages a write in handle 1's payload
+fn impStage(h: &mut HandleTable, s: &mut Array[u64]) bool {
+  var p = List[u64]();
+  p.push(s[0usize]);
+  h.data.set(1usize, p);
+  true
+}

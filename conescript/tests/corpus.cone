@@ -1,0 +1,326 @@
+// The verifier's corpus: units with one defect each, each refused with its own problem. A check removed from
+// the verifier must make some case here fail (the mutants in the lane's report did that, one check at a time).
+
+mod corpus;
+
+import testing use *;
+import collections use *;
+import conescript use *;
+
+fn has(s: &String, needle: &str) bool {
+  let hay = s.view();
+  let nd = String.from(needle);
+  let n = nd.view();
+  if n.len > hay.len { return false; }
+  var i = 0usize;
+  while i + n.len <= hay.len {
+    var j = 0usize;
+    while j < n.len && hay[i + j] == n[j] { j = j + 1usize; }
+    if j == n.len { return true; }
+    i = i + 1usize;
+  }
+  false
+}
+
+// The verifier must refuse, with a problem whose text holds 'needle', in unit 'unit' (NO_UNIT: not in a unit)
+fn refused(label: &str, w: &CodeWriter, tables: &ImportTables, unit: u32, needle: &str) {
+  match verify(&w.code, tables) {
+    case let Ok(v) { expect(false, label); }
+    case let Err(ps) {
+      var found = false;
+      var i = 0usize;
+      while i < ps.len() { if has(&ps[i].what, needle) && ps[i].unit == unit { found = true; } i = i + 1usize; }
+      expect(found, label);
+    }
+  }
+}
+
+fn accepted(label: &str, w: &CodeWriter, tables: &ImportTables) {
+  match verify(&w.code, tables) {
+    case let Ok(v) { expect(true, label); }
+    case let Err(ps) { expect(false, label); }
+  }
+}
+
+fn reads(b: &Array[u8]) bool {
+  match decode(b) {
+    case let Ok(c) { true }
+    case let Err(p) { false }
+  }
+}
+
+fn noop(h: &mut HandleTable, s: &mut Array[u64]) bool { true }
+
+// A writer with a unit of the given signature, ready for ops
+fn unit(params: &Array[u32], results: &Array[u32]) CodeWriter {
+  var w = CodeWriter.make();
+  let sig = w.code.types.sig(params, results);
+  w.beginUnit(sig, "u");
+  w
+}
+
+fn main() i32 {
+  let e = List[u32]();
+  let tables = ImportTables.make();
+
+  // a good one, so the corpus is not refusing everything
+  var w = unit(&[TY_F64], &[TY_F64]);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(1.0); w.op(OP_F64_ADD); w.endUnit();
+  accepted("a sound unit is accepted", &w, &tables);
+
+  w = unit(e.view(), &[TY_BOOL]);
+  w.f64Const(1.0); w.op(OP_BOOL_NOT); w.endUnit();
+  refused("wrong operand type", &w, &tables, 0u32, "wrong type");
+
+  w = unit(e.view(), &[TY_F64]);
+  w.op(OP_F64_ADD); w.endUnit();
+  refused("pop from an empty stack", &w, &tables, 0u32, "empty");
+
+  w = unit(e.view(), &[TY_F64]);
+  w.opU(OP_BOOL_CONST, 2u32); w.endUnit();
+  refused("a bool constant that is neither 0 nor 1", &w, &tables, 0u32, "bool constant");
+
+  w = unit(e.view(), &[TY_F64]);
+  w.boolConst(true); w.endUnit();
+  refused("the result type is wrong", &w, &tables, 0u32, "wrong type");
+
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.endUnit();
+  refused("a value left over at the end", &w, &tables, 0u32, "left on the stack");
+
+  w = unit(e.view(), &[TY_F64]);
+  let bt = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_BLOCK, bt); w.boolConst(true); w.op(OP_END); w.endUnit();
+  refused("a block ends with the wrong type", &w, &tables, 0u32, "wrong type");
+
+  w = unit(e.view(), e.view());
+  w.op(OP_ELSE); w.endUnit();
+  refused("else outside an if", &w, &tables, 0u32, "else");
+
+  w = unit(e.view(), e.view());
+  w.opU(OP_BR, 1u32); w.endUnit();
+  refused("a branch depth out of range", &w, &tables, 0u32, "depth");
+
+  w = unit(e.view(), &[TY_F64]);
+  let bt2 = w.code.types.sig(e.view(), &[TY_F64]);
+  w.opU(OP_BLOCK, bt2); w.boolConst(true); w.opU(OP_BR, 0u32); w.op(OP_END); w.endUnit();
+  refused("a branch carries the wrong type", &w, &tables, 0u32, "wrong type");
+
+  // handle locals must be set before they are read
+  w = unit(e.view(), e.view());
+  let hnd = w.code.types.handle(3u32);
+  let hl0 = w.local(hnd);
+  w.opU(OP_LOCAL_GET, hl0); w.opU(OP_DROP, hnd); w.endUnit();
+  refused("a handle local read before it is set", &w, &tables, 0u32, "before it is set");
+
+  // definite assignment across structure: a handle parameter is copied into a local in some arms only
+  var hw = CodeWriter.make();
+  let hty = hw.code.types.handle(3u32);
+  let hsg = hw.code.types.sig(&[hty], e.view());
+  let hbt = hw.code.types.sig(e.view(), e.view());
+  hw.beginUnit(hsg, "u");
+  var hl = hw.local(hty);
+  hw.boolConst(true); hw.opU(OP_IF, hbt);
+  hw.opU(OP_LOCAL_GET, 0u32); hw.opU(OP_LOCAL_SET, hl);
+  hw.op(OP_END);
+  hw.opU(OP_LOCAL_GET, hl); hw.opU(OP_DROP, hty); hw.endUnit();
+  refused("set in an if with no else, read after it", &hw, &tables, 0u32, "before it is set");
+
+  hw = CodeWriter.make();
+  let hty2 = hw.code.types.handle(3u32);
+  let hsg2 = hw.code.types.sig(&[hty2], e.view());
+  let hbt2 = hw.code.types.sig(e.view(), e.view());
+  hw.beginUnit(hsg2, "u");
+  hl = hw.local(hty2);
+  hw.boolConst(true); hw.opU(OP_IF, hbt2);
+  hw.opU(OP_LOCAL_GET, 0u32); hw.opU(OP_LOCAL_SET, hl);
+  hw.op(OP_ELSE);
+  hw.opU(OP_LOCAL_GET, hl); hw.opU(OP_DROP, hty2);
+  hw.op(OP_END);
+  hw.endUnit();
+  refused("set in the then arm only, read in the else arm", &hw, &tables, 0u32, "before it is set");
+
+  hw = CodeWriter.make();
+  let hty3 = hw.code.types.handle(3u32);
+  let hsg3 = hw.code.types.sig(&[hty3], e.view());
+  let hbt3 = hw.code.types.sig(e.view(), e.view());
+  hw.beginUnit(hsg3, "u");
+  hl = hw.local(hty3);
+  hw.boolConst(true); hw.opU(OP_IF, hbt3);
+  hw.opU(OP_LOCAL_GET, 0u32); hw.opU(OP_LOCAL_SET, hl);
+  hw.op(OP_ELSE);
+  hw.opU(OP_LOCAL_GET, 0u32); hw.opU(OP_LOCAL_SET, hl);
+  hw.op(OP_END);
+  hw.opU(OP_LOCAL_GET, hl); hw.opU(OP_DROP, hty3); hw.endUnit();
+  accepted("set in both arms, read after", &hw, &tables);
+
+  hw = CodeWriter.make();
+  let hty4 = hw.code.types.handle(3u32);
+  let hsg4 = hw.code.types.sig(&[hty4], e.view());
+  let hbt4 = hw.code.types.sig(e.view(), e.view());
+  hw.beginUnit(hsg4, "u");
+  hl = hw.local(hty4);
+  hw.opU(OP_BLOCK, hbt4);
+  hw.boolConst(true); hw.opU(OP_BR_IF, 0u32);
+  hw.opU(OP_LOCAL_GET, 0u32); hw.opU(OP_LOCAL_SET, hl);
+  hw.op(OP_END);
+  hw.opU(OP_LOCAL_GET, hl); hw.opU(OP_DROP, hty4); hw.endUnit();
+  refused("a branch past the set, read after the block", &hw, &tables, 0u32, "before it is set");
+
+  hw = CodeWriter.make();
+  let hty5 = hw.code.types.handle(3u32);
+  let hsg5 = hw.code.types.sig(&[hty5], e.view());
+  let hbt5 = hw.code.types.sig(e.view(), e.view());
+  hw.beginUnit(hsg5, "u");
+  hl = hw.local(hty5);
+  hw.boolConst(true); hw.opU(OP_IF, hbt5);
+  hw.opU(OP_LOCAL_GET, 0u32); hw.opU(OP_LOCAL_SET, hl);
+  hw.op(OP_ELSE);
+  hw.op(OP_END);
+  hw.opU(OP_LOCAL_GET, hl); hw.opU(OP_DROP, hty5); hw.endUnit();
+  refused("set in the then arm only, read after the if", &hw, &tables, 0u32, "before it is set");
+
+  hw = CodeWriter.make();
+  let hty6 = hw.code.types.handle(3u32);
+  let hsg6 = hw.code.types.sig(&[hty6], e.view());
+  let hbt6 = hw.code.types.sig(e.view(), e.view());
+  hw.beginUnit(hsg6, "u");
+  hl = hw.local(hty6);
+  hw.boolConst(true); hw.opU(OP_IF, hbt6);
+  hw.op(OP_ELSE);
+  hw.opU(OP_LOCAL_GET, 0u32); hw.opU(OP_LOCAL_SET, hl);
+  hw.op(OP_END);
+  hw.opU(OP_LOCAL_GET, hl); hw.opU(OP_DROP, hty6); hw.endUnit();
+  refused("set in the else arm only, read after the if", &hw, &tables, 0u32, "before it is set");
+
+  w = unit(e.view(), e.view());
+  w.opU(OP_IMPORT, 5u32); w.endUnit();
+  refused("an import that does not exist", &w, &tables, 0u32, "import that does not exist");
+
+  w = unit(e.view(), e.view());
+  let bt3 = w.code.types.sig(e.view(), e.view());
+  w.opU(OP_BLOCK, bt3); w.opU(OP_BR, 0u32); w.f64Const(1.0); w.op(OP_F64_ADD); w.opU(OP_DROP, TY_F64); w.op(OP_END);
+  w.endUnit();
+  accepted("code after a branch is dead and typed loosely", &w, &tables);
+
+  // effects: a fixed or derive unit may not reach an acting import
+  var ti = ImportTables.make();
+  let tsig = ti.types.sig(e.view(), e.view());
+  ti.add("host", "act", tsig, true, 1u32, &noop);
+  ti.add("host", "look", tsig, false, 1u32, &noop);
+  w = CodeWriter.make();
+  let wsig = w.code.types.sig(e.view(), e.view());
+  let iact = w.addImport("host", "act", wsig);
+  let ilook = w.addImport("host", "look", wsig);
+  w.beginUnit(wsig, "acts"); w.opU(OP_IMPORT, iact); w.endUnit();
+  w.beginUnit(wsig, "calls"); w.opU(OP_CALL, 0u32); w.endUnit();
+  w.beginUnit(wsig, "looks"); w.opU(OP_IMPORT, ilook); w.endUnit();
+  w.addEntry(ENTRY_HANDLER, 0u32, 0u32, 0u32);
+  w.addEntry(ENTRY_FIXED, 2u32, 0u32, 0u32);
+  accepted("a handler may act; a fixed unit may look", &w, &ti);
+  w.addEntry(ENTRY_DERIVE, 0u32, 1u32, 0u32);
+  refused("a derive unit with an acting import", &w, &ti, 0u32, "acting");
+  w = CodeWriter.make();
+  let wsig2 = w.code.types.sig(e.view(), e.view());
+  let iact2 = w.addImport("host", "act", wsig2);
+  w.beginUnit(wsig2, "acts"); w.opU(OP_IMPORT, iact2); w.endUnit();
+  w.beginUnit(wsig2, "calls"); w.opU(OP_CALL, 0u32); w.endUnit();
+  w.addEntry(ENTRY_FIXED, 1u32, 0u32, 0u32);
+  refused("a fixed unit reaching an acting import through a call", &w, &ti, 1u32, "acting");
+
+  // imports
+  w = CodeWriter.make();
+  let fsig = w.code.types.sig(&[TY_F64], e.view());
+  w.addImport("host", "act", fsig);
+  refused("an import with the wrong signature", &w, &ti, NO_UNIT, "different signature");
+  w = CodeWriter.make();
+  let gsig = w.code.types.sig(e.view(), e.view());
+  w.addImport("host", "missing", gsig);
+  refused("an import the host does not offer", &w, &ti, NO_UNIT, "not offered");
+  w = CodeWriter.make();
+  let hsig = w.code.types.sig(e.view(), e.view());
+  w.addImport("other", "act", hsig);
+  refused("an import in another namespace", &w, &ti, NO_UNIT, "not offered");
+
+  // structure
+  w = unit(e.view(), e.view());
+  w.opU(OP_LOCAL_GET, 5u32); w.endUnit();
+  refused("a local out of range", &w, &tables, 0u32, "local out of range");
+  w = unit(e.view(), e.view());
+  w.opU(OP_CALL, 9u32); w.endUnit();
+  refused("a call to a unit that does not exist", &w, &tables, 0u32, "does not exist");
+  w = unit(e.view(), &[TY_F64]);
+  let ibt = w.code.types.sig(e.view(), &[TY_F64]);
+  w.boolConst(true); w.opU(OP_IF, ibt); w.f64Const(1.0); w.op(OP_END); w.endUnit();
+  refused("an if with results and no else", &w, &tables, 0u32, "needs an else");
+  w = unit(e.view(), e.view());
+  w.op(OP_UNREACHABLE);
+  refused("a unit with no final end", &w, &tables, 0u32, "does not end");
+  w = unit(e.view(), e.view());
+  w.endUnit(); w.op(OP_UNREACHABLE);
+  refused("code after the final end", &w, &tables, 0u32, "after the function's end");
+  w = unit(e.view(), e.view());
+  w.op(OP_F64_CONST); w.op(0u8); w.endUnit();
+  refused("a cut-short f64 constant", &w, &tables, 0u32, "cut-short");
+  w = unit(e.view(), e.view());
+  w.op(0xFFu8); w.endUnit();
+  refused("an unknown op", &w, &tables, 0u32, "unknown op");
+  w = unit(e.view(), &[TY_F64]);
+  let t2 = w.code.types.tuple(&[TY_F64, TY_F64]);
+  w.f64Const(1.0); w.f64Const(2.0); w.opU(OP_TUPLE_MAKE, t2); w.opUU(OP_TUPLE_GET, t2, 2u32); w.endUnit();
+  refused("a tuple field out of range", &w, &tables, 0u32, "tuple field");
+  w = unit(e.view(), e.view());
+  let pbt = w.code.types.sig(&[TY_BOOL], e.view());
+  w.opU(OP_BLOCK, pbt); w.op(OP_END); w.endUnit();
+  refused("a block type with parameters", &w, &tables, 0u32, "without parameters");
+  w = unit(e.view(), e.view());
+  w.f64Const(1.0); w.opU(OP_DROP, TY_BOOL); w.endUnit();
+  refused("drop with the wrong type", &w, &tables, 0u32, "wrong type");
+  w = unit(e.view(), e.view());
+  w.code.types.defs.push(TypeDef(T_LIST, 99u32, List[u32](), List[u32]()));
+  w.endUnit();
+  refused("a type that refers forward", &w, &tables, NO_UNIT, "malformed type");
+  w = unit(e.view(), e.view());
+  w.opUU(OP_LIST_MAKE, TY_F64, 0u32); w.endUnit();
+  refused("list.make with a type that is not a list", &w, &tables, 0u32, "list type");
+  w = unit(e.view(), &[TY_F64]);
+  w.f64Const(1.0); w.f64Const(2.0); w.boolConst(true); w.opU(OP_SELECT, TY_BOOL); w.endUnit();
+  refused("select with the wrong operand type", &w, &tables, 0u32, "wrong type");
+
+  // the container
+  w = unit(e.view(), e.view());
+  w.endUnit();
+  let good = encode(&w.code);
+  expect(reads(good.view()), "the container of a sound unit reads");
+  var bad = good.clone();
+  bad.set(4usize, 2u8);
+  expect(!reads(bad.view()), "another major version is refused");
+  bad = good.clone();
+  bad.set(0usize, 'X');
+  expect(!reads(bad.view()), "a wrong magic is refused");
+  // sections out of order, each whole: the entries and names sections swapped
+  var starts = List[usize]();
+  var k = 8usize;
+  while k < good.len() {
+    starts.push(k);
+    k = k + 2usize + usize.from(*good[k + 1usize]);     // id, a one-byte length, contents
+  }
+  expectInt(i64.from(starts.len()), 6i64, "six sections in the sound unit");
+  bad = List[u8]();
+  k = 0usize;
+  while k < *starts[4usize] { bad.push(*good[k]); k = k + 1usize; }
+  k = *starts[5usize];
+  while k < good.len() { bad.push(*good[k]); k = k + 1usize; }
+  k = *starts[4usize];
+  while k < *starts[5usize] { bad.push(*good[k]); k = k + 1usize; }
+  expect(bad.len() == good.len() && !reads(bad.view()), "sections out of order are refused");
+  // the same sections in order read
+  var rebuilt = List[u8]();
+  k = 0usize;
+  while k < good.len() { rebuilt.push(*good[k]); k = k + 1usize; }
+  expect(reads(rebuilt.view()), "the sections in order read");
+  bad = good.clone();
+  bad.truncate(good.len() - 3usize);
+  expect(!reads(bad.view()), "a truncated container is refused");
+  done()
+}

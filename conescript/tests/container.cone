@@ -1,0 +1,178 @@
+// The container and the whole pipeline on damaged bytes: a round trip, the printer, and 10,000 random mutations of
+// valid code. The verifier and the reader never crash on any of them; whatever they accept runs to a result or a
+// trap.
+
+mod container;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import conescript use *;
+
+fn impSum(h: &mut HandleTable, s: &mut Array[u64]) bool {
+  var t = 0.0;
+  if usize.from(s[0usize]) < h.size() {
+    let p = h.payload(s[0usize]);
+    var i = 0usize;
+    while i < p.len() { t = t + f64.fromBits(*p[i]); i = i + 1usize; }
+  }
+  s[0usize] = t.bits();
+  true
+}
+fn impWide(h: &mut HandleTable, s: &mut Array[u64]) bool {
+  let x = f64.fromBits(s[0usize]);
+  s[1usize] = (x + 1.0).bits();
+  s[2usize] = (x + 2.0).bits();
+  true
+}
+
+fn tables() ImportTables {
+  var ti = ImportTables.make();
+  let lf = ti.types.list(TY_F64);
+  let e = List[u32]();
+  ti.add("host", "sum", ti.types.sig(&[lf], &[TY_F64]), false, 3u32, &impSum);
+  ti.add("host", "wide", ti.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]), true, 1u32, &impWide);
+  ti
+}
+
+// A code with a bit of everything: blocks, an if with an else, a loop, a call, tuples, a list and imports
+fn rich() CodeWriter {
+  var w = CodeWriter.make();
+  let e = List[u32]();
+  let btF = w.code.types.sig(e.view(), &[TY_F64]);
+  let bt0 = w.code.types.sig(e.view(), e.view());
+  let sigFF = w.code.types.sig(&[TY_F64], &[TY_F64]);
+  let t2 = w.code.types.tuple(&[TY_F64, TY_F64]);
+  let lf = w.code.types.list(TY_F64);
+  let isum = w.addImport("host", "sum", w.code.types.sig(&[lf], &[TY_F64]));
+  let iwide = w.addImport("host", "wide", w.code.types.sig(&[TY_F64], &[TY_F64, TY_F64, TY_F64]));
+  w.beginUnit(sigFF, "main");
+  let acc = w.local(TY_F64);
+  let tl = w.local(t2);
+  w.opU(OP_BLOCK, btF);
+  w.opU(OP_LOCAL_GET, 0u32); w.f64Const(0.0); w.op(OP_F64_LT);
+  w.opU(OP_IF, btF); w.f64Const(1.0); w.op(OP_ELSE); w.f64Const(2.0); w.op(OP_END);
+  w.opU(OP_BR, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_SET, acc);
+  w.opU(OP_LOOP, bt0);
+  w.opU(OP_LOCAL_GET, acc); w.f64Const(1.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_TEE, acc);
+  w.f64Const(5.0); w.op(OP_F64_LT); w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, acc); w.opU(OP_CALL, 1u32); w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_TUPLE_MAKE, t2); w.opU(OP_LOCAL_SET, tl);
+  w.opU(OP_LOCAL_GET, tl); w.opUU(OP_TUPLE_GET, t2, 1u32);
+  w.f64Const(1.0); w.f64Const(2.0); w.opUU(OP_LIST_MAKE, lf, 2u32); w.opU(OP_IMPORT, isum); w.op(OP_F64_ADD);
+  w.f64Const(7.0); w.opU(OP_IMPORT, iwide); w.op(OP_F64_ADD); w.op(OP_F64_ADD); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.beginUnit(sigFF, "double");
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 0u32); w.op(OP_F64_ADD);
+  w.endUnit();
+  w.addEntry(ENTRY_FIXED, 1u32, 0u32, 0u32);
+  w.addEntry(ENTRY_HANDLER, 0u32, 3u32, 0u32);
+  w
+}
+
+// A small deterministic random source
+struct Rng { s: u64;
+  fn next(self: &mut) u64 {
+    var x = self.s;
+    x = x ^ (x << 13u64); x = x ^ (x >> 7u64); x = x ^ (x << 17u64);
+    self.s = x;
+    x
+  }
+  fn below(self: &mut, n: usize) usize { usize.from(self.next() % u64.from(n)) }
+}
+
+fn main() i32 {
+  let tb = tables();
+  let w = rich();
+  let bytes = encode(&w.code);
+  match verify(&w.code, &tb) {
+    case let Ok(v) {
+      var it = Interpreter.make();
+      it.setFuel(1000u64);
+      var h = HandleTable.make();
+      var out = List[u64]();
+      var args = List[u64]();
+      args.push(3.0.bits());
+      let t = it.run(&v, &tb, &mut h, 0u32, args.view(), &mut out);
+      expect(t is None, "the rich unit runs");
+      // acc ends at 5 after the loop; double(5) = 10; tuple (10, 3); get 1 = 3; + sum(1, 2) = 6; + wide(7) = 7 + 8 + 9, total 6+7+8+9 = 30
+      expectFloat(f64.fromBits(*out[0usize]), 30.0, 0.0, "the rich unit's answer");
+    }
+    case let Err(ps) { expect(false, "the rich code verifies"); }
+  }
+
+  // a round trip
+  match decode(bytes.view()) {
+    case let Ok(c) {
+      let again = encode(&c);
+      expect(again == bytes, "decode then encode gives the same bytes");
+      expectInt(i64.from(c.units.len()), 2i64, "two units read back");
+      expectStr(c.units[0usize].name.view(), "main", "names read back");
+    }
+    case let Err(p) { expect(false, "valid bytes decode"); }
+  }
+
+  // the printer
+  var sw = CodeWriter.make();
+  let ssig = sw.code.types.sig(&[TY_F64], &[TY_F64]);
+  sw.beginUnit(ssig, "twice");
+  sw.opU(OP_LOCAL_GET, 0u32); sw.f64Const(2.0); sw.op(OP_F64_MUL);
+  sw.endUnit();
+  sw.addEntry(ENTRY_FIXED, 0u32, 4u32, 1u32);
+  print <- showCode(&sw.code).view();
+
+  // 10,000 random mutations
+  var rng = Rng(0x9E3779B97F4A7C15u64);
+  var decoded = 0u32;
+  var verified = 0u32;
+  var ran = 0u32;
+  var trapped = 0u32;
+  var n = 0u32;
+  while n < 10000u32 {
+    var b = bytes.clone();
+    let edits = 1usize + rng.below(3usize);
+    var k = 0usize;
+    while k < edits {
+      let kind = rng.below(5usize);
+      if kind == 0usize { b.set(rng.below(b.len()), u8.from(rng.next() & 0xFFu64)); }
+      else if kind == 1usize { let i = rng.below(b.len()); b.set(i, *b[i] ^ u8.from(1u64 << (rng.next() & 7u64))); }
+      else if kind == 2usize { b.insert(rng.below(b.len()), u8.from(rng.next() & 0xFFu64)); }
+      else if kind == 3usize { if b.len() > 9usize { b.remove(rng.below(b.len())); } }
+      else { if b.len() > 9usize && rng.below(40usize) == 0usize { b.truncate(8usize + rng.below(b.len() - 8usize)); } }
+      k = k + 1usize;
+    }
+    match decode(b.view()) {
+      case let Ok(c) {
+        decoded = decoded + 1u32;
+        match verify(&c, &tb) {
+          case let Ok(v) {
+            verified = verified + 1u32;
+            var u = 0usize;
+            while u < v.unitCount() {
+              var args = List[u64]();
+              var q = 0u32;
+              while q < v.paramSlots(u) { args.push(0u64); q = q + 1u32; }
+              var it = Interpreter.make();
+              it.setFuel(2000u64);
+              var h = HandleTable.make();
+              var out = List[u64]();
+              let t = it.run(&v, &tb, &mut h, u32.from(u), args.view(), &mut out);
+              ran = ran + 1u32;
+              if t is Some { trapped = trapped + 1u32; }
+              u = u + 1usize;
+            }
+          }
+          case let Err(ps) {}
+        }
+      }
+      case let Err(p) {}
+    }
+    n = n + 1u32;
+  }
+  expect(decoded > 0u32 && verified > 0u32 && ran > 0u32, "some mutants reach the interpreter");
+  print <- "mutants: 10000, read "; print <- decoded; print <- ", verified "; print <- verified;
+  print <- ", units run "; print <- ran; print <- ", trapped "; print <- trapped; print <- "\n";
+  done()
+}

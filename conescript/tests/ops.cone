@@ -1,0 +1,266 @@
+// Every f64, bool and i64 op on fixed inputs, run through the verifier and the interpreter, against what Cone
+// itself computes for the same inputs (-0, infinity and NaN included).
+
+mod ops;
+
+import testing use *;
+import collections use *;
+import conescript use *;
+
+// A unit of two parameters of type 'a', one result of type 'r', doing 'op' on them
+fn binary(op: u8, a: u32, r: u32) CodeWriter {
+  var w = CodeWriter.make();
+  let sig = w.code.types.sig(&[a, a], &[r]);
+  w.beginUnit(sig, "binary");
+  w.opU(OP_LOCAL_GET, 0u32);
+  w.opU(OP_LOCAL_GET, 1u32);
+  w.op(op);
+  w.endUnit();
+  w
+}
+
+fn unary(op: u8, a: u32, r: u32) CodeWriter {
+  var w = CodeWriter.make();
+  let sig = w.code.types.sig(&[a], &[r]);
+  w.beginUnit(sig, "unary");
+  w.opU(OP_LOCAL_GET, 0u32);
+  w.op(op);
+  w.endUnit();
+  w
+}
+
+// The result slots of unit 0 run with the arguments; ok is false if verification or the run failed
+struct Out { slots: List[u64]; ok: bool; }
+
+fn exec(w: &CodeWriter, args: &Array[u64]) Out {
+  let tables = ImportTables.make();
+  match verify(&w.code, &tables) {
+    case let Ok(v) {
+      var it = Interpreter.make();
+      it.setFuel(1000000u64);
+      var h = HandleTable.make();
+      var out = List[u64]();
+      let t = it.run(&v, &tables, &mut h, 0u32, args, &mut out);
+      Out(out, t is None)
+    }
+    case let Err(ps) { Out(List[u64](), false) }
+  }
+}
+
+fn first(o: &Out) u64 { if o.slots.len() > 0usize { *o.slots[0usize] } else { 0xDEADBEEFu64 } }
+
+fn sameF(got: u64, want: f64) bool {
+  let g = f64.fromBits(got);
+  if want != want { return g != g; }
+  got == want.bits()
+}
+
+fn inputs() List[f64] {
+  var l = List[f64]();
+  l.push(0.0); l.push(-0.0); l.push(1.5); l.push(-2.25); l.push(1e300); l.push(-1e300); l.push(5e-324);
+  l.push(f64.fromBits(0x7FF0000000000000u64)); l.push(f64.fromBits(0xFFF0000000000000u64));
+  l.push(f64.fromBits(0x7FF8000000000000u64)); l.push(3.0); l.push(-0.5);
+  l
+}
+
+fn refArith(op: u8, a: f64, b: f64) f64 {
+  match op {
+    case OP_F64_ADD { a + b }
+    case OP_F64_SUB { a - b }
+    case OP_F64_MUL { a * b }
+    case OP_F64_DIV { a / b }
+    else { 0.0 }
+  }
+}
+
+fn minRef(a: f64, b: f64) f64 {
+  if a != a || b != b { return f64.fromBits(0x7FF8000000000000u64); }
+  if a == 0.0 && b == 0.0 { return if a.bits() != 0u64 { a } else { b }; }
+  if a < b { a } else { b }
+}
+fn maxRef(a: f64, b: f64) f64 {
+  if a != a || b != b { return f64.fromBits(0x7FF8000000000000u64); }
+  if a == 0.0 && b == 0.0 { return if a.bits() == 0u64 { a } else { b }; }
+  if a > b { a } else { b }
+}
+
+fn pair(x: u64, y: u64) List[u64] {
+  var l = List[u64]();
+  l.push(x); l.push(y);
+  l
+}
+fn one(x: u64) List[u64] {
+  var l = List[u64]();
+  l.push(x);
+  l
+}
+
+fn main() i32 {
+  let xs = inputs();
+  var arith = List[u8]();
+  arith.push(OP_F64_ADD); arith.push(OP_F64_SUB); arith.push(OP_F64_MUL); arith.push(OP_F64_DIV);
+  var i = 0usize;
+  while i < arith.len() {
+    let op = *arith[i];
+    let w = binary(op, TY_F64, TY_F64);
+    var a = 0usize;
+    var n = 0u32;
+    while a < xs.len() {
+      var b = 0usize;
+      while b < xs.len() {
+        let args = pair(xs[a].bits(), xs[b].bits());
+        let o = exec(&w, args.view());
+        if !(o.ok && o.slots.len() == 1usize && sameF(first(&o), refArith(op, *xs[a], *xs[b]))) { n = n + 1u32; }
+        b = b + 1usize;
+      }
+      a = a + 1usize;
+    }
+    expectInt(i64.from(n), 0i64, "f64 add/sub/mul/div mismatches");
+    i = i + 1usize;
+  }
+
+  // min and max
+  var mm = 0u32;
+  var a = 0usize;
+  let wmin = binary(OP_F64_MIN, TY_F64, TY_F64);
+  let wmax = binary(OP_F64_MAX, TY_F64, TY_F64);
+  while a < xs.len() {
+    var b = 0usize;
+    while b < xs.len() {
+      let args = pair(xs[a].bits(), xs[b].bits());
+      if !sameF(first(&exec(&wmin, args.view())), minRef(*xs[a], *xs[b])) { mm = mm + 1u32; }
+      if !sameF(first(&exec(&wmax, args.view())), maxRef(*xs[a], *xs[b])) { mm = mm + 1u32; }
+      b = b + 1usize;
+    }
+    a = a + 1usize;
+  }
+  expectInt(i64.from(mm), 0i64, "min/max mismatches");
+
+  // comparisons: each of the six against Cone's own
+  var cmp = 0u32;
+  var ops = List[u8]();
+  ops.push(OP_F64_EQ); ops.push(OP_F64_NE); ops.push(OP_F64_LT); ops.push(OP_F64_LE); ops.push(OP_F64_GT); ops.push(OP_F64_GE);
+  i = 0usize;
+  while i < ops.len() {
+    let op = *ops[i];
+    let w = binary(op, TY_F64, TY_BOOL);
+    a = 0usize;
+    while a < xs.len() {
+      var b = 0usize;
+      while b < xs.len() {
+        let x = *xs[a];
+        let y = *xs[b];
+        var want = false;
+        if op == OP_F64_EQ { want = x == y; }
+        else if op == OP_F64_NE { want = x != y; }
+        else if op == OP_F64_LT { want = x < y; }
+        else if op == OP_F64_LE { want = x <= y; }
+        else if op == OP_F64_GT { want = x > y; }
+        else { want = x >= y; }
+        let args = pair(x.bits(), y.bits());
+        if first(&exec(&w, args.view())) != (if want { 1u64 } else { 0u64 }) { cmp = cmp + 1u32; }
+        b = b + 1usize;
+      }
+      a = a + 1usize;
+    }
+    i = i + 1usize;
+  }
+  expectInt(i64.from(cmp), 0i64, "f64 comparison mismatches");
+
+  // unary: neg, abs, sqrt
+  var un = 0u32;
+  let wneg = unary(OP_F64_NEG, TY_F64, TY_F64);
+  let wabs = unary(OP_F64_ABS, TY_F64, TY_F64);
+  let wsq = unary(OP_F64_SQRT, TY_F64, TY_F64);
+  a = 0usize;
+  while a < xs.len() {
+    let args = one(xs[a].bits());
+    let x = *xs[a];
+    // negation flips the sign bit, zero and NaN included
+    if first(&exec(&wneg, args.view())) != (x.bits() ^ 0x8000000000000000u64) { un = un + 1u32; }
+    let absx = f64.fromBits(x.bits() & 0x7FFFFFFFFFFFFFFFu64);
+    if !sameF(first(&exec(&wabs, args.view())), absx) { un = un + 1u32; }
+    if !sameF(first(&exec(&wsq, args.view())), x.sqrt()) { un = un + 1u32; }
+    a = a + 1usize;
+  }
+  expectInt(i64.from(un), 0i64, "unary mismatches");
+  // abs and sqrt on known values, so the table is not only comparing Cone with Cone
+  expect(sameF(first(&exec(&wabs, one((-2.5).bits()).view())), 2.5), "abs of -2.5");
+  expect(sameF(first(&exec(&wsq, one((9.0).bits()).view())), 3.0), "sqrt of 9");
+  expect(sameF(first(&exec(&wneg, one((4.0).bits()).view())), -4.0), "neg of 4");
+
+  // bool ops: and, or over the four pairs, not
+  var bo = 0u32;
+  let wand = binary(OP_BOOL_AND, TY_BOOL, TY_BOOL);
+  let wor = binary(OP_BOOL_OR, TY_BOOL, TY_BOOL);
+  let wnot = unary(OP_BOOL_NOT, TY_BOOL, TY_BOOL);
+  var p = 0u64;
+  while p < 2u64 {
+    var q = 0u64;
+    while q < 2u64 {
+      let args = pair(p, q);
+      if first(&exec(&wand, args.view())) != (p & q) { bo = bo + 1u32; }
+      if first(&exec(&wor, args.view())) != (p | q) { bo = bo + 1u32; }
+      q = q + 1u64;
+    }
+    if first(&exec(&wnot, one(p).view())) != (1u64 - p) { bo = bo + 1u32; }
+    p = p + 1u64;
+  }
+  expectInt(i64.from(bo), 0i64, "bool op mismatches");
+  expectUInt(first(&exec(&wand, pair(1u64, 1u64).view())), 1u64, "true and true");
+  expectUInt(first(&exec(&wor, pair(0u64, 0u64).view())), 0u64, "false or false");
+  expectUInt(first(&exec(&wnot, one(0u64).view())), 1u64, "not false");
+
+  // conversions
+  let wfb = unary(OP_BOOL_FROM_F64, TY_F64, TY_BOOL);
+  let wbf = unary(OP_F64_FROM_BOOL, TY_BOOL, TY_F64);
+  var cv = 0u32;
+  a = 0usize;
+  while a < xs.len() {
+    let want = if *xs[a] != 0.0 { 1u64 } else { 0u64 };
+    if first(&exec(&wfb, one(xs[a].bits()).view())) != want { cv = cv + 1u32; }
+    a = a + 1usize;
+  }
+  if !sameF(first(&exec(&wbf, one(1u64).view())), 1.0) { cv = cv + 1u32; }
+  if !sameF(first(&exec(&wbf, one(0u64).view())), 0.0) { cv = cv + 1u32; }
+  expectInt(i64.from(cv), 0i64, "conversion mismatches");
+  expectUInt(first(&exec(&wfb, one((-0.0).bits()).view())), 0u64, "-0 is false");
+  expectUInt(first(&exec(&wfb, one(f64.fromBits(0x7FF8000000000000u64).bits()).view())), 1u64, "NaN is true");
+
+  // i64: add, sub, mul wrap; comparisons are signed
+  var iv = List[i64]();
+  iv.push(0i64); iv.push(1i64); iv.push(-1i64); iv.push(7i64); iv.push(-9i64); iv.push(0x7FFFFFFFFFFFFFFFi64); iv.push(-0x7FFFFFFFFFFFFFFFi64 - 1i64);
+  var ic = 0u32;
+  let wadd = binary(OP_I64_ADD, TY_I64, TY_I64);
+  let wsub = binary(OP_I64_SUB, TY_I64, TY_I64);
+  let wmul = binary(OP_I64_MUL, TY_I64, TY_I64);
+  let wlt = binary(OP_I64_LT, TY_I64, TY_BOOL);
+  let weq = binary(OP_I64_EQ, TY_I64, TY_BOOL);
+  let wne = binary(OP_I64_NE, TY_I64, TY_BOOL);
+  a = 0usize;
+  while a < iv.len() {
+    var b = 0usize;
+    while b < iv.len() {
+      let x = *iv[a];
+      let y = *iv[b];
+      let args = pair(x as u64, y as u64);
+      if first(&exec(&wadd, args.view())) != ((x + y) as u64) { ic = ic + 1u32; }
+      if first(&exec(&wsub, args.view())) != ((x - y) as u64) { ic = ic + 1u32; }
+      if first(&exec(&wmul, args.view())) != ((x * y) as u64) { ic = ic + 1u32; }
+      if first(&exec(&wlt, args.view())) != (if x < y { 1u64 } else { 0u64 }) { ic = ic + 1u32; }
+      if first(&exec(&weq, args.view())) != (if x == y { 1u64 } else { 0u64 }) { ic = ic + 1u32; }
+      if first(&exec(&wne, args.view())) != (if x != y { 1u64 } else { 0u64 }) { ic = ic + 1u32; }
+      b = b + 1usize;
+    }
+    a = a + 1usize;
+  }
+  expectInt(i64.from(ic), 0i64, "i64 op mismatches");
+  expectUInt(first(&exec(&wadd, pair(2u64, 3u64).view())), 5u64, "2 + 3");
+  expectUInt(first(&exec(&wsub, pair(2u64, 3u64).view())), 0xFFFFFFFFFFFFFFFFu64, "2 - 3");
+  expectUInt(first(&exec(&wlt, pair((-1i64) as u64, 1u64).view())), 1u64, "-1 < 1 signed");
+  let wfi = unary(OP_F64_FROM_I64, TY_I64, TY_F64);
+  expect(sameF(first(&exec(&wfi, one((-3i64) as u64).view())), -3.0), "f64.from_i64");
+  let wfp = unary(OP_I64_FROM_PART, TY_PART, TY_I64);
+  expectUInt(first(&exec(&wfp, one(42u64).view())), 42u64, "i64.from_part");
+  done()
+}
