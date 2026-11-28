@@ -1,0 +1,106 @@
+# The manifest's driven tests, end to end: serve a split world (tools\worldserve.py, over a slowed link), open it with pegasus
+# headless, and read the server's request log and the run's own lines. Run from anywhere:
+#   pwsh tools\manifest-test.ps1 [-Mbit 1] [-LatencyMs 100]
+# 1. a first open fetches the manifest and every file; a second open of the unchanged world, with the same cache, fetches the
+#    manifest and NO file;
+# 2. a file whose hash is wrong (same size) is left out, said once, and only its subtree is missing (the run's key count, read
+#    from a local copy that leaves the same file out, agrees);
+# 3. a file whose size is wrong does the same;
+# 4. the world mended: only the file that was left out is fetched, the rest are kept by content.
+# Tests 2 and 3 use a fresh cache each: a file kept by its hash is never fetched, so a cache that held the right file would hide
+# the wrong one. PEGASUS_MUTANT=manifest-skip-hash makes (2) FAIL (the file is not left out). Prints PASS or FAIL for each; stops
+# the server. Exit 0 only if every test passed.
+param(
+  [double]$Mbit = 1,
+  [double]$LatencyMs = 100,
+  [string]$World = ''
+)
+$here = Split-Path -Parent $PSCommandPath
+$exe = Join-Path $here '..\build\release\pegasus.exe'
+if (-not $World) { $World = Join-Path $here '..\worlds\split\first.world' }
+$src = Split-Path -Parent (Resolve-Path $World).Path
+$name = Split-Path -Leaf $World
+$env:PATH += ';C:\libs\SDL3-3.4.16\lib\x64'
+
+$others = Get-Process browser, guidebrowser, pegasus -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike 'C:\src\pegasus3d-wt-*' }
+if ($others) { Write-Output "a browser outside the lane worktrees is running ($($others.Id -join ',')): not running"; exit 2 }
+
+$tmp = Join-Path $env:TEMP "manifest-test-$PID"
+$served = Join-Path $tmp 'served'
+New-Item -ItemType Directory -Force $served | Out-Null
+Copy-Item (Join-Path $src '*') $served
+$outLog = Join-Path $tmp 'server.out'
+$errLog = Join-Path $tmp 'server.err'
+$server = Start-Process python -ArgumentList @('-u', (Join-Path $here 'worldserve.py'), $served, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs) `
+  -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
+$failed = 0
+function Check($what, $good) {
+  if ($good) { Write-Output "PASS $what" } else { Write-Output "FAIL $what"; $script:failed++ }
+}
+try {
+  $port = 0
+  for ($i = 0; $i -lt 50 -and $port -eq 0; $i++) {
+    Start-Sleep -Milliseconds 100
+    if ((Test-Path $outLog) -and ((Get-Content $outLog -Raw) -match 'on (\d+)')) { $port = [int]$Matches[1] }
+  }
+  if ($port -eq 0) { Write-Output 'the server did not start'; exit 3 }
+  $url = "http://127.0.0.1:$port/$name"
+  $files = @(Get-Content (Join-Path $served $name) | Where-Object { $_ -notmatch '^//' -and $_.Trim() }).Count
+
+  function Open-World($keysFrom) {
+    $before = (Get-Content $errLog -ErrorAction SilentlyContinue | Measure-Object).Count
+    $out = & $exe --world $url --keys-from $keysFrom --steps 300 2>&1 | Out-String
+    # (the server's log holds a traceback each time a client drops a connection at exit: only its GET lines are requests)
+    $log = @(Get-Content $errLog -ErrorAction SilentlyContinue | Select-Object -Skip $before | Where-Object { $_ -match ' GET /' })
+    [pscustomobject]@{ out = $out; requests = $log.Count; files = @($log | Where-Object { $_ -match 'GET /first-' }).Count }
+  }
+  $okRun = { param($o) ($o -match 'jobs started nearest first: yes: ok') -and ($o -match 'check resident keys: \d+ \(want \d+\), \d+ released: ok') }
+
+  # 1. cold, then warm
+  $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache1'
+  $a = Open-World (Join-Path $src $name)
+  Check "first open: $($a.files) of $files files fetched, none left out, the run's checks pass" (($a.files -eq $files) -and ($a.out -match ' 0 left out') -and (& $okRun $a.out))
+  $b = Open-World (Join-Path $src $name)
+  Check "second open of the unchanged world: $($b.files) files fetched ($($b.requests) request in all), $files kept" `
+    (($b.files -eq 0) -and ($b.requests -eq 1) -and ($b.out -match "$files kept, 0 fetched, 0 left out") -and (& $okRun $b.out))
+
+  # 2. a file with one bit changed (same size, so the hash is wrong), in the served folder and in a local copy that gives the
+  # run's key count (it leaves the file out too)
+  $lines = Get-Content (Join-Path $served $name)
+  $hashFile = ($lines | Where-Object { $_ -match '^first-07' }).Split(' ')[0]
+  $sizeFile = ($lines | Where-Object { $_ -match '^first-05' }).Split(' ')[0]
+  $local = Join-Path $tmp 'local'
+  New-Item -ItemType Directory -Force $local | Out-Null
+  Copy-Item (Join-Path $src '*') $local
+  $bytes = [System.IO.File]::ReadAllBytes((Join-Path $src $hashFile))
+  $bytes[$bytes.Length - 2] = $bytes[$bytes.Length - 2] -bxor 1
+  foreach ($d in @($served, $local)) { [System.IO.File]::WriteAllBytes((Join-Path $d $hashFile), $bytes) }
+  $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache2'
+  $c = Open-World (Join-Path $local $name)
+  $said = @([regex]::Matches($c.out, "file $hashFile \(subtree [^)]*\) left out: its hash is")).Count
+  Check "wrong hash: $hashFile left out and said once ($said), 1 of $files left out, the run's checks pass" `
+    (($said -eq 1) -and ($c.out -match ' 1 left out') -and (& $okRun $c.out))
+
+  # 3. one file a byte longer
+  Copy-Item (Join-Path $src $hashFile) (Join-Path $served $hashFile) -Force
+  Copy-Item (Join-Path $src $hashFile) (Join-Path $local $hashFile) -Force
+  $longer = [System.IO.File]::ReadAllBytes((Join-Path $src $sizeFile)) + [byte]10
+  foreach ($d in @($served, $local)) { [System.IO.File]::WriteAllBytes((Join-Path $d $sizeFile), $longer) }
+  $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache3'
+  $d3 = Open-World (Join-Path $local $name)
+  $said = @([regex]::Matches($d3.out, "file $sizeFile \(subtree [^)]*\) left out: its size is")).Count
+  Check "wrong size: $sizeFile left out and said once ($said), 1 left out, the run's checks pass" `
+    (($said -eq 1) -and ($d3.out -match ' 1 left out') -and (& $okRun $d3.out))
+
+  # 4. mended: with cache3, only the file that was left out is fetched
+  Copy-Item (Join-Path $src $sizeFile) (Join-Path $served $sizeFile) -Force
+  $e = Open-World (Join-Path $src $name)
+  Check "the world mended: $($e.files) file fetched again (the one left out), the rest kept" `
+    (($e.files -eq 1) -and ($e.out -match "$($files - 1) kept, 1 fetched, 0 left out") -and (& $okRun $e.out))
+}
+finally {
+  Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+}
+if ($failed) { Write-Output "FAILED: $failed"; exit 1 }
+Write-Output 'all passed'

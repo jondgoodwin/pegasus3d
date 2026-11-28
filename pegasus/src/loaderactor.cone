@@ -172,6 +172,9 @@ actor Loader {
   pendingWorld: String;             // the world being fetched: the name its text is read under
   pieces: List[String];             // a manifest's files' texts, by place, as they arrive
   got: usize;                       // how many of them are in
+  filesKept: u64;                   // of those, files the cache had by content hash (not fetched)
+  filesFetched: u64;                // files fetched and found as the manifest said
+  filesLeftOut: u64;                // files left out: not fetched, or the wrong size or hash, or a bad manifest line
 
   fn init(self: &new, render: Render, report: Sender[bool], expectBuilds: u64, retire: bool, offByOne: bool, simOnly: bool) {
     var ws = List[Worker]();
@@ -188,7 +191,7 @@ actor Loader {
     catalog.learn(browserAvatarMaterialKey(), browserAvatarMaterialRecipe());
     *self = Self(render, None[Sim], catalog, ws, b, false, report, expectBuilds, retire, false, simOnly,
       MeshCache.make(Path.from(cacheFolder().view()), buildStamp(), CACHE_CAP_BYTES), 0u64, 0u64, 0u64, Instant.now(), false,
-      Fetcher(), String(), List[String](), 0usize);
+      Fetcher(), String(), List[String](), 0usize, 0u64, 0u64, 0u64);
   }
 
   // Player -> Loader (event): open world 'world' for 'sim', which Player has
@@ -207,14 +210,18 @@ actor Loader {
     pendingWorld = world.clone();
     if isManifest(world.view()) {
       let listing = await fetcher.text(world.clone());
-      let names = manifestFiles(listing.text.view());
+      let names = manifestEntries(listing.text.view());
       printStr(numberLine("arrival: manifest of ", u64.from(names.len()), numberLine(" files in at +", self.sinceOpenedMs(), " ms\n").view()).view());
       pieces = List[String]();
       got = 0usize;
+      filesKept = 0u64;
+      filesFetched = 0u64;
+      filesLeftOut = 0u64;
       var i = 0usize;
       while i < names.len() {
         pieces.push(String());
-        selfactor.piece(i, siblingOf(world.view(), names[i].view()));
+        let n = &names[i];
+        selfactor.piece(i, siblingOf(world.view(), n.name.view()), n.name.clone(), n.size, n.hash, n.path.clone(), n.ok);
         i = i + 1usize;
       }
       if names.len() == 0usize { self.begin(String()); }
@@ -227,13 +234,45 @@ actor Loader {
   }
 
   // The fetch of one file of the manifest's world: put in its place, and when the last is in, the world begins
-  pub async fn piece(self, i: usize, loc: String) {
-    var one = await fetcher.text(loc);
+  // (a file whose line is not whole is not fetched). A file kept under its content hash is not fetched; one fetched is checked
+  // against the size and hash, and if it fails it is left out (its text is empty) and said so, once
+  pub async fn piece(self, i: usize, loc: String, name: String, size: u64, hash: u64, path: String, lineOk: bool) {
     var text = String();
-    text <-> one.text;
+    let remote = isUrl(loc.view()) && cache.on();
+    if !lineOk {
+      printStr("loader: manifest line of file ");
+      printStr(name.view()); printStr(" is not whole (NAME SIZE HASH PATH): left out\n");
+      filesLeftOut = filesLeftOut + 1u64;
+    } else {
+      var haveIt = false;
+      if remote {
+        var k = await fetcher.kept(String.from(cache.dir.view()), size, hash);
+        if k.ok { text <-> k.text; haveIt = true; filesKept = filesKept + 1u64; }
+      }
+      if !haveIt {
+        var one = await fetcher.text(loc);
+        text <-> one.text;
+        if !one.ok {
+          text = String();                                   // (the fetch said what went wrong)
+          filesLeftOut = filesLeftOut + 1u64;
+        } else {
+          let verdict = judgeFile(size, hash, text.view(), mutantIs("manifest-skip-hash"));
+          if verdict != FILE_FINE {
+            printStr(dropLine(name.view(), path.view(), verdict, text.view(), size, hash).view());
+            text = String();
+            filesLeftOut = filesLeftOut + 1u64;
+          } else {
+            filesFetched = filesFetched + 1u64;
+            if remote { fetcher.keep(String.from(cache.dir.view()), hash, text.clone()); }
+          }
+        }
+      }
+    }
     pieces.set(i, text);
     got = got + 1usize;
     if got < pieces.len() { return; }
+    printStr(numberLine("arrival: ", u64.from(pieces.len()), numberLine(" files: ", filesKept, numberLine(" kept, ", filesFetched,
+      numberLine(" fetched, ", filesLeftOut, " left out\n").view()).view()).view()).view());
     var whole = String();
     each p in &pieces {
       whole.appendBytes(p.view());

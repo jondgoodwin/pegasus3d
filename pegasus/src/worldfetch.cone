@@ -1,9 +1,12 @@
 // Fetching a world's text: from a path on disk, or from a URL (http://), by the Loader's own connection.
 //
 // THE MANIFEST (a choice of the smallest kind; browser-arch may change it). A world is named by one location. If the name ends in
-// ".world" it is a MANIFEST: a text file with one file name on each line (blank lines and lines starting "//" are left out), each
-// name relative to the manifest's own folder or URL. The world's text is the files' texts in the manifest's order, one after the
-// other (a newline between two when the first does not end in one). Any other name is the world's one file.
+// ".world" it is a MANIFEST: a text file with one line for each file, "NAME SIZE HASH PATH" (blank lines and lines starting "//"
+// are left out; see `ManifestEntry`), NAME relative to the manifest's own folder or URL. The world's text is the files' texts in
+// the manifest's order, one after the other (a newline between two when the first does not end in one). Any other name is the
+// world's one file. A file whose size or hash is not the manifest's is LEFT OUT (its subtree is missing, the rest is the world),
+// and said so once; a file that passes is kept in the cache folder under its hash and not fetched again while it is there. The
+// manifest itself is not checked (nothing says what it should be).
 // The language has no way for one file to add to a part another file made, so the files are cut at part boundaries and the order
 // is the world's order; the first cut is the text's, not the language's.
 //
@@ -45,20 +48,109 @@ pub fn isUrl(loc: &str) bool { loc.startsWith("http://") || loc.startsWith("http
 // The location names a manifest
 pub fn isManifest(loc: &str) bool { loc.endsWith(".world") }
 
-// The file names a manifest's text lists, in order
-pub fn manifestFiles(text: &str) List[String] {
+// One line of a manifest: "NAME SIZE HASH PATH", the fields apart by spaces. SIZE is decimal, HASH is 16 hex digits (`contentHash`
+// of the file's bytes), PATH is the dotted path of the part whose subtree the file holds ("first.materials"; the part declared on
+// the file's first line, or for a file that starts with something else, the part that line sits in). A line with fewer fields or a
+// number that is not one is not `ok`: its file is not fetched and the world goes without it.
+pub struct ManifestEntry {
+  pub name: String;
+  pub size: u64;
+  pub hash: u64;
+  pub path: String;
+  pub ok: bool;
+}
+
+// The fields of 'line' apart by white space
+fn splitFields(line: &str) List[String] {
   var out = List[String]();
+  let b: &Array[u8] = line;
+  var cur = String();
+  var i = 0usize;
+  while i < b.len {
+    let c = b[i];
+    if c <= ' ' {
+      if cur.len() > 0usize { out.push(cur.clone()); cur = String(); }
+    } else {
+      cur.appendByte(c);
+    }
+    i = i + 1usize;
+  }
+  if cur.len() > 0usize { out.push(cur.clone()); }
+  out
+}
+
+// 's' as an unsigned number in 'base' (10 or 16) into 'out'; false if it is empty, has another character, or does not fit
+fn parseNumber(s: &str, base: u64, out: &mut u64) bool {
+  let b: &Array[u8] = s;
+  if b.len == 0usize { return false; }
+  var v = 0u64;
+  var i = 0usize;
+  while i < b.len {
+    let c = b[i];
+    var d = 99u64;
+    if c >= '0' && c <= '9' { d = u64.from(c - '0'); }
+    else if c >= 'a' && c <= 'f' { d = u64.from(c - 'a') + 10u64; }
+    if d >= base { return false; }
+    if v > (18446744073709551615u64 - d) / base { return false; }
+    v = v * base + d;
+    i = i + 1usize;
+  }
+  *out = v;
+  true
+}
+
+// The entries a manifest's text lists, in order (blank lines and lines starting "//" left out)
+pub fn manifestEntries(text: &str) List[ManifestEntry] {
+  var out = List[ManifestEntry]();
   var it = text.lines();
   while true {
     match it.next() {
       case let Some(line) {
         let t = line.trim();
-        if t.len() > 0usize && !t.startsWith("//") { out.push(String.from(t)); }
+        if t.len() == 0usize || t.startsWith("//") { continue; }
+        let f = splitFields(t);
+        var size = 0u64;
+        var hash = 0u64;
+        var ok = f.len() == 4usize;
+        if ok { ok = parseNumber(f[1].view(), 10u64, &mut size) && f[2].len() == 16usize && parseNumber(f[2].view(), 16u64, &mut hash); }
+        out.push(ManifestEntry(f[0].clone(), size, hash, if f.len() == 4usize { f[3].clone() } else { String() }, ok));
       }
       else { break; }
     }
   }
   out
+}
+
+// What `judgeFile` says of a file that arrived
+pub const FILE_FINE = 0u32;
+pub const FILE_WRONG_SIZE = 1u32;
+pub const FILE_WRONG_HASH = 2u32;
+
+// Whether the file's 'text' is what the manifest gave: its size first, then its content hash. PEGASUS_MUTANT=manifest-skip-hash
+// (`skipHash`) does not look at the hash, and a check must fail on it
+pub fn judgeFile(size: u64, hash: u64, text: &Array[u8], skipHash: bool) u32 {
+  if u64.from(text.len) != size { return FILE_WRONG_SIZE; }
+  if !skipHash && contentHash(text) != hash { return FILE_WRONG_HASH; }
+  FILE_FINE
+}
+
+// The one line saying a file was left out and why, as one string so no other actor's print breaks it. 'got' is the arrived text
+pub fn dropLine(name: &str, path: &str, verdict: u32, got: &Array[u8], size: u64, hash: u64) String {
+  var s = String.from("loader: file ");
+  s.append(name);
+  s.append(" (subtree ");
+  s.append(path);
+  s.append(") left out: ");
+  if verdict == FILE_WRONG_SIZE {
+    s.append(numberLine("its size is ", u64.from(got.len), numberLine(" bytes, the manifest says ", size, "\n").view()).view());
+  } else {
+    s.append("its hash is ");
+    s.append(cacheHex(contentHash(got)).view());
+    s.append(", the manifest says ");
+    s.append(cacheHex(hash).view());
+    s.append("\n");
+  }
+  s
 }
 
 // The location of 'name' beside 'loc': 'loc' up to and including its last '/' (or '\'), then 'name'
@@ -83,10 +175,14 @@ pub fn readWorldNow(loc: &str) String {
   match fs.readFile(&Path.from(loc)) {
     case let Ok(text) {
       if !isManifest(loc) { out.appendBytes(text.view()); return out; }
-      let names = manifestFiles(String.from(text.view()).view());
+      let names = manifestEntries(String.from(text.view()).view());
       each n in &names {
-        match fs.readFile(&Path.from(siblingOf(loc, n.view()).view())) {
-          case let Ok(part) { out.appendBytes(part.view()); out.append(joinAfter(part.view()).view()); }
+        match fs.readFile(&Path.from(siblingOf(loc, n.name.view()).view())) {
+          case let Ok(part) {
+            // a file the Loader leaves out (a bad line, a wrong size or hash) is left out here too, so the counts agree
+            if !n.ok || judgeFile(n.size, n.hash, part.view(), mutantIs("manifest-skip-hash")) != FILE_FINE { continue; }
+            out.appendBytes(part.view()); out.append(joinAfter(part.view()).view());
+          }
           else { return String(); }
         }
       }
@@ -107,6 +203,19 @@ actor Fetcher {
   client: HttpClient;
 
   fn init(self: &new) { *self = Self(HttpClient.standard()); }
+
+  // The file kept under content hash 'hash' in the cache folder 'dir' (of this size, hash checked again); ok false: not kept
+  pub async fn kept(self, dir: String, size: u64, hash: u64) Fetched {
+    match loadKeptFile(&Path.from(dir.view()), size, hash) {
+      case let Some(text) { return Fetched(text, true); }
+      case is None[String] { return Fetched(String(), false); }
+    }
+  }
+
+  // Keep a file that passed its check, under its content hash
+  pub async fn keep(self, dir: String, hash: u64, text: String) {
+    _ = storeKeptFile(&Path.from(dir.view()), hash, text.view());
+  }
 
   // The text at 'loc': a URL by the client, else a path on disk read in chunks
   pub async fn text(self, loc: String) Fetched {
