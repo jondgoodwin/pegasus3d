@@ -1,0 +1,44 @@
+// The world fetch's driven checks (`pegasus --checks`): the manifest's lines, the location of a file beside its manifest, and a
+// manifest world read from disk comes out as its files' texts in order, a newline between two that did not have one. (The URL
+// path is measured end to end by tools\arrival-test.ps1: a served world arrives with the same keys and every check of the run.)
+
+fn fetchLine(name: &str, good: bool) bool {
+  print <- "check world fetch "; printStr(name);
+  if good { print <- ": ok\n"; } else { print <- ": FAILED\n"; }
+  good
+}
+
+fn writeText(path: &Path, text: &str) {
+  var b = List[u8]();
+  let raw: &Array[u8] = text;
+  b.appendSlice(raw);
+  match fs.writeFile(path, b.view()) { else {} }
+}
+
+fn checkWorldFetch() bool {
+  var all = true;
+  let names = manifestFiles("// the files\n a.ddd \n\n b.ddd\r\n  // left out\nc.ddd");
+  all = fetchLine("a manifest lists its files in order, without blanks and comments",
+    names.len() == 3usize && names[0].view() == "a.ddd" && names[1].view() == "b.ddd" && names[2].view() == "c.ddd") && all;
+  all = fetchLine("a file is found beside its manifest, by URL or by path",
+    siblingOf("http://127.0.0.1:80/w/x.world", "a.ddd").view() == "http://127.0.0.1:80/w/a.ddd"
+    && siblingOf("C:\\w\\x.world", "a.ddd").view() == "C:\\w\\a.ddd" && siblingOf("x.world", "a.ddd").view() == "a.ddd") && all;
+  all = fetchLine("a location is told as a URL or a path, a manifest by its ending",
+    isUrl("http://h/x") && isUrl("https://h/x") && !isUrl("C:\\x") && isManifest("a/b.world") && !isManifest("a/b.ddd")) && all;
+  var temp = fs.tempDir();
+  var root = Path.from("");
+  match &temp { case let Ok(t) { root = t.path().clone(); } else {} }
+  let dir = root.join("fetch");
+  match fs.makeDirAll(&dir) { else {} }
+  writeText(&dir.join("one.ddd"), "part first\n");
+  writeText(&dir.join("two.ddd"), "  part a");              // no newline at its end
+  writeText(&dir.join("three.ddd"), "  part b\n");
+  writeText(&dir.join("w.world"), "// three files\none.ddd\ntwo.ddd\nthree.ddd\n");
+  let whole = readWorldNow(dir.join("w.world").view());
+  all = fetchLine("a manifest world read from disk is its files in order, one line each",
+    whole.view() == "part first\n  part a\n  part b\n") && all;
+  all = fetchLine("a world file that is not a manifest reads as itself", readWorldNow(dir.join("one.ddd").view()).view() == "part first\n") && all;
+  writeText(&dir.join("gone.world"), "one.ddd\nmissing.ddd\n");
+  all = fetchLine("a manifest naming a file that is not there reads as nothing", readWorldNow(dir.join("gone.world").view()).len() == 0usize) && all;
+  all
+}

@@ -45,16 +45,18 @@ actor Worker {
   leaf: List[String];               // each part's own name, by slot (for the mesh hash lines)
   hashes: bool;                     // PEGASUS_MESH_HASHES is set
   cacheDir: Path;                   // the mesh cache's folder, read from only (empty: no cache)
-  skipSum: bool;                    // the mutant that reads cache entries without checking their checksum
+  stamp: u64;                       // this build's stamp: an entry another build wrote is a miss
+  lax: u32;                         // the mutants that read cache entries without checking the checksum or the stamp (cacheLax)
 
   fn init(self: &new) {
     let e = libc.getenv("PEGASUS_MESH_HASHES");
-    *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize, Path.from(""), mutantIs("cache-skip-checksum"));
+    *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize, Path.from(""), 0u64, cacheLax());
   }
 
   // Loader -> Worker: the world's text. 'index' is this worker's number: the first one reports a refusal, for all
-  pub async fn open(self, index: usize, file: String, text: String, cacheDir: String) {
+  pub async fn open(self, index: usize, file: String, text: String, cacheDir: String, stamp: u64) {
     self.cacheDir = Path.from(cacheDir.view());
+    self.stamp = stamp;
     var names = Names.standard();
     let vocab = vocabulary(&mut names);
     let reading = read(text.view(), names, vocab);
@@ -105,7 +107,7 @@ actor Worker {
       var cached = plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
       var outcome = 0u32;
       if !cacheDir.isEmpty() {
-        outcome = loadEntry(&cacheDir, job.key, CACHE_MATERIAL, skipSum, &mut cached);
+        outcome = loadEntry(&cacheDir, job.key, CACHE_MATERIAL, stamp, lax, &mut cached);
         if outcome == LOAD_HIT { return Built(cached, outcome); }
       }
       match &mut builder {
@@ -123,7 +125,7 @@ actor Worker {
       var outcome = 0u32;
       var cached = plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.), Vec3(0., 0., 0.));
       if !cacheDir.isEmpty() {
-        outcome = loadEntry(&cacheDir, job.key, CACHE_MESH, skipSum, &mut cached);
+        outcome = loadEntry(&cacheDir, job.key, CACHE_MESH, stamp, lax, &mut cached);
         if outcome == LOAD_HIT {
           if hashes {
             printStr(meshHashLine(leaf[usize.from(job.recipe.slot)].view(), meshHash(&cached.mesh)).view());
@@ -166,6 +168,10 @@ actor Loader {
   damaged: u64;                     // of those, entries that were damaged or unreadable
   opened: Instant;                  // when the world was opened
   arrived: bool;                    // the line saying every key landed has been printed
+  fetcher: Fetcher;                 // this Loader's own connection for a world's files (worldfetch.cone), never Sim's
+  pendingWorld: String;             // the world being fetched: the name its text is read under
+  pieces: List[String];             // a manifest's files' texts, by place, as they arrive
+  got: usize;                       // how many of them are in
 
   fn init(self: &new, render: Render, report: Sender[bool], expectBuilds: u64, retire: bool, offByOne: bool, simOnly: bool) {
     var ws = List[Worker]();
@@ -181,7 +187,8 @@ actor Loader {
     catalog.learn(browserAvatarKey(), browserAvatarRecipe());   // the browser's own avatar needs nothing from a world
     catalog.learn(browserAvatarMaterialKey(), browserAvatarMaterialRecipe());
     *self = Self(render, None[Sim], catalog, ws, b, false, report, expectBuilds, retire, false, simOnly,
-      MeshCache.make(Path.from(cacheFolder().view()), CACHE_CAP_BYTES), 0u64, 0u64, 0u64, Instant.now(), false);
+      MeshCache.make(Path.from(cacheFolder().view()), buildStamp(), CACHE_CAP_BYTES), 0u64, 0u64, 0u64, Instant.now(), false,
+      Fetcher(), String(), List[String](), 0usize);
   }
 
   // Player -> Loader (event): open world 'world' for 'sim', which Player has
@@ -189,40 +196,70 @@ actor Loader {
   // their keys, and Sim then asks for each
   pub async fn openWorld(self, world: String, sim: Sim) {
     self.opened = Instant.now();
+    self.sim = Some[Sim](sim.clone());
     if world.view() == "mock" || world.view() == "parts40" {
       sim.world(mockWorld(world, &mut core));
-    } else {
-      // A world's file: read, understood by the conescript reader, and its parts kept that have no problem
-      let path = Path.from(world.view());
-      var text = String();
-      var f = File.none();
-      var opened = await aio.openFile(&path, Access.Read);
-      match &mut opened {
-        case var &mut Ok(ok) { f <-> *ok; }
-        case var &mut Err(e) { print <- "loader: "; printStr(world.view()); print <- " cannot be opened: error "; print <- e.code; print <- "\n"; }
-      }
-      var offset = 0u64;
-      var going = !f.isNone();
-      while going {
-        var read = await f.readAt(offset, IoBuf(READ_CHUNK));
-        going = false;
-        match &mut read {
-          case var &mut Ok(buf) {
-            text.appendBytes(buf.view());
-            offset = offset + u64.from(buf.len());
-            going = buf.len() == READ_CHUNK;
-          }
-          case var &mut Err(e) { print <- "loader: "; printStr(world.view()); print <- " cannot be read: error "; print <- e.code; print <- "\n"; }
-        }
-      }
-      var w = 0usize;
-      while w < WORKERS {
-        workers[w].open(w, world.clone(), String.from(text.view()), String.from(cache.dir.view()));
-        w = w + 1usize;
-      }
-      sim.world(self.imageOfText(world.view(), text.view()));
+      return;
     }
-    self.sim = Some[Sim](sim);
+    // A world named by a manifest: its files are asked for together (`piece`), and the world is made when the last is in. A world
+    // named by one file: that file, then the world
+    printStr(numberLine("arrival: opened at ", u64.from(opened.nanos()), " ns\n").view());
+    pendingWorld = world.clone();
+    if isManifest(world.view()) {
+      let listing = await fetcher.text(world.clone());
+      let names = manifestFiles(listing.text.view());
+      printStr(numberLine("arrival: manifest of ", u64.from(names.len()), numberLine(" files in at +", self.sinceOpenedMs(), " ms\n").view()).view());
+      pieces = List[String]();
+      got = 0usize;
+      var i = 0usize;
+      while i < names.len() {
+        pieces.push(String());
+        selfactor.piece(i, siblingOf(world.view(), names[i].view()));
+        i = i + 1usize;
+      }
+      if names.len() == 0usize { self.begin(String()); }
+    } else {
+      var one = await fetcher.text(world.clone());
+      var text = String();
+      text <-> one.text;
+      self.begin(text);
+    }
+  }
+
+  // The fetch of one file of the manifest's world: put in its place, and when the last is in, the world begins
+  pub async fn piece(self, i: usize, loc: String) {
+    var one = await fetcher.text(loc);
+    var text = String();
+    text <-> one.text;
+    pieces.set(i, text);
+    got = got + 1usize;
+    if got < pieces.len() { return; }
+    var whole = String();
+    each p in &pieces {
+      whole.appendBytes(p.view());
+      whole.append(joinAfter(p.view()).view());
+    }
+    pieces = List[String]();
+    self.begin(whole);
+  }
+
+  fn sinceOpenedMs(self: &) u64 { u64.from((Instant.now() - opened).micros() / 1000i64) }
+
+  // The world's whole text is in (phase 1): the reader understands it, the workers are given it to build from, and the world image
+  // moves to Sim, which declares every part. Phase 2, the content, follows as Sim asks for it, nearest first
+  fn begin(self: &mut, text: String) {
+    printStr(numberLine("arrival: ", u64.from(text.len()), numberLine(" bytes of world in at +", self.sinceOpenedMs(), " ms\n").view()).view());
+    var w = 0usize;
+    while w < WORKERS {
+      workers[w].open(w, pendingWorld.clone(), String.from(text.view()), String.from(cache.dir.view()), cache.stamp);
+      w = w + 1usize;
+    }
+    let image = self.imageOfText(pendingWorld.view(), text.view());
+    match &sim {
+      case let Some(s) { s.world(image); }
+      case is None[Sim] {}
+    }
+    printStr(numberLine("arrival: parts declared at +", self.sinceOpenedMs(), " ms\n").view());
   }
 
   // The text of a world file as the message Sim takes: every part the reader kept, each key taught its recipe
