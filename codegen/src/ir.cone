@@ -1,0 +1,198 @@
+// codegen's lower form: what the backend compiles (design: MyDrive\Incubator\3D Web\WI\native-backend-design-2026-11-28.md,
+// sections 3-5).
+//
+// A Func is a list of blocks; block 0 is the entry. Each block is a list of instructions ending in exactly one
+// terminator (JMP, BR, RET, TRAP). Instructions work on virtual registers (vregs): each is one 64-bit value of one
+// class, CLASS_INT or CLASS_F64. Temporaries are defined once; a vreg standing for a source local, or for a block's
+// result, may be assigned many times (the form is not SSA). Vreg 0 is NO_REG and never defined.
+//
+// The frame is explicit: a function's incoming area (its arguments, then its results written over them) and its
+// outgoing area (what it passes to a call) are 8-byte slots reached by ARG_* and OUT_* ops. 'nArea' is how many slots
+// the incoming area has (the larger of argument and result slots); 'outSlots' how many the largest call needs.
+//
+// Ops that can trap carry a site: 'site' is the source's (unit << 32) | byte offset, which the trap reports. Sites
+// mean nothing to the backend beyond being copied into the trap table.
+//
+// THE MEANINGS OF THE FLOAT OPS ARE EXACT and are the ConeScript interpreter's (conescript\src\interp.cone):
+//   FADD FSUB FMUL FDIV FSQRT   one IEEE op, rounded once to nearest; never fused, reordered or folded
+//   FNEG FABS                    flip / clear the sign bit (NaNs included)
+//   FMIN                         NaN if either is NaN; else the lesser; if equal, the OR of the two bit patterns (-0 wins)
+//   FMAX                         NaN if either is NaN; else the greater; if equal, the AND of the bit patterns (+0 wins)
+//   FCMP cc                      IEEE: unordered gives false for every cc except CC_NE, which gives true; dst is 0 or 1
+//   I2F                          signed 64-bit integer to the nearest f64
+// Integer ops wrap (two's complement), as Cone's do. ICMP's dst is 0 or 1.
+
+pub const NO_REG = 0u32;
+pub const NO_BLOCK = 0xFFFFFFFFu32;
+
+pub const CLASS_INT = 0u8;
+pub const CLASS_F64 = 1u8;
+
+// Condition codes (ICMP: signed; FCMP: as above)
+pub const CC_EQ = 0u8;
+pub const CC_NE = 1u8;
+pub const CC_LT = 2u8;
+pub const CC_LE = 3u8;
+pub const CC_GT = 4u8;
+pub const CC_GE = 5u8;
+
+// ---- ops ----  (dst, a, b are vregs; k and cc as noted)
+pub const IR_MOV = 1u8;        // dst = a (same class)
+pub const IR_ICONST = 2u8;     // dst(int) = k
+pub const IR_FCONST = 3u8;     // dst(f64) = f64.fromBits(k)
+pub const IR_IADD = 10u8;      // dst = a + b
+pub const IR_ISUB = 11u8;
+pub const IR_IMUL = 12u8;
+pub const IR_IAND = 13u8;
+pub const IR_IOR = 14u8;
+pub const IR_IXOR = 15u8;
+pub const IR_ICMP = 16u8;      // dst(int) = a cc b, signed
+pub const IR_FADD = 20u8;
+pub const IR_FSUB = 21u8;
+pub const IR_FMUL = 22u8;
+pub const IR_FDIV = 23u8;
+pub const IR_FSQRT = 24u8;     // dst = sqrt(a)
+pub const IR_FNEG = 25u8;      // dst = -a
+pub const IR_FABS = 26u8;
+pub const IR_FMIN = 27u8;
+pub const IR_FMAX = 28u8;
+pub const IR_FCMP = 29u8;      // dst(int) = a cc b
+pub const IR_I2F = 30u8;       // dst(f64) = a(int)
+pub const IR_SELECT = 31u8;    // dst = if c != 0 { a } else { b }; c is the 'c' field (int); a, b, dst one class
+// memory (the Cone profile; the ConeScript lift never emits these)
+pub const IR_LOAD = 40u8;      // dst = *(a + k), 64 bits
+pub const IR_STORE = 41u8;     // *(a + k) = b, 64 bits
+// frame
+pub const IR_ARG_GET = 50u8;   // dst = incoming slot k
+pub const IR_ARG_SET = 51u8;   // incoming slot k = a
+pub const IR_OUT_SET = 52u8;   // outgoing slot k = a (before a call)
+pub const IR_OUT_GET = 53u8;   // dst = outgoing slot k (after a call)
+// calls (each clobbers every allocatable register)
+pub const IR_CALL = 60u8;      // call function k of the same Funcs; arguments and results in the outgoing area.
+                               // First: if ctx.depth == 0, trap TRAP_DEPTH at site; else depth -= 1 (+= 1 on return)
+pub const IR_GATE = 61u8;      // ok = gate(ctx, k, &outgoing[0]); if ok == 0, trap TRAP_GATE at site.
+                               // k below 1 << 32 is an import's index; k = (1 << 32) | n is list.make of the n slots
+                               // at outgoing[0 ..< n], whose handle comes back in outgoing[0]
+pub const IR_FUEL = 62u8;      // if fuel < k, trap TRAP_FUEL at site; else fuel -= k
+// terminators
+pub const IR_JMP = 70u8;       // to block t
+pub const IR_BR = 71u8;        // if a != 0 to block t else to block f
+pub const IR_RET = 72u8;       // return (results already written with ARG_SET)
+pub const IR_TRAP = 73u8;      // trap kind k at site
+
+// Trap kinds, as the entry stub returns them (0 is success). They match conescript's TrapKind order + 1.
+pub const TRAP_NONE = 0u64;
+pub const TRAP_FUEL = 1u64;
+pub const TRAP_GATE = 2u64;        // an import or runtime entry refused
+pub const TRAP_UNREACHABLE = 3u64;
+pub const TRAP_DEPTH = 4u64;       // call depth or the stack guard
+
+pub struct Inst {
+  pub op: u8;
+  pub cc: u8;
+  pub dst: u32;
+  pub a: u32;
+  pub b: u32;
+  pub c: u32;        // SELECT's condition
+  pub t: u32;        // JMP / BR target block
+  pub f: u32;        // BR's false block
+  pub k: u64;
+  pub site: u64;
+}
+
+pub struct Block {
+  pub insts: List[Inst];
+}
+
+pub struct Func {
+  pub name: String;
+  pub classes: List[u8];      // by vreg; entry 0 is NO_REG's
+  pub blocks: List[Block];
+  pub nArea: u32;
+  pub outSlots: u32;
+  pub site: u64;              // reported by a depth trap in the prologue
+}
+
+// The functions compiled together into one MachineCode; a CALL's k indexes this list
+pub alias Funcs = List[Func];
+
+// Writes a Func: make vregs and blocks, choose the current block, append instructions
+pub struct FuncBuilder {
+  pub func: Func;
+  cur: u32;
+
+  pub fn make(name: &str, nArea: u32, site: u64) FuncBuilder {
+    var f = Func(String.from(name), List[u8](), List[Block](), nArea, 0u32, site);
+    f.classes.push(CLASS_INT);
+    f.blocks.push(Block(List[Inst]()));
+    FuncBuilder(f, 0u32)
+  }
+
+  pub fn vreg(self: &mut, class: u8) u32 {
+    self.func.classes.push(class);
+    u32.from(self.func.classes.len() - 1usize)
+  }
+  pub fn block(self: &mut) u32 {
+    self.func.blocks.push(Block(List[Inst]()));
+    u32.from(self.func.blocks.len() - 1usize)
+  }
+  pub fn at(self: &mut, b: u32) { self.cur = b; }
+  pub fn current(self: &) u32 { self.cur }
+  // A call needs n outgoing slots: the area grows to the largest
+  pub fn needOut(self: &mut, n: u32) { if n > self.func.outSlots { self.func.outSlots = n; } }
+
+  pub fn emit(self: &mut, i: Inst) { (&mut self.func.blocks[usize.from(self.cur)]).insts.push(i); }
+
+  // The common shapes
+  pub fn op3(self: &mut, op: u8, dst: u32, a: u32, b: u32) {
+    self.emit(Inst(op, 0u8, dst, a, b, NO_REG, NO_BLOCK, NO_BLOCK, 0u64, 0u64));
+  }
+  pub fn cmp(self: &mut, op: u8, cc: u8, dst: u32, a: u32, b: u32) {
+    self.emit(Inst(op, cc, dst, a, b, NO_REG, NO_BLOCK, NO_BLOCK, 0u64, 0u64));
+  }
+  pub fn opImm(self: &mut, op: u8, dst: u32, a: u32, k: u64) {
+    self.emit(Inst(op, 0u8, dst, a, NO_REG, NO_REG, NO_BLOCK, NO_BLOCK, k, 0u64));
+  }
+  pub fn select(self: &mut, dst: u32, c: u32, a: u32, b: u32) {
+    self.emit(Inst(IR_SELECT, 0u8, dst, a, b, c, NO_BLOCK, NO_BLOCK, 0u64, 0u64));
+  }
+  pub fn sited(self: &mut, op: u8, k: u64, site: u64) {
+    self.emit(Inst(op, 0u8, NO_REG, NO_REG, NO_REG, NO_REG, NO_BLOCK, NO_BLOCK, k, site));
+  }
+  pub fn jmp(self: &mut, t: u32) {
+    self.emit(Inst(IR_JMP, 0u8, NO_REG, NO_REG, NO_REG, NO_REG, t, NO_BLOCK, 0u64, 0u64));
+  }
+  pub fn br(self: &mut, a: u32, t: u32, f: u32) {
+    self.emit(Inst(IR_BR, 0u8, NO_REG, a, NO_REG, NO_REG, t, f, 0u64, 0u64));
+  }
+  pub fn ret(self: &mut) {
+    self.emit(Inst(IR_RET, 0u8, NO_REG, NO_REG, NO_REG, NO_REG, NO_BLOCK, NO_BLOCK, 0u64, 0u64));
+  }
+  pub fn trap(self: &mut, kind: u64, site: u64) {
+    self.emit(Inst(IR_TRAP, 0u8, NO_REG, NO_REG, NO_REG, NO_REG, NO_BLOCK, NO_BLOCK, kind, site));
+  }
+}
+
+// ---- the context generated code reaches through r15 (x64) / x28 (arm64) ----
+// Field offsets are fixed: the emitter writes them as constants. The runner (conescript\src\native.cone) owns one.
+pub const CTX_GATE = 0u32;         // usize: &fn @c (ctx: *u8, k: u64, slots: *u64) u64
+pub const CTX_FUEL = 8u32;         // u64: fuel at entry, and left at exit
+pub const CTX_DEPTH = 16u32;       // u64: calls still allowed below the entry function (the runner sets MAX_CALL_DEPTH - 1)
+pub const CTX_STACK_LIMIT = 24u32; // usize: the lowest rsp a prologue accepts (the entry stub sets it 256 KiB below its rsp;
+                                   // below it a prologue traps TRAP_DEPTH at the Func's site: a net that should never fire)
+pub const CTX_ENTRY_SP = 32u32;    // usize: rsp saved by the entry stub, for unwinding a trap
+pub const CTX_TRAP_SITE = 40u32;   // u64: the site of the trap that stopped the run
+pub const CTX_USER = 48u32;        // usize: the host's own pointer. The gate is handed the NativeCtx itself and finds it here
+
+pub struct NativeCtx {
+  pub gate: usize;
+  pub fuel: u64;
+  pub depth: u64;
+  pub stackLimit: usize;
+  pub entrySp: usize;
+  pub trapSite: u64;
+  pub user: usize;
+}
+
+// Depth allowed per run, in both executors
+pub const MAX_CALL_DEPTH = 1024u64;
