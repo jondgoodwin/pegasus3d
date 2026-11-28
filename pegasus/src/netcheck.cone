@@ -108,7 +108,25 @@ fn checkWire() bool {
   people.push(OtherPerson(3u32, Vec3(1., 0., 2.), 0.5));
   var deltas = PartDeltas();
   var i = 0u32;
-  while i < 12u32 { deltas.push(PartDelta(i * 5u32, FIELD_PLACEMENT, Mat4.fromTranslation(Vec3(f32.from(i), 0.5, -8.)), 0u64)); i = i + 1u32; }
+  while i < 12u32 { deltas.push(PartDelta(i * 5u32, FIELD_PLACEMENT, Mat4.fromTranslation(Vec3(f32.from(i), 0.5, -8.)), 0u64, noLook())); i = i + 1u32; }
+  // a lamp's look on the wire: one delta of the look alone, intact after the round trip
+  var lampDeltas = PartDeltas();
+  var lamp = noLook();
+  lamp.kind = LOOK_SPOT; lamp.shadows = true; lamp.dir = Vec3(0., -1., 0.25); lamp.color = Vec3(1., 0.8, 0.5); lamp.amount = 4000.5;
+  lamp.reach = 9.; lamp.source = 0.07; lamp.cone = 0.6; lamp.softEdge = 0.2;
+  lampDeltas.push(PartDelta(9u32, FIELD_LOOK, Mat4.identity(), 0u64, lamp));
+  let lampTail = encodePartTail(5u64, &lampDeltas, 0u64);
+  var lampFull = List[u8]();
+  lampFull.appendSlice(encodePeople(3u64, &OtherPersons()).view());
+  lampFull.appendList(lampTail.clone());
+  var lStep = 0u64;
+  var lPeople = OtherPersons();
+  var lThrough = 0u64;
+  var lGot = PartDeltas();
+  var lHash = 0u64;
+  var lampOk = decodeShared(bytesOfList(&lampFull), &mut lStep, &mut lPeople, &mut lThrough, &mut lGot, &mut lHash);
+  lampOk = lampOk && lGot.len() == 1usize && lGot[0usize].mask == FIELD_LOOK && sameLook(&lGot[0usize].look, &lamp)
+    && lampTail.len() == 1usize + 8usize + LOOK_DELTA_BYTES + 1usize;
   let head = encodePeople(77u64, &people);
   var full = List[u8]();
   full.appendSlice(head.view());
@@ -123,7 +141,7 @@ fn checkWire() bool {
     && gotStep == 77u64 && gotPeople.len() == 1usize && gotPeople[0usize].id == 3u32 && gotThrough == 41u64 && gotDeltas.len() == 12usize
     && gotDeltas[7usize].id == 35u32 && gotDeltas[7usize].placement.m[12] == 7. && full.len() <= 1173usize
     && gotHash == 0xABCDEF0123456789u64
-    && partRoom(1usize) >= 12usize && full.len() == head.len() + 1usize + 8usize + 12usize * PLACEMENT_DELTA_BYTES + 9usize;
+    && partRoom(1usize) >= 12usize * PLACEMENT_DELTA_BYTES && lampOk && full.len() == head.len() + 1usize + 8usize + 12usize * PLACEMENT_DELTA_BYTES + 9usize;
   let atRest = bytesOfList(&encodePartTail(41u64, &PartDeltas(), 0u64));
   partsOk = partsOk && atRest.len() == 2usize && head.len() + atRest.len() == 9usize + 20usize + 2usize;
   // the hash: the same states hash alike, one part moved a hair hashes differently, and the order matters
@@ -133,16 +151,24 @@ fn checkWire() bool {
   hs2.push(Mat4.fromTranslation(Vec3(1., 2., 3.))); hs2.push(Mat4.identity());
   var ms = List[ContentKey]();
   ms.push(7u64); ms.push(9u64);
-  let h1 = statesHash(&hs, &ms);
-  let sameHash = h1 == statesHash(&hs2, &ms) && h1 != 0u64;
+  var ls = List[PartLook]();
+  ls.push(noLook()); ls.push(lamp);
+  let h1 = statesHash(&hs, &ms, &ls);
+  let sameHash = h1 == statesHash(&hs2, &ms, &ls) && h1 != 0u64;
   hs2.set(1usize, Mat4.fromTranslation(Vec3(0., 0., 0.0001)));
-  partsOk = partsOk && sameHash && statesHash(&hs2, &ms) != h1;
+  partsOk = partsOk && sameHash && statesHash(&hs2, &ms, &ls) != h1;
+  // a lamp's intensity alone changes the hash
+  var ls2 = ls.clone();
+  var dimmer = lamp;
+  dimmer.amount = 4000.25;
+  ls2.set(1usize, dimmer);
+  partsOk = partsOk && statesHash(&hs, &ms, &ls2) != h1;
   // a material key alone changes the hash, and so does a key's high half
   var ms2 = ms.clone();
   ms2.set(1usize, 9u64 + 0x100000000u64);
-  partsOk = partsOk && statesHash(&hs, &ms2) != h1;
+  partsOk = partsOk && statesHash(&hs, &ms2, &ls) != h1;
   ms2.set(1usize, 10u64);
-  partsOk = partsOk && statesHash(&hs, &ms2) != h1;
+  partsOk = partsOk && statesHash(&hs, &ms2, &ls) != h1;
   print <- "check wire snapshot: "; print <- u64.from(head.len()); print <- " bytes of people, 12 changed parts in "; print <- u64.from(full.len());
   print <- " bytes, none changed adds "; print <- u64.from(atRest.len()); print <- " byte";
   if partsOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
@@ -217,8 +243,15 @@ fn checkPartDelta(vsSent: bool) bool {
   var nowMat = List[ContentKey]();
   i = 0usize;
   while i < 3usize { definedMat.push(100u64 + u64.from(i)); nowMat.push(100u64 + u64.from(i)); i = i + 1usize; }
-  var tracker = PartTracker.make(&defined, &definedMat, vsSent);
+  var definedLook = List[PartLook]();
+  i = 0usize;
+  while i < 3usize { definedLook.push(noLook()); i = i + 1usize; }
+  var nowLook = definedLook.clone();
+  var lampLook = noLook();
+  lampLook.kind = LOOK_POINT; lampLook.amount = 800.; lampLook.reach = 6.;
+  var tracker = PartTracker.make(&defined, &definedMat, &definedLook, vsSent);
   var view = PartView.make(3usize);
+  var lookOnly = 0u64;              // deltas that carried a look and nothing else
   var materialOnly = 0u64;          // deltas that carried a material key and no placement
   var materialWithPlace = 0u64;     // deltas that carried both
   var ackAtServer = 0u64;
@@ -235,10 +268,12 @@ fn checkPartDelta(vsSent: bool) bool {
     // part 0 changes its material alone at step 12, and part 2 changes it again at step 15 (the snapshot at 16 carries it)
     if step == 12u64 { nowMat.set(0usize, 200u64); _ = tracker.observeMaterial(0usize, 200u64); }
     if step == 15u64 { nowMat.set(2usize, 300u64); _ = tracker.observeMaterial(2usize, 300u64); }
+    // part 1 is a lamp turned on at step 17 (the snapshot at 18 carries it)
+    if step == 17u64 { nowLook.set(1usize, lampLook); _ = tracker.observeLook(1usize, &nowLook[1usize]); }
     if due != 0u64 && step >= due { if dueAck > ackAtServer { ackAtServer = dueAck; } due = 0u64; }
     if step % 2u64 == 0u64 {
       var deltas = PartDeltas();
-      let through = tracker.select(ackAtServer, 8usize, false, &mut deltas);
+      let through = tracker.select(ackAtServer, 8usize * DELTA_BYTES, false, &mut deltas);
       var full = List[u8]();
       full.appendSlice(encodePeople(step, &OtherPersons()).view());
       full.appendList(encodePartTail(through, &deltas, 0u64));
@@ -254,6 +289,7 @@ fn checkPartDelta(vsSent: bool) bool {
         var gotHash = 0u64;
         if decodeShared(bytesOfList(&full), &mut gotStep, &mut people, &mut gotThrough, &mut got, &mut gotHash) {
           each d in &got {
+            if d.mask == FIELD_LOOK { lookOnly = lookOnly + 1u64; }
             if (d.mask & FIELD_MATERIAL) != 0u32 {
               if (d.mask & FIELD_PLACEMENT) == 0u32 { materialOnly = materialOnly + 1u64; } else { materialWithPlace = materialWithPlace + 1u64; }
             }
@@ -277,7 +313,12 @@ fn checkPartDelta(vsSent: bool) bool {
   var matSame = true;
   i = 0usize;
   while i < 3usize { if *gotMat[i] != *nowMat[i] { matSame = false; } i = i + 1usize; }
-  same = same && matSame && materialOnly >= 1u64;
+  // ... and its looks, the lamp turned on sent as the look alone
+  let gotLook = view.looks(&definedLook);
+  var lookSame = true;
+  i = 0usize;
+  while i < 3usize { if !sameLook(&gotLook[i], &nowLook[i]) { lookSame = false; } i = i + 1usize; }
+  same = same && matSame && materialOnly >= 1u64 && lookSame && lookOnly >= 1u64;
   print <- "check part deltas (the snapshot at step 4 lost): "; print <- sent; print <- " part states sent in all, "; print <- sentLate;
   print <- " in the last twenty steps, the snapshot "; print <- u64.from(firstBytes); print <- " bytes with a part and "; print <- u64.from(lastBytes);
   print <- " at rest; the client's parts "; if same { print <- "match"; } else { print <- "DIFFER from"; } print <- " the server's";

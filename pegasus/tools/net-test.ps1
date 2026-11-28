@@ -30,12 +30,14 @@ switch ($Scenario) {
   "loop" { $srvArgs += @("--steps", "1800", "--until-empty") }
   "loss" { $srvArgs += @("--steps", "1800", "--until-empty", "--impair", "50", "20", "10") }
   "glide" { $srvArgs += @("--steps", "1800", "--until-empty") }
+  "light" { $srvArgs += @("--steps", "1800", "--until-empty"); $env:PEGASUS_LIGHT_CHANGE = "400:sun:25000" }
   "avatar" { $srvArgs += @("--steps", "1800", "--until-empty") }
   "glideloss" { $srvArgs += @("--steps", "1800", "--until-empty", "--impair", "50", "20", "10") }
   "rejoin" { $srvArgs += @("--steps", "900") }
   "refuse" { $srvArgs += @("--steps", "400") }
 }
 $srv = Start-P "server" $srvArgs
+Remove-Item Env:PEGASUS_LIGHT_CHANGE -ErrorAction SilentlyContinue   # only the server changes a light
 if (-not (Wait-Line "$out\server.log" "Serving on UDP port" 20)) { Write-Host "server did not start"; Stop-Process -Id $srv.Id -Force; exit 1 }
 if ($Scenario -eq "loss" -or $Scenario -eq "glideloss") {
   if (-not (Wait-Line "$out\server.log" "Relay: port" 5)) { Write-Host "no relay"; exit 1 }
@@ -57,7 +59,7 @@ if ($Scenario -eq "glide" -or $Scenario -eq "glideloss") {
   Start-Sleep -Milliseconds 1500
   $c = Start-P "clientC" ($cl + @("--stand", "--shot", "$out\clientC.bmp", "--shot-after", $AfterSteps))
   Wait-Exit $a 60; Wait-Exit $c 60; Wait-Exit $srv 60
-} elseif ($Scenario -eq "loop" -or $Scenario -eq "loss") {
+} elseif ($Scenario -eq "loop" -or $Scenario -eq "loss" -or $Scenario -eq "light") {
   $b = Start-P "clientB" ($cl + @("--steps", "520", "--stand"))
   Start-Sleep -Milliseconds 1500
   $a = Start-P "clientA" ($cl + @("--steps", "420"))
@@ -74,7 +76,7 @@ if ($Scenario -eq "glide" -or $Scenario -eq "glideloss") {
 foreach ($p in $procs) { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
 foreach ($f in Get-ChildItem "$out\*.log") {
   Write-Host "== $($f.Name)"
-  Get-Content $f | Select-String -Pattern "^(check|net |sim: |pegasus:|Serving|Relay|REFUSED|loader:)" | ForEach-Object { $_.Line }
+  Get-Content $f | Select-String -Pattern "^(check|net |sim: |pegasus:|Serving|Relay|REFUSED|loader:|render: light)" | ForEach-Object { $_.Line }
 }
 foreach ($p in $procs) { Write-Host "exit pid $($p.Id): $($p.ExitCode)" }
 # glide scenarios: every client must end with each moved part where the server has it
@@ -85,5 +87,18 @@ if ($Scenario -like "glide*") {
     if ($n -eq "clientC") { continue }
     $same = ($got.Count -eq $srvParts.Count) -and (($got -join "|") -eq ($srvParts -join "|"))
     Write-Host "GLIDE-CHECK $n final parts [$($got -join '; ')] vs server [$($srvParts -join '; ')]: $(if ($same) { 'MATCH' } else { 'DIFFER' })"
+  }
+}
+# light scenario (W142): the server changes the sun's lux at its step 400; each client's Render must end with the server's light
+if ($Scenario -eq "light") {
+  $srvLight = (Get-Content "$out\server.log" | Select-String -Pattern "^sim: light: (.*?), \d+ look changes").Matches | Select-Object -First 1
+  Write-Host "LIGHT-CHECK server: $($srvLight.Groups[1].Value)"
+  foreach ($n in "clientA", "clientB") {
+    $r = (Get-Content "$out\$n.log" -ErrorAction SilentlyContinue | Select-String -Pattern "^render: light: (.*)$").Matches | Select-Object -First 1
+    $s = (Get-Content "$out\$n.log" -ErrorAction SilentlyContinue | Select-String -Pattern "^sim: light: (.*?), \d+ look changes").Matches | Select-Object -First 1
+    $lux = [regex]::Match($srvLight.Groups[1].Value, "lux ([\d.]+)").Groups[1].Value
+    $rlux = [regex]::Match($r.Groups[1].Value, "lux ([\d.]+)").Groups[1].Value
+    $slux = [regex]::Match($s.Groups[1].Value, "lux ([\d.]+)").Groups[1].Value
+    Write-Host "LIGHT-CHECK $n render: $($r.Groups[1].Value) | sim: $($s.Groups[1].Value): $(if (($lux -eq $rlux) -and ($lux -eq $slux)) { 'MATCH' } else { 'DIFFER' })"
   }
 }
