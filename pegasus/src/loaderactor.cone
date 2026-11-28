@@ -30,7 +30,8 @@ pub const MOCK_KEYS_40 = 9usize;    // the 40-part world's five meshes and five 
 const READ_CHUNK = 65536usize;     // a world file is read this much at a time
 const WORKERS = 3usize;            // jobs in flight at once
 const CACHE_EVICT_EVERY = 32u64;   // the mesh cache is trimmed to its cap after this many writes (and at stop)
-const SETTLE_US = 1000i64;         // the burst of requests that follows a world image is gathered for this long
+pub const PARTS_NOT_KNOWN = 0xFFFFFFFFusize;   // Render.partsAwaited: the world's files are not all in
+const SETTLE_US = 1000i64;        // the burst of requests that follows a world image is gathered for this long
 
 // What a worker's job came back with: the products, and what the cache said (0: the cache was not asked: mock content, or off)
 pub struct Built {
@@ -53,8 +54,10 @@ actor Worker {
     *self = Self(None[PartBuilder], List[String](), (e as usize) != 0usize, Path.from(""), 0u64, cacheLax());
   }
 
-  // Loader -> Worker: the world's text. 'index' is this worker's number: the first one reports a refusal, for all
-  pub async fn open(self, index: usize, file: String, text: String, cacheDir: String, stamp: u64) {
+  // Loader -> Worker: the world's text, or the part of it that has arrived (a part builder made from the text builds any part the
+  // text has: slots are the same in any longer text). 'index' is this worker's number: the first one reports a refusal, for all, and
+  // only when 'whole' says the text is every file's
+  pub async fn open(self, index: usize, file: String, text: String, cacheDir: String, stamp: u64, whole: bool) {
     self.cacheDir = Path.from(cacheDir.view());
     self.stamp = stamp;
     var names = Names.standard();
@@ -71,7 +74,7 @@ actor Worker {
           i = i + 1usize;
         }
         // a unit the verifier refused leaves out the parts that use it; one line each, from the first worker only
-        if index == 0usize {
+        if index == 0usize && whole {
           let refused = bld.refusals();
           var r = 0usize;
           while r < refused.len() {
@@ -81,13 +84,14 @@ actor Worker {
           }
         }
         self.builder = Some[PartBuilder](bld);
+        leaf = List[String]();
         i = 0usize;
         while i < w.nodes.len() { leaf.push(String.from(w.names.text(w.nodes[i].name))); i = i + 1usize; }
       }
       case let Err(problems) {
         // Only a fault in the code's shared tables (its version or types) refuses the world's code whole; no part is
         // built. Each problem names a unit.
-        if index == 0usize {
+        if index == 0usize && whole {
           var k = 0usize;
           while k < problems.len() {
             print <- "build: "; printStr(file.view()); print <- ": the world's code was refused: "; printStr(problems[k].what.view());
@@ -150,6 +154,26 @@ actor Worker {
   }
 }
 
+// The Loader's reader: reads a world's text, or the files of it that have arrived, off the Loader's own turns (so a file arriving
+// meanwhile is taken in at once) with the `conescript` reader, which it uses as it is
+actor Reader {
+  reads: u64;
+
+  fn init(self: &new) { *self = Self(0u64); }
+
+  // Loader -> Reader: the shape parts of the first files, as far as they are understood (`readPrefix`)
+  pub async fn prefix(self, file: String, text: String) ImageWorld {
+    reads = reads + 1u64;
+    readPrefix(file.view(), text.view())
+  }
+
+  // Loader -> Reader: the whole world: every part, the rules and derives, the keys and the looks (`readImage`)
+  pub async fn whole(self, file: String, text: String) ImageWorld {
+    reads = reads + 1u64;
+    readImage(file.view(), text.view())
+  }
+}
+
 actor Loader {
   render: Render;
   sim: Option[Sim];
@@ -171,7 +195,14 @@ actor Loader {
   fetcher: Fetcher;                 // this Loader's own connection for a world's files (worldfetch.cone), never Sim's
   pendingWorld: String;             // the world being fetched: the name its text is read under
   pieces: List[String];             // a manifest's files' texts, by place, as they arrive
-  got: usize;                       // how many of them are in
+  reader: Reader;
+  arrival: FileArrival;             // which files are in, and which read to start next (worldfetch.cone)
+  earlySlots: List[u32];            // the parts declared to Sim before every file was in: each one's slot,
+  earlyKeys: List[ContentKey];      // ... and mesh key, to check against the whole world's parts when it is read
+  earlyBroken: bool;                // a longer text disagreed with a part already declared: no more are declared early
+  latest: String;                   // the text the latest read covered: what a worker that has not seen the newest parts is opened with
+  latestSlots: usize;               // the number of parts that text has: a worker opened with it can build any slot below
+  covers: List[usize];              // for each worker, the number of parts of the text it was opened with
   filesKept: u64;                   // of those, files the cache had by content hash (not fetched)
   filesFetched: u64;                // files fetched and found as the manifest said
   filesLeftOut: u64;                // files left out: not fetched, or the wrong size or hash, or a bad manifest line
@@ -181,10 +212,12 @@ actor Loader {
   fn init(self: &new, render: Render, report: Sender[bool], expectBuilds: u64, retire: bool, offByOne: bool, simOnly: bool) {
     var ws = List[Worker]();
     var b = List[bool]();
+    var cov = List[usize]();
     let oneAtATime = (libc.getenv("PEGASUS_MESH_HASHES") as usize) != 0usize;
     var i = 0usize;
     while i < WORKERS {
       ws.push(Worker());
+      cov.push(0usize);
       b.push(oneAtATime && i > 0usize);   // PEGASUS_MESH_HASHES: only worker 0 takes jobs, so the hash lines of two workers cannot tear into each other
       i = i + 1usize;
     }
@@ -193,7 +226,8 @@ actor Loader {
     catalog.learn(browserAvatarMaterialKey(), browserAvatarMaterialRecipe());
     *self = Self(render, None[Sim], catalog, ws, b, false, report, expectBuilds, retire, false, simOnly,
       MeshCache.make(Path.from(cacheFolder().view()), buildStamp(), CACHE_CAP_BYTES), 0u64, 0u64, 0u64, Instant.now(), false,
-      Fetcher(), String(), List[String](), 0usize, 0u64, 0u64, 0u64, List[ManifestEntry](), List[bool]());
+      Fetcher(), String(), List[String](), Reader(), FileArrival.make(0usize, false), List[u32](), List[ContentKey](), false, String(), 0usize,
+      cov, 0u64, 0u64, 0u64, List[ManifestEntry](), List[bool]());
   }
 
   // Player -> Loader (event): open world 'world' for 'sim', which Player has
@@ -225,7 +259,11 @@ actor Loader {
       fromKept = List[bool]();
       printStr(numberLine("arrival: manifest of ", u64.from(names.len()), numberLine(" files in at +", self.sinceOpenedMs(), " ms\n").view()).view());
       pieces = List[String]();
-      got = 0usize;
+      arrival = FileArrival.make(names.len(), mutantIs("rules-early"));
+      if !simOnly { render.partsAwaited(PARTS_NOT_KNOWN); }
+      earlySlots = List[u32]();
+      earlyKeys = List[ContentKey]();
+      earlyBroken = false;
       filesKept = 0u64;
       filesFetched = 0u64;
       filesLeftOut = 0u64;
@@ -281,42 +319,141 @@ actor Loader {
         }
       }
     }
-    pieces.set(i, text);
-    got = got + 1usize;
-    if got < pieces.len() { return; }
-    // each file's text must begin where the manifest says (the part its first line declares, or sits in): one that does not is
-    // left out, and said once (the paths are worked out through every file before, so a file left out for this does not move another's)
-    let declared = declaredPaths(&pieces);
-    var f = 0usize;
-    while f < pieces.len() && f < entries.len() {
-      if declared[f].len() > 0usize && declared[f].view() != entries[f].path.view() {
-        printStr(pathLine(entries[f].name.view(), entries[f].path.view(), declared[f].view()).view());
-        pieces.set(f, String());
-        if *fromKept[f] { filesKept = filesKept - 1u64; } else { filesFetched = filesFetched - 1u64; }
+    // a file's text must begin where the manifest says: the part its first line declares must be the path's last part. Judged from
+    // the file's own text, so a file left out for this (or any other reason) moves no other file's place. A mismatch is left out, said once
+    if lineOk && text.len() > 0usize {
+      let place = placeOfText(text.view());
+      if !placeFits(path.view(), &place) {
+        printStr(pathLine(name.view(), path.view(), &place).view());
+        text = String();
+        if *fromKept[i] { filesKept = filesKept - 1u64; } else { filesFetched = filesFetched - 1u64; }
         filesLeftOut = filesLeftOut + 1u64;
       }
+    }
+    pieces.set(i, text);
+    arrival.arrive(i);
+    if arrival.allIn() {
+      printStr(numberLine("arrival: ", u64.from(pieces.len()), numberLine(" files: ", filesKept, numberLine(" kept, ", filesFetched,
+        numberLine(" fetched, ", filesLeftOut, " left out\n").view()).view()).view()).view());
+      printStr(numberLine("arrival: ", u64.from(self.joined(pieces.len()).len()), numberLine(" bytes of world in at +", self.sinceOpenedMs(), " ms\n").view()).view());
+    }
+    self.readNext();
+  }
+
+  // The files that have arrived: their texts one after the other, a newline between two that did not have one
+  fn joined(self: &, files: usize) String {
+    var out = String();
+    var f = 0usize;
+    while f < files && f < pieces.len() {
+      out.appendBytes(pieces[f].view());
+      out.append(joinAfter(pieces[f].view()).view());
       f = f + 1usize;
     }
-    printStr(numberLine("arrival: ", u64.from(pieces.len()), numberLine(" files: ", filesKept, numberLine(" kept, ", filesFetched,
-      numberLine(" fetched, ", filesLeftOut, " left out\n").view()).view()).view()).view());
-    var whole = String();
-    each p in &pieces {
-      whole.appendBytes(p.view());
-      whole.append(joinAfter(p.view()).view());
+    out
+  }
+
+  // Start the next read the arrived files call for, if none is under way: the first files read (a prefix, whose shape parts Sim
+  // declares now), or every file read (the whole world: its rules and derives start only now)
+  fn readNext(self: &mut) {
+    let what = arrival.next();
+    if what == READ_PREFIX { selfactor.readPrefix(arrival.inRun()); }
+    if what == READ_WHOLE { selfactor.readWhole(arrival.inRun()); }
+  }
+
+  // Read the first 'files' files, and declare the shape parts that are settled. A file that arrives meanwhile waits for this read:
+  // the next one then gathers every file in by that time
+  pub async fn readPrefix(self, files: usize) {
+    let text = self.joined(files);
+    var img = await reader.prefix(pendingWorld.clone(), text.clone());
+    self.takePrefix(text, &mut img);
+    arrival.readDone(false);
+    self.readNext();
+  }
+
+  // Every file is in: read the whole world and give it to Sim (with the rules, the derives and the looks)
+  pub async fn readWhole(self, files: usize) {
+    let text = self.joined(files);
+    var img = await reader.whole(pendingWorld.clone(), text.clone());
+    arrival.readDone(true);
+    self.finish(text, &mut img);
+  }
+
+  // The parts the first files give that will be the same in the whole world: those before the first the reader left out (a part
+  // naming one in a file not in yet is among the left-out), as far as the order the whole world gives them. They go to Sim now, each
+  // key taught its recipe; a worker that is asked for one is opened with this text
+  fn takePrefix(self: &mut, text: String, img: &mut ImageWorld) {
+    latest = text;
+    latestSlots = usize.from(img.slots);
+    var k = 0usize;
+    while k < img.parts.len() && img.parts[k].slot < img.firstDropped { k = k + 1usize; }
+    var i = 0usize;
+    var same = true;
+    while i < earlySlots.len() {
+      if i >= k || img.parts[i].slot != *earlySlots[i] || img.parts[i].key != *earlyKeys[i] { same = false; }
+      i = i + 1usize;
     }
-    pieces = List[String]();
-    self.begin(whole);
+    if !same && !earlyBroken {
+      earlyBroken = true;
+      printStr(numberLine("loader: a longer text read differently a part already declared (", u64.from(earlySlots.len()), " declared early): no more are declared early\n").view());
+    }
+    if earlyBroken || k <= earlySlots.len() { return; }
+    var decls = PartDecls();
+    var j = earlySlots.len();
+    while j < k {
+      let p = &img.parts[j];
+      core.learn(p.key, p.recipe.copy());
+      core.learn(p.material, p.materialRecipe.copy());
+      decls.push(PartDecl(p.path.clone(), p.key, p.material, noLook(), p.placement, p.slot));
+      earlySlots.push(p.slot);
+      earlyKeys.push(p.key);
+      j = j + 1usize;
+    }
+    match &sim {
+      case let Some(s) { s.declare(decls, img.startFeet); }
+      case is None[Sim] {}
+    }
+    printStr(numberLine("arrival: ", u64.from(earlySlots.len()), numberLine(" parts declared early (", u64.from(arrival.inRun()),
+      numberLine(" of ", u64.from(arrival.files()), numberLine(" files) at +", self.sinceOpenedMs(), " ms\n").view()).view()).view()).view());
+  }
+
+  // The whole world is read: the part of it that was not declared early goes to Sim with its rules, derives and looks
+  fn finish(self: &mut, text: String, img: &mut ImageWorld) {
+    latest = text;
+    latestSlots = usize.from(img.slots);
+    // worker 0 reads the whole world to report what the verifier refuses; the others are opened when asked for a part the text
+    // they have lacks
+    workers[0usize].open(0usize, pendingWorld.clone(), String.from(latest.view()), String.from(cache.dir.view()), cache.stamp, true);
+    covers.set(0usize, latestSlots);
+    var same = !earlyBroken && earlySlots.len() <= img.parts.len();
+    var i = 0usize;
+    while same && i < earlySlots.len() {
+      if img.parts[i].slot != *earlySlots[i] || img.parts[i].key != *earlyKeys[i] { same = false; }
+      i = i + 1usize;
+    }
+    if !same {
+      printStr(numberLine("loader: the whole world's parts differ from the ", u64.from(earlySlots.len()), " declared early\n").view());
+    }
+    let partCount = img.parts.len();
+    let image = self.imageOf(pendingWorld.view(), img, earlySlots.len());
+    if !simOnly { render.partsAwaited(partCount); }
+    match &sim {
+      case let Some(s) { s.world(image); }
+      case is None[Sim] {}
+    }
+    if arrival.allIn() { pieces = List[String](); }
+    printStr(numberLine("arrival: parts declared at +", self.sinceOpenedMs(), " ms\n").view());
   }
 
   fn sinceOpenedMs(self: &) u64 { u64.from((Instant.now() - opened).micros() / 1000i64) }
 
-  // The world's whole text is in (phase 1): the reader understands it, the workers are given it to build from, and the world image
+  // A world of one file is in (phase 1): the reader understands it, the workers are given it to build from, and the world image
   // moves to Sim, which declares every part. Phase 2, the content, follows as Sim asks for it, nearest first
   fn begin(self: &mut, text: String) {
     printStr(numberLine("arrival: ", u64.from(text.len()), numberLine(" bytes of world in at +", self.sinceOpenedMs(), " ms\n").view()).view());
     var w = 0usize;
     while w < WORKERS {
-      workers[w].open(w, pendingWorld.clone(), String.from(text.view()), String.from(cache.dir.view()), cache.stamp);
+      workers[w].open(w, pendingWorld.clone(), String.from(text.view()), String.from(cache.dir.view()), cache.stamp, true);
+      covers.set(w, 0xFFFFFFFFusize);
       w = w + 1usize;
     }
     let image = self.imageOfText(pendingWorld.view(), text.view());
@@ -327,15 +464,23 @@ actor Loader {
     printStr(numberLine("arrival: parts declared at +", self.sinceOpenedMs(), " ms\n").view());
   }
 
-  // The text of a world file as the message Sim takes: every part the reader kept, each key taught its recipe
   fn imageOfText(self: &mut, file: &str, text: &str) WorldImage {
     var image = readImage(file, text);
+    self.imageOf(file, &mut image, 0usize)
+  }
+
+  // A world read, as the message Sim takes: every part the reader kept from the first 'skip' on (the ones before were declared
+  // early), each key taught its recipe
+  fn imageOf(self: &mut, file: &str, image: &mut ImageWorld, skip: usize) WorldImage {
     showProblems(file, &image.problems);
     var parts = PartDecls();
-    each p in &image.parts {
+    var pi = skip;
+    while pi < image.parts.len() {
+      let p = &image.parts[pi];
       core.learn(p.key, p.recipe.copy());
       core.learn(p.material, p.materialRecipe.copy());
       parts.push(PartDecl(p.path.clone(), p.key, p.material, noLook(), p.placement, p.slot));
+      pi = pi + 1usize;
     }
     // the world's lights, camera and sky: parts with no mesh or material, after the shape parts (their ids are the shape
     // parts' before them), a look each
@@ -343,7 +488,7 @@ actor Loader {
       parts.push(PartDecl(lp.path.clone(), NO_CONTENT, NO_CONTENT, lp.look, lp.placement, lp.slot));
     }
     print <- "loader: world "; printStr(file); print <- ": "; print <- u64.from(image.parts.len()); print <- " parts, ";
-    print <- u64.from(distinctKeys(&image)); print <- " distinct mesh keys, "; print <- u64.from(distinctMaterials(&image));
+    print <- u64.from(distinctKeys(image)); print <- " distinct mesh keys, "; print <- u64.from(distinctMaterials(image));
     print <- " distinct material keys, "; print <- u64.from(image.problems.len());
     print <- " problems, "; print <- u64.from(image.dropped.len()); print <- " parts dropped";
     var k = 0usize;
@@ -387,6 +532,13 @@ actor Loader {
         match core.next() {
           case let Some(job) {
             busy.set(w, true);
+            // a part of a world still arriving: this worker's text may lack it, so it is opened with the newest first (the
+            // worker takes its messages in order, so the job finds the builder made)
+            let shape = job.recipe.shape.view();
+            if (shape == MATERIAL_SHAPE || shape.startsWith("cs.")) && usize.from(job.recipe.slot) >= covers[w] && latestSlots > 0usize {
+              workers[w].open(w, pendingWorld.clone(), String.from(latest.view()), String.from(cache.dir.view()), cache.stamp, false);
+              covers.set(w, latestSlots);
+            }
             selfactor.run(w, job);
           }
           case is None[BuildJob] { break; }

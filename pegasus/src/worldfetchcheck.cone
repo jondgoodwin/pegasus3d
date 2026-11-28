@@ -118,17 +118,18 @@ fn checkWorldFetch(skipHash: bool) bool {
   let badEntries = manifestEntries(badField);
   all = fetchLine("a bad size or hash on one line is no fault of the manifest: that line's file alone is not ok",
     manifestFault(badField, &badEntries).len() == 0usize && !badEntries[0].ok && badEntries[1].ok) && all;
-  // each file's declared place: the part its first line declares (with the parts open above it), or the part that line sits in
-  var placed = List[String]();
-  placed.push(String.from("part first\n"));
-  placed.push(String.from("  part materials\n    part lawn: physical(color: x)\n"));
-  placed.push(String.from("  worldAvatars(cast: [a])\n  part people\n"));
-  placed.push(String.from("// only a comment\n"));
-  placed.push(String.from("    part deep\n"));
-  let at = declaredPaths(&placed);
-  all = fetchLine("a file's declared place is read from its first line of code and the parts open above it",
-    at.len() == 5usize && at[0].view() == "first" && at[1].view() == "first.materials" && at[2].view() == "first"
-    && at[3].len() == 0usize && at[4].view() == "first.people.deep") && all;
+  // each file's place, from its own text alone: the indent and the part its first line of code declares (none if it starts with
+  // something else, or has no code); the manifest's path must end in that part
+  let p0 = placeOfText("part first\n");
+  let p1 = placeOfText("// a comment\n\n  part materials\n    part lawn: physical(color: x)\n");
+  let p2 = placeOfText("  worldAvatars(cast: [a])\n  part people\n");
+  let p3 = placeOfText("// only a comment\n");
+  all = fetchLine("a file's place is read from its first line of code alone",
+    p0.has && p0.indent == 0usize && p0.name.view() == "first" && p1.has && p1.indent == 2usize && p1.name.view() == "materials"
+    && p2.has && p2.indent == 2usize && p2.name.len() == 0usize && !p3.has) && all;
+  all = fetchLine("a path fits a file that declares its last part, or has nothing of its own to compare",
+    placeFits("first.materials", &p1) && !placeFits("first.sea", &p1) && !placeFits("materials2", &p1) && placeFits("first", &p2)
+    && placeFits("anything", &p3) && placeFits("first", &p0)) && all;
   // a manifest whose path for a file is wrong (it says first.sea; the file begins at first.island), read from disk: that file is left
   // out and the others stay; and a manifest that is a fault reads as nothing
   writeText(&dir.join("p1.ddd"), "part first\n");
@@ -152,5 +153,37 @@ fn checkWorldFetch(skipHash: bool) bool {
   all = fetchLine("a manifest naming a file twice reads as nothing: the world does not open", readWorldNow(dir.join("dup.world").view()).len() == 0usize) && all;
   all = fetchLine("a file that was never kept is not given",
     match loadKeptFile(&keep, 3u64, contentHash("abc")) { case is Some[String] { false } case is None[String] { true } }) && all;
+  // a file in the middle that is left out (its hash is wrong) moves no later file's place, though a later file is a child of what it held
+  writeText(&dir.join("d1.ddd"), "part first\n");
+  writeText(&dir.join("d2.ddd"), "  part islanX\n");
+  writeText(&dir.join("d3.ddd"), "    part dock\n");
+  writeText(&dir.join("d4.ddd"), "  part sea\n");
+  var droppedWorld = String.from(manifestLineOf("d1.ddd", "part first\n", "first").view());
+  droppedWorld.append(manifestLineOf("d2.ddd", "  part island\n", "first.island").view());
+  droppedWorld.append(manifestLineOf("d3.ddd", "    part dock\n", "first.island.dock").view());
+  droppedWorld.append(manifestLineOf("d4.ddd", "  part sea\n", "first.sea").view());
+  writeText(&dir.join("dropped.world"), droppedWorld.view());
+  all = fetchLine("a file left out in the middle leaves the later files in their places",
+    readWorldNow(dir.join("dropped.world").view()).view() == "part first\n    part dock\n  part sea\n") && all;
+  // the files arrive in any order: nothing is read until the first file is in; a read under way holds the next until it is done; the
+  // whole world (rules, derives, looks) is read only when every file is in. PEGASUS_MUTANT=rules-early reads it from the first file on
+  var a = FileArrival.make(4usize, mutantIs("rules-early"));
+  a.arrive(1usize);
+  let n0 = a.next();
+  a.arrive(0usize);
+  let n1 = a.next();
+  let allInThen = a.allIn();
+  a.arrive(3usize);
+  let n2 = a.next();
+  a.readDone(false);
+  let n3 = a.next();
+  a.arrive(2usize);
+  let wholeNow = a.allIn();
+  let n4 = a.next();
+  a.readDone(true);
+  let n5 = a.next();
+  all = fetchLine("files in any order: no read until the first file is in, a prefix read while others are missing, the whole only when every file is in",
+    n0 == READ_NONE && n1 == READ_PREFIX && !allInThen && n2 == READ_NONE && n3 == READ_NONE && wholeNow && n4 == READ_WHOLE && n5 == READ_NONE
+    && a.files() == 4usize) && all;
   all
 }

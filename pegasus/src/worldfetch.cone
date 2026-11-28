@@ -224,62 +224,56 @@ fn partNameOf(t: &str) String {
   out
 }
 
-// Where each file's text begins, as the dotted path of the parts open there (the same rule tools\splitworld.py writes the manifest's
-// PATH by): the part declared on a file's first line of code, with the parts open above it (by indentation, through every file
-// before); or, if the file starts with something else, the part that line sits in. Empty for a file with no code in it. 'texts' are
-// the files in the manifest's order
-pub fn declaredPaths(texts: &List[String]) List[String] {
-  var out = List[String]();
-  var indents = List[usize]();
-  var names = List[String]();
-  each text in &*texts {
-    var path = String();
-    var have = false;
-    var it = text.view().lines();
-    while true {
-      match it.next() {
-        case let Some(line) {
-          let t = line.trim();
-          if t.len() == 0usize || t.startsWith("//") { continue; }
-          let raw: &Array[u8] = line;
-          var indent = 0usize;
-          while indent < raw.len && raw[indent] == ' ' { indent = indent + 1usize; }
-          while indents.len() > 0usize && *indents[indents.len() - 1usize] >= indent {
-            _ = indents.pop();
-            _ = names.pop();
-          }
-          let pname = partNameOf(t);
-          if !have {
-            have = true;
-            var k = 0usize;
-            while k < names.len() {
-              if k > 0usize { path.append("."); }
-              path.append(names[k].view());
-              k = k + 1usize;
-            }
-            if pname.len() > 0usize {
-              if names.len() > 0usize { path.append("."); }
-              path.append(pname.view());
-            }
-          }
-          if pname.len() > 0usize { indents.push(indent); names.push(pname); }
-        }
-        else { break; }
+// Where a file's text begins, worked out from that text alone (never from the files before it, so a file left out moves nothing of
+// another's): whether it has any code, how far its first line of code is indented, and the name of the part that line declares
+// ("" if the file starts with something else: a field, an each, an on)
+pub struct FilePlace {
+  pub has: bool;
+  pub indent: usize;
+  pub name: String;
+}
+
+pub fn placeOfText(text: &Array[u8]) FilePlace {
+  var s = String();
+  s.appendBytes(text);
+  var it = s.view().lines();
+  while true {
+    match it.next() {
+      case let Some(line) {
+        let t = line.trim();
+        if t.len() == 0usize || t.startsWith("//") { continue; }
+        let raw: &Array[u8] = line;
+        var indent = 0usize;
+        while indent < raw.len && raw[indent] == ' ' { indent = indent + 1usize; }
+        return FilePlace(true, indent, partNameOf(t));
       }
+      else { break; }
     }
-    out.push(path);
   }
-  out
+  FilePlace(false, 0usize, String())
+}
+
+// Whether the manifest's PATH for a file agrees with where its own text begins: a file that declares a part must be that part (the
+// last name of the path); a file with no code, or that starts with something else, has nothing of its own to compare with
+pub fn placeFits(path: &str, place: &FilePlace) bool {
+  if !place.has || place.name.len() == 0usize { return true; }
+  let p: &Array[u8] = path;
+  var cut = 0usize;
+  var i = 0usize;
+  while i < p.len { if p[i] == '.' { cut = i + 1usize; } i = i + 1usize; }
+  var last = String();
+  last.appendBytes(&p[cut..<p.len]);
+  last.view() == place.name.view()
 }
 
 // The one line saying a file was left out because its text begins somewhere other than the manifest says
-pub fn pathLine(name: &str, path: &str, declared: &str) String {
+pub fn pathLine(name: &str, path: &str, place: &FilePlace) String {
   var s = String.from("loader: file ");
   s.append(name);
   s.append(" (subtree ");
   s.append(path);
-  s.append(") left out: its text begins at ");
-  s.append(declared);
+  s.append(") left out: its text begins at the part ");
+  s.append(place.name.view());
   s.append(", the manifest says ");
   s.append(path);
   s.append("\n");
@@ -322,11 +316,10 @@ pub fn readWorldNow(loc: &str) String {
           else { return String(); }
         }
       }
-      let declared = declaredPaths(&texts);
       var i = 0usize;
       while i < names.len() {
         let t = &texts[i];
-        if declared[i].len() == 0usize || declared[i].view() == names[i].path.view() {
+        if placeFits(names[i].path.view(), &placeOfText(t.view())) {
           out.append(t.view()); out.append(joinAfter(t.view()).view());
         }
         i = i + 1usize;
@@ -342,6 +335,53 @@ pub fn joinAfter(text: &Array[u8]) String {
   var s = String();
   if text.len > 0usize && text[text.len - 1usize] != '\n' { s.append("\n"); }
   s
+}
+
+// What the Loader does next with a manifest's files as they come in, kept apart from the actor so a check can drive it in any order
+pub const READ_NONE = 0u32;         // nothing: a read is under way, every file read, or no new run of files
+pub const READ_PREFIX = 1u32;       // read the files in from the start so far (`run` of them): their shape parts are declared early
+pub const READ_WHOLE = 2u32;        // every file is in: read the whole world, and only now start its rules and derives
+
+pub struct FileArrival {
+  have: List[bool];                 // file i is in (arrived and judged, or left out)
+  got: usize;
+  run: usize;                       // the files in from the start with none missing: a part's id is its place in the whole world's order, so
+                                    // only a run from the first file can be declared
+  readFiles: usize;                 // how many files the latest prefix read covered
+  reading: bool;                    // a read is under way: a file that arrives meanwhile waits for it (one read gathers every file in by then)
+  concluded: bool;                  // the whole world was read
+  early: bool;                      // PEGASUS_MUTANT=rules-early: the whole world, rules and all, is read from the first file on
+
+  pub fn make(files: usize, early: bool) FileArrival {
+    var have = List[bool]();
+    var i = 0usize;
+    while i < files { have.push(false); i = i + 1usize; }
+    FileArrival(have, 0usize, 0usize, 0usize, false, false, early)
+  }
+
+  pub fn arrive(self: &mut, i: usize) {
+    if i >= have.len() || *have[i] { return; }
+    have.set(i, true);
+    got = got + 1usize;
+    while run < have.len() && *have[run] { run = run + 1usize; }
+  }
+
+  pub fn files(self: &) usize { have.len() }
+  pub fn allIn(self: &) bool { got == have.len() }
+  pub fn inRun(self: &) usize { run }
+
+  // The next read to start (READ_NONE, READ_PREFIX or READ_WHOLE); it counts as under way until `readDone`
+  pub fn next(self: &mut) u32 {
+    if reading || concluded { return READ_NONE; }
+    if run == have.len() || (early && run > 0usize) { reading = true; return READ_WHOLE; }
+    if run > readFiles { reading = true; readFiles = run; return READ_PREFIX; }
+    READ_NONE
+  }
+
+  pub fn readDone(self: &mut, whole: bool) {
+    reading = false;
+    if whole { concluded = true; }
+  }
 }
 
 actor Fetcher {

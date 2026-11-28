@@ -154,17 +154,52 @@ actor Sim {
   materialChanges: u64;             // material keys a part changed to (`setMaterial`)
   lookChanges: u64;                 // looks a part changed to (`setLook`)
   poseHistory: PoseHistory;         // each part's place at the last POSE_STEPS steps, for picking at a press's drawn time
+  held: PartDecls;                  // a shared zone's or a client's parts declared before the whole world is in: kept for `world`, which takes them first
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
       Actions(), AimedPresses(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
-      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, 0u64, PoseHistory.make());
+      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, 0u64, PoseHistory.make(), PartDecls());
+  }
+
+  // Loader -> Sim (move): the next parts of the world, declared before the whole world is in (the Loader read the files that have
+  // arrived: the parts of a run of files from the start, in the order the whole world will give them). Local play declares them
+  // now, each given its id and its content asked for by nearness to 'feet' (where the person is known to start, so far). A server
+  // or a client keeps them for `world`: what it makes of the parts (what the clients are shown, or what the person is shown and
+  // joined to) is made once, from the whole. Rules, derives and every look wait for `world`: a rule may name any part by its path
+  pub async fn declare(self, decls: PartDecls, feet: Vec3) {
+    if role != SIM_WHOLE {
+      each d in &decls { held.push(PartDecl(d.name.clone(), d.key, d.material, d.look, d.placement, d.slot)); }
+      return;
+    }
+    self.declareParts(&decls, feet);
+  }
+
+  // Give each part its id now, before its content exists, and ask the Loader for its content, the nearer to 'feet' the sooner
+  fn declareParts(self: &mut, decls: &PartDecls, feet: Vec3) {
+    each d in &*decls {
+      let id = u32.from(parts.len());
+      parts.push(SimPart(id, d.name.clone(), d.key, d.material, d.material, d.look, d.look, d.placement, d.slot, true));
+      // a light, a camera or the sky has no content to ask for: its look is all it is
+      if d.key == NO_CONTENT { continue; }
+      let at = d.placement.translation();
+      loader.build(ContentRequest(d.key, id, (at - feet).length()));
+      // a server never draws: its Loader builds the shapes Sim needs and no material
+      if role != SIM_SERVER { loader.build(ContentRequest(d.material, id, (at - feet).length())); }
+    }
   }
 
   // Loader -> Sim (move): the world image. Each part is given its id now,
   // before its content exists, and its content is asked for by key
   pub async fn world(self, image: WorldImage) {
     var img = image;
+    if held.len() > 0usize {
+      // a server's or a client's earlier parts come first, as the whole world gives them
+      var all = PartDecls();
+      all <-> held;
+      each d in &img.parts { all.push(PartDecl(d.name.clone(), d.key, d.material, d.look, d.placement, d.slot)); }
+      img.parts <-> all;
+    }
     worldName = img.name.clone();
     person.feet = img.startFeet;
     haveImage = true;
@@ -188,17 +223,10 @@ actor Sim {
       let tr = libc.getenv("PEGASUS_TRACE_PART");
       if (tr as usize) != 0usize { rules.traceFor(tr); }
     }
+    self.declareParts(&img.parts, person.feet);
     var keys = List[ContentKey]();
-    each d in &img.parts {
-      let id = u32.from(parts.len());
-      parts.push(SimPart(id, d.name.clone(), d.key, d.material, d.material, d.look, d.look, d.placement, d.slot, true));
-      // a light, a camera or the sky has no content to ask for: its look is all it is
-      if d.key == NO_CONTENT { continue; }
-      let at = d.placement.translation();
-      loader.build(ContentRequest(d.key, id, (at - person.feet).length()));
-      // a server never draws: its Loader builds the shapes Sim needs and no material
-      if role != SIM_SERVER { loader.build(ContentRequest(d.material, id, (at - person.feet).length())); }
-      if !keys.contains(&d.key) { keys.push(d.key); }
+    each p in &parts {
+      if p.key != NO_CONTENT && !keys.contains(&p.key) { keys.push(p.key); }
     }
     zoneKeys = keys.len();
     if role == SIM_SERVER {

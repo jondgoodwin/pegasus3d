@@ -7,6 +7,13 @@
 #    from a local copy that leaves the same file out, agrees);
 # 3. a file whose size is wrong does the same;
 # 4. the world mended: only the file that was left out is fetched, the rest are kept by content.
+# 5. a manifest path that does not match the file's own first part: that file is left out;
+# 6. a manifest that is a fault does not open the world;
+# 7. a file left out in the middle of a world cut deeper (a child's file follows the file that opened its parent): the later files keep
+#    their places, so only that one file is left out (W144: a file's place is worked out from its own text);
+# 8. the last file is slow: the parts of the files that are in are declared and drawn before it arrives, and the world's rules and
+#    derives start only after it ("sim: world ..., rules verified" comes after "bytes of world in"). PEGASUS_MUTANT=rules-early starts
+#    them with the first file, and makes (8) FAIL.
 # Tests 2 and 3 use a fresh cache each: a file kept by its hash is never fetched, so a cache that held the right file would hide
 # the wrong one. PEGASUS_MUTANT=manifest-skip-hash makes (2) FAIL (the file is not left out). Prints PASS or FAIL for each; stops
 # the server. Exit 0 only if every test passed.
@@ -106,7 +113,7 @@ try {
   foreach ($d in @($served, $local)) { Set-Content -Path (Join-Path $d $name) -Value $badPath -Encoding ascii }
   $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache5'
   $f = Open-World (Join-Path $local $name)
-  $said = @([regex]::Matches($f.out, "file first-07.ddd \(subtree first.wrong\) left out: its text begins at first.plinth, the manifest says first.wrong")).Count
+  $said = @([regex]::Matches($f.out, "file first-07.ddd \(subtree first.wrong\) left out: its text begins at the part plinth, the manifest says first.wrong")).Count
   Check "wrong path: first-07.ddd left out and said once ($said), 1 left out, the run's checks pass" `
     (($said -eq 1) -and ($f.out -match ' 1 left out') -and (& $okRun $f.out))
 
@@ -123,6 +130,55 @@ try {
   $said = @([regex]::Matches($h.out, 'cannot be used: it has a line of 1 fields, not four')).Count
   Check "manifest that cannot be read: said once ($said), $($h.files) files fetched, no arrival line" `
     (($said -eq 1) -and ($h.files -eq 0) -and -not ($h.out -match 'arrival: \d+ files'))
+
+  # 7. a world cut deeper (files of a part's children follow the file that opens the part): the file that opens a parent is left out
+  $deep = Join-Path $tmp 'deep'
+  $deepLocal = Join-Path $tmp 'deeplocal'
+  python (Join-Path $here 'splitworld.py') (Join-Path $here '..\worlds\first.ddd') $deep first --max-indent 4 | Out-Null
+  Copy-Item $deep $deepLocal -Recurse
+  $dl = @(Get-Content (Join-Path $deep 'first.world') | Where-Object { $_ -notmatch '^//' -and $_.Trim() })
+  $victim = ''
+  for ($k = 0; $k + 1 -lt $dl.Count; $k++) {
+    $pa = $dl[$k].Split(' ')[3]; $pb = $dl[$k + 1].Split(' ')[3]
+    if ($pb.StartsWith($pa + '.') -and $dl[$k].Split(' ')[0] -notmatch 'first-00') { $victim = $dl[$k].Split(' ')[0]; break }
+  }
+  $vb = [System.IO.File]::ReadAllBytes((Join-Path $deep $victim))
+  $vb[$vb.Length - 2] = $vb[$vb.Length - 2] -bxor 1
+  [System.IO.File]::WriteAllBytes((Join-Path $deepLocal $victim), $vb)
+  $deepServed = Join-Path $served 'deep'
+  Copy-Item $deepLocal $deepServed -Recurse
+  $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache7'
+  $urlDeep = "http://127.0.0.1:$port/deep/first.world"
+  $outDeep = & $exe --world $urlDeep --keys-from (Join-Path $deepLocal 'first.world') --steps 300 2>&1 | Out-String
+  $saidDeep = @([regex]::Matches($outDeep, "file $victim \(subtree [^)]*\) left out: its hash is")).Count
+  Check "a file left out in the middle ($victim, which opens a part whose children follow): said once ($saidDeep), the only one left out, no other file's place is wrong" `
+    (($saidDeep -eq 1) -and ($outDeep -match ' 1 left out') -and -not ($outDeep -match 'its text begins at'))
+  # (what the world is without the parent a file opened is another matter: its children's text then has no parent to be under, the reader
+  # refuses it, and nothing draws. Only the file's own place is tested here.)
+
+  # 8. the last file is slow
+  $slowOut = Join-Path $tmp 'slow.out'
+  $slowErr = Join-Path $tmp 'slow.err'
+  $last = ($dl = @(Get-Content (Join-Path $src $name) | Where-Object { $_ -notmatch '^//' -and $_.Trim() }))[-1].Split(' ')[0]
+  $slow = Start-Process python -ArgumentList @('-u', (Join-Path $here 'worldserve.py'), $src, '--port', '0', '--mbit', $Mbit, '--latency-ms', $LatencyMs, '--delay', "$last=1500") `
+    -RedirectStandardOutput $slowOut -RedirectStandardError $slowErr -PassThru -WindowStyle Hidden
+  try {
+    $slowPort = 0
+    for ($i = 0; $i -lt 50 -and $slowPort -eq 0; $i++) {
+      Start-Sleep -Milliseconds 100
+      if ((Test-Path $slowOut) -and ((Get-Content $slowOut -Raw) -match 'on (\d+)')) { $slowPort = [int]$Matches[1] }
+    }
+    $env:PEGASUS_MESH_CACHE = Join-Path $tmp 'cache8'
+    $lineList = @(& $exe --world "http://127.0.0.1:$slowPort/$name" --keys-from (Join-Path $src $name) --steps 500 2>&1 | Out-String -Stream)
+    $early = ($lineList | Select-String -Pattern 'parts declared early' | Select-Object -First 1).LineNumber
+    $textIn = ($lineList | Select-String -Pattern 'bytes of world in at' | Select-Object -First 1).LineNumber
+    $drawn = ($lineList | Select-String -Pattern 'arrival: first part drawn' | Select-Object -First 1).LineNumber
+    $rules = ($lineList | Select-String -Pattern 'sim: world .*rules verified' | Select-Object -First 1).LineNumber
+    $joined = $lineList -join "`n"
+    Check "the last file is slow: parts declared early (line $early) and the first drawn (line $drawn) before the text is in (line $textIn), the rules start after it (line $rules)" `
+      ($early -and $drawn -and $textIn -and $rules -and ($early -lt $textIn) -and ($drawn -lt $textIn) -and ($textIn -lt $rules) -and (& $okRun $joined))
+  }
+  finally { Stop-Process -Id $slow.Id -Force -ErrorAction SilentlyContinue }
 }
 finally {
   Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
