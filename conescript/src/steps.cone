@@ -1,0 +1,176 @@
+// Step functions: code a world's Sim runs every step, such as a flock's steering (W148, lane boids).
+//
+// FOR REVIEW: the language is Jon's, and everything this file reads is a proposal, not settled. It takes the forms the
+// manual already sketches (animators.html, "Your own animator: a step function"; control-flow.html; fields.html),
+// cut to what a boids flock needs:
+//
+//   field velocity: place = (0, 0, 1), mutable: true     a place field: own to each copy, read and set by a step
+//   on(created, start(stepAnimator(b, step: steer)))      run 'steer' with 'b' every step, from the world's first
+//   fn steer(b: part, dt: duration) bool { ... true }      a step function: true to go on, false to end
+//
+// Inside a step function, Cone's statements: let, var, NAME = EXPR, if / else, and 'each o in P.parts { }', which
+// runs as the world runs, over the parts P holds (known when the world is read). Its values are numbers, truths,
+// points (x, y, z) and parts. A part's 'place' is where it stands in its holder's frame; 'p.FIELD' a place field.
+// Points add, subtract, scale by a number and divide by one; 'length(v)', 'dot(a, b)' and 'v.x' give numbers.
+// set(p.place, v), set(p.FIELD, v) and set(p.facing, v) are its acts: each is staged, and all a step's are applied
+// when every step function of the step has run, so each reads the world as it stood at the step's start.
+//
+// Lowered (lower.cone's lowerSim): each step function is a unit (part, f64) -> bool, numbered after the Sim code's
+// other units; each stepper an entry ENTRY_STEP, a = its number, b = its part, whose unit (f64) -> bool calls the
+// function with its part; each place field's starting value an entry ENTRY_FIXED, a = the part, b = the field's
+// number (its name's place in 'placeNames'), whose unit gives the point. The host imports are below.
+
+// The types a step function's values have
+pub const ST_NUM = 0u32;
+pub const ST_BOOL = 1u32;
+pub const ST_POINT = 2u32;
+pub const ST_PART = 3u32;
+pub const ST_COUNT = 4u32;          // a loop's hidden counter (i64)
+
+// A value, checked
+pub const SX_NUM = 0u32;            // num
+pub const SX_TRUTH = 1u32;          // num: 1 or 0
+pub const SX_LOCAL = 2u32;          // index: the local
+pub const SX_PART = 3u32;           // index: the slot
+pub const SX_PLACE = 4u32;          // args[0]: the part
+pub const SX_FIELD = 5u32;          // index: the place field's number; args[0]: the part
+pub const SX_ARITH = 6u32;          // sym: + - * /; args: two
+pub const SX_CMP = 7u32;            // sym: < > l g E N; args: two numbers
+pub const SX_LOGIC = 8u32;          // sym: A O; args: two truths
+pub const SX_NOT = 9u32;
+pub const SX_NEG = 10u32;
+pub const SX_TUPLE = 11u32;         // args: three numbers
+pub const SX_LENGTH = 12u32;
+pub const SX_DOT = 13u32;
+pub const SX_COMPONENT = 14u32;     // index: 0, 1 or 2; args[0]: a point
+
+pub struct SExpr {
+  pub op: u32;
+  pub ty: u32;                      // ST_*
+  pub sym: u8;
+  pub num: f64;
+  pub index: u32;
+  pub args: List[SExpr];
+}
+
+// A statement, checked
+pub const SS_SET = 0u32;            // index: the local; value[0]
+pub const SS_IF = 1u32;             // value[0]: the condition; body, other
+pub const SS_EACH = 2u32;           // index: the loop's part local; count: its counter local; slot: the holder; n: its parts
+pub const SS_SET_PLACE = 3u32;      // value: the part, the point
+pub const SS_SET_FIELD = 4u32;      // index: the field's number; value: the part, the point
+pub const SS_SET_FACING = 5u32;     // value: the part, the direction
+
+pub struct SStmt {
+  pub op: u32;
+  pub index: u32;
+  pub count: u32;
+  pub slot: u32;
+  pub n: u32;
+  pub value: List[SExpr];
+  pub body: List[SStmt];
+  pub other: List[SStmt];
+}
+
+// A step function, checked: its locals' types (its two parameters first), its statements and its result
+pub struct StepFn {
+  pub slot: usize;
+  pub name: u32;
+  pub at: Spot;
+  pub locals: List[u32];
+  pub body: List[SStmt];
+  pub result: SExpr;
+  pub ok: bool;                     // false: a mistake in it; it is left out, with its steppers
+}
+
+// on(created, start(stepAnimator(part, step: fn)))
+pub struct StepperInfo {
+  pub at: Spot;
+  pub target: usize;                // the part's slot
+  pub step: usize;                  // the step function's number
+  pub live: bool;
+}
+
+// field NAME: place = (x, y, z), mutable: true
+pub struct PlaceField {
+  pub slot: usize;
+  pub name: u32;
+  pub at: Spot;
+  pub number: u32;                  // its name's place in Understood.placeNames
+  pub x: f64;
+  pub y: f64;
+  pub z: f64;
+  pub mutable: bool;
+}
+
+// -------- the host imports a step function's code names (namespace "host"); FOR REVIEW --------
+pub const ENTRY_STEP = 3u8;
+pub const HOST_PLACE = "place";             // (part) -> (f64, f64, f64): where it stands in its holder, at the step's start
+pub const HOST_PLACE_FIELD = "place_field"; // (part, i64 field) -> (f64, f64, f64); traps if the part has no such field
+pub const HOST_CHILD = "child";             // (part, i64 k) -> part: the k-th part it holds
+pub const HOST_SET_PLACE = "set_place";     // acting: (part, (f64, f64, f64))
+pub const HOST_SET_PLACE_FIELD = "set_place_field";   // acting: (part, i64 field, (f64, f64, f64))
+pub const HOST_SET_FACING = "set_facing";   // acting: (part, (f64, f64, f64)): turn it so its front (+z) looks along it
+
+fn point3(tt: &mut TypeTable) u32 { tt.tuple(&[TY_F64, TY_F64, TY_F64]) }
+pub fn placeSignature(tt: &mut TypeTable) u32 { let p = point3(tt); tt.sig(&[TY_PART], &[p]) }
+pub fn placeFieldSignature(tt: &mut TypeTable) u32 { let p = point3(tt); tt.sig(&[TY_PART, TY_I64], &[p]) }
+pub fn childSignature(tt: &mut TypeTable) u32 { tt.sig(&[TY_PART, TY_I64], &[TY_PART]) }
+pub fn setPlaceSignature(tt: &mut TypeTable) u32 { let p = point3(tt); let none = List[u32](); tt.sig(&[TY_PART, p], none.view()) }
+pub fn setPlaceFieldSignature(tt: &mut TypeTable) u32 {
+  let p = point3(tt);
+  let none = List[u32]();
+  tt.sig(&[TY_PART, TY_I64, p], none.view())
+}
+pub fn setFacingSignature(tt: &mut TypeTable) u32 { setPlaceSignature(tt) }
+// A stepper's unit: (f64 dt) -> bool
+pub fn stepperSignature(tt: &mut TypeTable) u32 { tt.sig(&[TY_F64], &[TY_BOOL]) }
+
+fn sx(op: u32, ty: u32) SExpr { SExpr(op, ty, 0u8, 0., 0u32, List[SExpr]()) }
+fn sx1(op: u32, ty: u32, a: SExpr) SExpr { var e = sx(op, ty); e.args.push(a); e }
+fn sx2(op: u32, ty: u32, sym: u8, a: SExpr, b: SExpr) SExpr { var e = sx(op, ty); e.sym = sym; e.args.push(a); e.args.push(b); e }
+fn ss(op: u32) SStmt { SStmt(op, 0u32, 0u32, 0u32, 0u32, List[SExpr](), List[SStmt](), List[SStmt]()) }
+
+fn stName(t: u32) &str {
+  if t == ST_NUM { return "a number"; }
+  if t == ST_BOOL { return "a truth"; }
+  if t == ST_POINT { return "a point"; }
+  "a part"
+}
+
+// A name in reach inside a step function
+struct StepName {
+  name: u32;
+  local: u32;
+  ty: u32;
+  mutable: bool;
+}
+
+// The checking of one step function: the names in reach, innermost last, and its locals
+struct StepScope {
+  names: List[StepName];
+  locals: List[u32];
+  slot: usize;                       // the part it is written in: paths are looked for outward from it
+
+  fn find(self: &, name: u32) Option[usize] {
+    var k = self.names.len();
+    while k > 0usize {
+      k = k - 1usize;
+      if self.names[k].name == name { return Some[usize](k); }
+    }
+    None
+  }
+  fn add(self: &mut, name: u32, ty: u32, mutable: bool) u32 {
+    self.locals.push(ty);
+    let l = u32.from(self.locals.len() - 1usize);
+    self.names.push(StepName(name, l, ty, mutable));
+    l
+  }
+}
+
+// The number of a place field's name, if any part has one of that name
+pub fn placeNumber(names: &List[u32], name: u32) Option[u32] {
+  var i = 0usize;
+  while i < names.len() { if *names[i] == name { return Some[u32](u32.from(i)); } i = i + 1usize; }
+  None
+}
