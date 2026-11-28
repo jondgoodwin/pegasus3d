@@ -29,7 +29,8 @@ fn impWide(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
   s[2usize] = (x + 2.0).bits();
   true
 }
-fn impAct(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { true }
+fn impTwo(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { s[0usize] = 2u64; true }
+fn impAct(h:&mut HandleTable[u8], s: &mut Array[u64]) bool { true }
 fn impFail(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { h.fail = String.from("the host said no"); false }
 fn impFail2(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { false }
 fn impStage(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
@@ -887,9 +888,9 @@ fn main() i32 {
     while xi < xs.len() {
       sets = List[List[u64]]();
       var a0 = List[u64](); a0.push(*xs[xi]); sets.push(a0);
-      mutantDiff("mutant: no moves into result vregs", c, &tb, &sweep, &sets, LiftOpts(true, false, false), &mut m1);
-      mutantDiff("mutant: fuel on a forward branch", c, &tb, &sweep, &sets, LiftOpts(false, true, false), &mut m2);
-      mutantDiff("mutant: fsub swapped", c, &tb, &sweep, &sets, LiftOpts(false, false, true), &mut m3);
+      mutantDiff("mutant: no moves into result vregs", c, &tb, &sweep, &sets, LiftOpts(true, false, false, false, false), &mut m1);
+      mutantDiff("mutant: fuel on a forward branch", c, &tb, &sweep, &sets, LiftOpts(false, true, false, false, false), &mut m2);
+      mutantDiff("mutant: fsub swapped", c, &tb, &sweep, &sets, LiftOpts(false, false, true, false, false), &mut m3);
       xi = xi + 1usize;
     }
     ci = ci + 1usize;
@@ -899,13 +900,58 @@ fn main() i32 {
     let w = binary(OP_F64_SUB, TY_F64, TY_F64);
     match verify(&w.code, &tb) {
       case let Ok(v) {
-        let ev = compileNativeEvalWith(&v, LiftOpts(false, false, true));
+        let ev = compileNativeEvalWith(&v, LiftOpts(false, false, true, false, false));
         var args = List[u64](); args.push((5.0).bits()); args.push((2.0).bits());
         let a = runInterp(&v, &tb, 0u32, args.view(), 10u64);
         let b = runNative(&ev, &v, &tb, 0u32, args.view(), 10u64);
         expect(differ(&a, &b).len() > 0usize, "the ops table's f64.sub catches the swapped operands");
       }
       case let Err(ps) { expect(false, "binary verifies"); }
+    }
+  }
+  // f64.from_bool of a bool slot holding 2 (an import may hand one back): 1.0 in the interpreter, so 1.0 in both lifts;
+  // the lift without its test for nonzero gives 2.0, and this case catches it
+  {
+    var tb2 = ImportTables[u8].make();
+    let e0 = List[u32]();
+    tb2.add("host", "two", tb2.types.sig(e0.view(), &[TY_BOOL]), false, 1u32, &impTwo);
+    var w = CodeWriter.make();
+    let bsig = w.code.types.sig(e0.view(), &[TY_F64]);
+    let isig = w.code.types.sig(e0.view(), &[TY_BOOL]);
+    let ii = w.addImport("host", "two", isig);
+    w.beginUnit(bsig, "boolTwo");
+    w.opU(OP_IMPORT, ii); w.op(OP_F64_FROM_BOOL);
+    w.endUnit();
+    match verify(&w.code, &tb2) {
+      case let Ok(v) {
+        let none = List[u64]();
+        let a = runInterp(&v, &tb2, 0u32, none.view(), 100u64);
+        expect(!a.trapped && f64.fromBits(*a.slots[0usize]) == 1.0, "the interpreter gives 1.0 for a bool slot holding 2");
+        let ev = compileNativeEval(&v);
+        let b = runNative(&ev, &v, &tb2, 0u32, none.view(), 100u64);
+        expect(differ(&a, &b).len() == 0usize, "the lift (evaluator) gives 1.0 for a bool slot holding 2");
+        match compileNative(&v) {
+          case let Ok(nc) {
+            let c = runNative(&nc, &v, &tb2, 0u32, none.view(), 100u64);
+            expect(differ(&a, &c).len() == 0usize, "native code gives 1.0 for a bool slot holding 2");
+          }
+          case let Err(e) { expect(false, "the bool-two unit compiles"); }
+        }
+        let mo = LiftOpts(false, false, false, true, false);
+        let evm = compileNativeEvalWith(&v, mo);
+        let bm = runNative(&evm, &v, &tb2, 0u32, none.view(), 100u64);
+        expect(differ(&a, &bm).len() > 0usize, "caught: f64.from_bool without its test for nonzero (evaluator)");
+        match compileNativeWith(&v, mo) {
+          case let Ok(ncm) {
+            let cm = runNative(&ncm, &v, &tb2, 0u32, none.view(), 100u64);
+            expect(differ(&a, &cm).len() > 0usize, "caught: f64.from_bool without its test for nonzero (native)");
+            print <- "mutant, from_bool as a bare I2F: interpreter "; print <- f64.fromBits(*a.slots[0usize]); print <- ", mutant native ";
+            print <- f64.fromBits(*cm.slots[0usize]); print <- "\n";
+          }
+          case let Err(e) { expect(false, "the mutant bool-two unit compiles"); }
+        }
+      }
+      case let Err(ps) { expect(false, "the bool-two unit verifies"); }
     }
   }
   print <- "mutant, no moves into result vregs: "; print <- m1.badEval; print <- " of "; print <- m1.runs; print <- " runs differ\n";

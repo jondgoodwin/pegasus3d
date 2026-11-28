@@ -98,6 +98,9 @@ pub struct RuleHost {
   tables: ImportTables[u8];
   hs: RuleHandles;
   interp: Interpreter;
+  nat: List[NativeCode];            // PEGASUS_NATIVE=1: the code compiled natively (one element), else empty (the interpreter runs)
+  nrun: NativeRunner;
+  stackSaid: bool;                  // PEGASUS_NATIVE_STACKINFO has had its one line
   applyOnTrap: bool;                // the check's mutant: a trapped handler's writes are handed back anyway
 
   // The host for code, with 'fields' fields (each starting at 0) and 'slots' slots; or what the verifier refused
@@ -120,7 +123,11 @@ pub struct RuleHost {
         var it = Interpreter.make();
         // PEGASUS_PROFILE_RULES set: the interpreter times its runs (W136); `profileReport` says what it found
         it.profiling = (libc.getenv("PEGASUS_PROFILE_RULES") as usize) != 0usize;
-        Ok[RuleHost, List[CodeProblem]](RuleHost(v, tables, hs, it, applyOnTrap))
+        // PEGASUS_NATIVE=1: every derive and handler runs as machine code (conescript's native.cone); unset, nothing changes
+        let nat = nativeIfAsked(&v, "sim");
+        var nr = NativeRunner.make();
+        nr.profiling = it.profiling;
+        Ok[RuleHost, List[CodeProblem]](RuleHost(v, tables, hs, it, nat, nr, false, applyOnTrap))
       }
       case let Err(ps) { Err[RuleHost, List[CodeProblem]](ps) }
     }
@@ -129,6 +136,14 @@ pub struct RuleHost {
   // When profiling is on (PEGASUS_PROFILE_RULES): the runs so far and where their time went
   pub fn profileReport(self: &, steps: u64) {
     if !self.interp.profiling { return; }
+    if self.nat.len() > 0usize {
+      // native: only the whole run is timed (the clock is not read inside an import's call)
+      let q = &self.nrun.profile;
+      print <- "sim: rules profile (native) over "; print <- steps; print <- " steps: "; print <- q.runs; print <- " runs; run time total ";
+      print <- f64.from(q.runNs) / 1000.; print <- " us (per run "; print <- (if q.runs > 0u64 { f64.from(q.runNs) / f64.from(q.runs) / 1000. } else { 0. });
+      print <- " us); host calls and window copies not separated\n";
+      return;
+    }
     let p = &self.interp.profile;
     let runs = f64.from(p.runs);
     print <- "sim: rules profile over "; print <- steps; print <- " steps: "; print <- p.runs; print <- " runs, "; print <- p.imports;
@@ -162,8 +177,21 @@ pub struct RuleHost {
   fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
     self.hs.fail = String();
     (&mut self.hs.data[RULE_WRITES]).clear();
-    self.interp.setFuel(RULE_FUEL);
     let none = List[u64]();
+    if self.nat.len() > 0usize {
+      if !self.stackSaid {
+        self.stackSaid = true;
+        if (libc.getenv("PEGASUS_NATIVE_STACKINFO") as usize) != 0usize {
+          print <- "sim: native: "; print <- stackHeadroom() / 1024usize; print <- " KiB of this thread's stack lie below Sim's first native run (the generated code's guard needs 256 KiB)\n";
+        }
+      }
+      self.nrun.setFuel(RULE_FUEL);
+      match self.nrun.run(&self.nat[0usize], &self.code, &self.tables, &mut self.hs, unit, none.view(), out) {
+        case let Some(t) { return Some[String](t.message.clone()); }
+        case is None { return None; }
+      }
+    }
+    self.interp.setFuel(RULE_FUEL);
     match self.interp.run(&self.code, &self.tables, &mut self.hs, unit, none.view(), out) {
       case let Some(t) { Some[String](t.message.clone()) }
       case is None { None }

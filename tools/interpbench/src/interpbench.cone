@@ -3,10 +3,16 @@
 //   interpbench build REPS FILE...   each world built REPS times with no window: the whole build's time (min, median, max),
 //                                    then, from a profiled pass, how much of a run was the host's call, the copying of
 //                                    each import's window, and the interpreter itself
-//   interpbench micro                a tight loop run in the form, against the same loop in Cone
-//   interpbench import              an import called in a loop, against the same call made directly
+//   interpbench micro                a tight loop run in the form by the interpreter and by native code, against the same
+//                                    loop in Cone
+//   interpbench import              an import called in a loop: interpreter, native code, and the same call made directly
+//   interpbench procgen             number-only procgen forms (no sculpt calls): a per-vertex displacement over 100,000
+//                                    vertices, and a branching-tree recursion through call; interpreter, native, Cone
+//   interpbench sim STEPS FILE      a world's derives run each step (Sim's steady state): interpreter against native code
+//   interpbench compile REPS FILE...  per world: make (lower and verify) against compile (lift, compileX64, load), both Codes
 //
-// Times are the steady clock's nanoseconds; run it with nothing else heavy going and say what else was.
+// Times are the steady clock's nanoseconds, medians of 7 in a release build; run it with nothing else heavy going and say
+// what else was.
 
 mod interpbench;
 
@@ -17,6 +23,7 @@ import fs;
 import path use Path;
 import conescript use *;
 import partbuild use *;
+import codegen;
 import time use Instant;
 
 fn argIs(a: *u8, b: &str) bool {
@@ -185,6 +192,76 @@ fn impInc(h: &mut HandleTable[u8], s: &mut Array[u64]) bool {
   true
 }
 
+// A run's timing over 7 repetitions
+struct Timed { med: i64; min: i64; max: i64; answer: u64; ok: bool; }
+
+fn timed(times: &List[i64], answer: u64) Timed {
+  let s = sorted(times);
+  Timed(*s[3usize], *s[0usize], *s[6usize], answer, true)
+}
+
+fn noTime() Timed { Timed(0i64, 0i64, 0i64, 0u64, false) }
+
+// The unit run 7 times by the interpreter (the first result slot is the answer)
+fn timeInterp(v: &VerifiedCode, tb: &ImportTables[u8], h: &mut HandleTable[u8], unit: u32, args: &Array[u64], fuel: u64) Timed {
+  var it = Interpreter.make();
+  var out = List[u64]();
+  var times = List[i64]();
+  var answer = 0u64;
+  var r = 0;
+  while r < 7 {
+    it.setFuel(fuel);
+    let t0 = Instant.now().nanos();
+    let t = it.run(v, tb, h, unit, args, &mut out);
+    let t1 = Instant.now().nanos();
+    if t is Some { return noTime(); }
+    answer = *out[0usize];
+    times.push(t1 - t0);
+    r = r + 1;
+  }
+  timed(&times, answer)
+}
+
+// The same, as machine code
+fn timeNative(nc: &NativeCode, v: &VerifiedCode, tb: &ImportTables[u8], h: &mut HandleTable[u8], unit: u32, args: &Array[u64], fuel: u64) Timed {
+  var rn = NativeRunner.make();
+  var out = List[u64]();
+  var times = List[i64]();
+  var answer = 0u64;
+  var r = 0;
+  while r < 7 {
+    rn.setFuel(fuel);
+    let t0 = Instant.now().nanos();
+    let t = rn.run(nc, v, tb, h, unit, args, &mut out);
+    let t1 = Instant.now().nanos();
+    if t is Some { return noTime(); }
+    answer = *out[0usize];
+    times.push(t1 - t0);
+    r = r + 1;
+  }
+  timed(&times, answer)
+}
+
+fn ms(ns: i64) f64 { f64.from(ns) / 1e6 }
+
+// One line of a timing table: 'work' units of the thing counted (turns, vertices, calls) in one run
+fn row(label: &str, t: &Timed, work: i64) {
+  print <- "  "; printStr(label); print <- " median "; print <- ms(t.med); print <- " ms (min "; print <- ms(t.min); print <- ", max "; print <- ms(t.max);
+  print <- "); per unit of work "; print <- f64.from(t.med) / f64.from(work); print <- " ns; answer bits "; print <- t.answer; print <- "\n";
+}
+
+// The three rows and the ratios, for a unit run by the interpreter and by native code, and the plain Cone's time
+fn compare3(work: i64, ti: &Timed, tn: &Timed, tc: &Timed, workC: i64) {
+  if !ti.ok || !tn.ok { print <- "  a run trapped\n"; return; }
+  row("interpreter ", ti, work);
+  row("native code ", tn, work);
+  print <- "  plain Cone   median "; print <- ms(tc.med); print <- " ms (min "; print <- ms(tc.min); print <- ", max "; print <- ms(tc.max);
+  print <- "); per unit of work "; print <- f64.from(tc.med) / f64.from(workC); print <- " ns; answer bits "; print <- tc.answer; print <- "\n";
+  print <- "  the interpreter and native code gave "; print <- (if ti.answer == tn.answer { "the same bits" } else { "DIFFERENT BITS" });
+  print <- "; per unit of work, interpreter / native "; print <- (f64.from(ti.med) / f64.from(work)) / (f64.from(tn.med) / f64.from(work));
+  print <- "x; native / plain Cone "; print <- (f64.from(tn.med) / f64.from(work)) / (f64.from(tc.med) / f64.from(workC)); print <- "x\n";
+}
+
 fn micro() {
   let tables = noImports();
   var h = HandleTable[u8].make();
@@ -192,25 +269,14 @@ fn micro() {
   let w = loopCode(n);
   match verify(&w.code, &tables) {
     case let Ok(v) {
-      var it = Interpreter.make();
-      var out = List[u64]();
       let none = List[u64]();
-      var times = List[i64]();
-      var r = 0;
-      var answer = 0.;
-      while r < 7 {
-        it.setFuel(1000000000u64);
-        let t0 = Instant.now().nanos();
-        let t = it.run(&v, &tables, &mut h, 0u32, none.view(), &mut out);
-        let t1 = Instant.now().nanos();
-        if t is Some { print <- "the loop trapped\n"; return; }
-        answer = f64.fromBits(*out[0usize]);
-        times.push(t1 - t0);
-        r = r + 1;
-      }
+      let ti = timeInterp(&v, &tables, &mut h, 0u32, none.view(), 1000000000u64);
+      var tn = noTime();
+      let nat = nativeAlways(&v, "micro", liftOptsNone());
+      if nat.len() > 0usize { tn = timeNative(&nat[0usize], &v, &tables, &mut h, 0u32, none.view(), 1000000000u64); }
       var ntimes = List[i64]();
       var nanswer = 0.;
-      r = 0;
+      var r = 0;
       while r < 7 {
         let t0 = Instant.now().nanos();
         nanswer = nativeLoop(n * 40i64 + i64.from(r), nanswer);
@@ -218,19 +284,183 @@ fn micro() {
         ntimes.push(t1 - t0);
         r = r + 1;
       }
-      let st = sorted(&times);
-      let sn = sorted(&ntimes);
-      let perTurn = f64.from(*st[3usize]) / f64.from(n);
-      let perTurnNative = f64.from(*sn[3usize]) / f64.from(n * 40i64);
-      print <- "form loop: "; print <- n; print <- " turns, 13 ops each; run min/median/max "; print <- f64.from(*st[0usize]) / 1e6; print <- " / ";
-      print <- f64.from(*st[3usize]) / 1e6; print <- " / "; print <- f64.from(*st[6usize]) / 1e6; print <- " ms; answer "; print <- answer; print <- "\n";
-      print <- "  per turn "; print <- perTurn; print <- " ns, per op "; print <- perTurn / 13.; print <- " ns\n";
-      print <- "native loop: "; print <- n * 40i64; print <- " turns; median "; print <- f64.from(*sn[3usize]) / 1e6; print <- " ms (min "; print <- f64.from(*sn[0usize]) / 1e6;
-      print <- ", max "; print <- f64.from(*sn[6usize]) / 1e6; print <- "); answer "; print <- nanswer; print <- "\n";
-      print <- "  per turn "; print <- perTurnNative; print <- " ns\n";
-      print <- "  interpreted to native, per turn: "; print <- perTurn / perTurnNative; print <- "x\n";
+      let tc = timed(&ntimes, nanswer.bits());
+      print <- "micro: a form loop of "; print <- n; print <- " turns, 13 ops and one fuel a turn (the plain Cone loop runs "; print <- n * 40i64; print <- " turns)\n";
+      compare3(n, &ti, &tn, &tc, n * 40i64);
+      print <- "  (the plain Cone loop's answer differs by design: it runs a different number of turns)\n";
     }
     case let Err(ps) { print <- "the loop code was refused\n"; }
+  }
+}
+
+// ---- procgen: number-only forms, no sculpt calls ----
+
+// (a) Per-vertex displacement: a loop over 'n' vertices, about 20 float ops each (muls, adds, a sqrt, an abs, a min and a max,
+// a divide), accumulating a checksum. Unit 0 () -> f64.
+fn displaceCode(n: i64) CodeWriter {
+  let e = List[u32]();
+  var w = CodeWriter.make();
+  let bt = w.code.types.sig(e.view(), e.view());
+  let msig = w.code.types.sig(e.view(), &[TY_F64]);
+  w.beginUnit(msig, "displace");
+  let acc = w.local(TY_F64);
+  let i = w.local(TY_I64);
+  let x = w.local(TY_F64);
+  let y = w.local(TY_F64);
+  let z = w.local(TY_F64);
+  let wd = w.local(TY_F64);
+  let t = w.local(TY_F64);
+  let u = w.local(TY_F64);
+  w.opU(OP_BLOCK, bt);
+  w.opU(OP_LOOP, bt);
+  // x = float(i) * 0.001
+  w.opU(OP_LOCAL_GET, i); w.op(OP_F64_FROM_I64); w.f64Const(0.001); w.op(OP_F64_MUL); w.opU(OP_LOCAL_SET, x);
+  // y = x * 1.5 + 0.25
+  w.opU(OP_LOCAL_GET, x); w.f64Const(1.5); w.op(OP_F64_MUL); w.f64Const(0.25); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, y);
+  // z = y * y - x
+  w.opU(OP_LOCAL_GET, y); w.opU(OP_LOCAL_GET, y); w.op(OP_F64_MUL); w.opU(OP_LOCAL_GET, x); w.op(OP_F64_SUB); w.opU(OP_LOCAL_SET, z);
+  // wd = sqrt(abs(z) + 1)
+  w.opU(OP_LOCAL_GET, z); w.op(OP_F64_ABS); w.f64Const(1.0); w.op(OP_F64_ADD); w.op(OP_F64_SQRT); w.opU(OP_LOCAL_SET, wd);
+  // t = min(max(wd * 0.5 - y, -2), 2)
+  w.opU(OP_LOCAL_GET, wd); w.f64Const(0.5); w.op(OP_F64_MUL); w.opU(OP_LOCAL_GET, y); w.op(OP_F64_SUB); w.f64Const(-2.0); w.op(OP_F64_MAX);
+  w.f64Const(2.0); w.op(OP_F64_MIN); w.opU(OP_LOCAL_SET, t);
+  // u = x / (y * y + 1)
+  w.opU(OP_LOCAL_GET, x); w.opU(OP_LOCAL_GET, y); w.opU(OP_LOCAL_GET, y); w.op(OP_F64_MUL); w.f64Const(1.0); w.op(OP_F64_ADD); w.op(OP_F64_DIV);
+  w.opU(OP_LOCAL_SET, u);
+  // acc = acc + (t * 0.75 + wd - u)
+  w.opU(OP_LOCAL_GET, acc); w.opU(OP_LOCAL_GET, t); w.f64Const(0.75); w.op(OP_F64_MUL); w.opU(OP_LOCAL_GET, wd); w.op(OP_F64_ADD);
+  w.opU(OP_LOCAL_GET, u); w.op(OP_F64_SUB); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, acc);
+  // i = i + 1; loop while i < n
+  w.opU(OP_LOCAL_GET, i); w.i64Const(1i64); w.op(OP_I64_ADD); w.opU(OP_LOCAL_TEE, i); w.i64Const(n); w.op(OP_I64_LT);
+  w.opU(OP_BR_IF, 0u32);
+  w.op(OP_END);
+  w.op(OP_END);
+  w.opU(OP_LOCAL_GET, acc);
+  w.endUnit();
+  w
+}
+
+fn displaceCone(n: i64) f64 {
+  var acc = 0.;
+  var i = 0i64;
+  while i < n {
+    let x = f64.from(i) * 0.001;
+    let y = x * 1.5 + 0.25;
+    let z = y * y - x;
+    let wd = (z.abs() + 1.0).sqrt();
+    let t = (wd * 0.5 - y).max(-2.0).min(2.0);
+    let u = x / (y * y + 1.0);
+    acc = acc + (t * 0.75 + wd - u);
+    i = i + 1i64;
+  }
+  acc
+}
+
+// A segment's length: len * (1 + ang * ang * 0.01), pushed
+fn seg(w: &mut CodeWriter) {
+  w.opU(OP_LOCAL_GET, 1u32); w.f64Const(1.0); w.opU(OP_LOCAL_GET, 2u32); w.opU(OP_LOCAL_GET, 2u32); w.op(OP_F64_MUL); w.f64Const(0.01);
+  w.op(OP_F64_MUL); w.op(OP_F64_ADD); w.op(OP_F64_MUL);
+}
+
+// (b) A branching tree through call with parameters: tree(depth, len, ang) = the segment's length, and, below depth 0, the
+// sum of the two children's (lengths 0.7 and 0.6 of it, angles +0.3 and -0.4). Unit 0 is tree; unit 1 () -> f64 is the
+// run: tree(depth, 1, 0). A tree of depth d makes 2^(d+1) - 1 calls.
+fn treeCode(depth: i64) CodeWriter {
+  let e = List[u32]();
+  var w = CodeWriter.make();
+  let bt = w.code.types.sig(e.view(), &[TY_F64]);
+  let tsig = w.code.types.sig(&[TY_I64, TY_F64, TY_F64], &[TY_F64]);
+  let msig = w.code.types.sig(e.view(), &[TY_F64]);
+  let tree = w.beginUnit(tsig, "tree");
+  w.opU(OP_LOCAL_GET, 0u32); w.i64Const(0i64); w.op(OP_I64_EQ);
+  w.opU(OP_IF, bt);
+  seg(&mut w);
+  w.op(OP_ELSE);
+  seg(&mut w);
+  w.opU(OP_LOCAL_GET, 0u32); w.i64Const(1i64); w.op(OP_I64_SUB);
+  w.opU(OP_LOCAL_GET, 1u32); w.f64Const(0.7); w.op(OP_F64_MUL);
+  w.opU(OP_LOCAL_GET, 2u32); w.f64Const(0.3); w.op(OP_F64_ADD);
+  w.opU(OP_CALL, tree);
+  w.opU(OP_LOCAL_GET, 0u32); w.i64Const(1i64); w.op(OP_I64_SUB);
+  w.opU(OP_LOCAL_GET, 1u32); w.f64Const(0.6); w.op(OP_F64_MUL);
+  w.opU(OP_LOCAL_GET, 2u32); w.f64Const(-0.4); w.op(OP_F64_ADD);
+  w.opU(OP_CALL, tree);
+  w.op(OP_F64_ADD); w.op(OP_F64_ADD);
+  w.op(OP_END);
+  w.endUnit();
+  w.beginUnit(msig, "run");
+  w.i64Const(depth); w.f64Const(1.0); w.f64Const(0.0); w.opU(OP_CALL, tree);
+  w.endUnit();
+  w
+}
+
+fn treeCone(d: i64, len: f64, ang: f64) f64 {
+  let s = len * (1.0 + ang * ang * 0.01);
+  if d == 0i64 { return s; }
+  s + treeCone(d - 1i64, len * 0.7, ang + 0.3) + treeCone(d - 1i64, len * 0.6, ang - 0.4)
+}
+
+fn procgen() {
+  let tables = noImports();
+  var h = HandleTable[u8].make();
+  let none = List[u64]();
+
+  // (a) displacement
+  let n = 100000i64;
+  let wa = displaceCode(n);
+  match verify(&wa.code, &tables) {
+    case let Ok(v) {
+      let ti = timeInterp(&v, &tables, &mut h, 0u32, none.view(), 1000000000u64);
+      var tn = noTime();
+      let nat = nativeAlways(&v, "procgen", liftOptsNone());
+      if nat.len() > 0usize { tn = timeNative(&nat[0usize], &v, &tables, &mut h, 0u32, none.view(), 1000000000u64); }
+      var ctimes = List[i64]();
+      var canswer = 0.;
+      var r = 0;
+      while r < 7 {
+        let t0 = Instant.now().nanos();
+        canswer = displaceCone(n);
+        let t1 = Instant.now().nanos();
+        ctimes.push(t1 - t0);
+        r = r + 1;
+      }
+      let tc = timed(&ctimes, canswer.bits());
+      print <- "procgen (a): per-vertex displacement, "; print <- n; print <- " vertices, 20 float ops each (work unit: one vertex)\n";
+      compare3(n, &ti, &tn, &tc, n);
+      print <- "  the plain Cone answer is "; print <- (if tc.answer == ti.answer { "the same bits" } else { "different bits (LLVM may fuse or reorder: only the two executors must agree)" }); print <- "\n";
+    }
+    case let Err(ps) { print <- "procgen (a): the code was refused: "; print <- ps[0usize].what.view(); print <- "\n"; }
+  }
+
+  // (b) the tree
+  let depth = 12i64;
+  let wb = treeCode(depth);
+  match verify(&wb.code, &tables) {
+    case let Ok(v) {
+      let ti = timeInterp(&v, &tables, &mut h, 1u32, none.view(), 1000000000u64);
+      var tn = noTime();
+      let nat = nativeAlways(&v, "procgen", liftOptsNone());
+      if nat.len() > 0usize { tn = timeNative(&nat[0usize], &v, &tables, &mut h, 1u32, none.view(), 1000000000u64); }
+      var ctimes = List[i64]();
+      var canswer = 0.;
+      var r = 0;
+      while r < 7 {
+        let t0 = Instant.now().nanos();
+        canswer = treeCone(depth, 1.0, 0.0);
+        let t1 = Instant.now().nanos();
+        ctimes.push(t1 - t0);
+        r = r + 1;
+      }
+      let tc = timed(&ctimes, canswer.bits());
+      var calls = 1i64;
+      var dd = 0i64;
+      while dd <= depth { calls = calls * 2i64; dd = dd + 1i64; }
+      calls = calls - 1i64;
+      print <- "procgen (b): branching tree, depth "; print <- depth; print <- ", two children each, "; print <- calls; print <- " calls (work unit: one call)\n";
+      compare3(calls, &ti, &tn, &tc, calls);
+      print <- "  the plain Cone answer is "; print <- (if tc.answer == ti.answer { "the same bits" } else { "different bits" }); print <- "\n";
+    }
+    case let Err(ps) { print <- "procgen (b): the code was refused: "; print <- ps[0usize].what.view(); print <- "\n"; }
   }
 }
 
@@ -266,32 +496,261 @@ fn importMicro() {
   let w = importLoopCode(n, &impInc, &mut tables);
   match verify(&w.code, &tables) {
     case let Ok(v) {
-      var it = Interpreter.make();
-      var out = List[u64]();
       let none = List[u64]();
-      var times = List[i64]();
+      let ti = timeInterp(&v, &tables, &mut h, 0u32, none.view(), 1000000000u64);
+      var tn = noTime();
+      let nat = nativeAlways(&v, "import", liftOptsNone());
+      if nat.len() > 0usize { tn = timeNative(&nat[0usize], &v, &tables, &mut h, 0u32, none.view(), 1000000000u64); }
+      // the same call made directly: the host function itself, in a Cone loop
+      var ctimes = List[i64]();
+      var slots = List[u64]();
+      slots.push(0u64);
       var r = 0;
       while r < 7 {
-        it.setFuel(1000000000u64);
+        slots.set(0usize, (0.0).bits());
         let t0 = Instant.now().nanos();
-        let t = it.run(&v, &tables, &mut h, 0u32, none.view(), &mut out);
+        var i = 0i64;
+        while i < n { _ = impInc(&mut h, slots.viewMut()); i = i + 1i64; }
         let t1 = Instant.now().nanos();
-        if t is Some { print <- "the loop trapped\n"; return; }
-        times.push(t1 - t0);
+        ctimes.push(t1 - t0);
         r = r + 1;
       }
-      let st = sorted(&times);
-      print <- "import loop: "; print <- n; print <- " turns (8 ops and one import each); run min/median/max "; print <- f64.from(*st[0usize]) / 1e6;
-      print <- " / "; print <- f64.from(*st[3usize]) / 1e6; print <- " / "; print <- f64.from(*st[6usize]) / 1e6; print <- " ms; per turn ";
-      print <- f64.from(*st[3usize]) / f64.from(n); print <- " ns; answer "; print <- f64.fromBits(*out[0usize]); print <- "\n";
+      let tc = timed(&ctimes, *slots[0usize]);
+      print <- "import loop: "; print <- n; print <- " turns (8 ops and one import each; work unit: one turn)\n";
+      compare3(n, &ti, &tn, &tc, n);
+      print <- "  (plain Cone here is the host function called directly in a loop: no executor, no window)\n";
     }
     case let Err(ps) { print <- "the import loop's code was refused: "; print <- ps[0usize].what.view(); print <- "\n"; }
+  }
+}
+
+// ---- Sim's derives, steady state ----
+//
+// What Sim does each step for a world with many derives, with nothing else around it: every derive's unit run once, by the
+// interpreter and by native code, with the host's imports as Sim's (the same functions as pegasus\src\simrules.cone) and the
+// clock read only twice round the whole pass (the profile of PEGASUS_PROFILE_RULES reads it twice an import, which costs the
+// interpreter's side more).
+
+alias SimHandles = HandleTable[u8];
+
+fn sField(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(1usize).len() { hs.fail = String.from("host.field: no such field"); return false; }
+  slots[0usize] = *hs.payload(1usize)[i];
+  true
+}
+fn sOccupied(hs: &mut SimHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  slots[0usize] = if s < hs.payload(2usize).len() { *hs.payload(2usize)[s] } else { 0u64 };
+  true
+}
+fn sNothing(hs: &mut SimHandles, slots: &mut Array[u64]) bool { true }
+
+fn simTables() ImportTables[u8] {
+  var t = ImportTables[u8].make();
+  let f = fieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_FIELD, f, false, 1u32, &sField);
+  let o = occupiedSignature(&mut t.types);
+  t.add(NS_HOST, HOST_OCCUPIED, o, false, 1u32, &sOccupied);
+  let s = setFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FIELD, s, true, 1u32, &sNothing);
+  let a = startAnimSignature(&mut t.types);
+  t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &sNothing);
+  let g = glideSignature(&mut t.types);
+  t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &sNothing);
+  t
+}
+
+fn simBench(file: &str, steps: u64) {
+  match fs.readFile(&Path.from(file)) {
+    case let Err(e) { printStr(file); print <- ": cannot be read\n"; }
+    case let Ok(text) {
+      let reading = readWorld(text.view());
+      let w = &reading.understood;
+      let code = lowerSim(w);
+      let tb = simTables();
+      match verifyEach(&code, &tb) {
+        case let Err(ps) { print <- "the world's sim code was refused\n"; }
+        case let Ok(v) {
+          var units = List[u32]();
+          var u = 0usize;
+          while u < v.unitCount() { if !v.isRefused(u) && v.paramSlots(u) == 0u32 { units.push(u32.from(u)); } u = u + 1usize; }
+          var h = SimHandles.make();
+          var fields = List[u64]();
+          var i = 0usize;
+          while i < w.fields.len() { fields.push(w.fields[i].init.bits()); i = i + 1usize; }
+          var inside = List[u64]();
+          i = 0usize;
+          while i < w.nodes.len() { inside.push(1u64); i = i + 1usize; }
+          h.alloc(HANDLE_HOST, fields);
+          h.alloc(HANDLE_HOST, inside);
+          h.alloc(HANDLE_HOST, List[u64]());
+          let none = List[u64]();
+          var out = List[u64]();
+          let nat = nativeAlways(&v, "sim", liftOptsNone());
+          var it = Interpreter.make();
+          var rn = NativeRunner.make();
+          var ti = List[i64]();
+          var tn = List[i64]();
+          var sumI = 0u64;
+          var sumN = 0u64;
+          var rep = 0;
+          while rep < 8 {                       // the first of the 8 passes warms up and is not counted
+            let t0 = Instant.now().nanos();
+            var s = 0u64;
+            while s < steps {
+              var k = 0usize;
+              while k < units.len() {
+                it.setFuel(100000u64);
+                let t = it.run(&v, &tb, &mut h, *units[k], none.view(), &mut out);
+                if t is Some { print <- "a derive trapped\n"; return; }
+                if out.len() > 0usize { sumI = sumI + *out[0usize]; }
+                k = k + 1usize;
+              }
+              s = s + 1u64;
+            }
+            let t1 = Instant.now().nanos();
+            if rep > 0 { ti.push(t1 - t0); }
+            if nat.len() > 0usize {
+              let t2 = Instant.now().nanos();
+              s = 0u64;
+              while s < steps {
+                var k = 0usize;
+                while k < units.len() {
+                  rn.setFuel(100000u64);
+                  let t = rn.run(&nat[0usize], &v, &tb, &mut h, *units[k], none.view(), &mut out);
+                  if t is Some { print <- "a derive trapped natively\n"; return; }
+                  if out.len() > 0usize { sumN = sumN + *out[0usize]; }
+                  k = k + 1usize;
+                }
+                s = s + 1u64;
+              }
+              let t3 = Instant.now().nanos();
+              if rep > 0 { tn.push(t3 - t2); }
+            }
+            rep = rep + 1;
+          }
+          let mi = med(&ti);
+          let mn = med(&tn);
+          let perStepI = f64.from(mi) / f64.from(steps);
+          let perStepN = f64.from(mn) / f64.from(steps);
+          print <- "sim derives: "; printStr(file); print <- ": "; print <- units.len(); print <- " units a step, "; print <- steps; print <- " steps, medians of 7 passes\n";
+          print <- "  interpreter  "; print <- perStepI / 1000.; print <- " us a step ("; print <- perStepI / f64.from(units.len()); print <- " ns a derive)\n";
+          print <- "  native code  "; print <- perStepN / 1000.; print <- " us a step ("; print <- perStepN / f64.from(units.len()); print <- " ns a derive)\n";
+          print <- "  interpreter / native "; print <- perStepI / perStepN; print <- "x; the two executors' result checksums "; print <- (if sumI == sumN { "agree" } else { "DIFFER" }); print <- "\n";
+        }
+      }
+    }
+  }
+}
+
+// ---- compile time ----
+
+fn dummyHost(h: &mut HandleTable[u8], s: &mut Array[u64]) bool { true }
+
+// Sim's import table, for verifying only (pegasus\src\simrules.cone has the real one)
+fn simTablesForVerify() ImportTables[u8] {
+  var t = ImportTables[u8].make();
+  let f = fieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_FIELD, f, false, 1u32, &dummyHost);
+  let o = occupiedSignature(&mut t.types);
+  t.add(NS_HOST, HOST_OCCUPIED, o, false, 1u32, &dummyHost);
+  let s = setFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FIELD, s, true, 1u32, &dummyHost);
+  let a = startAnimSignature(&mut t.types);
+  t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &dummyHost);
+  let g = glideSignature(&mut t.types);
+  t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &dummyHost);
+  t
+}
+
+fn med(xs: &List[i64]) i64 { let s = sorted(xs); *s[s.len() / 2usize] }
+
+// One Code's make (lower and verify) against its compile (lift, compileX64, load), medians of 'reps'
+fn compileRow(label: &str, sim: bool, text: &Array[u8], reps: u64) {
+  var makes = List[i64]();
+  var lifts = List[i64]();
+  var gens = List[i64]();
+  var loads = List[i64]();
+  var units = 0usize;
+  var bytes = 0usize;
+  var ok = true;
+  var k = 0u64;
+  while k < reps + 1u64 {                // the first pass warms the caches and is not counted
+    let reading = readWorld(text);
+    let w = &reading.understood;
+    let t0 = Instant.now().nanos();
+    var tfixed = toolImports(&w.vocab, &w.names);
+    var tsim = simTablesForVerify();
+    let code = if sim { lowerSim(w) } else { lower(w) };
+    var vv = List[VerifiedCode]();
+    if sim {
+      match verifyEach(&code, &tsim) { case let Ok(v) { vv.push(v); } case let Err(ps) { ok = false; } }
+    } else {
+      match verifyEach(&code, &tfixed) { case let Ok(v) { vv.push(v); } case let Err(ps) { ok = false; } }
+    }
+    let t1 = Instant.now().nanos();
+    if ok && vv.len() > 0usize && vv[0usize].unitCount() > 0usize {
+      let t2 = Instant.now().nanos();
+      let funcs = lift(&vv[0usize]);
+      let t3 = Instant.now().nanos();
+      match codegen.compileX64(&funcs, codegen.hostAbi()) {
+        case let Ok(mc) {
+          let t4 = Instant.now().nanos();
+          bytes = mc.bytes.len();
+          match codegen.load(&mc) {
+            case let Ok(lc) {
+              let t5 = Instant.now().nanos();
+              if k > 0u64 { makes.push(t1 - t0); lifts.push(t3 - t2); gens.push(t4 - t3); loads.push(t5 - t4); }
+            }
+            case let Err(e) { ok = false; }
+          }
+        }
+        case let Err(e) { ok = false; }
+      }
+      units = vv[0usize].unitCount();
+    }
+    k = k + 1u64;
+  }
+  printStr(label); print <- ": ";
+  if !ok || makes.len() == 0usize { print <- (if units == 0usize { "no units\n" } else { "FAILED\n" }); return; }
+  let m = med(&makes);
+  let l = med(&lifts);
+  let g = med(&gens);
+  let d = med(&loads);
+  print <- units; print <- " units, "; print <- bytes; print <- " B of machine code; make (lower+verify) "; print <- us(m); print <- " us; compile = lift ";
+  print <- us(l); print <- " + compileX64 "; print <- us(g); print <- " + load "; print <- us(d); print <- " = "; print <- us(l + g + d);
+  print <- " us; compile / make "; print <- f64.from(l + g + d) / f64.from(m); print <- "x\n";
+}
+
+fn compileWorld(file: &str, reps: u64) {
+  match fs.readFile(&Path.from(file)) {
+    case let Ok(text) {
+      printStr(file); print <- "\n";
+      compileRow("  fixed code", false, text.view(), reps);
+      compileRow("  sim code  ", true, text.view(), reps);
+    }
+    case let Err(e) { printStr(file); print <- ": cannot be read\n"; }
   }
 }
 
 fn main(argc: i32, argv: **u8) i32 {
   if argc > 1i32 && argIs(*(argv + 1usize), "micro") { micro(); return 0i32; }
   if argc > 1i32 && argIs(*(argv + 1usize), "import") { importMicro(); return 0i32; }
+  if argc > 1i32 && argIs(*(argv + 1usize), "procgen") { procgen(); return 0i32; }
+  if argc > 3i32 && argIs(*(argv + 1usize), "sim") {
+    simBench(cstr.fromPtr(*(argv + 3usize)).view(), argNumber(*(argv + 2usize)));
+    return 0i32;
+  }
+  if argc > 3i32 && argIs(*(argv + 1usize), "compile") {
+    let reps = argNumber(*(argv + 2usize));
+    var a = 3i32;
+    while a < argc {
+      compileWorld(cstr.fromPtr(*(argv + usize.from(a))).view(), reps);
+      a = a + 1i32;
+    }
+    return 0i32;
+  }
   if argc > 3i32 && argIs(*(argv + 1usize), "build") {
     let reps = argNumber(*(argv + 2usize));
     var a = 3i32;
@@ -301,6 +760,6 @@ fn main(argc: i32, argv: **u8) i32 {
     }
     return 0i32;
   }
-  print <- "usage: interpbench build REPS FILE... | micro | import\n";
+  print <- "usage: interpbench build REPS FILE... | micro | import | procgen | compile REPS FILE...\n";
   2i32
 }

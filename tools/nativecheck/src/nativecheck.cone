@@ -1,0 +1,735 @@
+// nativecheck: the merge gate for the native executor (the native-backend design, section 14).
+//
+//   nativecheck FILE.ddd...     for each world:
+//     1. reads it, lowers and verifies both its Codes (the fixed code that builds parts, and Sim's derives and rules);
+//     2. compiles both natively (lift, compileX64, load), noting the machine code's size and checksum;
+//     3. builds every part through the interpreter and natively (PartBuilder in both modes) and compares what each made:
+//        mesh (every position, normal, uv and index by its bits, and the box), look (material, light, camera, eye) and
+//        placement (at, turn, placement matrix, facing), and the notes;
+//     4. runs every derive and handler of Sim's code with the fields set to a spread of values (0, -0, negative, large,
+//        tiny, infinite, NaN), at full fuel and at a small fuel, on both executors;
+//     5. runs every parameterless unit of the fixed code on both executors with a fuel sweep.
+//   Runs are compared on result slots, trap (kind, unit, offset, message), fuel left, and the handle table (kinds and
+//   payloads: for Sim's code that includes its staged writes). Every NaN counts as one value. It prints a table per
+//   world and exits 1 on any difference or any code that does not compile.
+//
+// NATIVECHECK_MUTANT=add-to-sub puts a fault into the lift (the first f64.add of each Code becomes a subtraction) so that
+// the check can be seen to fail: it must then exit 1.
+
+mod nativecheck;
+
+import stdio use *;
+import libc;
+import collections use *;
+import geomath use *;
+import mesh use Mesh;
+import conescript use *;
+import partbuild use *;
+import codegen;
+import thread;
+import path use Path;
+import fs;
+
+// -------- a run, as a comparable record --------
+
+struct Snap {
+  trapped: bool;
+  kind: u32;
+  unit: u32;
+  offset: u32;
+  message: String;
+  slots: List[u64];
+  fuel: u64;
+  hkinds: List[u32];
+  hdata: List[u64];     // each handle's payload, then a marker
+  fail: String;
+}
+
+fn kindNum(t: &Trap) u32 {
+  match t.kind {
+    case FuelOut { 1u32 }
+    case ImportFailed { 2u32 }
+    case Unreachable { 3u32 }
+    case DepthOut { 4u32 }
+    case BadCall { 5u32 }
+    case Refused { 6u32 }
+  }
+}
+
+// Every NaN is one value
+fn canon(x: u64) u64 {
+  let f = f64.fromBits(x);
+  if f != f { return 0x7FF8000000000000u64; }
+  x
+}
+
+fn snapOf[V](r: &Option[Trap], out: &List[u64], fuel: u64, h: &HandleTable[V]) Snap {
+  var s = Snap(false, 0u32, 0u32, 0u32, String(), List[u64](), fuel, List[u32](), List[u64](), h.fail.clone());
+  match r {
+    case let Some(t) { s.trapped = true; s.kind = kindNum(t); s.unit = t.unit; s.offset = t.offset; s.message = t.message.clone(); }
+    case is None {}
+  }
+  var i = 0usize;
+  while i < out.len() { s.slots.push(canon(*out[i])); i = i + 1usize; }
+  i = 0usize;
+  while i < h.kinds.len() {
+    s.hkinds.push(*h.kinds[i]);
+    let p = &h.data[i];
+    var j = 0usize;
+    while j < p.len() { s.hdata.push(canon(*p[j])); j = j + 1usize; }
+    s.hdata.push(0xABCDEF0123456789u64);
+    i = i + 1usize;
+  }
+  s
+}
+
+// What differs, or an empty string
+fn differ(a: &Snap, b: &Snap) &str {
+  if a.trapped != b.trapped { return "trapped or not"; }
+  if a.kind != b.kind { return "trap kind"; }
+  if a.unit != b.unit { return "trap unit"; }
+  if a.offset != b.offset { return "trap offset"; }
+  if !(a.message == b.message) { return "trap message"; }
+  if a.fuel != b.fuel { return "fuel left"; }
+  if !(a.slots == b.slots) { return "result slots"; }
+  if !(a.hkinds == b.hkinds) { return "handle kinds"; }
+  if !(a.hdata == b.hdata) { return "handle payloads (staged writes)"; }
+  if !(a.fail == b.fail) { return "refusal message"; }
+  ""
+}
+
+struct Tally {
+  runs: u64;
+  trapped: u64;
+  diffs: u64;
+  printed: u32;
+}
+
+fn newTally() Tally { Tally(0u64, 0u64, 0u64, 0u32) }
+
+// -------- Sim's host (the same table as pegasus\src\simrules.cone, which this package cannot import) --------
+
+alias RuleHandles = HandleTable[u8];
+const RULE_FIELDS = 1usize;
+const RULE_INSIDE = 2usize;
+const RULE_WRITES = 3usize;
+const WRITE_SET = 0u64;
+const WRITE_ANIM = 1u64;
+const WRITE_GLIDE = 2u64;
+const RULE_FUEL = 100000u64;
+const FIXED_FUEL = 100000000u64;
+
+fn hostField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(RULE_FIELDS).len() { hs.fail = String.from("host.field: no such field"); return false; }
+  slots[0usize] = *hs.payload(RULE_FIELDS)[i];
+  true
+}
+
+fn hostOccupied(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  slots[0usize] = if s < hs.payload(RULE_INSIDE).len() { *hs.payload(RULE_INSIDE)[s] } else { 0u64 };
+  true
+}
+
+fn stage(hs: &mut RuleHandles, kind: u64, a: u64, b: u64, c: u64) {
+  (&mut hs.data[RULE_WRITES]).push(kind);
+  (&mut hs.data[RULE_WRITES]).push(a);
+  (&mut hs.data[RULE_WRITES]).push(b);
+  (&mut hs.data[RULE_WRITES]).push(c);
+}
+
+fn hostSetField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(RULE_FIELDS).len() { hs.fail = String.from("host.set_field: no such field"); return false; }
+  stage(hs, WRITE_SET, u64.from(i), slots[1usize], 0u64);
+  true
+}
+
+fn hostStartAnim(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  stage(hs, WRITE_ANIM, slots[0usize], 0u64, 0u64);
+  true
+}
+
+fn hostGlide(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(RULE_FIELDS).len() { hs.fail = String.from("host.glide: no such field"); return false; }
+  stage(hs, WRITE_GLIDE, u64.from(i), slots[1usize], slots[2usize]);
+  true
+}
+
+fn ruleImports() ImportTables[u8] {
+  var t = ImportTables[u8].make();
+  let f = fieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_FIELD, f, false, 1u32, &hostField);
+  let o = occupiedSignature(&mut t.types);
+  t.add(NS_HOST, HOST_OCCUPIED, o, false, 1u32, &hostOccupied);
+  let s = setFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FIELD, s, true, 1u32, &hostSetField);
+  let a = startAnimSignature(&mut t.types);
+  t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &hostStartAnim);
+  let g = glideSignature(&mut t.types);
+  t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &hostGlide);
+  t
+}
+
+fn ruleHandles(fields: &List[u64], inside: &List[u64]) RuleHandles {
+  var hs = RuleHandles.make();
+  hs.alloc(HANDLE_HOST, fields.clone());
+  hs.alloc(HANDLE_HOST, inside.clone());
+  hs.alloc(HANDLE_HOST, List[u64]());
+  hs
+}
+
+// The values the fields take: zero, minus zero, small and large of both signs, tiny, infinite, not-a-number
+fn spread() List[f64] {
+  var l = List[f64]();
+  l.push(0.); l.push(f64.fromBits(0x8000000000000000u64)); l.push(1.); l.push(-1.); l.push(0.5); l.push(2.); l.push(3.7);
+  l.push(-0.001); l.push(1.0e9); l.push(1.0e300); l.push(-1.0e300); l.push(f64.fromBits(1u64));
+  l.push(f64.fromBits(0x7FF0000000000000u64)); l.push(f64.fromBits(0xFFF0000000000000u64)); l.push(f64.fromBits(0x7FF8000000000000u64));
+  l
+}
+
+// -------- executors --------
+
+fn runSim(v: &VerifiedCode, tb: &ImportTables[u8], nc: &NativeCode, native: bool, unit: u32, fuel: u64, fields: &List[u64], inside: &List[u64]) Snap {
+  var h = ruleHandles(fields, inside);
+  var out = List[u64]();
+  let none = List[u64]();
+  if native {
+    var r = NativeRunner.make();
+    r.setFuel(fuel);
+    let t = r.run(nc, v, tb, &mut h, unit, none.view(), &mut out);
+    return snapOf(&t, &out, r.fuelLeft(), &h);
+  }
+  var it = Interpreter.make();
+  it.setFuel(fuel);
+  let t = it.run(v, tb, &mut h, unit, none.view(), &mut out);
+  snapOf(&t, &out, it.fuelLeft(), &h)
+}
+
+fn toolHandles() ToolHandles {
+  var hs = ToolHandles.make();
+  hs.allocValue(ToolValue.Parts(List[MaterialRec]()));
+  hs
+}
+
+fn runFixed(v: &VerifiedCode, tb: &ImportTables[ToolValue], nc: &NativeCode, native: bool, unit: u32, fuel: u64) Snap {
+  var h = toolHandles();
+  var out = List[u64]();
+  let none = List[u64]();
+  if native {
+    var r = NativeRunner.make();
+    r.setFuel(fuel);
+    let t = r.run(nc, v, tb, &mut h, unit, none.view(), &mut out);
+    return snapOf(&t, &out, r.fuelLeft(), &h);
+  }
+  var it = Interpreter.make();
+  it.setFuel(fuel);
+  let t = it.run(v, tb, &mut h, unit, none.view(), &mut out);
+  snapOf(&t, &out, it.fuelLeft(), &h)
+}
+
+fn note(t: &mut Tally, world: &str, what: &str, unit: u32, fuel: u64, why: &str) {
+  t.diffs = t.diffs + 1u64;
+  if t.printed < 8u32 {
+    t.printed = t.printed + 1u32;
+    print <- "  DIFFERENCE "; printStr(world); print <- " "; printStr(what); print <- " unit "; print <- unit; print <- " fuel "; print <- fuel;
+    print <- ": "; printStr(why); print <- "\n";
+  }
+}
+
+// -------- products, as digests --------
+
+fn fnv(h: u64, x: u64) u64 {
+  var r = h;
+  var k = 0u64;
+  while k < 8u64 {
+    r = (r ^ ((x >> (8u64 * k)) & 0xFFu64)) * 1099511628211u64;
+    k = k + 1u64;
+  }
+  r
+}
+fn hf(h: u64, x: f32) u64 { fnv(h, u64.from(x.bits())) }
+fn hb(h: u64, x: bool) u64 { fnv(h, if x { 1u64 } else { 0u64 }) }
+fn hv3(h: u64, v: Vec3) u64 { hf(hf(hf(h, v.x), v.y), v.z) }
+fn hcol(h: u64, c: Color) u64 { hf(hf(hf(hf(h, c.red), c.green), c.blue), c.alpha) }
+
+fn meshDigest(p: &PartProducts) u64 {
+  let m = &p.mesh;
+  var h = 14695981039346656037u64;
+  h = fnv(h, u64.from(m.positions.len())); h = fnv(h, u64.from(m.normals.len()));
+  h = fnv(h, u64.from(m.uvs.len())); h = fnv(h, u64.from(m.indices.len())); h = fnv(h, u64.from(m.groups.len()));
+  var i = 0usize;
+  while i < m.positions.len() { h = hv3(h, *m.positions[i]); i = i + 1usize; }
+  i = 0usize;
+  while i < m.normals.len() { h = hv3(h, *m.normals[i]); i = i + 1usize; }
+  i = 0usize;
+  while i < m.uvs.len() { let q = *m.uvs[i]; h = hf(hf(h, q.x), q.y); i = i + 1usize; }
+  i = 0usize;
+  while i < m.indices.len() { h = fnv(h, u64.from(*m.indices[i])); i = i + 1usize; }
+  h = hv3(h, p.low); h = hv3(h, p.high); h = hv3(h, p.half);
+  h
+}
+
+fn lookDigest(p: &PartProducts) u64 {
+  var h = 14695981039346656037u64;
+  let m = &p.material;
+  h = hcol(h, m.color); h = hb(h, m.physical); h = hf(h, m.roughness); h = hf(h, m.metal); h = hf(h, m.covers);
+  h = hf(h, m.coat); h = hf(h, m.coatRoughness); h = hf(h, m.reflects);
+  h = fnv(h, u64.from(p.light.kind));
+  let s = &p.light.sun;
+  h = hv3(h, s.toSun); h = hcol(h, s.color); h = hf(h, s.lux); h = hb(h, s.shadows);
+  let l = &p.light.lamp;
+  h = hv3(h, l.aim); h = hcol(h, l.color); h = hf(h, l.candela); h = hf(h, l.reach); h = hf(h, l.source); h = hf(h, l.cone);
+  h = hf(h, l.softEdge); h = hb(h, l.spot); h = hb(h, l.shadows);
+  h = hf(h, p.eye); h = hb(h, p.hasEye); h = hb(h, p.hasCamera);
+  h = hf(h, p.camera.lens); h = hf(h, p.camera.aperture); h = hf(h, p.camera.focus); h = hf(h, p.camera.exposure);
+  h
+}
+
+fn placeDigest(p: &PartProducts) u64 {
+  var h = 14695981039346656037u64;
+  h = hv3(h, p.at);
+  h = hf(hf(hf(hf(h, p.turn.x), p.turn.y), p.turn.z), p.turn.w);
+  var i = 0usize;
+  while i < 16usize { h = hf(h, p.placement.m[i]); i = i + 1usize; }
+  h = hv3(h, p.facing);
+  h
+}
+
+fn notesDigest(p: &PartProducts) u64 {
+  var h = 14695981039346656037u64;
+  h = hb(h, p.made);
+  h = fnv(h, u64.from(p.notes.len()));
+  var i = 0usize;
+  while i < p.notes.len() {
+    let s = p.notes[i].view();
+    var k = 0usize;
+    while k < s.len() { h = fnv(h, u64.from(s[k])); k = k + 1usize; }
+    h = fnv(h, 0xFFu64);
+    i = i + 1usize;
+  }
+  h
+}
+
+// -------- one world --------
+
+struct Totals {
+  worlds: u64;
+  bad: u64;               // worlds with a difference or a failure
+}
+
+fn ints(n: u64) { print <- n; }
+
+fn pad(s: &str, w: usize) {
+  printStr(s);
+  var k = s.len();
+  while k < w { print <- " "; k = k + 1usize; }
+}
+
+fn checkWorld(file: &str, opts: LiftOpts, tot: &mut Totals) {
+  var text = String();
+  match fs.readFile(&Path.from(file)) {
+    case let Ok(t) { text = t; }
+    case let Err(e) { print <- "world "; printStr(file); print <- ": cannot be read\n"; tot.bad = tot.bad + 1u64; return; }
+  }
+  tot.worlds = tot.worlds + 1u64;
+  var bad = false;
+  let reading = readWorld(text.view());
+  let w = &reading.understood;
+  print <- "world "; printStr(file); print <- "  ("; print <- w.nodes.len(); print <- " parts, "; print <- w.fields.len(); print <- " fields, ";
+  print <- w.derives.len(); print <- " derives, "; print <- w.moves.len(); print <- " move rules, "; print <- reading.problems.len(); print <- " problems read)\n";
+
+  // ---- both Codes, lowered and verified ----
+  let fixedCode = lower(w);
+  let ftables = toolImports(&w.vocab, &w.names);
+  let simCode = lowerSim(w);
+  let stables = ruleImports();
+  var fixedOk = false;
+  var simOk = false;
+  var fixedN = 0usize; var fixedRefused = 0usize; var simN = 0usize; var simRefused = 0usize;
+  var fixedBytes = 0usize; var simBytes = 0usize; var fixedSum = 0u64; var simSum = 0u64;
+  var fixedCompiled = String.from("-"); var simCompiled = String.from("-");
+  var fnat = List[NativeCode]();
+  var snat = List[NativeCode]();
+  var fv = List[VerifiedCode]();
+  var sv = List[VerifiedCode]();
+  match verifyEach(&fixedCode, &ftables) {
+    case let Ok(v) { fixedN = v.unitCount(); var u = 0usize; while u < fixedN { if v.isRefused(u) { fixedRefused = fixedRefused + 1usize; } u = u + 1usize; } fv.push(v); fixedOk = true; }
+    case let Err(ps) { fixedCompiled = String.from("verify failed"); }
+  }
+  match verifyEach(&simCode, &stables) {
+    case let Ok(v) { simN = v.unitCount(); var u = 0usize; while u < simN { if v.isRefused(u) { simRefused = simRefused + 1usize; } u = u + 1usize; } sv.push(v); simOk = true; }
+    case let Err(ps) { simCompiled = String.from("verify failed"); }
+  }
+
+  // ---- compiled natively; the machine code's size and checksum (the same Code gives the same bytes: run it twice) ----
+  if fixedOk && fixedN > 0usize {
+    match compileNativeWith(&fv[0usize], opts) {
+      case let Ok(n) { fnat.push(n); fixedCompiled = String.from("yes"); }
+      case let Err(e) { fixedCompiled = String.from("NO: "); fixedCompiled.append(e.view()); bad = true; }
+    }
+    let f1 = liftWith(&fv[0usize], opts);
+    match codegen.compileX64(&f1, codegen.hostAbi()) {
+      case let Ok(mc) { fixedBytes = mc.bytes.len(); fixedSum = codegen.checksum(mc.bytes.view(), mc.bytes.len()); }
+      case let Err(e) { bad = true; }
+    }
+  }
+  if simOk && simN > 0usize {
+    match compileNativeWith(&sv[0usize], opts) {
+      case let Ok(n) { snat.push(n); simCompiled = String.from("yes"); }
+      case let Err(e) { simCompiled = String.from("NO: "); simCompiled.append(e.view()); bad = true; }
+    }
+    let f1 = liftWith(&sv[0usize], opts);
+    match codegen.compileX64(&f1, codegen.hostAbi()) {
+      case let Ok(mc) { simBytes = mc.bytes.len(); simSum = codegen.checksum(mc.bytes.view(), mc.bytes.len()); }
+      case let Err(e) { bad = true; }
+    }
+  }
+  if simOk && simN == 0usize { simCompiled = String.from("(no units)"); }
+  if fixedOk && fixedN == 0usize { fixedCompiled = String.from("(no units)"); }
+
+  // ---- every part, built both ways ----
+  var partsN = 0u64; var dMesh = 0u64; var dLook = 0u64; var dPlace = 0u64; var dNotes = 0u64; var partsNative = true;
+  var madeCount = 0u64;
+  var pt = newTally();
+  if fixedOk {
+    let a = PartBuilder.makeWith(w, toolImports(&w.vocab, &w.names), 0u8, opts);
+    let b = PartBuilder.makeWith(w, toolImports(&w.vocab, &w.names), 1u8, opts);
+    match a {
+      case let Ok(ba) {
+        match b {
+          case let Ok(bb) {
+            var ia = ba;
+            var ib = bb;
+            if !ib.isNative() && fixedN > 0usize { partsNative = false; bad = true; }
+            var i = 0usize;
+            while i < w.order.len() {
+              let slot = *w.order[i];
+              let pa = ia.buildPart(slot, w.nodes[slot].kind);
+              let pb = ib.buildPart(slot, w.nodes[slot].kind);
+              partsN = partsN + 1u64;
+              if pa.made { madeCount = madeCount + 1u64; }
+              if meshDigest(&pa) != meshDigest(&pb) { dMesh = dMesh + 1u64; note(&mut pt, file, "part mesh", u32.from(slot), 0u64, "mesh differs"); }
+              if lookDigest(&pa) != lookDigest(&pb) { dLook = dLook + 1u64; note(&mut pt, file, "part look", u32.from(slot), 0u64, "look differs"); }
+              if placeDigest(&pa) != placeDigest(&pb) { dPlace = dPlace + 1u64; note(&mut pt, file, "part placement", u32.from(slot), 0u64, "placement differs"); }
+              if notesDigest(&pa) != notesDigest(&pb) { dNotes = dNotes + 1u64; note(&mut pt, file, "part notes", u32.from(slot), 0u64, "notes or made differ"); }
+              i = i + 1usize;
+            }
+          }
+          case let Err(ps) { bad = true; }
+        }
+      }
+      case let Err(ps) {}
+    }
+  }
+
+  // ---- every parameterless unit of the fixed code, with a fuel sweep ----
+  var ft = newTally();
+  if fixedOk && fnat.len() > 0usize {
+    var fuels = List[u64]();
+    fuels.push(FIXED_FUEL); fuels.push(0u64); fuels.push(1u64); fuels.push(2u64); fuels.push(3u64); fuels.push(5u64); fuels.push(8u64);
+    fuels.push(13u64); fuels.push(50u64);
+    var u = 0usize;
+    while u < fixedN {
+      if !fv[0usize].isRefused(u) && fv[0usize].paramSlots(u) == 0u32 {
+        var q = 0usize;
+        while q < fuels.len() {
+          let a = runFixed(&fv[0usize], &ftables, &fnat[0usize], false, u32.from(u), *fuels[q]);
+          let b = runFixed(&fv[0usize], &ftables, &fnat[0usize], true, u32.from(u), *fuels[q]);
+          ft.runs = ft.runs + 1u64;
+          if a.trapped { ft.trapped = ft.trapped + 1u64; }
+          let why = differ(&a, &b);
+          if why.len() > 0usize { note(&mut ft, file, "fixed unit", u32.from(u), *fuels[q], why); }
+          q = q + 1usize;
+        }
+      }
+      u = u + 1usize;
+    }
+  }
+
+  // ---- every derive and handler of Sim's code, with the fields set to a spread of values ----
+  var st = newTally();
+  if simOk && snat.len() > 0usize {
+    let sp = spread();
+    let nf = w.fields.len();
+    let ns = w.nodes.len();
+    var k = 0usize;
+    while k < sp.len() {
+      var fields = List[u64]();
+      var f = 0usize;
+      while f < nf { fields.push((*sp[(k + f * 3usize) % sp.len()]).bits()); f = f + 1usize; }
+      var inside = List[u64]();
+      var s = 0usize;
+      while s < ns { inside.push(u64.from((k + s) & 1usize)); s = s + 1usize; }
+      var u = 0usize;
+      while u < simN {
+        if !sv[0usize].isRefused(u) && sv[0usize].paramSlots(u) == 0u32 {
+          var fuels = List[u64]();
+          fuels.push(RULE_FUEL); fuels.push(u64.from(k));
+          var q = 0usize;
+          while q < fuels.len() {
+            let a = runSim(&sv[0usize], &stables, &snat[0usize], false, u32.from(u), *fuels[q], &fields, &inside);
+            let b = runSim(&sv[0usize], &stables, &snat[0usize], true, u32.from(u), *fuels[q], &fields, &inside);
+            st.runs = st.runs + 1u64;
+            if a.trapped { st.trapped = st.trapped + 1u64; }
+            let why = differ(&a, &b);
+            if why.len() > 0usize { note(&mut st, file, "sim unit", u32.from(u), *fuels[q], why); }
+            q = q + 1usize;
+          }
+        }
+        u = u + 1usize;
+      }
+      k = k + 1usize;
+    }
+  }
+
+  // ---- the table ----
+  let diffs = dMesh + dLook + dPlace + dNotes + ft.diffs + st.diffs;
+  if diffs > 0u64 { bad = true; }
+  print <- "  "; pad("", 22usize); pad("fixed code (parts)", 34usize); print <- "sim code (derives, rules)\n";
+  print <- "  "; pad("units (refused)", 22usize);
+  print <- fixedN; print <- " ("; print <- fixedRefused; print <- ")";
+  print <- "                          "; print <- simN; print <- " ("; print <- simRefused; print <- ")\n";
+  print <- "  "; pad("compiled natively", 22usize); printStr(fixedCompiled.view()); print <- "                       "; printStr(simCompiled.view()); print <- "\n";
+  print <- "  "; pad("machine code", 22usize); print <- fixedBytes; print <- " B, checksum "; print <- fixedSum; print <- "   ";
+  print <- simBytes; print <- " B, checksum "; print <- simSum; print <- "\n";
+  print <- "  "; pad("parts built", 22usize); print <- partsN; print <- " ("; print <- madeCount; print <- " made); differ: mesh "; print <- dMesh;
+  print <- ", look "; print <- dLook; print <- ", placement "; print <- dPlace; print <- ", notes "; print <- dNotes;
+  if !partsNative { print <- "   NOT NATIVE"; }
+  print <- "\n";
+  print <- "  "; pad("fixed unit runs", 22usize); print <- ft.runs; print <- " ("; print <- ft.trapped; print <- " trapped); differ "; print <- ft.diffs; print <- "\n";
+  print <- "  "; pad("sim unit runs", 22usize); print <- st.runs; print <- " ("; print <- st.trapped; print <- " trapped); differ "; print <- st.diffs; print <- "\n";
+  print <- "  "; pad("result", 22usize); print <- (if bad { "DIFFERENT" } else { "identical" }); print <- "\n";
+  if bad { tot.bad = tot.bad + 1u64; }
+}
+
+// -------- the built-in ops world --------
+//
+// What the worlds' own code does is narrow: ConeScript's lowering emits imports, calls, if/else, bool and float
+// conversions and constants, and no arithmetic at all. So that a fault in the lift's float, integer or compare ops cannot
+// pass, nativecheck also runs a hand-assembled world of one unit per op (f64 add, sub, mul, div, min, max, the six
+// compares, neg, abs, sqrt, bool.from_f64, f64.from_bool, i64 add, sub, mul, the three compares, f64.from_i64), each
+// over every pair of a spread of inputs on both executors.
+
+fn addBinary(w: &mut CodeWriter, op: u8, a: u32, r: u32) {
+  let sig = w.code.types.sig(&[a, a], &[r]);
+  w.beginUnit(sig, "binary");
+  w.opU(OP_LOCAL_GET, 0u32); w.opU(OP_LOCAL_GET, 1u32); w.op(op);
+  w.endUnit();
+}
+
+fn addUnary(w: &mut CodeWriter, op: u8, a: u32, r: u32) {
+  let sig = w.code.types.sig(&[a], &[r]);
+  w.beginUnit(sig, "unary");
+  w.opU(OP_LOCAL_GET, 0u32); w.op(op);
+  w.endUnit();
+}
+
+fn intSpread() List[u64] {
+  var l = List[u64]();
+  l.push(0u64); l.push(1u64); l.push((-1i64) as u64); l.push(7u64); l.push((-9i64) as u64);
+  l.push(0x7FFFFFFFFFFFFFFFu64); l.push(0x8000000000000000u64); l.push(1000000007u64);
+  l
+}
+
+fn runArgs(v: &VerifiedCode, tb: &ImportTables[u8], nc: &NativeCode, native: bool, unit: u32, args: &Array[u64]) Snap {
+  var h = RuleHandles.make();
+  var out = List[u64]();
+  if native {
+    var r = NativeRunner.make();
+    r.setFuel(1000u64);
+    let t = r.run(nc, v, tb, &mut h, unit, args, &mut out);
+    return snapOf(&t, &out, r.fuelLeft(), &h);
+  }
+  var it = Interpreter.make();
+  it.setFuel(1000u64);
+  let t = it.run(v, tb, &mut h, unit, args, &mut out);
+  snapOf(&t, &out, it.fuelLeft(), &h)
+}
+
+fn checkBuiltin(opts: LiftOpts, tot: &mut Totals) {
+  tot.worlds = tot.worlds + 1u64;
+  var w = CodeWriter.make();
+  var kinds = List[u8]();                 // by unit: 0 two floats, 1 one float, 2 two ints, 3 one int, 4 two bools, 5 one bool
+  var binF = List[u8]();
+  binF.push(OP_F64_ADD); binF.push(OP_F64_SUB); binF.push(OP_F64_MUL); binF.push(OP_F64_DIV); binF.push(OP_F64_MIN); binF.push(OP_F64_MAX);
+  var i = 0usize;
+  while i < binF.len() { addBinary(&mut w, *binF[i], TY_F64, TY_F64); kinds.push(0u8); i = i + 1usize; }
+  var cmpF = List[u8]();
+  cmpF.push(OP_F64_EQ); cmpF.push(OP_F64_NE); cmpF.push(OP_F64_LT); cmpF.push(OP_F64_LE); cmpF.push(OP_F64_GT); cmpF.push(OP_F64_GE);
+  i = 0usize;
+  while i < cmpF.len() { addBinary(&mut w, *cmpF[i], TY_F64, TY_BOOL); kinds.push(0u8); i = i + 1usize; }
+  addUnary(&mut w, OP_F64_NEG, TY_F64, TY_F64); kinds.push(1u8);
+  addUnary(&mut w, OP_F64_ABS, TY_F64, TY_F64); kinds.push(1u8);
+  addUnary(&mut w, OP_F64_SQRT, TY_F64, TY_F64); kinds.push(1u8);
+  addUnary(&mut w, OP_BOOL_FROM_F64, TY_F64, TY_BOOL); kinds.push(1u8);
+  addUnary(&mut w, OP_F64_FROM_BOOL, TY_BOOL, TY_F64); kinds.push(5u8);
+  addUnary(&mut w, OP_BOOL_NOT, TY_BOOL, TY_BOOL); kinds.push(5u8);
+  addBinary(&mut w, OP_BOOL_AND, TY_BOOL, TY_BOOL); kinds.push(4u8);
+  addBinary(&mut w, OP_BOOL_OR, TY_BOOL, TY_BOOL); kinds.push(4u8);
+  addBinary(&mut w, OP_I64_ADD, TY_I64, TY_I64); kinds.push(2u8);
+  addBinary(&mut w, OP_I64_SUB, TY_I64, TY_I64); kinds.push(2u8);
+  addBinary(&mut w, OP_I64_MUL, TY_I64, TY_I64); kinds.push(2u8);
+  addBinary(&mut w, OP_I64_EQ, TY_I64, TY_BOOL); kinds.push(2u8);
+  addBinary(&mut w, OP_I64_NE, TY_I64, TY_BOOL); kinds.push(2u8);
+  addBinary(&mut w, OP_I64_LT, TY_I64, TY_BOOL); kinds.push(2u8);
+  addUnary(&mut w, OP_F64_FROM_I64, TY_I64, TY_F64); kinds.push(3u8);
+
+  let tb = ImportTables[u8].make();
+  var t = newTally();
+  var bad = false;
+  var sz = 0usize;
+  var sum = 0u64;
+  match verifyEach(&w.code, &tb) {
+    case let Err(ps) { print <- "world built-in ops: the hand-assembled code did not verify\n"; tot.bad = tot.bad + 1u64; return; }
+    case let Ok(v) {
+      let f1 = liftWith(&v, opts);
+      match codegen.compileX64(&f1, codegen.hostAbi()) {
+        case let Ok(mc) { sz = mc.bytes.len(); sum = codegen.checksum(mc.bytes.view(), mc.bytes.len()); }
+        case let Err(e) { bad = true; }
+      }
+      match compileNativeWith(&v, opts) {
+        case let Err(e) { bad = true; print <- "world built-in ops: the native compile failed: "; print <- e.view(); print <- "\n"; }
+        case let Ok(nc) {
+          var fs = List[u64]();
+          let sp = spread();
+          i = 0usize;
+          while i < sp.len() { fs.push((*sp[i]).bits()); i = i + 1usize; }
+          let ints = intSpread();
+          var bs = List[u64](); bs.push(0u64); bs.push(1u64);
+          var u = 0usize;
+          while u < v.unitCount() {
+            let kind = *kinds[u];
+            var xs = &fs;
+            if kind == 2u8 || kind == 3u8 { xs = &ints; }
+            if kind == 4u8 || kind == 5u8 { xs = &bs; }
+            let two = kind == 0u8 || kind == 2u8 || kind == 4u8;
+            var a = 0usize;
+            while a < xs.len() {
+              var b = 0usize;
+              while b < (if two { xs.len() } else { 1usize }) {
+                var args = List[u64]();
+                args.push(*xs[a]);
+                if two { args.push(*xs[b]); }
+                let r1 = runArgs(&v, &tb, &nc, false, u32.from(u), args.view());
+                let r2 = runArgs(&v, &tb, &nc, true, u32.from(u), args.view());
+                t.runs = t.runs + 1u64;
+                let why = differ(&r1, &r2);
+                if why.len() > 0usize { note(&mut t, "built-in ops", "op unit", u32.from(u), 0u64, why); }
+                b = b + 1usize;
+              }
+              a = a + 1usize;
+            }
+            u = u + 1usize;
+          }
+        }
+      }
+    }
+  }
+  if t.diffs > 0u64 { bad = true; }
+  print <- "world built-in ops  (hand-assembled: one unit per op, every pair of a spread of inputs)\n";
+  print <- "  "; pad("machine code", 22usize); print <- sz; print <- " B, checksum "; print <- sum; print <- "\n";
+  print <- "  "; pad("op runs", 22usize); print <- t.runs; print <- "; differ "; print <- t.diffs; print <- "\n";
+  print <- "  "; pad("result", 22usize); print <- (if bad { "DIFFERENT" } else { "identical" }); print <- "\n";
+  if bad { tot.bad = tot.bad + 1u64; }
+}
+
+// -------- the stack guard on a worker thread --------
+//
+// The entry stub puts the generated code's stack limit 256 KiB below its own rsp, without knowing the thread's stack size.
+// Sim's native runs are on an actors worker thread, whose stack is the default (1 MB reserved on Windows). This runs an
+// endless recursion with a fat frame (60 values live across the call) natively on a worker thread with the default stack:
+// the frames use up the 256 KiB before the 1024th call, so the stack guard (not the depth count) must stop it, with
+// DepthOut, leaving the thread and the process alive.
+
+fn fatCode() CodeWriter {
+  let e = List[u32]();
+  var w = CodeWriter.make();
+  let msig = w.code.types.sig(e.view(), &[TY_F64]);
+  let me = w.beginUnit(msig, "fat");
+  var ls = List[u32]();
+  var i = 0usize;
+  while i < 60usize { ls.push(w.local(TY_F64)); i = i + 1usize; }
+  i = 0usize;
+  while i < 60usize {
+    w.opU(OP_LOCAL_GET, *ls[i]); w.f64Const(f64.from(i) + 1.0); w.op(OP_F64_ADD); w.opU(OP_LOCAL_SET, *ls[i]);
+    i = i + 1usize;
+  }
+  w.opU(OP_CALL, me);
+  i = 0usize;
+  while i < 60usize { w.opU(OP_LOCAL_GET, *ls[i]); w.op(OP_F64_ADD); i = i + 1usize; }
+  w.endUnit();
+  w
+}
+
+struct StackResult { room: usize; kind: u32; fuelNative: u64; fuelInterp: u64; same: bool; ok: bool; }
+
+fn deepRun(n: i64) StackResult {
+  let room = stackHeadroom();
+  let w = fatCode();
+  let tb = ImportTables[u8].make();
+  let none = List[u64]();
+  match verify(&w.code, &tb) {
+    case let Err(ps) { return StackResult(room, 0u32, 0u64, 0u64, false, false); }
+    case let Ok(v) {
+      var h1 = RuleHandles.make();
+      var h2 = RuleHandles.make();
+      var out = List[u64]();
+      var it = Interpreter.make();
+      it.setFuel(100000u64);
+      let ti = it.run(&v, &tb, &mut h1, 0u32, none.view(), &mut out);
+      match compileNative(&v) {
+        case let Err(e) { return StackResult(room, 0u32, 0u64, 0u64, false, false); }
+        case let Ok(nc) {
+          var rn = NativeRunner.make();
+          rn.setFuel(100000u64);
+          let tn = rn.run(&nc, &v, &tb, &mut h2, 0u32, none.view(), &mut out);
+          var kind = 0u32;
+          var same = false;
+          match &tn { case let Some(t) { kind = kindNum(t); } case is None {} }
+          match &ti { case let Some(a) { match &tn { case let Some(b) { same = kindNum(a) == kindNum(b) && a.message == b.message; } case is None {} } } case is None {} }
+          return StackResult(room, kind, rn.fuelLeft(), it.fuelLeft(), same, true);
+        }
+      }
+    }
+  }
+}
+
+fn checkStack(tot: &mut Totals) {
+  tot.worlds = tot.worlds + 1u64;
+  let here = deepRun(0i64);
+  let t = thread.start(0i64, &deepRun);
+  let there = t.join();
+  var bad = false;
+  if !here.ok || !there.ok || here.kind != 4u32 || there.kind != 4u32 || !here.same || !there.same { bad = true; }
+  print <- "world stack guard  (an endless recursion with 60 values live across the call, run natively)\n";
+  print <- "  "; pad("main thread", 22usize); print <- "room below the call "; print <- here.room / 1024usize; print <- " KiB; trap kind "; print <- here.kind;
+  print <- " (4 = DepthOut); fuel left native "; print <- here.fuelNative; print <- ", interpreter "; print <- here.fuelInterp; print <- "\n";
+  print <- "  "; pad("worker thread", 22usize); print <- "room below the call "; print <- there.room / 1024usize; print <- " KiB; trap kind "; print <- there.kind;
+  print <- " (4 = DepthOut); fuel left native "; print <- there.fuelNative; print <- ", interpreter "; print <- there.fuelInterp; print <- "\n";
+  print <- "  "; pad("result", 22usize); print <- (if bad { "FAILED" } else { "stopped by the guard or the depth count, process alive" }); print <- "\n";
+  if bad { tot.bad = tot.bad + 1u64; }
+}
+
+fn main(argc: i32, argv: **u8) i32 {
+  var opts = liftOptsNone();
+  let m = libc.getenv("NATIVECHECK_MUTANT");
+  if (m as usize) != 0usize {
+    opts.addToSub = true;
+    print <- "NATIVECHECK_MUTANT: the first f64.add of each Code is lifted as a subtraction; this run must fail\n";
+  }
+  if argc < 2i32 { print <- "usage: nativecheck FILE.ddd...  (tools\\nativecheck\\run.ps1 gives it every guide world and pegasus\\worlds)\n"; return 2i32; }
+  var tot = Totals(0u64, 0u64);
+  checkBuiltin(opts, &mut tot);
+  checkStack(&mut tot);
+  var a = 1i32;
+  while a < argc {
+    checkWorld(cstr.fromPtr(*(argv + usize.from(a))).view(), opts, &mut tot);
+    a = a + 1i32;
+  }
+  print <- "\nnativecheck: "; print <- tot.worlds; print <- " worlds (the built-in ops and stack-guard worlds, and the files), "; print <- tot.bad; print <- " with a difference or a failure: ";
+  print <- (if tot.bad == 0u64 { "all identical" } else { "FAILED" }); print <- "\n";
+  if tot.bad == 0u64 { 0i32 } else { 1i32 }
+}

@@ -16,9 +16,11 @@ pub struct LiftOpts {
   pub noMoves: bool;        // do not move values into a label's result vregs
   pub fuelForward: bool;    // charge fuel on a taken forward branch too
   pub swapFsub: bool;       // f64.sub with its operands swapped
+  pub fromBoolPlain: bool;  // f64.from_bool as a bare I2F, with no test for nonzero (the fault the ICMP NE fixed)
+  pub addToSub: bool;       // the first f64.add of the code lifted as an FSUB (nativecheck's test of itself)
 }
 
-pub fn liftOptsNone() LiftOpts { LiftOpts(false, false, false) }
+pub fn liftOptsNone() LiftOpts { LiftOpts(false, false, false, false, false) }
 
 struct LCtrl {
   kind: u8;               // 0 function, 1 block, 2 loop, 3 if, 4 else
@@ -35,6 +37,7 @@ struct Lifter {
   ctrls: List[LCtrl];
   unit: u64;
   opts: LiftOpts;
+  flipped: *u8;           // addToSub: set once an FADD has been flipped (shared by every unit of one lift)
 
   fn site(self: &, at: usize) u64 { (self.unit << 32u64) | u64.from(at) }
   fn push(self: &mut, cls: u8) u32 { let r = self.fb.vreg(cls); self.stack.push(r); r }
@@ -133,7 +136,7 @@ fn areaOf(v: &VerifiedCode, u: usize) u32 {
   if p > r { p } else { r }
 }
 
-fn liftUnit(v: &VerifiedCode, u: usize, opts: LiftOpts) Func {
+fn liftUnit(v: &VerifiedCode, u: usize, opts: LiftOpts, flipped: *u8) Func {
   let cu = &v.code.units[u];
   let name = cu.name.view();
   let unitSite = u64.from(u) << 32u64;
@@ -145,7 +148,7 @@ fn liftUnit(v: &VerifiedCode, u: usize, opts: LiftOpts) Func {
   let info = &v.units[u];
   let types = &v.code.types;
   let sig = &types.defs[usize.from(cu.sig)];
-  var lf = Lifter(FuncBuilder.make(name, areaOf(v, u), unitSite), List[u32](), List[LCtrl](), u64.from(u), opts);
+  var lf = Lifter(FuncBuilder.make(name, areaOf(v, u), unitSite), List[u32](), List[LCtrl](), u64.from(u), opts, flipped);
 
   // The locals: the parameters, then the unit's own; each slot a vreg
   var localTy = List[u32]();
@@ -305,7 +308,10 @@ fn liftUnit(v: &VerifiedCode, u: usize, opts: LiftOpts) Func {
       case OP_I64_CONST { lf.iconst(a1); }
       case OP_BOOL_CONST { lf.iconst(a1); }
       case OP_PART_CONST { lf.iconst(a1); }
-      case OP_F64_ADD { lf.bin(IR_FADD, CLASS_F64); }
+      case OP_F64_ADD {
+        if lf.opts.addToSub && *lf.flipped == 0u8 { *lf.flipped = 1u8; lf.bin(IR_FSUB, CLASS_F64); }
+        else { lf.bin(IR_FADD, CLASS_F64); }
+      }
       case OP_F64_SUB {
         if lf.opts.swapFsub {
           let b = lf.pop();
@@ -343,7 +349,19 @@ fn liftUnit(v: &VerifiedCode, u: usize, opts: LiftOpts) Func {
         let d = lf.push(CLASS_INT);
         lf.fb.cmp(IR_FCMP, CC_NE, d, a, z);
       }
-      case OP_F64_FROM_BOOL { lf.una(IR_I2F, CLASS_F64); }
+      case OP_F64_FROM_BOOL {
+        // 1.0 for any nonzero slot, as the interpreter gives (a host may hand back a bool slot holding 2)
+        if lf.opts.fromBoolPlain { lf.una(IR_I2F, CLASS_F64); }
+        else {
+          let a = lf.pop();
+          let z = lf.fb.vreg(CLASS_INT);
+          lf.fb.opImm(IR_ICONST, z, NO_REG, 0u64);
+          let t = lf.fb.vreg(CLASS_INT);
+          lf.fb.cmp(IR_ICMP, CC_NE, t, a, z);
+          let d = lf.push(CLASS_F64);
+          lf.fb.op3(IR_I2F, d, t, NO_REG);
+        }
+      }
       case OP_I64_ADD { lf.bin(IR_IADD, CLASS_INT); }
       case OP_I64_SUB { lf.bin(IR_ISUB, CLASS_INT); }
       case OP_I64_MUL { lf.bin(IR_IMUL, CLASS_INT); }
@@ -446,8 +464,9 @@ fn liftUnit(v: &VerifiedCode, u: usize, opts: LiftOpts) Func {
 // One Func per unit
 pub fn liftWith(v: &VerifiedCode, opts: LiftOpts) Funcs {
   var fs = List[Func]();
+  var flipped = 0u8;
   var u = 0usize;
-  while u < v.units.len() { fs.push(liftUnit(v, u, opts)); u = u + 1usize; }
+  while u < v.units.len() { fs.push(liftUnit(v, u, opts, &mut flipped as *u8)); u = u + 1usize; }
   fs
 }
 
@@ -472,8 +491,11 @@ pub fn compileNativeEvalWith(v: &VerifiedCode, opts: LiftOpts) NativeCode {
 }
 pub fn compileNativeEval(v: &VerifiedCode) NativeCode { compileNativeEvalWith(v, liftOptsNone()) }
 
-pub fn compileNative(v: &VerifiedCode) Result[NativeCode, String] {
-  let funcs = lift(v);
+pub fn compileNative(v: &VerifiedCode) Result[NativeCode, String] { compileNativeWith(v, liftOptsNone()) }
+
+// As compileNative, with the lift's faults on when 'opts' says (nativecheck's test of itself; never set otherwise)
+pub fn compileNativeWith(v: &VerifiedCode, opts: LiftOpts) Result[NativeCode, String] {
+  let funcs = liftWith(v, opts);
   match compileX64(&funcs, hostAbi()) {
     case let Err(e) { Err[NativeCode, String](e) }
     case let Ok(mc) {
@@ -489,16 +511,61 @@ pub fn compileNative(v: &VerifiedCode) Result[NativeCode, String] {
   }
 }
 
+extern {
+  fn @c(system) GetCurrentThreadStackLimits(low: *usize, high: *usize);
+}
+
+// How many bytes of this thread's stack lie below the caller (Windows: from the thread's stack limits; 0 where unknown).
+// The entry stub puts the generated code's stack limit 256 KiB below its own rsp, so a thread that calls native code must
+// have at least that much room below the call: PEGASUS_NATIVE_STACKINFO=1 has Sim print it at its first native run.
+pub fn stackHeadroom() usize {
+  var low = 0usize;
+  var high = 0usize;
+  var probe = 0u8;
+  #if #os == .windows {
+    GetCurrentThreadStackLimits(&mut low as *usize, &mut high as *usize);
+    let here = (&mut probe as *u8) as usize;
+    if here > low { return here - low; }
+  }
+  0usize
+}
+
+// Is the native executor asked for? (the environment variable PEGASUS_NATIVE set to 1; unset, nothing changes)
+pub fn nativeRequested() bool {
+  let p = libc.getenv("PEGASUS_NATIVE");
+  (p as usize) != 0usize && *p == '1' && *(p + 1usize) == 0u8
+}
+
+// What a browser calls once it has verified its code: none when native is not asked for; the compiled code when it is;
+// and when 'compileNative' refuses, one line saying why (naming 'who') and none, so the caller keeps the interpreter
+pub fn nativeIfAsked(v: &VerifiedCode, who: &str) List[NativeCode] {
+  if !nativeRequested() { return List[NativeCode](); }
+  nativeAlways(v, who, liftOptsNone())
+}
+
+// As nativeIfAsked without asking (tools\nativecheck builds both ways in one process); 'opts' are the lift's faults, for tests
+pub fn nativeAlways(v: &VerifiedCode, who: &str, opts: LiftOpts) List[NativeCode] {
+  var l = List[NativeCode]();
+  match compileNativeWith(v, opts) {
+    case let Ok(n) { l.push(n); }
+    case let Err(e) {
+      printStr(who); print <- ": PEGASUS_NATIVE: the native compile failed ("; print <- e.view(); print <- "); using the interpreter\n";
+    }
+  }
+  l
+}
+
 // What the gate finds through NativeCtx.user: the run's table and handles, erased, and the generic dispatcher
 struct GateCtx {
   handles: *u8;
   tables: *u8;
   code: *u8;
-  dispatch: &fn(handles: *u8, tables: *u8, code: *u8, k: u64, slots: *u64) u64;
+  win: *u8;               // the runner's List[u64] for an import's window, kept between calls so that none allocates
+  dispatch: &fn(handles: *u8, tables: *u8, code: *u8, win: *u8, k: u64, slots: *u64) u64;
 }
 
 // list.make's runtime entry and every import: what the interpreter's OP_LIST_MAKE and OP_IMPORT do
-fn dispatch[V](hp: *u8, tp: *u8, cp: *u8, k: u64, slots: *u64) u64 {
+fn dispatch[V](hp: *u8, tp: *u8, cp: *u8, wp: *u8, k: u64, slots: *u64) u64 {
   let handles = hp as *HandleTable[V];
   if (k >> 32u64) == 1u64 {
     let total = usize.from(k & 0xFFFFFFFFu64);
@@ -518,12 +585,17 @@ fn dispatch[V](hp: *u8, tp: *u8, cp: *u8, k: u64, slots: *u64) u64 {
   let w = if n > r { n } else { r };
   let f = (*tables).entries[usize.from(ri.table)].call;
   (*handles).fail = String();
+  // the runner's window buffer, taken out for the call (a local nobody else reaches) and put back after
+  let kept = &mut *(wp as *List[u64]);
   var win = List[u64]();
+  win <-> *kept;
+  win.clear();
   var q = 0usize;
   while q < w { win.push(*(slots + q)); q = q + 1usize; }
   let ok = f(&mut *handles, win.viewMut());
   q = 0usize;
   while q < w { *(slots + q) = *win[q]; q = q + 1usize; }
+  win <-> *kept;
   if ok { 1u64 } else { 0u64 }
 }
 
@@ -531,7 +603,7 @@ fn @c nativeGate(ctx: *u8, k: u64, slots: *u64) u64 {
   let nc = ctx as *NativeCtx;
   let g = (*nc).user as *GateCtx;
   let d = (*g).dispatch;
-  d((*g).handles, (*g).tables, (*g).code, k, slots)
+  d((*g).handles, (*g).tables, (*g).code, (*g).win, k, slots)
 }
 
 fn nativeTrap(kind: TrapKind, site: u64, message: String) Option[Trap] {
@@ -541,12 +613,26 @@ fn nativeTrap(kind: TrapKind, site: u64, message: String) Option[Trap] {
 // Runs verified code natively: the interpreter's twin, with the same 'run'
 pub struct NativeRunner {
   fuel: u64;
+  pub profiling: bool;      // time each run (only 'runs' and 'runNs' of the profile are filled: imports are not timed natively)
+  pub profile: Profile;
+  area: List[u64];          // the slot area of the run in hand, and the window of the import in hand: kept so none allocates
+  win: List[u64];
 
-  pub fn make() NativeRunner { NativeRunner(0u64) }
+  pub fn make() NativeRunner { NativeRunner(0u64, false, Profile(0u64, 0i64, 0u64, 0i64, 0i64), List[u64](), List[u64]()) }
   pub fn setFuel(self: &mut, fuel: u64) { self.fuel = fuel; }
   pub fn fuelLeft(self: &) u64 { self.fuel }
 
   pub fn run[V](self: &mut, n: &NativeCode, v: &VerifiedCode, tables: &ImportTables[V], handles: &mut HandleTable[V],
+             unit: u32, args: &Array[u64], out: &mut List[u64]) Option[Trap] {
+    if !self.profiling { return self.exec(n, v, tables, handles, unit, args, out); }
+    let t0 = Instant.now().nanos();
+    let r = self.exec(n, v, tables, handles, unit, args, out);
+    self.profile.runs = self.profile.runs + 1u64;
+    self.profile.runNs = self.profile.runNs + (Instant.now().nanos() - t0);
+    r
+  }
+
+  fn exec[V](self: &mut, n: &NativeCode, v: &VerifiedCode, tables: &ImportTables[V], handles: &mut HandleTable[V],
              unit: u32, args: &Array[u64], out: &mut List[u64]) Option[Trap] {
     out.clear();
     let cur = usize.from(unit);
@@ -554,19 +640,19 @@ pub struct NativeRunner {
       return nativeTrap(TrapKind.BadCall, u64.from(unit) << 32u64, String.from("a unit that does not exist, or the wrong number of arguments"));
     }
     if *v.refused[cur] { return nativeTrap(TrapKind.Refused, u64.from(unit) << 32u64, String.from("the unit's code was refused")); }
-    var area = List[u64]();
-    area.resize(usize.from(n.funcs[cur].nArea), 0u64);
+    self.area.clear();                 // the slot area, kept between runs so that a run allocates nothing
+    self.area.resize(usize.from(n.funcs[cur].nArea), 0u64);
     var i = 0usize;
-    while i < args.len { area.set(i, args[i]); i = i + 1usize; }
-    var g = GateCtx(handles as *u8, tables as *u8, v as *u8, &dispatch[V]);
+    while i < args.len { self.area.set(i, args[i]); i = i + 1usize; }
+    var g = GateCtx(handles as *u8, tables as *u8, v as *u8, (&mut self.win) as *u8, &dispatch[V]);
     var ctx = NativeCtx(&nativeGate as usize, self.fuel, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, (&mut g as *u8) as usize);
     var t = 0u64;
-    if n.native { t = n.loaded[0usize].call(&mut ctx, unit, area.viewMut()); }
-    else { t = evalFuncs(&n.funcs, &mut ctx, unit, area.viewMut(), &nativeGate); }
+    if n.native { t = n.loaded[0usize].call(&mut ctx, unit, self.area.viewMut()); }
+    else { t = evalFuncs(&n.funcs, &mut ctx, unit, self.area.viewMut(), &nativeGate); }
     self.fuel = ctx.fuel;
     if t == TRAP_NONE {
       var j = 0usize;
-      while j < usize.from(v.units[cur].resultSlots) { out.push(*area[j]); j = j + 1usize; }
+      while j < usize.from(v.units[cur].resultSlots) { out.push(*self.area[j]); j = j + 1usize; }
       return None;
     }
     if t == TRAP_FUEL { return nativeTrap(TrapKind.FuelOut, ctx.trapSite, String.from("out of fuel")); }

@@ -118,11 +118,19 @@ pub struct PartBuilder {
   tables: ImportTables[ToolValue];
   hs: ToolHandles;
   interp: Interpreter;
+  nat: List[NativeCode];        // PEGASUS_NATIVE=1: the code compiled natively (one element), else empty (the interpreter runs)
+  nrun: NativeRunner;
   made: List[MaterialRec];      // the material parts' values, by slot
 
   // The builder for a world: its code lowered and verified against 'tables' (toolImports, or that with a shim swapped);
   // or what the verifier refused
   pub fn make(w: &Understood, tables: ImportTables[ToolValue]) Result[PartBuilder, List[CodeProblem]] {
+    PartBuilder.makeWith(w, tables, if nativeRequested() { 1u8 } else { 0u8 }, liftOptsNone())
+  }
+
+  // As make, with the executor chosen: 0 the interpreter, 1 native (the lift's faults 'opts' on, for tools\nativecheck's test
+  // of itself). A native compile that fails says why and leaves the interpreter ('isNative' tells)
+  pub fn makeWith(w: &Understood, tables: ImportTables[ToolValue], mode: u8, opts: LiftOpts) Result[PartBuilder, List[CodeProblem]] {
     let code = lower(w);
     match verifyEach(&code, &tables) {
       case let Ok(v) {
@@ -131,7 +139,9 @@ pub struct PartBuilder {
         var made = List[MaterialRec]();
         var i = 0usize;
         while i < w.nodes.len() { made.push(greyMaterial()); i = i + 1usize; }
-        Ok[PartBuilder, List[CodeProblem]](PartBuilder(v, tables, hs, Interpreter.make(), made))
+        // PEGASUS_NATIVE=1: every unit runs as machine code (conescript's native.cone); unset, nothing changes
+        let nat = if mode == 1u8 { nativeAlways(&v, "partbuild", opts) } else { List[NativeCode]() };
+        Ok[PartBuilder, List[CodeProblem]](PartBuilder(v, tables, hs, Interpreter.make(), nat, NativeRunner.make(), made))
       }
       case let Err(ps) { Err[PartBuilder, List[CodeProblem]](ps) }
     }
@@ -139,6 +149,12 @@ pub struct PartBuilder {
 
   // The interpreter that runs the units (to switch its profiling on and read it: tools\interpbench)
   pub fn interpreter(self: &mut) &mut Interpreter { &mut self.interp }
+
+  // Is this builder running its units as machine code (PEGASUS_NATIVE=1 and the compile succeeded)?
+  pub fn isNative(self: &) bool { self.nat.len() > 0usize }
+
+  // The native runner, to switch its profiling on and read it (only the runs and their time are filled)
+  pub fn nativeRunner(self: &mut) &mut NativeRunner { &mut self.nrun }
 
   // The world's code, as lowered (for --show-code)
   pub fn lowered(self: &) &Code { self.code.source() }
@@ -172,8 +188,15 @@ pub struct PartBuilder {
   // Runs a unit: its result slots in 'out'; the trap's message if it stopped
   fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
     self.hs.fail = String();
-    self.interp.setFuel(FIXED_FUEL);
     let none = List[u64]();
+    if self.nat.len() > 0usize {
+      self.nrun.setFuel(FIXED_FUEL);
+      match self.nrun.run(&self.nat[0usize], &self.code, &self.tables, &mut self.hs, unit, none.view(), out) {
+        case let Some(t) { return Some[String](t.message.clone()); }
+        case is None { return None; }
+      }
+    }
+    self.interp.setFuel(FIXED_FUEL);
     match self.interp.run(&self.code, &self.tables, &mut self.hs, unit, none.view(), out) {
       case let Some(t) { Some[String](t.message.clone()) }
       case is None { None }
