@@ -59,6 +59,34 @@ alias SimParts = List[SimPart];
 alias ShapeTable = List[ContentShapes];
 alias Actions = List[Action];
 
+// Whether the dotted path 'name' ("board.pieces.whiteRook1.body") holds the whole segments of 'want' ("pieces.whiteRook1"):
+// 'want' is the path, or its beginning, its end or a stretch of it
+fn pathHas(name: &str, want: &str) bool {
+  if want.len() > name.len() { return false; }
+  var i = 0usize;
+  while i + want.len() <= name.len() {
+    var same = true;
+    var k = 0usize;
+    while k < want.len() && same {
+      if name[i + k] != want[k] { same = false; }
+      k = k + 1usize;
+    }
+    let startsSegment = i == 0usize || name[i - 1usize] == '.';
+    let endsSegment = i + want.len() == name.len() || name[i + want.len()] == '.';
+    if same && startsSegment && endsSegment { return true; }
+    i = i + 1usize;
+  }
+  false
+}
+
+// A press the Player aimed at a named part: from this eye, at the part's middle, once the part's shape is known
+struct AimedPress {
+  name: String;
+  eye: Vec3;
+  atNs: u64;
+}
+alias AimedPresses = List[AimedPress];
+
 // A glide Sim started: the piece, and where it is to end (in the world, level), for the run's check
 struct Landing {
   piece: u32;
@@ -88,6 +116,7 @@ actor Sim {
   parts: SimParts;
   heldShapes: ShapeTable;
   arrived: Actions;                 // actions sent since the last admit
+  aimed: AimedPresses;              // presses aimed at a named part (`--press-part`), until its shape is known
   queue: Actions;                   // this step's admitted actions, for react
   reacted: Actions;                 // the actions react ran, for the run's checks
   rules: SimRules;                  // the world's rules, their units and the frames a rule moves (simrules.cone)
@@ -125,7 +154,7 @@ actor Sim {
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
-      Actions(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
+      Actions(), AimedPresses(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
       NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, PoseHistory.make());
   }
 
@@ -199,6 +228,12 @@ actor Sim {
     arrived.push(a);
   }
 
+  // Player -> Sim (event): a press along the ray from 'eye' to the middle of the part named 'part' (`--press-part`); the
+  // ray is then an ordinary press, so picking decides what it reaches
+  pub async fn actAtPart(self, part: String, eye: Vec3, atNs: u64) {
+    aimed.push(AimedPress(part, eye, atNs));
+  }
+
   pub async fn stop(self) {
     running = false;
   }
@@ -235,6 +270,7 @@ actor Sim {
     if role == SIM_CLIENT && !self.clientReady() { return; }   // before it is in, a client's steps are not counted
     step = step + 1u64;
     if role == SIM_SERVER { self.serveJoins(); }
+    if aimed.len() > 0usize { self.aimPresses(); }
     if role == SIM_CLIENT { self.admitClient(); } else { self.admit(); }
     if role == SIM_CLIENT { self.moveClient(); self.mergeParts(); }
     else if role == SIM_SERVER { self.moveServer(); }
@@ -267,6 +303,34 @@ actor Sim {
     let verdict = self.checks();
     var f = io.finished.clone();
     f <- verdict;
+  }
+
+  // The presses aimed at a named part whose shape is known become presses along the ray from the eye to the part's
+  // middle, now; one for a name no part has is reported and dropped (once the world's parts are all here)
+  fn aimPresses(self: &mut) {
+    var waiting = AimedPresses();
+    each q in &aimed {
+      var found = false;
+      var ready = false;
+      var middle = Vec3(0., 0., 0.);
+      each p in &parts {
+        if !ready && pathHas(p.name.view(), q.name.view()) {
+          found = true;
+          each s in &heldShapes {
+            if s.key == p.key { ready = true; middle = self.placeOf(p).transformPoint(s.pick.centre); }
+          }
+        }
+      }
+      if ready {
+        let along = (middle - q.eye).normalize();
+        arrived.push(Action(VERB_PRESS, NO_PART, q.eye, along, q.atNs, ORIGIN_PERSON));
+      } else if found || !haveImage {
+        waiting.push(AimedPress(q.name.clone(), q.eye, q.atNs));
+      } else {
+        print <- "sim: press-part: no part named "; printStr(q.name.view()); print <- "\n";
+      }
+    }
+    aimed = waiting;
   }
 
   // Admit: the actions that arrived, in the order they came, stamped for
