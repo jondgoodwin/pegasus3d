@@ -136,6 +136,11 @@ pub struct Understood {
   pub moves: List[MoveInfo];       // pick-and-place rules
   pub vocab: Vocabulary;           // the table a Made's 'tool' is a row of
   pub avatars: List[usize];        // the designs the world gives its visitors (worldAvatars(cast: [...])), by slot: one, for now
+  // W148, FOR REVIEW (steps.cone): step functions, the steppers that run them, and the place fields they read and set
+  pub steps: List[StepFn];
+  pub steppers: List[StepperInfo];
+  pub placeFields: List[PlaceField];
+  pub placeNames: List[u32];       // each place field's name once: a field's number is its name's place here
 }
 
 // A function of a part, checked: its steps (its lets) and its result, each a
@@ -333,7 +338,8 @@ fn unitScale(unit: u32) f64 {
 pub fn understand(decls: &List[PartDecl], names: Names, vocab: Vocabulary, problems: &mut List[Problem]) Understood {
   var c = Checker(List[Node](), List[Problem](), names, List[FieldInfo](), List[AreaInfo](),
     List[DeriveInfo](), List[usize](), List[RuleInfo](), List[Problem](), List[FnInfo](),
-    List[u32](), List[Ty](), List[MoveInfo](), vocab, List[usize]());
+    List[u32](), List[Ty](), List[MoveInfo](), vocab, List[usize](), List[StepFn](), List[StepperInfo](), List[PlaceField](),
+    List[u32]());
   var units = List[Unit]();
   if decls.len() > 0usize {
     c.place(&decls[0], 0usize);
@@ -370,8 +376,16 @@ pub fn understand(decls: &List[PartDecl], names: Names, vocab: Vocabulary, probl
   moves <-> c.moves;
   var avatars = List[usize]();
   avatars <-> c.avatars;
+  var steps = List[StepFn]();
+  steps <-> c.steps;
+  var steppers = List[StepperInfo]();
+  steppers <-> c.steppers;
+  var placeFields = List[PlaceField]();
+  placeFields <-> c.placeFields;
+  var placeNames = List[u32]();
+  placeNames <-> c.placeNames;
   var w = Understood(nodes, units, alive, List[usize](), table, fields, areas, derives, deriveOrder, rules, functions,
-    moves, vocabulary, avatars);
+    moves, vocabulary, avatars, steps, steppers, placeFields, placeNames);
   order(&mut w, &mut c.problems);
   leaveOutBehaviors(&mut w, &mut c.later);
   var i = 0usize;
@@ -403,6 +417,10 @@ struct Checker {
   moves: List[MoveInfo];
   vocab: Vocabulary;         // the calls a world may make
   avatars: List[usize];      // worldAvatars(cast: [...]): the designs, by slot
+  steps: List[StepFn];       // step functions (steps.cone, W148)
+  steppers: List[StepperInfo];
+  placeFields: List[PlaceField];
+  placeNames: List[u32];
 
   fn failName(self: &mut, at: Spot, a: &str, name: u32, c: &str) {
     var m = String.from(a);
@@ -470,6 +488,23 @@ struct Checker {
     while f < d.fields.len() {
       let fd = &d.fields[f];
       var ty = Ty.Pure;
+      if fd.ty == N_PLACE {
+        // a place field, a step function's (W148, for review): its name numbered among the place fields' names
+        var number = 0u32;
+        match placeNumber(&self.placeNames, fd.name) {
+          case let Some(n) { number = n; }
+          case is None { self.placeNames.push(fd.name); number = u32.from(self.placeNames.len() - 1usize); }
+        }
+        var mutable = false;
+        var o = 0usize;
+        while o < fd.options.len() {
+          if fd.options[o].label == N_MUTABLE { match &fd.options[o].value { case let Truth(t) { mutable = t.value; } else {} } }
+          o = o + 1usize;
+        }
+        self.placeFields.push(PlaceField(slot, fd.name, fd.at, number, 0., 0., 0., mutable));
+        f = f + 1usize;
+        continue;
+      }
       if fd.ty == N_BOOL { ty = Ty.Truth; }
       else if fd.ty == N_PART { ty = Ty.Shape; }     // holds a part, or None
       else if fd.ty != N_NUMBER {
@@ -489,6 +524,12 @@ struct Checker {
     var g = 0usize;
     while g < d.functions.len() {
       let fd = &d.functions[g];
+      if fd.params.len() > 0usize {
+        // a step function (W148): checked in pass 2, kept apart from the functions of values
+        self.steps.push(StepFn(slot, fd.name, fd.at, List[u32](), List[SStmt](), sx(SX_TRUTH, ST_BOOL), false));
+        g = g + 1usize;
+        continue;
+      }
       if fd.ty != N_SHAPE {
         self.failName(fd.at, "a function makes a shape, for now, not '", fd.ty, "'");
       }
@@ -626,7 +667,8 @@ struct Checker {
     // Its functions first: what makes it, or a part inside it, may call one
     var g = 0usize;
     while g < d.functions.len() {
-      self.checkFunction(&d.functions[g], slot);
+      if d.functions[g].params.len() > 0usize { self.checkStep(&d.functions[g], slot); }
+      else { self.checkFunction(&d.functions[g], slot); }
       g = g + 1usize;
     }
     var make = Val.Absent;
@@ -700,7 +742,8 @@ struct Checker {
     // Its fields' defaults and options
     var f = 0usize;
     while f < d.fields.len() {
-      self.checkField(&d.fields[f], slot);
+      if d.fields[f].ty == N_PLACE { self.checkPlaceField(&d.fields[f], slot); }
+      else { self.checkField(&d.fields[f], slot); }
       f = f + 1usize;
     }
     // Its behaviors: what is set aside is counted
@@ -1521,6 +1564,12 @@ struct Checker {
         if a.callee.len() == 1usize && *a.callee[0] == N_START && a.args.len() == 1usize {
           match &a.args[0].value {
             case let Call(k) {
+              if k.callee.len() == 1usize && *k.callee[0] == N_STEPANIMATOR {
+                // a step function run every step (W148, for review): started at the world's creation only, for now
+                if clicked { self.fail(k.at, "a stepAnimator starts on(created, ...), for now", "", ""); }
+                else { self.stepper(&k.args, k.at, slot); }
+                return;
+              }
               if k.callee.len() == 1usize && *k.callee[0] == N_KEYS {
                 match self.keys(&k.args, k.at, slot) {
                   case let Some(info) { self.rules.push(RuleInfo(at, clicked, part, info, true)); }
@@ -1784,6 +1833,464 @@ struct Checker {
       i = i + 1usize;
     }
     Some[KeysInfo](info)
+  }
+
+  // -------- step functions (steps.cone; W148, FOR REVIEW) --------
+
+  // A step function's statements and result checked. Its mistakes lose only it (and its steppers), not its part
+  fn checkStep(self: &mut, fd: &FnDecl, slot: usize) {
+    var index = 0usize;
+    var found = false;
+    var g = 0usize;
+    while g < self.steps.len() {
+      if self.steps[g].slot == slot && self.steps[g].name == fd.name { index = g; found = true; }
+      g = g + 1usize;
+    }
+    if !found { return; }
+    let from = self.problems.len();
+    var sc = StepScope(List[StepName](), List[u32](), slot);
+    var ok = true;
+    if fd.params.len() != 2usize || fd.params[0].ty != N_PART || (fd.params[1].ty != N_DURATION && fd.params[1].ty != N_NUMBER) {
+      self.fail(fd.at, "a step function takes its part and the step's length: fn NAME(p: part, dt: duration) bool, for now", "", "");
+      ok = false;
+    }
+    if fd.ty != N_BOOL { self.fail(fd.at, "a step function gives a truth (bool): true to go on, false to end", "", ""); ok = false; }
+    if ok {
+      _ = sc.add(fd.params[0].name, ST_PART, false);
+      _ = sc.add(fd.params[1].name, ST_NUM, false);
+    }
+    var body = List[SStmt]();
+    if ok { ok = self.stepStmts(&fd.body, &mut sc, &mut body); }
+    var result = sx(SX_TRUTH, ST_BOOL);
+    if ok {
+      match self.stepExpr(&fd.result, &mut sc) {
+        case let Some(r) {
+          if r.ty != ST_BOOL { self.fail(fd.result.spot(), "a step function's last line is a truth: true to go on", "", ""); ok = false; }
+          else { result = r; }
+        }
+        case is None { ok = false; }
+      }
+    }
+    self.toLater(from);
+    let s = &mut self.steps[index];
+    s.locals <-> sc.locals;
+    s.body <-> body;
+    s.result = result;
+    s.ok = ok;
+  }
+
+  fn stepStmts(self: &mut, l: &List[Stmt], sc: &mut StepScope, out: &mut List[SStmt]) bool {
+    let mark = sc.names.len();
+    var i = 0usize;
+    while i < l.len() {
+      if !self.stepStmt(&l[i], sc, out) { return false; }
+      i = i + 1usize;
+    }
+    while sc.names.len() > mark { _ = sc.names.pop(); }
+    true
+  }
+
+  fn stepStmt(self: &mut, st: &Stmt, sc: &mut StepScope, out: &mut List[SStmt]) bool {
+    if st.kind == STMT_LET || st.kind == STMT_VAR {
+      match self.stepExpr(&st.value[0usize], sc) {
+        case let Some(v) {
+          let l = sc.add(st.name, v.ty, st.kind == STMT_VAR);
+          var s = ss(SS_SET);
+          s.index = l;
+          s.value.push(v);
+          out.push(s);
+          return true;
+        }
+        case is None { return false; }
+      }
+    }
+    if st.kind == STMT_ASSIGN {
+      var k = 0usize;
+      match sc.find(st.name) {
+        case let Some(x) { k = x; }
+        case is None { self.failName(st.at, "nothing named '", st.name, "' is in reach to be set: 'var' makes one"); return false; }
+      }
+      if !sc.names[k].mutable { self.failName(st.at, "'", st.name, "' is fixed: 'var', not 'let', makes a name that changes"); return false; }
+      match self.stepExpr(&st.value[0usize], sc) {
+        case let Some(v) {
+          if v.ty != sc.names[k].ty {
+            self.fail(st.at, "this gives ", stName(v.ty), ", not what the name holds");
+            return false;
+          }
+          var s = ss(SS_SET);
+          s.index = sc.names[k].local;
+          s.value.push(v);
+          out.push(s);
+          return true;
+        }
+        case is None { return false; }
+      }
+    }
+    if st.kind == STMT_IF {
+      var s = ss(SS_IF);
+      match self.stepExpr(&st.value[0usize], sc) {
+        case let Some(c) {
+          if c.ty != ST_BOOL { self.fail(st.at, "an if's condition is a truth", "", ""); return false; }
+          s.value.push(c);
+        }
+        case is None { return false; }
+      }
+      if !self.stepStmts(&st.body, sc, &mut s.body) { return false; }
+      if !self.stepStmts(&st.other, sc, &mut s.other) { return false; }
+      out.push(s);
+      return true;
+    }
+    if st.kind == STMT_EACH {
+      // each o in P.parts: P a part known now
+      var holder = 0usize;
+      var okOver = false;
+      match &st.value[0usize] {
+        case let Path(p) {
+          if p.names.len() >= 2usize && *p.names[p.names.len() - 1usize] == N_PARTS {
+            var head = List[u32]();
+            var k = 0usize;
+            while k + 1usize < p.names.len() { head.push(*p.names[k]); k = k + 1usize; }
+            match self.partOf(&Expr.Path(p.at, head), sc.slot) {
+              case let Some(h) { holder = h; okOver = true; }
+              case is None { return false; }
+            }
+          }
+        }
+        else {}
+      }
+      if !okOver { self.fail(st.at, "a step function's loop goes through the parts of a part: each o in P.parts, for now", "", ""); return false; }
+      var s = ss(SS_EACH);
+      s.slot = u32.from(holder);
+      s.n = u32.from(self.nodes[holder].children.len());
+      s.count = sc.add(N_NONE, ST_COUNT, false);
+      let mark = sc.names.len();
+      s.index = sc.add(st.name, ST_PART, false);
+      if !self.stepStmts(&st.body, sc, &mut s.body) { return false; }
+      while sc.names.len() > mark { _ = sc.names.pop(); }
+      out.push(s);
+      return true;
+    }
+    // an act: set(p.place | p.facing | p.FIELD, point)
+    match &st.value[0usize] {
+      case let Call(c) {
+        if c.callee.len() == 1usize && *c.callee[0usize] == N_SET && c.args.len() == 2usize {
+          match &c.args[0usize].value {
+            case let Path(p) {
+              if p.names.len() >= 2usize {
+                let last = *p.names[p.names.len() - 1usize];
+                var head = List[u32]();
+                var k = 0usize;
+                while k + 1usize < p.names.len() { head.push(*p.names[k]); k = k + 1usize; }
+                var part = sx(SX_PART, ST_PART);
+                match self.stepPart(&Expr.Path(p.at, head), sc) {
+                  case let Some(x) { part = x; }
+                  case is None { return false; }
+                }
+                var value = sx(SX_NUM, ST_NUM);
+                match self.stepExpr(&c.args[1usize].value, sc) {
+                  case let Some(v) { value = v; }
+                  case is None { return false; }
+                }
+                if value.ty != ST_POINT { self.fail(c.args[1usize].value.spot(), "a place, a facing or a place field is set to a point", "", ""); return false; }
+                var s = ss(SS_SET_PLACE);
+                if last == N_FACING { s.op = SS_SET_FACING; }
+                else if last != N_PLACE {
+                  match placeNumber(&self.placeNames, last) {
+                    case let Some(n) {
+                      if !self.placeMutable(last) {
+                        self.failName(p.at, "the place field '", last, "' is fixed: it is set only if it is 'mutable: true'");
+                        return false;
+                      }
+                      s.op = SS_SET_FIELD;
+                      s.index = n;
+                    }
+                    case is None {
+                      self.failName(p.at, "a step sets a part's place, its facing or a place field, not '", last, "'");
+                      return false;
+                    }
+                  }
+                }
+                s.value.push(part);
+                s.value.push(value);
+                out.push(s);
+                return true;
+              }
+            }
+            else {}
+          }
+        }
+      }
+      else {}
+    }
+    self.fail(st.at, "a step function's act is set(p.place, v), set(p.facing, v) or set(p.FIELD, v), for now", "", "");
+    false
+  }
+
+  // Is every place field of this name mutable?
+  fn placeMutable(self: &, name: u32) bool {
+    var i = 0usize;
+    while i < self.placeFields.len() {
+      if self.placeFields[i].name == name && !self.placeFields[i].mutable { return false; }
+      i = i + 1usize;
+    }
+    true
+  }
+
+  // A value that is a part: a name holding one, or a part's path
+  fn stepPart(self: &mut, e: &Expr, sc: &mut StepScope) Option[SExpr] {
+    match self.stepExpr(e, sc) {
+      case let Some(v) {
+        if v.ty != ST_PART { self.fail(e.spot(), "a part is wanted here, not ", stName(v.ty), ""); return None; }
+        Some[SExpr](v)
+      }
+      case is None { None }
+    }
+  }
+
+  fn stepExpr(self: &mut, e: &Expr, sc: &mut StepScope) Option[SExpr] {
+    match e {
+      case let Number(n) {
+        if n.unit != N_NONE && n.unit != N_M && n.unit != N_CM && n.unit != N_MM && n.unit != N_S && n.unit != N_MS {
+          self.fail(n.at, "a step function's number is plain, or in m, cm, mm, s or ms, for now", "", "");
+          return None;
+        }
+        var x = sx(SX_NUM, ST_NUM);
+        x.num = n.value * unitScale(n.unit);
+        Some[SExpr](x)
+      }
+      case let Truth(t) {
+        var x = sx(SX_TRUTH, ST_BOOL);
+        x.num = if t.value { 1. } else { 0. };
+        Some[SExpr](x)
+      }
+      case let Path(p) {
+        let first = *p.names[0usize];
+        match sc.find(first) {
+          case let Some(k) {
+            var x = sx(SX_LOCAL, sc.names[k].ty);
+            x.index = sc.names[k].local;
+            var i = 1usize;
+            while i < p.names.len() {
+              match self.stepMember(x, *p.names[i], p.at) {
+                case let Some(y) { x = y; }
+                case is None { return None; }
+              }
+              i = i + 1usize;
+            }
+            return Some[SExpr](x);
+          }
+          case is None {}
+        }
+        // a part's path, then perhaps its place, a place field or a point's coordinate
+        var slot = 0usize;
+        match self.lookOutward(first, sc.slot) {
+          case let Some(s) { slot = s; }
+          case is None { self.failName(p.at, "nothing named '", first, "' is in reach here"); return None; }
+        }
+        var i = 1usize;
+        while i < p.names.len() {
+          match self.childNamed(slot, *p.names[i]) {
+            case let Some(s) { slot = s; i = i + 1usize; }
+            case is None { break; }
+          }
+        }
+        var x = sx(SX_PART, ST_PART);
+        x.index = u32.from(slot);
+        while i < p.names.len() {
+          match self.stepMember(x, *p.names[i], p.at) {
+            case let Some(y) { x = y; }
+            case is None { return None; }
+          }
+          i = i + 1usize;
+        }
+        Some[SExpr](x)
+      }
+      case let Tuple(t) {
+        if t.items.len() != 3usize { self.fail(t.at, "a point in a step function is (x, y, z)", "", ""); return None; }
+        var x = sx(SX_TUPLE, ST_POINT);
+        var i = 0usize;
+        while i < 3usize {
+          match self.stepExpr(&t.items[i], sc) {
+            case let Some(v) {
+              if v.ty != ST_NUM { self.fail(t.at, "a point's coordinates are numbers", "", ""); return None; }
+              x.args.push(v);
+            }
+            case is None { return None; }
+          }
+          i = i + 1usize;
+        }
+        Some[SExpr](x)
+      }
+      case let Negative(g) {
+        match self.stepExpr(&g.operand[0usize], sc) {
+          case let Some(v) {
+            if v.ty != ST_NUM && v.ty != ST_POINT { self.fail(g.at, "only a number or a point is negated", "", ""); return None; }
+            let t = v.ty;
+            Some[SExpr](sx1(SX_NEG, t, v))
+          }
+          case is None { None }
+        }
+      }
+      case let Not(g) {
+        match self.stepExpr(&g.operand[0usize], sc) {
+          case let Some(v) {
+            if v.ty != ST_BOOL { self.fail(g.at, "only a truth is negated with '!'", "", ""); return None; }
+            Some[SExpr](sx1(SX_NOT, ST_BOOL, v))
+          }
+          case is None { None }
+        }
+      }
+      case let Binary(b) {
+        var a = sx(SX_NUM, ST_NUM);
+        var c = sx(SX_NUM, ST_NUM);
+        match self.stepExpr(&b.operands[0usize], sc) { case let Some(v) { a = v; } case is None { return None; } }
+        match self.stepExpr(&b.operands[1usize], sc) { case let Some(v) { c = v; } case is None { return None; } }
+        let op = b.op;
+        let ta = a.ty;
+        let tc = c.ty;
+        if op == 'A' || op == 'O' {
+          if ta == ST_BOOL && tc == ST_BOOL { return Some[SExpr](sx2(SX_LOGIC, ST_BOOL, op, a, c)); }
+        }
+        else if op == '<' || op == '>' || op == 'l' || op == 'g' || op == 'E' || op == 'N' {
+          if ta == ST_NUM && tc == ST_NUM { return Some[SExpr](sx2(SX_CMP, ST_BOOL, op, a, c)); }
+        }
+        else if op == '+' || op == '-' {
+          if ta == tc && (ta == ST_NUM || ta == ST_POINT) { return Some[SExpr](sx2(SX_ARITH, ta, op, a, c)); }
+        }
+        else if op == '*' {
+          if ta == ST_NUM && tc == ST_NUM { return Some[SExpr](sx2(SX_ARITH, ST_NUM, op, a, c)); }
+          if ta == ST_POINT && tc == ST_NUM { return Some[SExpr](sx2(SX_ARITH, ST_POINT, op, a, c)); }
+          if ta == ST_NUM && tc == ST_POINT { return Some[SExpr](sx2(SX_ARITH, ST_POINT, op, c, a)); }
+        }
+        else if op == '/' {
+          if tc == ST_NUM && (ta == ST_NUM || ta == ST_POINT) { return Some[SExpr](sx2(SX_ARITH, ta, op, a, c)); }
+        }
+        var m = String.from("this operator does not take ");
+        m.append(stName(ta)); m.append(" and "); m.append(stName(tc));
+        self.problems.push(Problem(b.at, m));
+        None
+      }
+      case let Call(c) {
+        if c.callee.len() == 1usize && (*c.callee[0usize] == N_LENGTH || *c.callee[0usize] == N_DOT) {
+          let isDot = *c.callee[0usize] == N_DOT;
+          let want = if isDot { 2usize } else { 1usize };
+          if c.args.len() != want { self.fail(c.at, if isDot { "dot(a, b) takes two points" } else { "length(v) takes one point" }, "", ""); return None; }
+          var x = sx(if isDot { SX_DOT } else { SX_LENGTH }, ST_NUM);
+          var i = 0usize;
+          while i < want {
+            match self.stepExpr(&c.args[i].value, sc) {
+              case let Some(v) {
+                if v.ty != ST_POINT { self.fail(c.at, "length and dot take points", "", ""); return None; }
+                x.args.push(v);
+              }
+              case is None { return None; }
+            }
+            i = i + 1usize;
+          }
+          return Some[SExpr](x);
+        }
+        self.fail(c.at, "a step function calls length(v) or dot(a, b), for now", "", "");
+        None
+      }
+      else {
+        self.fail(e.spot(), "this is not understood in a step function yet", "", "");
+        None
+      }
+    }
+  }
+
+  // v.NAME: a part's place or place field, or a point's x, y or z
+  fn stepMember(self: &mut, v: SExpr, name: u32, at: Spot) Option[SExpr] {
+    if v.ty == ST_POINT && (name == N_X || name == N_Y || name == N_Z) {
+      var x = sx1(SX_COMPONENT, ST_NUM, v);
+      x.index = if name == N_X { 0u32 } else if name == N_Y { 1u32 } else { 2u32 };
+      return Some[SExpr](x);
+    }
+    if v.ty == ST_PART {
+      if name == N_PLACE { return Some[SExpr](sx1(SX_PLACE, ST_POINT, v)); }
+      match placeNumber(&self.placeNames, name) {
+        case let Some(n) {
+          var x = sx1(SX_FIELD, ST_POINT, v);
+          x.index = n;
+          return Some[SExpr](x);
+        }
+        case is None {}
+      }
+    }
+    self.failName(at, "'", name, "' is not a part's place or place field, nor a point's x, y or z");
+    None
+  }
+
+  // on(created, start(stepAnimator(part, step: fn))): the part's step function runs every step
+  fn stepper(self: &mut, args: &List[Arg], at: Spot, slot: usize) {
+    if args.len() != 2usize || args[0usize].label != N_NONE || args[1usize].label != N_STEP {
+      self.fail(at, "stepAnimator(part, step: fn), for now", "", "");
+      return;
+    }
+    var target = 0usize;
+    match self.partOf(&args[0usize].value, slot) {
+      case let Some(s) { target = s; }
+      case is None { return; }
+    }
+    var name = N_NONE;
+    match &args[1usize].value {
+      case let Path(p) { if p.names.len() == 1usize { name = *p.names[0usize]; } }
+      else {}
+    }
+    var s = slot;
+    while true {
+      var g = 0usize;
+      while g < self.steps.len() {
+        if self.steps[g].slot == s && self.steps[g].name == name {
+          self.steppers.push(StepperInfo(at, target, g, true));
+          return;
+        }
+        g = g + 1usize;
+      }
+      if s == 0usize { break; }
+      s = self.nodes[s].parent;
+    }
+    self.fail(args[1usize].value.spot(), "step: names a step function in reach, fn NAME(p: part, dt: duration) bool", "", "");
+  }
+
+  // A place field's default and options (W148)
+  fn checkPlaceField(self: &mut, fd: &FieldDecl, slot: usize) {
+    var idx = 0usize;
+    var found = false;
+    var i = 0usize;
+    while i < self.placeFields.len() {
+      if self.placeFields[i].slot == slot && self.placeFields[i].name == fd.name { idx = i; found = true; }
+      i = i + 1usize;
+    }
+    if !found { return; }
+    match &fd.value {
+      case let Some(e) {
+        match self.value(e, Ty.Direction, slot) {
+          case let Some(v) {
+            match &v {
+              case let Tuple(items) {
+                let f = &mut self.placeFields[idx];
+                f.x = numOf(&items[0usize]); f.y = numOf(&items[1usize]); f.z = numOf(&items[2usize]);
+              }
+              else {}
+            }
+          }
+          case is None {}
+        }
+      }
+      case is None {}
+    }
+    i = 0usize;
+    while i < fd.options.len() {
+      if fd.options[i].label == N_MUTABLE {
+        match self.value(&fd.options[i].value, Ty.Truth, slot) {
+          case let Some(v) { match &v { case let Truth(b) { (&mut self.placeFields[idx]).mutable = *b; } else {} } }
+          case is None {}
+        }
+      }
+      else { self.failName(fd.options[i].value.spot(), "'", fd.options[i].label, "' is not an option of a place field, for now"); }
+      i = i + 1usize;
+    }
   }
 
   // After every part is read: each name used once, one writer for each value,
