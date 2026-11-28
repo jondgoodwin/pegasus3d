@@ -1,0 +1,290 @@
+// The handles of one evaluation, and the shims that read and make what they hold.
+//
+// What a tool makes is plain data (a ToolValue). The conescript interpreter keeps every object of a run in one table
+// (conescript's HandleTable[V]); here V is ToolValue, so a handle in the code is an index into the same table the shims
+// read their handle arguments from and write their results to. A list the code makes ('list.make') is in the table
+// too, as a payload of slots (kind HANDLE_LIST). Handle 0 is none: it reads as an empty list, and as a refusal
+// wherever a value is needed. A shim borrows its handle arguments (reads them, never takes them), so a value used twice
+// is read twice.
+
+// What one handle holds
+pub enum ToolValue {
+  Nothing;                      // what a wrong handle reads as
+  Pieces(List[PolyMesh]);       // a shape: pieces, not welded
+  Outline(sculpt.Profile);
+  Spine(sculpt.Path);
+  Stroke(StrokeSpec);
+  Material(MaterialRec);
+  Modifier(ModifierRec);
+  Sun(SunRec);
+  Lamp(LampRec);
+  Camera(CameraRec);
+  Volume;                       // a space: read by the checker, never built
+  Parts(List[MaterialRec]);     // the materials the world's material parts made, by slot (host.part_value reads it)
+}
+
+pub alias ToolHandles = HandleTable[ToolValue];
+
+// One shim: reads its arguments from the first slots, writes its result over them; false when it declines
+// (it has said why through refuse)
+pub alias ToolShim = &fn(handles: &mut ToolHandles, slots: &mut Array[u64]) bool;
+pub alias ToolShims = List[ToolShim];
+
+// A shim declines the call: it says why (the first reason stands). The interpreter makes it a trap with this message.
+pub fn refuse(hs: &mut ToolHandles, why: &str) {
+  if hs.fail.len() == 0usize { hs.fail = String.from(why); }
+}
+
+pub fn refused(hs: &ToolHandles) bool { hs.fail.len() > 0usize }
+
+fn badInput(hs: &mut ToolHandles, what: &str) {
+  var m = String.from("expected ");
+  m.append(what);
+  refuse(hs, m.view());
+}
+
+// Whether h names something the host made
+fn held(hs: &ToolHandles, h: u64) bool { h != 0u64 && usize.from(h) < hs.values.len() }
+
+// The pieces of a shape, copied (a handle that is not a shape refuses the call)
+pub fn readPieces(hs: &mut ToolHandles, h: u64) List[PolyMesh] {
+  var out = List[PolyMesh]();
+  if !held(hs, h) { badInput(hs, "a shape"); return out; }
+  match &hs.values[usize.from(h)] {
+    case let Some(v) {
+      match v {
+        case let Pieces(p) {
+          var i = 0usize;
+          while i < p.len() { out.push(p[i].clone()); i = i + 1usize; }
+          return out;
+        }
+        else {}
+      }
+    }
+    else {}
+  }
+  badInput(hs, "a shape");
+  out
+}
+
+pub fn readOutline(hs: &mut ToolHandles, h: u64) sculpt.Profile {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Outline(o) { return copyProfile(o); }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "an outline");
+  sculpt.Profile.rectangle(0.1, 0.1)
+}
+
+pub fn readSpine(hs: &mut ToolHandles, h: u64) sculpt.Path {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Spine(s) { return copyPath(s); }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "a spine");
+  sculpt.Path.line(Vec3(0., 0., 0.), Vec3(0., 1., 0.), 1u32)
+}
+
+pub fn readMaterial(hs: &mut ToolHandles, h: u64) MaterialRec {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Material(m) { return *m; }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "a material");
+  greyMaterial()
+}
+
+pub fn readModifier(hs: &mut ToolHandles, h: u64) ModifierRec {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Modifier(m) { return *m; }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "a modifier");
+  ModifierRec(MOD_COVERS, 1., 0.)
+}
+
+pub fn readSun(hs: &mut ToolHandles, h: u64) SunRec {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Sun(s) { return *s; }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "a sun");
+  SunRec(Vec3(0., 1., 0.), Color(0., 0., 0., 1.), 0., false)
+}
+
+pub fn readLamp(hs: &mut ToolHandles, h: u64) LampRec {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Lamp(l) { return *l; }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "a light");
+  LampRec(Vec3(0., -1., 0.), Color(1., 1., 1., 1.), 0., 1., 0., 0., 0., false, false)
+}
+
+pub fn readCamera(hs: &mut ToolHandles, h: u64) CameraRec {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Camera(c) { return *c; }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "a camera");
+  CameraRec(0.05, 0., 2., 0.)
+}
+
+pub fn readStroke(hs: &mut ToolHandles, h: u64) StrokeSpec {
+  if held(hs, h) {
+    match &hs.values[usize.from(h)] {
+      case let Some(v) {
+        match v {
+          case let Stroke(s) { return copyStroke(s); }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  badInput(hs, "a stroke");
+  noStroke()
+}
+
+fn noStroke() StrokeSpec {
+  StrokeSpec(sculptbrush.BrushDraw, false, sculpt.Profile.rectangle(0.1, 0.1), Vec2(0., 0.), Vec3(0., 0., 1.), 0.001, 0., 0.)
+}
+
+// What a list handle holds, as its words; handle 0 is the empty list
+fn words(hs: &mut ToolHandles, h: u64, width: usize, what: &str) List[u64] {
+  var out = List[u64]();
+  if h == 0u64 { return out; }
+  if usize.from(h) >= hs.kinds.len() || *hs.kinds[usize.from(h)] != HANDLE_LIST { badInput(hs, what); return out; }
+  let payload = &hs.data[usize.from(h)];
+  if payload.len() % width != 0usize { badInput(hs, what); return out; }
+  var i = 0usize;
+  while i < payload.len() { out.push(*payload[i]); i = i + 1usize; }
+  out
+}
+
+// A list of shapes as the pieces of all of them
+pub fn readShapes(hs: &mut ToolHandles, h: u64) List[PolyMesh] {
+  let ws = words(hs, h, 1usize, "a list of shapes");
+  var out = List[PolyMesh]();
+  var i = 0usize;
+  while i < ws.len() {
+    var one = readPieces(hs, *ws[i]);
+    var k = 0usize;
+    while k < one.len() { out.push(one[k].clone()); k = k + 1usize; }
+    i = i + 1usize;
+  }
+  out
+}
+
+pub fn readOutlines(hs: &mut ToolHandles, h: u64) List[sculpt.Profile] {
+  let ws = words(hs, h, 1usize, "a list of outlines");
+  var out = List[sculpt.Profile]();
+  var i = 0usize;
+  while i < ws.len() { out.push(readOutline(hs, *ws[i])); i = i + 1usize; }
+  out
+}
+
+pub fn readStrokes(hs: &mut ToolHandles, h: u64) List[StrokeSpec] {
+  let ws = words(hs, h, 1usize, "a list of strokes");
+  var out = List[StrokeSpec]();
+  var i = 0usize;
+  while i < ws.len() { out.push(readStroke(hs, *ws[i])); i = i + 1usize; }
+  out
+}
+
+pub fn readModifiers(hs: &mut ToolHandles, h: u64) List[ModifierRec] {
+  let ws = words(hs, h, 1usize, "a list of modifiers");
+  var out = List[ModifierRec]();
+  var i = 0usize;
+  while i < ws.len() { out.push(readModifier(hs, *ws[i])); i = i + 1usize; }
+  out
+}
+
+// A list of points (three slots an item, as the f64 of the f32 each)
+pub fn readPoints(hs: &mut ToolHandles, h: u64) List[Vec3] {
+  let ws = words(hs, h, 3usize, "a list of points");
+  var out = List[Vec3]();
+  var i = 0usize;
+  while i + 2usize < ws.len() {
+    out.push(Vec3(f32.from(f64.fromBits(*ws[i])), f32.from(f64.fromBits(*ws[i + 1usize])), f32.from(f64.fromBits(*ws[i + 2usize]))));
+    i = i + 3usize;
+  }
+  out
+}
+
+// A list of flat points
+pub fn readFlatPoints(hs: &mut ToolHandles, h: u64) List[Vec2] {
+  let ws = words(hs, h, 2usize, "a list of flat points");
+  var out = List[Vec2]();
+  var i = 0usize;
+  while i + 1usize < ws.len() {
+    out.push(Vec2(f32.from(f64.fromBits(*ws[i])), f32.from(f64.fromBits(*ws[i + 1usize]))));
+    i = i + 2usize;
+  }
+  out
+}
+
+// A list of plain numbers
+pub fn readNumbers(hs: &mut ToolHandles, h: u64) List[f32] {
+  let ws = words(hs, h, 1usize, "a list of numbers");
+  var out = List[f32]();
+  var i = 0usize;
+  while i < ws.len() { out.push(f32.from(f64.fromBits(*ws[i]))); i = i + 1usize; }
+  out
+}
+
+// A world's text read with this package's table: parsed, expanded and understood
+pub fn readWorld(src: &Array[u8]) Reading {
+  var names = Names.standard();
+  let vocab = vocabulary(&mut names);
+  read(src, names, vocab)
+}

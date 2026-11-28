@@ -1,0 +1,385 @@
+// Building a part from the world's code: what a browser calls to make one part's products.
+//
+// A world is lowered (conescript's lower) to one Code; verified against the import tables this file offers (every row of
+// the vocabulary through its shim, and the host's own imports); and each part is then made by running its units through
+// the interpreter. A browser keeps one PartBuilder for the world and asks it for each part in the world's order, then maps
+// the PartProducts to its own products (the guide browser to Arrivals, the new browser's Loader to its messages).
+//
+// A tool that refuses (a shim says why) stops the unit it was called from: the part is left out and the products say
+// why in 'notes'; the rest of the world is built.
+
+// The fuel one unit may spend (an evaluation is straight-line code: every call and import costs one or its weight)
+const FIXED_FUEL = 100000000u64;
+
+// Faces meeting at less than this are drawn as one smooth surface (mine: as modellers' auto-smooth defaults, 30 degrees)
+const SMOOTH_ANGLE = 0.5236;
+
+// The handle that holds the materials made so far: the first made by the builder, after handle 0
+const PARTS_HANDLE = 1usize;
+
+pub const LIGHT_NONE = 0u32;
+pub const LIGHT_SUN = 1u32;
+pub const LIGHT_LAMP = 2u32;
+
+// The light a part carries, if it is one
+pub struct PartLight {
+  pub kind: u32;          // LIGHT_NONE, LIGHT_SUN or LIGHT_LAMP
+  pub sun: SunRec;
+  pub lamp: LampRec;
+}
+
+// What building one part made, in plain data. A browser maps it to its own products.
+pub struct PartProducts {
+  pub made: bool;             // false: a tool refused and the part is left out (see notes)
+  pub notes: List[String];    // each thing left out, and why, in the order it happened
+  pub mesh: Mesh;             // a shape: its pieces triangulated, appended and smoothed by angle; empty for the others
+  pub low: Vec3;              // the mesh's box (zero when there is no mesh)
+  pub high: Vec3;
+  pub half: Vec3;             // the box about the origin that holds the mesh
+  pub material: MaterialRec;  // a material part's own, a shape's material; grey when none was said
+  pub light: PartLight;
+  pub at: Vec3;               // where it stands in its parent (an arrival: where it stands)
+  pub turn: Quat;
+  pub placement: Mat4;        // 'at' then 'turn', within its parent's frame
+  pub facing: Vec3;           // an arrival: which way it looks, in its parent's frame
+  pub eye: f32;               // an arrival: how high the eye is, when said
+  pub hasEye: bool;
+  pub camera: CameraRec;      // an arrival: how its picture is taken, when said
+  pub hasCamera: bool;
+}
+
+fn noLight() PartLight {
+  PartLight(LIGHT_NONE, SunRec(Vec3(0., 1., 0.), Color(0., 0., 0., 1.), 0., false),
+    LampRec(Vec3(0., -1., 0.), Color(1., 1., 1., 1.), 0., 1., 0., 0., 0., false, false))
+}
+
+fn emptyProducts() PartProducts {
+  PartProducts(true, List[String](), Mesh(), Vec3(0., 0., 0.), Vec3(0., 0., 0.), Vec3(0., 0., 0.), greyMaterial(), noLight(),
+    Vec3(0., 0., 0.), Quat.identity(), Mat4.identity(), Vec3(0., 0., 0.), 0., false, CameraRec(0.05, 0., 2., 0.), false)
+}
+
+// -------- the host's imports --------
+
+// host.none.<type>: handle 0 (no stroke path, no list)
+fn hostNone(hs: &mut ToolHandles, slots: &mut Array[u64]) bool {
+  slots[0usize] = 0u64;
+  true
+}
+
+// host.part_value: the material another part made, as a new handle (the part is a material part, made before this one)
+fn hostPartValue(hs: &mut ToolHandles, slots: &mut Array[u64]) bool {
+  let slot = usize.from(slots[0usize]);
+  var rec = greyMaterial();
+  var found = false;
+  if hs.values.len() > PARTS_HANDLE {
+    match &hs.values[PARTS_HANDLE] {
+      case let Some(v) {
+        match v {
+          case let Parts(list) { if slot < list.len() { rec = *list[slot]; found = true; } }
+          else {}
+        }
+      }
+      else {}
+    }
+  }
+  if !found { refuse(hs, "no material was made for that part"); return false; }
+  slots[0usize] = hs.allocValue(ToolValue.Material(rec));
+  true
+}
+
+// The imports a world's code may name: every row of the vocabulary through its shim (namespace "vocabulary"), and the
+// host's own (part_value, and none for each handle and list type)
+pub fn toolImports(vocab: &Vocabulary, names: &Names) ImportTables[ToolValue] {
+  var t = ImportTables[ToolValue].make();
+  let shims = toolShims();
+  var i = 0usize;
+  while i < vocab.tools.len() {
+    let name = toolName(vocab, names, u32.from(i));
+    let sig = toolSignature(&mut t.types, &vocab.tools[i]);
+    t.add(NS_VOCABULARY, name.view(), sig, false, vocab.tools[i].weight, *shims[i]);
+    i = i + 1usize;
+  }
+  let pv = partValueSignature(&mut t.types);
+  t.add(NS_HOST, HOST_PART_VALUE, pv, false, 1u32, &hostPartValue);
+  let nones = noneTypes();
+  i = 0usize;
+  while i < nones.len() {
+    let sig = noneSignature(&mut t.types, *nones[i]);
+    t.add(NS_HOST, noneName(*nones[i]).view(), sig, false, 1u32, &hostNone);
+    i = i + 1usize;
+  }
+  t
+}
+
+// -------- the builder --------
+
+pub struct PartBuilder {
+  code: VerifiedCode;
+  tables: ImportTables[ToolValue];
+  hs: ToolHandles;
+  interp: Interpreter;
+  made: List[MaterialRec];      // the material parts' values, by slot
+
+  // The builder for a world: its code lowered and verified against 'tables' (toolImports, or that with a shim swapped);
+  // or what the verifier refused
+  pub fn make(w: &Understood, tables: ImportTables[ToolValue]) Result[PartBuilder, List[CodeProblem]] {
+    let code = lower(w);
+    match verify(&code, &tables) {
+      case let Ok(v) {
+        var hs = ToolHandles.make();
+        hs.allocValue(ToolValue.Parts(List[MaterialRec]()));
+        var made = List[MaterialRec]();
+        var i = 0usize;
+        while i < w.nodes.len() { made.push(greyMaterial()); i = i + 1usize; }
+        Ok[PartBuilder, List[CodeProblem]](PartBuilder(v, tables, hs, Interpreter.make(), made))
+      }
+      case let Err(ps) { Err[PartBuilder, List[CodeProblem]](ps) }
+    }
+  }
+
+  // The world's code, as lowered (for --show-code)
+  pub fn lowered(self: &) &Code { self.code.source() }
+
+  // The unit that gives a part's value, if the part has one (value 0 is its make; option i is 1 + i)
+  fn unitFor(self: &, a: u32, b: u32) Option[u32] {
+    let es = &self.code.source().entries;
+    var i = 0usize;
+    while i < es.len() {
+      if es[i].a == a && es[i].b == b { return Some[u32](es[i].unit); }
+      i = i + 1usize;
+    }
+    None
+  }
+
+  // Runs a unit: its result slots in 'out'; the trap's message if it stopped
+  fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
+    self.hs.fail = String();
+    self.interp.setFuel(FIXED_FUEL);
+    let none = List[u64]();
+    match self.interp.run(&self.code, &self.tables, &mut self.hs, unit, none.view(), out) {
+      case let Some(t) { Some[String](t.message.clone()) }
+      case is None { None }
+    }
+  }
+
+  // The materials made so far, shown to host.part_value
+  fn refresh(self: &mut) {
+    var list = List[MaterialRec]();
+    var i = 0usize;
+    while i < self.made.len() { list.push(*self.made[i]); i = i + 1usize; }
+    self.hs.values.set(PARTS_HANDLE, Some[ToolValue](ToolValue.Parts(list)));
+  }
+
+
+  // A part's place in its parent: 'at' (a point) and, but for an arrival, 'rotation'; either left out
+  pub fn placeOf(self: &mut, slot: usize, kind: Kind) PartProducts {
+    var p = emptyProducts();
+    var out = List[u64]();
+    match self.unitFor(u32.from(slot), u32.from(OPT_AT) + 1u32) {
+      case let Some(u) {
+        let trapped = self.run(u, &mut out);
+        if trapped is None { p.at = Vec3(numAt(&out, 0usize), numAt(&out, 1usize), numAt(&out, 2usize)); }
+      }
+      case is None {}
+    }
+    if kind != Kind.Arrival {
+      match self.unitFor(u32.from(slot), u32.from(OPT_ROTATION) + 1u32) {
+        case let Some(u) {
+          let trapped = self.run(u, &mut out);
+          if trapped is None {
+            p.turn = Quat(numAt(&out, 0usize), numAt(&out, 1usize), numAt(&out, 2usize),
+              numAt(&out, 3usize));
+          }
+        }
+        case is None {}
+      }
+    }
+    p.placement = Mat4.fromTrs(p.at, p.turn, Vec3(1., 1., 1.));
+    self.hs.release(PARTS_HANDLE + 1usize);
+    p
+  }
+
+  // The value of a rotation key of a rule (keys(...)'s values): a quaternion; the identity if its unit stopped
+  pub fn keyTurn(self: &mut, rule: usize, value: usize) Quat {
+    var out = List[u64]();
+    var q = Quat.identity();
+    match self.unitFor(ENTRY_KEYS_FLAG | u32.from(rule), u32.from(value)) {
+      case let Some(u) {
+        if self.run(u, &mut out) is None {
+          q = Quat(numAt(&out, 0usize), numAt(&out, 1usize), numAt(&out, 2usize), numAt(&out, 3usize));
+        }
+      }
+      case is None {}
+    }
+    self.hs.release(PARTS_HANDLE + 1usize);
+    q
+  }
+
+  // The value of an offset key of a rule: a vector; zero if its unit stopped
+  pub fn keyOffset(self: &mut, rule: usize, value: usize) Vec3 {
+    var out = List[u64]();
+    var v = Vec3(0., 0., 0.);
+    match self.unitFor(ENTRY_KEYS_FLAG | u32.from(rule), u32.from(value)) {
+      case let Some(u) {
+        if self.run(u, &mut out) is None { v = Vec3(numAt(&out, 0usize), numAt(&out, 1usize), numAt(&out, 2usize)); }
+      }
+      case is None {}
+    }
+    self.hs.release(PARTS_HANDLE + 1usize);
+    v
+  }
+
+  // One part's products. 'kind' is what the part is (the world's nodes say); a part's values are its units.
+  pub fn buildPart(self: &mut, slot: usize, kind: Kind) PartProducts {
+    self.refresh();
+    var p = self.placeOf(slot, kind);
+    let s = u32.from(slot);
+    var out = List[u64]();
+    if kind == Kind.Material {
+      match self.unitFor(s, 0u32) {
+        case let Some(u) {
+          match self.run(u, &mut out) {
+            case let Some(why) { p.notes.push(why); }
+            case is None {
+              p.material = readMaterial(&mut self.hs, *out[0usize]);
+              if refused(&self.hs) { p.notes.push(self.hs.fail.clone()); p.material = greyMaterial(); }
+            }
+          }
+        }
+        case is None {}
+      }
+      self.made.set(slot, p.material);
+    }
+    else if kind == Kind.Shape {
+      // its material: the one it names, or the one written in its line; one that refuses leaves it grey
+      match self.unitFor(s, u32.from(OPT_MATERIAL) + 1u32) {
+        case let Some(u) {
+          match self.run(u, &mut out) {
+            case let Some(why) { p.notes.push(why); }
+            case is None {
+              p.material = readMaterial(&mut self.hs, *out[0usize]);
+              if refused(&self.hs) { p.notes.push(self.hs.fail.clone()); p.material = greyMaterial(); }
+            }
+          }
+        }
+        case is None {}
+      }
+      match self.unitFor(s, 0u32) {
+        case let Some(u) {
+          match self.run(u, &mut out) {
+            case let Some(why) { p.notes.push(why); p.made = false; }
+            case is None { self.shapeInto(*out[0usize], &mut p); }
+          }
+        }
+        case is None { p.made = false; }
+      }
+    }
+    else if kind == Kind.Light {
+      match self.unitFor(s, 0u32) {
+        case let Some(u) {
+          match self.run(u, &mut out) {
+            case let Some(why) { p.notes.push(why); p.made = false; }
+            case is None { self.lightInto(*out[0usize], &mut p); }
+          }
+        }
+        case is None { p.made = false; }
+      }
+    }
+    else if kind == Kind.Arrival {
+      match self.unitFor(s, u32.from(OPT_FACING) + 1u32) {
+        case let Some(u) {
+          if self.run(u, &mut out) is None {
+            p.facing = Vec3(numAt(&out, 0usize), numAt(&out, 1usize), numAt(&out, 2usize));
+          }
+        }
+        case is None {}
+      }
+      match self.unitFor(s, u32.from(OPT_EYE) + 1u32) {
+        case let Some(u) {
+          if self.run(u, &mut out) is None { p.eye = numAt(&out, 0usize); p.hasEye = true; }
+        }
+        case is None {}
+      }
+      match self.unitFor(s, u32.from(OPT_CAMERA) + 1u32) {
+        case let Some(u) {
+          if self.run(u, &mut out) is None {
+            p.camera = readCamera(&mut self.hs, *out[0usize]);
+            p.hasCamera = !refused(&self.hs);
+          }
+        }
+        case is None {}
+      }
+    }
+    self.hs.release(PARTS_HANDLE + 1usize);
+    p
+  }
+
+  // A shape's pieces made one mesh: each piece triangulated, appended, then smoothed by angle (where faces meet at less
+  // than SMOOTH_ANGLE the surface is drawn smooth, at more it keeps its edge)
+  fn shapeInto(self: &mut, h: u64, p: &mut PartProducts) {
+    let pieces = readPieces(&mut self.hs, h);
+    if refused(&self.hs) { p.notes.push(self.hs.fail.clone()); p.made = false; return; }
+    var mesh = Mesh();
+    var i = 0usize;
+    while i < pieces.len() {
+      let m = pieces[i].triangulate(false);
+      mesh.append(&m);
+      i = i + 1usize;
+    }
+    smoothByAngle(&mut mesh, f32.from(SMOOTH_ANGLE));
+    var low = Vec3(1.0e30f, 1.0e30f, 1.0e30f);
+    var high = Vec3(-1.0e30f, -1.0e30f, -1.0e30f);
+    var k = 0usize;
+    while k < mesh.positions.len() {
+      let q = *mesh.positions[k];
+      low = low.min(q);
+      high = high.max(q);
+      k = k + 1usize;
+    }
+    if mesh.positions.len() > 0usize {
+      p.low = low;
+      p.high = high;
+      p.half = Vec3(maxAbs(low.x, high.x), maxAbs(low.y, high.y), maxAbs(low.z, high.z));
+    }
+    p.mesh = mesh;
+  }
+
+  // A light's record, a sun or a lamp as the tool made it
+  fn lightInto(self: &mut, h: u64, p: &mut PartProducts) {
+    var isSun = false;
+    var isLamp = false;
+    if usize.from(h) < self.hs.values.len() {
+      match &self.hs.values[usize.from(h)] {
+        case let Some(v) {
+          match v {
+            case is Sun { isSun = true; }
+            case is Lamp { isLamp = true; }
+            else {}
+          }
+        }
+        else {}
+      }
+    }
+    if isSun { p.light.kind = LIGHT_SUN; p.light.sun = readSun(&mut self.hs, h); }
+    else if isLamp { p.light.kind = LIGHT_LAMP; p.light.lamp = readLamp(&mut self.hs, h); }
+    else { p.notes.push(String.from("not a light")); p.made = false; }
+  }
+}
+
+fn maxAbs(a: f32, b: f32) f32 {
+  let x = if a < 0. { -a } else { a };
+  let y = if b < 0. { -b } else { b };
+  if x > y { x } else { y }
+}
+
+// Slot i of a result, as the f32 of the f64 it holds
+fn numAt(out: &List[u64], i: usize) f32 { f32.from(f64.fromBits(*out[i])) }
+
+// Products of a plain mesh of one color, at the origin: what a browser's mock content makes until it reads a world
+pub fn plainProducts(mesh: Mesh, color: Color, half: Vec3) PartProducts {
+  var p = emptyProducts();
+  p.mesh = mesh;
+  p.material = toolPlain(color);
+  p.half = half;
+  p
+}

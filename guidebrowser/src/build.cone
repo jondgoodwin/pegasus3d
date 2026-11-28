@@ -1,13 +1,12 @@
 // Building: an understood world's parts made, in its order, each sent to the
-// loop the moment it is made. This is the interpreter: it walks the checked
-// values, packs each call's arguments into slots as the vocabulary table says
-// and calls the shim of the row it names (partbuild's), which makes the value.
-// (A generator of code takes its place where measuring shows a part is built
-// often enough to matter.)
+// loop the moment it is made. The parts' values are not walked here: the world
+// is lowered to code of the intermediate form (conescript's lower), verified,
+// and each part is made by running its units through the interpreter
+// (partbuild's PartBuilder), which gives plain products; this file maps them to
+// what the loop is sent.
 //
-//   a material      its color, kept by slot for the shapes that name it
-//   a shape         its mesh made from its recipe, its look, its place: an
-//                   Arrival.Part
+//   a material      its look, kept by slot for the shapes that name it
+//   a shape         its mesh, its look, its place: an Arrival.Part
 //   a light         the sun, in physical units: an Arrival.Sun
 //   an arrival      the first one is where the visitor stands: an Arrival.Stand
 //   a group         only its place, which the parts inside it start from
@@ -30,18 +29,34 @@ pub const EYE_HEIGHT = 1.6;
 // a clear sky is several thousand nits.
 pub const SKY_NITS = 4000.;
 
-// The rows the build knows by their place in the vocabulary (the first eight rows are fixed: partbuild/vocab.list)
+// The row the build knows by its place in the vocabulary (the first eight rows are fixed: partbuild/vocab.list)
 const TOOL_BOX = 0u32;
-const TOOL_SUNLIGHT = 5u32;
 
 // Every part of the world built and sent (built and dropped, unless send:
 // to time building alone); how many parts were
 pub fn build(w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
-  buildWith(toolShims(), w, ready, send)
+  buildWith(toolImports(&w.vocab, &w.names), w, ready, send)
 }
 
-// The same with the shims given (a check swaps one for a shim that refuses)
-pub fn buildWith(shims: ToolShims, w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
+// The same with the imports given (a check swaps one for a shim that refuses)
+pub fn buildWith(tables: ImportTables[ToolValue], w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
+  match PartBuilder.make(w, tables) {
+    case let Ok(b) { buildParts(b, w, ready, send) }
+    case let Err(problems) {
+      // code that does not verify never runs: the world's parts are left out
+      var i = 0usize;
+      while i < problems.len() {
+        print <- "build: the world's code was refused: "; printStr(problems[i].what.view()); print <- " (unit "; print <- problems[i].unit;
+        print <- ", offset "; print <- problems[i].offset; print <- ")\n";
+        i = i + 1usize;
+      }
+      0u64
+    }
+  }
+}
+
+fn buildParts(builder: PartBuilder, w: &Understood, ready: &Sender[Arrival], send: bool) u64 {
+  var bld = builder;
   var looks = List[Look]();     // by slot: a material's look
   var places = List[Mat4]();    // by slot: where the part's own origin is, in the world
   var frames = List[SlotFrame]();
@@ -53,8 +68,9 @@ pub fn buildWith(shims: ToolShims, w: &Understood, ready: &Sender[Arrival], send
     var turn = Quat.identity();
     let kind = w.nodes[s].kind;
     if kind == Kind.Group || kind == Kind.Shape || kind == Kind.Light {
-      if !(w.units[s].options[OPT_AT] is Absent) { at = vec3(&w.units[s].options[OPT_AT]); }
-      turn = turnOf(&shims, w, &w.units[s].options[OPT_ROTATION]);
+      let own = bld.placeOf(s, kind);
+      at = own.at;
+      turn = own.turn;
     }
     frames.push(SlotFrame(u32.from(w.nodes[s].parent), String.from(w.names.text(w.nodes[s].name)), at, turn,
       kind == Kind.Shape && *w.alive[s]));
@@ -67,64 +83,46 @@ pub fn buildWith(shims: ToolShims, w: &Understood, ready: &Sender[Arrival], send
     let slot = *w.order[i];
     let kind = w.nodes[slot].kind;
     let parent = w.nodes[slot].parent;
-    var hs = ToolHandles.make();       // this part's: what its tools make
+    if kind == Kind.Arrival && standing { i = i + 1usize; continue; }
+    var p = bld.buildPart(slot, kind);
     if kind == Kind.Group || kind == Kind.Shape || kind == Kind.Light {
-      let own = placement(&shims, w, &w.units[slot].options[OPT_AT], &w.units[slot].options[OPT_ROTATION]);
-      places.set(slot, *places[parent] * own);
+      places.set(slot, *places[parent] * p.placement);
     }
+    var k = 0usize;
+    while k < p.notes.len() { leftOut(w, slot, p.notes[k].view()); k = k + 1usize; }
     if kind == Kind.Material {
-      looks.set(slot, lookOf(&shims, &mut hs, w, &w.units[slot].make));
-      if hs.refused() { leftOut(w, slot, &hs); looks.set(slot, greyLook()); }
+      looks.set(slot, lookOf(&p.material));
     }
     else if kind == Kind.Shape {
-      var look = greyLook();
-      match &w.units[slot].options[OPT_MATERIAL] {
-        case let Ref(m) { look = *looks[*m]; }
-        case let Make(made) {
-          look = lookOf(&shims, &mut hs, w, &w.units[slot].options[OPT_MATERIAL]);
-          if hs.refused() { leftOut(w, slot, &hs); look = greyLook(); hs = ToolHandles.make(); }
-        }
-        else {}
-      }
-      var low = Vec3(0., 0., 0.);
-      var high = Vec3(0., 0., 0.);
-      let mesh = shapeMesh(&shims, &mut hs, w, &w.units[slot].make, &mut low, &mut high);
-      if hs.refused() { leftOut(w, slot, &hs); }
-      else {
-        let a = Arrival.Part(Built(u32.from(slot), String.from(w.names.text(w.nodes[slot].name)), mesh, low, high, look,
-          *places[slot]));
+      if p.made {
+        var mesh = Mesh();
+        mesh <-> p.mesh;
+        let a = Arrival.Part(Built(u32.from(slot), String.from(w.names.text(w.nodes[slot].name)), mesh, p.low, p.high,
+          lookOf(&p.material), *places[slot]));
         if send { ready.send(a); }
         parts = parts + 1u64;
       }
     }
-    else if kind == Kind.Light && !isSun(&w.units[slot].make) {
-      let a = lampOf(&shims, &mut hs, w, &w.units[slot].make, *places[slot]);
-      if hs.refused() { leftOut(w, slot, &hs); }
-      else if send { ready.send(a); }
-    }
     else if kind == Kind.Light {
-      let a = sunOf(&shims, &mut hs, w, &w.units[slot].make);
-      if hs.refused() { leftOut(w, slot, &hs); }
-      else if send { ready.send(a); }
+      if p.made {
+        if p.light.kind == LIGHT_SUN {
+          if send { ready.send(sunOf(&p.light.sun)); }
+        }
+        else if send { ready.send(lampOf(&p.light.lamp, *places[slot])); }
+      }
     }
-    else if kind == Kind.Arrival && !standing {
+    else if kind == Kind.Arrival {
       let base = *places[parent];
-      let feet = base * vec3(&w.units[slot].options[OPT_AT]);
-      let facing = base.transformVector(vec3(&w.units[slot].options[OPT_FACING]));
+      let feet = base * p.at;
+      let facing = base.transformVector(p.facing);
       var height = f32.from(EYE_HEIGHT);
-      if !(w.units[slot].options[OPT_EYE] is Absent) { height = f32.from(numOf(&w.units[slot].options[OPT_EYE])); }
+      if p.hasEye { height = p.eye; }
       var lens: f32 = 0.;
       var aperture: f32 = 0.;
       var focus: f32 = 2.;
       var exposure: f32 = 0.;
-      match &w.units[slot].options[OPT_CAMERA] {
-        case let Make(c) {
-          var words = List[u64]();
-          pack(&shims, &mut hs, w, NO_FN, &w.units[slot].options[OPT_CAMERA], Ty.Camera, &List[u64](), &mut words);
-          let cam = hs.camera(*words[0usize]);
-          lens = cam.lens; aperture = cam.aperture; focus = cam.focus; exposure = cam.exposure;
-        }
-        else {}
+      if p.hasCamera {
+        lens = p.camera.lens; aperture = p.camera.aperture; focus = p.camera.focus; exposure = p.camera.exposure;
       }
       let a = Arrival.Stand(feet + Vec3(0., height, 0.), facing, lens, aperture, focus, exposure);
       if send { ready.send(a); }
@@ -133,23 +131,28 @@ pub fn buildWith(shims: ToolShims, w: &Understood, ready: &Sender[Arrival], send
     i = i + 1usize;
   }
   if send && (w.rules.len() > 0usize || w.derives.len() > 0usize || w.areas.len() > 0usize || w.moves.len() > 0usize) {
-    ready.send(Arrival.Behaviors(program(&shims, w, frames)));
+    ready.send(Arrival.Behaviors(program(&mut bld, w, frames)));
   }
   parts
 }
 
 // A part whose tools refused: left out, and why
-fn leftOut(w: &Understood, slot: usize, hs: &ToolHandles) {
-  print <- "build: '"; printStr(w.names.text(w.nodes[slot].name)); print <- "' left out: "; printStr(hs.why()); print <- "\n";
+fn leftOut(w: &Understood, slot: usize, why: &str) {
+  print <- "build: '"; printStr(w.names.text(w.nodes[slot].name)); print <- "' left out: "; printStr(why); print <- "\n";
 }
 
 fn greyLook() Look {
   Look(Color(0.5, 0.5, 0.5, 1.), false, 1., 0., 1., 0., 0.05, 0.)
 }
 
+// A material's look
+fn lookOf(m: &MaterialRec) Look {
+  Look(m.color, m.physical, m.roughness, m.metal, m.covers, m.coat, m.coatRoughness, m.reflects)
+}
+
 
 // What the world does, for its World actor
-fn program(shims: &ToolShims, w: &Understood, frames: List[SlotFrame]) Program {
+fn program(bld: &mut PartBuilder, w: &Understood, frames: List[SlotFrame]) Program {
   var fields = List[FieldRt]();
   var i = 0usize;
   while i < w.fields.len() {
@@ -168,7 +171,7 @@ fn program(shims: &ToolShims, w: &Understood, frames: List[SlotFrame]) Program {
   i = 0usize;
   while i < w.deriveOrder.len() {
     let d = &w.derives[*w.deriveOrder[i]];
-    if d.live { derives.push(DeriveRt(d.target.prop, u32.from(d.target.index), copyCalc(&d.calc))); }
+    if d.live { derives.push(DeriveRt(d.target.prop, u32.from(d.target.index), u32.from(*w.deriveOrder[i]))); }
     i = i + 1usize;
   }
   var rules = List[RuleRt]();
@@ -179,7 +182,7 @@ fn program(shims: &ToolShims, w: &Understood, frames: List[SlotFrame]) Program {
       var what = String.from("keys on ");
       what.append(w.names.text(w.nodes[r.keys.slot].name));
       what.append(if r.keys.prop == P_ROTATION { ".rotation" } else { ".offset" });
-      rules.push(RuleRt(r.clicked, u32.from(r.part), animOf(shims, w, &r.keys), what));
+      rules.push(RuleRt(r.clicked, u32.from(r.part), animOf(bld, i, &r.keys), what));
     }
     i = i + 1usize;
   }
@@ -187,19 +190,13 @@ fn program(shims: &ToolShims, w: &Understood, frames: List[SlotFrame]) Program {
   i = 0usize;
   while i < w.moves.len() {
     let m = &w.moves[i];
-    if *w.alive[m.part] {
-      var acts = List[MoveActRt]();
-      var k = 0usize;
-      while k < m.acts.len() {
-        let a = m.acts[k];
-        acts.push(MoveActRt(a.kind, u32.from(a.field), a.value, u32.from(a.to), middleOf(w, a.to), f32.from(a.seconds)));
-        k = k + 1usize;
-      }
-      moves.push(MoveRt(u32.from(m.part), acts));
-    }
+    if *w.alive[m.part] { moves.push(MoveRt(u32.from(m.part), u32.from(i))); }
     i = i + 1usize;
   }
-  Program(frames, fields, areas, derives, rules, moves)
+  var middles = List[Vec3]();
+  i = 0usize;
+  while i < w.nodes.len() { middles.push(middleOf(w, i)); i = i + 1usize; }
+  Program(frames, fields, areas, derives, rules, moves, middles, lowerSim(w))
 }
 
 // Where a part's shape has its middle, in its own frame: a box's, from its
@@ -225,29 +222,15 @@ fn middleOf(w: &Understood, slot: usize) Vec3 {
   Vec3(0., 0., 0.)
 }
 
-fn copyCalc(c: &Calc) Calc {
-  match c {
-    case let Num(x) { Calc.Num(*x) }
-    case let Field(f) { Calc.Field(*f) }
-    case let Occupied(s) { Calc.Occupied(*s) }
-    case let Choose(parts) {
-      var out = List[Calc]();
-      var i = 0usize;
-      while i < parts.len() { out.push(copyCalc(&parts[i])); i = i + 1usize; }
-      Calc.Choose(out)
-    }
-  }
-}
-
 // keys(...) as tweenstack's animator: one track of its keys, linear between
 // them, in a clip that loops as it says
-fn animOf(shims: &ToolShims, w: &Understood, k: &KeysInfo) Anim {
+fn animOf(bld: &mut PartBuilder, rule: usize, k: &KeysInfo) Anim {
   var track = Track.make(if k.prop == P_ROTATION { TK_QUAT } else { TK_VEC3 });
   var i = 0usize;
   while i < k.times.len() {
     let t = f32.from(*k.times[i]);
-    if k.prop == P_ROTATION { track.addQuat(t, turnOf(shims, w, &k.values[i]), INTERP_LINEAR); }
-    else { track.addVec3(t, vec3(&k.values[i]), INTERP_LINEAR); }
+    if k.prop == P_ROTATION { track.addQuat(t, bld.keyTurn(rule, i), INTERP_LINEAR); }
+    else { track.addVec3(t, bld.keyOffset(rule, i), INTERP_LINEAR); }
     i = i + 1usize;
   }
   var clip = Clip.make("", k.mode);
@@ -256,184 +239,12 @@ fn animOf(shims: &ToolShims, w: &Understood, k: &KeysInfo) Anim {
 }
 
 
-// rotation(angle, about: direction), about the upright axis when 'about' is
-// left out; none if the rotation is
-fn turnOf(shims: &ToolShims, w: &Understood, rotation: &Val) Quat {
-  match rotation {
-    case let Make(m) {
-      var hs = ToolHandles.make();
-      var words = List[u64]();
-      pack(shims, &mut hs, w, NO_FN, rotation, Ty.Rotation, &List[u64](), &mut words);
-      return Quat(f32.from(f64.fromBits(*words[0usize])), f32.from(f64.fromBits(*words[1usize])),
-        f32.from(f64.fromBits(*words[2usize])), f32.from(f64.fromBits(*words[3usize])));
-    }
-    else { Quat.identity() }
-  }
-}
-
-// 'at:' then 'rotation:', either left out
-fn placement(shims: &ToolShims, w: &Understood, at: &Val, rotation: &Val) Mat4 {
-  var origin = Vec3(0., 0., 0.);
-  if !(at is Absent) { origin = vec3(at); }
-  Mat4.fromTrs(origin, turnOf(shims, w, rotation), Vec3(1., 1., 1.))
-}
-
-// A material's look: physical(color:, roughness:, metal:), or plain(color); or a list of one of
-// them and its modifiers: translucent(covers:)
-fn lookOf(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, make: &Val) Look {
-  var words = List[u64]();
-  pack(shims, hs, w, NO_FN, make, Ty.Material, &List[u64](), &mut words);
-  let m = hs.material(*words[0usize]);
-  Look(m.color, m.physical, m.roughness, m.metal, m.covers, m.coat, m.coatRoughness, m.reflects)
-}
-
-// -------- values --------
-//
-// A value's words (the vocabulary says how many a type takes), pushed onto 'out'; 'dflt' is what a value left out
-// stands for. A call is made where it is read: a function's step read twice is made twice.
-
-// No function: a value written in a part's own line
-const NO_FN = 0xFFFFFFFFusize;
-
-// What a list of this type holds, one item's type
-fn itemOf(ty: Ty) Ty {
-  if ty == Ty.Outlines { return Ty.Outline; }
-  if ty == Ty.Shapes { return Ty.Shape; }
-  if ty == Ty.Strokes { return Ty.Stroke; }
-  if ty == Ty.Modifiers { return Ty.Modifier; }
-  if ty == Ty.Points { return Ty.Point; }
-  if ty == Ty.Points2 { return Ty.Point2; }
-  Ty.Pure
-}
-
-fn pack(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, within: usize, v: &Val, ty: Ty, dflt: &List[u64],
-    out: &mut List[u64]) {
-  match v {
-    case is Absent {
-      var i = 0usize;
-      while i < dflt.len() { out.push(*dflt[i]); i = i + 1usize; }
-      if dflt.len() == 0usize {
-        var z = 0u32;
-        while z < slotsOf(ty) { out.push(0u64); z = z + 1u32; }
-      }
-    }
-    case let Num(x) { out.push(x.bits()); }
-    case let Truth(b) { out.push(if *b { 1u64 } else { 0u64 }); }
-    case let Tuple(items) {
-      var i = 0usize;
-      while i < items.len() { out.push(numOf(&items[i]).bits()); i = i + 1usize; }
-    }
-    case let Range(ends) {
-      var i = 0usize;
-      while i < ends.len() { out.push(numOf(&ends[i]).bits()); i = i + 1usize; }
-    }
-    case let Local(k) { pack(shims, hs, w, within, &w.functions[within].lets[*k], ty, dflt, out); }
-    case let Call(f) { pack(shims, hs, w, *f, &w.functions[*f].result, ty, dflt, out); }
-    case let Make(m) { makeValue(shims, hs, w, within, m, out); }
-    case let Items(items) {
-      let item = itemOf(ty);
-      var temp = List[u64]();
-      var i = 0usize;
-      while i < items.len() { pack(shims, hs, w, within, &items[i], item, &List[u64](), &mut temp); i = i + 1usize; }
-      out.push(hs.newList(slotsOf(item), temp.view()));
-    }
-    case let Ref(s) { out.push(0u64); }
-  }
-}
-
-// A call made: its arguments packed as its row says, its shim called, its result's words pushed onto 'out'
-fn makeValue(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, within: usize, m: &Made, out: &mut List[u64]) {
-  let tool = usize.from(m.tool);
-  let sig = &w.vocab.tools[tool];
-  var args = List[u64]();
-  if m.tool == w.vocab.outlineList {
-    // [(x, y), ...]: the items are one list argument
-    var temp = List[u64]();
-    var i = 0usize;
-    while i < m.args.len() { pack(shims, hs, w, within, &m.args[i], Ty.Point2, &List[u64](), &mut temp); i = i + 1usize; }
-    args.push(hs.newList(2u32, temp.view()));
-  }
-  else if m.tool == w.vocab.materialList {
-    // [material, modifier, ...]: the material, then the modifiers as one list
-    pack(shims, hs, w, within, &m.args[0], Ty.Material, &List[u64](), &mut args);
-    var temp = List[u64]();
-    var i = 1usize;
-    while i < m.args.len() { pack(shims, hs, w, within, &m.args[i], Ty.Modifier, &List[u64](), &mut temp); i = i + 1usize; }
-    args.push(hs.newList(1u32, temp.view()));
-  }
-  else {
-    var i = 0usize;
-    while i < sig.params.len() {
-      pack(shims, hs, w, within, &m.args[i], sig.params[i].ty, &sig.params[i].fallback, &mut args);
-      i = i + 1usize;
-    }
-  }
-  let r = usize.from(sig.resultSlots);
-  while args.len() < r { args.push(0u64); }
-  let began = sdl.GetPerformanceCounter();
-  let shim = *shims[tool];
-  let n = args.len();
-  let ok = shim(hs, args.viewMut().sliceMut(0usize, n));
-  let took = micros(began, sdl.GetPerformanceCounter());
-  // A shape step slower than 3 ms says so, with what it took (its own steps' times included)
-  if sig.makes == Ty.Shape && took > 3000. {
-    print <- "build: "; printStr(w.names.text(*sig.path[sig.path.len() - 1usize])); print <- " took "; print <- took; print <- " us\n";
-  }
-  var k = 0usize;
-  while k < r {
-    out.push(if ok { *args[k] } else { 0u64 });
-    k = k + 1usize;
-  }
-}
-
-// -------- shapes --------
-//
-// A shape is made by calling the rows of the vocabulary as its value says, as pieces, each a PolyMesh. Each piece is
-// made triangles, faceted, and the triangles put together as one mesh; then it is smoothed by angle: where faces meet
-// at less than SMOOTH_ANGLE the surface is drawn smooth (a turned post), at more it keeps its edge (a box's corner,
-// the step of a base).
-
-// Faces meeting at less than this are drawn as one smooth surface (mine: as
-// modellers' auto-smooth defaults, 30 degrees)
-const SMOOTH_ANGLE = 0.5236;
-
-// The mesh of a shape, and its box
-fn shapeMesh(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, make: &Val, lowOut: &mut Vec3,
-    highOut: &mut Vec3) Mesh {
-  var words = List[u64]();
-  pack(shims, hs, w, NO_FN, make, Ty.Shape, &List[u64](), &mut words);
-  var mesh = Mesh();
-  if hs.refused() { return mesh; }
-  let pieces = hs.pieces(*words[0usize]);
-  var i = 0usize;
-  while i < pieces.len() {
-    let m = pieces[i].triangulate(false);
-    mesh.append(&m);
-    i = i + 1usize;
-  }
-  smoothByAngle(&mut mesh, f32.from(SMOOTH_ANGLE));
-  var low = Vec3(1.0e30f, 1.0e30f, 1.0e30f);
-  var high = Vec3(-1.0e30f, -1.0e30f, -1.0e30f);
-  var k = 0usize;
-  while k < mesh.positions.len() {
-    let p = *mesh.positions[k];
-    low = low.min(p);
-    high = high.max(p);
-    k = k + 1usize;
-  }
-  if mesh.positions.len() > 0usize { *lowOut = low; *highOut = high; }
-  mesh
-}
-
 // -------- lights --------
 
 // sunLight(direction:, color:, lux:, castsShadow:): 'direction' points to the
 // sun, so its light travels the other way; its color times its lux is the
 // light on a surface facing it
-fn sunOf(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, make: &Val) Arrival {
-  var words = List[u64]();
-  pack(shims, hs, w, NO_FN, make, Ty.Light, &List[u64](), &mut words);
-  let sun = hs.sun(*words[0usize]);
+fn sunOf(sun: &SunRec) Arrival {
   let way = sun.toSun.normalize();
   let c = sun.color;
   let lux = sun.lux;
@@ -443,20 +254,10 @@ fn sunOf(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, make: &Val) Ar
   Arrival.Sun(light, sun.shadows, way, lux)
 }
 
-fn isSun(make: &Val) bool {
-  match make {
-    case let Make(m) { m.tool == TOOL_SUNLIGHT }
-    else { false }
-  }
-}
-
 // spotLight(reach, color:, intensity:, source:, castsShadow:, aim:, cone:,
 // softEdge:) or pointLight(reach, color:, intensity:, source:, castsShadow:),
 // placed where its part is: its aim turned as its part is
-fn lampOf(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, make: &Val, place: Mat4) Arrival {
-  var words = List[u64]();
-  pack(shims, hs, w, NO_FN, make, Ty.Light, &List[u64](), &mut words);
-  let l = hs.lamp(*words[0usize]);
+fn lampOf(l: &LampRec, place: Mat4) Arrival {
   var lamp = LampInfo(place * Vec3(0., 0., 0.), Vec3(0., -1., 0.), l.color, l.candela, l.reach, l.source, 0., 0., false,
     l.shadows);
   if l.spot {
@@ -466,14 +267,4 @@ fn lampOf(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, make: &Val, p
     lamp.softEdge = l.softEdge;
   }
   Arrival.Lamp(lamp)
-}
-
-fn vec3(v: &Val) Vec3 {
-  match v {
-    case let Tuple(items) {
-      return Vec3(f32.from(numOf(&items[0])), f32.from(numOf(&items[1])), f32.from(numOf(&items[2])));
-    }
-    else {}
-  }
-  Vec3(0., 0., 0.)
 }

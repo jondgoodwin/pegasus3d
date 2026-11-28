@@ -1,0 +1,125 @@
+// The world's frames as Sim holds them: where each slot of the world stands, and the glides that move a part.
+//
+// A world's parts stand in frames inside frames (a rook in a piece group in the board's group). A part's offset is the
+// one thing a rule moves: the offset of a frame is added to its `at`, so everything inside it moves too. A glide
+// carries one frame's offset from where it is to where it must be, over seconds of the steps' own time, eased; Sim
+// steps it (`tick`) once a step, in its own state, and publishes the parts' places after it (Render shows them through
+// its snapshot blend). Plan step 6 (the click).
+
+pub struct Glide {
+  pub piece: u32;                   // the slot whose offset moves
+  pub from: Vec3;                   // its offset when the glide began
+  pub to: Vec3;                     // and where it ends
+  pub t: f32;                       // how far along, 0 to 1
+  pub perStep: f32;                 // how much of the glide one step does
+}
+
+pub struct Slots {
+  frames: SlotFrames;               // by slot, as the image gave them
+  offsets: List[Vec3];              // by slot: what a rule has moved it by, in its parent's frame
+  positions: List[Vec3];            // by slot: in the world, as of the last `refresh`
+  rotations: List[Quat];
+  places: List[Mat4];
+  glides: List[Glide];
+  dirty: bool;                      // an offset changed since the last `refresh`
+
+  pub fn none() Slots {
+    Slots(SlotFrames(), List[Vec3](), List[Vec3](), List[Quat](), List[Mat4](), List[Glide](), false)
+  }
+
+  pub fn make(frames: SlotFrames) Slots {
+    var s = Slots(frames, List[Vec3](), List[Vec3](), List[Quat](), List[Mat4](), List[Glide](), true);
+    var i = 0usize;
+    while i < s.frames.len() {
+      s.offsets.push(Vec3(0., 0., 0.)); s.positions.push(Vec3(0., 0., 0.));
+      s.rotations.push(Quat.identity()); s.places.push(Mat4.identity());
+      i = i + 1usize;
+    }
+    s.refresh();
+    s
+  }
+
+  pub fn count(self: &) usize { frames.len() }
+
+  pub fn nameOf(self: &, slot: u32) &str {
+    if usize.from(slot) < frames.len() { frames[usize.from(slot)].name.view() } else { "?" }
+  }
+
+  // Is the part at 'slot' the part 'holder', or inside it?
+  pub fn within(self: &, slot: u32, holder: u32) bool {
+    var s = slot;
+    var guard = frames.len();
+    while guard > 0usize && usize.from(s) < frames.len() {
+      if s == holder { return true; }
+      let p = frames[usize.from(s)].parent;
+      if p == s { return false; }
+      s = p;
+      guard = guard - 1usize;
+    }
+    false
+  }
+
+  // Every slot's place, parents first (a parent's slot is always the lower), when an offset has changed
+  pub fn refresh(self: &mut) {
+    if !dirty { return; }
+    dirty = false;
+    var s = 0usize;
+    while s < frames.len() {
+      let f = &frames[s];
+      let shift = f.at + *offsets[s];
+      let p = usize.from(f.parent);
+      if p == s || p > s {
+        positions.set(s, shift);
+        rotations.set(s, f.turn);
+      } else {
+        positions.set(s, *positions[p] + *rotations[p] * shift);
+        rotations.set(s, *rotations[p] * f.turn);
+      }
+      places.set(s, Mat4.fromTrs(*positions[s], *rotations[s], Vec3(1., 1., 1.)));
+      s = s + 1usize;
+    }
+  }
+
+  // The slot's frame in the world (as of the last `refresh`)
+  pub fn place(self: &, slot: u32) Mat4 { *places[usize.from(slot)] }
+
+  // Where 'local', a point in the slot's frame, is in the world
+  pub fn worldPoint(self: &, slot: u32, local: Vec3) Vec3 {
+    let s = usize.from(slot);
+    *positions[s] + *rotations[s] * local
+  }
+
+  // Start 'piece' gliding so that its origin stands over 'there' (a point in the world), level: it keeps its height. The
+  // piece's offset changes in its parent's frame. A glide the piece already had is replaced.
+  pub fn startGlide(self: &mut, piece: u32, there: Vec3, seconds: f32) {
+    let k = usize.from(piece);
+    let here = *positions[k];
+    let parent = usize.from(frames[k].parent);
+    var shift = Vec3(there.x - here.x, 0., there.z - here.z);
+    if parent != k { shift = rotations[parent].conjugate() * shift; }
+    var kept = List[Glide]();
+    each g in &glides { if g.piece != piece { kept.push(*g); } }
+    var per: f32 = 1.;
+    if seconds > 0.0001 { per = 0.016666668 / seconds; }
+    let now = *offsets[k];
+    kept.push(Glide(piece, now, now + shift, 0., per));
+    glides = kept;
+  }
+
+  pub fn gliding(self: &) bool { glides.len() > 0usize }
+
+  // One step's worth of every glide
+  pub fn tick(self: &mut) {
+    if glides.len() == 0usize { return; }
+    var kept = List[Glide]();
+    each g in &glides {
+      var t = g.t + g.perStep;
+      if t >= 1. { t = 1.; }
+      let e = t * t * (3. - 2. * t);
+      offsets.set(usize.from(g.piece), g.from + (g.to - g.from) * e);
+      if t < 1. { kept.push(Glide(g.piece, g.from, g.to, t, g.perStep)); }
+    }
+    glides = kept;
+    dirty = true;
+  }
+}

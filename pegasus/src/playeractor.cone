@@ -28,6 +28,15 @@ const WALK_FROM = 60u64;            // walk forward from this step
 const WALK_TO = 180u64;             // to this one: 2 s
 const PRESS_AT = 240u64;            // then press at box-a
 const BOX_A_CENTRE = Vec3(0., 0.5, -8.);
+const PRESS_FROM_HEIGHT: f32 = 10.;     // a scripted press looks straight down from this high over (x, z)
+
+// A press a headless run is told to make (`--press STEP,XCM,ZCM`): at drawn step 'step', straight down on (x, z)
+pub struct ScriptPress {
+  pub step: u64;
+  pub x: f32;
+  pub z: f32;
+}
+alias ScriptPresses = List[ScriptPress];
 
 actor Player {
   render: Render;
@@ -42,10 +51,19 @@ actor Player {
   running: bool;
   pressed: bool;
   mutant: bool;                     // passed to Sim: the snapshot check's mutant
+  plan: ScriptPresses;              // the presses a headless run was told to make, in step order (none: the box-a press)
+  planned: usize;                   // how many of them are made
+  still: bool;                      // the person stays where it arrived (a shot told to press)
 
   fn init(self: &new, render: Render, loader: Loader, audio: Audio, moves: StateWriter[MoveIntent],
       looks: StateWriter[LookIntent], drawn: StateReader[DrawnFrame], mutant: bool) {
-    *self = Self(render, loader, audio, moves, looks, drawn, None[Sim], 0., -0.15, true, false, mutant);
+    *self = Self(render, loader, audio, moves, looks, drawn, None[Sim], 0., -0.15, true, false, mutant, ScriptPresses(), 0usize, false);
+  }
+
+  // The presses a headless run makes instead of the one at box-a; 'still': and the person does not walk
+  pub async fn presses(self, list: ScriptPresses, still: bool) {
+    plan = list;
+    self.still = still;
   }
 
   // Start the zone's Sim, then ask the Loader to open 'world' for it
@@ -96,12 +114,16 @@ actor Player {
       if !running { break; }
       let d = drawn.newest();
       var f: f32 = 0.;
-      if walks && d.step >= WALK_FROM && d.step < WALK_TO { f = 1.; }
+      if walks && !still && d.step >= WALK_FROM && d.step < WALK_TO { f = 1.; }
       moves.put(&MoveIntent(f, 0.));
       // the look moves a little every tick, so each frame has a newer pose to read
       let wobble = 0.001 * f32.from(d.frame % 7u64);
       looks.put(&LookIntent(yaw, pitch + wobble));
-      if walks && !pressed && d.step >= PRESS_AT {
+      if planned < plan.len() && d.step >= plan[planned].step {
+        self.press(Vec3(plan[planned].x, PRESS_FROM_HEIGHT, plan[planned].z), Vec3(0., -1., 0.), d.displayNs);
+        planned = planned + 1usize;
+      }
+      if walks && !pressed && plan.len() == 0usize && d.step >= PRESS_AT {
         pressed = true;
         let along = (BOX_A_CENTRE - d.eye).normalize();
         self.press(d.eye, along, d.displayNs);
