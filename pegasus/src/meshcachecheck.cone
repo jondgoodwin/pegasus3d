@@ -57,7 +57,10 @@ fn freshProducts() PartProducts { plainProducts(Mesh(), Color(0.5, 0.5, 0.5, 1.)
 
 fn entryIsThere(dir: &Path, key: ContentKey) bool { fs.exists(&entryPath(dir, key)) }
 
-fn checkMeshCache(skipSum: bool) bool {
+const STAMP = 0x51a3c0de77u64;      // the build the checks play, and OTHER_STAMP another
+const OTHER_STAMP = 0x51a3c0de78u64;
+
+fn checkMeshCache(lax: u32) bool {
   var temp = fs.tempDir();
   match &temp {
     case is Err { print <- "check mesh cache: no temporary folder\n"; return false; }
@@ -70,13 +73,13 @@ fn checkMeshCache(skipSum: bool) bool {
   // A product written and read back: the same mesh, boxes and material; the boxes Sim gets from it are the built ones'
   {
     let dir = root.join("roundtrip");
-    var cache = MeshCache.make(dir.clone(), CACHE_CAP_BYTES);
+    var cache = MeshCache.make(dir.clone(), STAMP, CACHE_CAP_BYTES);
     let built = sampleProducts(0.7);
     let kept = cache.store(11u64, CACHE_MESH, &built) && cache.store(12u64, CACHE_MATERIAL, &built);
     var got = freshProducts();
     var gotMat = freshProducts();
-    let hit = loadEntry(&dir, 11u64, CACHE_MESH, skipSum, &mut got) == LOAD_HIT;
-    let hitMat = loadEntry(&dir, 12u64, CACHE_MATERIAL, skipSum, &mut gotMat) == LOAD_HIT;
+    let hit = loadEntry(&dir, 11u64, CACHE_MESH, STAMP, lax, &mut got) == LOAD_HIT;
+    let hitMat = loadEntry(&dir, 12u64, CACHE_MATERIAL, STAMP, lax, &mut gotMat) == LOAD_HIT;
     let wantShapes = shapesOf(11u64, &built);
     let gotShapes = shapesOf(11u64, &got);
     let same = hit && meshHash(&got.mesh) == meshHash(&built.mesh) && got.mesh.vertexCount() == built.mesh.vertexCount()
@@ -86,45 +89,45 @@ fn checkMeshCache(skipSum: bool) bool {
     let sameMat = hitMat && sameMaterial(&gotMat.material, &built.material);
     // a key with no entry, and an entry asked for as the other kind
     var none = freshProducts();
-    let miss = loadEntry(&dir, 99u64, CACHE_MESH, skipSum, &mut none) == LOAD_MISS;
+    let miss = loadEntry(&dir, 99u64, CACHE_MESH, STAMP, lax, &mut none) == LOAD_MISS;
     var wrongKind = freshProducts();
-    let wrong = loadEntry(&dir, 11u64, CACHE_MATERIAL, skipSum, &mut wrongKind) == LOAD_CORRUPT;
+    let wrong = loadEntry(&dir, 11u64, CACHE_MATERIAL, STAMP, lax, &mut wrongKind) == LOAD_CORRUPT;
     all = cacheLine("round trip: the mesh, its boxes and the material read back are the built ones", kept && same && sameMat && miss && wrong) && all;
   }
 
   // A byte flipped in the payload, and one in the header's key: corrupt, and the product is not touched
   {
     let dir = root.join("flipped");
-    var cache = MeshCache.make(dir.clone(), CACHE_CAP_BYTES);
+    var cache = MeshCache.make(dir.clone(), STAMP, CACHE_CAP_BYTES);
     let built = sampleProducts(0.7);
     _ = cache.store(21u64, CACHE_MESH, &built);
     _ = cache.store(22u64, CACHE_MESH, &built);
     _ = cache.store(23u64, CACHE_MATERIAL, &built);
     flipByte(&dir, 21u64, 200usize);                       // inside the mesh's positions
     flipByte(&dir, 22u64, 17usize);                        // the key in the header
-    flipByte(&dir, 23u64, 44usize);                        // inside the material's record
+    flipByte(&dir, 23u64, 56usize);                        // inside the material's record
     var a = freshProducts();
     var b = freshProducts();
     var c = freshProducts();
-    let ra = loadEntry(&dir, 21u64, CACHE_MESH, skipSum, &mut a);
-    let rb = loadEntry(&dir, 22u64, CACHE_MESH, skipSum, &mut b);
-    let rc = loadEntry(&dir, 23u64, CACHE_MATERIAL, skipSum, &mut c);
+    let ra = loadEntry(&dir, 21u64, CACHE_MESH, STAMP, lax, &mut a);
+    let rb = loadEntry(&dir, 22u64, CACHE_MESH, STAMP, lax, &mut b);
+    let rc = loadEntry(&dir, 23u64, CACHE_MATERIAL, STAMP, lax, &mut c);
     let refused = ra == LOAD_CORRUPT && rb == LOAD_CORRUPT && rc == LOAD_CORRUPT && a.mesh.vertexCount() == 0usize;
     // and the rebuilt product replaces the entry: it reads back
     _ = cache.store(21u64, CACHE_MESH, &built);
     var again = freshProducts();
-    let healed = loadEntry(&dir, 21u64, CACHE_MESH, skipSum, &mut again) == LOAD_HIT && meshHash(&again.mesh) == meshHash(&built.mesh);
+    let healed = loadEntry(&dir, 21u64, CACHE_MESH, STAMP, lax, &mut again) == LOAD_HIT && meshHash(&again.mesh) == meshHash(&built.mesh);
     all = cacheLine("a flipped byte is a corrupt miss, and the rebuilt entry reads back", refused && healed) && all;
   }
 
   // A truncated entry, at the header, mid-payload and one byte short; and an empty file
   {
     let dir = root.join("truncated");
-    var cache = MeshCache.make(dir.clone(), CACHE_CAP_BYTES);
+    var cache = MeshCache.make(dir.clone(), STAMP, CACHE_CAP_BYTES);
     let built = sampleProducts(0.7);
     var sizes = List[usize]();
     sizes.push(0usize); sizes.push(10usize); sizes.push(HEADER_BYTES); sizes.push(300usize);
-    let full = entryBytes(31u64, CACHE_MESH, &built).len();
+    let full = entryBytes(31u64, CACHE_MESH, STAMP, &built).len();
     sizes.push(full - 1usize);
     var good = true;
     var i = 0usize;
@@ -132,7 +135,7 @@ fn checkMeshCache(skipSum: bool) bool {
       _ = cache.store(31u64, CACHE_MESH, &built);
       cutEntry(&dir, 31u64, *sizes[i]);
       var p = freshProducts();
-      if loadEntry(&dir, 31u64, CACHE_MESH, skipSum, &mut p) != LOAD_CORRUPT || p.mesh.vertexCount() != 0usize { good = false; }
+      if loadEntry(&dir, 31u64, CACHE_MESH, STAMP, lax, &mut p) != LOAD_CORRUPT || p.mesh.vertexCount() != 0usize { good = false; }
       i = i + 1usize;
     }
     all = cacheLine("a truncated entry is a corrupt miss", good) && all;
@@ -141,7 +144,7 @@ fn checkMeshCache(skipSum: bool) bool {
   // An entry of another format version, or another vocabulary version: a clean miss (not corrupt, so not reported)
   {
     let dir = root.join("version");
-    var cache = MeshCache.make(dir.clone(), CACHE_CAP_BYTES);
+    var cache = MeshCache.make(dir.clone(), STAMP, CACHE_CAP_BYTES);
     let built = sampleProducts(0.7);
     _ = cache.store(41u64, CACHE_MESH, &built);
     _ = cache.store(42u64, CACHE_MESH, &built);
@@ -149,16 +152,39 @@ fn checkMeshCache(skipSum: bool) bool {
     flipByte(&dir, 42u64, 12usize);                        // the vocabulary version's
     var a = freshProducts();
     var b = freshProducts();
-    let old = loadEntry(&dir, 41u64, CACHE_MESH, skipSum, &mut a) == LOAD_OLD && loadEntry(&dir, 42u64, CACHE_MESH, skipSum, &mut b) == LOAD_OLD;
+    let old = loadEntry(&dir, 41u64, CACHE_MESH, STAMP, lax, &mut a) == LOAD_OLD && loadEntry(&dir, 42u64, CACHE_MESH, STAMP, lax, &mut b) == LOAD_OLD;
     all = cacheLine("an entry of another format or vocabulary version is a clean miss", old) && all;
+  }
+
+  // An entry another build wrote: a clean miss (not corrupt, not reported), rebuilt, and the rebuilt entry replaces it and hits
+  // for the build that wrote it. The stamp is the only thing that differs
+  {
+    let dir = root.join("stamp");
+    var old = MeshCache.make(dir.clone(), OTHER_STAMP, CACHE_CAP_BYTES);
+    let built = sampleProducts(0.7);
+    _ = old.store(61u64, CACHE_MESH, &built);
+    _ = old.store(62u64, CACHE_MATERIAL, &built);
+    var a = freshProducts();
+    var b = freshProducts();
+    let sameBuild = loadEntry(&dir, 61u64, CACHE_MESH, OTHER_STAMP, lax, &mut a) == LOAD_HIT;
+    var c = freshProducts();
+    var d = freshProducts();
+    let miss = loadEntry(&dir, 61u64, CACHE_MESH, STAMP, lax, &mut c) == LOAD_OLD && loadEntry(&dir, 62u64, CACHE_MATERIAL, STAMP, lax, &mut d) == LOAD_OLD
+      && c.mesh.vertexCount() == 0usize;
+    var now = MeshCache.make(dir.clone(), STAMP, CACHE_CAP_BYTES);
+    _ = now.store(61u64, CACHE_MESH, &built);
+    var e = freshProducts();
+    let healed = loadEntry(&dir, 61u64, CACHE_MESH, STAMP, lax, &mut e) == LOAD_HIT && meshHash(&e.mesh) == meshHash(&built.mesh)
+      && loadEntry(&dir, 61u64, CACHE_MESH, OTHER_STAMP, lax, &mut b) == LOAD_OLD;
+    all = cacheLine("an entry another build wrote is a clean miss, and the rebuilt entry replaces it", sameBuild && miss && healed) && all;
   }
 
   // Eviction: under a cap of two entries and a half, the oldest go; one used again is kept; the newest is never deleted
   {
     let dir = root.join("evict");
     let built = sampleProducts(0.7);
-    let size = u64.from(entryBytes(51u64, CACHE_MESH, &built).len());
-    var cache = MeshCache.make(dir.clone(), size * 2u64 + size / 2u64);
+    let size = u64.from(entryBytes(51u64, CACHE_MESH, STAMP, &built).len());
+    var cache = MeshCache.make(dir.clone(), STAMP, size * 2u64 + size / 2u64);
     _ = cache.store(51u64, CACHE_MESH, &built);
     _ = cache.store(52u64, CACHE_MESH, &built);
     _ = cache.store(53u64, CACHE_MESH, &built);
