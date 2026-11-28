@@ -1,0 +1,301 @@
+// The register allocator on its own: liveness round a loop, the intervals it makes, the rule that a value live across a
+// call goes to memory, the choice of what to spill, and, over many generated functions and register files, the
+// properties that make an allocation safe: two values that are live together never share a register, every register
+// is from its class's file, and every spill slot is its own.
+
+mod regalloc;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import codegen use *;
+
+fn take(b: &mut FuncBuilder) Func {
+  var f = Func(String(), List[u8](), List[Block](), 0u32, 0u32, 0u64);
+  f <-> b.func;
+  f
+}
+
+fn isReg(a: &Allocation, v: u32, r: u32) bool { a.locs[usize.from(v)].kind == LOC_REG && a.locs[usize.from(v)].n == r }
+fn isSpill(a: &Allocation, v: u32) bool { a.locs[usize.from(v)].kind == LOC_SPILL }
+
+// v1 = 1; v2 = 2; v3 = v1 + v2; arg0 = v3
+fn straight() Func {
+  var b = FuncBuilder.make("straight", 1u32, 0u64);
+  let v1 = b.vreg(CLASS_INT);
+  let v2 = b.vreg(CLASS_INT);
+  let v3 = b.vreg(CLASS_INT);
+  b.opImm(IR_ICONST, v1, NO_REG, 1u64);
+  b.opImm(IR_ICONST, v2, NO_REG, 2u64);
+  b.op3(IR_IADD, v3, v1, v2);
+  b.opImm(IR_ARG_SET, NO_REG, v3, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+// The loop: x is made before it and read inside it, so it is live all the way round the back edge
+//   B0: n = arg0; x = 5; i = 0; one = 1; jmp B1
+//   B1: c = i < n; br c B2 B3
+//   B2: t = i + x; i = t + one; jmp B1
+//   B3: arg0 = i; ret
+fn loopFn() Func {
+  var b = FuncBuilder.make("loop", 1u32, 0u64);
+  let n = b.vreg(CLASS_INT);
+  let x = b.vreg(CLASS_INT);
+  let i = b.vreg(CLASS_INT);
+  let one = b.vreg(CLASS_INT);
+  let c = b.vreg(CLASS_INT);
+  let t = b.vreg(CLASS_INT);
+  let b1 = b.block();
+  let b2 = b.block();
+  let b3 = b.block();
+  b.opImm(IR_ARG_GET, n, NO_REG, 0u64);
+  b.opImm(IR_ICONST, x, NO_REG, 5u64);
+  b.opImm(IR_ICONST, i, NO_REG, 0u64);
+  b.opImm(IR_ICONST, one, NO_REG, 1u64);
+  b.jmp(b1);
+  b.at(b1);
+  b.cmp(IR_ICMP, CC_LT, c, i, n);
+  b.br(c, b2, b3);
+  b.at(b2);
+  b.op3(IR_IADD, t, i, x);
+  b.op3(IR_IADD, i, t, one);
+  b.jmp(b1);
+  b.at(b3);
+  b.opImm(IR_ARG_SET, NO_REG, i, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+// a is last used before the call, b after it, f (a float) across it, and r is made after it
+fn callFn(gate: bool) Func {
+  var b = FuncBuilder.make("callfn", 1u32, 0u64);
+  b.needOut(1u32);
+  let a = b.vreg(CLASS_INT);
+  let c = b.vreg(CLASS_INT);
+  let f = b.vreg(CLASS_F64);
+  let r = b.vreg(CLASS_INT);
+  b.opImm(IR_ICONST, a, NO_REG, 1u64);
+  b.opImm(IR_ICONST, c, NO_REG, 2u64);
+  b.opImm(IR_FCONST, f, NO_REG, (1.5).bits());
+  b.opImm(IR_OUT_SET, NO_REG, a, 0u64);
+  if gate { b.sited(IR_GATE, 0u64, 0u64); } else { b.sited(IR_CALL, 0u64, 0u64); }
+  b.opImm(IR_OUT_GET, r, NO_REG, 0u64);
+  b.op3(IR_IADD, r, r, c);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, f, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+// k values defined one after another, then all summed, so all k are live at once
+fn together(k: u32) Func {
+  var b = FuncBuilder.make("together", 1u32, 0u64);
+  var vs = List[u32]();
+  var i = 0u32;
+  while i < k { let v = b.vreg(CLASS_INT); b.opImm(IR_ICONST, v, NO_REG, u64.from(i)); vs.push(v); i = i + 1u32; }
+  let acc = b.vreg(CLASS_INT);
+  b.opImm(IR_ICONST, acc, NO_REG, 0u64);
+  var j = 0usize;
+  while j < vs.len() { b.op3(IR_IADD, acc, acc, *vs[j]); j = j + 1usize; }
+  b.opImm(IR_ARG_SET, NO_REG, acc, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+// A function made from a seed: values built from earlier ones, a loop round some of them, calls here and there
+fn generated(seed: u64) Func {
+  var s = seed * 6364136223846793005u64 + 1442695040888963407u64;
+  var b = FuncBuilder.make("gen", 2u32, 0u64);
+  b.needOut(2u32);
+  var ints = List[u32]();
+  var floats = List[u32]();
+  let a0 = b.vreg(CLASS_INT);
+  b.opImm(IR_ARG_GET, a0, NO_REG, 0u64);
+  ints.push(a0);
+  let f0 = b.vreg(CLASS_F64);
+  b.opImm(IR_ARG_GET, f0, NO_REG, 1u64);
+  floats.push(f0);
+  let head = b.block();
+  let body = b.block();
+  let exit = b.block();
+  b.jmp(head);
+  b.at(head);
+  let cnt = b.vreg(CLASS_INT);
+  b.opImm(IR_ICONST, cnt, NO_REG, 3u64);
+  let cc = b.vreg(CLASS_INT);
+  b.cmp(IR_ICMP, CC_LT, cc, a0, cnt);
+  b.br(cc, body, exit);
+  b.at(body);
+  var n = 0u32;
+  while n < 40u32 {
+    s = s * 6364136223846793005u64 + 1442695040888963407u64;
+    let pick = (s >> 33u64) % 7u64;
+    let x = *ints[usize.from((s >> 20u64) % u64.from(ints.len()))];
+    let y = *ints[usize.from((s >> 40u64) % u64.from(ints.len()))];
+    let fx = *floats[usize.from((s >> 24u64) % u64.from(floats.len()))];
+    let fy = *floats[usize.from((s >> 44u64) % u64.from(floats.len()))];
+    if pick <= 2u64 {
+      let v = b.vreg(CLASS_INT);
+      b.op3(if pick == 0u64 { IR_IADD } else if pick == 1u64 { IR_IMUL } else { IR_IXOR }, v, x, y);
+      ints.push(v);
+    } else if pick <= 4u64 {
+      let v = b.vreg(CLASS_F64);
+      b.op3(if pick == 3u64 { IR_FADD } else { IR_FMUL }, v, fx, fy);
+      floats.push(v);
+    } else if pick == 5u64 {
+      b.opImm(IR_OUT_SET, NO_REG, x, 0u64);
+      b.sited(IR_CALL, 0u64, 0u64);
+      let v = b.vreg(CLASS_INT);
+      b.opImm(IR_OUT_GET, v, NO_REG, 0u64);
+      ints.push(v);
+    } else {
+      let v = b.vreg(CLASS_F64);
+      b.opImm(IR_I2F, v, x, 0u64);
+      floats.push(v);
+    }
+    n = n + 1u32;
+  }
+  // everything made is read at the end, so the values are all live to here
+  let acc = b.vreg(CLASS_INT);
+  b.opImm(IR_ICONST, acc, NO_REG, 0u64);
+  var i = 0usize;
+  while i < ints.len() { b.op3(IR_IADD, acc, acc, *ints[i]); i = i + 1usize; }
+  let facc = b.vreg(CLASS_F64);
+  b.opImm(IR_FCONST, facc, NO_REG, 0u64);
+  i = 0usize;
+  while i < floats.len() { b.op3(IR_FADD, facc, facc, *floats[i]); i = i + 1usize; }
+  b.op3(IR_IADD, a0, a0, acc);
+  b.jmp(head);
+  b.at(exit);
+  b.opImm(IR_ARG_SET, NO_REG, a0, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn files(nInts: usize, nFloats: usize) RegFile {
+  let full = x64RegFile();
+  var rf = RegFile(List[u8](), List[u8]());
+  var i = 0usize;
+  while i < nInts && i < full.ints.len() { rf.ints.push(*full.ints[i]); i = i + 1usize; }
+  i = 0usize;
+  while i < nFloats && i < full.floats.len() { rf.floats.push(*full.floats[i]); i = i + 1usize; }
+  rf
+}
+
+fn inFile(rf: &RegFile, cls: u8, r: u32) bool {
+  var i = 0usize;
+  let n = if cls == CLASS_INT { rf.ints.len() } else { rf.floats.len() };
+  while i < n {
+    let x = if cls == CLASS_INT { *rf.ints[i] } else { *rf.floats[i] };
+    if u32.from(x) == r { return true; }
+    i = i + 1usize;
+  }
+  false
+}
+
+// The safety properties of one allocation; the number of violations
+fn violations(f: &Func, a: &Allocation, rf: &RegFile) u32 {
+  var bad = 0u32;
+  let nv = f.classes.len();
+  var v = 1usize;
+  while v < nv {
+    let lv = &a.locs[v];
+    if lv.kind == LOC_REG && !inFile(rf, *f.classes[v], lv.n) { bad = bad + 1u32; }
+    if lv.kind == LOC_SPILL && lv.n >= a.nSpill { bad = bad + 1u32; }
+    var w = v + 1usize;
+    while w < nv {
+      let lw = &a.locs[w];
+      let overlap = *a.lo[v] <= *a.hi[v] && *a.lo[w] <= *a.hi[w] && *a.lo[v] <= *a.hi[w] && *a.lo[w] <= *a.hi[v];
+      if lv.kind == LOC_REG && lw.kind == LOC_REG && lv.n == lw.n && *f.classes[v] == *f.classes[w] && overlap { bad = bad + 1u32; }
+      if lv.kind == LOC_SPILL && lw.kind == LOC_SPILL && lv.n == lw.n { bad = bad + 1u32; }
+      w = w + 1usize;
+    }
+    v = v + 1usize;
+  }
+  bad
+}
+
+fn main() i32 {
+  let full = x64RegFile();
+
+  // straight-line code: the intervals, and a result that takes its first operand's register
+  let s = straight();
+  let sa = allocate(&s, &full);
+  expectUInt(u64.from(*sa.lo[1usize]), 1u64, "v1 starts where it is made");
+  expectUInt(u64.from(*sa.hi[1usize]), 4u64, "v1 ends where the add reads it");
+  expectUInt(u64.from(*sa.lo[3usize]), 5u64, "v3 starts at the add's result");
+  expectUInt(u64.from(*sa.hi[3usize]), 6u64, "v3 ends where it is stored");
+  expect(isReg(&sa, 1u32, 0u32) && isReg(&sa, 2u32, 1u32), "the first two values take the first two registers");
+  expect(isReg(&sa, 3u32, 0u32), "the sum reuses a register its operands have finished with");
+  expectUInt(u64.from(sa.nSpill), 0u64, "nothing spills");
+
+  // the loop: values made before it and read in it live to the end of the loop
+  let l = loopFn();
+  let la = allocate(&l, &full);
+  expectUInt(u64.from(*la.lo[2usize]), 3u64, "x is made at instruction 1");
+  expectUInt(u64.from(*la.hi[2usize]), 19u64, "x lives to the end of the loop's last block, not to its last read");
+  expectUInt(u64.from(*la.hi[1usize]), 19u64, "n, read only in the loop head, lives round the loop");
+  expectUInt(u64.from(*la.hi[4usize]), 19u64, "the constant one lives round the loop");
+  expectUInt(u64.from(*la.hi[3usize]), 20u64, "i lives to the store after the loop");
+  expectUInt(u64.from(la.nSpill), 0u64, "the loop spills nothing");
+  expectInt(i64.from(violations(&l, &la, &full)), 0i64, "the loop's allocation is safe");
+
+  // a call, and a gate: whatever lives across one is in memory
+  var callIsGate = 0u32;
+  while callIsGate < 2u32 {
+    let cf = callFn(callIsGate == 1u32);
+    let ca = allocate(&cf, &full);
+    expect(!isSpill(&ca, 1u32), "a value last read before the call keeps a register");
+    expect(isSpill(&ca, 2u32), "an integer live across the call is in memory");
+    expect(isSpill(&ca, 3u32), "a float live across the call is in memory");
+    expect(!isSpill(&ca, 4u32), "a value made after the call keeps a register");
+    expectUInt(u64.from(ca.nSpill), 2u64, "two spill slots");
+    expectInt(i64.from(violations(&cf, &ca, &full)), 0i64, "the call's allocation is safe");
+    callIsGate = callIsGate + 1u32;
+  }
+
+  // more values live together than registers: the ones that end last go to memory
+  let t = together(14u32);
+  let ta = allocate(&t, &full);
+  expectUInt(u64.from(ta.nSpill), 5u64, "14 values and an accumulator want 15 of 10 registers: five spill");
+  expectInt(i64.from(violations(&t, &ta, &full)), 0i64, "the crowded allocation is safe");
+  expect(isSpill(&ta, 14u32), "the value that is read last is the one spilled");
+  let t3 = files(3usize, 3usize);
+  let tb = allocate(&t, &t3);
+  expectUInt(u64.from(tb.nSpill), 12u64, "with three registers, twelve of fifteen spill");
+
+  // the same function twice gives the same allocation
+  let g1 = generated(7u64);
+  let g2 = generated(7u64);
+  let x1 = allocate(&g1, &full);
+  let x2 = allocate(&g2, &full);
+  var same = x1.nSpill == x2.nSpill && x1.locs.len() == x2.locs.len();
+  var i = 0usize;
+  while same && i < x1.locs.len() {
+    if x1.locs[i].kind != x2.locs[i].kind || x1.locs[i].n != x2.locs[i].n { same = false; }
+    i = i + 1usize;
+  }
+  expect(same, "the allocator is deterministic");
+
+  // properties over generated functions and register files, down to none
+  var total = 0u32;
+  var bad = 0u32;
+  var seed = 1u64;
+  while seed <= 40u64 {
+    let f = generated(seed);
+    var k = 0usize;
+    while k < 6usize {
+      let rf = if k == 0usize { files(10usize, 14usize) } else if k == 1usize { files(4usize, 4usize) } else if k == 2usize { files(2usize, 1usize) }
+               else if k == 3usize { files(1usize, 1usize) } else if k == 4usize { files(0usize, 0usize) } else { files(10usize, 3usize) };
+      let a = allocate(&f, &rf);
+      bad = bad + violations(&f, &a, &rf);
+      total = total + 1u32;
+      k = k + 1usize;
+    }
+    seed = seed + 1u64;
+  }
+  expectInt(i64.from(bad), 0i64, "no allocation of 40 generated functions in 6 register files breaks a rule");
+  expectInt(i64.from(total), 240i64, "all of them were made");
+  done()
+}

@@ -1,0 +1,1314 @@
+// Hand-built functions in the lower form, compiled to x64, loaded into executable memory and run, with exact expected
+// results: every op, the float rules (-0, infinity, NaN), branches in every block layout, loops, calls three deep, values
+// live across calls, more live values than registers, the gate, and every trap, ten thousand times over. The whole suite
+// runs under several register files (the full one, then ones so small that nearly everything is spilled, then none) and,
+// at the end, under three deliberate breakages (mutants) that it must notice.
+
+mod native;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import codegen use *;
+
+// ---- the gate the generated code calls ----
+struct Probe {
+  calls: u64;
+  lastK: u64;
+  nSlots: u64;        // how many slots the gate sums into slot 0
+  refuse: bool;
+  badAlign: u64;      // times the slot area was not 16-byte aligned
+  badCtx: u64;        // times the context was not the one the test made
+}
+
+fn @c testGate(ctx: *u8, k: u64, slots: *u64) u64 {
+  let c = ctx as *NativeCtx;
+  let p = (*c).user as *Probe;
+  (*p).calls = (*p).calls + 1u64;
+  (*p).lastK = k;
+  if (slots as usize) % 16usize != 0usize { (*p).badAlign = (*p).badAlign + 1u64; }
+  if (*c).fuel > 0xFFFFFFFFFFFFFFF0u64 { (*p).badCtx = (*p).badCtx + 1u64; }
+  if (*p).refuse { return 0u64; }
+  var sum = 0u64;
+  var j = 0u64;
+  while j < (*p).nSlots { sum = sum + *(slots + usize.from(j)); j = j + 1u64; }
+  *slots = sum;
+  1u64
+}
+
+// ---- the report one run of the suite builds ----
+struct Rep {
+  total: u32;
+  fails: List[String];
+}
+
+fn ck(r: &mut Rep, ok: bool, name: &str) {
+  r.total = r.total + 1u32;
+  if !ok { r.fails.push(String.from(name)); }
+}
+
+struct Res {
+  trap: u64;
+  area: List[u64];
+  fuel: u64;
+  site: u64;
+  depth: u64;       // the call count left after the run
+}
+
+fn build(funcs: &Funcs, opts: &Options, rep: &mut Rep, name: &str) Option[LoadedCode] {
+  match compileX64With(funcs, hostAbi(), opts) {
+    case let Ok(mc) {
+      match load(&mc) {
+        case let Ok(lc) { Some(lc) }
+        case let Err(e) { ck(rep, false, name); None }
+      }
+    }
+    case let Err(e) { print <- "compile failed: ", e, "\n"; ck(rep, false, name); None }
+  }
+}
+
+// Runs function 'func' with the argument slots 'area' (which becomes the result slots) under 'fuel'
+fn exec(lc: &LoadedCode, func: u32, area0: List[u64], fuel: u64, probe: &mut Probe) Res {
+  var area = area0;
+  var ctx = NativeCtx(&testGate as usize, fuel, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, (probe as *u8) as usize);
+  let t = lc.call(&mut ctx, func, area.viewMut());
+  Res(t, area, ctx.fuel, ctx.trapSite, ctx.depth)
+}
+
+fn noProbe() Probe { Probe(0u64, 0u64, 0u64, false, 0u64, 0u64) }
+
+fn run(lc: &LoadedCode, func: u32, args: List[u64]) Res {
+  var p = noProbe();
+  exec(lc, func, args, 1000000000u64, &mut p)
+}
+
+fn first(r: Res) u64 { *r.area[0usize] }
+
+// The finished function out of its builder (a field can't be moved out, so it is swapped for an empty one)
+fn take(b: &mut FuncBuilder) Func {
+  var f = Func(String(), List[u8](), List[Block](), 0u32, 0u32, 0u64);
+  f <-> b.func;
+  f
+}
+fn copyOf(a: &List[u64]) List[u64] {
+  var l = List[u64]();
+  var i = 0usize;
+  while i < a.len() { l.push(*a[i]); i = i + 1usize; }
+  l
+}
+
+fn l1(a: u64) List[u64] { var l = List[u64](); l.push(a); l }
+fn l2(a: u64, b: u64) List[u64] { var l = List[u64](); l.push(a); l.push(b); l }
+fn l3(a: u64, b: u64, c: u64) List[u64] { var l = List[u64](); l.push(a); l.push(b); l.push(c); l }
+
+fn nanBits() u64 { 0x7FF8000000000000u64 }
+// Floats compare as the contract says: bit for bit, except that every NaN is one value
+fn sameF(got: u64, want: u64) bool {
+  let w = f64.fromBits(want);
+  let g = f64.fromBits(got);
+  if w != w { return g != g; }
+  got == want
+}
+
+fn floats() List[f64] {
+  var l = List[f64]();
+  l.push(0.0); l.push(-0.0); l.push(1.5); l.push(-2.25); l.push(1e300); l.push(-1e300); l.push(5e-324);
+  l.push(f64.fromBits(0x7FF0000000000000u64)); l.push(f64.fromBits(0xFFF0000000000000u64));
+  l.push(f64.fromBits(0x7FF8000000000000u64)); l.push(3.0); l.push(-0.5); l.push(0.1);
+  l.push(9007199254740993.0); l.push(f64.fromBits(0xFFF8000000000001u64));
+  l
+}
+fn ints() List[u64] {
+  var l = List[u64]();
+  l.push(0u64); l.push(1u64); l.push(0xFFFFFFFFFFFFFFFFu64); l.push(0x7FFFFFFFFFFFFFFFu64); l.push(0x8000000000000000u64);
+  l.push(0x100000000u64); l.push(0x7FFFFFFFu64); l.push(0xFFFFFFFF80000000u64); l.push(123456789012345u64); l.push(3u64);
+  l
+}
+
+// ---- the reference: what the interpreter and Cone itself give ----
+fn minRef(a: f64, b: f64) f64 {
+  if a != a || b != b { return a + b; }
+  if a < b { return a; }
+  if b < a { return b; }
+  f64.fromBits(a.bits() | b.bits())
+}
+fn maxRef(a: f64, b: f64) f64 {
+  if a != a || b != b { return a + b; }
+  if a > b { return a; }
+  if b > a { return b; }
+  f64.fromBits(a.bits() & b.bits())
+}
+fn b2u(b: bool) u64 { if b { 1u64 } else { 0u64 } }
+fn fcmpRef(cc: u8, x: f64, y: f64) bool {
+  if cc == CC_EQ { x == y } else if cc == CC_NE { x != y } else if cc == CC_LT { x < y }
+  else if cc == CC_LE { x <= y } else if cc == CC_GT { x > y } else { x >= y }
+}
+fn icmpRef(cc: u8, a: u64, b: u64) bool {
+  let x = a as i64;
+  let y = b as i64;
+  if cc == CC_EQ { x == y } else if cc == CC_NE { x != y } else if cc == CC_LT { x < y }
+  else if cc == CC_LE { x <= y } else if cc == CC_GT { x > y } else { x >= y }
+}
+
+// ---- the binary ops, as a table: kind 0-5 float arithmetic, 6-11 fcmp, 12-17 integer arithmetic, 18-23 icmp ----
+fn kOp(k: usize) u8 {
+  if k == 0usize { IR_FADD } else if k == 1usize { IR_FSUB } else if k == 2usize { IR_FMUL } else if k == 3usize { IR_FDIV }
+  else if k == 4usize { IR_FMIN } else if k == 5usize { IR_FMAX } else if k < 12usize { IR_FCMP }
+  else if k == 12usize { IR_IADD } else if k == 13usize { IR_ISUB } else if k == 14usize { IR_IMUL }
+  else if k == 15usize { IR_IAND } else if k == 16usize { IR_IOR } else if k == 17usize { IR_IXOR } else { IR_ICMP }
+}
+fn kCc(k: usize) u8 { if k >= 6usize && k < 12usize { u8.from(k - 6usize) } else if k >= 18usize { u8.from(k - 18usize) } else { 0u8 } }
+fn kFloatIn(k: usize) bool { k < 12usize }
+fn kFloatOut(k: usize) bool { k < 6usize }
+
+fn refBin(k: usize, a: u64, b: u64) u64 {
+  let x = f64.fromBits(a);
+  let y = f64.fromBits(b);
+  if k == 0usize { return (x + y).bits(); }
+  if k == 1usize { return (x - y).bits(); }
+  if k == 2usize { return (x * y).bits(); }
+  if k == 3usize { return (x / y).bits(); }
+  if k == 4usize { return minRef(x, y).bits(); }
+  if k == 5usize { return maxRef(x, y).bits(); }
+  if k < 12usize { return b2u(fcmpRef(kCc(k), x, y)); }
+  if k == 12usize { return a + b; }
+  if k == 13usize { return a - b; }
+  if k == 14usize { return a * b; }
+  if k == 15usize { return a & b; }
+  if k == 16usize { return a | b; }
+  if k == 17usize { return a ^ b; }
+  b2u(icmpRef(kCc(k), a, b))
+}
+
+// f(a, b) = a op b into slot 0. order 0 loads a then b; 1 loads b then a (so the result can land on b's register);
+// 2 uses one vreg for both operands.
+fn binFn(k: usize, order: u32) Func {
+  let cin = if kFloatIn(k) { CLASS_F64 } else { CLASS_INT };
+  let cout = if kFloatOut(k) { CLASS_F64 } else { CLASS_INT };
+  var b = FuncBuilder.make("bin", 2u32, 0u64);
+  let x = b.vreg(cin);
+  let y = b.vreg(cin);
+  let r = b.vreg(cout);
+  if order == 1u32 {
+    b.opImm(IR_ARG_GET, y, NO_REG, 1u64);
+    b.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+  } else {
+    b.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+    if order == 0u32 { b.opImm(IR_ARG_GET, y, NO_REG, 1u64); }
+  }
+  let yy = if order == 2u32 { x } else { y };
+  if kOp(k) == IR_FCMP || kOp(k) == IR_ICMP { b.cmp(kOp(k), kCc(k), r, x, yy); } else { b.op3(kOp(k), r, x, yy); }
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+// ---- the container of every binary op, in three operand orders: function 24 * order + kind ----
+fn binFuncs() Funcs {
+  var fs = Funcs();
+  var order = 0u32;
+  while order < 3u32 {
+    var k = 0usize;
+    while k < 24usize { fs.push(binFn(k, order)); k = k + 1usize; }
+    order = order + 1u32;
+  }
+  fs
+}
+
+// Does the code from 'from' for 'size' bytes hold the byte pair (b0, then one in lo..=hi)?
+fn hasPair(mc: &MachineCode, from: u32, size: u32, b0: u8, lo: u8, hi: u8) bool {
+  var i = usize.from(from);
+  let end = usize.from(from) + usize.from(size);
+  while i + 1usize < end {
+    if *mc.bytes[i] == b0 && *mc.bytes[i + 1usize] >= lo && *mc.bytes[i + 1usize] <= hi { return true; }
+    i = i + 1usize;
+  }
+  false
+}
+
+fn suiteBin(o: &Options, rep: &mut Rep) {
+  let fs = binFuncs();
+  // minsd and maxsd (F2 0F 5D, F2 0F 5F) are never emitted: the sequence the form needs is not theirs
+  match compileX64With(&fs, hostAbi(), o) {
+    case let Ok(mc) {
+      var found = false;
+      var i = 0usize;
+      while i + 3usize < mc.bytes.len() {
+        // F2, perhaps a REX prefix, 0F, then 5D or 5F
+        let rex = *mc.bytes[i + 1usize] >= 0x40u8 && *mc.bytes[i + 1usize] <= 0x4Fu8;
+        let at = if rex { i + 2usize } else { i + 1usize };
+        if *mc.bytes[i] == 0xF2u8 && *mc.bytes[at] == 0x0Fu8 && (*mc.bytes[at + 1usize] == 0x5Du8 || *mc.bytes[at + 1usize] == 0x5Fu8) {
+          found = true;
+        }
+        i = i + 1usize;
+      }
+      ck(rep, !found, "no minsd or maxsd in the code");
+    }
+    case let Err(e) { ck(rep, false, "compile for the minsd scan"); }
+  }
+  match build(&fs, o, rep, "build bin") { case None { return; } case let Some(lc) {
+    let fl = floats();
+    let il = ints();
+    var order = 0u32;
+    while order < 3u32 {
+      var k = 0usize;
+      while k < 24usize {
+        let f = order * 24u32 + u32.from(k);
+        var bad = 0u32;
+        let n = if kFloatIn(k) { fl.len() } else { il.len() };
+        var i = 0usize;
+        while i < n {
+          var j = 0usize;
+          while j < n {
+            let a = if kFloatIn(k) { fl[i].bits() } else { *il[i] };
+            let b = if kFloatIn(k) { fl[j].bits() } else { *il[j] };
+            let bb = if order == 2u32 { a } else { b };
+            let r = run(&lc, f, l2(a, b));
+            let want = refBin(k, a, bb);
+            let ok = r.trap == 0u64 && if kFloatOut(k) { sameF(*r.area[0usize], want) } else { *r.area[0usize] == want };
+            if !ok { bad = bad + 1u32; }
+            j = j + 1usize;
+          }
+          i = i + 1usize;
+        }
+        // names that say which op: the mutants are shown by them
+        if k == 4usize { ck(rep, bad == 0u32, "fmin on -0, +0, NaN and infinity"); }
+        else if k == 5usize { ck(rep, bad == 0u32, "fmax on -0, +0, NaN and infinity"); }
+        else if k >= 6usize && k < 12usize { ck(rep, bad == 0u32, "the fcmp table with NaN"); }
+        else if k >= 18usize { ck(rep, bad == 0u32, "the icmp table"); }
+        else if k >= 12usize { ck(rep, bad == 0u32, "integer arithmetic wraps"); }
+        else { ck(rep, bad == 0u32, "float arithmetic"); }
+        k = k + 1usize;
+      }
+      order = order + 1u32;
+    }
+  } }
+}
+
+// ---- unary ops: fsqrt, fneg, fabs, i2f ----
+fn unFn(op: u8) Func {
+  var b = FuncBuilder.make("un", 1u32, 0u64);
+  let x = b.vreg(if op == IR_I2F { CLASS_INT } else { CLASS_F64 });
+  let r = b.vreg(CLASS_F64);
+  b.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+  b.opImm(op, r, x, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn suiteUnary(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  fs.push(unFn(IR_FSQRT)); fs.push(unFn(IR_FNEG)); fs.push(unFn(IR_FABS)); fs.push(unFn(IR_I2F));
+  match build(&fs, o, rep, "build unary") { case None { return; } case let Some(lc) {
+    let fl = floats();
+    var bad = 0u32;
+    var i = 0usize;
+    while i < fl.len() {
+      let x = *fl[i];
+      let a = x.bits();
+      if !sameF(first(run(&lc, 0u32, l1(a))), x.sqrt().bits()) { bad = bad + 1u32; }
+      if first(run(&lc, 1u32, l1(a))) != (a ^ 0x8000000000000000u64) { bad = bad + 1u32; }
+      if first(run(&lc, 2u32, l1(a))) != (a & 0x7FFFFFFFFFFFFFFFu64) { bad = bad + 1u32; }
+      i = i + 1usize;
+    }
+    ck(rep, bad == 0u32, "fsqrt, fneg and fabs, including their NaNs and zeros");
+    let il = ints();
+    bad = 0u32;
+    i = 0usize;
+    while i < il.len() {
+      let want = f64.from(*il[i] as i64).bits();
+      if first(run(&lc, 3u32, l1(*il[i]))) != want { bad = bad + 1u32; }
+      i = i + 1usize;
+    }
+    ck(rep, bad == 0u32, "i2f");
+  } }
+}
+
+// ---- select ----
+// f(c, a, b) = c != 0 ? a : b; the three loads in some order so the result lands on each operand's register
+fn selFn(isFloat: bool, order: u32) Func {
+  let cl = if isFloat { CLASS_F64 } else { CLASS_INT };
+  var b = FuncBuilder.make("sel", 3u32, 0u64);
+  let c = b.vreg(CLASS_INT);
+  let x = b.vreg(cl);
+  let y = b.vreg(cl);
+  let r = b.vreg(cl);
+  if order == 0u32 {
+    b.opImm(IR_ARG_GET, c, NO_REG, 0u64); b.opImm(IR_ARG_GET, x, NO_REG, 1u64); b.opImm(IR_ARG_GET, y, NO_REG, 2u64);
+  } else if order == 1u32 {
+    b.opImm(IR_ARG_GET, y, NO_REG, 2u64); b.opImm(IR_ARG_GET, x, NO_REG, 1u64); b.opImm(IR_ARG_GET, c, NO_REG, 0u64);
+  } else {
+    b.opImm(IR_ARG_GET, x, NO_REG, 1u64); b.opImm(IR_ARG_GET, c, NO_REG, 0u64); b.opImm(IR_ARG_GET, y, NO_REG, 2u64);
+  }
+  b.select(r, c, x, y);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn suiteSelect(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  var order = 0u32;
+  while order < 3u32 { fs.push(selFn(false, order)); fs.push(selFn(true, order)); order = order + 1u32; }
+  match build(&fs, o, rep, "build select") { case None { return; } case let Some(lc) {
+    var bad = 0u32;
+    var f = 0u32;
+    while f < 6u32 {
+      let cs = [0u64, 1u64, 2u64, 0x8000000000000000u64];
+      var c = 0usize;
+      while c < 4usize {
+        let a = if f % 2u32 == 1u32 { (1.5).bits() } else { 111u64 };
+        let b = if f % 2u32 == 1u32 { (-0.0).bits() } else { 222u64 };
+        let want = if cs[c] != 0u64 { a } else { b };
+        if first(run(&lc, f, l3(cs[c], a, b))) != want { bad = bad + 1u32; }
+        c = c + 1usize;
+      }
+      f = f + 1u32;
+    }
+    ck(rep, bad == 0u32, "select, integer and float, in three register layouts");
+  } }
+}
+
+// ---- compare and branch, in every block layout, fused or not ----
+// f(a, b) = (a cc b) ? 11 : 22 into slot 0, and the compare's own value into slot 1 when 'twice'. layout 0: the true block
+// follows; 1: the false block follows; 2: neither does.
+fn brFn(k: usize, layout: u32, twice: bool) Func {
+  let cin = if kFloatIn(k) { CLASS_F64 } else { CLASS_INT };
+  var b = FuncBuilder.make("br", 2u32, 0u64);
+  let x = b.vreg(cin);
+  let y = b.vreg(cin);
+  let c = b.vreg(CLASS_INT);
+  let r = b.vreg(CLASS_INT);
+  // blocks are numbered in the order made, and laid out in that order: 0 is the entry
+  let b1 = b.block();
+  let b2 = b.block();
+  var b3 = NO_BLOCK;
+  if layout == 2u32 { b3 = b.block(); }
+  // layout 0: the true block follows the branch; 1: the false block follows; 2: a block that is neither sits between
+  let trueB = if layout == 0u32 { b1 } else { b2 };
+  let falseB = if layout == 0u32 { b2 } else if layout == 1u32 { b1 } else { b3 };
+  b.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+  b.opImm(IR_ARG_GET, y, NO_REG, 1u64);
+  b.cmp(kOp(k), kCc(k), c, x, y);
+  b.br(c, trueB, falseB);
+  if layout == 2u32 { b.at(b1); b.trap(TRAP_UNREACHABLE, 0u64); }
+  b.at(trueB);
+  b.opImm(IR_ICONST, r, NO_REG, 11u64);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  if twice { b.opImm(IR_ARG_SET, NO_REG, c, 1u64); }
+  b.ret();
+  b.at(falseB);
+  b.opImm(IR_ICONST, r, NO_REG, 22u64);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  if twice { b.opImm(IR_ARG_SET, NO_REG, c, 1u64); }
+  b.ret();
+  take(&mut b)
+}
+
+fn suiteBranch(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  // function = ((layout * 2 + twice) * 12) + kind, kind 0-5 fcmp, 6-11 icmp
+  var layout = 0u32;
+  while layout < 3u32 {
+    var tw = 0u32;
+    while tw < 2u32 {
+      var k = 0usize;
+      while k < 12usize { fs.push(brFn(if k < 6usize { k + 6usize } else { k + 12usize }, layout, tw == 1u32)); k = k + 1usize; }
+      tw = tw + 1u32;
+    }
+    layout = layout + 1u32;
+  }
+  // a compare used only by the branch after it is fused into it: no setcc in its function; one used twice keeps its setcc
+  match compileX64With(&fs, hostAbi(), o) {
+    case let Ok(mc) {
+      var wrong = 0u32;
+      var q = 0usize;
+      while q < 72usize {
+        let isFused = (q / 12usize) % 2usize == 0usize;
+        let has = hasPair(&mc, *mc.funcOffsets[q], *mc.funcSizes[q], 0x0Fu8, 0x90u8, 0x9Fu8);
+        if has == isFused { wrong = wrong + 1u32; }
+        q = q + 1usize;
+      }
+      ck(rep, wrong == 0u32, "a compare used once is fused into its branch");
+    }
+    case let Err(e) { ck(rep, false, "compile for the fusion scan"); }
+  }
+  match build(&fs, o, rep, "build branches") { case None { return; } case let Some(lc) {
+    let fl = floats();
+    let il = ints();
+    var bad = 0u32;
+    layout = 0u32;
+    while layout < 3u32 {
+      var tw = 0u32;
+      while tw < 2u32 {
+        var k = 0usize;
+        while k < 12usize {
+          let f = (layout * 2u32 + tw) * 12u32 + u32.from(k);
+          let isF = k < 6usize;
+          let cc = u8.from(k % 6usize);
+          let n = if isF { fl.len() } else { il.len() };
+          var i = 0usize;
+          while i < n {
+            var j = 0usize;
+            while j < n {
+              let a = if isF { fl[i].bits() } else { *il[i] };
+              let b = if isF { fl[j].bits() } else { *il[j] };
+              let truth = if isF { fcmpRef(cc, f64.fromBits(a), f64.fromBits(b)) } else { icmpRef(cc, a, b) };
+              let r = run(&lc, f, l2(a, b));
+              if r.trap != 0u64 || *r.area[0usize] != (if truth { 11u64 } else { 22u64 }) { bad = bad + 1u32; }
+              if tw == 1u32 && *r.area[1usize] != b2u(truth) { bad = bad + 1u32; }
+              j = j + 1usize;
+            }
+            i = i + 1usize;
+          }
+          k = k + 1usize;
+        }
+        tw = tw + 1u32;
+      }
+      layout = layout + 1u32;
+    }
+    ck(rep, bad == 0u32, "compare and branch in every layout, fused and not");
+  } }
+}
+
+// ---- nested branches, and loops ----
+// classify(x): a tree of branches on a signed integer
+fn classifyFn() Func {
+  var b = FuncBuilder.make("classify", 1u32, 0u64);
+  let x = b.vreg(CLASS_INT);
+  let z = b.vreg(CLASS_INT);
+  let m100 = b.vreg(CLASS_INT);
+  let p100 = b.vreg(CLASS_INT);
+  let c = b.vreg(CLASS_INT);
+  let r = b.vreg(CLASS_INT);
+  let neg = b.block();
+  let nonneg = b.block();
+  let veryNeg = b.block();
+  let someNeg = b.block();
+  let zero = b.block();
+  let pos = b.block();
+  let bigPos = b.block();
+  let smallPos = b.block();
+  b.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+  b.opImm(IR_ICONST, z, NO_REG, 0u64);
+  b.opImm(IR_ICONST, m100, NO_REG, 0xFFFFFFFFFFFFFF9Cu64);
+  b.opImm(IR_ICONST, p100, NO_REG, 100u64);
+  b.cmp(IR_ICMP, CC_LT, c, x, z);
+  b.br(c, neg, nonneg);
+  b.at(neg);
+  b.cmp(IR_ICMP, CC_LT, c, x, m100);
+  b.br(c, veryNeg, someNeg);
+  b.at(veryNeg); b.opImm(IR_ICONST, r, NO_REG, 1u64); b.opImm(IR_ARG_SET, NO_REG, r, 0u64); b.ret();
+  b.at(someNeg); b.opImm(IR_ICONST, r, NO_REG, 2u64); b.opImm(IR_ARG_SET, NO_REG, r, 0u64); b.ret();
+  b.at(nonneg);
+  b.cmp(IR_ICMP, CC_EQ, c, x, z);
+  b.br(c, zero, pos);
+  b.at(zero); b.opImm(IR_ICONST, r, NO_REG, 3u64); b.opImm(IR_ARG_SET, NO_REG, r, 0u64); b.ret();
+  b.at(pos);
+  b.cmp(IR_ICMP, CC_GT, c, x, p100);
+  b.br(c, bigPos, smallPos);
+  b.at(bigPos); b.opImm(IR_ICONST, r, NO_REG, 4u64); b.opImm(IR_ARG_SET, NO_REG, r, 0u64); b.ret();
+  b.at(smallPos); b.opImm(IR_ICONST, r, NO_REG, 5u64); b.opImm(IR_ARG_SET, NO_REG, r, 0u64); b.ret();
+  take(&mut b)
+}
+
+// sum(n): 1 + 2 + ... + n, a fuel charge of 'k' at each trip round the loop (site 'site')
+fn sumFn(k: u64, site: u64) Func {
+  var b = FuncBuilder.make("sum", 1u32, 0x0000000100000050u64);
+  let n = b.vreg(CLASS_INT);
+  let acc = b.vreg(CLASS_INT);
+  let i = b.vreg(CLASS_INT);
+  let one = b.vreg(CLASS_INT);
+  let c = b.vreg(CLASS_INT);
+  let head = b.block();
+  let body = b.block();
+  let exit = b.block();
+  b.opImm(IR_ARG_GET, n, NO_REG, 0u64);
+  b.opImm(IR_ICONST, acc, NO_REG, 0u64);
+  b.opImm(IR_ICONST, i, NO_REG, 1u64);
+  b.opImm(IR_ICONST, one, NO_REG, 1u64);
+  b.jmp(head);
+  b.at(head);
+  b.cmp(IR_ICMP, CC_GT, c, i, n);
+  b.br(c, exit, body);
+  b.at(body);
+  b.op3(IR_IADD, acc, acc, i);
+  b.op3(IR_IADD, i, i, one);
+  b.sited(IR_FUEL, k, site);
+  b.jmp(head);
+  b.at(exit);
+  b.opImm(IR_ARG_SET, NO_REG, acc, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+// fsum(n): 0.5 added n times, as a float loop
+fn fsumFn() Func {
+  var b = FuncBuilder.make("fsum", 1u32, 0u64);
+  let n = b.vreg(CLASS_INT);
+  let acc = b.vreg(CLASS_F64);
+  let half = b.vreg(CLASS_F64);
+  let i = b.vreg(CLASS_INT);
+  let one = b.vreg(CLASS_INT);
+  let c = b.vreg(CLASS_INT);
+  let head = b.block();
+  let body = b.block();
+  let exit = b.block();
+  b.opImm(IR_ARG_GET, n, NO_REG, 0u64);
+  b.opImm(IR_FCONST, acc, NO_REG, 0u64);
+  b.opImm(IR_FCONST, half, NO_REG, (0.5).bits());
+  b.opImm(IR_ICONST, i, NO_REG, 0u64);
+  b.opImm(IR_ICONST, one, NO_REG, 1u64);
+  b.jmp(head);
+  b.at(head);
+  b.cmp(IR_ICMP, CC_GE, c, i, n);
+  b.br(c, exit, body);
+  b.at(body);
+  b.op3(IR_FADD, acc, acc, half);
+  b.op3(IR_IADD, i, i, one);
+  b.jmp(head);
+  b.at(exit);
+  b.opImm(IR_ARG_SET, NO_REG, acc, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn suiteFlow(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  fs.push(classifyFn());
+  fs.push(sumFn(1u64, 0x0000000100000099u64));
+  fs.push(fsumFn());
+  match build(&fs, o, rep, "build flow") { case None { return; } case let Some(lc) {
+    let probes = [0xFFFFFFFFFFFFFF00u64, 0xFFFFFFFFFFFFFF9Cu64, 0xFFFFFFFFFFFFFF9Bu64, 0xFFFFFFFFFFFFFFFFu64, 0u64, 1u64, 100u64, 101u64,
+                  0x7FFFFFFFFFFFFFFFu64, 0x8000000000000000u64];
+    let wants = [1u64, 2u64, 1u64, 2u64, 3u64, 5u64, 5u64, 4u64, 4u64, 1u64];
+    var bad = 0u32;
+    var i = 0usize;
+    while i < 10usize {
+      let r = run(&lc, 0u32, l1(probes[i]));
+      if r.trap != 0u64 || *r.area[0usize] != wants[i] { bad = bad + 1u32; }
+      i = i + 1usize;
+    }
+    ck(rep, bad == 0u32, "nested branches");
+    // a loop of a million turns, a fuel unit each: the result, and exactly the fuel left
+    var p = noProbe();
+    let r = exec(&lc, 1u32, l1(1000000u64), 1500000u64, &mut p);
+    ck(rep, r.trap == 0u64 && *r.area[0usize] == 500000500000u64, "a million-turn loop gives the sum");
+    ck(rep, r.fuel == 500000u64, "a million-turn loop leaves the fuel it should");
+    let r2 = run(&lc, 2u32, l1(1000000u64));
+    ck(rep, r2.trap == 0u64 && *r2.area[0usize] == (500000.0).bits(), "a million float additions in a loop");
+    let r3 = run(&lc, 1u32, l1(0u64));
+    ck(rep, r3.trap == 0u64 && *r3.area[0usize] == 0u64, "a loop of no turns");
+  } }
+}
+
+// ---- calls, three deep, with several slots in and out; values live across them ----
+// f2(a, b, c) = (a*b + c, a - c, b), with twelve other values live inside it so every register gets used
+fn f2Fn() Func {
+  var bd = FuncBuilder.make("f2", 3u32, 0u64);
+  let a = bd.vreg(CLASS_INT);
+  let b = bd.vreg(CLASS_INT);
+  let c = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ARG_GET, a, NO_REG, 0u64);
+  bd.opImm(IR_ARG_GET, b, NO_REG, 1u64);
+  bd.opImm(IR_ARG_GET, c, NO_REG, 2u64);
+  // t_i = a + i for i = 1 .. 12, all live until the sum
+  var ts = List[u32]();
+  var i = 1u64;
+  while i <= 12u64 {
+    let k = bd.vreg(CLASS_INT);
+    let t = bd.vreg(CLASS_INT);
+    bd.opImm(IR_ICONST, k, NO_REG, i);
+    bd.op3(IR_IADD, t, a, k);
+    ts.push(t);
+    i = i + 1u64;
+  }
+  let s = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ICONST, s, NO_REG, 0u64);
+  var j = 0usize;
+  while j < ts.len() { bd.op3(IR_IADD, s, s, *ts[j]); j = j + 1usize; }
+  // s = 12a + 78, so s - (12a + 78) is zero
+  let c12 = bd.vreg(CLASS_INT);
+  let c78 = bd.vreg(CLASS_INT);
+  let m = bd.vreg(CLASS_INT);
+  let z = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ICONST, c12, NO_REG, 12u64);
+  bd.opImm(IR_ICONST, c78, NO_REG, 78u64);
+  bd.op3(IR_IMUL, m, a, c12);
+  bd.op3(IR_IADD, m, m, c78);
+  bd.op3(IR_ISUB, z, s, m);
+  let r0 = bd.vreg(CLASS_INT);
+  let r1 = bd.vreg(CLASS_INT);
+  bd.op3(IR_IMUL, r0, a, b);
+  bd.op3(IR_IADD, r0, r0, c);
+  bd.op3(IR_IADD, r0, r0, z);
+  bd.op3(IR_ISUB, r1, a, c);
+  bd.opImm(IR_ARG_SET, NO_REG, r0, 0u64);
+  bd.opImm(IR_ARG_SET, NO_REG, r1, 1u64);
+  bd.opImm(IR_ARG_SET, NO_REG, b, 2u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+// f1(a, b, c) = let (p, q, r) = f2(a + 1, b * 2, c - 3) in (p + a, q * 2, r - b)
+fn f1Fn() Func {
+  var bd = FuncBuilder.make("f1", 3u32, 0u64);
+  bd.needOut(3u32);
+  let a = bd.vreg(CLASS_INT);
+  let b = bd.vreg(CLASS_INT);
+  let c = bd.vreg(CLASS_INT);
+  let one = bd.vreg(CLASS_INT);
+  let two = bd.vreg(CLASS_INT);
+  let three = bd.vreg(CLASS_INT);
+  let a1 = bd.vreg(CLASS_INT);
+  let b2 = bd.vreg(CLASS_INT);
+  let c3 = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ARG_GET, a, NO_REG, 0u64);
+  bd.opImm(IR_ARG_GET, b, NO_REG, 1u64);
+  bd.opImm(IR_ARG_GET, c, NO_REG, 2u64);
+  bd.opImm(IR_ICONST, one, NO_REG, 1u64);
+  bd.opImm(IR_ICONST, two, NO_REG, 2u64);
+  bd.opImm(IR_ICONST, three, NO_REG, 3u64);
+  bd.op3(IR_IADD, a1, a, one);
+  bd.op3(IR_IMUL, b2, b, two);
+  bd.op3(IR_ISUB, c3, c, three);
+  bd.opImm(IR_OUT_SET, NO_REG, a1, 0u64);
+  bd.opImm(IR_OUT_SET, NO_REG, b2, 1u64);
+  bd.opImm(IR_OUT_SET, NO_REG, c3, 2u64);
+  bd.sited(IR_CALL, 2u64, 0x0000000200000010u64);
+  let p = bd.vreg(CLASS_INT);
+  let q = bd.vreg(CLASS_INT);
+  let r = bd.vreg(CLASS_INT);
+  bd.opImm(IR_OUT_GET, p, NO_REG, 0u64);
+  bd.opImm(IR_OUT_GET, q, NO_REG, 1u64);
+  bd.opImm(IR_OUT_GET, r, NO_REG, 2u64);
+  let o0 = bd.vreg(CLASS_INT);
+  let o1 = bd.vreg(CLASS_INT);
+  let o2 = bd.vreg(CLASS_INT);
+  bd.op3(IR_IADD, o0, p, a);
+  bd.op3(IR_IMUL, o1, q, two);
+  bd.op3(IR_ISUB, o2, r, b);
+  bd.opImm(IR_ARG_SET, NO_REG, o0, 0u64);
+  bd.opImm(IR_ARG_SET, NO_REG, o1, 1u64);
+  bd.opImm(IR_ARG_SET, NO_REG, o2, 2u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+// f0(a, b, c): x = a * 3 and y = float(b) * 0.5 are live across the call to f1(a, b, c) = (p, q, r); gives (p + x, q, bits(y + float(r)))
+fn f0Fn() Func {
+  var bd = FuncBuilder.make("f0", 3u32, 0u64);
+  bd.needOut(3u32);
+  let a = bd.vreg(CLASS_INT);
+  let b = bd.vreg(CLASS_INT);
+  let c = bd.vreg(CLASS_INT);
+  let three = bd.vreg(CLASS_INT);
+  let x = bd.vreg(CLASS_INT);
+  let fb = bd.vreg(CLASS_F64);
+  let half = bd.vreg(CLASS_F64);
+  let y = bd.vreg(CLASS_F64);
+  bd.opImm(IR_ARG_GET, a, NO_REG, 0u64);
+  bd.opImm(IR_ARG_GET, b, NO_REG, 1u64);
+  bd.opImm(IR_ARG_GET, c, NO_REG, 2u64);
+  bd.opImm(IR_ICONST, three, NO_REG, 3u64);
+  bd.op3(IR_IMUL, x, a, three);
+  bd.opImm(IR_I2F, fb, b, 0u64);
+  bd.opImm(IR_FCONST, half, NO_REG, (0.5).bits());
+  bd.op3(IR_FMUL, y, fb, half);
+  bd.opImm(IR_OUT_SET, NO_REG, a, 0u64);
+  bd.opImm(IR_OUT_SET, NO_REG, b, 1u64);
+  bd.opImm(IR_OUT_SET, NO_REG, c, 2u64);
+  bd.sited(IR_CALL, 1u64, 0x0000000300000020u64);
+  let p = bd.vreg(CLASS_INT);
+  let q = bd.vreg(CLASS_INT);
+  let r = bd.vreg(CLASS_INT);
+  bd.opImm(IR_OUT_GET, p, NO_REG, 0u64);
+  bd.opImm(IR_OUT_GET, q, NO_REG, 1u64);
+  bd.opImm(IR_OUT_GET, r, NO_REG, 2u64);
+  let o0 = bd.vreg(CLASS_INT);
+  let fr = bd.vreg(CLASS_F64);
+  let o2 = bd.vreg(CLASS_F64);
+  bd.op3(IR_IADD, o0, p, x);
+  bd.opImm(IR_I2F, fr, r, 0u64);
+  bd.op3(IR_FADD, o2, y, fr);
+  bd.opImm(IR_ARG_SET, NO_REG, o0, 0u64);
+  bd.opImm(IR_ARG_SET, NO_REG, q, 1u64);
+  bd.opImm(IR_ARG_SET, NO_REG, o2, 2u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+fn refCalls(a: u64, b: u64, c: u64) List[u64] {
+  // f2(a + 1, b * 2, c - 3)
+  let a1 = a + 1u64;
+  let b2 = b * 2u64;
+  let c3 = c - 3u64;
+  let p = a1 * b2 + c3;
+  let q = a1 - c3;
+  let r = b2;
+  // f1's results
+  let o0 = p + a;
+  let o1 = q * 2u64;
+  let o2 = r - b;
+  let x = a * 3u64;
+  let y = f64.from(b as i64) * 0.5;
+  var l = List[u64]();
+  l.push(o0 + x);
+  l.push(o1);
+  l.push((y + f64.from(o2 as i64)).bits());
+  l
+}
+
+fn suiteCalls(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  fs.push(f0Fn()); fs.push(f1Fn()); fs.push(f2Fn());
+  match build(&fs, o, rep, "build calls") { case None { return; } case let Some(lc) {
+    let vals = [0u64, 1u64, 7u64, 0xFFFFFFFFFFFFFFFEu64, 100000u64, 0x8000000000000000u64];
+    var bad = 0u32;
+    var i = 0usize;
+    while i < 6usize {
+      var j = 0usize;
+      while j < 6usize {
+        let r = run(&lc, 0u32, l3(vals[i], vals[j], vals[(i + j) % 6usize]));
+        let w = refCalls(vals[i], vals[j], vals[(i + j) % 6usize]);
+        if r.trap != 0u64 || *r.area[0usize] != *w[0usize] || *r.area[1usize] != *w[1usize] || !sameF(*r.area[2usize], *w[2usize]) {
+          bad = bad + 1u32;
+        }
+        j = j + 1usize;
+      }
+      i = i + 1usize;
+    }
+    ck(rep, bad == 0u32, "calls three deep with three slots in and out, values live across them");
+  } }
+}
+
+// ---- more live values than registers ----
+// manyInt(x0 .. x23): acc = x23; for i = 22 down to 0: acc = acc * 3 + x_i; every x_i live until its turn
+fn manyIntFn(n: u32) Func {
+  var bd = FuncBuilder.make("many", n, 0u64);
+  var xs = List[u32]();
+  var i = 0u32;
+  while i < n { let x = bd.vreg(CLASS_INT); bd.opImm(IR_ARG_GET, x, NO_REG, u64.from(i)); xs.push(x); i = i + 1u32; }
+  let three = bd.vreg(CLASS_INT);
+  let acc = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ICONST, three, NO_REG, 3u64);
+  bd.op3(IR_ISUB, acc, *xs[usize.from(n) - 1usize], *xs[usize.from(n) - 1usize]);
+  bd.op3(IR_IADD, acc, acc, *xs[usize.from(n) - 1usize]);
+  var j = usize.from(n) - 1usize;
+  while j > 0usize {
+    j = j - 1usize;
+    bd.op3(IR_IMUL, acc, acc, three);
+    bd.op3(IR_IADD, acc, acc, *xs[j]);
+  }
+  bd.opImm(IR_ARG_SET, NO_REG, acc, 0u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+fn manyFloatFn(n: u32) Func {
+  var bd = FuncBuilder.make("manyf", n, 0u64);
+  var xs = List[u32]();
+  var i = 0u32;
+  while i < n { let x = bd.vreg(CLASS_F64); bd.opImm(IR_ARG_GET, x, NO_REG, u64.from(i)); xs.push(x); i = i + 1u32; }
+  let k = bd.vreg(CLASS_F64);
+  let acc = bd.vreg(CLASS_F64);
+  bd.opImm(IR_FCONST, k, NO_REG, (1.0625).bits());
+  bd.op3(IR_FMUL, acc, *xs[usize.from(n) - 1usize], k);
+  var j = usize.from(n) - 1usize;
+  while j > 0usize {
+    j = j - 1usize;
+    bd.op3(IR_FMUL, acc, acc, k);
+    bd.op3(IR_FMAX, acc, acc, *xs[j]);       // fmax reads its operands through the scratch registers when they are spilled
+    bd.op3(IR_FADD, acc, acc, *xs[j]);
+  }
+  bd.opImm(IR_ARG_SET, NO_REG, acc, 0u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+fn suiteSpill(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  fs.push(manyIntFn(24u32));
+  fs.push(manyFloatFn(20u32));
+  match build(&fs, o, rep, "build spills") { case None { return; } case let Some(lc) {
+    var args = List[u64]();
+    var i = 0u64;
+    while i < 24u64 { args.push(i * 1000003u64 + 7u64); i = i + 1u64; }
+    var want = *args[23usize];
+    var j = 22usize;
+    while true { want = want * 3u64 + *args[j]; if j == 0usize { break; } j = j - 1usize; }
+    // the builder's first step makes acc = x23 - x23 + x23
+    let r = run(&lc, 0u32, copyOf(&args));
+    ck(rep, r.trap == 0u64 && *r.area[0usize] == want, "24 live integers, more than the registers");
+    var fa = List[u64]();
+    i = 0u64;
+    while i < 20u64 { fa.push((f64.from(i as i64) * 0.37 + 0.11).bits()); i = i + 1u64; }
+    var fw = f64.fromBits(*fa[19usize]) * 1.0625;
+    j = 18usize;
+    while true {
+      fw = maxRef(fw * 1.0625, f64.fromBits(*fa[j])) + f64.fromBits(*fa[j]);
+      if j == 0usize { break; }
+      j = j - 1usize;
+    }
+    let r2 = run(&lc, 1u32, copyOf(&fa));
+    ck(rep, r2.trap == 0u64 && *r2.area[0usize] == fw.bits(), "20 live floats, more than the registers");
+  } }
+}
+
+// ---- memory ops and moves ----
+// mem(p, v, fv): [p+8] = v; [p+16] = fv; loads them back (int and float), loads [p+32-16] as an integer, loads [p] through
+// a base 2^32 below p with a displacement of 2^32 and stores [p+24] = v + 1 through the same; the results go through moves
+fn memFn() Func {
+  var b = FuncBuilder.make("mem", 4u32, 0u64);
+  let p = b.vreg(CLASS_INT);
+  let v = b.vreg(CLASS_INT);
+  let fv = b.vreg(CLASS_F64);
+  let r1 = b.vreg(CLASS_INT);
+  let r2 = b.vreg(CLASS_F64);
+  let q = b.vreg(CLASS_INT);
+  let c32 = b.vreg(CLASS_INT);
+  let r3 = b.vreg(CLASS_INT);
+  let big = b.vreg(CLASS_INT);
+  let base2 = b.vreg(CLASS_INT);
+  let r4 = b.vreg(CLASS_INT);
+  let one = b.vreg(CLASS_INT);
+  let v1 = b.vreg(CLASS_INT);
+  let m1 = b.vreg(CLASS_INT);
+  let m2 = b.vreg(CLASS_F64);
+  b.opImm(IR_ARG_GET, p, NO_REG, 0u64);
+  b.opImm(IR_ARG_GET, v, NO_REG, 1u64);
+  b.opImm(IR_ARG_GET, fv, NO_REG, 2u64);
+  b.emit(Inst(IR_STORE, 0u8, NO_REG, p, v, NO_REG, NO_BLOCK, NO_BLOCK, 8u64, 0u64));
+  b.emit(Inst(IR_STORE, 0u8, NO_REG, p, fv, NO_REG, NO_BLOCK, NO_BLOCK, 16u64, 0u64));
+  b.opImm(IR_LOAD, r1, p, 8u64);
+  b.opImm(IR_LOAD, r2, p, 16u64);
+  b.opImm(IR_ICONST, c32, NO_REG, 32u64);
+  b.op3(IR_IADD, q, p, c32);
+  b.opImm(IR_LOAD, r3, q, 0xFFFFFFFFFFFFFFF0u64);
+  b.opImm(IR_ICONST, big, NO_REG, 0x100000000u64);
+  b.op3(IR_ISUB, base2, p, big);
+  b.opImm(IR_LOAD, r4, base2, 0x100000000u64);
+  b.opImm(IR_ICONST, one, NO_REG, 1u64);
+  b.op3(IR_IADD, v1, v, one);
+  b.emit(Inst(IR_STORE, 0u8, NO_REG, base2, v1, NO_REG, NO_BLOCK, NO_BLOCK, 0x100000018u64, 0u64));
+  b.opImm(IR_MOV, m1, r1, 0u64);
+  b.opImm(IR_MOV, m2, r2, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, m1, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, m2, 1u64);
+  b.opImm(IR_ARG_SET, NO_REG, r3, 2u64);
+  b.opImm(IR_ARG_SET, NO_REG, r4, 3u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn suiteMemory(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  fs.push(memFn());
+  match build(&fs, o, rep, "build memory") { case None { return; } case let Some(lc) {
+    var mem = List[u64]();
+    var i = 0usize;
+    while i < 6usize { mem.push(0xAAAA00u64 + u64.from(i)); i = i + 1usize; }
+    let addr = (mem.viewMut() as *u64) as usize;
+    let fbits = (-12.5).bits();
+    var args = List[u64]();
+    args.push(u64.from(addr)); args.push(777u64); args.push(fbits); args.push(0u64);
+    let r = run(&lc, 0u32, args);
+    ck(rep, r.trap == 0u64 && *r.area[0usize] == 777u64, "a store then a load of an integer, through a move");
+    ck(rep, *r.area[1usize] == fbits, "a store then a load of a float, through a move");
+    ck(rep, *r.area[2usize] == fbits, "a load with a negative displacement");
+    ck(rep, *r.area[3usize] == 0xAAAA00u64, "a load through a base 2^32 below with a displacement of 2^32");
+    ck(rep, *mem[1usize] == 777u64 && *mem[2usize] == fbits && *mem[3usize] == 778u64, "the stores landed where they were aimed");
+    ck(rep, *mem[0usize] == 0xAAAA00u64 && *mem[4usize] == 0xAAAA04u64 && *mem[5usize] == 0xAAAA05u64, "and nowhere else");
+  } }
+}
+
+// ---- the gate ----
+// f(a, b, c): sends (a, b, c) through the gate as import k and gives its answer plus a * 2, which was live across the call
+fn gateFn(k: u64, site: u64) Func {
+  var bd = FuncBuilder.make("gate", 3u32, 0u64);
+  bd.needOut(3u32);
+  let a = bd.vreg(CLASS_INT);
+  let b = bd.vreg(CLASS_INT);
+  let c = bd.vreg(CLASS_INT);
+  let two = bd.vreg(CLASS_INT);
+  let live = bd.vreg(CLASS_INT);
+  let g = bd.vreg(CLASS_INT);
+  let r = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ARG_GET, a, NO_REG, 0u64);
+  bd.opImm(IR_ARG_GET, b, NO_REG, 1u64);
+  bd.opImm(IR_ARG_GET, c, NO_REG, 2u64);
+  bd.opImm(IR_ICONST, two, NO_REG, 2u64);
+  bd.op3(IR_IMUL, live, a, two);
+  bd.opImm(IR_OUT_SET, NO_REG, a, 0u64);
+  bd.opImm(IR_OUT_SET, NO_REG, b, 1u64);
+  bd.opImm(IR_OUT_SET, NO_REG, c, 2u64);
+  bd.sited(IR_GATE, k, site);
+  bd.opImm(IR_OUT_GET, g, NO_REG, 0u64);
+  bd.op3(IR_IADD, r, g, live);
+  bd.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+fn suiteGate(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  fs.push(gateFn(7u64, 0x0000000400000008u64));
+  fs.push(gateFn(0x100000003u64, 0x0000000400000018u64));
+  match build(&fs, o, rep, "build gate") { case None { return; } case let Some(lc) {
+    var p = Probe(0u64, 0u64, 3u64, false, 0u64, 0u64);
+    let r = exec(&lc, 0u32, l3(10u64, 20u64, 300u64), 1000u64, &mut p);
+    ck(rep, r.trap == 0u64 && *r.area[0usize] == 350u64, "the gate sums the slots, and a value lives across it");
+    ck(rep, p.calls == 1u64 && p.lastK == 7u64, "the gate is called once, with its k");
+    let r2 = exec(&lc, 1u32, l3(1u64, 2u64, 3u64), 1000u64, &mut p);
+    ck(rep, r2.trap == 0u64 && *r2.area[0usize] == 8u64 && p.lastK == 0x100000003u64, "the runtime entry's k reaches the gate whole");
+    ck(rep, p.badAlign == 0u64 && p.badCtx == 0u64, "the gate's slot area is aligned and its context is the host's");
+    p.refuse = true;
+    let r3 = exec(&lc, 0u32, l3(1u64, 2u64, 3u64), 1000u64, &mut p);
+    ck(rep, r3.trap == TRAP_GATE && r3.site == 0x0000000400000008u64, "a refusing gate traps TRAP_GATE at its site");
+  } }
+}
+
+// ---- traps ----
+// rec(n): n == 0 gives 0, else 1 + rec(n - 1)
+fn recFn() Func {
+  var bd = FuncBuilder.make("rec", 1u32, 0x0000000500000001u64);
+  bd.needOut(1u32);
+  let n = bd.vreg(CLASS_INT);
+  let z = bd.vreg(CLASS_INT);
+  let one = bd.vreg(CLASS_INT);
+  let c = bd.vreg(CLASS_INT);
+  let m = bd.vreg(CLASS_INT);
+  let r = bd.vreg(CLASS_INT);
+  let base = bd.block();
+  let step = bd.block();
+  bd.opImm(IR_ARG_GET, n, NO_REG, 0u64);
+  bd.opImm(IR_ICONST, z, NO_REG, 0u64);
+  bd.cmp(IR_ICMP, CC_EQ, c, n, z);
+  bd.br(c, base, step);
+  bd.at(base);
+  bd.opImm(IR_ARG_SET, NO_REG, z, 0u64);
+  bd.ret();
+  bd.at(step);
+  bd.opImm(IR_ICONST, one, NO_REG, 1u64);
+  bd.op3(IR_ISUB, m, n, one);
+  bd.opImm(IR_OUT_SET, NO_REG, m, 0u64);
+  bd.sited(IR_CALL, 0u64, 0x0000000500000077u64);
+  bd.opImm(IR_OUT_GET, r, NO_REG, 0u64);
+  bd.op3(IR_IADD, r, r, one);
+  bd.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+// unr(n): n == 0 gives 42; anything else is unreachable
+fn unrFn() Func {
+  var bd = FuncBuilder.make("unr", 1u32, 0u64);
+  let n = bd.vreg(CLASS_INT);
+  let z = bd.vreg(CLASS_INT);
+  let c = bd.vreg(CLASS_INT);
+  let r = bd.vreg(CLASS_INT);
+  let ok = bd.block();
+  let bad = bd.block();
+  bd.opImm(IR_ARG_GET, n, NO_REG, 0u64);
+  bd.opImm(IR_ICONST, z, NO_REG, 0u64);
+  bd.cmp(IR_ICMP, CC_EQ, c, n, z);
+  bd.br(c, ok, bad);
+  bd.at(ok);
+  bd.opImm(IR_ICONST, r, NO_REG, 42u64);
+  bd.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  bd.ret();
+  bd.at(bad);
+  bd.trap(TRAP_UNREACHABLE, 0x0000000600000044u64);
+  take(&mut bd)
+}
+
+// outer(n): calls unr(n) and gives its answer plus one: a trap inside it leaves a frame behind to be dropped
+fn outerFn() Func {
+  var bd = FuncBuilder.make("outer", 1u32, 0u64);
+  bd.needOut(1u32);
+  let n = bd.vreg(CLASS_INT);
+  let r = bd.vreg(CLASS_INT);
+  let one = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ARG_GET, n, NO_REG, 0u64);
+  bd.opImm(IR_OUT_SET, NO_REG, n, 0u64);
+  bd.sited(IR_CALL, 4u64, 0x0000000700000001u64);
+  bd.opImm(IR_OUT_GET, r, NO_REG, 0u64);
+  bd.opImm(IR_ICONST, one, NO_REG, 1u64);
+  bd.op3(IR_IADD, r, r, one);
+  bd.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+// big(): a function with a frame of 'slots' outgoing slots; it gives 5
+fn bigFn(slots: u32) Func {
+  var bd = FuncBuilder.make("big", 1u32, 0x0000000800000001u64);
+  bd.needOut(slots);
+  let r = bd.vreg(CLASS_INT);
+  bd.opImm(IR_ICONST, r, NO_REG, 5u64);
+  bd.opImm(IR_OUT_SET, NO_REG, r, u64.from(slots) - 1u64);
+  bd.opImm(IR_OUT_SET, NO_REG, r, 0u64);
+  let s = bd.vreg(CLASS_INT);
+  bd.opImm(IR_OUT_GET, s, NO_REG, u64.from(slots) - 1u64);
+  bd.opImm(IR_ARG_SET, NO_REG, s, 0u64);
+  bd.ret();
+  take(&mut bd)
+}
+
+// Runs 'f' ten thousand times, each time expecting the trap and its site, then a normal function that must give its answer
+fn repeatTrap(lc: &LoadedCode, f: u32, args: &List[u64], fuel: u64, kind: u64, site: u64, leftFuel: u64, normal: u32,
+              normalArgs: &List[u64], normalWant: u64) bool {
+  var i = 0u32;
+  var bad = 0u32;
+  while i < 10000u32 {
+    var p = noProbe();
+    let r = exec(lc, f, copyOf(args), fuel, &mut p);
+    if r.trap != kind || r.site != site || r.fuel != leftFuel { bad = bad + 1u32; }
+    i = i + 1u32;
+  }
+  let after = run(lc, normal, copyOf(normalArgs));
+  bad == 0u32 && after.trap == 0u64 && *after.area[0usize] == normalWant
+}
+
+fn suiteTraps(o: &Options, rep: &mut Rep) {
+  var fs = Funcs();
+  fs.push(recFn());                                   // 0
+  fs.push(unrFn());                                   // 1
+  fs.push(sumFn(3u64, 0x0000000100000099u64));        // 2: three units a turn
+  fs.push(outerFn());                                 // 3
+  fs.push(unrFn());                                   // 4: the one outer calls
+  fs.push(bigFn(40000u32));                           // 5: a 320 KB frame, past the stack guard
+  fs.push(bigFn(12000u32));                           // 6: a 96 KB frame, inside it
+  fs.push(gateFn(9u64, 0x0000000900000009u64));       // 7
+  match build(&fs, o, rep, "build traps") { case None { return; } case let Some(lc) {
+    // fuel: the k-th back-edge. 10 turns of 3 units: fuel f lets floor(f / 3) charges through, the next fails with f mod 3 left
+    var bad = 0u32;
+    var f = 0u64;
+    while f < 50u64 {
+      var p = noProbe();
+      let r = exec(&lc, 2u32, l1(10u64), f, &mut p);
+      let paid = f / 3u64;
+      if f >= 30u64 {
+        if r.trap != 0u64 || r.fuel != f - 30u64 || *r.area[0usize] != 55u64 { bad = bad + 1u32; }
+      } else {
+        if r.trap != TRAP_FUEL || r.fuel != f - paid * 3u64 || r.site != 0x0000000100000099u64 { bad = bad + 1u32; }
+      }
+      f = f + 1u64;
+    }
+    ck(rep, bad == 0u32, "fuel runs out at the right back-edge with the fuel the interpreter leaves");
+    // each trap, ten thousand times, then a normal run
+    let a10 = l1(10u64);
+    let a0 = l1(0u64);
+    let a1 = l1(1u64);
+    let a5 = l1(5u64);
+    let a5000 = l1(5000u64);
+    ck(rep, repeatTrap(&lc, 2u32, &a10, 7u64, TRAP_FUEL, 0x0000000100000099u64, 1u64, 1u32, &a0, 42u64),
+       "ten thousand fuel traps leak nothing");
+    ck(rep, repeatTrap(&lc, 1u32, &a1, 100u64, TRAP_UNREACHABLE, 0x0000000600000044u64, 100u64, 1u32, &a0, 42u64),
+       "ten thousand unreachable traps leak nothing");
+    ck(rep, repeatTrap(&lc, 3u32, &a5, 100u64, TRAP_UNREACHABLE, 0x0000000600000044u64, 100u64, 3u32, &a0, 43u64),
+       "ten thousand traps inside a call leak nothing");
+    // the depth limit: MAX_CALL_DEPTH frames in all, so 1023 calls below the entry function work and 1024 do not
+    var pd = noProbe();
+    let ok = exec(&lc, 0u32, l1(1023u64), 1000000u64, &mut pd);
+    ck(rep, ok.trap == 0u64 && *ok.area[0usize] == 1023u64, "recursion 1023 calls deep runs");
+    let over = exec(&lc, 0u32, l1(1024u64), 1000000u64, &mut pd);
+    ck(rep, over.trap == TRAP_DEPTH && over.site == 0x0000000500000077u64, "the 1024th call below the entry traps TRAP_DEPTH at the call");
+    ck(rep, ok.depth == 1023u64, "depth after a run that returned is what it was");
+    ck(rep, over.depth == 0u64, "a refused call leaves the depth count at zero, not below it");
+    ck(rep, repeatTrap(&lc, 0u32, &a5000, 1000000u64, TRAP_DEPTH, 0x0000000500000077u64, 1000000u64, 0u32, &a10, 10u64),
+       "ten thousand depth traps, a thousand frames each, leak nothing");
+    // the gate refusing, ten thousand times
+    var bad2 = 0u32;
+    var i = 0u32;
+    while i < 10000u32 {
+      var p = Probe(0u64, 0u64, 3u64, true, 0u64, 0u64);
+      let r = exec(&lc, 7u32, l3(1u64, 2u64, 3u64), 50u64, &mut p);
+      if r.trap != TRAP_GATE || r.site != 0x0000000900000009u64 || r.fuel != 50u64 { bad2 = bad2 + 1u32; }
+      i = i + 1u32;
+    }
+    var pn = Probe(0u64, 0u64, 3u64, false, 0u64, 0u64);
+    let after = exec(&lc, 7u32, l3(1u64, 2u64, 3u64), 50u64, &mut pn);
+    ck(rep, bad2 == 0u32 && after.trap == 0u64 && *after.area[0usize] == 8u64, "ten thousand refusals by the gate leak nothing");
+    // the stack guard: a frame past 256 KiB traps in the prologue; one inside it, and over a page, runs
+    let g1 = run(&lc, 5u32, l1(0u64));
+    ck(rep, g1.trap == TRAP_DEPTH && g1.site == 0x0000000800000001u64, "a frame past the stack guard traps in its prologue");
+    let g2 = run(&lc, 6u32, l1(0u64));
+    ck(rep, g2.trap == 0u64 && *g2.area[0usize] == 5u64, "a frame of 96 KB runs, its pages touched in order");
+    // a function the container does not have, or an area too short
+    let bf = run(&lc, 99u32, l1(0u64));
+    ck(rep, bf.trap == TRAP_BADFUNC, "a function that does not exist is refused without running");
+    let short = run(&lc, 7u32, l1(0u64));
+    ck(rep, short.trap == TRAP_BADFUNC, "an area shorter than the function's is refused");
+  } }
+}
+
+// ---- compiling the same code twice gives the same bytes ----
+fn suiteDeterminism(o: &Options, rep: &mut Rep) {
+  var same = true;
+  var round = 0u32;
+  while round < 2u32 {
+    var a = binFuncs();
+    a.push(f0Fn()); a.push(f1Fn()); a.push(f2Fn()); a.push(manyIntFn(24u32)); a.push(manyFloatFn(20u32)); a.push(classifyFn());
+    var b = binFuncs();
+    b.push(f0Fn()); b.push(f1Fn()); b.push(f2Fn()); b.push(manyIntFn(24u32)); b.push(manyFloatFn(20u32)); b.push(classifyFn());
+    match compileX64With(&a, hostAbi(), o) {
+      case let Ok(x) {
+        match compileX64With(&b, hostAbi(), o) {
+          case let Ok(y) {
+            if x.bytes.len() != y.bytes.len() { same = false; }
+            else {
+              var i = 0usize;
+              while i < x.bytes.len() { if *x.bytes[i] != *y.bytes[i] { same = false; } i = i + 1usize; }
+            }
+            let ex = encode(&x);
+            let ey = encode(&y);
+            if ex.len() != ey.len() { same = false; }
+          }
+          case let Err(e) { same = false; }
+        }
+      }
+      case let Err(e) { same = false; }
+    }
+    round = round + 1u32;
+  }
+  ck(rep, same, "the same functions compile to the same bytes");
+}
+
+// ---- code that is not well formed is refused, not compiled ----
+fn suiteRefusal(o: &Options, rep: &mut Rep) {
+  // no terminator
+  var b1 = FuncBuilder.make("noterm", 1u32, 0u64);
+  let x = b1.vreg(CLASS_INT);
+  b1.opImm(IR_ICONST, x, NO_REG, 1u64);
+  var f1 = Funcs(); f1.push(take(&mut b1));
+  ck(rep, compileX64With(&f1, hostAbi(), o) is Err, "a block without a terminator is refused");
+  // a jump to a block that does not exist
+  var b2 = FuncBuilder.make("badjump", 1u32, 0u64);
+  b2.jmp(9u32);
+  var f2 = Funcs(); f2.push(take(&mut b2));
+  ck(rep, compileX64With(&f2, hostAbi(), o) is Err, "a jump to no block is refused");
+  // a float vreg where an integer is needed
+  var b3 = FuncBuilder.make("badclass", 1u32, 0u64);
+  let fx = b3.vreg(CLASS_F64);
+  let ix = b3.vreg(CLASS_INT);
+  b3.op3(IR_IADD, ix, fx, fx);
+  b3.ret();
+  var f3 = Funcs(); f3.push(take(&mut b3));
+  ck(rep, compileX64With(&f3, hostAbi(), o) is Err, "the wrong class of vreg is refused");
+  // a call to a function that is not there
+  var b4 = FuncBuilder.make("badcall", 1u32, 0u64);
+  b4.sited(IR_CALL, 5u64, 0u64);
+  b4.ret();
+  var f4 = Funcs(); f4.push(take(&mut b4));
+  ck(rep, compileX64With(&f4, hostAbi(), o) is Err, "a call of a missing function is refused");
+  // a slot outside the incoming area
+  var b5 = FuncBuilder.make("badslot", 1u32, 0u64);
+  let y = b5.vreg(CLASS_INT);
+  b5.opImm(IR_ARG_GET, y, NO_REG, 4u64);
+  b5.ret();
+  var f5 = Funcs(); f5.push(take(&mut b5));
+  ck(rep, compileX64With(&f5, hostAbi(), o) is Err, "a slot outside the area is refused");
+  // a terminator in the middle
+  var b6 = FuncBuilder.make("midterm", 1u32, 0u64);
+  b6.ret();
+  b6.ret();
+  var f6 = Funcs(); f6.push(take(&mut b6));
+  ck(rep, compileX64With(&f6, hostAbi(), o) is Err, "a terminator before the end of a block is refused");
+  var f7 = Funcs();
+  ck(rep, compileX64With(&f7, hostAbi(), o) is Err, "no functions is refused");
+  // an area bigger than the limit (the entry stub's frame holds the largest)
+  var b8 = FuncBuilder.make("hugearea", 5000u32, 0u64);
+  b8.ret();
+  var f8 = Funcs(); f8.push(take(&mut b8));
+  ck(rep, compileX64With(&f8, hostAbi(), o) is Err, "an incoming area past the limit is refused");
+}
+
+// ---- the whole suite under one set of options ----
+fn suite(o: &Options) Rep {
+  var rep = Rep(0u32, List[String]());
+  suiteBin(o, &mut rep);
+  suiteUnary(o, &mut rep);
+  suiteSelect(o, &mut rep);
+  suiteBranch(o, &mut rep);
+  suiteFlow(o, &mut rep);
+  suiteCalls(o, &mut rep);
+  suiteSpill(o, &mut rep);
+  suiteMemory(o, &mut rep);
+  suiteGate(o, &mut rep);
+  suiteTraps(o, &mut rep);
+  suiteDeterminism(o, &mut rep);
+  suiteRefusal(o, &mut rep);
+  rep
+}
+
+fn files(nInts: usize, nFloats: usize) Options {
+  let full = x64RegFile();
+  var rf = RegFile(List[u8](), List[u8]());
+  var i = 0usize;
+  while i < nInts && i < full.ints.len() { rf.ints.push(*full.ints[i]); i = i + 1usize; }
+  i = 0usize;
+  while i < nFloats && i < full.floats.len() { rf.floats.push(*full.floats[i]); i = i + 1usize; }
+  Options(rf, MUT_NONE)
+}
+
+fn report(name: &str, rep: &Rep) {
+  expectInt(i64.from(rep.fails.len()), 0i64, name);
+  var i = 0usize;
+  while i < rep.fails.len() && i < 5usize { print <- "  FAILED under ", name, ": ", rep.fails[i], "\n"; i = i + 1usize; }
+}
+
+fn caught(name: &str, o: &Options) {
+  let rep = suite(o);
+  expect(rep.fails.len() > 0usize, name);
+  var shown = List[String]();
+  var i = 0usize;
+  while i < rep.fails.len() {
+    var seen = false;
+    var j = 0usize;
+    while j < shown.len() { if shown[j] == rep.fails[i] { seen = true; } j = j + 1usize; }
+    if !seen { shown.push(String.from(rep.fails[i].view())); }
+    i = i + 1usize;
+  }
+  var k = 0usize;
+  while k < shown.len() && k < 4usize { print <- "mutant ", name, " is caught by: ", shown[k], "\n"; k = k + 1usize; }
+}
+
+fn main() i32 {
+  let full = defaultOptions();
+  let rep = suite(&full);
+  report("full register files", &rep);
+  print <- rep.total, " checks under the full register files\n";
+  let o2 = files(2usize, 2usize);
+  let r2 = suite(&o2);
+  report("two registers of each kind", &r2);
+  let o1 = files(1usize, 1usize);
+  let r1 = suite(&o1);
+  report("one register of each kind", &r1);
+  let o0 = files(0usize, 0usize);
+  let r0 = suite(&o0);
+  report("no registers at all: every value in memory", &r0);
+  let oi = files(10usize, 0usize);
+  let ri = suite(&oi);
+  report("integer registers only", &ri);
+  let of = files(0usize, 14usize);
+  let rf = suite(&of);
+  report("float registers only", &rf);
+
+  // the mutants: each must be noticed
+  var m1 = defaultOptions();
+  m1.mutant = MUT_FMIN_MINSD;
+  caught("fmin as minsd", &m1);
+  var m2 = defaultOptions();
+  m2.mutant = MUT_FUEL_NO_ADD;
+  caught("fuel stub forgets to add back", &m2);
+  // the allocator is handed a register the emitter uses as scratch (r10), then a float one (xmm14)
+  var m3 = defaultOptions();
+  m3.regs.ints.push(R10);
+  caught("allocator given scratch r10", &m3);
+  var m4 = defaultOptions();
+  m4.regs.floats.push(14u8);
+  caught("allocator given scratch xmm14", &m4);
+  done()
+}

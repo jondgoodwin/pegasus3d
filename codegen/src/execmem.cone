@@ -1,0 +1,97 @@
+// Executable memory (design section 6, "Loading"): a MachineCode copied into pages that are never writable and executable
+// at once. Windows: VirtualAlloc read-write, copy, VirtualProtect to read-execute, FlushInstructionCache. Linux: mmap
+// read-write, copy, mprotect to read-execute (x64 needs no cache flush). The Linux half is written from the
+// documentation and has not been run.
+//
+// FREEING: Cone gives a struct a finalizer, 'fn final(self: &uni)', that runs when the value dies, and LoadedCode has one,
+// so its pages go back when it goes out of scope. 'free' is there too for a host that wants them back sooner; it is safe
+// to call, and the finalizer after it does nothing.
+
+extern {
+  fn @c(system) VirtualAlloc(addr: *u8, size: usize, kind: u32, protect: u32) *u8;
+  fn @c(system) VirtualProtect(addr: *u8, size: usize, protect: u32, old: *u32) i32;
+  fn @c(system) VirtualFree(addr: *u8, size: usize, kind: u32) i32;
+  fn @c(system) FlushInstructionCache(process: usize, addr: *u8, size: usize) i32;
+  fn @c(system) GetCurrentProcess() usize;
+  fn @c mmap(addr: *u8, size: usize, protect: i32, flags: i32, fd: i32, offset: i64) *u8;
+  fn @c mprotect(addr: *u8, size: usize, protect: i32) i32;
+  fn @c munmap(addr: *u8, size: usize) i32;
+}
+
+// The calling convention of the machine this is running on
+pub fn hostAbi() Abi {
+  var a = Abi.SysV;
+  #if #os == .windows { a = Abi.Win64; }
+  a
+}
+
+fn releasePages(mem: *u8, size: usize) {
+  if mem as usize == 0usize { return; }
+  #if #os == .windows { VirtualFree(mem, 0usize, 0x8000u32); } #else { munmap(mem, size); }
+}
+
+pub struct LoadedCode {
+  mem: *u8;
+  size: usize;
+  entry: usize;
+  nAreas: List[u32];
+
+  // Runs function 'func' of the container through the entry stub, with the argument slots in 'area' (results come back in
+  // the same slots) and the host's context 'ctx' (its gate, fuel and depth set by the caller). Gives 0 for success, or the
+  // trap kind (ir.cone's TRAP_*), with the trap's site in ctx.trapSite and the fuel left in ctx.fuel. A function the
+  // container does not have, or an area shorter than the function's nArea, gives TRAP_BADFUNC without running anything.
+  pub fn call(self: &, ctx: &mut NativeCtx, func: u32, area: &mut Array[u64]) u64 {
+    if self.mem as usize == 0usize { return TRAP_BADFUNC; }
+    if usize.from(func) >= self.nAreas.len() { return TRAP_BADFUNC; }
+    if area.len < usize.from(*self.nAreas[usize.from(func)]) { return TRAP_BADFUNC; }
+    let f = (self.mem + self.entry) as &fn @c (ctx: *u8, func: u64, area: *u64) u64;
+    f(ctx as *u8, u64.from(func), area as *u64)
+  }
+
+  // The address of the entry stub, for a host that wraps the call itself (the tests do, to check what the stub preserves)
+  pub fn entryAddress(self: &) usize { (self.mem as usize) + self.entry }
+
+  // Gives the pages back now (a second call, and the finalizer after it, do nothing)
+  pub fn free(self: &mut) {
+    releasePages(self.mem, self.size);
+    self.mem = null;
+  }
+
+  fn final(self: &uni) {
+    releasePages(self.mem, self.size);
+  }
+}
+
+// Copies the container into fresh pages and makes them executable. Fails (and frees what it took) if the container is for
+// another ABI than this machine's, or the system refuses.
+pub fn load(mc: &MachineCode) Result[LoadedCode, String] {
+  if mc.abi != hostAbi() { return Err(String.from("the code is for another calling convention than this machine's")); }
+  if mc.bytes.len() == 0usize { return Err(String.from("there is no code to load")); }
+  let size = (mc.bytes.len() + 4095usize) / 4096usize * 4096usize;
+  var mem = null as *u8;
+  #if #os == .windows {
+    mem = VirtualAlloc(null, size, 0x3000u32, 0x04u32);           // commit and reserve, read-write
+  } #else {
+    mem = mmap(null, size, 3i32, 0x22i32, 0i32 - 1i32, 0i64);     // read-write, private, anonymous
+    if mem as usize == 0xFFFFFFFFFFFFFFFFusize { mem = null; }
+  }
+  if mem as usize == 0usize { return Err(String.from("the system gave no memory for the code")); }
+  var i = 0usize;
+  while i < mc.bytes.len() { *(mem + i) = *mc.bytes[i]; i = i + 1usize; }
+  var ok = false;
+  #if #os == .windows {
+    var old = 0u32;
+    ok = VirtualProtect(mem, size, 0x20u32, &mut old as *u32) != 0i32;        // read-execute
+    if ok { FlushInstructionCache(GetCurrentProcess(), mem, size); }
+  } #else {
+    ok = mprotect(mem, size, 5i32) == 0i32;                                   // read-execute
+  }
+  if !ok {
+    releasePages(mem, size);
+    return Err(String.from("the system refused to make the code executable"));
+  }
+  var areas = List[u32]();
+  i = 0usize;
+  while i < mc.nAreas.len() { areas.push(*mc.nAreas[i]); i = i + 1usize; }
+  Ok(LoadedCode(mem, size, usize.from(mc.entryOffset), areas))
+}

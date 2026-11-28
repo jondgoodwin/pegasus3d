@@ -1,0 +1,199 @@
+// MachineCode: what the compiler produces, and its stored form (design section 7). Nothing here writes to disk: a host
+// that wants a cache keeps the bytes 'encode' makes, and 'decode' reads them back and checks them.
+//
+// THE ENTRY STUB'S AREA COPY (the one choice the brief left open): the stub copies the incoming area into the callee's
+// frame and back, and sizes the copy from a TABLE inside the code, one 8-byte record per function (its offset, then its
+// nArea), not from a count in the area's first word. So the caller hands over exactly the slots the function takes and
+// returns, and no slot is a count. 'nAreas' below is the same table for the host to check an area's length against.
+//
+// There is nothing to relocate: the code holds no absolute address (the gate and every limit are reached through the
+// context), so a decoded container is copied into executable memory and run as it is.
+
+pub enum Abi { Win64; SysV; }
+
+// The trap the entry stub returns when it is asked for a function the container does not have
+pub const TRAP_BADFUNC = 255u64;
+
+pub const MC_MAJOR = 1u16;
+pub const MC_MINOR = 0u16;
+
+// One trap stub: where it starts in the code, the kind it returns, and the site it stores in the context
+pub struct TrapSite {
+  pub offset: u32;
+  pub kind: u64;
+  pub site: u64;
+}
+
+pub struct MachineCode {
+  pub abi: Abi;
+  pub bytes: List[u8];
+  pub entryOffset: u32;
+  pub funcOffsets: List[u32];
+  pub funcSizes: List[u32];
+  pub nAreas: List[u32];
+  pub traps: List[TrapSite];
+  // The content key (design section 7): set by whoever compiled from some form, and carried and checked by the cache; the
+  // backend itself never reads it
+  pub key: List[u8];
+
+  pub fn make(abi: Abi) MachineCode {
+    MachineCode(abi, List[u8](), 0u32, List[u32](), List[u32](), List[u32](), List[TrapSite](), List[u8]())
+  }
+}
+
+fn targetByte(abi: Abi) u8 { if abi == Abi.Win64 { 0u8 } else { 1u8 } }
+
+fn put32(o: &mut List[u8], x: u32) {
+  o.push(u8.from(x & 0xFFu32)); o.push(u8.from((x >> 8u32) & 0xFFu32));
+  o.push(u8.from((x >> 16u32) & 0xFFu32)); o.push(u8.from((x >> 24u32) & 0xFFu32));
+}
+fn put64(o: &mut List[u8], x: u64) {
+  put32(o, u32.from(x & 0xFFFFFFFFu64));
+  put32(o, u32.from(x >> 32u64));
+}
+
+// FNV-1a over bytes: the stored form's checksum (it catches a damaged or truncated file; it is no defence against a
+// forger, which is why a cached entry is never trusted without its key)
+pub fn checksum(d: &Array[u8], upto: usize) u64 {
+  var h = 0xCBF29CE484222325u64;
+  var i = 0usize;
+  while i < upto {
+    h = (h ^ u64.from(d[i])) * 0x100000001B3u64;
+    i = i + 1usize;
+  }
+  h
+}
+
+// The stored form: the magic CGX\0, major and minor, the target, the key, the function table, the entry offset, the trap
+// table, the code bytes, then the checksum of all that came before
+pub fn encode(mc: &MachineCode) List[u8] {
+  var o = List[u8]();
+  o.push('C'); o.push('G'); o.push('X'); o.push(0u8);
+  o.push(u8.from(MC_MAJOR & 0xFFu16)); o.push(u8.from(MC_MAJOR >> 8u16));
+  o.push(u8.from(MC_MINOR & 0xFFu16)); o.push(u8.from(MC_MINOR >> 8u16));
+  o.push(targetByte(mc.abi));
+  put32(&mut o, u32.from(mc.key.len()));
+  var i = 0usize;
+  while i < mc.key.len() { o.push(*mc.key[i]); i = i + 1usize; }
+  put32(&mut o, mc.entryOffset);
+  put32(&mut o, u32.from(mc.funcOffsets.len()));
+  i = 0usize;
+  while i < mc.funcOffsets.len() {
+    put32(&mut o, *mc.funcOffsets[i]);
+    put32(&mut o, *mc.funcSizes[i]);
+    put32(&mut o, *mc.nAreas[i]);
+    i = i + 1usize;
+  }
+  put32(&mut o, u32.from(mc.traps.len()));
+  i = 0usize;
+  while i < mc.traps.len() {
+    let t = &mc.traps[i];
+    put32(&mut o, t.offset);
+    put64(&mut o, t.kind);
+    put64(&mut o, t.site);
+    i = i + 1usize;
+  }
+  put32(&mut o, u32.from(mc.bytes.len()));
+  i = 0usize;
+  while i < mc.bytes.len() { o.push(*mc.bytes[i]); i = i + 1usize; }
+  let sum = checksum(o.view(), o.len());
+  put64(&mut o, sum);
+  o
+}
+
+struct Rd {
+  d: List[u8];
+  pos: usize;
+  bad: bool;
+
+  fn need(self: &mut, n: usize) bool {
+    if self.bad || n > self.d.len() - self.pos { self.bad = true; return false; }
+    true
+  }
+  fn u8v(self: &mut) u8 {
+    if !self.need(1usize) { return 0u8; }
+    let x = *self.d[self.pos];
+    self.pos = self.pos + 1usize;
+    x
+  }
+  fn u32v(self: &mut) u32 {
+    if !self.need(4usize) { return 0u32; }
+    var x = 0u32;
+    var i = 0usize;
+    while i < 4usize { x = x | (u32.from(*self.d[self.pos + i]) << u32.from(i * 8usize)); i = i + 1usize; }
+    self.pos = self.pos + 4usize;
+    x
+  }
+  fn u64v(self: &mut) u64 {
+    let lo = u64.from(self.u32v());
+    let hi = u64.from(self.u32v());
+    lo | (hi << 32u64)
+  }
+}
+
+// Reads the stored form back, checking everything that can be checked without running the code: the magic, the version,
+// the target, that every table lies inside the bytes, and the checksum
+pub fn decode(data: &Array[u8]) Result[MachineCode, String] {
+  if data.len < 17usize { return Err(String.from("too short to be machine code")); }
+  if data[0usize] != 'C' || data[1usize] != 'G' || data[2usize] != 'X' || data[3usize] != 0u8 {
+    return Err(String.from("the magic is not CGX"));
+  }
+  let end = data.len - 8usize;
+  var want = 0u64;
+  var s = 0usize;
+  while s < 8usize { want = want | (u64.from(data[end + s]) << u64.from(s * 8usize)); s = s + 1usize; }
+  if checksum(data, end) != want { return Err(String.from("the checksum does not match: the file is damaged or cut short")); }
+  var body = List[u8]();
+  var c = 0usize;
+  while c < end { body.push(data[c]); c = c + 1usize; }
+  var r = Rd(body, 4usize, false);
+  let major = u16.from(r.u8v()) | (u16.from(r.u8v()) << 8u16);
+  let minor = u16.from(r.u8v()) | (u16.from(r.u8v()) << 8u16);
+  if major != MC_MAJOR { return Err(String.from("the container's major version is not one this reader knows")); }
+  if minor > MC_MINOR { return Err(String.from("the container's minor version is newer than this reader")); }
+  let target = r.u8v();
+  if target > 1u8 { return Err(String.from("a target this reader does not know")); }
+  var mc = MachineCode.make(if target == 0u8 { Abi.Win64 } else { Abi.SysV });
+  let nkey = usize.from(r.u32v());
+  if !r.need(nkey) { return Err(String.from("the key runs past the end")); }
+  var i = 0usize;
+  while i < nkey { mc.key.push(r.u8v()); i = i + 1usize; }
+  mc.entryOffset = r.u32v();
+  let nf = usize.from(r.u32v());
+  if !r.need(nf * 12usize) { return Err(String.from("the function table runs past the end")); }
+  i = 0usize;
+  while i < nf {
+    mc.funcOffsets.push(r.u32v());
+    mc.funcSizes.push(r.u32v());
+    mc.nAreas.push(r.u32v());
+    i = i + 1usize;
+  }
+  let nt = usize.from(r.u32v());
+  if !r.need(nt * 20usize) { return Err(String.from("the trap table runs past the end")); }
+  i = 0usize;
+  while i < nt {
+    let off = r.u32v();
+    let kind = r.u64v();
+    let site = r.u64v();
+    mc.traps.push(TrapSite(off, kind, site));
+    i = i + 1usize;
+  }
+  let nb = usize.from(r.u32v());
+  if !r.need(nb) { return Err(String.from("the code runs past the end")); }
+  i = 0usize;
+  while i < nb { mc.bytes.push(r.u8v()); i = i + 1usize; }
+  if r.bad || r.pos != end { return Err(String.from("the container has bytes it does not account for")); }
+  // every offset names a place inside the code
+  if usize.from(mc.entryOffset) >= nb { return Err(String.from("the entry offset is outside the code")); }
+  i = 0usize;
+  while i < nf {
+    if usize.from(*mc.funcOffsets[i]) + usize.from(*mc.funcSizes[i]) > nb { return Err(String.from("a function lies outside the code")); }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < nt {
+    if usize.from(mc.traps[i].offset) >= nb { return Err(String.from("a trap stub lies outside the code")); }
+    i = i + 1usize;
+  }
+  Ok(mc)
+}

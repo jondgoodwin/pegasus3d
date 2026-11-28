@@ -1,0 +1,283 @@
+// The x64 encoder: the instructions the emitter (x64.cone) uses, as bytes, and nothing else.
+//
+// Registers are numbers 0-15 (the hardware's: rax 0, rcx 1, rdx 2, rbx 3, rsp 4, rbp 5, rsi 6, rdi 7, r8-r15); an xmm
+// register is its number too, in the instructions that take one. A memory operand is a Mem: base, optional index with
+// a scale, and a 32-bit displacement. Labels are numbers the emitter makes with newLabel and fixes with bind; jumps and
+// calls to labels are always rel32, patched by finish. Every instruction is checked against LLVM's disassembler by
+// tests\encodings.cone and tests\check-encodings.ps1 (a testing tool only, never a dependency).
+
+pub const RAX = 0u8;
+pub const RCX = 1u8;
+pub const RDX = 2u8;
+pub const RBX = 3u8;
+pub const RSP = 4u8;
+pub const RBP = 5u8;
+pub const RSI = 6u8;
+pub const RDI = 7u8;
+pub const R8 = 8u8;
+pub const R9 = 9u8;
+pub const R10 = 10u8;
+pub const R11 = 11u8;
+pub const R12 = 12u8;
+pub const R13 = 13u8;
+pub const R14 = 14u8;
+pub const R15 = 15u8;
+pub const NOREG = 0xFFu8;
+
+// Condition codes, as the low nibble of jcc / setcc / cmovcc
+pub const XC_B = 2u8;     // below (CF)
+pub const XC_AE = 3u8;    // above or equal (not CF)
+pub const XC_E = 4u8;
+pub const XC_NE = 5u8;
+pub const XC_BE = 6u8;    // below or equal (CF or ZF)
+pub const XC_A = 7u8;     // above
+pub const XC_P = 0xAu8;   // parity: unordered after ucomisd
+pub const XC_NP = 0xBu8;
+pub const XC_L = 0xCu8;
+pub const XC_GE = 0xDu8;
+pub const XC_LE = 0xEu8;
+pub const XC_G = 0xFu8;
+
+// The group-1 arithmetic ops: their /digit, and (8 * digit + 3) is the "op r64, r/m64" opcode
+pub const ALU_ADD = 0u8;
+pub const ALU_OR = 1u8;
+pub const ALU_AND = 4u8;
+pub const ALU_SUB = 5u8;
+pub const ALU_XOR = 6u8;
+pub const ALU_CMP = 7u8;
+
+// The scalar SSE2 arithmetic opcodes (F2 0F xx)
+pub const SSE_SQRT = 0x51u8;
+pub const SSE_ADD = 0x58u8;
+pub const SSE_MUL = 0x59u8;
+pub const SSE_SUB = 0x5Cu8;
+pub const SSE_MIN = 0x5Du8;    // minsd: the emitter never uses it (its NaN and zero rules are not ours), but a mutant does
+pub const SSE_DIV = 0x5Eu8;
+pub const SSE_MAX = 0x5Fu8;
+
+pub const UNBOUND = 0xFFFFFFFFu32;
+const FIX_REL32 = 0u8;
+const FIX_ABS32 = 1u8;
+
+pub struct Mem {
+  pub base: u8;
+  pub index: u8;      // NOREG for none (rsp can't be an index)
+  pub scale: u8;      // 1, 2, 4 or 8
+  pub disp: i32;
+}
+
+pub fn mbase(base: u8, disp: i32) Mem { Mem(base, NOREG, 1u8, disp) }
+pub fn mindex(base: u8, index: u8, scale: u8, disp: i32) Mem { Mem(base, index, scale, disp) }
+
+struct Fixup {
+  at: u32;
+  label: u32;
+  kind: u8;
+}
+
+pub struct Asm {
+  pub code: List[u8];
+  labels: List[u32];
+  fixups: List[Fixup];
+
+  pub fn make() Asm { Asm(List[u8](), List[u32](), List[Fixup]()) }
+
+  // ---- raw bytes ----
+  pub fn b(self: &mut, x: u8) { self.code.push(x); }
+  pub fn d32(self: &mut, x: u32) {
+    self.code.push(u8.from(x & 0xFFu32));
+    self.code.push(u8.from((x >> 8u32) & 0xFFu32));
+    self.code.push(u8.from((x >> 16u32) & 0xFFu32));
+    self.code.push(u8.from((x >> 24u32) & 0xFFu32));
+  }
+  pub fn d64(self: &mut, x: u64) {
+    self.d32(u32.from(x & 0xFFFFFFFFu64));
+    self.d32(u32.from(x >> 32u64));
+  }
+  pub fn here(self: &) u32 { u32.from(self.code.len()) }
+
+  // ---- labels ----
+  pub fn newLabel(self: &mut) u32 {
+    self.labels.push(UNBOUND);
+    u32.from(self.labels.len() - 1usize)
+  }
+  pub fn bind(self: &mut, l: u32) {
+    let at = self.here();
+    self.labels.set(usize.from(l), at);
+  }
+  pub fn isBound(self: &, l: u32) bool { *self.labels[usize.from(l)] != UNBOUND }
+  pub fn labelPos(self: &, l: u32) u32 { *self.labels[usize.from(l)] }
+
+  // Patches every reference; false if one names a label never bound
+  pub fn finish(self: &mut) bool {
+    var i = 0usize;
+    while i < self.fixups.len() {
+      let f = &self.fixups[i];
+      let target = *self.labels[usize.from(f.label)];
+      if target == UNBOUND { return false; }
+      let at = usize.from(f.at);
+      let v = if f.kind == FIX_REL32 { target - (f.at + 4u32) } else { target };
+      self.code.set(at, u8.from(v & 0xFFu32));
+      self.code.set(at + 1usize, u8.from((v >> 8u32) & 0xFFu32));
+      self.code.set(at + 2usize, u8.from((v >> 16u32) & 0xFFu32));
+      self.code.set(at + 3usize, u8.from((v >> 24u32) & 0xFFu32));
+      i = i + 1usize;
+    }
+    true
+  }
+
+  // A 32-bit field holding a label's offset from the start of the code (a table entry)
+  pub fn labelOffset32(self: &mut, l: u32) {
+    self.fixups.push(Fixup(self.here(), l, FIX_ABS32));
+    self.d32(0u32);
+  }
+  fn rel32(self: &mut, l: u32) {
+    self.fixups.push(Fixup(self.here(), l, FIX_REL32));
+    self.d32(0u32);
+  }
+
+  // ---- the general forms ----
+  // REX: w is the 64-bit flag, r the ModRM.reg register, x the index, b the ModRM.rm or base; 'force' for the byte
+  // registers sil, dil, spl, bpl (a REX prefix makes them mean those and not ah-bh)
+  fn rex(self: &mut, w: bool, r: u8, x: u8, b: u8, force: bool) {
+    var v = 0x40u8;
+    if w { v = v | 8u8; }
+    if r >= 8u8 && r != NOREG { v = v | 4u8; }
+    if x >= 8u8 && x != NOREG { v = v | 2u8; }
+    if b >= 8u8 && b != NOREG { v = v | 1u8; }
+    if v != 0x40u8 || force { self.b(v); }
+  }
+
+  fn modrmMem(self: &mut, reg: u8, m: Mem) {
+    let r = (reg & 7u8) << 3u8;
+    let base = m.base & 7u8;
+    let small = m.disp >= -128 && m.disp <= 127;
+    // mod 00 with base 101 means rip or disp32, so rbp and r13 as a base always carry a displacement
+    let mode = if m.disp == 0 && base != 5u8 { 0u8 } else if small { 1u8 } else { 2u8 };
+    if m.index == NOREG && base != 4u8 {
+      self.b((mode << 6u8) | r | base);
+    } else {
+      self.b((mode << 6u8) | r | 4u8);
+      let ss = if m.scale == 8u8 { 3u8 } else if m.scale == 4u8 { 2u8 } else if m.scale == 2u8 { 1u8 } else { 0u8 };
+      let idx = if m.index == NOREG { 4u8 } else { m.index & 7u8 };
+      self.b((ss << 6u8) | (idx << 3u8) | base);
+    }
+    if mode == 1u8 { self.b(u8.from((m.disp as u32) & 0xFFu32)); }
+    else if mode == 2u8 { self.d32(m.disp as u32); }
+  }
+
+  // pfx: a mandatory prefix (0x66, 0xF2, 0xF3) or 0; esc: the 0x0F escape; 'reg' is a register or a /digit
+  pub fn opRR(self: &mut, pfx: u8, w: bool, esc: bool, op: u8, reg: u8, rm: u8, rex8: bool) {
+    if pfx != 0u8 { self.b(pfx); }
+    self.rex(w, reg, NOREG, rm, rex8);
+    if esc { self.b(0x0Fu8); }
+    self.b(op);
+    self.b(0xC0u8 | ((reg & 7u8) << 3u8) | (rm & 7u8));
+  }
+  pub fn opRM(self: &mut, pfx: u8, w: bool, esc: bool, op: u8, reg: u8, m: Mem, rex8: bool) {
+    if pfx != 0u8 { self.b(pfx); }
+    self.rex(w, reg, m.index, m.base, rex8);
+    if esc { self.b(0x0Fu8); }
+    self.b(op);
+    self.modrmMem(reg, m);
+  }
+
+  // ---- integer moves ----
+  pub fn movRR(self: &mut, dst: u8, src: u8) { self.opRR(0u8, true, false, 0x89u8, src, dst, false); }
+  pub fn movRM(self: &mut, dst: u8, m: Mem) { self.opRM(0u8, true, false, 0x8Bu8, dst, m, false); }
+  pub fn movMR(self: &mut, m: Mem, src: u8) { self.opRM(0u8, true, false, 0x89u8, src, m, false); }
+  pub fn mov32RM(self: &mut, dst: u8, m: Mem) { self.opRM(0u8, false, false, 0x8Bu8, dst, m, false); }
+  // mov dword [m], k   and   mov qword [m], k (k sign-extended)
+  pub fn mov32MI(self: &mut, m: Mem, k: u32) { self.opRM(0u8, false, false, 0xC7u8, 0u8, m, false); self.d32(k); }
+  pub fn movMI(self: &mut, m: Mem, k: i32) { self.opRM(0u8, true, false, 0xC7u8, 0u8, m, false); self.d32(k as u32); }
+  // The shortest form that gives dst the 64-bit value k: mov r32, imm32 (zero-extends), mov r/m64, simm32, or movabs
+  pub fn movRI(self: &mut, dst: u8, k: u64) {
+    if k <= 0xFFFFFFFFu64 {
+      self.rex(false, 0u8, NOREG, dst, false);
+      self.b(0xB8u8 + (dst & 7u8));
+      self.d32(u32.from(k));
+    } else if (k as i64) >= -2147483648i64 && (k as i64) < 0i64 {
+      self.opRR(0u8, true, false, 0xC7u8, 0u8, dst, false);
+      self.d32(u32.from(k & 0xFFFFFFFFu64));
+    } else {
+      self.rex(true, 0u8, NOREG, dst, false);
+      self.b(0xB8u8 + (dst & 7u8));
+      self.d64(k);
+    }
+  }
+
+  // ---- integer arithmetic (64-bit) ----
+  // op dst, src   |   op dst, [m]   |   op [m], src   |   op dst, imm   |   op [m], imm
+  pub fn aluRR(self: &mut, op: u8, dst: u8, src: u8) { self.opRR(0u8, true, false, op * 8u8 + 3u8, dst, src, false); }
+  pub fn aluRM(self: &mut, op: u8, dst: u8, m: Mem) { self.opRM(0u8, true, false, op * 8u8 + 3u8, dst, m, false); }
+  pub fn aluMR(self: &mut, op: u8, m: Mem, src: u8) { self.opRM(0u8, true, false, op * 8u8 + 1u8, src, m, false); }
+  pub fn aluRI(self: &mut, op: u8, dst: u8, k: i32) {
+    if k >= -128 && k <= 127 {
+      self.opRR(0u8, true, false, 0x83u8, op, dst, false);
+      self.b(u8.from((k as u32) & 0xFFu32));
+    } else {
+      self.opRR(0u8, true, false, 0x81u8, op, dst, false);
+      self.d32(k as u32);
+    }
+  }
+  pub fn aluMI(self: &mut, op: u8, m: Mem, k: i32) {
+    if k >= -128 && k <= 127 {
+      self.opRM(0u8, true, false, 0x83u8, op, m, false);
+      self.b(u8.from((k as u32) & 0xFFu32));
+    } else {
+      self.opRM(0u8, true, false, 0x81u8, op, m, false);
+      self.d32(k as u32);
+    }
+  }
+  // and / or / xor on the low bytes: op r8, r8
+  pub fn alu8RR(self: &mut, op: u8, dst: u8, src: u8) { self.opRR(0u8, false, false, op * 8u8 + 2u8, dst, src, true); }
+  pub fn imulRR(self: &mut, dst: u8, src: u8) { self.opRR(0u8, true, true, 0xAFu8, dst, src, false); }
+  pub fn imulRM(self: &mut, dst: u8, m: Mem) { self.opRM(0u8, true, true, 0xAFu8, dst, m, false); }
+  pub fn testRR(self: &mut, a: u8, b: u8) { self.opRR(0u8, true, false, 0x85u8, b, a, false); }
+  pub fn leaRM(self: &mut, dst: u8, m: Mem) { self.opRM(0u8, true, false, 0x8Du8, dst, m, false); }
+  // lea dst, [rip + label]
+  pub fn leaLabel(self: &mut, dst: u8, l: u32) {
+    self.rex(true, dst, NOREG, NOREG, false);
+    self.b(0x8Du8);
+    self.b(((dst & 7u8) << 3u8) | 5u8);
+    self.rel32(l);
+  }
+  pub fn setcc(self: &mut, cc: u8, r: u8) { self.opRR(0u8, false, true, 0x90u8 + cc, 0u8, r, true); }
+  // movzx dst32, src8
+  pub fn movzx8(self: &mut, dst: u8, src: u8) { self.opRR(0u8, false, true, 0xB6u8, dst, src, true); }
+  pub fn cmovRR(self: &mut, cc: u8, dst: u8, src: u8) { self.opRR(0u8, true, true, 0x40u8 + cc, dst, src, false); }
+  pub fn cmovRM(self: &mut, cc: u8, dst: u8, m: Mem) { self.opRM(0u8, true, true, 0x40u8 + cc, dst, m, false); }
+
+  // ---- control ----
+  pub fn push(self: &mut, r: u8) { self.rex(false, 0u8, NOREG, r, false); self.b(0x50u8 + (r & 7u8)); }
+  pub fn pop(self: &mut, r: u8) { self.rex(false, 0u8, NOREG, r, false); self.b(0x58u8 + (r & 7u8)); }
+  pub fn ret(self: &mut) { self.b(0xC3u8); }
+  pub fn leave(self: &mut) { self.b(0xC9u8); }
+  pub fn jcc(self: &mut, cc: u8, l: u32) { self.b(0x0Fu8); self.b(0x80u8 + cc); self.rel32(l); }
+  pub fn jmp(self: &mut, l: u32) { self.b(0xE9u8); self.rel32(l); }
+  pub fn call(self: &mut, l: u32) { self.b(0xE8u8); self.rel32(l); }
+  pub fn callR(self: &mut, r: u8) { self.opRR(0u8, false, false, 0xFFu8, 2u8, r, false); }
+  pub fn callM(self: &mut, m: Mem) { self.opRM(0u8, false, false, 0xFFu8, 2u8, m, false); }
+
+  // ---- scalar double SSE2 ----
+  // op xmm, xmm   |   op xmm, [m]   for addsd subsd mulsd divsd sqrtsd minsd maxsd
+  pub fn sseRR(self: &mut, op: u8, dst: u8, src: u8) { self.opRR(0xF2u8, false, true, op, dst, src, false); }
+  pub fn sseRM(self: &mut, op: u8, dst: u8, m: Mem) { self.opRM(0xF2u8, false, true, op, dst, m, false); }
+  pub fn movsdRM(self: &mut, dst: u8, m: Mem) { self.opRM(0xF2u8, false, true, 0x10u8, dst, m, false); }
+  pub fn movsdMR(self: &mut, m: Mem, src: u8) { self.opRM(0xF2u8, false, true, 0x11u8, src, m, false); }
+  pub fn movapd(self: &mut, dst: u8, src: u8) { self.opRR(0x66u8, false, true, 0x28u8, dst, src, false); }
+  pub fn ucomisdRR(self: &mut, a: u8, b: u8) { self.opRR(0x66u8, false, true, 0x2Eu8, a, b, false); }
+  pub fn ucomisdRM(self: &mut, a: u8, m: Mem) { self.opRM(0x66u8, false, true, 0x2Eu8, a, m, false); }
+  pub fn xorpd(self: &mut, dst: u8, src: u8) { self.opRR(0x66u8, false, true, 0x57u8, dst, src, false); }
+  pub fn andpd(self: &mut, dst: u8, src: u8) { self.opRR(0x66u8, false, true, 0x54u8, dst, src, false); }
+  pub fn orpd(self: &mut, dst: u8, src: u8) { self.opRR(0x66u8, false, true, 0x56u8, dst, src, false); }
+  pub fn cvtsi2sdRR(self: &mut, dst: u8, src: u8) { self.opRR(0xF2u8, true, true, 0x2Au8, dst, src, false); }
+  pub fn cvtsi2sdRM(self: &mut, dst: u8, m: Mem) { self.opRM(0xF2u8, true, true, 0x2Au8, dst, m, false); }
+  // movq xmm, r64   |   movq r64, xmm
+  pub fn movqXR(self: &mut, x: u8, r: u8) { self.opRR(0x66u8, true, true, 0x6Eu8, x, r, false); }
+  pub fn movqRX(self: &mut, r: u8, x: u8) { self.opRR(0x66u8, true, true, 0x7Eu8, x, r, false); }
+  pub fn movupsRM(self: &mut, dst: u8, m: Mem) { self.opRM(0u8, false, true, 0x10u8, dst, m, false); }
+  pub fn movupsMR(self: &mut, m: Mem, src: u8) { self.opRM(0u8, false, true, 0x11u8, src, m, false); }
+  pub fn stmxcsr(self: &mut, m: Mem) { self.opRM(0u8, false, true, 0xAEu8, 3u8, m, false); }
+  pub fn ldmxcsr(self: &mut, m: Mem) { self.opRM(0u8, false, true, 0xAEu8, 2u8, m, false); }
+}

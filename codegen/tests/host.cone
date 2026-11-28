@@ -1,0 +1,298 @@
+// What the entry stub gives back to its host: every register the host's ABI calls callee-saved, xmm6-15 (Win64), the
+// frame pointer and MXCSR, on a normal return and on every kind of trap; and that the generated code rounds to nearest
+// whatever MXCSR the host had. A wrapper made with the encoder sets those registers to known values, calls the stub, and
+// reports in a mask which of them changed. The SysV wrapper is written and assembled but only runs on Linux.
+
+mod host;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import codegen use *;
+
+fn @c testGate(ctx: *u8, k: u64, slots: *u64) u64 {
+  let c = ctx as *NativeCtx;
+  let refuse = (*c).user as *u64;
+  if *refuse != 0u64 { return 0u64; }
+  *slots = 99u64;
+  1u64
+}
+
+fn take(b: &mut FuncBuilder) Func {
+  var f = Func(String(), List[u8](), List[Block](), 0u32, 0u32, 0u64);
+  f <-> b.func;
+  f
+}
+
+// The wrapper: wrap(ctx, func, area) with area[0] the real entry's address and area[1] where the mask goes; the real
+// area follows at area + 16.
+fn wrapper(win: bool) MachineCode {
+  var a = Asm.make();
+  let xmmSave = 32i32;
+  let areaOff = 192i32;
+  let mxOff = 200i32;
+  let S = 216i32;        // 8 mod 16 after the pushes, so rsp is 16-aligned at the call
+  a.push(RBP);
+  a.movRR(RBP, RSP);
+  a.push(RBX);
+  if win { a.push(RSI); a.push(RDI); }
+  a.push(R12); a.push(R13); a.push(R14); a.push(R15);
+  a.aluRI(ALU_SUB, RSP, S);
+  let areaReg = if win { R8 } else { RDX };
+  a.movMR(mbase(RSP, areaOff), areaReg);
+  if win {
+    var i = 0u8;
+    while i < 10u8 { a.movupsMR(mbase(RSP, xmmSave + 16i32 * i32.from(i)), 6u8 + i); i = i + 1u8; }
+  }
+  // the host's MXCSR is saved and set to round toward zero
+  a.stmxcsr(mbase(RSP, mxOff));
+  a.mov32MI(mbase(RSP, mxOff + 4i32), 0x7F80u32);
+  a.ldmxcsr(mbase(RSP, mxOff + 4i32));
+  // known values
+  a.movRI(RBX, 0x1111111111111111u64);
+  a.movRI(R12, 0x1212121212121212u64);
+  a.movRI(R13, 0x1313131313131313u64);
+  a.movRI(R14, 0x1414141414141414u64);
+  a.movRI(R15, 0x1515151515151515u64);
+  if win {
+    a.movRI(RSI, 0x1616161616161616u64);
+    a.movRI(RDI, 0x1717171717171717u64);
+    var i = 0u8;
+    while i < 10u8 { a.movRI(RAX, 0x2000000000000000u64 + u64.from(i)); a.movqXR(6u8 + i, RAX); i = i + 1u8; }
+  }
+  // call the real entry with the real area
+  a.movRM(R10, mbase(areaReg, 0i32));
+  a.leaRM(areaReg, mbase(areaReg, 16i32));
+  a.callR(R10);
+  // the mask of what changed, in r11
+  a.movRI(R11, 0u64);
+  let regs = [RBX, R12, R13, R14, R15, RSI, RDI];
+  let pats = [0x1111111111111111u64, 0x1212121212121212u64, 0x1313131313131313u64, 0x1414141414141414u64, 0x1515151515151515u64,
+              0x1616161616161616u64, 0x1717171717171717u64];
+  var k = 0usize;
+  while k < 7usize {
+    if win || k < 5usize {
+      let skip = a.newLabel();
+      a.movRI(R10, pats[k]);
+      a.aluRR(ALU_CMP, regs[k], R10);
+      a.jcc(XC_E, skip);
+      a.aluRI(ALU_OR, R11, 1i32 << i32.from(k));
+      a.bind(skip);
+    }
+    k = k + 1usize;
+  }
+  if win {
+    var i = 0u8;
+    while i < 10u8 {
+      let skip = a.newLabel();
+      a.movqRX(RCX, 6u8 + i);
+      a.movRI(R10, 0x2000000000000000u64 + u64.from(i));
+      a.aluRR(ALU_CMP, RCX, R10);
+      a.jcc(XC_E, skip);
+      a.aluRI(ALU_OR, R11, 0x100i32 << i32.from(i));
+      a.bind(skip);
+      i = i + 1u8;
+    }
+  }
+  // rbp must still be the frame: rsp + S + the pushes
+  let rbpSkip = a.newLabel();
+  a.leaRM(R10, mbase(RSP, S + if win { 56i32 } else { 40i32 }));
+  a.aluRR(ALU_CMP, RBP, R10);
+  a.jcc(XC_E, rbpSkip);
+  a.aluRI(ALU_OR, R11, 0x10000i32);
+  a.bind(rbpSkip);
+  // MXCSR must be as the host had it, and the exception flags the run raised must not be left in it
+  let mxSkip = a.newLabel();
+  a.stmxcsr(mbase(RSP, mxOff + 4i32));
+  a.mov32RM(RCX, mbase(RSP, mxOff + 4i32));
+  a.aluRI(ALU_CMP, RCX, 0x7F80i32);
+  a.jcc(XC_E, mxSkip);
+  a.aluRI(ALU_OR, R11, 0x20000i32);
+  a.bind(mxSkip);
+  // hand the mask back, and the host's own MXCSR
+  a.movRM(RCX, mbase(RSP, areaOff));
+  a.movMR(mbase(RCX, 8i32), R11);
+  a.ldmxcsr(mbase(RSP, mxOff));
+  if win {
+    var i = 0u8;
+    while i < 10u8 { a.movupsRM(6u8 + i, mbase(RSP, xmmSave + 16i32 * i32.from(i))); i = i + 1u8; }
+  }
+  a.aluRI(ALU_ADD, RSP, S);
+  a.pop(R15); a.pop(R14); a.pop(R13); a.pop(R12);
+  if win { a.pop(RDI); a.pop(RSI); }
+  a.pop(RBX);
+  a.pop(RBP);
+  a.ret();
+  a.finish();
+  var mc = MachineCode.make(if win { Abi.Win64 } else { Abi.SysV });
+  var i = 0usize;
+  while i < a.code.len() { mc.bytes.push(*a.code[i]); i = i + 1usize; }
+  i = 0usize;
+  while i < 64usize { mc.funcOffsets.push(0u32); mc.funcSizes.push(0u32); mc.nAreas.push(0u32); i = i + 1usize; }
+  mc
+}
+
+// f(a, b) = a + b, a float add whose result depends on the rounding mode
+fn addFn() Func {
+  var b = FuncBuilder.make("add", 2u32, 0u64);
+  let x = b.vreg(CLASS_F64);
+  let y = b.vreg(CLASS_F64);
+  let r = b.vreg(CLASS_F64);
+  b.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+  b.opImm(IR_ARG_GET, y, NO_REG, 1u64);
+  b.op3(IR_FADD, r, x, y);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn unrFn() Func {
+  var b = FuncBuilder.make("unr", 1u32, 0u64);
+  b.trap(TRAP_UNREACHABLE, 0x77u64);
+  take(&mut b)
+}
+
+// uses every allocatable register, so every one is a callee-saved register the stub must restore
+fn busyFn() Func {
+  var b = FuncBuilder.make("busy", 2u32, 0u64);
+  var vs = List[u32]();
+  let a = b.vreg(CLASS_INT);
+  b.opImm(IR_ARG_GET, a, NO_REG, 0u64);
+  var i = 1u64;
+  while i <= 10u64 {
+    let k = b.vreg(CLASS_INT);
+    let v = b.vreg(CLASS_INT);
+    b.opImm(IR_ICONST, k, NO_REG, i);
+    b.op3(IR_IADD, v, a, k);
+    vs.push(v);
+    i = i + 1u64;
+  }
+  let fa = b.vreg(CLASS_F64);
+  b.opImm(IR_I2F, fa, a, 0u64);
+  var fs = List[u32]();
+  i = 0u64;
+  while i < 10u64 {
+    let v = b.vreg(CLASS_F64);
+    b.op3(IR_FADD, v, fa, fa);
+    fs.push(v);
+    i = i + 1u64;
+  }
+  let s = b.vreg(CLASS_INT);
+  b.opImm(IR_ICONST, s, NO_REG, 0u64);
+  var j = 0usize;
+  while j < vs.len() { b.op3(IR_IADD, s, s, *vs[j]); j = j + 1usize; }
+  let fsum = b.vreg(CLASS_F64);
+  b.opImm(IR_FCONST, fsum, NO_REG, 0u64);
+  j = 0usize;
+  while j < fs.len() { b.op3(IR_FADD, fsum, fsum, *fs[j]); j = j + 1usize; }
+  b.opImm(IR_ARG_SET, NO_REG, s, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, fsum, 1u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn gateFn() Func {
+  var b = FuncBuilder.make("gate", 1u32, 0u64);
+  b.needOut(1u32);
+  let r = b.vreg(CLASS_INT);
+  b.sited(IR_GATE, 1u64, 0x55u64);
+  b.opImm(IR_OUT_GET, r, NO_REG, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.ret();
+  take(&mut b)
+}
+
+fn fuelFn() Func {
+  var b = FuncBuilder.make("fuel", 1u32, 0u64);
+  b.sited(IR_FUEL, 5u64, 0x66u64);
+  b.ret();
+  take(&mut b)
+}
+
+// Runs function 'func' of 'lc' through the wrapper; the trap kind, the mask, and the area afterwards
+struct Hosted { trap: u64; mask: u64; area: List[u64]; }
+
+fn hosted(w: &LoadedCode, lc: &LoadedCode, func: u32, args: List[u64], fuel: u64, refuse: bool) Hosted {
+  var area = List[u64]();
+  area.push(u64.from(lc.entryAddress()));
+  area.push(0xFFFFFFFFFFFFFFFFu64);
+  var i = 0usize;
+  while i < args.len() { area.push(*args[i]); i = i + 1usize; }
+  var flag = if refuse { 1u64 } else { 0u64 };
+  var ctx = NativeCtx(&testGate as usize, fuel, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, (&mut flag as *u8) as usize);
+  let t = w.call(&mut ctx, func, area.viewMut());
+  let mask = *area[1usize];
+  var rest = List[u64]();
+  i = 2usize;
+  while i < area.len() { rest.push(*area[i]); i = i + 1usize; }
+  Hosted(t, mask, rest)
+}
+
+fn suite(o: &Options) List[String] {
+  var fails = List[String]();
+  var fs = Funcs();
+  fs.push(addFn());      // 0
+  fs.push(unrFn());      // 1
+  fs.push(busyFn());     // 2
+  fs.push(gateFn());     // 3
+  fs.push(fuelFn());     // 4
+  let mcw = wrapper(hostAbi() == Abi.Win64);
+  let wl = match load(&mcw) { case let Ok(x) { x } case let Err(e) { print <- "wrapper: ", e, "\n"; return fails; } };
+  let mcr = match compileX64With(&fs, hostAbi(), o) { case let Ok(x) { x } case let Err(e) { print <- "compile: ", e, "\n"; return fails; } };
+  let lc = match load(&mcr) { case let Ok(x) { x } case let Err(e) { print <- "load: ", e, "\n"; return fails; } };
+
+  // a normal run: the rounding is to nearest although the host rounds toward zero, and nothing of the host's has changed
+  let one = 1.0;
+  let tiny = 1.6653345369377348e-16;       // 1.5 * 2^-53: past half an ulp of 1.0, so nearest rounds up and zero rounds down
+  var args = List[u64]();
+  args.push(one.bits()); args.push(tiny.bits());
+  let r = hosted(&wl, &lc, 0u32, args, 1000u64, false);
+  if r.trap != 0u64 { fails.push(String.from("a normal run returns 0")); }
+  if r.mask != 0u64 { fails.push(String.from("a normal run changes nothing of the host's")); }
+  if *r.area[0usize] != (one + tiny).bits() { fails.push(String.from("the generated code rounds to nearest whatever the host's MXCSR")); }
+  // a run that uses every register
+  var a2 = List[u64]();
+  a2.push(5u64); a2.push(0u64);
+  let b = hosted(&wl, &lc, 2u32, a2, 1000u64, false);
+  // ten ints (5 + i) sum to 105; ten floats 2 * 5.0 sum to 100
+  if b.trap != 0u64 || b.mask != 0u64 || *b.area[0usize] != 105u64 || *b.area[1usize] != (100.0).bits() { fails.push(String.from("a run that uses every register restores them")); }
+  // each kind of trap
+  var i = 0u32;
+  var bad = 0u32;
+  while i < 1000u32 {
+    let u = hosted(&wl, &lc, 1u32, List[u64](), 1000u64, false);
+    if u.trap != TRAP_UNREACHABLE || u.mask != 0u64 { bad = bad + 1u32; }
+    let g = hosted(&wl, &lc, 3u32, List[u64](), 1000u64, true);
+    if g.trap != TRAP_GATE || g.mask != 0u64 { bad = bad + 1u32; }
+    let f = hosted(&wl, &lc, 4u32, List[u64](), 3u64, false);
+    if f.trap != TRAP_FUEL || f.mask != 0u64 { bad = bad + 1u32; }
+    i = i + 1u32;
+  }
+  if bad > 0u32 { fails.push(String.from("a trap hands back every register, the frame and MXCSR")); }
+  fails
+}
+
+fn caught(name: &str, o: &Options) {
+  let f = suite(o);
+  expect(f.len() > 0usize, name);
+  var i = 0usize;
+  while i < f.len() && i < 2usize { print <- "mutant ", name, " is caught by: ", f[i], "\n"; i = i + 1usize; }
+}
+
+fn main() i32 {
+  let o = defaultOptions();
+  let f = suite(&o);
+  var i = 0usize;
+  while i < f.len() { print <- "FAILED: ", f[i], "\n"; i = i + 1usize; }
+  expectInt(i64.from(f.len()), 0i64, "the host's registers, frame and MXCSR come back");
+  var m1 = defaultOptions();
+  m1.mutant = MUT_NO_MXCSR_SET;
+  caught("entry stub does not set MXCSR", &m1);
+  var m2 = defaultOptions();
+  m2.mutant = MUT_NO_MXCSR_RESTORE;
+  caught("stub does not restore MXCSR", &m2);
+  var m3 = defaultOptions();
+  m3.mutant = MUT_NO_R12_RESTORE;
+  caught("stub does not restore r12", &m3);
+  done()
+}

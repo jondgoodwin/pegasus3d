@@ -1,0 +1,252 @@
+// The machine-code container: its stored form round-trips, every kind of damage is refused, a decoded container loads and
+// runs, code for another ABI is not loaded, freed code is not run, and the bytes of two small programs are pinned (a
+// golden checksum for each ABI), so a change to what the compiler emits shows up here and in any cache key made from it.
+
+mod container;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import codegen use *;
+
+fn take(b: &mut FuncBuilder) Func {
+  var f = Func(String(), List[u8](), List[Block](), 0u32, 0u32, 0u64);
+  f <-> b.func;
+  f
+}
+
+// f0(a, b) = f1(a, b) + 7;  f1(a, b) = a * b
+fn program() Funcs {
+  var fs = Funcs();
+  var b0 = FuncBuilder.make("f0", 2u32, 0x100u64);
+  b0.needOut(2u32);
+  let a = b0.vreg(CLASS_INT);
+  let b = b0.vreg(CLASS_INT);
+  let r = b0.vreg(CLASS_INT);
+  let seven = b0.vreg(CLASS_INT);
+  b0.opImm(IR_ARG_GET, a, NO_REG, 0u64);
+  b0.opImm(IR_ARG_GET, b, NO_REG, 1u64);
+  b0.opImm(IR_OUT_SET, NO_REG, a, 0u64);
+  b0.opImm(IR_OUT_SET, NO_REG, b, 1u64);
+  b0.sited(IR_CALL, 1u64, 0x101u64);
+  b0.opImm(IR_OUT_GET, r, NO_REG, 0u64);
+  b0.opImm(IR_ICONST, seven, NO_REG, 7u64);
+  b0.op3(IR_IADD, r, r, seven);
+  b0.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b0.ret();
+  fs.push(take(&mut b0));
+  var b1 = FuncBuilder.make("f1", 2u32, 0x200u64);
+  let x = b1.vreg(CLASS_INT);
+  let y = b1.vreg(CLASS_INT);
+  let z = b1.vreg(CLASS_INT);
+  b1.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+  b1.opImm(IR_ARG_GET, y, NO_REG, 1u64);
+  b1.op3(IR_IMUL, z, x, y);
+  b1.opImm(IR_ARG_SET, NO_REG, z, 0u64);
+  b1.ret();
+  fs.push(take(&mut b1));
+  fs
+}
+
+// A float program with a fuel charge and a gate call, for more of the code to be pinned
+fn program2() Funcs {
+  var fs = Funcs();
+  var b = FuncBuilder.make("g", 2u32, 0x300u64);
+  b.needOut(2u32);
+  let x = b.vreg(CLASS_F64);
+  let y = b.vreg(CLASS_F64);
+  let m = b.vreg(CLASS_F64);
+  let n = b.vreg(CLASS_F64);
+  let c = b.vreg(CLASS_INT);
+  let r = b.vreg(CLASS_F64);
+  let t = b.block();
+  let f = b.block();
+  b.opImm(IR_ARG_GET, x, NO_REG, 0u64);
+  b.opImm(IR_ARG_GET, y, NO_REG, 1u64);
+  b.sited(IR_FUEL, 2u64, 0x301u64);
+  b.op3(IR_FMIN, m, x, y);
+  b.op3(IR_FMAX, n, x, y);
+  b.cmp(IR_FCMP, CC_LT, c, m, n);
+  b.br(c, t, f);
+  b.at(t);
+  b.op3(IR_FSUB, r, n, m);
+  b.opImm(IR_OUT_SET, NO_REG, r, 0u64);
+  b.sited(IR_GATE, 3u64, 0x302u64);
+  b.opImm(IR_OUT_GET, r, NO_REG, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.ret();
+  b.at(f);
+  b.opImm(IR_FSQRT, r, m, 0u64);
+  b.opImm(IR_ARG_SET, NO_REG, r, 0u64);
+  b.ret();
+  fs.push(take(&mut b));
+  fs
+}
+
+fn other(abi: Abi) Abi { if abi == Abi.Win64 { Abi.SysV } else { Abi.Win64 } }
+
+fn same(a: &MachineCode, b: &MachineCode) bool {
+  if a.abi != b.abi || a.entryOffset != b.entryOffset { return false; }
+  if a.bytes.len() != b.bytes.len() || a.funcOffsets.len() != b.funcOffsets.len() || a.traps.len() != b.traps.len() { return false; }
+  if a.key.len() != b.key.len() { return false; }
+  var i = 0usize;
+  while i < a.bytes.len() { if *a.bytes[i] != *b.bytes[i] { return false; } i = i + 1usize; }
+  i = 0usize;
+  while i < a.funcOffsets.len() {
+    if *a.funcOffsets[i] != *b.funcOffsets[i] || *a.funcSizes[i] != *b.funcSizes[i] || *a.nAreas[i] != *b.nAreas[i] { return false; }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < a.traps.len() {
+    if a.traps[i].offset != b.traps[i].offset || a.traps[i].kind != b.traps[i].kind || a.traps[i].site != b.traps[i].site { return false; }
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < a.key.len() { if *a.key[i] != *b.key[i] { return false; } i = i + 1usize; }
+  true
+}
+
+// the stored form with its checksum made right again after a change
+fn reseal(d: &mut List[u8]) {
+  let n = d.len() - 8usize;
+  let sum = checksum(d.view(), n);
+  var i = 0usize;
+  while i < 8usize { d.set(n + i, u8.from((sum >> u64.from(i * 8usize)) & 0xFFu64)); i = i + 1usize; }
+}
+
+fn hex(x: u64) String { var s = String(); s.appendHex(x, 16usize); s }
+
+fn main() i32 {
+  let abi = hostAbi();
+  let fs = program();
+  match compileX64(&fs, abi) {
+    case let Err(e) { expect(false, "the program compiles"); }
+    case let Ok(mc0) {
+      var mc = mc0;
+      mc.key.push(1u8); mc.key.push(2u8); mc.key.push(250u8);
+      let stored = encode(&mc);
+      // the stored form round-trips
+      match decode(stored.view()) {
+        case let Err(e) { expect(false, "the stored form reads back"); print <- e, "\n"; }
+        case let Ok(back) {
+          expect(same(&mc, &back), "the container reads back as it was");
+          expectUInt(u64.from(back.funcOffsets.len()), 2u64, "two functions");
+          expectUInt(u64.from(*back.nAreas[0usize]), 2u64, "their areas");
+          expect(back.traps.len() > 0usize, "the trap table is carried");
+          // and the decoded one runs
+          match load(&back) {
+            case let Err(e) { expect(false, "the decoded container loads"); }
+            case let Ok(lc) {
+              var ctx = NativeCtx(0usize, 1000u64, MAX_CALL_DEPTH - 1u64, 0usize, 0usize, 0u64, 0usize);
+              var area = List[u64]();
+              area.push(6u64); area.push(7u64);
+              let t = lc.call(&mut ctx, 0u32, area.viewMut());
+              expectUInt(t, 0u64, "the decoded code runs to the end");
+              expectUInt(*area[0usize], 49u64, "6 * 7 + 7");
+              var short = List[u64]();
+              short.push(1u64);
+              expectUInt(lc.call(&mut ctx, 0u32, short.viewMut()), TRAP_BADFUNC, "an area too short for the function is refused");
+              expectUInt(lc.call(&mut ctx, 5u32, area.viewMut()), TRAP_BADFUNC, "a function the container lacks is refused");
+              var lc2 = lc;
+              lc2.free();
+              expectUInt(lc2.call(&mut ctx, 0u32, area.viewMut()), TRAP_BADFUNC, "freed code is not run");
+              lc2.free();
+            }
+          }
+        }
+      }
+
+      // damage: every single flipped bit anywhere in the stored form is refused
+      var refused = 0u32;
+      var i = 0usize;
+      while i < stored.len() {
+        var d = List[u8]();
+        var j = 0usize;
+        while j < stored.len() { d.push(*stored[j]); j = j + 1usize; }
+        d.set(i, *stored[i] ^ (1u8 << u8.from(i % 8usize)));
+        if decode(d.view()) is Err { refused = refused + 1u32; }
+        i = i + 1usize;
+      }
+      expectUInt(u64.from(refused), u64.from(stored.len()), "every flipped bit is refused");
+      // and every truncation
+      var cut = 0u32;
+      i = 0usize;
+      while i < stored.len() {
+        var d = List[u8]();
+        var j = 0usize;
+        while j < i { d.push(*stored[j]); j = j + 1usize; }
+        if decode(d.view()) is Err { cut = cut + 1u32; }
+        i = i + 1usize;
+      }
+      expectUInt(u64.from(cut), u64.from(stored.len()), "every truncation is refused");
+
+      // changes that keep the checksum right are refused for what they say
+      var d1 = List[u8]();
+      i = 0usize;
+      while i < stored.len() { d1.push(*stored[i]); i = i + 1usize; }
+      d1.set(4usize, 9u8);
+      reseal(&mut d1);
+      expect(decode(d1.view()) is Err, "another major version is refused");
+      var d2 = List[u8]();
+      i = 0usize;
+      while i < stored.len() { d2.push(*stored[i]); i = i + 1usize; }
+      d2.set(6usize, 5u8);
+      reseal(&mut d2);
+      expect(decode(d2.view()) is Err, "a newer minor version is refused");
+      var d3 = List[u8]();
+      i = 0usize;
+      while i < stored.len() { d3.push(*stored[i]); i = i + 1usize; }
+      d3.set(8usize, 7u8);
+      reseal(&mut d3);
+      expect(decode(d3.view()) is Err, "an unknown target is refused");
+      var d4 = List[u8]();
+      i = 0usize;
+      while i < stored.len() { d4.push(*stored[i]); i = i + 1usize; }
+      d4.set(0usize, 'X');
+      reseal(&mut d4);
+      expect(decode(d4.view()) is Err, "a wrong magic is refused");
+      // the entry offset (after the 3-byte key it is at 9 + 4 + 3) pointing outside the code
+      var d5 = List[u8]();
+      i = 0usize;
+      while i < stored.len() { d5.push(*stored[i]); i = i + 1usize; }
+      d5.set(16usize, 0xFFu8); d5.set(17usize, 0xFFu8); d5.set(18usize, 0xFFu8); d5.set(19usize, 0x7Fu8);
+      reseal(&mut d5);
+      expect(decode(d5.view()) is Err, "an entry offset outside the code is refused");
+      expect(decode(List[u8]().view()) is Err, "nothing at all is refused");
+
+      // code for the other ABI compiles, but this machine will not load it
+      match compileX64(&fs, other(abi)) {
+        case let Err(e) { expect(false, "the program compiles for the other ABI"); }
+        case let Ok(foreign) {
+          expect(load(&foreign) is Err, "code for the other ABI is not loaded");
+          var differs = foreign.bytes.len() != mc.bytes.len();
+          var k = 0usize;
+          while !differs && k < mc.bytes.len() { if *foreign.bytes[k] != *mc.bytes[k] { differs = true; } k = k + 1usize; }
+          expect(differs, "the two ABIs' code differs (the stub, the gate's registers)");
+        }
+      }
+    }
+  }
+
+  // the bytes of two small programs, for each ABI, pinned: a change in the compiler's output shows here
+  var abis = List[Abi]();
+  abis.push(Abi.Win64);
+  abis.push(Abi.SysV);
+  var a = 0usize;
+  while a < 2usize {
+    let ab = if a == 0usize { Abi.Win64 } else { Abi.SysV };
+    let name = if a == 0usize { "win64" } else { "sysv" };
+    let p1 = program();
+    match compileX64(&p1, ab) {
+      case let Ok(mc) { print <- "program ", name, " ", mc.bytes.len(), " bytes, checksum ", hex(checksum(mc.bytes.view(), mc.bytes.len())), "\n"; }
+      case let Err(e) { expect(false, "program compiles"); }
+    }
+    let p2 = program2();
+    match compileX64(&p2, ab) {
+      case let Ok(mc) { print <- "program2 ", name, " ", mc.bytes.len(), " bytes, checksum ", hex(checksum(mc.bytes.view(), mc.bytes.len())), "\n"; }
+      case let Err(e) { expect(false, "program2 compiles"); }
+    }
+    a = a + 1usize;
+  }
+  done()
+}

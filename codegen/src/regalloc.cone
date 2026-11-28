@@ -1,0 +1,290 @@
+// The register allocator (design section 5): liveness by backward dataflow to a fixpoint, one interval per vreg in
+// layout order, and a linear scan (Poletto and Sarkar) over two register files. A vreg whose interval spans a call op
+// (IR_CALL, IR_GATE) is given a stack slot, never a register, so no register is saved around a call. The output is a
+// location per vreg: a register or a spill slot. The register files are passed in a struct, so another target (ARM64)
+// reuses all of this with its own.
+//
+// Positions: instruction n of the function, counted over the blocks in layout order, reads its operands at point 2n and
+// writes its result at point 2n+1. An interval is the inclusive hull [lo, hi] of the points where its vreg is read or
+// written, and of the whole of every block it is live into or out of. Two intervals that share no point may share a
+// register, so an operand's last read at 2n and the result written at 2n+1 can use one register: the emitter's templates
+// allow the destination to be either source.
+
+pub const LOC_NONE = 0u8;      // the vreg is never mentioned
+pub const LOC_REG = 1u8;       // n is the register number
+pub const LOC_SPILL = 2u8;     // n is the spill slot
+
+pub struct Loc {
+  pub kind: u8;
+  pub n: u32;
+}
+
+// The allocatable registers of each class, in the order they are preferred
+pub struct RegFile {
+  pub ints: List[u8];
+  pub floats: List[u8];
+}
+
+pub struct Allocation {
+  pub locs: List[Loc];          // by vreg
+  pub lo: List[u32];            // by vreg: the first point of its interval (lo > hi when never mentioned)
+  pub hi: List[u32];
+  pub nSpill: u32;
+}
+
+// The registers x64 gives the allocator: rax rcx rdx rbx rsi rdi r8 r9 r12 r13, and xmm0-xmm13. r10, r11, xmm14 and xmm15
+// are the emitter's scratch; r14 holds fuel, r15 the context, rbp the frame, rsp the stack.
+pub fn x64RegFile() RegFile {
+  var r = RegFile(List[u8](), List[u8]());
+  r.ints.push(0u8); r.ints.push(1u8); r.ints.push(2u8); r.ints.push(3u8); r.ints.push(6u8);
+  r.ints.push(7u8); r.ints.push(8u8); r.ints.push(9u8); r.ints.push(12u8); r.ints.push(13u8);
+  var x = 0u8;
+  while x < 14u8 { r.floats.push(x); x = x + 1u8; }
+  r
+}
+
+// ---- what an instruction reads and writes ----
+pub struct Uses {
+  pub a: u32;
+  pub b: u32;
+  pub c: u32;
+}
+
+// The vregs an instruction reads (NO_REG for none)
+pub fn usesOf(i: &Inst) Uses {
+  let op = i.op;
+  if op == IR_MOV || op == IR_FSQRT || op == IR_FNEG || op == IR_FABS || op == IR_I2F || op == IR_LOAD
+     || op == IR_ARG_SET || op == IR_OUT_SET || op == IR_BR {
+    return Uses(i.a, NO_REG, NO_REG);
+  }
+  if (op >= IR_IADD && op <= IR_ICMP) || (op >= IR_FADD && op <= IR_FDIV) || op == IR_FMIN || op == IR_FMAX
+     || op == IR_FCMP || op == IR_STORE {
+    return Uses(i.a, i.b, NO_REG);
+  }
+  if op == IR_SELECT { return Uses(i.a, i.b, i.c); }
+  Uses(NO_REG, NO_REG, NO_REG)
+}
+
+// The vreg an instruction writes (NO_REG for none)
+pub fn defOf(i: &Inst) u32 {
+  let op = i.op;
+  if op == IR_MOV || op == IR_ICONST || op == IR_FCONST || (op >= IR_IADD && op <= IR_ICMP) || (op >= IR_FADD && op <= IR_I2F)
+     || op == IR_SELECT || op == IR_LOAD || op == IR_ARG_GET || op == IR_OUT_GET {
+    return i.dst;
+  }
+  NO_REG
+}
+
+pub fn isTerminator(op: u8) bool { op == IR_JMP || op == IR_BR || op == IR_RET || op == IR_TRAP }
+pub fn isCall(op: u8) bool { op == IR_CALL || op == IR_GATE }
+
+// ---- bit sets over vregs ----
+fn bitGet(s: &List[u64], base: usize, v: u32) bool {
+  let w = *s[base + usize.from(v >> 6u32)];
+  ((w >> u64.from(v & 63u32)) & 1u64) != 0u64
+}
+fn bitSet(s: &mut List[u64], base: usize, v: u32) {
+  let at = base + usize.from(v >> 6u32);
+  let w = *s[at];
+  s.set(at, w | (1u64 << u64.from(v & 63u32)));
+}
+
+// The blocks a block can go to next
+fn succs(f: &Func, b: usize, out: &mut List[u32]) {
+  out.clear();
+  let insts = &f.blocks[b].insts;
+  if insts.len() == 0usize { return; }
+  let last = &insts[insts.len() - 1usize];
+  if last.op == IR_JMP { out.push(last.t); }
+  else if last.op == IR_BR { out.push(last.t); out.push(last.f); }
+}
+
+fn extend(lo: &mut List[u32], hi: &mut List[u32], v: u32, p: u32) {
+  let i = usize.from(v);
+  if p < *lo[i] { lo.set(i, p); }
+  if p > *hi[i] { hi.set(i, p); }
+}
+
+// Liveness, intervals, then the scan. The function must be well formed (validate in x64.cone checks that).
+pub fn allocate(f: &Func, rf: &RegFile) Allocation {
+  let nv = f.classes.len();
+  let nb = f.blocks.len();
+  let nw = nv / 64usize + 1usize;
+
+  // gen: read before any write in the block; kill: written in the block
+  var gen = List[u64]();
+  gen.resize(nb * nw, 0u64);
+  var kill = List[u64]();
+  kill.resize(nb * nw, 0u64);
+  var b = 0usize;
+  while b < nb {
+    let insts = &f.blocks[b].insts;
+    var n = 0usize;
+    while n < insts.len() {
+      let i = &insts[n];
+      let u = usesOf(i);
+      if u.a != NO_REG && !bitGet(&kill, b * nw, u.a) { bitSet(&mut gen, b * nw, u.a); }
+      if u.b != NO_REG && !bitGet(&kill, b * nw, u.b) { bitSet(&mut gen, b * nw, u.b); }
+      if u.c != NO_REG && !bitGet(&kill, b * nw, u.c) { bitSet(&mut gen, b * nw, u.c); }
+      let d = defOf(i);
+      if d != NO_REG { bitSet(&mut kill, b * nw, d); }
+      n = n + 1usize;
+    }
+    b = b + 1usize;
+  }
+
+  // live-out(b) = union of live-in(successors); live-in(b) = gen(b) + (live-out(b) - kill(b)); until nothing changes
+  var liveIn = List[u64]();
+  liveIn.resize(nb * nw, 0u64);
+  var liveOut = List[u64]();
+  liveOut.resize(nb * nw, 0u64);
+  var next = List[u32]();
+  var changed = true;
+  while changed {
+    changed = false;
+    b = nb;
+    while b > 0usize {
+      b = b - 1usize;
+      succs(f, b, &mut next);
+      var w = 0usize;
+      while w < nw {
+        var o = 0u64;
+        var s = 0usize;
+        while s < next.len() { o = o | *liveIn[usize.from(*next[s]) * nw + w]; s = s + 1usize; }
+        let ni = *gen[b * nw + w] | (o & ~*kill[b * nw + w]);
+        if o != *liveOut[b * nw + w] { liveOut.set(b * nw + w, o); changed = true; }
+        if ni != *liveIn[b * nw + w] { liveIn.set(b * nw + w, ni); changed = true; }
+        w = w + 1usize;
+      }
+    }
+  }
+
+  // intervals, and where the calls are
+  var lo = List[u32]();
+  lo.resize(nv, 0xFFFFFFFFu32);
+  var hi = List[u32]();
+  hi.resize(nv, 0u32);
+  var n = 0u32;
+  b = 0usize;
+  while b < nb {
+    let insts = &f.blocks[b].insts;
+    let start = n;
+    var k = 0usize;
+    while k < insts.len() {
+      let i = &insts[k];
+      let u = usesOf(i);
+      if u.a != NO_REG { extend(&mut lo, &mut hi, u.a, 2u32 * n); }
+      if u.b != NO_REG { extend(&mut lo, &mut hi, u.b, 2u32 * n); }
+      if u.c != NO_REG { extend(&mut lo, &mut hi, u.c, 2u32 * n); }
+      let d = defOf(i);
+      if d != NO_REG { extend(&mut lo, &mut hi, d, 2u32 * n + 1u32); }
+      n = n + 1u32;
+      k = k + 1usize;
+    }
+    // whatever is live into the block is live from its first point, and out of it to its last
+    if insts.len() > 0usize {
+      var v = 1u32;
+      while usize.from(v) < nv {
+        if bitGet(&liveIn, b * nw, v) { extend(&mut lo, &mut hi, v, 2u32 * start); }
+        if bitGet(&liveOut, b * nw, v) { extend(&mut lo, &mut hi, v, 2u32 * (n - 1u32) + 1u32); }
+        v = v + 1u32;
+      }
+    }
+    b = b + 1usize;
+  }
+  // cb[n] = how many of the instructions 0 ..< n are calls
+  var cb = List[u32]();
+  var running = 0u32;
+  b = 0usize;
+  cb.push(0u32);
+  while b < nb {
+    let insts = &f.blocks[b].insts;
+    var k = 0usize;
+    while k < insts.len() {
+      if isCall(insts[k].op) { running = running + 1u32; }
+      cb.push(running);
+      k = k + 1usize;
+    }
+    b = b + 1usize;
+  }
+
+  // the scan, over each class in order of interval start (ties by vreg number, so the result is the same every time)
+  var locs = List[Loc]();
+  locs.resize(nv, Loc(LOC_NONE, 0u32));
+  var nSpill = 0u32;
+  var cls = 0u8;
+  while cls < 2u8 {
+    var order = List[u64]();
+    var v = 1usize;
+    while v < nv {
+      if *f.classes[v] == cls && *lo[v] <= *hi[v] { order.push((u64.from(*lo[v]) << 32u64) | u64.from(v)); }
+      v = v + 1usize;
+    }
+    order.sortBy((x, y) => x <=> y);
+    var regs = List[u8]();
+    var rcopy = 0usize;
+    let rsrc = if cls == CLASS_INT { rf.ints.len() } else { rf.floats.len() };
+    while rcopy < rsrc { regs.push(if cls == CLASS_INT { *rf.ints[rcopy] } else { *rf.floats[rcopy] }); rcopy = rcopy + 1usize; }
+    var busy = List[bool]();
+    busy.resize(regs.len(), false);
+    // active intervals: their end, vreg and the index in the register file they hold
+    var actHi = List[u32]();
+    var actV = List[u32]();
+    var actR = List[u32]();
+    var q = 0usize;
+    while q < order.len() {
+      let vr = u32.from(*order[q] & 0xFFFFFFFFu64);
+      let vi = usize.from(vr);
+      let l = *lo[vi];
+      let h = *hi[vi];
+      q = q + 1usize;
+      // expire what ended before this one starts
+      var x = 0usize;
+      while x < actHi.len() {
+        if *actHi[x] < l {
+          busy.set(usize.from(*actR[x]), false);
+          actHi.remove(x); actV.remove(x); actR.remove(x);
+        } else { x = x + 1usize; }
+      }
+      // across a call: memory
+      let first = (l + 1u32) / 2u32;
+      let last = if h >= 1u32 { (h - 1u32) / 2u32 } else { 0u32 };
+      if h >= 1u32 && last >= first && *cb[usize.from(last) + 1usize] - *cb[usize.from(first)] > 0u32 {
+        locs.set(vi, Loc(LOC_SPILL, nSpill));
+        nSpill = nSpill + 1u32;
+        continue;
+      }
+      // the first free register in the file's order
+      var free = regs.len();
+      var r = 0usize;
+      while r < regs.len() { if !*busy[r] { free = r; break; } r = r + 1usize; }
+      if free < regs.len() {
+        busy.set(free, true);
+        locs.set(vi, Loc(LOC_REG, u32.from(*regs[free])));
+        actHi.push(h); actV.push(vr); actR.push(u32.from(free));
+        continue;
+      }
+      // none free: whichever of the active ones and this one ends last goes to memory
+      var far = actHi.len();          // an index into the active lists; len() means "this one"
+      var farHi = h;
+      var y = 0usize;
+      while y < actHi.len() {
+        if *actHi[y] > farHi { farHi = *actHi[y]; far = y; }
+        y = y + 1usize;
+      }
+      if far == actHi.len() {
+        locs.set(vi, Loc(LOC_SPILL, nSpill));
+        nSpill = nSpill + 1u32;
+      } else {
+        let victim = usize.from(*actV[far]);
+        let ridx = *actR[far];
+        locs.set(victim, Loc(LOC_SPILL, nSpill));
+        nSpill = nSpill + 1u32;
+        locs.set(vi, Loc(LOC_REG, u32.from(*regs[usize.from(ridx)])));
+        actHi.set(far, h); actV.set(far, vr);
+      }
+    }
+    cls = cls + 1u8;
+  }
+  Allocation(locs, lo, hi, nSpill)
+}

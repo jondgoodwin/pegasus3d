@@ -1,0 +1,476 @@
+// Every instruction form the x64 encoder makes, over the registers and addressing modes that change its REX, ModRM and SIB
+// bytes. The test prints one line per case: the bytes, a bar, and the text LLVM must show for them. The comparison
+// with LLVM is tests\check-encodings.ps1 (llvm-mc --disassemble); the .out file pins the bytes, so a change to the
+// encoder shows here at once and the script then says whether it is still right.
+
+mod encodings;
+
+import testing use *;
+import stdio use *;
+import collections use *;
+import codegen use *;
+
+fn n64(r: u8) &str {
+  let names = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+  names[usize.from(r)]
+}
+fn n32(r: u8) &str {
+  let names = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"];
+  names[usize.from(r)]
+}
+fn n8(r: u8) &str {
+  let names = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"];
+  names[usize.from(r)]
+}
+fn nx(r: u8) &str {
+  let names = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
+               "xmm13", "xmm14", "xmm15"];
+  names[usize.from(r)]
+}
+fn ccName(cc: u8) &str {
+  if cc == XC_B { "b" } else if cc == XC_AE { "ae" } else if cc == XC_E { "e" } else if cc == XC_NE { "ne" }
+  else if cc == XC_BE { "be" } else if cc == XC_A { "a" } else if cc == XC_P { "p" } else if cc == XC_NP { "np" }
+  else if cc == XC_L { "l" } else if cc == XC_GE { "ge" } else if cc == XC_LE { "le" } else { "g" }
+}
+fn aluName(op: u8) &str {
+  if op == ALU_ADD { "add" } else if op == ALU_OR { "or" } else if op == ALU_AND { "and" } else if op == ALU_SUB { "sub" }
+  else if op == ALU_XOR { "xor" } else { "cmp" }
+}
+
+// LLVM's Intel syntax for a memory operand's address
+fn addr(m: Mem) String {
+  var s = String();
+  s <- "["; s <- n64(m.base);
+  if m.index != NOREG {
+    s <- " + ";
+    if m.scale > 1u8 { s <- u64.from(m.scale); s <- "*"; }
+    s <- n64(m.index);
+  }
+  if m.disp > 0 { s <- " + "; s <- i64.from(m.disp); }
+  else if m.disp < 0 { s <- " - "; s <- 0i64 - i64.from(m.disp); }
+  s <- "]";
+  s
+}
+fn sized(prefix: &str, m: Mem) String { var s = String.from(prefix); s <- addr(m).view(); s }
+fn q(m: Mem) String { sized("qword ptr ", m) }
+fn dw(m: Mem) String { sized("dword ptr ", m) }
+fn xw(m: Mem) String { sized("xmmword ptr ", m) }
+
+// One case: all the bytes the encoder made (or the first 'n' of them), then the expected text
+fn line(a: &Asm, n: usize, text: String) {
+  var s = String();
+  var i = 0usize;
+  let total = if n == 0usize { a.code.len() } else { n };
+  while i < total {
+    if i > 0usize { s <- " "; }
+    s.appendHex(u64.from(*a.code[i]), 2usize);
+    i = i + 1usize;
+  }
+  s <- " | ";
+  s <- text.view();
+  print <- s, "\n";
+  expect(total > 0usize, "an instruction has bytes");
+}
+
+// The expected text of the common shapes: "op a, b", "op a", with memory operands already rendered
+fn rr(op: &str, a: &str, b: &str) String { var s = String.from(op); s <- " "; s <- a; s <- ", "; s <- b; s }
+fn r1(op: &str, a: &str) String { var s = String.from(op); s <- " "; s <- a; s }
+fn rm(op: &str, a: &str, m: String) String { var s = String.from(op); s <- " "; s <- a; s <- ", "; s <- m.view(); s }
+fn mr(op: &str, m: String, b: &str) String { var s = String.from(op); s <- " "; s <- m.view(); s <- ", "; s <- b; s }
+fn m1(op: &str, m: String) String { var s = String.from(op); s <- " "; s <- m.view(); s }
+fn jt(cc: u8, rest: &str) String { var s = String.from("j"); s <- ccName(cc); s <- " "; s <- rest; s }
+fn st(cc: u8, r: &str) String { var s = String.from("set"); s <- ccName(cc); s <- " "; s <- r; s }
+
+fn mems() List[Mem] {
+  var l = List[Mem]();
+  let bases = [RAX, RCX, RSP, RBP, RSI, R8, R12, R13, R15];
+  let disps = [0, 8, -8, 128, -200];
+  var i = 0usize;
+  while i < 9usize {
+    var j = 0usize;
+    while j < 5usize {
+      l.push(mbase(bases[i], disps[j]));
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+  // with an index and each scale
+  let ibases = [RAX, RSP, R12, R13];
+  let idx = [RBX, R9];
+  let scales = [1u8, 2u8, 4u8, 8u8];
+  let sd = [0, 16, 1000];
+  i = 0usize;
+  while i < 4usize {
+    var j = 0usize;
+    while j < 2usize {
+      var k = 0usize;
+      while k < 4usize {
+        var d = 0usize;
+        while d < 3usize { l.push(mindex(ibases[i], idx[j], scales[k], sd[d])); d = d + 1usize; }
+        k = k + 1usize;
+      }
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+  l
+}
+
+fn main() i32 {
+  let regs = [RAX, RCX, RSP, RBP, RSI, R8, R12, R13, R15];
+  let all = [RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15];
+  let ms = mems();
+
+  // mov r64, r64 over every pair
+  var i = 0usize;
+  while i < 16usize {
+    var j = 0usize;
+    while j < 16usize {
+      var a = Asm.make();
+      a.movRR(all[i], all[j]);
+      line(&a, 0usize, rr("mov", n64(all[i]), n64(all[j])));
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+
+  // the register-register forms over the representative registers
+  let alus = [ALU_ADD, ALU_OR, ALU_AND, ALU_SUB, ALU_XOR, ALU_CMP];
+  var o = 0usize;
+  while o < 6usize {
+    i = 0usize;
+    while i < 9usize {
+      var j = 0usize;
+      while j < 9usize {
+        var a = Asm.make();
+        a.aluRR(alus[o], regs[i], regs[j]);
+        line(&a, 0usize, rr(aluName(alus[o]), n64(regs[i]), n64(regs[j])));
+        j = j + 1usize;
+      }
+      i = i + 1usize;
+    }
+    o = o + 1usize;
+  }
+  i = 0usize;
+  while i < 9usize {
+    var j = 0usize;
+    while j < 9usize {
+      var a = Asm.make();
+      a.imulRR(regs[i], regs[j]);
+      line(&a, 0usize, rr("imul", n64(regs[i]), n64(regs[j])));
+      var t = Asm.make();
+      t.testRR(regs[i], regs[j]);
+      line(&t, 0usize, rr("test", n64(regs[i]), n64(regs[j])));
+      var c = Asm.make();
+      c.cmovRR(XC_NE, regs[i], regs[j]);
+      line(&c, 0usize, rr("cmovne", n64(regs[i]), n64(regs[j])));
+      var x = Asm.make();
+      x.cmovRR(XC_E, regs[i], regs[j]);
+      line(&x, 0usize, rr("cmove", n64(regs[i]), n64(regs[j])));
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+
+  // and / or on bytes, as the compare templates combine two flags; movzx from a byte register
+  let byteRegs = [RAX, RCX, RSP, RBP, RSI, RDI, R8, R10, R11, R15];
+  i = 0usize;
+  while i < 10usize {
+    var j = 0usize;
+    while j < 10usize {
+      var a = Asm.make();
+      a.alu8RR(ALU_AND, byteRegs[i], byteRegs[j]);
+      line(&a, 0usize, rr("and", n8(byteRegs[i]), n8(byteRegs[j])));
+      var b = Asm.make();
+      b.alu8RR(ALU_OR, byteRegs[i], byteRegs[j]);
+      line(&b, 0usize, rr("or", n8(byteRegs[i]), n8(byteRegs[j])));
+      var m = Asm.make();
+      m.movzx8(byteRegs[i], byteRegs[j]);
+      line(&m, 0usize, rr("movzx", n32(byteRegs[i]), n8(byteRegs[j])));
+      j = j + 1usize;
+    }
+    i = i + 1usize;
+  }
+
+  // setcc over every condition and register
+  let ccs = [XC_B, XC_AE, XC_E, XC_NE, XC_BE, XC_A, XC_P, XC_NP, XC_L, XC_GE, XC_LE, XC_G];
+  var cc = 0usize;
+  while cc < 12usize {
+    i = 0usize;
+    while i < 16usize {
+      var a = Asm.make();
+      a.setcc(ccs[cc], all[i]);
+      line(&a, 0usize, st(ccs[cc], n8(all[i])));
+      i = i + 1usize;
+    }
+    cc = cc + 1usize;
+  }
+
+  // immediates
+  i = 0usize;
+  while i < 16usize {
+    let r = all[i];
+    var a = Asm.make();
+    a.movRI(r, 5u64);
+    line(&a, 0usize, rr("mov", n32(r), "5"));
+    var b = Asm.make();
+    b.movRI(r, 0xFFFFFFFFu64);
+    line(&b, 0usize, rr("mov", n32(r), "4294967295"));
+    var c = Asm.make();
+    c.movRI(r, 0xFFFFFFFFFFFFFFFFu64);
+    line(&c, 0usize, rr("mov", n64(r), "-1"));
+    var d = Asm.make();
+    d.movRI(r, 0xFFFFFFFF80000000u64);
+    line(&d, 0usize, rr("mov", n64(r), "-2147483648"));
+    var e = Asm.make();
+    e.movRI(r, 0x0807060504030201u64);
+    line(&e, 0usize, rr("movabs", n64(r), "578437695752307201"));
+    var f = Asm.make();
+    f.movRI(r, 0x8000000000000000u64);
+    line(&f, 0usize, rr("movabs", n64(r), "-9223372036854775808"));
+    var g = Asm.make();
+    g.movRI(r, 0x100000000u64);
+    line(&g, 0usize, rr("movabs", n64(r), "4294967296"));
+    var h = Asm.make();
+    h.aluRI(ALU_SUB, r, 1);
+    line(&h, 0usize, rr("sub", n64(r), "1"));
+    var k = Asm.make();
+    k.aluRI(ALU_ADD, r, -128);
+    line(&k, 0usize, rr("add", n64(r), "-128"));
+    var l = Asm.make();
+    l.aluRI(ALU_CMP, r, 100000);
+    line(&l, 0usize, rr("cmp", n64(r), "100000"));
+    var m = Asm.make();
+    m.aluRI(ALU_AND, r, -129);
+    line(&m, 0usize, rr("and", n64(r), "-129"));
+    i = i + 1usize;
+  }
+
+  // push, pop, call through a register, and the one-byte forms
+  i = 0usize;
+  while i < 16usize {
+    var a = Asm.make();
+    a.push(all[i]);
+    line(&a, 0usize, r1("push", n64(all[i])));
+    var b = Asm.make();
+    b.pop(all[i]);
+    line(&b, 0usize, r1("pop", n64(all[i])));
+    var c = Asm.make();
+    c.callR(all[i]);
+    line(&c, 0usize, r1("call", n64(all[i])));
+    i = i + 1usize;
+  }
+  var one = Asm.make();
+  one.ret();
+  line(&one, 0usize, String.from("ret"));
+  var lv = Asm.make();
+  lv.leave();
+  line(&lv, 0usize, String.from("leave"));
+
+  // memory forms, for each address
+  var mi = 0usize;
+  while mi < ms.len() {
+    let m = *ms[mi];
+    let rg = [RAX, R9];
+    var r = 0usize;
+    while r < 2usize {
+      let g = rg[r];
+      var a = Asm.make();
+      a.movRM(g, m);
+      line(&a, 0usize, rm("mov", n64(g), q(m)));
+      var b = Asm.make();
+      b.movMR(m, g);
+      line(&b, 0usize, mr("mov", q(m), n64(g)));
+      var c = Asm.make();
+      c.leaRM(g, m);
+      line(&c, 0usize, rm("lea", n64(g), addr(m)));
+      var d = Asm.make();
+      d.aluRM(ALU_ADD, g, m);
+      line(&d, 0usize, rm("add", n64(g), q(m)));
+      var e = Asm.make();
+      e.aluMR(ALU_SUB, m, g);
+      line(&e, 0usize, mr("sub", q(m), n64(g)));
+      var f = Asm.make();
+      f.imulRM(g, m);
+      line(&f, 0usize, rm("imul", n64(g), q(m)));
+      var h = Asm.make();
+      h.cmovRM(XC_NE, g, m);
+      line(&h, 0usize, rm("cmovne", n64(g), q(m)));
+      var k = Asm.make();
+      k.mov32RM(g, m);
+      line(&k, 0usize, rm("mov", n32(g), dw(m)));
+      r = r + 1usize;
+    }
+    var a = Asm.make();
+    a.aluMI(ALU_SUB, m, 1);
+    line(&a, 0usize, mr("sub", q(m), "1"));
+    var b = Asm.make();
+    b.aluMI(ALU_ADD, m, 100000);
+    line(&b, 0usize, mr("add", q(m), "100000"));
+    var c = Asm.make();
+    c.movMI(m, -5);
+    line(&c, 0usize, mr("mov", q(m), "-5"));
+    var d = Asm.make();
+    d.mov32MI(m, 8080u32);
+    line(&d, 0usize, mr("mov", dw(m), "8080"));
+    var e = Asm.make();
+    e.callM(m);
+    line(&e, 0usize, m1("call", q(m)));
+    var f = Asm.make();
+    f.stmxcsr(m);
+    line(&f, 0usize, m1("stmxcsr", dw(m)));
+    var g = Asm.make();
+    g.ldmxcsr(m);
+    line(&g, 0usize, m1("ldmxcsr", dw(m)));
+    mi = mi + 1usize;
+  }
+
+  // scalar SSE2: register-register over a spread of registers, and memory
+  let xr = [0u8, 1u8, 7u8, 8u8, 13u8, 14u8, 15u8];
+  let sseOps = [SSE_ADD, SSE_SUB, SSE_MUL, SSE_DIV, SSE_SQRT, SSE_MIN, SSE_MAX];
+  let sseNames = ["addsd", "subsd", "mulsd", "divsd", "sqrtsd", "minsd", "maxsd"];
+  o = 0usize;
+  while o < 7usize {
+    i = 0usize;
+    while i < 7usize {
+      var j = 0usize;
+      while j < 7usize {
+        var a = Asm.make();
+        a.sseRR(sseOps[o], xr[i], xr[j]);
+        line(&a, 0usize, rr(sseNames[o], nx(xr[i]), nx(xr[j])));
+        j = j + 1usize;
+      }
+      i = i + 1usize;
+    }
+    o = o + 1usize;
+  }
+  i = 0usize;
+  while i < 7usize {
+    var j = 0usize;
+    while j < 7usize {
+      var a = Asm.make();
+      a.movapd(xr[i], xr[j]);
+      line(&a, 0usize, rr("movapd", nx(xr[i]), nx(xr[j])));
+      var b = Asm.make();
+      b.ucomisdRR(xr[i], xr[j]);
+      line(&b, 0usize, rr("ucomisd", nx(xr[i]), nx(xr[j])));
+      var c = Asm.make();
+      c.xorpd(xr[i], xr[j]);
+      line(&c, 0usize, rr("xorpd", nx(xr[i]), nx(xr[j])));
+      var d = Asm.make();
+      d.andpd(xr[i], xr[j]);
+      line(&d, 0usize, rr("andpd", nx(xr[i]), nx(xr[j])));
+      var e = Asm.make();
+      e.orpd(xr[i], xr[j]);
+      line(&e, 0usize, rr("orpd", nx(xr[i]), nx(xr[j])));
+      j = j + 1usize;
+    }
+    // between xmm and general registers
+    var k = 0usize;
+    while k < 9usize {
+      var a = Asm.make();
+      a.movqXR(xr[i], regs[k]);
+      line(&a, 0usize, rr("movq", nx(xr[i]), n64(regs[k])));
+      var b = Asm.make();
+      b.movqRX(regs[k], xr[i]);
+      line(&b, 0usize, rr("movq", n64(regs[k]), nx(xr[i])));
+      var c = Asm.make();
+      c.cvtsi2sdRR(xr[i], regs[k]);
+      line(&c, 0usize, rr("cvtsi2sd", nx(xr[i]), n64(regs[k])));
+      k = k + 1usize;
+    }
+    i = i + 1usize;
+  }
+  mi = 0usize;
+  while mi < ms.len() {
+    let m = *ms[mi];
+    let xs = [0u8, 9u8];
+    var r = 0usize;
+    while r < 2usize {
+      let x = xs[r];
+      var a = Asm.make();
+      a.movsdRM(x, m);
+      line(&a, 0usize, rm("movsd", nx(x), q(m)));
+      var b = Asm.make();
+      b.movsdMR(m, x);
+      line(&b, 0usize, mr("movsd", q(m), nx(x)));
+      var c = Asm.make();
+      c.sseRM(SSE_ADD, x, m);
+      line(&c, 0usize, rm("addsd", nx(x), q(m)));
+      var d = Asm.make();
+      d.ucomisdRM(x, m);
+      line(&d, 0usize, rm("ucomisd", nx(x), q(m)));
+      var e = Asm.make();
+      e.cvtsi2sdRM(x, m);
+      line(&e, 0usize, rm("cvtsi2sd", nx(x), q(m)));
+      var f = Asm.make();
+      f.movupsRM(x, m);
+      line(&f, 0usize, rm("movups", nx(x), xw(m)));
+      var g = Asm.make();
+      g.movupsMR(m, x);
+      line(&g, 0usize, mr("movups", xw(m), nx(x)));
+      r = r + 1usize;
+    }
+    mi = mi + 1usize;
+  }
+
+  // labels: a jump forward over 16 bytes, a jump back, and rip-relative lea
+  cc = 0usize;
+  while cc < 12usize {
+    var a = Asm.make();
+    let l = a.newLabel();
+    a.jcc(ccs[cc], l);
+    var n = 0usize;
+    while n < 16usize { a.b(0x90u8); n = n + 1usize; }
+    a.bind(l);
+    expect(a.finish(), "jcc forward resolves");
+    line(&a, 6usize, jt(ccs[cc], "16"));
+    var b = Asm.make();
+    let m = b.newLabel();
+    b.bind(m);
+    b.jcc(ccs[cc], m);
+    expect(b.finish(), "jcc back resolves");
+    line(&b, 0usize, jt(ccs[cc], "-6"));
+    cc = cc + 1usize;
+  }
+  var jf = Asm.make();
+  let lf = jf.newLabel();
+  jf.jmp(lf);
+  var z = 0usize;
+  while z < 100usize { jf.b(0x90u8); z = z + 1usize; }
+  jf.bind(lf);
+  expect(jf.finish(), "jmp forward resolves");
+  line(&jf, 5usize, String.from("jmp 100"));
+  var cf = Asm.make();
+  let lc = cf.newLabel();
+  cf.bind(lc);
+  cf.call(lc);
+  expect(cf.finish(), "call back resolves");
+  line(&cf, 0usize, String.from("call -5"));
+  i = 0usize;
+  while i < 16usize {
+    var a = Asm.make();
+    let l = a.newLabel();
+    a.leaLabel(all[i], l);
+    var n = 0usize;
+    while n < 32usize { a.b(0x90u8); n = n + 1usize; }
+    a.bind(l);
+    expect(a.finish(), "lea rip resolves");
+    line(&a, 7usize, rm("lea", n64(all[i]), String.from("[rip + 32]")));
+    i = i + 1usize;
+  }
+  // an unresolved label is refused
+  var bad = Asm.make();
+  let lb = bad.newLabel();
+  bad.jmp(lb);
+  expect(!bad.finish(), "a label never bound is refused");
+  // a label offset in data
+  var dl = Asm.make();
+  let ld = dl.newLabel();
+  dl.labelOffset32(ld);
+  dl.b(0x90u8);
+  dl.bind(ld);
+  expect(dl.finish(), "an offset field resolves");
+  expectUInt(u64.from(*dl.code[0usize]), 5u64, "the offset field holds the label's position");
+  done()
+}

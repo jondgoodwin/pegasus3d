@@ -1,0 +1,834 @@
+// The x64 emitter (design sections 6 and 8): the lower form's functions to machine code. Scalar SSE2 only, one fixed
+// template per op over the locations regalloc.cone chose, labels and rel32 fix-ups for jumps and calls, and one entry
+// stub for the whole container.
+//
+// THE FRAME. push rbp; mov rbp, rsp; then rsp drops by a multiple of 16, so rsp is 16-aligned at every call (the entry
+// stub's call and every internal call and the gate call alike). From rsp upward: 32 bytes the callee may use as Win64's
+// shadow space, then the outgoing area (outSlots 8-byte slots, which is the callee's incoming area); spill slot n is at
+// [rbp - 8(n+1)]. A function's own incoming area starts at rbp + 16 (saved rbp, return address) + 32 (the caller's shadow).
+//
+// THE REGISTERS. r15 is the context and r14 the fuel left, pinned through the whole run; rbp is the frame. r10, r11,
+// xmm14 and xmm15 are the emitter's scratch and never allocated. Every other register is clobbered by any call, which is
+// why regalloc keeps nothing in one across a call.
+//
+// FLOATS. Every float op is one scalar SSE2 instruction, rounded once to nearest, in the operand order the form says.
+// fmin and fmax are a ucomisd sequence with the exact meaning ir.cone gives them. Never emitted: minsd and maxsd (except
+// by the test mutant MUT_FMIN_MINSD), FMA, x87, and any folding of float constants.
+
+// Test mutants: each breaks one thing on purpose so the tests can show they would notice. Real compiles use MUT_NONE.
+pub const MUT_NONE = 0u32;
+pub const MUT_FMIN_MINSD = 1u32;      // fmin as minsd
+pub const MUT_FUEL_NO_ADD = 2u32;     // the fuel trap stub forgets to give the charge back
+pub const MUT_NO_MXCSR_SET = 3u32;    // the entry stub runs the code under the host's MXCSR
+pub const MUT_NO_MXCSR_RESTORE = 4u32;  // the way out leaves our MXCSR for the host
+pub const MUT_NO_R12_RESTORE = 5u32;  // the way out leaves r12 as the generated code last used it
+
+const XMM_SCRATCH = 14u8;
+const XMM_SCRATCH2 = 15u8;
+
+pub struct Options {
+  pub regs: RegFile;
+  pub mutant: u32;
+}
+
+pub fn defaultOptions() Options { Options(x64RegFile(), MUT_NONE) }
+
+struct Stub {
+  label: u32;
+  kind: u64;
+  site: u64;
+  addBack: u64;      // fuel to give back first (a fuel trap), else 0
+  giveDepth: bool;   // put back the depth count a refused call took
+}
+
+struct Gen {
+  a: Asm;
+  win: bool;
+  mutant: u32;
+  al: Allocation;
+  cls: List[u8];             // the current function's vreg classes
+  useCount: List[u32];       // how many instructions read each vreg, and write it, in the current function
+  defCount: List[u32];
+  blockLabels: List[u32];
+  stubs: List[Stub];
+  funcLabels: List[u32];
+  unwind: u32;
+  traps: List[TrapSite];
+  next: u32;                 // the block that follows the one being emitted, NO_BLOCK after the last
+}
+
+// ---- checking the input: only well-formed code is compiled ----
+
+fn badAt(f: &Func, b: usize, n: usize, what: &str) Option[String] {
+  var s = String.from("function ");
+  s <- f.name.view();
+  s <- ", block "; s <- b; s <- ", instruction "; s <- n; s <- ": "; s <- what;
+  Some(s)
+}
+
+// A vreg operand: in range, not NO_REG, of class 'want' (2 means either)
+fn okReg(f: &Func, v: u32, want: u8) bool {
+  if v == NO_REG || usize.from(v) >= f.classes.len() { return false; }
+  want == 2u8 || *f.classes[usize.from(v)] == want
+}
+
+fn checkInst(f: &Func, i: &Inst, nFuncs: usize, b: usize, n: usize) Option[String] {
+  let op = i.op;
+  let nBlocks = f.blocks.len();
+  if op == IR_MOV {
+    if !okReg(f, i.dst, 2u8) || !okReg(f, i.a, 2u8) || *f.classes[usize.from(i.dst)] != *f.classes[usize.from(i.a)] {
+      return badAt(f, b, n, "mov needs two vregs of one class");
+    }
+  } else if op == IR_ICONST {
+    if !okReg(f, i.dst, CLASS_INT) { return badAt(f, b, n, "iconst needs an integer vreg"); }
+  } else if op == IR_FCONST {
+    if !okReg(f, i.dst, CLASS_F64) { return badAt(f, b, n, "fconst needs a float vreg"); }
+  } else if op >= IR_IADD && op <= IR_ICMP {
+    if !okReg(f, i.dst, CLASS_INT) || !okReg(f, i.a, CLASS_INT) || !okReg(f, i.b, CLASS_INT) {
+      return badAt(f, b, n, "an integer op needs integer vregs");
+    }
+    if op == IR_ICMP && i.cc > CC_GE { return badAt(f, b, n, "icmp has no such condition"); }
+  } else if (op >= IR_FADD && op <= IR_FDIV) || op == IR_FMIN || op == IR_FMAX {
+    if !okReg(f, i.dst, CLASS_F64) || !okReg(f, i.a, CLASS_F64) || !okReg(f, i.b, CLASS_F64) {
+      return badAt(f, b, n, "a float op needs float vregs");
+    }
+  } else if op == IR_FSQRT || op == IR_FNEG || op == IR_FABS {
+    if !okReg(f, i.dst, CLASS_F64) || !okReg(f, i.a, CLASS_F64) { return badAt(f, b, n, "a float op needs float vregs"); }
+  } else if op == IR_FCMP {
+    if !okReg(f, i.dst, CLASS_INT) || !okReg(f, i.a, CLASS_F64) || !okReg(f, i.b, CLASS_F64) {
+      return badAt(f, b, n, "fcmp needs an integer result and float operands");
+    }
+    if i.cc > CC_GE { return badAt(f, b, n, "fcmp has no such condition"); }
+  } else if op == IR_I2F {
+    if !okReg(f, i.dst, CLASS_F64) || !okReg(f, i.a, CLASS_INT) { return badAt(f, b, n, "i2f needs a float result and an integer operand"); }
+  } else if op == IR_SELECT {
+    if !okReg(f, i.c, CLASS_INT) || !okReg(f, i.dst, 2u8) || !okReg(f, i.a, 2u8) || !okReg(f, i.b, 2u8) {
+      return badAt(f, b, n, "select needs an integer condition and three vregs");
+    }
+    let cl = *f.classes[usize.from(i.dst)];
+    if *f.classes[usize.from(i.a)] != cl || *f.classes[usize.from(i.b)] != cl { return badAt(f, b, n, "select's vregs are not of one class"); }
+  } else if op == IR_LOAD {
+    if !okReg(f, i.dst, 2u8) || !okReg(f, i.a, CLASS_INT) { return badAt(f, b, n, "load needs an integer address"); }
+  } else if op == IR_STORE {
+    if !okReg(f, i.b, 2u8) || !okReg(f, i.a, CLASS_INT) { return badAt(f, b, n, "store needs an integer address"); }
+  } else if op == IR_ARG_GET || op == IR_ARG_SET {
+    let v = if op == IR_ARG_GET { i.dst } else { i.a };
+    if !okReg(f, v, 2u8) { return badAt(f, b, n, "an argument slot op needs a vreg"); }
+    if i.k >= u64.from(f.nArea) { return badAt(f, b, n, "the slot is outside the incoming area"); }
+  } else if op == IR_OUT_SET || op == IR_OUT_GET {
+    let v = if op == IR_OUT_GET { i.dst } else { i.a };
+    if !okReg(f, v, 2u8) { return badAt(f, b, n, "an outgoing slot op needs a vreg"); }
+    if i.k >= u64.from(f.outSlots) { return badAt(f, b, n, "the slot is outside the outgoing area"); }
+  } else if op == IR_CALL {
+    if i.k >= u64.from(nFuncs) { return badAt(f, b, n, "call of a function the container does not have"); }
+  } else if op == IR_GATE || op == IR_FUEL || op == IR_TRAP {
+    // any constant is a meaning for these
+  } else if op == IR_JMP {
+    if usize.from(i.t) >= nBlocks { return badAt(f, b, n, "jump to a block that does not exist"); }
+  } else if op == IR_BR {
+    if !okReg(f, i.a, CLASS_INT) { return badAt(f, b, n, "br needs an integer condition"); }
+    if usize.from(i.t) >= nBlocks || usize.from(i.f) >= nBlocks { return badAt(f, b, n, "branch to a block that does not exist"); }
+  } else if op == IR_RET {
+  } else {
+    return badAt(f, b, n, "an op this backend does not know");
+  }
+  None
+}
+
+fn checkFunc(f: &Func, nFuncs: usize) Option[String] {
+  if f.blocks.len() == 0usize || f.classes.len() == 0usize {
+    var s = String.from("function "); s <- f.name.view(); s <- " has no blocks";
+    return Some(s);
+  }
+  // Limits that keep every displacement in 32 bits, the entry stub's frame small (it holds the largest area), and the
+  // liveness sets (one bit per vreg per block) to some megabytes
+  if f.nArea > 4096u32 || f.outSlots > 1000000u32 || f.classes.len() > 1000000usize
+     || f.blocks.len() * (f.classes.len() / 64usize + 1usize) > 2000000usize {
+    var s = String.from("function "); s <- f.name.view(); s <- " is bigger than this backend takes";
+    return Some(s);
+  }
+  var b = 0usize;
+  while b < f.blocks.len() {
+    let insts = &f.blocks[b].insts;
+    if insts.len() == 0usize { return badAt(f, b, 0usize, "an empty block"); }
+    var n = 0usize;
+    while n < insts.len() {
+      let i = &insts[n];
+      let last = n + 1usize == insts.len();
+      if isTerminator(i.op) != last { return badAt(f, b, n, "a block must end in exactly one terminator"); }
+      let r = checkInst(f, i, nFuncs, b, n);
+      if r is Some { return r; }
+      n = n + 1usize;
+    }
+    b = b + 1usize;
+  }
+  None
+}
+
+// ---- locations ----
+
+fn locOf(g: &Gen, v: u32) Loc {
+  let l = &g.al.locs[usize.from(v)];
+  Loc(l.kind, l.n)
+}
+fn isReg(g: &Gen, v: u32) bool { g.al.locs[usize.from(v)].kind == LOC_REG }
+fn regOf(g: &Gen, v: u32) u8 { u8.from(g.al.locs[usize.from(v)].n) }
+fn slotOf(g: &Gen, v: u32) Mem { mbase(RBP, 0i32 - (i32.from(g.al.locs[usize.from(v)].n) + 1i32) * 8i32) }
+fn isFloat(g: &Gen, v: u32) bool { *g.cls[usize.from(v)] == CLASS_F64 }
+
+// Int vreg v in a register: its own, or loaded into 'scratch'
+fn useI(g: &mut Gen, v: u32, scratch: u8) u8 {
+  if isReg(g, v) { return regOf(g, v); }
+  let m = slotOf(g, v);
+  g.a.movRM(scratch, m);
+  scratch
+}
+fn useF(g: &mut Gen, v: u32, scratch: u8) u8 {
+  if isReg(g, v) { return regOf(g, v); }
+  let m = slotOf(g, v);
+  g.a.movsdRM(scratch, m);
+  scratch
+}
+// The register a result is computed in: the vreg's own, or the scratch (and then stored with storeI / storeF)
+fn destR(g: &Gen, v: u32, scratch: u8) u8 { if isReg(g, v) { regOf(g, v) } else { scratch } }
+
+fn loadI(g: &mut Gen, w: u8, v: u32) {
+  if isReg(g, v) { let r = regOf(g, v); if r != w { g.a.movRR(w, r); } }
+  else { let m = slotOf(g, v); g.a.movRM(w, m); }
+}
+fn loadF(g: &mut Gen, w: u8, v: u32) {
+  if isReg(g, v) { let r = regOf(g, v); if r != w { g.a.movapd(w, r); } }
+  else { let m = slotOf(g, v); g.a.movsdRM(w, m); }
+}
+fn storeI(g: &mut Gen, v: u32, r: u8) {
+  if !isReg(g, v) { let m = slotOf(g, v); g.a.movMR(m, r); }
+}
+fn storeF(g: &mut Gen, v: u32, x: u8) {
+  if !isReg(g, v) { let m = slotOf(g, v); g.a.movsdMR(m, x); }
+}
+
+// A value moved from one vreg's home to another's (the same class)
+fn moveV(g: &mut Gen, dst: u32, src: u32) {
+  if isFloat(g, dst) {
+    if isReg(g, dst) { loadF(g, regOf(g, dst), src); }
+    else if isReg(g, src) { let m = slotOf(g, dst); g.a.movsdMR(m, regOf(g, src)); }
+    else { let s = slotOf(g, src); let d = slotOf(g, dst); g.a.movRM(R10, s); g.a.movMR(d, R10); }
+  } else {
+    if isReg(g, dst) { loadI(g, regOf(g, dst), src); }
+    else if isReg(g, src) { let m = slotOf(g, dst); g.a.movMR(m, regOf(g, src)); }
+    else { let s = slotOf(g, src); let d = slotOf(g, dst); g.a.movRM(R10, s); g.a.movMR(d, R10); }
+  }
+}
+
+// A vreg loaded from memory, and stored to it (floats travel as bits through r10 when they live in a spill slot)
+fn loadMem(g: &mut Gen, dst: u32, m: Mem) {
+  if isReg(g, dst) {
+    if isFloat(g, dst) { g.a.movsdRM(regOf(g, dst), m); } else { g.a.movRM(regOf(g, dst), m); }
+  } else {
+    let d = slotOf(g, dst);
+    g.a.movRM(R10, m);
+    g.a.movMR(d, R10);
+  }
+}
+fn storeMem(g: &mut Gen, m: Mem, src: u32) {
+  if isReg(g, src) {
+    if isFloat(g, src) { g.a.movsdMR(m, regOf(g, src)); } else { g.a.movMR(m, regOf(g, src)); }
+  } else {
+    let s = slotOf(g, src);
+    g.a.movRM(R10, s);
+    g.a.movMR(m, R10);
+  }
+}
+
+// ---- stubs for the traps ----
+
+fn newStub(g: &mut Gen, kind: u64, site: u64, addBack: u64) u32 {
+  let l = g.a.newLabel();
+  g.stubs.push(Stub(l, kind, site, addBack, false));
+  l
+}
+
+// The stub for a call refused for its depth: the count it just took one from goes back, so a refused call leaves depth as it was
+fn newDepthStub(g: &mut Gen, site: u64) u32 {
+  let l = g.a.newLabel();
+  g.stubs.push(Stub(l, TRAP_DEPTH, site, 0u64, true));
+  l
+}
+
+// Stores the site, puts the kind in eax and goes to the container's unwind
+fn trapBody(g: &mut Gen, kind: u64, site: u64) {
+  g.traps.push(TrapSite(g.a.here(), kind, site));
+  g.a.movRI(R10, site);
+  g.a.movMR(mbase(R15, i32.from(CTX_TRAP_SITE)), R10);
+  g.a.movRI(RAX, kind);
+  let u = g.unwind;
+  g.a.jmp(u);
+}
+
+// ---- the ops ----
+
+fn intCC(cc: u8) u8 {
+  if cc == CC_EQ { XC_E } else if cc == CC_NE { XC_NE } else if cc == CC_LT { XC_L }
+  else if cc == CC_LE { XC_LE } else if cc == CC_GT { XC_G } else { XC_GE }
+}
+
+fn binI(g: &mut Gen, i: &Inst, alu: u8, mul: bool) {
+  let rd = destR(g, i.dst, R10);
+  var a = i.a;
+  var b = i.b;
+  var w = rd;
+  let bIsRd = isReg(g, b) && regOf(g, b) == rd;
+  let aIsRd = isReg(g, a) && regOf(g, a) == rd;
+  if bIsRd && !aIsRd {
+    // the destination is the second operand: swap if the op allows, else work in the scratch
+    if alu != ALU_SUB { let t = a; a = b; b = t; } else { w = R10; }
+  }
+  loadI(g, w, a);
+  if mul {
+    if isReg(g, b) { g.a.imulRR(w, regOf(g, b)); } else { let m = slotOf(g, b); g.a.imulRM(w, m); }
+  } else {
+    if isReg(g, b) { g.a.aluRR(alu, w, regOf(g, b)); } else { let m = slotOf(g, b); g.a.aluRM(alu, w, m); }
+  }
+  if w != rd { g.a.movRR(rd, w); }
+  storeI(g, i.dst, rd);
+}
+
+fn binF(g: &mut Gen, i: &Inst, sse: u8) {
+  let rd = destR(g, i.dst, XMM_SCRATCH);
+  var w = rd;
+  // a float op is never swapped, so a NaN operand's payload comes through as the form says
+  if isReg(g, i.b) && regOf(g, i.b) == rd && !(isReg(g, i.a) && regOf(g, i.a) == rd) { w = XMM_SCRATCH; }
+  loadF(g, w, i.a);
+  if isReg(g, i.b) { g.a.sseRR(sse, w, regOf(g, i.b)); } else { let m = slotOf(g, i.b); g.a.sseRM(sse, w, m); }
+  if w != rd { g.a.movapd(rd, w); }
+  storeF(g, i.dst, rd);
+}
+
+// ucomisd x, y
+fn ucomi(g: &mut Gen, x: u32, y: u32) {
+  let rx = useF(g, x, XMM_SCRATCH);
+  if isReg(g, y) { g.a.ucomisdRR(rx, regOf(g, y)); } else { let m = slotOf(g, y); g.a.ucomisdRM(rx, m); }
+}
+
+// cmp a, b
+fn cmpI(g: &mut Gen, a: u32, b: u32) {
+  let ra = useI(g, a, R10);
+  if isReg(g, b) { g.a.aluRR(ALU_CMP, ra, regOf(g, b)); } else { let m = slotOf(g, b); g.a.aluRM(ALU_CMP, ra, m); }
+}
+
+fn fcmpValue(g: &mut Gen, i: &Inst) {
+  let cc = i.cc;
+  let rd = destR(g, i.dst, R11);
+  if cc == CC_EQ || cc == CC_NE {
+    ucomi(g, i.a, i.b);
+    if cc == CC_EQ {
+      // equal and ordered: ZF set and PF clear
+      g.a.setcc(XC_E, R10); g.a.setcc(XC_NP, R11); g.a.alu8RR(ALU_AND, R10, R11);
+    } else {
+      // not equal, or unordered
+      g.a.setcc(XC_NE, R10); g.a.setcc(XC_P, R11); g.a.alu8RR(ALU_OR, R10, R11);
+    }
+    g.a.movzx8(rd, R10);
+  } else {
+    // a < b is b > a, so lt and le compare the other way round: "above" is false when unordered
+    if cc == CC_LT || cc == CC_LE { ucomi(g, i.b, i.a); } else { ucomi(g, i.a, i.b); }
+    g.a.setcc(if cc == CC_GT || cc == CC_LT { XC_A } else { XC_AE }, rd);
+    g.a.movzx8(rd, rd);
+  }
+  storeI(g, i.dst, rd);
+}
+
+fn fminmax(g: &mut Gen, i: &Inst, isMax: bool) {
+  if g.mutant == MUT_FMIN_MINSD && !isMax {
+    loadF(g, XMM_SCRATCH, i.a);
+    if isReg(g, i.b) { g.a.sseRR(SSE_MIN, XMM_SCRATCH, regOf(g, i.b)); } else { let m = slotOf(g, i.b); g.a.sseRM(SSE_MIN, XMM_SCRATCH, m); }
+    if isReg(g, i.dst) { g.a.movapd(regOf(g, i.dst), XMM_SCRATCH); } else { storeF(g, i.dst, XMM_SCRATCH); }
+    return;
+  }
+  loadF(g, XMM_SCRATCH, i.a);
+  loadF(g, XMM_SCRATCH2, i.b);
+  let done = g.a.newLabel();
+  let nan = g.a.newLabel();
+  let other = g.a.newLabel();
+  g.a.ucomisdRR(XMM_SCRATCH, XMM_SCRATCH2);
+  g.a.jcc(XC_P, nan);                                 // unordered: NaN
+  if !isMax {
+    g.a.jcc(XC_B, done);                              // a < b: a
+    g.a.jcc(XC_A, other);                             // a > b: b
+    g.a.orpd(XMM_SCRATCH, XMM_SCRATCH2);              // equal: the OR of the bits, so -0 wins
+  } else {
+    g.a.jcc(XC_A, done);
+    g.a.jcc(XC_B, other);
+    g.a.andpd(XMM_SCRATCH, XMM_SCRATCH2);             // equal: the AND of the bits, so +0 wins
+  }
+  g.a.jmp(done);
+  g.a.bind(other);
+  g.a.movapd(XMM_SCRATCH, XMM_SCRATCH2);
+  g.a.jmp(done);
+  g.a.bind(nan);
+  g.a.sseRR(SSE_ADD, XMM_SCRATCH, XMM_SCRATCH2);      // a + b, which is the NaN the interpreter gives
+  g.a.bind(done);
+  if isReg(g, i.dst) { g.a.movapd(regOf(g, i.dst), XMM_SCRATCH); } else { storeF(g, i.dst, XMM_SCRATCH); }
+}
+
+fn selectOp(g: &mut Gen, i: &Inst) {
+  let rc = useI(g, i.c, R10);
+  g.a.testRR(rc, rc);
+  if isFloat(g, i.dst) {
+    let w = destR(g, i.dst, XMM_SCRATCH);
+    let useA = g.a.newLabel();
+    let done = g.a.newLabel();
+    g.a.jcc(XC_NE, useA);
+    loadF(g, w, i.b);
+    g.a.jmp(done);
+    g.a.bind(useA);
+    loadF(g, w, i.a);
+    g.a.bind(done);
+    storeF(g, i.dst, w);
+  } else {
+    // flags are set; moves leave them alone. The destination may already hold a or b.
+    let w = destR(g, i.dst, R11);
+    let isA = isReg(g, i.a) && regOf(g, i.a) == w;
+    let isB = isReg(g, i.b) && regOf(g, i.b) == w;
+    if isA && isB { }
+    else if isA {
+      if isReg(g, i.b) { g.a.cmovRR(XC_E, w, regOf(g, i.b)); } else { let m = slotOf(g, i.b); g.a.cmovRM(XC_E, w, m); }
+    } else {
+      if !isB { loadI(g, w, i.b); }
+      if isReg(g, i.a) { g.a.cmovRR(XC_NE, w, regOf(g, i.a)); } else { let m = slotOf(g, i.a); g.a.cmovRM(XC_NE, w, m); }
+    }
+    storeI(g, i.dst, w);
+  }
+}
+
+// A conditional jump to T when 'code' holds, else F, honouring that the next block can be fallen into
+fn jumpIf(g: &mut Gen, code: u8, t: u32, f: u32) {
+  let lt = *g.blockLabels[usize.from(t)];
+  let lf = *g.blockLabels[usize.from(f)];
+  if t == g.next { g.a.jcc(code ^ 1u8, lf); }
+  else { g.a.jcc(code, lt); if f != g.next { g.a.jmp(lf); } }
+}
+
+// ucomisd then a jump on equal or not equal, where unordered counts as not equal
+fn jumpFloatEq(g: &mut Gen, isEq: bool, t: u32, f: u32) {
+  let lt = *g.blockLabels[usize.from(t)];
+  let lf = *g.blockLabels[usize.from(f)];
+  if isEq {
+    if t == g.next { g.a.jcc(XC_P, lf); g.a.jcc(XC_NE, lf); }
+    else { g.a.jcc(XC_P, lf); g.a.jcc(XC_E, lt); if f != g.next { g.a.jmp(lf); } }
+  } else {
+    if t == g.next { g.a.jcc(XC_P, lt); g.a.jcc(XC_E, lf); }
+    else { g.a.jcc(XC_P, lt); g.a.jcc(XC_NE, lt); if f != g.next { g.a.jmp(lf); } }
+  }
+}
+
+// Is instruction n a compare whose only use is the branch right after it?
+fn fused(g: &Gen, insts: &List[Inst], n: usize) bool {
+  if n + 1usize >= insts.len() { return false; }
+  let c = &insts[n];
+  let br = &insts[n + 1usize];
+  if c.op != IR_ICMP && c.op != IR_FCMP { return false; }
+  br.op == IR_BR && br.a == c.dst && *g.useCount[usize.from(c.dst)] == 1u32 && *g.defCount[usize.from(c.dst)] == 1u32
+}
+
+// The compare, then the jumps, in place of a setcc and a test
+fn fusedBranch(g: &mut Gen, c: &Inst, br: &Inst) {
+  if c.op == IR_ICMP {
+    cmpI(g, c.a, c.b);
+    jumpIf(g, intCC(c.cc), br.t, br.f);
+    return;
+  }
+  let cc = c.cc;
+  if cc == CC_EQ || cc == CC_NE {
+    ucomi(g, c.a, c.b);
+    jumpFloatEq(g, cc == CC_EQ, br.t, br.f);
+  } else {
+    if cc == CC_LT || cc == CC_LE { ucomi(g, c.b, c.a); } else { ucomi(g, c.a, c.b); }
+    jumpIf(g, if cc == CC_GT || cc == CC_LT { XC_A } else { XC_AE }, br.t, br.f);
+  }
+}
+
+fn fitsI32(k: u64) bool { let s = k as i64; s >= -2147483648i64 && s <= 2147483647i64 }
+
+fn emitInst(g: &mut Gen, f: &Func, insts: &List[Inst], n: usize) {
+  let i = &insts[n];
+  let op = i.op;
+  match op {
+    case IR_MOV { if i.dst != i.a { moveV(g, i.dst, i.a); } }
+    case IR_ICONST {
+      let rd = destR(g, i.dst, R10);
+      g.a.movRI(rd, i.k);
+      storeI(g, i.dst, rd);
+    }
+    case IR_FCONST {
+      if isReg(g, i.dst) {
+        let x = regOf(g, i.dst);
+        if i.k == 0u64 { g.a.xorpd(x, x); } else { g.a.movRI(R10, i.k); g.a.movqXR(x, R10); }
+      } else {
+        let m = slotOf(g, i.dst);
+        g.a.movRI(R10, i.k);
+        g.a.movMR(m, R10);
+      }
+    }
+    case IR_IADD { binI(g, i, ALU_ADD, false); }
+    case IR_ISUB { binI(g, i, ALU_SUB, false); }
+    case IR_IMUL { binI(g, i, ALU_ADD, true); }
+    case IR_IAND { binI(g, i, ALU_AND, false); }
+    case IR_IOR { binI(g, i, ALU_OR, false); }
+    case IR_IXOR { binI(g, i, ALU_XOR, false); }
+    case IR_ICMP {
+      if !fused(g, insts, n) {
+        let rd = destR(g, i.dst, R11);
+        cmpI(g, i.a, i.b);
+        g.a.setcc(intCC(i.cc), rd);
+        g.a.movzx8(rd, rd);
+        storeI(g, i.dst, rd);
+      }
+    }
+    case IR_FADD { binF(g, i, SSE_ADD); }
+    case IR_FSUB { binF(g, i, SSE_SUB); }
+    case IR_FMUL { binF(g, i, SSE_MUL); }
+    case IR_FDIV { binF(g, i, SSE_DIV); }
+    case IR_FSQRT {
+      let rd = destR(g, i.dst, XMM_SCRATCH);
+      if isReg(g, i.a) { g.a.sseRR(SSE_SQRT, rd, regOf(g, i.a)); } else { let m = slotOf(g, i.a); g.a.sseRM(SSE_SQRT, rd, m); }
+      storeF(g, i.dst, rd);
+    }
+    case IR_FNEG {
+      let rd = destR(g, i.dst, XMM_SCRATCH);
+      g.a.movRI(R10, 0x8000000000000000u64);
+      g.a.movqXR(XMM_SCRATCH2, R10);
+      loadF(g, rd, i.a);
+      g.a.xorpd(rd, XMM_SCRATCH2);
+      storeF(g, i.dst, rd);
+    }
+    case IR_FABS {
+      let rd = destR(g, i.dst, XMM_SCRATCH);
+      g.a.movRI(R10, 0x7FFFFFFFFFFFFFFFu64);
+      g.a.movqXR(XMM_SCRATCH2, R10);
+      loadF(g, rd, i.a);
+      g.a.andpd(rd, XMM_SCRATCH2);
+      storeF(g, i.dst, rd);
+    }
+    case IR_FMIN { fminmax(g, i, false); }
+    case IR_FMAX { fminmax(g, i, true); }
+    case IR_FCMP { if !fused(g, insts, n) { fcmpValue(g, i); } }
+    case IR_I2F {
+      let rd = destR(g, i.dst, XMM_SCRATCH);
+      if isReg(g, i.a) { g.a.cvtsi2sdRR(rd, regOf(g, i.a)); } else { let m = slotOf(g, i.a); g.a.cvtsi2sdRM(rd, m); }
+      storeF(g, i.dst, rd);
+    }
+    case IR_SELECT { selectOp(g, i); }
+    case IR_LOAD {
+      var base = useI(g, i.a, R10);
+      var disp = 0i32;
+      if fitsI32(i.k) { disp = i32.from(i.k as i64); }
+      else { g.a.movRR(R10, base); g.a.movRI(R11, i.k); g.a.aluRR(ALU_ADD, R10, R11); base = R10; }
+      loadMem(g, i.dst, mbase(base, disp));
+    }
+    case IR_STORE {
+      var base = useI(g, i.a, R10);
+      var disp = 0i32;
+      if fitsI32(i.k) { disp = i32.from(i.k as i64); }
+      else { g.a.movRR(R10, base); g.a.movRI(R11, i.k); g.a.aluRR(ALU_ADD, R10, R11); base = R10; }
+      if isFloat(g, i.b) && !isReg(g, i.b) {
+        let s = slotOf(g, i.b);
+        g.a.movRM(R11, s);
+        g.a.movMR(mbase(base, disp), R11);
+      } else if isFloat(g, i.b) {
+        g.a.movsdMR(mbase(base, disp), regOf(g, i.b));
+      } else {
+        let rb = useI(g, i.b, R11);
+        g.a.movMR(mbase(base, disp), rb);
+      }
+    }
+    case IR_ARG_GET { loadMem(g, i.dst, mbase(RBP, 48i32 + 8i32 * i32.from(i.k))); }
+    case IR_ARG_SET { storeMem(g, mbase(RBP, 48i32 + 8i32 * i32.from(i.k)), i.a); }
+    case IR_OUT_SET { storeMem(g, mbase(RSP, 32i32 + 8i32 * i32.from(i.k)), i.a); }
+    case IR_OUT_GET { loadMem(g, i.dst, mbase(RSP, 32i32 + 8i32 * i32.from(i.k))); }
+    case IR_CALL {
+      let stub = newDepthStub(g, i.site);
+      let depth = mbase(R15, i32.from(CTX_DEPTH));
+      g.a.aluMI(ALU_SUB, depth, 1);
+      g.a.jcc(XC_B, stub);
+      let target = *g.funcLabels[usize.from(i.k)];
+      g.a.call(target);
+      g.a.aluMI(ALU_ADD, depth, 1);
+    }
+    case IR_GATE {
+      let stub = newStub(g, TRAP_GATE, i.site, 0u64);
+      // (ctx, k, &outgoing[0]) in the host's first three argument registers
+      if g.win {
+        g.a.movRR(RCX, R15); g.a.movRI(RDX, i.k); g.a.leaRM(R8, mbase(RSP, 32i32));
+      } else {
+        g.a.movRR(RDI, R15); g.a.movRI(RSI, i.k); g.a.leaRM(RDX, mbase(RSP, 32i32));
+      }
+      g.a.callM(mbase(R15, i32.from(CTX_GATE)));
+      g.a.testRR(RAX, RAX);
+      g.a.jcc(XC_E, stub);
+    }
+    case IR_FUEL {
+      let stub = newStub(g, TRAP_FUEL, i.site, i.k);
+      if i.k <= 0x7FFFFFFFu64 { g.a.aluRI(ALU_SUB, R14, i32.from(i.k)); }
+      else { g.a.movRI(R11, i.k); g.a.aluRR(ALU_SUB, R14, R11); }
+      g.a.jcc(XC_B, stub);
+    }
+    case IR_JMP {
+      if i.t != g.next { let l = *g.blockLabels[usize.from(i.t)]; g.a.jmp(l); }
+    }
+    case IR_BR {
+      if n > 0usize && fused(g, insts, n - 1usize) {
+        fusedBranch(g, &insts[n - 1usize], i);
+      } else {
+        let r = useI(g, i.a, R10);
+        g.a.testRR(r, r);
+        jumpIf(g, XC_NE, i.t, i.f);
+      }
+    }
+    case IR_RET { g.a.leave(); g.a.ret(); }
+    case IR_TRAP { trapBody(g, i.k, i.site); }
+    else { }
+  }
+}
+
+// ---- one function ----
+
+fn alignTo(g: &mut Gen, n: u32) {
+  while g.a.here() % n != 0u32 { g.a.b(0xCCu8); }
+}
+
+fn emitFunc(g: &mut Gen, funcs: &Funcs, idx: usize, rf: &RegFile) {
+  let f = &funcs[idx];
+  g.al = allocate(f, rf);
+  g.cls = List[u8]();
+  var c = 0usize;
+  while c < f.classes.len() { g.cls.push(*f.classes[c]); c = c + 1usize; }
+  // how often each vreg is read and written: a compare is fused with its branch only if it has one write and one read
+  g.useCount = List[u32]();
+  g.useCount.resize(f.classes.len(), 0u32);
+  g.defCount = List[u32]();
+  g.defCount.resize(f.classes.len(), 0u32);
+  var b = 0usize;
+  while b < f.blocks.len() {
+    let insts = &f.blocks[b].insts;
+    var n = 0usize;
+    while n < insts.len() {
+      let u = usesOf(&insts[n]);
+      if u.a != NO_REG { g.useCount.set(usize.from(u.a), *g.useCount[usize.from(u.a)] + 1u32); }
+      if u.b != NO_REG { g.useCount.set(usize.from(u.b), *g.useCount[usize.from(u.b)] + 1u32); }
+      if u.c != NO_REG { g.useCount.set(usize.from(u.c), *g.useCount[usize.from(u.c)] + 1u32); }
+      let d = defOf(&insts[n]);
+      if d != NO_REG { g.defCount.set(usize.from(d), *g.defCount[usize.from(d)] + 1u32); }
+      n = n + 1usize;
+    }
+    b = b + 1usize;
+  }
+  g.blockLabels = List[u32]();
+  b = 0usize;
+  while b < f.blocks.len() { let l = g.a.newLabel(); g.blockLabels.push(l); b = b + 1usize; }
+  g.stubs = List[Stub]();
+
+  // the frame: shadow space, the outgoing area, the spill slots, rounded to 16
+  let frame = (32u32 + 8u32 * f.outSlots + 8u32 * g.al.nSpill + 15u32) & 0xFFFFFFF0u32;
+  let entry = *g.funcLabels[idx];
+  g.a.bind(entry);
+  g.a.push(RBP);
+  g.a.movRR(RBP, RSP);
+  // the stack guard: refuse to go below the limit, before touching anything below it
+  let guard = newStub(g, TRAP_DEPTH, f.site, 0u64);
+  g.a.leaRM(R10, mbase(RSP, 0i32 - i32.from(frame)));
+  g.a.aluRM(ALU_CMP, R10, mbase(R15, i32.from(CTX_STACK_LIMIT)));
+  g.a.jcc(XC_B, guard);
+  // a frame of a page or more is touched a page at a time, the way the system grows a stack
+  var off = 4096u32;
+  while off < frame { g.a.aluMR(ALU_CMP, mbase(RSP, 0i32 - i32.from(off)), RAX); off = off + 4096u32; }
+  g.a.movRR(RSP, R10);
+
+  b = 0usize;
+  while b < f.blocks.len() {
+    let l = *g.blockLabels[b];
+    g.a.bind(l);
+    g.next = if b + 1usize < f.blocks.len() { u32.from(b + 1usize) } else { NO_BLOCK };
+    let insts = &f.blocks[b].insts;
+    var n = 0usize;
+    while n < insts.len() { emitInst(g, f, insts, n); n = n + 1usize; }
+    b = b + 1usize;
+  }
+  // the trap stubs this function asked for
+  var s = 0usize;
+  while s < g.stubs.len() {
+    let st = Stub(g.stubs[s].label, g.stubs[s].kind, g.stubs[s].site, g.stubs[s].addBack, g.stubs[s].giveDepth);
+    g.a.bind(st.label);
+    if st.giveDepth { g.a.aluMI(ALU_ADD, mbase(R15, i32.from(CTX_DEPTH)), 1); }
+    if st.addBack != 0u64 && g.mutant != MUT_FUEL_NO_ADD {
+      // the interpreter refuses a charge before subtracting it, so give it back
+      if st.addBack <= 0x7FFFFFFFu64 { g.a.aluRI(ALU_ADD, R14, i32.from(st.addBack)); }
+      else { g.a.movRI(R11, st.addBack); g.a.aluRR(ALU_ADD, R14, R11); }
+    }
+    trapBody(g, st.kind, st.site);
+    s = s + 1usize;
+  }
+}
+
+// ---- the entry stub ----
+
+fn emitEntry(g: &mut Gen, nFuncs: usize, maxArea: u32, base: u32, table: u32) {
+  let win = g.win;
+  let outBytes = 8u32 * maxArea;
+  let areaOff = 32u32 + outBytes;
+  let nAreaOff = areaOff + 8u32;
+  let mxOff = areaOff + 16u32;
+  let xmmOff = areaOff + 24u32;
+  var raw = xmmOff + if win { 160u32 } else { 0u32 };
+  raw = (raw + 15u32) & 0xFFFFFFF0u32;
+  // after push rbp and the callee-saved pushes (7 or 5) rsp is 8 mod 16; the frame brings it to 0
+  let S = raw + 8u32;
+
+  g.a.push(RBP);
+  g.a.movRR(RBP, RSP);
+  g.a.push(RBX);
+  if win { g.a.push(RSI); g.a.push(RDI); }
+  g.a.push(R12); g.a.push(R13); g.a.push(R14); g.a.push(R15);
+  // ctx, func, area: r15, rax, rdi
+  if win { g.a.movRR(R15, RCX); g.a.movRR(RAX, RDX); g.a.movRR(RDI, R8); }
+  else { g.a.movRR(R15, RDI); g.a.movRR(RAX, RSI); g.a.movRR(RDI, RDX); }
+  g.a.aluRI(ALU_SUB, RSP, i32.from(S));
+  g.a.movMR(mbase(RSP, i32.from(areaOff)), RDI);
+  if win {
+    var x = 0u8;
+    while x < 10u8 { g.a.movupsMR(mbase(RSP, i32.from(xmmOff) + 16i32 * i32.from(x)), 6u8 + x); x = x + 1u8; }
+  }
+  // MXCSR: keep the host's, run with round-to-nearest and nothing masked off
+  g.a.stmxcsr(mbase(RSP, i32.from(mxOff)));
+  g.a.mov32MI(mbase(RSP, i32.from(mxOff) + 4i32), 0x1F80u32);
+  if g.mutant != MUT_NO_MXCSR_SET { g.a.ldmxcsr(mbase(RSP, i32.from(mxOff) + 4i32)); }
+  g.a.movRM(R14, mbase(R15, i32.from(CTX_FUEL)));
+  g.a.leaRM(RCX, mbase(RSP, -262144i32));
+  g.a.movMR(mbase(R15, i32.from(CTX_STACK_LIMIT)), RCX);
+  g.a.movMR(mbase(R15, i32.from(CTX_ENTRY_SP)), RSP);
+
+  let epilogue = g.a.newLabel();
+  let bad = g.a.newLabel();
+  g.a.aluRI(ALU_CMP, RAX, i32.from(u32.from(nFuncs)));
+  g.a.jcc(XC_AE, bad);
+  g.a.leaLabel(R10, table);
+  g.a.mov32RM(RCX, mindex(R10, RAX, 8u8, 4i32));
+  g.a.movMR(mbase(RSP, i32.from(nAreaOff)), RCX);
+  // copy the area in
+  let inLoop = g.a.newLabel();
+  let inDone = g.a.newLabel();
+  g.a.movRI(RDX, 0u64);
+  g.a.bind(inLoop);
+  g.a.aluRR(ALU_CMP, RDX, RCX);
+  g.a.jcc(XC_AE, inDone);
+  g.a.movRM(R8, mindex(RDI, RDX, 8u8, 0i32));
+  g.a.movMR(mindex(RSP, RDX, 8u8, 32i32), R8);
+  g.a.aluRI(ALU_ADD, RDX, 1);
+  g.a.jmp(inLoop);
+  g.a.bind(inDone);
+  // call the function: its offset is in the table's record
+  g.a.mov32RM(R11, mindex(R10, RAX, 8u8, 0i32));
+  g.a.leaLabel(R10, base);
+  g.a.aluRR(ALU_ADD, R10, R11);
+  g.a.callR(R10);
+  // and the area back out
+  let outLoop = g.a.newLabel();
+  let outDone = g.a.newLabel();
+  g.a.movRM(RCX, mbase(RSP, i32.from(nAreaOff)));
+  g.a.movRM(RDI, mbase(RSP, i32.from(areaOff)));
+  g.a.movRI(RDX, 0u64);
+  g.a.bind(outLoop);
+  g.a.aluRR(ALU_CMP, RDX, RCX);
+  g.a.jcc(XC_AE, outDone);
+  g.a.movRM(R8, mindex(RSP, RDX, 8u8, 32i32));
+  g.a.movMR(mindex(RDI, RDX, 8u8, 0i32), R8);
+  g.a.aluRI(ALU_ADD, RDX, 1);
+  g.a.jmp(outLoop);
+  g.a.bind(outDone);
+  g.a.movRI(RAX, TRAP_NONE);
+  g.a.jmp(epilogue);
+  g.a.bind(bad);
+  g.a.movRI(RAX, TRAP_BADFUNC);
+  // the way out, for success and for every trap: rax holds the result and rsp the frame
+  g.a.bind(epilogue);
+  g.a.movMR(mbase(R15, i32.from(CTX_FUEL)), R14);
+  if g.mutant != MUT_NO_MXCSR_RESTORE { g.a.ldmxcsr(mbase(RSP, i32.from(mxOff))); }
+  if win {
+    var x = 0u8;
+    while x < 10u8 { g.a.movupsRM(6u8 + x, mbase(RSP, i32.from(xmmOff) + 16i32 * i32.from(x))); x = x + 1u8; }
+  }
+  g.a.aluRI(ALU_ADD, RSP, i32.from(S));
+  g.a.pop(R15); g.a.pop(R14); g.a.pop(R13);
+  if g.mutant == MUT_NO_R12_RESTORE { g.a.aluRI(ALU_ADD, RSP, 8); } else { g.a.pop(R12); }
+  if win { g.a.pop(RDI); g.a.pop(RSI); }
+  g.a.pop(RBX);
+  g.a.pop(RBP);
+  g.a.ret();
+  // the unwind every trap stub jumps to: back to the stub's frame, then out
+  let u = g.unwind;
+  g.a.bind(u);
+  g.a.movRM(RSP, mbase(R15, i32.from(CTX_ENTRY_SP)));
+  g.a.jmp(epilogue);
+}
+
+// ---- the compiler ----
+
+pub fn compileX64(funcs: &Funcs, abi: Abi) Result[MachineCode, String] {
+  let opts = defaultOptions();
+  compileX64With(funcs, abi, &opts)
+}
+
+// 'opts' is for the tests: another register file, or a mutant
+pub fn compileX64With(funcs: &Funcs, abi: Abi, opts: &Options) Result[MachineCode, String] {
+  if funcs.len() == 0usize { return Err(String.from("there are no functions to compile")); }
+  var i = 0usize;
+  var maxArea = 0u32;
+  while i < funcs.len() {
+    let bad = checkFunc(&funcs[i], funcs.len());
+    if bad is Some { return Err(bad.unwrap()); }
+    if funcs[i].nArea > maxArea { maxArea = funcs[i].nArea; }
+    i = i + 1usize;
+  }
+  var g = Gen(Asm.make(), abi == Abi.Win64, opts.mutant,
+              Allocation(List[Loc](), List[u32](), List[u32](), 0u32), List[u8](), List[u32](), List[u32](), List[u32](),
+              List[Stub](), List[u32](), 0u32, List[TrapSite](), NO_BLOCK);
+  let base = g.a.newLabel();
+  g.a.bind(base);
+  g.unwind = g.a.newLabel();
+  i = 0usize;
+  while i < funcs.len() { let l = g.a.newLabel(); g.funcLabels.push(l); i = i + 1usize; }
+  let table = g.a.newLabel();
+
+  var mc = MachineCode.make(abi);
+  i = 0usize;
+  while i < funcs.len() {
+    alignTo(&mut g, 16u32);
+    let start = g.a.here();
+    emitFunc(&mut g, funcs, i, &opts.regs);
+    mc.funcOffsets.push(start);
+    mc.funcSizes.push(g.a.here() - start);
+    mc.nAreas.push(funcs[i].nArea);
+    i = i + 1usize;
+  }
+  alignTo(&mut g, 16u32);
+  mc.entryOffset = g.a.here();
+  emitEntry(&mut g, funcs.len(), maxArea, base, table);
+  alignTo(&mut g, 8u32);
+  g.a.bind(table);
+  i = 0usize;
+  while i < funcs.len() {
+    g.a.labelOffset32(*g.funcLabels[i]);
+    g.a.d32(funcs[i].nArea);
+    i = i + 1usize;
+  }
+  if !g.a.finish() { return Err(String.from("internal error: a label was never bound")); }
+  i = 0usize;
+  while i < g.a.code.len() { mc.bytes.push(*g.a.code[i]); i = i + 1usize; }
+  i = 0usize;
+  while i < g.traps.len() {
+    let t = &g.traps[i];
+    mc.traps.push(TrapSite(t.offset, t.kind, t.site));
+    i = i + 1usize;
+  }
+  Ok(mc)
+}
