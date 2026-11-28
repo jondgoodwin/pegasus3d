@@ -105,3 +105,5 @@ Player is one actor: its work is a sequence of handoffs down one stack (who they
 - [Sim](sim.md), [Render](render.md), [Audio](audio.md), [Surfaces](surfaces.md): the partners.
 - [Server](server.md): the identity service.
 - The manual's visitors, avatars, outside and overlays pages.
+
+- **Pegasus, controllers and a gamepad (W147, 28 Nov).** `HandRay` carries the left stick's walk and strafe; Player adds them (and a gamepad's left stick, `InputSample.walk`/`strafe`) to the keys' intent. A trigger pull on either hand is a press along that hand's ray. The gamepad's south button presses along the look. Not seen in a headset.
