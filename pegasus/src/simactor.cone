@@ -40,12 +40,20 @@ struct SimPart {
   id: PartId;
   name: String;
   key: ContentKey;
-  placement: Mat4;
+  placement: Mat4;                  // where the image put it; once a rule moves it, `placeOf` is where it stands
+  slot: u32;                        // its number in the world's frames (`rules.slots`)
   asked: bool;                      // its content was asked of the Loader
 }
 alias SimParts = List[SimPart];
 alias ShapeTable = List[ContentShapes];
 alias Actions = List[Action];
+
+// A glide Sim started: the piece, and where it is to end (in the world, level), for the run's check
+struct Landing {
+  piece: u32;
+  goal: Vec3;
+}
+alias Landings = List[Landing];
 
 // What Player hands Sim when it starts it: the readers of Player's and
 // Render's latest values, and how long to run
@@ -70,6 +78,8 @@ actor Sim {
   arrived: Actions;                 // actions sent since the last admit
   queue: Actions;                   // this step's admitted actions, for react
   reacted: Actions;                 // the actions react ran, for the run's checks
+  rules: SimRules;                  // the world's rules, their units and the frames a rule moves (simrules.cone)
+  landings: Landings;               // the glides rules started, for the run's check
   person: PersonState;
   worldName: String;
   step: u64;
@@ -82,22 +92,28 @@ actor Sim {
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
-      Actions(), Actions(), Actions(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published]);
+      Actions(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published]);
   }
 
   // Loader -> Sim (move): the world image. Each part is given its id now,
   // before its content exists, and its content is asked for by key
   pub async fn world(self, image: WorldImage) {
-    worldName = image.name.clone();
-    person.feet = image.startFeet;
-    each d in &image.parts {
+    var img = image;
+    worldName = img.name.clone();
+    person.feet = img.startFeet;
+    var behaviour = Behaviour.none();
+    behaviour <-> img.behaviour;
+    rules = SimRules.make(behaviour, false);
+    each d in &img.parts {
       let id = u32.from(parts.len());
-      parts.push(SimPart(id, d.name.clone(), d.key, d.placement, true));
+      parts.push(SimPart(id, d.name.clone(), d.key, d.placement, d.slot, true));
       let at = d.placement.translation();
       loader.build(ContentRequest(d.key, id, (at - person.feet).length()));
     }
     print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(parts.len());
-    print <- " parts, "; print <- u64.from(image.units.len()); print <- " Sim units (mock)\n";
+    print <- " parts, "; print <- u64.from(img.units.len()); print <- " world file(s), "; print <- u64.from(rules.moveCount());
+    print <- " pick-and-place rules, "; print <- u64.from(rules.keysRuleCount());
+    print <- " keys rules (not run here), rules "; print <- if rules.live() { "verified" } else { "none" }; print <- "\n";
   }
 
   // Loader -> Sim (move): the shapes of a key
@@ -203,26 +219,56 @@ actor Sim {
     q <-> queue;
   }
 
-  // THE HANDLER-BUDGET SEAM. A world's handler runs here, under its budget;
-  // one that overruns is stopped, its writes dropped and the world told
-  // (sim.md, proposed). That comes with the interpreter; until then the only
-  // handler is the log line below, and every action counts as run.
+  // THE HANDLER-BUDGET SEAM. A world's handler runs here, under its budget
+  // (`RULE_FUEL`); one that traps or overruns is stopped, its writes dropped
+  // and the world told (simrules.cone, sim.md). A press on a part runs the
+  // pick-and-place rules that hold it; the glides they ask for start here.
   fn runHandler(self: &mut, a: &Action) bool {
     print <- "sim: step "; print <- step; print <- " react: verb "; print <- a.verb; print <- " to part ";
     if a.receiver == NO_PART { print <- "none"; }
     else { print <- a.receiver; print <- " ("; printStr(parts[usize.from(a.receiver)].name.view()); print <- ")"; }
     print <- "\n";
+    if a.verb == VERB_PRESS && a.receiver != NO_PART && rules.live() {
+      var asks = GlideAsks();
+      _ = rules.click(parts[usize.from(a.receiver)].slot, step, &mut asks);
+      each k in &asks { self.startGlide(*k); }
+    }
     true
   }
 
-  // Derive: subscriptions in dependency order. None yet
-  fn derive(self: &mut) {}
+  // A glide a rule asked for: the piece goes to stand over the middle of the part 'to' (its shape's bounds), level
+  fn startGlide(self: &mut, k: GlideAsk) {
+    var middle = Vec3(0., 0., 0.);
+    each p in &parts {
+      if p.slot == k.to {
+        each s in &heldShapes { if s.key == p.key { middle = s.pick.centre; } }
+      }
+    }
+    let there = rules.slots.worldPoint(k.to, middle);
+    let here = rules.slots.worldPoint(k.piece, Vec3(0., 0., 0.));
+    rules.slots.startGlide(k.piece, there, k.seconds);
+    landings.push(Landing(k.piece, there));
+    print <- "sim: step "; print <- step; print <- ", glide from ("; printF(here.x); print <- ", "; printF(here.z);
+    print <- ") to ("; printF(there.x); print <- ", "; printF(there.z); print <- ") over "; printF(k.seconds); print <- " s\n";
+  }
+
+  // Derive: the world's derives in dependency order, then what is moving moves (a glide's step)
+  fn derive(self: &mut) {
+    rules.derive(step);
+    rules.slots.tick();
+  }
+
+  // Where a part stands now: its frame in the world once a rule has moved it, else where the image put it
+  fn placeOf(self: &, p: &SimPart) Mat4 {
+    if usize.from(p.slot) < rules.slots.count() { rules.slots.place(p.slot) } else { p.placement }
+  }
 
   // Publish: the zone's parts and the person, as a snapshot nothing changes
   // after this
   fn publish(self: &mut, atNs: u64) {
+    rules.slots.refresh();
     var ps = PartStates();
-    each p in &parts { ps.push(PartState(p.id, p.key, NO_PART, p.placement)); }
+    each p in &parts { ps.push(PartState(p.id, p.key, NO_PART, self.placeOf(p))); }
     var s = Snapshot(step, atNs, person, ps, 0u64);
     s.sum = snapshotSum(&s);
     let out = Published(s);
@@ -250,7 +296,7 @@ actor Sim {
     each p in &parts {
       each s in &heldShapes {
         if s.key == p.key {
-          let t = rayBox(from, along, p.placement.translation(), s.pick.half);
+          let t = rayBox(from, along, self.placeOf(p).translation() + s.pick.centre, s.pick.half);
           if t >= 0. && t < bestT { bestT = t; best = p.id; }
         }
       }
@@ -286,7 +332,25 @@ actor Sim {
       print <- "check pointer: a press reached Sim with box-a's handle ("; print <- boxA; print <- ")";
       if hit { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
     }
-    print <- "sim: "; print <- step; print <- " steps, "; print <- lateSteps; print <- " dropped as late\n";
+    // Each piece a rule glided stands, once its glide is over, over the middle it was sent to (the last one for a piece)
+    var li = 0usize;
+    while li < landings.len() {
+      var last = true;
+      var lj = li + 1usize;
+      while lj < landings.len() { if landings[lj].piece == landings[li].piece { last = false; } lj = lj + 1usize; }
+      if last {
+        let at = rules.slots.worldPoint(landings[li].piece, Vec3(0., 0., 0.));
+        let goal = landings[li].goal;
+        let off = absf(at.x - goal.x) + absf(at.z - goal.z);
+        print <- "check glide: "; printStr(rules.slots.nameOf(landings[li].piece)); print <- " stands at ("; printF(at.x);
+        print <- ", "; printF(at.z); print <- ") and was sent to ("; printF(goal.x); print <- ", "; printF(goal.z); print <- "), "; printF(off);
+        print <- " m off";
+        if !rules.slots.gliding() && off < 0.01 { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
+      }
+      li = li + 1usize;
+    }
+    print <- "sim: "; print <- step; print <- " steps, "; print <- lateSteps; print <- " dropped as late; rules fired ";
+    print <- rules.fired; print <- ", stopped "; print <- rules.stopped; print <- "\n";
     if ok { 0 } else { 1 }
   }
 }

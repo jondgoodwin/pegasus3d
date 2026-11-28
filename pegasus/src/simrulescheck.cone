@@ -1,0 +1,65 @@
+// The driven check of Sim's rules (`--checks`): a handler staged, applied, and dropped whole when it traps, with no
+// window, GPU or thread. Hand-assembled code stands for a world's, as guidebrowser\src\simcheck.cone does for the guide
+// browser's host; the world's own rule (first.ddd's click) is driven end to end by `--world ... --press`.
+//
+//   a handler that sets field 0 to 5 and then 6: its two writes apply, in order, once it has returned (the field is 6)
+//   a handler that sets field 0 and then traps: the field is as it was and the world is told (stopped 1)
+//   a click on a part no rule holds: no rule runs
+//
+// PEGASUS_MUTANT=trapped-writes hands a trapped handler's writes back anyway; the second check must catch it.
+
+// A handler that sets field 0 to 5 and then to 6 and, if 'trap', then runs `unreachable`: pick-and-place rule 0
+fn setTwiceCode(trap: bool) Code {
+  var cw = CodeWriter.make();
+  let setSig = setFieldSignature(&mut cw.code.types);
+  let imp = cw.addImport(NS_HOST, HOST_SET_FIELD, setSig);
+  let none = List[u32]();
+  let sig = cw.code.types.sig(none.view(), none.view());
+  let u = cw.beginUnit(sig, "h");
+  cw.i64Const(0i64); cw.f64Const(5.); cw.opU(OP_IMPORT, imp);
+  cw.i64Const(0i64); cw.f64Const(6.); cw.opU(OP_IMPORT, imp);
+  if trap { cw.op(OP_UNREACHABLE); }
+  cw.endUnit();
+  cw.addEntry(ENTRY_HANDLER, u, ENTRY_MOVE_FLAG, 0u32);
+  var done = Code.empty();
+  done <-> cw.code;
+  done
+}
+
+// A world of two slots (the world, and slot 1 that the rule holds) with one field, 'held', beginning at 0
+fn tinyBehaviour(trap: bool) Behaviour {
+  var frames = SlotFrames();
+  frames.push(SlotFrame(String.from("world"), 0u32, Vec3(0., 0., 0.), Quat.identity()));
+  frames.push(SlotFrame(String.from("piece"), 0u32, Vec3(0., 0., 0.), Quat.identity()));
+  var fields = FieldDecls();
+  fields.push(FieldDecl(String.from("held"), 0.));
+  var moves = MoveDecls();
+  moves.push(MoveDecl(1u32, 0u32));
+  Behaviour(setTwiceCode(trap), frames, fields, DeriveDecls(), moves, 0usize)
+}
+
+fn rulesVerdict(ok: bool, what: &str) bool {
+  print <- "check rules: "; printStr(what); print <- if ok { " ok\n" } else { " WRONG\n" };
+  ok
+}
+
+pub fn checkRules(applyOnTrap: bool) bool {
+  var all = true;
+  {
+    var r = SimRules.make(tinyBehaviour(false), applyOnTrap);
+    var asks = GlideAsks();
+    let held = r.click(1u32, 1u64, &mut asks);
+    all = rulesVerdict(held && r.fieldValue(0usize) == 6. && r.fired == 1u64 && r.stopped == 0u64,
+      "a handler's two writes apply, in order, when it returns") && all;
+    let none = r.click(0u32, 2u64, &mut asks);
+    all = rulesVerdict(!none && r.fired == 1u64, "a click on a part no rule holds runs nothing") && all;
+  }
+  {
+    var r = SimRules.make(tinyBehaviour(true), applyOnTrap);
+    var asks = GlideAsks();
+    _ = r.click(1u32, 1u64, &mut asks);
+    all = rulesVerdict(r.fieldValue(0usize) == 0. && r.stopped == 1u64 && r.fired == 0u64,
+      "a handler that traps leaves its writes unapplied, and the world is told") && all;
+  }
+  all
+}

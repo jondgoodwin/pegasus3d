@@ -74,6 +74,7 @@ pub struct RenderCore {
   avatar: PartId;
   camera: PartId;
   stalePose: bool;                  // the head-pose check's mutant
+  blendAlpha: f32;                  // how far between the two newest snapshots this frame is (1: the newer)
   pub uploadedBytes: usize;
   pub released: u64;                // keys whose mesh was dropped on the Loader's word
   pub uploadFrames: u64;            // frames that uploaded anything
@@ -88,7 +89,7 @@ pub struct RenderCore {
 
   pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), 0u64,
-      NO_PART, NO_PART, stalePose, 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+      NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
   }
 
   // The newest snapshot: kept with the one before it
@@ -200,7 +201,7 @@ pub struct RenderCore {
           mesh <-> c.mesh;
           if mesh.normals.len() != mesh.positions.len() { mesh.computeFlatNormals(); }
           let m = g.renderer.addMesh(&mut g.device, &mesh);
-          let mat = g.renderer.addMaterial(&mut g.device, &c.material);
+          let mat = uploadLook(g, &c.look);
           residents.push(Resident(c.key, m, mat));
         }
         else { residents.push(Resident(c.key, MeshHandle.none(), MaterialHandle.none())); }
@@ -227,6 +228,7 @@ pub struct RenderCore {
               if target <= a.atNs { alpha = 0.; }
               else if target < b.atNs { alpha = f32.from(target - a.atNs) / f32.from(b.atNs - a.atNs); }
               plan.feet = a.person.feet + (b.person.feet - a.person.feet) * alpha;
+              blendAlpha = alpha;
             }
           }
           case is None[Published] {}
@@ -234,6 +236,25 @@ pub struct RenderCore {
       }
       case is None[Published] {}
     }
+  }
+
+  // Where the k-th part of the newer snapshot is drawn: between where the older snapshot had it and where the newer has
+  // it, by the same blend as the person (a part a rule glides moves smoothly between steps). Only its place moves; a
+  // glide does not turn anything
+  fn blendedPlace(self: &, k: usize, p: &PartState) Mat4 {
+    var place = p.placement;
+    match &older {
+      case let Some(a) {
+        if k < a.parts.len() && a.parts[k].id == p.id && blendAlpha < 1. {
+          let was = &a.parts[k].placement;
+          place.m[12] = was.m[12] + (place.m[12] - was.m[12]) * blendAlpha;
+          place.m[13] = was.m[13] + (place.m[13] - was.m[13]) * blendAlpha;
+          place.m[14] = was.m[14] + (place.m[14] - was.m[14]) * blendAlpha;
+        }
+      }
+      case is None[Published] {}
+    }
+    place
   }
 
   // Step 4: the newer snapshot's resident parts, from 'eye' looking along
@@ -259,10 +280,13 @@ pub struct RenderCore {
     g.list.clear();
     match &newer {
       case let Some(s) {
+        var k = 0usize;
         each p in &s.parts {
+          let place = self.blendedPlace(k, p);
           each r in &residents {
-            if r.key == p.key && !r.mesh.isNone() { g.list.add(r.mesh, r.material, p.placement); }
+            if r.key == p.key && !r.mesh.isNone() { g.list.add(r.mesh, r.material, place); }
           }
+          k = k + 1usize;
         }
       }
       case is None[Published] {}
@@ -343,6 +367,21 @@ fn daySky() Sky {
 
 // The GPU for a window ('window': its SDL handle as a number, since a raw
 // pointer is not Sendable), or off screen at 'w' x 'h' when 'window' is 0
+// A part's material on the GPU, from partbuild's record: a physical one by its roughness, metal, clear coat and
+// reflection, a plain one by its colour (and how much it covers), as the guide browser makes them
+fn uploadLook(g: &mut Gfx, look: &MaterialRec) MaterialHandle {
+  if look.physical {
+    var pbr = PbrMaterial.standard(look.color, look.metal, look.roughness);
+    pbr.clearcoat = look.coat;
+    pbr.clearcoatRoughness = look.coatRoughness;
+    if look.reflects > 0. { pbr = pbr.reflective(look.reflects); }
+    return g.renderer.addPbrMaterial(&mut g.device, &pbr);
+  }
+  var plain = Material.plain(look.color);
+  if look.covers < 1. { plain = plain.translucent(look.covers); }
+  g.renderer.addMaterial(&mut g.device, &plain)
+}
+
 fn makeGfx(window: usize, w: u32, h: u32) Option[Gfx] {
   var instance = Instance.create("pegasus");
   if !instance.isValid() { print <- "render: no Vulkan 1.3 instance\n"; return None[Gfx]; }
@@ -385,13 +424,15 @@ actor Render {
   stopped: Sender[bool];            // told, once the loop has ended, whether Render's checks passed (the shell then lets the window go)
   finished: Sender[i32];            // a shot's verdict
   stallMs: u64;                     // the stall check: Sim is busy this long once (0: no stall)
+  shotAfter: u64;                   // a shot waits for this step (--shot-after N; at least 10)
 
   fn init(self: &new, window: usize, w: u32, h: u32, gpu: bool, looks: StateReader[LookIntent],
       drawnOut: StateWriter[DrawnFrame], shot: String, wantKeys: usize, exactKeys: usize, stopped: Sender[bool], finished: Sender[i32],
-      stallMs: u64, stalePose: bool) {
+      stallMs: u64, stalePose: bool, shotAfter: u64) {
     var core = RenderCore.make(looks, drawnOut, stalePose);
     if gpu { core.gfx = makeGfx(window, w, h); }
-    *self = Self(core, false, window == 0usize, shot, wantKeys, exactKeys, stopped, finished, stallMs);
+    *self = Self(core, false, window == 0usize, shot, wantKeys, exactKeys, stopped, finished, stallMs,
+      if shotAfter > 10u64 { shotAfter } else { 10u64 });
   }
 
   // Render's checks at the end of a run: no snapshot changed after it was
@@ -452,7 +493,8 @@ actor Render {
       if !running { break; }
       if shot.len() > 0usize {
         let plan = core.prepare();
-        if core.residentCount() >= wantKeys && plan.step > 10u64 {
+        _ = core.finish(&plan);     // a frame as any other (nothing is drawn: no shot is asked of it), so Player's script sees the steps
+        if core.residentCount() >= wantKeys && plan.step > shotAfter {
           core.shoot(shot.view());
           var f = finished.clone();
           f <- 0;

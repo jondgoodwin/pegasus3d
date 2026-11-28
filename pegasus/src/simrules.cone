@@ -1,0 +1,355 @@
+// Sim's rules: a world's derives and handlers, run by conescript's interpreter at Sim's seams (plan step 6, the click).
+//
+// A world's rules are lowered (conescript's `lowerSim`) to a Code of units that reach the world only through imports in
+// namespace "host". This file is the table of those imports and the one place that runs a unit. The table is the new
+// browser's own (spec section 10a), made from conescript's names and signatures (the HOST_* constants and `*Signature`
+// functions); the guide browser has its own (`guidebrowser\src\simhost.cone`), the same in shape:
+//
+//   host.field(i)            a field's value, as it stood before the run (handle 1)
+//   host.occupied(part)      is the visitor inside that part's area (handle 2; no areas here yet, so always 0)
+//   host.set_field(i, v)     acting: staged, not written
+//   host.start_anim(k)       acting: staged
+//   host.glide(i, to, s)     acting: staged
+//
+// STAGED WRITES. An acting import appends to the run's write list and changes nothing else, so a handler does not see
+// its own writes and a handler that traps (or runs out of fuel) leaves nothing behind. `handle` gives the list to the
+// caller only when the run finished; `SimRules` applies it, in order, when the handler has returned.
+
+alias RuleHandles = HandleTable[u8];
+
+const RULE_FIELDS = 1usize;         // handle 1: the fields' values, as f64 bits
+const RULE_INSIDE = 2usize;         // handle 2: by slot, 1 if the visitor is inside an area of that part
+const RULE_WRITES = 3usize;         // handle 3: the staged writes of the run, four words each
+const NO_UNIT = 0xFFFFFFFFu32;
+
+// What a run may spend (a derive or a handler is a few ops; this only stops a runaway)
+pub const RULE_FUEL = 100000u64;
+
+const WRITE_SET = 0u64;             // a: the field, b: its value as bits
+const WRITE_ANIM = 1u64;            // a: the animator's number
+const WRITE_GLIDE = 2u64;           // a: the field holding the part, b: where it goes (a slot), c: seconds as bits
+
+// One thing a handler asked for, in the order it asked
+pub struct StagedWrite {
+  pub kind: u64;
+  pub a: u64;
+  pub b: u64;
+  pub c: u64;
+}
+
+fn hostField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(RULE_FIELDS).len() { hs.fail = String.from("host.field: no such field"); return false; }
+  slots[0usize] = *hs.payload(RULE_FIELDS)[i];
+  true
+}
+
+fn hostOccupied(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let s = usize.from(slots[0usize]);
+  slots[0usize] = if s < hs.payload(RULE_INSIDE).len() { *hs.payload(RULE_INSIDE)[s] } else { 0u64 };
+  true
+}
+
+fn stage(hs: &mut RuleHandles, kind: u64, a: u64, b: u64, c: u64) {
+  (&mut hs.data[RULE_WRITES]).push(kind);
+  (&mut hs.data[RULE_WRITES]).push(a);
+  (&mut hs.data[RULE_WRITES]).push(b);
+  (&mut hs.data[RULE_WRITES]).push(c);
+}
+
+fn hostSetField(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(RULE_FIELDS).len() { hs.fail = String.from("host.set_field: no such field"); return false; }
+  stage(hs, WRITE_SET, u64.from(i), slots[1usize], 0u64);
+  true
+}
+
+fn hostStartAnim(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  stage(hs, WRITE_ANIM, slots[0usize], 0u64, 0u64);
+  true
+}
+
+fn hostGlide(hs: &mut RuleHandles, slots: &mut Array[u64]) bool {
+  let i = usize.from(slots[0usize]);
+  if i >= hs.payload(RULE_FIELDS).len() { hs.fail = String.from("host.glide: no such field"); return false; }
+  stage(hs, WRITE_GLIDE, u64.from(i), slots[1usize], slots[2usize]);
+  true
+}
+
+// The imports Sim offers (the code's, lowerSim's, are checked against these)
+fn ruleImports() ImportTables[u8] {
+  var t = ImportTables[u8].make();
+  let f = fieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_FIELD, f, false, 1u32, &hostField);
+  let o = occupiedSignature(&mut t.types);
+  t.add(NS_HOST, HOST_OCCUPIED, o, false, 1u32, &hostOccupied);
+  let s = setFieldSignature(&mut t.types);
+  t.add(NS_HOST, HOST_SET_FIELD, s, true, 1u32, &hostSetField);
+  let a = startAnimSignature(&mut t.types);
+  t.add(NS_HOST, HOST_START_ANIM, a, true, 1u32, &hostStartAnim);
+  let g = glideSignature(&mut t.types);
+  t.add(NS_HOST, HOST_GLIDE, g, true, 1u32, &hostGlide);
+  t
+}
+
+// A world's Sim code, verified, with the values it reads and the interpreter that runs it
+pub struct RuleHost {
+  code: VerifiedCode;
+  tables: ImportTables[u8];
+  hs: RuleHandles;
+  interp: Interpreter;
+  applyOnTrap: bool;                // the check's mutant: a trapped handler's writes are handed back anyway
+
+  // The host for code, with 'fields' fields (each starting at 0) and 'slots' slots; or what the verifier refused
+  pub fn make(code: &Code, fields: usize, slots: usize, applyOnTrap: bool) Result[RuleHost, List[CodeProblem]] {
+    let tables = ruleImports();
+    match verify(code, &tables) {
+      case let Ok(v) {
+        var hs = RuleHandles.make();
+        var f = List[u64]();
+        var i = 0usize;
+        while i < fields { f.push(0u64); i = i + 1usize; }
+        var s = List[u64]();
+        i = 0usize;
+        while i < slots { s.push(0u64); i = i + 1usize; }
+        hs.alloc(HANDLE_HOST, f);
+        hs.alloc(HANDLE_HOST, s);
+        hs.alloc(HANDLE_HOST, List[u64]());
+        Ok[RuleHost, List[CodeProblem]](RuleHost(v, tables, hs, Interpreter.make(), applyOnTrap))
+      }
+      case let Err(ps) { Err[RuleHost, List[CodeProblem]](ps) }
+    }
+  }
+
+  pub fn setValue(self: &mut, i: usize, v: f64) { (&mut self.hs.data[RULE_FIELDS]).set(i, v.bits()); }
+  pub fn value(self: &, i: usize) f64 { f64.fromBits(*self.hs.payload(RULE_FIELDS)[i]) }
+
+  // The unit an entry names, if the code has one
+  pub fn unitFor(self: &, kind: u8, a: u32, b: u32) Option[u32] { entryUnit(self.code.source(), kind, a, b) }
+
+  // Runs a unit, leaving its result slots in 'out' and its staged writes in the write list; the trap's message if it stopped
+  fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
+    self.hs.fail = String();
+    (&mut self.hs.data[RULE_WRITES]).clear();
+    self.interp.setFuel(RULE_FUEL);
+    let none = List[u64]();
+    match self.interp.run(&self.code, &self.tables, &mut self.hs, unit, none.view(), out) {
+      case let Some(t) { Some[String](t.message.clone()) }
+      case is None { None }
+    }
+  }
+
+  // A derive's value now; the trap's message if it stopped
+  pub fn derive(self: &mut, unit: u32) Result[f64, String] {
+    var out = List[u64]();
+    match self.run(unit, &mut out) {
+      case let Some(why) { Err[f64, String](why) }
+      case is None { Ok[f64, String](f64.fromBits(*out[0usize])) }
+    }
+  }
+
+  // A handler run to its end: what it staged, in order, for the caller to apply. A handler that traps hands back nothing:
+  // 'writes' is left empty and the trap's message is returned
+  pub fn handle(self: &mut, unit: u32, writes: &mut List[StagedWrite]) Option[String] {
+    writes.clear();
+    var out = List[u64]();
+    let stopped = self.run(unit, &mut out);
+    if (stopped is Some) && !applyOnTrap { return stopped; }
+    let w = self.hs.payload(RULE_WRITES);
+    var i = 0usize;
+    while i + 3usize < w.len() {
+      writes.push(StagedWrite(*w[i], *w[i + 1usize], *w[i + 2usize], *w[i + 3usize]));
+      i = i + 4usize;
+    }
+    stopped
+  }
+}
+
+// A glide a handler asked for, for Sim to start: the piece, where it goes (a slot) and over how long
+pub struct GlideAsk {
+  pub piece: u32;
+  pub to: u32;
+  pub seconds: f32;
+}
+alias GlideAsks = List[GlideAsk];
+
+// What Sim runs a world's rules with: the verified code and its units, the fields' values, the frames and their glides.
+// A world that has no behaviour, or whose code the verifier refused, has the frames and nothing to run.
+pub struct SimRules {
+  host: Option[RuleHost];
+  pub slots: Slots;
+  fieldNames: List[String];
+  moves: MoveDecls;
+  moveUnits: List[u32];             // by pick-and-place rule: its unit (NO_UNIT: none)
+  derives: DeriveDecls;
+  deriveUnits: List[u32];
+  keysRules: usize;
+  pub stopped: u64;                 // handlers and derives stopped, their writes dropped
+  pub fired: u64;                   // handlers run to their end
+
+  pub fn none() SimRules {
+    SimRules(None[RuleHost], Slots.none(), List[String](), MoveDecls(), List[u32](), DeriveDecls(), List[u32](), 0usize, 0u64, 0u64)
+  }
+
+  // The rules of a behaviour: its code verified now. 'applyOnTrap' is the check's mutant
+  pub fn make(b: Behaviour, applyOnTrap: bool) SimRules {
+    var r = SimRules.none();
+    var behaviour = b;
+    var frames = SlotFrames();
+    frames <-> behaviour.frames;
+    r.slots = Slots.make(frames);
+    r.moves <-> behaviour.moves;
+    r.derives <-> behaviour.derives;
+    r.keysRules = behaviour.keysRules;
+    if r.moves.len() == 0usize && r.derives.len() == 0usize { return r; }
+    match RuleHost.make(&behaviour.code, behaviour.fields.len(), r.slots.count(), applyOnTrap) {
+      case let Ok(host) {
+        var h = host;
+        var i = 0usize;
+        while i < behaviour.fields.len() {
+          h.setValue(i, behaviour.fields[i].value);
+          r.fieldNames.push(behaviour.fields[i].name.clone());
+          i = i + 1usize;
+        }
+        i = 0usize;
+        while i < r.moves.len() {
+          r.moveUnits.push(unitOrNone(h.unitFor(ENTRY_HANDLER, ENTRY_MOVE_FLAG | r.moves[i].number, 0u32)));
+          i = i + 1usize;
+        }
+        i = 0usize;
+        while i < r.derives.len() {
+          r.deriveUnits.push(unitOrNone(h.unitFor(ENTRY_DERIVE, r.derives[i].number, 0u32)));
+          i = i + 1usize;
+        }
+        r.host = Some[RuleHost](h);
+      }
+      case let Err(problems) {
+        // code that does not verify never runs: this world's rules are left out
+        var i = 0usize;
+        while i < problems.len() {
+          print <- "sim: the world's behaviour code was refused: "; printStr(problems[i].what.view()); print <- "\n";
+          i = i + 1usize;
+        }
+        r.moves = MoveDecls();
+        r.derives = DeriveDecls();
+      }
+    }
+    r
+  }
+
+  pub fn live(self: &) bool { host is Some }
+  pub fn keysRuleCount(self: &) usize { keysRules }
+  pub fn moveCount(self: &) usize { moves.len() }
+
+  pub fn fieldValue(self: &, i: usize) f64 {
+    match &host { case let Some(h) { h.value(i) } else { 0. } }
+  }
+
+  // A click on the part at 'slot' at step 'step': each pick-and-place rule that holds it runs, in the order written,
+  // and what a handler staged is applied when it has returned. The glides it asked for are added to 'asks'. True if
+  // some rule held the slot
+  pub fn click(self: &mut, slot: u32, step: u64, asks: &mut GlideAsks) bool {
+    var any = false;
+    var m = 0usize;
+    while m < moves.len() {
+      if slots.within(slot, moves[m].part) {
+        any = true;
+        self.runHandler(*moveUnits[m], step, slot, asks);
+      }
+      m = m + 1usize;
+    }
+    any
+  }
+
+  // Runs a unit (none: nothing); a unit that traps or runs out of fuel is dropped whole, writes and all, and the world
+  // is told
+  fn runHandler(self: &mut, unit: u32, step: u64, clicked: u32, asks: &mut GlideAsks) {
+    if unit == NO_UNIT { return; }
+    var writes = List[StagedWrite]();
+    var why = None[String];
+    match &mut host {
+      case var &mut Some(h) { why = h.handle(unit, &mut writes); }
+      else {}
+    }
+    match &why {
+      case let Some(message) {
+        stopped = stopped + 1u64;
+        print <- "sim: step "; print <- step; print <- ", a rule was stopped and its changes dropped: "; printStr(message.view());
+        print <- "\n";
+        if writes.len() == 0usize { return; }       // the mutant hands them back: they are applied below
+      }
+      else {}
+    }
+    fired = fired + 1u64;
+    var k = 0usize;
+    while k < writes.len() {
+      let w = &writes[k];
+      if w.kind == WRITE_SET {
+        let f = usize.from(w.a);
+        let v = f64.fromBits(w.b);
+        match &mut host { case var &mut Some(h) { h.setValue(f, v); } else {} }
+        print <- "sim: step "; print <- step; print <- ", ";
+        printStr(fieldNames[f].view()); print <- " is now ";
+        if v < 0. { print <- "None"; } else { printStr(slots.nameOf(u32.from(i64.from(v)))); }
+        print <- "\n";
+      }
+      else if w.kind == WRITE_ANIM {
+        print <- "sim: step "; print <- step; print <- ", a keys rule started (not run in this browser yet)\n";
+      }
+      else {
+        // a glide: the part the field holds goes to stand over the middle of the part 'to'
+        let held = self.fieldValue(usize.from(w.a));
+        if held >= 0. {
+          let piece = u32.from(i64.from(held));
+          asks.push(GlideAsk(piece, u32.from(w.b), f32.from(f64.fromBits(w.c))));
+          print <- "sim: step "; print <- step; print <- ", "; printStr(slots.nameOf(piece));
+          print <- " glides to "; printStr(slots.nameOf(u32.from(w.b))); print <- "\n";
+        }
+      }
+      k = k + 1usize;
+    }
+  }
+
+  // The derives, in their order: a derive that sets a field writes it when its value changed. (A tint is not drawn
+  // by this browser yet.)
+  pub fn derive(self: &mut, step: u64) {
+    var d = 0usize;
+    while d < derives.len() {
+      let unit = *deriveUnits[d];
+      if unit != NO_UNIT && derives[d].prop == P_FIELD {
+        var got = None[f64];
+        match &mut host {
+          case var &mut Some(h) {
+            match h.derive(unit) {
+              case let Ok(x) { got = Some[f64](x); }
+              case let Err(why) {
+                stopped = stopped + 1u64;
+                print <- "sim: step "; print <- step; print <- ", a derive was stopped: "; printStr(why.view()); print <- "\n";
+              }
+            }
+          }
+          else {}
+        }
+        match got {
+          case let Some(v) {
+            let i = usize.from(derives[d].index);
+            if v != self.fieldValue(i) {
+              match &mut host { case var &mut Some(h) { h.setValue(i, v); } else {} }
+              print <- "sim: step "; print <- step; print <- ", "; printStr(fieldNames[i].view()); print <- " is now "; print <- v; print <- "\n";
+            }
+          }
+          else {}
+        }
+      }
+      d = d + 1usize;
+    }
+  }
+}
+
+// An entry's unit, or NO_UNIT
+fn unitOrNone(u: Option[u32]) u32 {
+  match u {
+    case let Some(x) { x }
+    else { NO_UNIT }
+  }
+}
