@@ -27,7 +27,7 @@ State and event traffic and asset traffic never block each other ([Network](netw
   - Render → Player, Sim: the frame's display time and the head and hands as drawn (latest value). Render reads the newest pose itself, last, before drawing.
   - Player → Loader: open world W for Sim S, which Player has started (event). Loader → Sim: the world image and Sim units (move).
   - Sim → Loader: build content K for part P at a priority set by nearness; part P no longer uses K (events).
-  - Loader → Sim: collision and pick shapes for K (move). Loader → Render: mesh, texture, material for K (bulk move, under Render's upload budget).
+  - Loader → Sim: collision and pick shapes for K (move). Loader → Render: mesh, texture, material for K (bulk move, under Render's upload budget). Loader → Render: release K, sent when K's last user leaves, so Render may drop its GPU content (event).
   - Client Sim ↔ server Sim, when connected: as in [Sim](sim.md), connected play.
 - **An action in a message is small:** a verb, a receiver handle, its parameters, the time it was made and where it came from. The fuller record in the actions proposal waits until that proposal is judged. `[design choice]`
 
