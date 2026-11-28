@@ -204,6 +204,13 @@ pub struct GlideAsk {
 }
 alias GlideAsks = List[GlideAsk];
 
+// A part's tint, as a derive last wrote it (a part not here has the tint 1)
+pub struct TintNow {
+  pub slot: u32;
+  pub value: f32;
+}
+alias TintNows = List[TintNow];
+
 // What Sim runs a world's rules with: the verified code and its units, the fields' values, the frames and their glides.
 // A world that has no behaviour, or whose code the verifier refused, has the frames and nothing to run.
 pub struct SimRules {
@@ -223,10 +230,12 @@ pub struct SimRules {
   traceSlot: u32;                   // the part whose frame `trace` prints (NO_UNIT: none)
   pub stopped: u64;                 // handlers and derives stopped, their writes dropped
   pub fired: u64;                   // handlers run to their end
+  tints: TintNows;                  // each tinted part's tint now
+  tintChanged: TintNows;            // the tints that changed since `takeTints` last took them
 
   pub fn none() SimRules {
     SimRules(None[RuleHost], Slots.none(), List[String](), MoveDecls(), List[u32](), DeriveDecls(), List[u32](),
-      KeysDecls(), List[u32](), AreaDecls(), SimAnim.make(), false, 0u64, NO_UNIT, 0u64, 0u64)
+      KeysDecls(), List[u32](), AreaDecls(), SimAnim.make(), false, 0u64, NO_UNIT, 0u64, 0u64, TintNows(), TintNows())
   }
 
   // The rules of a behaviour: its code verified now. 'applyOnTrap' is the check's mutant
@@ -348,6 +357,29 @@ pub struct SimRules {
   }
 
   // SENSE, the areas: which parts the visitor, with its eye at 'eye', is inside (host.occupied reads these)
+  // Another visitor's eye (a server's): the areas it is inside are inside, besides those `sense` found
+  pub fn senseMore(self: &mut, eye: Vec3) {
+    match &mut host {
+      case var &mut Some(h) {
+        var a = 0usize;
+        while a < areas.len() {
+          let ar = &areas[a];
+          if (eye - slots.worldPoint(ar.slot, ar.centre)).length() <= ar.radius { h.setInside(usize.from(ar.slot), true); }
+          a = a + 1usize;
+        }
+      }
+      else {}
+    }
+  }
+
+  // The tints the derives changed since the last call, in the order they changed (a part's tint multiplies its colour and
+  // glow; a light inside the part is its glow: Sim scales those lights' amounts)
+  pub fn takeTints(self: &mut) TintNows {
+    var out = TintNows();
+    out <-> tintChanged;
+    out
+  }
+
   pub fn sense(self: &mut, eye: Vec3) {
     if areas.len() == 0usize { return; }
     match &mut host {
@@ -446,13 +478,24 @@ pub struct SimRules {
     }
   }
 
+  // A derive wrote the tint 'value' for the part at 'slot': noted for Sim when it differs from the tint the part had
+  fn tintNow(self: &mut, slot: u32, value: f32, step: u64) {
+    var i = 0usize;
+    while i < tints.len() && tints[i].slot != slot { i = i + 1usize; }
+    if i == tints.len() { tints.push(TintNow(slot, 1.)); }
+    if tints[i].value == value { return; }
+    (&mut tints[i]).value = value;
+    tintChanged.push(TintNow(slot, value));
+    print <- "sim: step "; print <- step; print <- ", "; printStr(slots.nameOf(slot)); print <- " tint is now "; print <- value; print <- "\n";
+  }
+
   // The derives, in their order: a derive that sets a field writes it when its value changed. (A tint is not drawn
   // by this browser yet.)
   pub fn derive(self: &mut, step: u64) {
     var d = 0usize;
     while d < derives.len() {
       let unit = *deriveUnits[d];
-      if unit != NO_UNIT && derives[d].prop == P_FIELD {
+      if unit != NO_UNIT && (derives[d].prop == P_FIELD || derives[d].prop == P_TINT) {
         var got = None[f64];
         match &mut host {
           case var &mut Some(h) {
@@ -468,10 +511,13 @@ pub struct SimRules {
         }
         match got {
           case let Some(v) {
+            if derives[d].prop == P_TINT { self.tintNow(derives[d].index, f32.from(v), step); }
+            else {
             let i = usize.from(derives[d].index);
             if v != self.fieldValue(i) {
               match &mut host { case var &mut Some(h) { h.setValue(i, v); } else {} }
               print <- "sim: step "; print <- step; print <- ", "; printStr(fieldNames[i].view()); print <- " is now "; print <- v; print <- "\n";
+            }
             }
           }
           else {}
