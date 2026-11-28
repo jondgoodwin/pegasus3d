@@ -163,9 +163,11 @@ struct Pass {
   fn slotsOf(self: &, t: u32) u32 { if t == TY_ANY { 0u32 } else { *self.tyslots[usize.from(t)] } }
 
   fn push(self: &mut, t: u32) {
+    if self.failed { return; }
     self.vals.push(t);
     self.h = self.h + self.slotsOf(t);
     if self.h > self.maxH { self.maxH = self.h; }
+    if self.h > MAX_FRAME_SLOTS { self.fail("the operand stack is too deep"); }
   }
 
   // Pops a value; 'want' is TY_ANY to take any type
@@ -309,11 +311,20 @@ fn needsInit(types: &TypeTable, t: u32) bool {
   false
 }
 
+// The most slots a unit's locals, or its operand stack, may take. Every slot count is kept far below u32's range, so
+// no sum of them can wrap and put a local or an operand outside its frame.
+const MAX_FRAME_SLOTS = 1048576u32;
+
+// The slots of a list of types, never more than MAX_FRAME_SLOTS + 1 (a count that large is refused where it is used)
 fn slotsOfList(slots: &List[u32], ts: &List[u32]) u32 {
-  var n = 0u32;
+  var n = 0u64;
   var i = 0usize;
-  while i < ts.len() { n = n + *slots[usize.from(*ts[i])]; i = i + 1usize; }
-  n
+  while i < ts.len() {
+    n = n + u64.from(*slots[usize.from(*ts[i])]);
+    if n > u64.from(MAX_FRAME_SLOTS) { return MAX_FRAME_SLOTS + 1u32; }
+    i = i + 1usize;
+  }
+  u32.from(n)
 }
 
 // What the pass found out about a unit
@@ -339,6 +350,10 @@ fn checkUnit[V](code: &Code, canon: &List[u32], slots: &List[u32], imps: &List[R
   i = 0usize;
   while i < localTy.len() {
     let n = *slots[usize.from(*localTy[i])];
+    if u64.from(off) + u64.from(n) > u64.from(MAX_FRAME_SLOTS) {
+      problems.push(CodeProblem(u32.from(ui), 0u32, String.from("the frame is too large (its locals take too many slots)")));
+      return;
+    }
     info.localOff.push(off);
     info.localLen.push(n);
     off = off + n;
@@ -583,8 +598,7 @@ fn checkUnit[V](code: &Code, canon: &List[u32], slots: &List[u32], imps: &List[R
             while j > 0usize { j = j - 1usize; ps.pop(*canon[usize.from(*cs.items[j])]); }
             // The call writes its results over its arguments, so the window is the larger of the two
             let r = &imps[usize.from(k)];
-            if ps.h + r.resultSlots > ps.maxH { ps.maxH = ps.h + r.resultSlots; }
-            j = 0usize;
+            if ps.h + r.resultSlots > ps.maxH { ps.maxH = ps.h + r.resultSlots; }            j = 0usize;
             while j < cs.results.len() { ps.push(*canon[usize.from(*cs.results[j])]); j = j + 1usize; }
           }
         }
@@ -602,6 +616,17 @@ fn checkUnit[V](code: &Code, canon: &List[u32], slots: &List[u32], imps: &List[R
   info.tgt = ps.tgt.clone();
   info.keep = ps.keep.clone();
   info.drop = ps.drop.clone();
+}
+
+// Whether an entry's unit has the signature its kind needs: derive () -> f64, handler () -> (), fixed () -> one result.
+// The unit's signature has been checked already (a unit whose is not one is refused before this).
+fn entryShapeOk(code: &Code, canon: &List[u32], e: &EntryDecl) bool {
+  let s = &code.types.defs[usize.from(code.units[usize.from(e.unit)].sig)];
+  if s.items.len() != 0usize { return false; }
+  if e.kind == ENTRY_HANDLER { return s.results.len() == 0usize; }
+  if s.results.len() != 1usize { return false; }
+  if e.kind == ENTRY_DERIVE { return *canon[usize.from(*s.results[0usize])] == TY_F64; }
+  true
 }
 
 fn andInto(a: &mut List[bool], b: &List[bool]) {
@@ -748,6 +773,10 @@ pub fn verifyEach[V](code: &Code, tables: &ImportTables[V]) Result[VerifiedCode,
     let e = &code.entries[i];
     if usize.from(e.unit) >= code.units.len() { problems.push(CodeProblem(NO_UNIT, u32.from(i), String.from("an entry names a unit that does not exist"))); }
     else if e.kind > ENTRY_HANDLER { problems.push(CodeProblem(e.unit, 0u32, String.from("an entry of unknown kind"))); refused.set(usize.from(e.unit), true); }
+    else if !*refused[usize.from(e.unit)] && !entryShapeOk(code, &canon, e) {
+      problems.push(CodeProblem(e.unit, 0u32, String.from("an entry's unit has the wrong signature for its kind (derive () -> f64, handler () -> (), fixed no parameters and one result)")));
+      refused.set(usize.from(e.unit), true);
+    }
     else if e.kind != ENTRY_HANDLER && *reach[usize.from(e.unit)] && !*refused[usize.from(e.unit)] {
       problems.push(CodeProblem(e.unit, 0u32, String.from("a fixed or derive unit reaches an acting import")));
       refused.set(usize.from(e.unit), true);

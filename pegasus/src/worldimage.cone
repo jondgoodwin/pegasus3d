@@ -40,6 +40,13 @@ pub struct ImageWorld {
   pub problems: List[Problem];
   pub startFeet: Vec3;              // where the first arrival puts the person's feet
   pub behaviour: Behaviour;         // what the world's rules do (behaviour.cone)
+  pub look: WorldLook;              // its sun, lamps and camera (what Render needs to light and take the picture as the guide does)
+}
+
+// A light part's slot and its frame in the world's, as fillImage finds them
+struct LightAt {
+  slot: u32;
+  place: Mat4;
 }
 
 // The text of a world read into its image
@@ -52,17 +59,63 @@ pub fn readImage(file: &str, text: &Array[u8]) ImageWorld {
   var parts = ImageParts();
   var dropped = List[String]();
   var feet = Vec3(0., 0., 0.);
-  fillImage(&reading.understood, &mut parts, &mut dropped, &mut feet);
+  var lights = List[LightAt]();
+  var arrivals = List[u32]();       // the first arrival's slot, if any
+  fillImage(&reading.understood, &mut parts, &mut dropped, &mut feet, &mut lights, &mut arrivals);
   // the keys rules' animators: a PartBuilder runs the units that give each key's value
   var keys = KeysDecls();
+  var look = noLook();
   let w = &reading.understood;
   match PartBuilder.make(w, toolImports(&w.vocab, &w.names)) {
-    case let Ok(made) { var bld = made; keys = keysOf(w, &mut bld); }
+    case let Ok(made) { var bld = made; keys = keysOf(w, &mut bld); look = lookOf(&mut bld, &lights, &arrivals); }
     case let Err(why) {
       print <- "build: "; printStr(file); print <- ": the keys rules were left out, the world's code was refused ("; print <- u64.from(why.len()); print <- " problems)\n";
     }
   }
-  ImageWorld(String.from(file), parts, dropped, problems, feet, behaviourOf(w, keys))
+  ImageWorld(String.from(file), parts, dropped, problems, feet, behaviourOf(w, keys), look)
+}
+
+// A world with no sun and no camera said: Render keeps its own
+pub fn noLook() WorldLook {
+  WorldLook(false, Vec3(0., 1., 0.), Color(1., 1., 1., 1.), 0., false, WorldLamps(), false, 0., 0., 2., 0.)
+}
+
+// The world's sun, lamps and camera, each built by partbuild as the guide browser's build.cone builds it (sunOf, lampOf, the
+// Stand): the last sun said wins, every lamp is kept where its part stands, the first arrival's camera is the camera
+fn lookOf(bld: &mut PartBuilder, lights: &List[LightAt], arrivals: &List[u32]) WorldLook {
+  var look = noLook();
+  each at in lights {
+    let p = bld.buildPart(usize.from(at.slot), Kind.Light);
+    if !p.made { continue; }
+    if p.light.kind == LIGHT_SUN {
+      look.hasSun = true;
+      look.toSun = p.light.sun.toSun;
+      look.sunColor = p.light.sun.color;
+      look.lux = p.light.sun.lux;
+      look.shadows = p.light.sun.shadows;
+    } else {
+      let l = &p.light.lamp;
+      var lamp = WorldLamp(at.place * Vec3(0., 0., 0.), Vec3(0., -1., 0.), l.color, l.candela, l.reach, l.source, 0., 0., false, l.shadows);
+      if l.spot {
+        lamp.spot = true;
+        lamp.aim = at.place.transformVector(l.aim).normalize();
+        lamp.cone = l.cone;
+        lamp.softEdge = l.softEdge;
+      }
+      look.lamps.push(lamp);
+    }
+  }
+  if arrivals.len() > 0usize {
+    let p = bld.buildPart(usize.from(*arrivals[0usize]), Kind.Arrival);
+    look.hasCamera = true;
+    if p.hasCamera {
+      look.lens = p.camera.lens;
+      look.aperture = p.camera.aperture;
+      look.focus = p.camera.focus;
+      look.exposure = p.camera.exposure;
+    }
+  }
+  look
 }
 
 // How many different mesh keys the parts have
@@ -83,7 +136,8 @@ pub fn distinctMaterials(image: &ImageWorld) usize {
   seen.len()
 }
 
-fn fillImage(w: &Understood, parts: &mut ImageParts, dropped: &mut List[String], feet: &mut Vec3) {
+fn fillImage(w: &Understood, parts: &mut ImageParts, dropped: &mut List[String], feet: &mut Vec3, lights: &mut List[LightAt],
+    arrivals: &mut List[u32]) {
   var places = List[Mat4]();        // by slot: the part's own frame, in the world's
   var s = 0usize;
   while s < w.nodes.len() {
@@ -120,7 +174,11 @@ fn fillImage(w: &Understood, parts: &mut ImageParts, dropped: &mut List[String],
       let material = materialKeyOf(&materialRecipe);
       parts.push(ImagePart(u32.from(slot), pathOf(w, slot), u32.from(parent), at, turn, *places[slot], recipe, key, materialRecipe, material));
     }
+    else if kind == Kind.Light {
+      if *w.alive[slot] { lights.push(LightAt(u32.from(slot), *places[slot])); }
+    }
     else if kind == Kind.Arrival && !standing {
+      arrivals.push(u32.from(slot));
       *feet = *places[parent] * vec3(&w.units[slot].options[OPT_AT]);
       standing = true;
     }
