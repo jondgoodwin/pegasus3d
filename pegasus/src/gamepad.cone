@@ -1,0 +1,85 @@
+// A gamepad, through SDL (the sdl package does not bind gamepads, so the few calls are declared here): the first one
+// connected is opened, and its sticks and south button (A on an Xbox pad) are read on each of the shell's polls. Its
+// events are let through when the window has no focus (SDL's JOYSTICK_ALLOW_BACKGROUND_EVENTS), so that a pad works
+// while the person wears the headset; the keyboard and mouse need the window's focus, as Windows routes them.
+//
+// The left stick walks (forward and to the side), the right stick looks (on the desktop: in the headset the head looks),
+// and the south button presses along the look, as the left mouse button does.
+
+extern {
+  fn @c("SDL_InitSubSystem") sdlInitSub(flags: u32) bool;
+  fn @c("SDL_SetHint") sdlSetHint(name: cstr, value: cstr) bool;
+  fn @c("SDL_GetGamepads") sdlGetGamepads(count: *i32) *u32;
+  fn @c("SDL_free") sdlFree(p: *u32);
+  fn @c("SDL_OpenGamepad") sdlOpenGamepad(id: u32) *u8;
+  fn @c("SDL_CloseGamepad") sdlCloseGamepad(pad: *u8);
+  fn @c("SDL_GamepadConnected") sdlGamepadConnected(pad: *u8) bool;
+  fn @c("SDL_GetGamepadAxis") sdlGetGamepadAxis(pad: *u8, axis: i32) i16;
+  fn @c("SDL_GetGamepadButton") sdlGetGamepadButton(pad: *u8, button: i32) bool;
+}
+const SDL_INIT_GAMEPAD = 0x2000u32;
+const AXIS_LEFTX = 0i32;
+const AXIS_LEFTY = 1i32;
+const AXIS_RIGHTX = 2i32;
+const AXIS_RIGHTY = 3i32;
+const BUTTON_SOUTH = 0i32;
+const PAD_DEAD_ZONE: f32 = 0.2;              // a stick nearer its middle than this is at rest (the island's dead zone)
+pub const PAD_LOOK_PIXELS: f32 = 12.;        // a right stick held full over makes this many mouse pixels of look a poll
+
+// The gamepad as the shell polls it
+pub struct Gamepad {
+  pad: *u8;                         // the open pad (null: none)
+  started: bool;                    // SDL's gamepad subsystem began
+  wasDown: bool;                    // the south button was down at the last poll
+  polls: u64;
+  pub forward: f32;                 // -1 to 1: the left stick, forward positive
+  pub strafe: f32;                  // -1 to 1: right positive
+  pub lookX: f32;                   // -1 to 1: the right stick
+  pub lookY: f32;
+  pub pressed: bool;                // the south button went down since the last poll
+
+  pub fn make() Gamepad {
+    var g = Gamepad(null, false, false, 0u64, 0., 0., 0., 0., false);
+    _ = sdlSetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+    g.started = sdlInitSub(SDL_INIT_GAMEPAD);
+    g
+  }
+
+  // Read the pad (opening the first one connected, looked for every 250 polls, about half a second); at rest without one
+  pub fn poll(self: &mut) {
+    forward = 0.; strafe = 0.; lookX = 0.; lookY = 0.; pressed = false;
+    if !started { return; }
+    if pad != null && !sdlGamepadConnected(pad) { sdlCloseGamepad(pad); pad = null; print <- "pegasus: the gamepad was disconnected\n"; }
+    if pad == null {
+      if polls % 250u64 == 0u64 {
+        var count = 0i32;
+        let ids = sdlGetGamepads(&mut count);
+        if ids != null {
+          if count > 0i32 { pad = sdlOpenGamepad(*ids); if pad != null { print <- "pegasus: a gamepad is connected\n"; } }
+          sdlFree(ids);
+        }
+      }
+      polls = polls + 1u64;
+      if pad == null { return; }
+    }
+    forward = 0. - stickOf(sdlGetGamepadAxis(pad, AXIS_LEFTY));     // (SDL's y is down)
+    strafe = stickOf(sdlGetGamepadAxis(pad, AXIS_LEFTX));
+    lookX = stickOf(sdlGetGamepadAxis(pad, AXIS_RIGHTX));
+    lookY = stickOf(sdlGetGamepadAxis(pad, AXIS_RIGHTY));
+    let down = sdlGetGamepadButton(pad, BUTTON_SOUTH);
+    pressed = down && !wasDown;
+    wasDown = down;
+  }
+
+  fn final(self: &uni) {
+    if pad != null { sdlCloseGamepad(pad); }
+  }
+}
+
+// A stick's axis, -1 to 1, with the dead zone taken out
+fn stickOf(raw: i16) f32 {
+  let v = f32.from(raw) / 32767.;
+  if v > PAD_DEAD_ZONE { return (v - PAD_DEAD_ZONE) / (1. - PAD_DEAD_ZONE); }
+  if v < 0. - PAD_DEAD_ZONE { return (v + PAD_DEAD_ZONE) / (1. - PAD_DEAD_ZONE); }
+  0.
+}
