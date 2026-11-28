@@ -1,0 +1,219 @@
+// meshhash: the determinism test's headless hasher. "meshhash FILE.ddd" reads a world, builds each part's mesh through
+// partbuild's shims, and prints "<part name> <hash of its mesh>", the same lines as "guidebrowser --mesh-hashes FILE"
+// (baselines in tools\mesh-hashes), from the libraries alone: no sdl, gpu, render or CEF. So it builds and runs on any
+// machine Cone does, and its output is compared across machines (Loader design R1).
+//
+// The walk below (pack, makeValue, shapeMesh) is a copy of guidebrowser\src\build.cone's, kept to shapes (a part's
+// material, lights, places and behaviours do not touch a mesh), and the hash is guidebrowser\src\meshhash.cone's.
+// It goes when partbuild has the walk (W113); until then a change to build.cone's walk must be made here too.
+mod meshhash;
+
+import stdio use *;
+import libc;
+import collections use *;
+import geomath use *;
+import mesh use Mesh, PolyMesh;
+import conescript use *;
+import partbuild use *;
+import path use Path;
+import fs;
+
+const NO_FN = 0xFFFFFFFFusize;
+
+// What a list of this type holds, one item's type
+fn itemOf(ty: Ty) Ty {
+  if ty == Ty.Outlines { return Ty.Outline; }
+  if ty == Ty.Shapes { return Ty.Shape; }
+  if ty == Ty.Strokes { return Ty.Stroke; }
+  if ty == Ty.Modifiers { return Ty.Modifier; }
+  if ty == Ty.Points { return Ty.Point; }
+  if ty == Ty.Points2 { return Ty.Point2; }
+  Ty.Pure
+}
+
+fn pack(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, within: usize, v: &Val, ty: Ty, dflt: &List[u64],
+    out: &mut List[u64]) {
+  match v {
+    case is Absent {
+      var i = 0usize;
+      while i < dflt.len() { out.push(*dflt[i]); i = i + 1usize; }
+      if dflt.len() == 0usize {
+        var z = 0u32;
+        while z < slotsOf(ty) { out.push(0u64); z = z + 1u32; }
+      }
+    }
+    case let Num(x) { out.push(x.bits()); }
+    case let Truth(b) { out.push(if *b { 1u64 } else { 0u64 }); }
+    case let Tuple(items) {
+      var i = 0usize;
+      while i < items.len() { out.push(numOf(&items[i]).bits()); i = i + 1usize; }
+    }
+    case let Range(ends) {
+      var i = 0usize;
+      while i < ends.len() { out.push(numOf(&ends[i]).bits()); i = i + 1usize; }
+    }
+    case let Local(k) { pack(shims, hs, w, within, &w.functions[within].lets[*k], ty, dflt, out); }
+    case let Call(f) { pack(shims, hs, w, *f, &w.functions[*f].result, ty, dflt, out); }
+    case let Make(m) { makeValue(shims, hs, w, within, m, out); }
+    case let Items(items) {
+      let item = itemOf(ty);
+      var temp = List[u64]();
+      var i = 0usize;
+      while i < items.len() { pack(shims, hs, w, within, &items[i], item, &List[u64](), &mut temp); i = i + 1usize; }
+      out.push(hs.newList(slotsOf(item), temp.view()));
+    }
+    case let Ref(s) { out.push(0u64); }
+  }
+}
+
+// A call made: its arguments packed as its row says, its shim called, its result's words pushed onto 'out'
+fn makeValue(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, within: usize, m: &Made, out: &mut List[u64]) {
+  let tool = usize.from(m.tool);
+  let sig = &w.vocab.tools[tool];
+  var args = List[u64]();
+  if m.tool == w.vocab.outlineList {
+    // [(x, y), ...]: the items are one list argument
+    var temp = List[u64]();
+    var i = 0usize;
+    while i < m.args.len() { pack(shims, hs, w, within, &m.args[i], Ty.Point2, &List[u64](), &mut temp); i = i + 1usize; }
+    args.push(hs.newList(2u32, temp.view()));
+  }
+  else if m.tool == w.vocab.materialList {
+    // [material, modifier, ...]: the material, then the modifiers as one list
+    pack(shims, hs, w, within, &m.args[0], Ty.Material, &List[u64](), &mut args);
+    var temp = List[u64]();
+    var i = 1usize;
+    while i < m.args.len() { pack(shims, hs, w, within, &m.args[i], Ty.Modifier, &List[u64](), &mut temp); i = i + 1usize; }
+    args.push(hs.newList(1u32, temp.view()));
+  }
+  else {
+    var i = 0usize;
+    while i < sig.params.len() {
+      pack(shims, hs, w, within, &m.args[i], sig.params[i].ty, &sig.params[i].fallback, &mut args);
+      i = i + 1usize;
+    }
+  }
+  let r = usize.from(sig.resultSlots);
+  while args.len() < r { args.push(0u64); }
+  let shim = *shims[tool];
+  let n = args.len();
+  let ok = shim(hs, args.viewMut().sliceMut(0usize, n));
+  var k = 0usize;
+  while k < r {
+    out.push(if ok { *args[k] } else { 0u64 });
+    k = k + 1usize;
+  }
+}
+
+
+const SMOOTH_ANGLE = 0.5236;
+
+// The mesh of a shape, and its box
+fn shapeMesh(shims: &ToolShims, hs: &mut ToolHandles, w: &Understood, make: &Val, lowOut: &mut Vec3,
+    highOut: &mut Vec3) Mesh {
+  var words = List[u64]();
+  pack(shims, hs, w, NO_FN, make, Ty.Shape, &List[u64](), &mut words);
+  var mesh = Mesh();
+  if hs.refused() { return mesh; }
+  let pieces = hs.pieces(*words[0usize]);
+  var i = 0usize;
+  while i < pieces.len() {
+    let m = pieces[i].triangulate(false);
+    mesh.append(&m);
+    i = i + 1usize;
+  }
+  smoothByAngle(&mut mesh, f32.from(SMOOTH_ANGLE));
+  var low = Vec3(1.0e30f, 1.0e30f, 1.0e30f);
+  var high = Vec3(-1.0e30f, -1.0e30f, -1.0e30f);
+  var k = 0usize;
+  while k < mesh.positions.len() {
+    let p = *mesh.positions[k];
+    low = low.min(p);
+    high = high.max(p);
+    k = k + 1usize;
+  }
+  if mesh.positions.len() > 0usize { *lowOut = low; *highOut = high; }
+  mesh
+}
+
+// FNV-1a over a 32-bit word's four bytes, low byte first
+fn fnvWord(h: u64, w: u32) u64 {
+  var x = h;
+  var k = 0u32;
+  while k < 4u32 {
+    x = (x ^ u64.from((w >> (8u32 * k)) & 0xFFu32)) * 1099511628211u64;
+    k = k + 1u32;
+  }
+  x
+}
+
+// A mesh's hash: the counts, then every position, normal, uv and index, each by its bits
+fn meshHash(m: &Mesh) u64 {
+  var h = 14695981039346656037u64;
+  h = fnvWord(h, u32.from(m.positions.len()));
+  h = fnvWord(h, u32.from(m.normals.len()));
+  h = fnvWord(h, u32.from(m.uvs.len()));
+  h = fnvWord(h, u32.from(m.indices.len()));
+  h = fnvWord(h, u32.from(m.groups.len()));
+  var i = 0usize;
+  while i < m.positions.len() {
+    let p = *m.positions[i];
+    h = fnvWord(h, p.x.bits()); h = fnvWord(h, p.y.bits()); h = fnvWord(h, p.z.bits());
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < m.normals.len() {
+    let p = *m.normals[i];
+    h = fnvWord(h, p.x.bits()); h = fnvWord(h, p.y.bits()); h = fnvWord(h, p.z.bits());
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < m.uvs.len() {
+    let p = *m.uvs[i];
+    h = fnvWord(h, p.x.bits()); h = fnvWord(h, p.y.bits());
+    i = i + 1usize;
+  }
+  i = 0usize;
+  while i < m.indices.len() {
+    h = fnvWord(h, *m.indices[i]);
+    i = i + 1usize;
+  }
+  h
+}
+
+// The world in FILE, each shape part built in the world's order and its line printed; false when the file cannot be read
+fn meshHashes(file: &str) bool {
+  match fs.readFile(&Path.from(file)) {
+    case let Ok(text) {
+      let reading = readWorld(text.view());
+      showProblems(file, &reading.problems);
+      let w = &reading.understood;
+      let shims = toolShims();
+      var i = 0usize;
+      while i < w.order.len() {
+        let slot = *w.order[i];
+        if w.nodes[slot].kind == Kind.Shape {
+          var hs = ToolHandles.make();
+          var low = Vec3(0., 0., 0.);
+          var high = Vec3(0., 0., 0.);
+          let mesh = shapeMesh(&shims, &mut hs, w, &w.units[slot].make, &mut low, &mut high);
+          if hs.refused() {
+            print <- "build: '"; printStr(w.names.text(w.nodes[slot].name)); print <- "' left out: "; printStr(hs.why()); print <- "\n";
+          }
+          else { printStr(w.names.text(w.nodes[slot].name)); print <- " "; print <- meshHash(&mesh); print <- "\n"; }
+        }
+        i = i + 1usize;
+      }
+      true
+    }
+    case let Err(e) {
+      printStr(file); print <- ": cannot be read: "; print <- e; print <- "\n";
+      false
+    }
+  }
+}
+
+fn main(argc: i32, argv: **u8) i32 {
+  if argc < 2i32 { print <- "usage: meshhash FILE.ddd\n"; return 2i32; }
+  if meshHashes(cstr.fromPtr(*(argv + 1usize)).view()) { 0i32 } else { 1i32 }
+}
