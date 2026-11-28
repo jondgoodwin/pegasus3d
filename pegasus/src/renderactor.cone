@@ -135,6 +135,10 @@ pub struct RenderCore {
   pub longestSameNs: u64;           // the longest time drawing without a new snapshot
   pub framesDuringSame: u64;        // frames drawn in that time
   pub framesNow: u64;
+  pub firstDrawnNs: u64;            // arrival: when a frame first drew a part (the clock `Instant.now().nanos()`; 0: not yet)
+  pub tenDrawnNs: u64;              // when a frame first drew ten parts
+  pub allDrawnNs: u64;              // when a frame first drew every part of the snapshot
+  pub arrivalGapNs: u64;            // the longest gap between two frames up to then
   xrFrame: Option[HeadsetFrame];    // --xr: the runtime's frame this Render frame draws, begun (waited for) when it was prepared
   rays: Option[StateWriter[HandRay]];   // --xr: where the controller's ray is published
   xrStand: f32;                     // --xr: added to the head's height when the space's origin is the head, not the floor
@@ -150,7 +154,7 @@ pub struct RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), MaterialArrivals(),
       MaterialResidents(), List[ContentKey](), List[ContentKey](), mutantIs("material-stale"), mutantIs("material-no-show"), 0u64,
       NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
-      None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, false, false, false, ShotView.none(),
+      0u64, 0u64, 0u64, 0u64, None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, false, false, false, ShotView.none(),
       (libc.getenv("PEGASUS_TRACE_DRAWN") as usize) != 0usize)
   }
 
@@ -301,6 +305,7 @@ pub struct RenderCore {
     let now = u64.from(Instant.now().nanos());
     frame = frame + 1u64;
     if lastFrameNs != 0u64 && now - lastFrameNs > longestGapNs { longestGapNs = now - lastFrameNs; }
+    if allDrawnNs == 0u64 && lastFrameNs != 0u64 && now - lastFrameNs > arrivalGapNs { arrivalGapNs = now - lastFrameNs; }
     lastFrameNs = now;
     self.upload();
     var plan = FramePlan(now, Vec3(0., 0., 0.), 0u64, LookIntent(0., 0.), 0u64);
@@ -328,6 +333,7 @@ pub struct RenderCore {
     let look = head.look;
     let eye = plan.feet + head.offset;
     xrBase = plan.feet + Vec3(0., xrStand, 0.);
+    self.noteArrival();
     self.draw(eye, look, "");
     if head.hand.pulls != xrPulls || head.hand.valid {
       xrPulls = head.hand.pulls;
@@ -526,6 +532,36 @@ pub struct RenderCore {
     }
     self.dropDeferred();
     out
+  }
+
+  // Arrival's marks: the first frame that drew a part, ten parts, and every part of the snapshot, each printed once as
+  // an absolute time on the clock the Loader's "arrival: opened" line uses (the difference is the time from the opening)
+  fn noteArrival(self: &mut) {
+    if allDrawnNs != 0u64 { return; }
+    // the parts `chooseDrawn` would draw: a mesh and a material resident (counted here, so a headless run, which draws nothing, has marks too)
+    var drawn = 0usize;
+    var total = 0usize;
+    let snap = newer;
+    match &snap {
+      case let Some(s) {
+        total = s.parts.len();
+        each p in &s.parts {
+          match self.materialToDraw(p) {
+            case is Some { if self.meshResident(p.key) { drawn = drawn + 1usize; } }
+            case is None[MaterialResident] {}
+          }
+        }
+      }
+      case is None[Published] {}
+    }
+    if drawn == 0usize { return; }
+    let now = u64.from(Instant.now().nanos());
+    if firstDrawnNs == 0u64 { firstDrawnNs = now; printStr(numberLine("arrival: first part drawn at ", now, " ns\n").view()); }
+    if tenDrawnNs == 0u64 && drawn >= 10usize { tenDrawnNs = now; printStr(numberLine("arrival: ten parts drawn at ", now, " ns\n").view()); }
+    if drawn >= total {
+      allDrawnNs = now;
+      printStr(numberLine("arrival: all parts drawn at ", now, numberLine(" ns; longest gap between frames up to then ", arrivalGapNs / 1000u64, " us\n").view()).view());
+    }
   }
 
   // Step 4: the newer snapshot's resident parts, from 'eye' looking along

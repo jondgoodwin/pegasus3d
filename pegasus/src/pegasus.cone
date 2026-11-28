@@ -55,7 +55,8 @@ import render use *;
 import path use Path;
 import window use *;
 import actors;
-import aio use File;
+import aio use File, IoLimits;
+import actorhttp use HttpClient;
 import iobuf use IoBuf, Bytes;
 import iocore use Access, SocketAddr;
 import netmsg use NetEvent, EventHandler, Connection, Endpoint, NetConfig, LinkConfig, LossyRelay, eventHandler, mustListen, mustConnect, startLossyRelay;
@@ -205,6 +206,7 @@ fn main(argc: i32, argv: **u8) i32 {
   var checksOnly = false;
   var parts40 = false;
   var worldFile = String();
+  var keysFrom = String();
   var serving = false;
   var netStart = NetStart.whole();
   var shotAfter = 0u64;
@@ -232,6 +234,9 @@ fn main(argc: i32, argv: **u8) i32 {
       parts40 = true;
     } else if argIs(arg, "--world") && a + 1 < argc {
       worldFile = argString(*(argv + usize.from(a + 1)));
+      a = a + 1;
+    } else if argIs(arg, "--keys-from") && a + 1 < argc {
+      keysFrom = argString(*(argv + usize.from(a + 1)));       // a world fetched from a URL: a copy on this disk the key count is read from
       a = a + 1;
     } else if argIs(arg, "--serve") && a + 1 < argc {
       serving = true;
@@ -294,7 +299,8 @@ fn main(argc: i32, argv: **u8) i32 {
     let steerOk = checkSteerYaw(mutantIs("walk-mouse-yaw"));
     let materialsOk = checkMaterials();
     let cacheOk = checkMeshCache(cacheLax());
-    let ok = poseOk && loaderOk && cacheOk && rulesOk && pickOk && netOk && blendOk && steerOk && materialsOk;
+    let fetchOk = checkWorldFetch();
+    let ok = poseOk && loaderOk && cacheOk && fetchOk && rulesOk && pickOk && netOk && blendOk && steerOk && materialsOk;
     finalAll();
     return if ok { 0 } else { 1 };
   }
@@ -356,16 +362,16 @@ fn main(argc: i32, argv: **u8) i32 {
     if worldFile.len() > 0usize {
       // A real world: how many keys it makes is what the run checks (the Loader reads it again, when it opens it)
       var keys = 0usize;
-      match fs.readFile(&Path.from(worldFile.view())) {
-        case let Ok(text) {
-          let img = readImage(worldFile.view(), text.view());
-          keys = distinctKeys(&img);
-          // a server's Sim asks for no materials: it never draws
-          if !serving { keys = keys + distinctMaterials(&img); }
-          // a client of a world that declares no avatars also builds the browser's own figure and its material
-          if netStart.role == SIM_CLIENT && img.behaviour.avatar == NO_AVATAR { keys = keys + 2usize; }
-        }
-        case let Err(e) { print <- "pegasus: "; printStr(worldFile.view()); print <- " cannot be read: "; print <- e; print <- "\n"; return 1; }
+      let countFrom = if keysFrom.len() > 0usize { keysFrom.clone() } else { worldFile.clone() };
+      let text = readWorldNow(countFrom.view());
+      if text.len() == 0usize { print <- "pegasus: "; printStr(countFrom.view()); print <- " cannot be read\n"; return 1; }
+      {
+        let img = readImage(worldFile.view(), text.view());
+        keys = distinctKeys(&img);
+        // a server's Sim asks for no materials: it never draws
+        if !serving { keys = keys + distinctMaterials(&img); }
+        // a client of a world that declares no avatars also builds the browser's own figure and its material
+        if netStart.role == SIM_CLIENT && img.behaviour.avatar == NO_AVATAR { keys = keys + 2usize; }
       }
       wantKeys = keys;
       if headless { exactKeys = keys; }
