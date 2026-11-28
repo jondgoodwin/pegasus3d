@@ -112,18 +112,29 @@ fn checkWire() bool {
   let head = encodePeople(77u64, &people);
   var full = List[u8]();
   full.appendSlice(head.view());
-  full.appendList(encodePartTail(41u64, &deltas));
+  full.appendList(encodePartTail(41u64, &deltas, 0xABCDEF0123456789u64));
   var gotStep = 0u64;
   var gotPeople = OtherPersons();
   var gotThrough = 0u64;
   var gotDeltas = PartDeltas();
+  var gotHash = 0u64;
   let sharedBytes = bytesOfList(&full);
-  var partsOk = decodeShared(sharedBytes, &mut gotStep, &mut gotPeople, &mut gotThrough, &mut gotDeltas)
+  var partsOk = decodeShared(sharedBytes, &mut gotStep, &mut gotPeople, &mut gotThrough, &mut gotDeltas, &mut gotHash)
     && gotStep == 77u64 && gotPeople.len() == 1usize && gotPeople[0usize].id == 3u32 && gotThrough == 41u64 && gotDeltas.len() == 12usize
     && gotDeltas[7usize].id == 35u32 && gotDeltas[7usize].placement.m[12] == 7. && full.len() <= 1173usize
-    && partRoom(1usize) >= 12usize && full.len() == head.len() + 1usize + 8usize + 12usize * DELTA_BYTES;
-  let atRest = bytesOfList(&encodePartTail(41u64, &PartDeltas()));
-  partsOk = partsOk && atRest.len() == 1usize && head.len() + atRest.len() == 9usize + 20usize + 1usize;
+    && gotHash == 0xABCDEF0123456789u64
+    && partRoom(1usize) >= 12usize && full.len() == head.len() + 1usize + 8usize + 12usize * DELTA_BYTES + 9usize;
+  let atRest = bytesOfList(&encodePartTail(41u64, &PartDeltas(), 0u64));
+  partsOk = partsOk && atRest.len() == 2usize && head.len() + atRest.len() == 9usize + 20usize + 2usize;
+  // the hash: the same states hash alike, one part moved a hair hashes differently, and the order matters
+  var hs = List[Mat4]();
+  hs.push(Mat4.fromTranslation(Vec3(1., 2., 3.))); hs.push(Mat4.identity());
+  var hs2 = List[Mat4]();
+  hs2.push(Mat4.fromTranslation(Vec3(1., 2., 3.))); hs2.push(Mat4.identity());
+  let h1 = statesHash(&hs);
+  let sameHash = h1 == statesHash(&hs2) && h1 != 0u64;
+  hs2.set(1usize, Mat4.fromTranslation(Vec3(0., 0., 0.0001)));
+  partsOk = partsOk && sameHash && statesHash(&hs2) != h1;
   print <- "check wire snapshot: "; print <- u64.from(head.len()); print <- " bytes of people, 12 changed parts in "; print <- u64.from(full.len());
   print <- " bytes, none changed adds "; print <- u64.from(atRest.len()); print <- " byte";
   if partsOk { print <- ": ok\n"; } else { print <- ": FAILED\n"; ok = false; }
@@ -210,10 +221,10 @@ fn checkPartDelta(vsSent: bool) bool {
     if due != 0u64 && step >= due { if dueAck > ackAtServer { ackAtServer = dueAck; } due = 0u64; }
     if step % 2u64 == 0u64 {
       var deltas = PartDeltas();
-      let through = tracker.select(ackAtServer, 8usize, &mut deltas);
+      let through = tracker.select(ackAtServer, 8usize, false, &mut deltas);
       var full = List[u8]();
       full.appendSlice(encodePeople(step, &OtherPersons()).view());
-      full.appendList(encodePartTail(through, &deltas));
+      full.appendList(encodePartTail(through, &deltas, 0u64));
       lastBytes = full.len();
       if firstBytes == 0usize && deltas.len() > 0usize { firstBytes = full.len(); }
       sent = sent + u64.from(deltas.len());
@@ -223,7 +234,8 @@ fn checkPartDelta(vsSent: bool) bool {
         var people = OtherPersons();
         var gotThrough = 0u64;
         var got = PartDeltas();
-        if decodeShared(bytesOfList(&full), &mut gotStep, &mut people, &mut gotThrough, &mut got) {
+        var gotHash = 0u64;
+        if decodeShared(bytesOfList(&full), &mut gotStep, &mut people, &mut gotThrough, &mut got, &mut gotHash) {
           view.apply(gotStep, gotThrough, &got);
           if view.ack > dueAck { dueAck = view.ack; due = step + 2u64; }
         }

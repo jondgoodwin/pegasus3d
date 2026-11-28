@@ -106,8 +106,12 @@ actor Sim {
   startedNs: i64;
   zoneKeys: usize;                  // a server: the distinct keys of its parts
   finishedSent: bool;
-  avatarKey: ContentKey;            // a client: the design other people are drawn as (`standIn`)
+  avatarKey: ContentKey;            // a client: the design other people are drawn as (`avatarDesign`)
   hasAvatar: bool;
+  declaredAvatar: bool;             // a client: that design is the world's own, not the browser's figure
+  resyncAsked: bool;                // a client: a full snapshot was asked for and no snapshot has matched since
+  hashChecked: u64;                 // a client: shared snapshots whose part-state hash it compared with its own
+  hashMismatched: u64;              // ... and the ones that differed
   shown: List[Mat4];                // a client: where each part is shown now, by id (its picks run against these)
   wasGliding: bool;                 // a server: a glide was under way last step
   landedNs: i64;                    // a server: when its last glide ended (steady clock)
@@ -117,7 +121,7 @@ actor Sim {
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
       Actions(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
-      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, List[Mat4](), false, 0i64, 0i64, 0i64);
+      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64);
   }
 
   // Loader -> Sim (move): the world image. Each part is given its id now,
@@ -131,9 +135,12 @@ actor Sim {
     behaviour <-> img.behaviour;
     if role == SIM_CLIENT {
       // A client builds the world from its own copy of the description, as any world arrives: nothing is declared over
-      // the wire. It runs no rules, so the world's rules are not made, only read for the stand-in avatar
-      avatarKey = standIn(&behaviour, &img.parts);
-      hasAvatar = avatarKey != 0u64;
+      // the wire. It runs no rules, so the world's rules are not made, only read for the avatar it declares
+      avatarKey = avatarDesign(&behaviour, &img.parts);
+      hasAvatar = true;
+      declaredAvatar = behaviour.avatar != NO_AVATAR && avatarKey != browserAvatarKey();
+      // the browser's own figure is no part of the world, so nothing else asks the Loader for it
+      if !declaredAvatar { loader.build(ContentRequest(avatarKey, NO_PART, 0.)); }
     } else {
       rules = SimRules.make(behaviour, false);
     }
@@ -155,7 +162,7 @@ actor Sim {
       net.view = PartView.make(parts.len());
       print <- "sim: world "; printStr(worldName.view()); print <- ", "; print <- u64.from(parts.len());
       print <- " parts from its own copy of the description; other people are drawn as ";
-      if hasAvatar { print <- "the design of the first part a rule moves, scaled up\n"; } else { print <- "nothing (no rule of the world moves a part)\n"; }
+      if declaredAvatar { print <- "the avatar design the world declares\n"; } else { print <- "the browser's own figure (the world declares no avatars)\n"; }
       self.maybeHello();
       return;
     }
@@ -373,6 +380,13 @@ actor Sim {
       if a.receiver != NO_PART && usize.from(a.receiver) >= parts.len() { a.receiver = NO_PART; }
       arrived.push(a);
       net.clients[k].presses = net.clients[k].presses + 1u64;
+    } else if says.tag == C_RESYNC {
+      if !net.clients[k].declared { net.malformed = net.malformed + 1u64; return; }
+      // its part states hashed differently from the server's: forget what it acknowledged, send everything changed
+      net.clients[k].resync = true;
+      net.clients[k].partsAck = 0u64;
+      net.clients[k].resyncs = net.clients[k].resyncs + 1u64;
+      print <- "net server: person "; print <- net.clients[k].id; print <- " asked for a full snapshot: its part states hashed differently\n";
     }
   }
 
@@ -443,10 +457,15 @@ actor Sim {
       if r.declared {
         // the parts half is this client's: what changed after the last change it acknowledged
         var deltas = PartDeltas();
-        let through = net.tracker.select(r.partsAck, partRoom(people.len()), &mut deltas);
+        let fresh = r.resync;
+        r.resync = false;
+        let through = net.tracker.select(r.partsAck, partRoom(people.len()), fresh, &mut deltas);
+        // the hash of every part's state once this snapshot is applied; only when the snapshot completes the client's picture
+        var hash = 0u64;
+        if through == net.tracker.version { hash = statesHash(&net.tracker.states()); }
         var full = List[u8]();
         full.appendSlice(head.view());
-        full.appendList(encodePartTail(through, &deltas));
+        full.appendList(encodePartTail(through, &deltas, hash));
         let shared = bytesOfList(&full);
         net.sharedBytes = net.sharedBytes + u64.from(shared.len());
         net.partEntries = net.partEntries + u64.from(deltas.len());
@@ -557,13 +576,15 @@ actor Sim {
       var all = OtherPersons();
       var through = 0u64;
       var deltas = PartDeltas();
-      if !decodeShared(data, &mut s, &mut all, &mut through, &mut deltas) { net.malformed = net.malformed + 1u64; return; }
+      var hash = 0u64;
+      if !decodeShared(data, &mut s, &mut all, &mut through, &mut deltas, &mut hash) { net.malformed = net.malformed + 1u64; return; }
       var others = OtherPersons();
       each p in &all { if p.id != net.myId { others.push(*p); } }
       // an older snapshot than one held is dropped whole: its parts too, and its acknowledgement is never given
       if net.interp.add(s, Instant.now().nanos(), others) {
         net.view.apply(s, through, &deltas);
         if deltas.len() > 0usize { net.partsGot = net.partsGot + 1u64; }
+        if hash != 0u64 { self.checkHash(s, hash); }
       }
       net.sharedGot = net.sharedGot + 1u64;
     } else if u32.from(stream) == STREAM_PERSONAL {
@@ -571,6 +592,34 @@ actor Sim {
       if !decodePersonal(data, &mut p) { net.malformed = net.malformed + 1u64; return; }
       net.personal = Some[PersonalSnap](p);
       net.personalGot = net.personalGot + 1u64;
+    }
+  }
+
+  // The shared snapshot of step 'step' said the parts stand so that their states hash to 'theirs'. This client's own
+  // states, with that snapshot applied, should hash the same: acknowledged deltas never miss a change. If they differ
+  // that is a defect made visible: report it and ask for a full snapshot, a fresh baseline
+  fn checkHash(self: &mut, step: u64, theirs: u64) {
+    var defined = List[Mat4]();
+    each p in &parts { defined.push(p.placement); }
+    let mine = statesHash(&net.view.states(&defined));
+    hashChecked = hashChecked + 1u64;
+    if mine == theirs {
+      if resyncAsked {
+        resyncAsked = false;
+        print <- "net client: person "; print <- net.myId; print <- ": the part states match the server's again at step "; print <- step; print <- "\n";
+      }
+      return;
+    }
+    hashMismatched = hashMismatched + 1u64;
+    if !resyncAsked || hashMismatched % 30u64 == 0u64 {
+      resyncAsked = true;
+      print <- "net client: person "; print <- net.myId; print <- ": MISMATCH at step "; print <- step; print <- ": my part states hash to ";
+      print <- mine; print <- ", the server's to "; print <- theirs; print <- "; asking for a full snapshot\n";
+      net.view.ack = 0u64;
+      match &mut net.link {
+        case var &mut Some(c) { sendReliable(c, &encodeResync()); }
+        else {}
+      }
     }
   }
 
@@ -759,12 +808,12 @@ actor Sim {
     each p in &parts { ps.push(PartState(p.id, p.key, NO_PART, self.placeOf(p))); }
     var others = OtherPersons();
     if role == SIM_CLIENT { others = self.mergeOthers(); }
-    // Other people are parts of the stand-in design, standing where the server's snapshots put them (the id: after the world's)
+    // Other people are parts of the avatar design, standing where the server's snapshots put them (the id: after the world's)
     if role == SIM_CLIENT && hasAvatar {
       each o in &others {
         let turn = Quat.angleAxis(o.yaw, Vec3(0., 1., 0.));
         ps.push(PartState(u32.from(parts.len()) + o.id, avatarKey, NO_PART,
-          Mat4.fromTrs(o.feet, turn, Vec3(AVATAR_SCALE, AVATAR_SCALE, AVATAR_SCALE))));
+          Mat4.fromTrs(o.feet, turn, Vec3(1., 1., 1.))));
       }
     }
     var s = Snapshot(step, atNs, person, ps, others, 0u64);
@@ -892,6 +941,11 @@ actor Sim {
     print <- "; final feet ("; printF(net.predictor.person.feet.x); print <- ", "; printF(net.predictor.person.feet.y); print <- ", ";
     printF(net.predictor.person.feet.z); print <- ")\n";
     if net.malformed > 0u64 { ok = false; }
+    // the shared-state hash: every shared snapshot that completed this client's picture carried the server's hash of it
+    print <- "check part hashes: "; print <- hashChecked; print <- " shared snapshots compared, "; print <- hashMismatched; print <- " differed";
+    if hashMismatched == 0u64 && hashChecked > 0u64 { print <- ": ok\n"; }
+    else if hashChecked == 0u64 { print <- ": FAILED (none was compared)\n"; ok = false; }
+    else { print <- ": FAILED (a full snapshot was asked for; it "; if resyncAsked { print <- "has not matched since"; } else { print <- "has matched since"; } print <- ")\n"; ok = false; }
     if io.net.walks {
       let expected = f32.from(walkSteps) * STEP_SECONDS * WALK_SPEED;
       print <- "check walk: "; print <- walkSteps; print <- " steps forward moved "; printF(walked); print <- " m";
@@ -1014,16 +1068,15 @@ fn printF(x: f32) {
   print <- frac;
 }
 
-// The design other people are drawn as. The world declares no avatar design (sim.md: "a part of the avatar design the
-// world declares"), so the stand-in is the closest thing it does declare: the design of the first part one of its rules
-// moves, which is a thing that stands on the ground and is moved about, shown at AVATAR_SCALE. 0: the world moves nothing
-fn standIn(b: &Behaviour, decls: &PartDecls) ContentKey {
-  if b.moves.len() == 0usize { return 0u64; }
-  let piece = b.moves[0usize].part;
+// The design other people are drawn as: the design the world declares (worldAvatars), as its first part that is built;
+// a world that declares none, or a design with nothing to draw, gets the browser's own plain figure (never one of the
+// world's other parts)
+fn avatarDesign(b: &Behaviour, decls: &PartDecls) ContentKey {
+  if b.avatar == NO_AVATAR { return browserAvatarKey(); }
   each d in &*decls {
-    if frameWithin(&b.frames, d.slot, piece) { return d.key; }
+    if frameWithin(&b.frames, d.slot, b.avatar) { return d.key; }
   }
-  0u64
+  browserAvatarKey()
 }
 
 // Is the slot 'slot' the slot 'holder', or inside it?

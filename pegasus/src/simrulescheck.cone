@@ -35,7 +35,37 @@ fn tinyBehaviour(trap: bool) Behaviour {
   fields.push(FieldDecl(String.from("held"), 0.));
   var moves = MoveDecls();
   moves.push(MoveDecl(1u32, 0u32));
-  Behaviour(setTwiceCode(trap), frames, fields, DeriveDecls(), moves, 0usize)
+  Behaviour(setTwiceCode(trap), frames, fields, DeriveDecls(), moves, 0usize, NO_AVATAR)
+}
+
+// Two handlers: rule 0 (slot 1) sets field 0 to 5; rule 1 (slot 2) is code the verifier refuses (a call with no
+// operands on the stack). The world's other rule must go on working
+fn oneBadRuleBehaviour() Behaviour {
+  var cw = CodeWriter.make();
+  let setSig = setFieldSignature(&mut cw.code.types);
+  let imp = cw.addImport(NS_HOST, HOST_SET_FIELD, setSig);
+  let none = List[u32]();
+  let sig = cw.code.types.sig(none.view(), none.view());
+  let good = cw.beginUnit(sig, "good");
+  cw.i64Const(0i64); cw.f64Const(5.); cw.opU(OP_IMPORT, imp);
+  cw.endUnit();
+  let bad = cw.beginUnit(sig, "bad");
+  cw.opU(OP_IMPORT, imp);
+  cw.endUnit();
+  cw.addEntry(ENTRY_HANDLER, good, ENTRY_MOVE_FLAG, 0u32);
+  cw.addEntry(ENTRY_HANDLER, bad, ENTRY_MOVE_FLAG | 1u32, 0u32);
+  var code = Code.empty();
+  code <-> cw.code;
+  var frames = SlotFrames();
+  frames.push(SlotFrame(String.from("world"), 0u32, Vec3(0., 0., 0.), Quat.identity()));
+  frames.push(SlotFrame(String.from("goodPiece"), 0u32, Vec3(0., 0., 0.), Quat.identity()));
+  frames.push(SlotFrame(String.from("badPiece"), 0u32, Vec3(0., 0., 0.), Quat.identity()));
+  var fields = FieldDecls();
+  fields.push(FieldDecl(String.from("held"), 0.));
+  var moves = MoveDecls();
+  moves.push(MoveDecl(1u32, 0u32));
+  moves.push(MoveDecl(2u32, 1u32));
+  Behaviour(code, frames, fields, DeriveDecls(), moves, 0usize, NO_AVATAR)
 }
 
 fn rulesVerdict(ok: bool, what: &str) bool {
@@ -60,6 +90,16 @@ pub fn checkRules(applyOnTrap: bool) bool {
     _ = r.click(1u32, 1u64, &mut asks);
     all = rulesVerdict(r.fieldValue(0usize) == 0. && r.stopped == 1u64 && r.fired == 0u64,
       "a handler that traps leaves its writes unapplied, and the world is told") && all;
+  }
+  {
+    // one rule the verifier refuses: the host is made, the bad rule does nothing, the good rule still runs
+    var r = SimRules.make(oneBadRuleBehaviour(), applyOnTrap);
+    var asks = GlideAsks();
+    let bad = r.click(2u32, 1u64, &mut asks);
+    let untouched = r.fieldValue(0usize) == 0. && r.fired == 0u64;
+    let good = r.click(1u32, 2u64, &mut asks);
+    all = rulesVerdict(r.live() && r.refusedCount() == 1usize && bad && untouched && good && r.fieldValue(0usize) == 5. && r.fired == 1u64,
+      "a world with one refused rule keeps its other rule: 1 refused, the bad click does nothing, the good click runs") && all;
   }
   all
 }

@@ -48,6 +48,9 @@ pub struct PartTracker {
     PartTracker(l, c, 0u64, 0u64, vsSent)
   }
 
+  // Every part's placement as the server holds it now, by id
+  pub fn states(self: &) List[Mat4] { last.clone() }
+
   // The version of part 'id's newest change (0: never changed since the definition)
   pub fn changedAt(self: &, id: usize) u64 { if id < changed.len() { *changed[id] } else { 0u64 } }
 
@@ -62,9 +65,12 @@ pub struct PartTracker {
 
   // The parts changed after what the client acknowledged ('ack'), oldest change first, at most 'room' of them, with
   // their placements now. Returns the version the snapshot is complete through: the client may acknowledge it
-  pub fn select(self: &mut, ack: u64, room: usize, out: &mut PartDeltas) u64 {
+  // 'full': the client asked for a fresh baseline (its hash differed), so every part changed since the definition is sent,
+  // whatever it acknowledged and whatever was sent before
+  pub fn select(self: &mut, ack: u64, room: usize, full: bool, out: &mut PartDeltas) u64 {
     var base = ack;
     if vsSent { base = sentThrough; }
+    if full { base = 0u64; }
     var order = List[usize]();
     var i = 0usize;
     while i < changed.len() {
@@ -135,6 +141,18 @@ pub struct PartView {
     if deltas.len() > 0usize && through > ack { ack = through; }
   }
 
+  // Every part's placement as this client holds it, by id: the newest state the server sent it, or 'defined' (the
+  // placements its own copy of the description gave) if the server never changed it
+  pub fn states(self: &, defined: &List[Mat4]) List[Mat4] {
+    var out = List[Mat4]();
+    var i = 0usize;
+    while i < tracks.len() {
+      if tracks[i].seen == 0u32 { out.push(*defined[i]); } else { out.push(tracks[i].cur.placement); }
+      i = i + 1usize;
+    }
+    out
+  }
+
   // Part 'id' as shown 'x' steps (zero or less) from the snapshot of step 'newest': between its two newest states, or
   // 'defined' if the server never changed it. A part that rested long before its newest state moves over the
   // snapshot interval before it, not over all the rest
@@ -171,4 +189,14 @@ pub fn definitionSum(parts: &SimParts) u64 {
   h
 }
 
-pub const AVATAR_SCALE: f32 = 3.;   // the stand-in design is about 0.57 m tall; times 3 it is a person's height
+// THE SHARED-STATE HASH. One function, for the shared snapshot's check now and the determinism test later: FNV-1a over
+// the count, then every part's sixteen floats, each by its bits (`fnvWord`, meshhash.cone, the word hash the mesh hash
+// uses). Never 0 (0 means "no claim" on the wire)
+pub fn statesHash(states: &List[Mat4]) u64 {
+  var h = fnvWord(14695981039346656037u64, u32.from(states.len()));
+  each m in &*states {
+    var k = 0usize;
+    while k < 16usize { h = fnvWord(h, m.m[k].bits()); k = k + 1usize; }
+  }
+  if h == 0u64 { 1u64 } else { h }
+}

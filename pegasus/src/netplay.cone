@@ -29,6 +29,7 @@ pub const STREAM_PERSONAL = 4u32;   // server -> one client: the last input it a
 // Reliable message tags (a byte)
 pub const C_HELLO = 1u32;
 pub const C_PRESS = 2u32;
+pub const C_RESYNC = 3u32;          // a client's part states hashed differently from the server's: send every changed part again
 pub const S_REFUSED = 1u32;
 pub const S_WELCOME = 2u32;
 pub const S_SHAPES = 4u32;
@@ -401,9 +402,11 @@ pub struct ClientRow {
   pub presses: u64;
   pub partsAck: u64;                // the newest part version it said it applied
   pub lastShared: usize;            // the bytes of the shared snapshot last sent it
+  pub resync: bool;                 // it asked for a full snapshot: the next one carries every changed part
+  pub resyncs: u64;                 // how many times it asked
 
   pub fn make(id: u32, conn: Connection) ClientRow {
-    ClientRow(id, conn, PersonState(Vec3(0., 0., 0.), 0.), 0u32, BodySamples(), false, String(), false, 0u64, 0u64, 0u64, 0i64, 0u64, 0u64, 0usize)
+    ClientRow(id, conn, PersonState(Vec3(0., 0., 0.), 0.), 0u32, BodySamples(), false, String(), false, 0u64, 0u64, 0u64, 0i64, 0u64, 0u64, 0usize, false, 0u64)
   }
 
   // The samples a packet carried: those newer than any held are kept
@@ -453,6 +456,12 @@ pub fn encodePress(a: &Action) List[u8] {
   out
 }
 
+pub fn encodeResync() List[u8] {
+  var out = List[u8]();
+  putU8(&mut out, C_RESYNC);
+  out
+}
+
 // What a client's reliable message was
 pub struct ClientSays {
   pub tag: u32;                     // C_HELLO, C_PRESS, or 0: it did not parse
@@ -475,6 +484,7 @@ pub fn decodeClientSays(data: Bytes) ClientSays {
     let along = t.rvec3();
     let made = t.r64();
     out.action = Action(verb, receiver, from, along, made, ORIGIN_PERSON);
+  } else if tag == C_RESYNC {
   } else {
     return out;
   }
@@ -566,13 +576,15 @@ pub fn encodePeople(step: u64, people: &OtherPersons) List[u8] {
 
 // How many changed parts fit in a packet beside the people
 pub fn partRoom(people: usize) usize {
-  let used = 9usize + 20usize * people + 1usize + 8usize;
+  let used = 9usize + 20usize * people + 1usize + 8usize + 9usize;
   if used >= MOST_RELIABLE_BYTES { 0usize } else { (MOST_RELIABLE_BYTES - used) / DELTA_BYTES }
 }
 
 // The shared snapshot's second half, for one client: the parts that changed since what it last acknowledged. A
 // part at rest adds only the count byte, 0
-pub fn encodePartTail(through: u64, deltas: &PartDeltas) List[u8] {
+// 'hash' is the hash of every part's state once this snapshot is applied (`statesHash`, partsync.cone), 0 when the
+// snapshot does not complete the client's picture (more changed than fit): then it claims nothing and the client skips the check
+pub fn encodePartTail(through: u64, deltas: &PartDeltas, hash: u64) List[u8] {
   var out = List[u8]();
   putU8(&mut out, u32.from(deltas.len()));
   if deltas.len() > 0usize {
@@ -583,6 +595,7 @@ pub fn encodePartTail(through: u64, deltas: &PartDeltas) List[u8] {
       while m < 16usize { putF32(&mut out, d.placement.m[m]); m = m + 1usize; }
     }
   }
+  if hash != 0u64 { putU8(&mut out, 1u32); putU64(&mut out, hash); } else { putU8(&mut out, 0u32); }
   out
 }
 
@@ -637,7 +650,7 @@ pub fn decodeServerSays(data: Bytes) ServerSays {
   out
 }
 
-pub fn decodeShared(data: Bytes, step: &mut u64, out: &mut OtherPersons, through: &mut u64, deltas: &mut PartDeltas) bool {
+pub fn decodeShared(data: Bytes, step: &mut u64, out: &mut OtherPersons, through: &mut u64, deltas: &mut PartDeltas, hash: &mut u64) bool {
   var t = Take.make(data);
   *step = t.r64();
   let n = t.r8();
@@ -661,6 +674,8 @@ pub fn decodeShared(data: Bytes, step: &mut u64, out: &mut OtherPersons, through
     deltas.push(PartDelta(id, mask, m));
     i = i + 1u32;
   }
+  *hash = 0u64;
+  if t.r8() == 1u32 { *hash = t.r64(); }
   t.ok
 }
 

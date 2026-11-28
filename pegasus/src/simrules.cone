@@ -103,7 +103,9 @@ pub struct RuleHost {
   // The host for code, with 'fields' fields (each starting at 0) and 'slots' slots; or what the verifier refused
   pub fn make(code: &Code, fields: usize, slots: usize, applyOnTrap: bool) Result[RuleHost, List[CodeProblem]] {
     let tables = ruleImports();
-    match verify(code, &tables) {
+    // verifyEach: a rule that does not verify is refused alone (its handler or derive is left out), so one bad rule
+    // does not drop the rest. Only a fault in the code's shared tables is an Err
+    match verifyEach(code, &tables) {
       case let Ok(v) {
         var hs = RuleHandles.make();
         var f = List[u64]();
@@ -125,7 +127,16 @@ pub struct RuleHost {
   pub fn value(self: &, i: usize) f64 { f64.fromBits(*self.hs.payload(RULE_FIELDS)[i]) }
 
   // The unit an entry names, if the code has one
-  pub fn unitFor(self: &, kind: u8, a: u32, b: u32) Option[u32] { entryUnit(self.code.source(), kind, a, b) }
+  // (a refused unit is none: its rule does nothing)
+  pub fn unitFor(self: &, kind: u8, a: u32, b: u32) Option[u32] {
+    match entryUnit(self.code.source(), kind, a, b) {
+      case let Some(u) { if self.code.isRefused(usize.from(u)) { None[u32] } else { Some[u32](u) } }
+      case is None { None[u32] }
+    }
+  }
+
+  // The units the verifier refused, one problem each
+  pub fn refusals(self: &) &List[CodeProblem] { self.code.problems() }
 
   // Runs a unit, leaving its result slots in 'out' and its staged writes in the write list; the trap's message if it stopped
   fn run(self: &mut, unit: u32, out: &mut List[u64]) Option[String] {
@@ -221,6 +232,12 @@ pub struct SimRules {
           r.deriveUnits.push(unitOrNone(h.unitFor(ENTRY_DERIVE, r.derives[i].number, 0u32)));
           i = i + 1usize;
         }
+        var k = 0usize;
+        while k < h.refusals().len() {
+          print <- "sim: a rule of the world was refused and left out: "; printStr(h.refusals()[k].what.view());
+          print <- " (unit "; print <- h.refusals()[k].unit; print <- ")\n";
+          k = k + 1usize;
+        }
         r.host = Some[RuleHost](h);
       }
       case let Err(problems) {
@@ -238,6 +255,10 @@ pub struct SimRules {
   }
 
   pub fn live(self: &) bool { host is Some }
+  // How many of the world's rules the verifier refused (each left out; the rest run)
+  pub fn refusedCount(self: &) usize {
+    match &host { case let Some(h) { h.refusals().len() } else { 0usize } }
+  }
   pub fn keysRuleCount(self: &) usize { keysRules }
   pub fn moveCount(self: &) usize { moves.len() }
 
