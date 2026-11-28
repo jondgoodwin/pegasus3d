@@ -15,11 +15,38 @@ fn writeText(path: &Path, text: &str) {
   match fs.writeFile(path, b.view()) { else {} }
 }
 
-fn checkWorldFetch() bool {
+// "NAME SIZE HASH PATH\n" for a file whose text is 'text'
+fn manifestLineOf(name: &str, text: &str, path: &str) String {
+  var s = String.from(name);
+  s.append(" ");
+  s.append(numberLine("", u64.from(text.len()), "").view());
+  s.append(" ");
+  s.append(cacheHex(contentHash(text)).view());
+  s.append(" ");
+  s.append(path);
+  s.append("\n");
+  s
+}
+
+// 'skipHash' is the mutant (PEGASUS_MUTANT=manifest-skip-hash): the hash is not looked at, so the wrong-hash lines must FAIL
+fn checkWorldFetch(skipHash: bool) bool {
   var all = true;
-  let names = manifestFiles("// the files\n a.ddd \n\n b.ddd\r\n  // left out\nc.ddd");
-  all = fetchLine("a manifest lists its files in order, without blanks and comments",
-    names.len() == 3usize && names[0].view() == "a.ddd" && names[1].view() == "b.ddd" && names[2].view() == "c.ddd") && all;
+  let names = manifestEntries("// the files\n a.ddd 3 00000000000000ff first.a\n\n b.ddd 10 0123456789abcdef first.b\r\n  // left out\nc.ddd 4 zz");
+  all = fetchLine("a manifest lists its files in order, without blanks and comments, with size, hash and path",
+    names.len() == 3usize && names[0].name.view() == "a.ddd" && names[1].name.view() == "b.ddd" && names[2].name.view() == "c.ddd"
+    && names[0].ok && names[0].size == 3u64 && names[0].hash == 255u64 && names[0].path.view() == "first.a"
+    && names[1].ok && names[1].size == 10u64 && names[1].hash == 81985529216486895u64 && names[1].path.view() == "first.b") && all;
+  all = fetchLine("a manifest line that is not whole is not ok", !names[2].ok) && all;
+  all = fetchLine("a number that is not a number, or a hash of the wrong length, is not ok",
+    !manifestEntries("a.ddd 3x 00000000000000ff p")[0].ok && !manifestEntries("a.ddd 3 0000ff p")[0].ok
+    && !manifestEntries("a.ddd 3 00000000000000fg p")[0].ok) && all;
+  let good = "part a\n";
+  all = fetchLine("a file of the size and hash the manifest gives is fine",
+    judgeFile(7u64, contentHash(good), good, skipHash) == FILE_FINE) && all;
+  all = fetchLine("a file of another size is judged by its size",
+    judgeFile(8u64, contentHash(good), good, skipHash) == FILE_WRONG_SIZE) && all;
+  all = fetchLine("a file of the right size and another hash is judged by its hash",
+    judgeFile(7u64, contentHash("part b\n"), good, skipHash) == FILE_WRONG_HASH) && all;
   all = fetchLine("a file is found beside its manifest, by URL or by path",
     siblingOf("http://127.0.0.1:80/w/x.world", "a.ddd").view() == "http://127.0.0.1:80/w/a.ddd"
     && siblingOf("C:\\w\\x.world", "a.ddd").view() == "C:\\w\\a.ddd" && siblingOf("x.world", "a.ddd").view() == "a.ddd") && all;
@@ -33,12 +60,44 @@ fn checkWorldFetch() bool {
   writeText(&dir.join("one.ddd"), "part first\n");
   writeText(&dir.join("two.ddd"), "  part a");              // no newline at its end
   writeText(&dir.join("three.ddd"), "  part b\n");
-  writeText(&dir.join("w.world"), "// three files\none.ddd\ntwo.ddd\nthree.ddd\n");
+  var listing = String.from("// three files\n");
+  listing.append(manifestLineOf("one.ddd", "part first\n", "first").view());
+  listing.append(manifestLineOf("two.ddd", "  part a", "first.a").view());
+  listing.append(manifestLineOf("three.ddd", "  part b\n", "first.b").view());
+  writeText(&dir.join("w.world"), listing.view());
   let whole = readWorldNow(dir.join("w.world").view());
   all = fetchLine("a manifest world read from disk is its files in order, one line each",
     whole.view() == "part first\n  part a\n  part b\n") && all;
   all = fetchLine("a world file that is not a manifest reads as itself", readWorldNow(dir.join("one.ddd").view()).view() == "part first\n") && all;
-  writeText(&dir.join("gone.world"), "one.ddd\nmissing.ddd\n");
+  var gone = String.from(manifestLineOf("one.ddd", "part first\n", "first").view());
+  gone.append(manifestLineOf("missing.ddd", "x", "first.x").view());
+  writeText(&dir.join("gone.world"), gone.view());
   all = fetchLine("a manifest naming a file that is not there reads as nothing", readWorldNow(dir.join("gone.world").view()).len() == 0usize) && all;
+  // a file whose hash is another's (same size), and one whose size is wrong: each is left out, and only that one
+  var wrong = String.from(manifestLineOf("one.ddd", "part first\n", "first").view());
+  wrong.append(manifestLineOf("two.ddd", "  part x", "first.a").view());
+  wrong.append(manifestLineOf("three.ddd", "  part b\nmore", "first.b").view());
+  writeText(&dir.join("wrong.world"), wrong.view());
+  let rest = readWorldNow(dir.join("wrong.world").view());
+  all = fetchLine("a file of the wrong hash or the wrong size is left out of the world, and the others stay",
+    rest.view() == "part first\n") && all;
+  var wrongHash = String.from(manifestLineOf("one.ddd", "part first\n", "first").view());
+  wrongHash.append(manifestLineOf("two.ddd", "  part x", "first.a").view());
+  wrongHash.append(manifestLineOf("three.ddd", "  part b\n", "first.b").view());
+  writeText(&dir.join("wronghash.world"), wrongHash.view());
+  all = fetchLine("a file of the wrong hash alone is left out and the others stay",
+    readWorldNow(dir.join("wronghash.world").view()).view() == "part first\n  part b\n") && all;
+  // files kept by content hash: a kept file is read back; another size, or damaged bytes, is a miss
+  let keep = dir.join("kept");
+  let body = "part kept\n";
+  all = fetchLine("a file is kept under its hash and read back",
+    storeKeptFile(&keep, contentHash(body), body) && match loadKeptFile(&keep, 10u64, contentHash(body)) { case let Some(t) { t.view() == body } case is None[String] { false } }) && all;
+  all = fetchLine("a kept file of another size is not given",
+    match loadKeptFile(&keep, 11u64, contentHash(body)) { case is Some[String] { false } case is None[String] { true } }) && all;
+  writeText(&keptFilePath(&keep, contentHash(body)), "part kepx\n");
+  all = fetchLine("a kept file whose bytes were changed is not given",
+    match loadKeptFile(&keep, 10u64, contentHash(body)) { case is Some[String] { false } case is None[String] { true } }) && all;
+  all = fetchLine("a file that was never kept is not given",
+    match loadKeptFile(&keep, 3u64, contentHash("abc")) { case is Some[String] { false } case is None[String] { true } }) && all;
   all
 }

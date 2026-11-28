@@ -346,6 +346,66 @@ pub fn loadEntry(dir: &Path, key: ContentKey, kind: u32, stamp: u64, lax: u32, o
   LOAD_CORRUPT
 }
 
+// ---- Files of a world kept by content ----
+// A file the manifest names is kept under its content hash, beside the mesh entries (`.wtx`, not counted in the cap: a world's
+// text is small beside what it builds). A kept file is read back and checked against the size and hash the manifest gives, so a
+// damaged or foreign file there is a miss, never a world.
+
+const FILE_EXTENSION = ".wtx";
+
+// The hash of a file's bytes (the same sum that checks the entries)
+pub fn contentHash(b: &Array[u8]) u64 { sumOfBytes(b) }
+
+// Where the file of content hash 'hash' lives in 'dir'
+pub fn keptFilePath(dir: &Path, hash: u64) Path {
+  var name = cacheHex(hash);
+  name.append(FILE_EXTENSION);
+  dir.join(name.view())
+}
+
+// Write 'bytes' to 'file' by a temporary name beside it, then rename: a reader sees all of it or none. False if the disk would not
+// take it
+fn writeKept(dir: &Path, stem: String, file: &Path, bytes: &Array[u8]) bool {
+  match fs.makeDirAll(dir) { else {} }
+  var tmpName = stem;
+  tmpName.append(CACHE_TMP_EXTENSION);
+  tmpName.append(cacheHex(u64.from(time.Instant.now().nanos())).view());
+  let tmp = dir.join(tmpName.view());
+  var written = false;
+  match fs.writeFile(&tmp, bytes) { case is Ok { written = true; } else {} }
+  if !written { match fs.removeFile(&tmp) { else {} } return false; }
+  var done = false;
+  match fs.rename(&tmp, file) { case is Ok { done = true; } else {} }
+  if !done {
+    // (a file already there, which Windows will not rename over: a damaged one just refused, or another browser's)
+    match fs.removeFile(file) { else {} }
+    match fs.rename(&tmp, file) { case is Ok { done = true; } else {} }
+  }
+  if !done { match fs.removeFile(&tmp) { else {} } return false; }
+  true
+}
+
+// The kept file of content hash 'hash', if there and of this size and hash: None otherwise (a miss). A file read back whose bytes
+// do not hash to its name is removed
+pub fn loadKeptFile(dir: &Path, size: u64, hash: u64) Option[String] {
+  if dir.isEmpty() { return None[String]; }
+  let file = keptFilePath(dir, hash);
+  match fs.readFile(&file) {
+    case let Ok(bytes) {
+      if u64.from(bytes.len()) == size && sumOfBytes(bytes.view()) == hash { return Some[String](String.from(bytes.view())); }
+      match fs.removeFile(&file) { else {} }
+    }
+    else {}
+  }
+  None[String]
+}
+
+// Keep 'bytes' under 'hash' in 'dir'; false if the disk would not take it (or there is no cache)
+pub fn storeKeptFile(dir: &Path, hash: u64, bytes: &Array[u8]) bool {
+  if dir.isEmpty() { return false; }
+  writeKept(dir, cacheHex(hash), &keptFilePath(dir, hash), bytes)
+}
+
 // ---- The writer ----
 
 struct Found {
@@ -388,24 +448,8 @@ pub struct MeshCache {
   // Keep 'p' under 'key'; false if it is not kept (not cacheable, or the disk would not take it)
   pub fn store(self: &mut, key: ContentKey, kind: u32, p: &PartProducts) bool {
     if !self.on() || !cacheable(kind, p) { return false; }
-    match fs.makeDirAll(&dir) { else {} }
     let bytes = entryBytes(key, kind, stamp, p);
-    var tmpName = cacheHex(key);
-    tmpName.append(CACHE_TMP_EXTENSION);
-    tmpName.append(cacheHex(u64.from(time.Instant.now().nanos())).view());
-    let tmp = dir.join(tmpName.view());
-    var written = false;
-    match fs.writeFile(&tmp, bytes.view()) { case is Ok { written = true; } else {} }
-    if !written { match fs.removeFile(&tmp) { else {} } return false; }
-    let file = entryPath(&dir, key);
-    var done = false;
-    match fs.rename(&tmp, &file) { case is Ok { done = true; } else {} }
-    if !done {
-      // (an entry already there, which Windows will not rename over: a damaged one just refused, or another browser's)
-      match fs.removeFile(&file) { else {} }
-      match fs.rename(&tmp, &file) { case is Ok { done = true; } else {} }
-    }
-    if !done { match fs.removeFile(&tmp) { else {} } return false; }
+    if !writeKept(&dir, cacheHex(key), &entryPath(&dir, key), bytes.view()) { return false; }
     self.markUsed(key);
     self.stored = self.stored + 1u64;
     true
