@@ -145,13 +145,14 @@ pub struct RenderCore {
   pub xrEnded: bool;                // the headset's session is over: the run ends
   pub view: ShotView;               // the shot's own camera, if --shot-view named one
   pub traceDrawn: bool;             // PEGASUS_TRACE_DRAWN is set: a part whose turn changes between snapshots prints its drawn turn
+  waitingLook: Option[WorldLook];   // the world's light and camera, arrived and not yet set on the GPU side
 
   pub fn make(looks: StateReader[LookIntent], drawnOut: StateWriter[DrawnFrame], stalePose: bool) RenderCore {
     RenderCore(None[Gfx], looks, drawnOut, None[Published], None[Published], Arrivals(), Residents(), MaterialArrivals(),
       MaterialResidents(), List[ContentKey](), List[ContentKey](), mutantIs("material-stale"), mutantIs("material-no-show"), 0u64,
       NO_PART, NO_PART, stalePose, 1., 0usize, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
       None[HeadsetFrame], None[StateWriter[HandRay]], 0., Vec3(0., 0., 0.), 0u64, false, false, false, ShotView.none(),
-      (libc.getenv("PEGASUS_TRACE_DRAWN") as usize) != 0usize)
+      (libc.getenv("PEGASUS_TRACE_DRAWN") as usize) != 0usize, None[WorldLook])
   }
 
   // Whether the picture is the headset's
@@ -541,6 +542,12 @@ pub struct RenderCore {
   }
 
   fn drawWith(self: &mut, g: &mut Gfx, eye: Vec3, look: LookIntent, shot: &str) {
+    var arrived = None[WorldLook];
+    arrived <-> waitingLook;
+    match &arrived {
+      case let Some(l) { applyLook(g, l); }
+      else {}
+    }
     var camera = Camera.make();
     camera.fov = radians(60.);
     camera.near = 0.1;
@@ -721,6 +728,47 @@ fn hued(radiance: Vec3, r: f32, g: f32, b: f32) Color {
 }
 fn fmaxZero(x: f32) f32 { if x > 0. { x } else { 0. } }
 
+// A world's light and camera set as the guide browser sets them when its Sun, Lamp and Stand arrive (guidebrowser.cone): the sun
+// with its shadows, the sky from that sun, the world's lamps (the earlier world's gone), the exposure opened by the camera's
+// stops (on top of the exposure compensation makeFx measured) and the depth of field of its aperture. A world without a sun
+// keeps the sun and sky Render started with; one without an arrival keeps the image passes as they were.
+fn applyLook(g: &mut Gfx, l: &WorldLook) {
+  if l.hasSun {
+    let lux = l.lux;
+    let sky = f32.from(SKY_NITS);
+    g.renderer.setShadows(&mut g.device, &ShadowSettings(enabled: l.shadows));
+    g.renderer.setSky(&mut g.device, &clearDaySky(l.toSun.normalize(), lux));
+    g.light = Light.directional(Vec3(0., 0., 0.) - l.toSun, Color(l.sunColor.red * lux, l.sunColor.green * lux, l.sunColor.blue * lux, 1.),
+      Color(0.80 * sky, 0.88 * sky, 1.0 * sky, 1.));
+  }
+  g.renderer.lights.clear();
+  each lamp in &l.lamps {
+    var h = LightId.none();
+    if lamp.spot {
+      h = g.renderer.lights.addSpot(lamp.position, lamp.aim, lamp.color, lamp.candela, lamp.reach, lamp.cone - lamp.softEdge, lamp.cone);
+    } else {
+      h = g.renderer.lights.addPoint(lamp.position, lamp.color, lamp.candela, lamp.reach);
+    }
+    g.renderer.lights.setSourceRadius(h, lamp.source);
+    if lamp.shadows { g.renderer.lights.setCastsShadow(h, true); }
+  }
+  if l.hasCamera {
+    var settings = FxSettings.high();
+    settings.exposure.compensationEv = MEASURED_COMPENSATION_EV + l.exposure;
+    if l.aperture > 0. {
+      settings.dof = DofSettings.high();
+      settings.dof.aperture = l.aperture;
+      settings.dof.focusDistance = l.focus;
+      if l.lens > 0. { settings.dof.focalLength = l.lens; }
+    }
+    g.fx.configure(&settings);
+  }
+}
+
+// The exposure opened by this much beyond the world's own camera: measured against the guide browser's shot of first.ddd (W128);
+// the cause is not found
+const MEASURED_COMPENSATION_EV: f32 = 1.4;
+
 // The image passes, as the guide browser sets them for a window or a shot: rays, temporal anti-aliasing, ambient occlusion
 // and auto-exposure
 fn makeFx(renderer: &mut Renderer, post: &mut Post, device: &mut Device) ImageFx {
@@ -730,7 +778,7 @@ fn makeFx(renderer: &mut Renderer, post: &mut Post, device: &mut Device) ImageFx
   // Brightness measured against the guide browser's shot of this world (first.ddd, 120th frame): the same passes, light and sky
   // in Render gave a picture 1.4 stops darker (the guide's auto-exposure drifts up over its first seconds and Render's did not;
   // cause not found), so the exposure is opened by that much until the world's own camera exposure reaches Render
-  settings.exposure.compensationEv = 1.4;
+  settings.exposure.compensationEv = MEASURED_COMPENSATION_EV;
   fx.configure(&settings);
   fx
 }
@@ -899,6 +947,9 @@ actor Render {
 
   // Loader -> Render (bulk move): a material key's material, uploaded under the budget
   pub async fn material(self, c: MaterialContent) { core.takeMaterial(c); }
+
+  // Loader -> Render (event): how the world is lit and its picture taken (its sun, lamps and camera), taken up at the next frame
+  pub async fn look(self, l: WorldLook) { core.waitingLook = Some[WorldLook](l); }
 
   // Loader -> Render (event): nothing uses 'key' now; its mesh or material may go
   pub async fn release(self, key: ContentKey) { core.releaseContent(key); }
