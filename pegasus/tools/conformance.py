@@ -3,7 +3,8 @@
     python pegasus/tools/conformance.py                 run all, print the table; exit 1 on any difference in loads or meshes
     python pegasus/tools/conformance.py knight board    only these worlds
     python pegasus/tools/conformance.py --steps 600     steps pegasus runs (default 600)
-    python pegasus/tools/conformance.py --pegasus PATH --guide PATH
+    python pegasus/tools/conformance.py --pegasus PATH --guide PATH     (or the GUIDE_EXE environment variable; the default
+                                                                         is the main checkout's guide browser build)
 
 Per world:
   loads      the problem lines pegasus prints (loader) against `guidebrowser --check-world` (tools/checkworlds-expected is
@@ -30,7 +31,24 @@ WORLDS = REPO / "guidebrowser" / "worlds"
 TOOLS = REPO / "tools"
 SDL3 = os.environ.get("SDL3_LIB", r"C:\libs\SDL3-3.4.16\lib\x64")
 CEF = os.environ.get("CEF_RELEASE", r"C:\src\cef\cef_binary_156.0.28+g57389f0+chromium-156.0.8078.88_windows64_minimal\Release")
-GUIDE = Path(r"C:\src\pegasus3d-wt-material\guidebrowser\build\release\guidebrowser.exe")
+GUIDE = Path(os.environ.get("GUIDE_EXE", r"C:\src\pegasus3d\guidebrowser\build\release\guidebrowser.exe"))
+# The clicks of W119's behaviour baselines (tools/behaviour-logs.py) as presses on named parts: (step, part path). The
+# guide clicked at screen fractions; pegasus presses along the ray from its own eye to the part's middle, so picking decides
+# what is hit. board: a piece, then a square; guide2: the block; the knight and rook worlds have no click rule. The square
+# is one no piece hides from pegasus's eye (the guide's sq[36] is behind the white king there), so the glide's target
+# compares as 'sq[*]' (MASKED).
+CLICKS = {
+    "board": [(200, "pieces.whiteRook1"), (300, "squares.sq[35]")],
+    "guide2": [(300, "block")],
+    "knight": [(300, "knight")], "knightalone": [(300, "knight")], "knightclose": [(300, "knight")],
+    "rook": [(300, "rooks")],
+}
+MASKED = {"board"}
+# Events pegasus rightly has that the guide's baseline lacks, because the baseline's click (screen centre, measured 28 Nov
+# also at y 0.62) did not reach the block, while pegasus's press on the block does: the world's own rule is
+# on(clicked(block), start(keys(block.offset, ...))).
+GUIDE_CLICK_MISSED = {"guide2": ["block clicked: keys on block.offset started"]}
+MASK = [False]          # set per world: glide targets compare as one
 PROBLEM = re.compile(r"^[^\s:][^:]*\.ddd:\d+:\d+: ")
 
 
@@ -45,12 +63,15 @@ def guide_problems(exe: Path, world: str):
     return done.returncode, done.stdout.decode("utf-8", "replace").splitlines()
 
 
-def pegasus_run(exe: Path, world: str, steps: int):
+def pegasus_run(exe: Path, world: str, steps: int, clicks=()):
     """(exit code, output lines) of pegasus run in the worlds folder, so problem lines name the file as the guide's do.
     The Loader's workers print a hash line in several writes, so two workers' lines can tear into each other; a run with a
     torn line is repeated (up to 5 times)."""
     for _ in range(5):
-        done = subprocess.run([str(exe), "--world", world + ".ddd", "--steps", str(steps)], cwd=WORLDS,
+        cmd = [str(exe), "--world", world + ".ddd", "--steps", str(steps)]
+        for step, path in clicks:
+            cmd += ["--press-part", f"{step},{path}"]
+        done = subprocess.run(cmd, cwd=WORLDS,
                               env=env({"PEGASUS_MESH_HASHES": "1"}), capture_output=True, timeout=300)
         lines = done.stdout.decode("utf-8", "replace").splitlines()
         if all(re.match(r"^meshhash \S+ \d+$", l) for l in lines if "meshhash" in l):
@@ -82,13 +103,15 @@ def events_pegasus(lines):
     out = []
     for l in lines:
         m = re.match(r"^sim: step \d+, (.*)$", l)
-        if m and not m.group(1).startswith("react:"):
+        if m and not m.group(1).startswith(("react:", "glide from")):     # pegasus's own diagnostics, not events
             out.append(norm_event(m.group(1)))
     return out
 
 
 def norm_event(e):
     e = re.sub(r"\b\w+\.(\w+ is now)", r"\1", e)         # the guide names 'block.near', pegasus 'near'
+    if MASK[0]:
+        e = re.sub(r"glides to sq\[\d+\]", "glides to sq[*]", e)
     return e.replace(" is now true", " is now 1.0").replace(" is now false", " is now 0.0")
 
 
@@ -100,10 +123,10 @@ def main() -> int:
     ap.add_argument("--guide", default=str(GUIDE))
     args = ap.parse_args()
     names = args.worlds or [p.stem for p in sorted(WORLDS.glob("*.ddd"))]
-    rows, bad = [], 0
+    rows, bad, behdiff = [], 0, 0
     for name in names:
         gcode, gprob = guide_problems(Path(args.guide), name)
-        pcode, plines = pegasus_run(Path(args.pegasus), name, args.steps)
+        pcode, plines = pegasus_run(Path(args.pegasus), name, args.steps, CLICKS.get(name, ()))
         pprob = [l for l in plines if PROBLEM.match(l)]
         loads = "ok" if pprob == gprob else f"DIFF: guide {len(gprob)} problem(s), pegasus {len(pprob)}"
         loader = next((l for l in plines if l.startswith("loader: world")), "")
@@ -123,9 +146,19 @@ def main() -> int:
         meshes = f"{len(same)}/{len(want)} match ({len(got)} distinct built)"
         if differ or onlyg or onlyp:
             meshes += f"; differ {differ}; guide only {onlyg}; pegasus only {onlyp}"
+        MASK[0] = name in MASKED
         ge, pe = events_guide(name), events_pegasus(plines)
+        missed = GUIDE_CLICK_MISSED.get(name, [])
         both = [e for e in ge if e in pe]
-        behav = f"{len(both)} shared event(s)"
+        clicked = name in CLICKS
+        nopart = [l for l in plines if "press-part: no part" in l]
+        behav = (f"{len(CLICKS[name])} click(s): " if clicked else "no clicks: ") + f"{len(both)} shared event(s)"
+        same = ge == [e for e in pe if e not in missed]
+        if clicked and same and not nopart:
+            behav += ", identical in order" + (f" (pegasus also: {missed}, the guide's baseline click missed)" if missed else "")
+        if clicked and (not same or nopart):
+            behdiff += 1
+        behav += "".join(f"; {l}" for l in nopart)
         if [e for e in ge if e not in pe]:
             behav += f"; guide only {[e for e in ge if e not in pe]}"
         if [e for e in pe if e not in ge]:
@@ -138,8 +171,9 @@ def main() -> int:
         rows.append((name, counts, loads, meshes, behav, chk))
     for r in rows:
         print(f"{r[0]}: [{r[1]}] loads {r[2]} | meshes {r[3]} | behaviour {r[4]} | pegasus checks {r[5]}")
-    print(f"{len(rows)} world(s), {bad} with a difference in loads, meshes or checks")
-    return 1 if bad else 0
+    print(f"{len(rows)} world(s), {bad} with a difference in loads, meshes or checks; "
+          f"{sum(1 for r in rows if r[0] in CLICKS)} with replayed clicks, {behdiff} of them with a different event list")
+    return 1 if bad or behdiff else 0
 
 
 if __name__ == "__main__":
