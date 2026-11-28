@@ -1,9 +1,12 @@
 // Fetching a world's text: from a path on disk, or from a URL (http://), by the Loader's own connection.
 //
 // THE MANIFEST (a choice of the smallest kind; browser-arch may change it). A world is named by one location. If the name ends in
-// ".world" it is a MANIFEST: a text file with one file name on each line (blank lines and lines starting "//" are left out), each
-// name relative to the manifest's own folder or URL. The world's text is the files' texts in the manifest's order, one after the
-// other (a newline between two when the first does not end in one). Any other name is the world's one file.
+// ".world" it is a MANIFEST: a text file with one line for each file, "NAME SIZE HASH PATH" (blank lines and lines starting "//"
+// are left out; see `ManifestEntry`), NAME relative to the manifest's own folder or URL. The world's text is the files' texts in
+// the manifest's order, one after the other (a newline between two when the first does not end in one). Any other name is the
+// world's one file. A file whose size or hash is not the manifest's is LEFT OUT (its subtree is missing, the rest is the world),
+// and said so once; a file that passes is kept in the cache folder under its hash and not fetched again while it is there. The
+// manifest itself is not checked (nothing says what it should be).
 // The language has no way for one file to add to a part another file made, so the files are cut at part boundaries and the order
 // is the world's order; the first cut is the text's, not the language's.
 //
@@ -45,20 +48,236 @@ pub fn isUrl(loc: &str) bool { loc.startsWith("http://") || loc.startsWith("http
 // The location names a manifest
 pub fn isManifest(loc: &str) bool { loc.endsWith(".world") }
 
-// The file names a manifest's text lists, in order
-pub fn manifestFiles(text: &str) List[String] {
+// One line of a manifest: "NAME SIZE HASH PATH", the fields apart by spaces. SIZE is decimal, HASH is 16 hex digits (`contentHash`
+// of the file's bytes), PATH is the dotted path of the part whose subtree the file holds ("first.materials"; the part declared on
+// the file's first line, or for a file that starts with something else, the part that line sits in). A line with fewer fields or a
+// number that is not one is not `ok`: its file is not fetched and the world goes without it.
+pub struct ManifestEntry {
+  pub name: String;
+  pub size: u64;
+  pub hash: u64;
+  pub path: String;
+  pub ok: bool;
+}
+
+// The fields of 'line' apart by white space
+fn splitFields(line: &str) List[String] {
   var out = List[String]();
+  let b: &Array[u8] = line;
+  var cur = String();
+  var i = 0usize;
+  while i < b.len {
+    let c = b[i];
+    if c <= ' ' {
+      if cur.len() > 0usize { out.push(cur.clone()); cur = String(); }
+    } else {
+      cur.appendByte(c);
+    }
+    i = i + 1usize;
+  }
+  if cur.len() > 0usize { out.push(cur.clone()); }
+  out
+}
+
+// 's' as an unsigned number in 'base' (10 or 16) into 'out'; false if it is empty, has another character, or does not fit
+fn parseNumber(s: &str, base: u64, out: &mut u64) bool {
+  let b: &Array[u8] = s;
+  if b.len == 0usize { return false; }
+  var v = 0u64;
+  var i = 0usize;
+  while i < b.len {
+    let c = b[i];
+    var d = 99u64;
+    if c >= '0' && c <= '9' { d = u64.from(c - '0'); }
+    else if c >= 'a' && c <= 'f' { d = u64.from(c - 'a') + 10u64; }
+    if d >= base { return false; }
+    if v > (18446744073709551615u64 - d) / base { return false; }
+    v = v * base + d;
+    i = i + 1usize;
+  }
+  *out = v;
+  true
+}
+
+// The entries a manifest's text lists, in order (blank lines and lines starting "//" left out)
+pub fn manifestEntries(text: &str) List[ManifestEntry] {
+  var out = List[ManifestEntry]();
   var it = text.lines();
   while true {
     match it.next() {
       case let Some(line) {
         let t = line.trim();
-        if t.len() > 0usize && !t.startsWith("//") { out.push(String.from(t)); }
+        if t.len() == 0usize || t.startsWith("//") { continue; }
+        let f = splitFields(t);
+        var size = 0u64;
+        var hash = 0u64;
+        var ok = f.len() == 4usize;
+        if ok { ok = parseNumber(f[1].view(), 10u64, &mut size) && f[2].len() == 16usize && parseNumber(f[2].view(), 16u64, &mut hash); }
+        out.push(ManifestEntry(if f.len() > 0usize { f[0].clone() } else { String() }, size, hash, if f.len() == 4usize { f[3].clone() } else { String() }, ok));
       }
       else { break; }
     }
   }
   out
+}
+
+// What `judgeFile` says of a file that arrived
+pub const FILE_FINE = 0u32;
+pub const FILE_WRONG_SIZE = 1u32;
+pub const FILE_WRONG_HASH = 2u32;
+
+// Whether the file's 'text' is what the manifest gave: its size first, then its content hash. PEGASUS_MUTANT=manifest-skip-hash
+// (`skipHash`) does not look at the hash, and a check must fail on it
+pub fn judgeFile(size: u64, hash: u64, text: &Array[u8], skipHash: bool) u32 {
+  if u64.from(text.len) != size { return FILE_WRONG_SIZE; }
+  if !skipHash && contentHash(text) != hash { return FILE_WRONG_HASH; }
+  FILE_FINE
+}
+
+// The one line saying a file was left out and why, as one string so no other actor's print breaks it. 'got' is the arrived text
+pub fn dropLine(name: &str, path: &str, verdict: u32, got: &Array[u8], size: u64, hash: u64) String {
+  var s = String.from("loader: file ");
+  s.append(name);
+  s.append(" (subtree ");
+  s.append(path);
+  s.append(") left out: ");
+  if verdict == FILE_WRONG_SIZE {
+    s.append(numberLine("its size is ", u64.from(got.len), numberLine(" bytes, the manifest says ", size, "\n").view()).view());
+  } else {
+    s.append("its hash is ");
+    s.append(cacheHex(contentHash(got)).view());
+    s.append(", the manifest says ");
+    s.append(cacheHex(hash).view());
+    s.append("\n");
+  }
+  s
+}
+
+// Why a manifest cannot be used at all: "" if it can. It is the world's table of contents, so a fault in the table as a whole means
+// there is nothing to fall back to and the world does not open: the text is not text (a control byte), it lists no file, a line has
+// other than four fields (an error page, a cut-off download), or two lines name one file. (A line of four fields whose size or hash
+// is wrong is only its own file's fault: `ManifestEntry.ok`.) 'entries' is `manifestEntries(text)`
+pub fn manifestFault(text: &str, entries: &List[ManifestEntry]) String {
+  let raw: &Array[u8] = text;
+  var i = 0usize;
+  while i < raw.len {
+    let c = raw[i];
+    if c < ' ' && c != '\n' && c != '\r' && c != '\t' { return String.from("is not text"); }
+    i = i + 1usize;
+  }
+  if entries.len() == 0usize { return String.from("lists no files"); }
+  var it = text.lines();
+  while true {
+    match it.next() {
+      case let Some(line) {
+        let t = line.trim();
+        if t.len() == 0usize || t.startsWith("//") { continue; }
+        let f = splitFields(t);
+        if f.len() != 4usize {
+          var s = String.from("has a line of ");
+          s.append(numberLine("", u64.from(f.len()), " fields, not four (NAME SIZE HASH PATH): ").view());
+          s.append(t);
+          return s;
+        }
+      }
+      else { break; }
+    }
+  }
+  var a = 0usize;
+  while a < entries.len() {
+    var b = a + 1usize;
+    while b < entries.len() {
+      if entries[a].name.view() == entries[b].name.view() {
+        var s = String.from("names the file ");
+        s.append(entries[a].name.view());
+        s.append(" twice");
+        return s;
+      }
+      b = b + 1usize;
+    }
+    a = a + 1usize;
+  }
+  String()
+}
+
+// The one line saying a manifest cannot be used and the world does not open
+pub fn manifestFaultLine(loc: &str, fault: &str) String {
+  var s = String.from("loader: the manifest ");
+  s.append(loc);
+  s.append(" cannot be used: it ");
+  s.append(fault);
+  s.append(". The world does not open.\n");
+  s
+}
+
+// The name after "part " on a stripped line ("part lawn: physical(...)" is lawn); empty if the line does not declare a part
+fn partNameOf(t: &str) String {
+  var out = String();
+  if !t.startsWith("part ") { return out; }
+  let b: &Array[u8] = t;
+  var i = 5usize;
+  while i < b.len {
+    let c = b[i];
+    if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' { out.appendByte(c); } else { break; }
+    i = i + 1usize;
+  }
+  out
+}
+
+// Where a file's text begins, worked out from that text alone (never from the files before it, so a file left out moves nothing of
+// another's): whether it has any code, how far its first line of code is indented, and the name of the part that line declares
+// ("" if the file starts with something else: a field, an each, an on)
+pub struct FilePlace {
+  pub has: bool;
+  pub indent: usize;
+  pub name: String;
+}
+
+pub fn placeOfText(text: &Array[u8]) FilePlace {
+  var s = String();
+  s.appendBytes(text);
+  var it = s.view().lines();
+  while true {
+    match it.next() {
+      case let Some(line) {
+        let t = line.trim();
+        if t.len() == 0usize || t.startsWith("//") { continue; }
+        let raw: &Array[u8] = line;
+        var indent = 0usize;
+        while indent < raw.len && raw[indent] == ' ' { indent = indent + 1usize; }
+        return FilePlace(true, indent, partNameOf(t));
+      }
+      else { break; }
+    }
+  }
+  FilePlace(false, 0usize, String())
+}
+
+// Whether the manifest's PATH for a file agrees with where its own text begins: a file that declares a part must be that part (the
+// last name of the path); a file with no code, or that starts with something else, has nothing of its own to compare with
+pub fn placeFits(path: &str, place: &FilePlace) bool {
+  if !place.has || place.name.len() == 0usize { return true; }
+  let p: &Array[u8] = path;
+  var cut = 0usize;
+  var i = 0usize;
+  while i < p.len { if p[i] == '.' { cut = i + 1usize; } i = i + 1usize; }
+  var last = String();
+  last.appendBytes(&p[cut..<p.len]);
+  last.view() == place.name.view()
+}
+
+// The one line saying a file was left out because its text begins somewhere other than the manifest says
+pub fn pathLine(name: &str, path: &str, place: &FilePlace) String {
+  var s = String.from("loader: file ");
+  s.append(name);
+  s.append(" (subtree ");
+  s.append(path);
+  s.append(") left out: its text begins at the part ");
+  s.append(place.name.view());
+  s.append(", the manifest says ");
+  s.append(path);
+  s.append("\n");
+  s
 }
 
 // The location of 'name' beside 'loc': 'loc' up to and including its last '/' (or '\'), then 'name'
@@ -83,12 +302,27 @@ pub fn readWorldNow(loc: &str) String {
   match fs.readFile(&Path.from(loc)) {
     case let Ok(text) {
       if !isManifest(loc) { out.appendBytes(text.view()); return out; }
-      let names = manifestFiles(String.from(text.view()).view());
+      let manifest = String.from(text.view());
+      let names = manifestEntries(manifest.view());
+      if manifestFault(manifest.view(), &names).len() > 0usize { return String(); }
+      var texts = List[String]();
       each n in &names {
-        match fs.readFile(&Path.from(siblingOf(loc, n.view()).view())) {
-          case let Ok(part) { out.appendBytes(part.view()); out.append(joinAfter(part.view()).view()); }
+        match fs.readFile(&Path.from(siblingOf(loc, n.name.view()).view())) {
+          case let Ok(part) {
+            // a file the Loader leaves out (a bad line, a wrong size or hash) is left out here too, so the counts agree
+            if !n.ok || judgeFile(n.size, n.hash, part.view(), mutantIs("manifest-skip-hash")) != FILE_FINE { texts.push(String()); }
+            else { texts.push(String.from(part.view())); }
+          }
           else { return String(); }
         }
+      }
+      var i = 0usize;
+      while i < names.len() {
+        let t = &texts[i];
+        if placeFits(names[i].path.view(), &placeOfText(t.view())) {
+          out.append(t.view()); out.append(joinAfter(t.view()).view());
+        }
+        i = i + 1usize;
       }
     }
     else {}
@@ -103,10 +337,70 @@ pub fn joinAfter(text: &Array[u8]) String {
   s
 }
 
+// What the Loader does next with a manifest's files as they come in, kept apart from the actor so a check can drive it in any order
+pub const READ_NONE = 0u32;         // nothing: a read is under way, every file read, or no new run of files
+pub const READ_PREFIX = 1u32;       // read the files in from the start so far (`run` of them): their shape parts are declared early
+pub const READ_WHOLE = 2u32;        // every file is in: read the whole world, and only now start its rules and derives
+
+pub struct FileArrival {
+  have: List[bool];                 // file i is in (arrived and judged, or left out)
+  got: usize;
+  run: usize;                       // the files in from the start with none missing: a part's id is its place in the whole world's order, so
+                                    // only a run from the first file can be declared
+  readFiles: usize;                 // how many files the latest prefix read covered
+  reading: bool;                    // a read is under way: a file that arrives meanwhile waits for it (one read gathers every file in by then)
+  concluded: bool;                  // the whole world was read
+  early: bool;                      // PEGASUS_MUTANT=rules-early: the whole world, rules and all, is read from the first file on
+
+  pub fn make(files: usize, early: bool) FileArrival {
+    var have = List[bool]();
+    var i = 0usize;
+    while i < files { have.push(false); i = i + 1usize; }
+    FileArrival(have, 0usize, 0usize, 0usize, false, false, early)
+  }
+
+  pub fn arrive(self: &mut, i: usize) {
+    if i >= have.len() || *have[i] { return; }
+    have.set(i, true);
+    got = got + 1usize;
+    while run < have.len() && *have[run] { run = run + 1usize; }
+  }
+
+  pub fn files(self: &) usize { have.len() }
+  pub fn allIn(self: &) bool { got == have.len() }
+  pub fn inRun(self: &) usize { run }
+
+  // The next read to start (READ_NONE, READ_PREFIX or READ_WHOLE); it counts as under way until `readDone`
+  pub fn next(self: &mut) u32 {
+    if reading || concluded { return READ_NONE; }
+    if run == have.len() || (early && run > 0usize) { reading = true; return READ_WHOLE; }
+    if run > readFiles { reading = true; readFiles = run; return READ_PREFIX; }
+    READ_NONE
+  }
+
+  pub fn readDone(self: &mut, whole: bool) {
+    reading = false;
+    if whole { concluded = true; }
+  }
+}
+
 actor Fetcher {
   client: HttpClient;
 
   fn init(self: &new) { *self = Self(HttpClient.standard()); }
+
+  // The file kept under content hash 'hash' in the cache folder 'dir' (of this size, hash checked again); ok false: not kept
+  pub async fn kept(self, dir: String, size: u64, hash: u64) Fetched {
+    match loadKeptFile(&Path.from(dir.view()), size, hash) {
+      case let Some(text) { return Fetched(text, true); }
+      case is None[String] { return Fetched(String(), false); }
+    }
+  }
+
+  // Keep a file that passed its check, under its content hash
+  pub async fn keep(self, dir: String, hash: u64, text: String) {
+    _ = storeKeptFile(&Path.from(dir.view()), hash, text.view());
+  }
 
   // The text at 'loc': a URL by the client, else a path on disk read in chunks
   pub async fn text(self, loc: String) Fetched {

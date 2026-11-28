@@ -1,6 +1,6 @@
 """A local file server that serves a world's files over a slowed link, for arrival tests.
 
-    python worldserve.py ROOT_DIR [--port N] [--mbit RATE] [--latency-ms MS]
+    python worldserve.py ROOT_DIR [--port N] [--mbit RATE] [--latency-ms MS] [--delay NAME=MS ...]
 
 Binds 127.0.0.1 only. GET /PATH answers the file ROOT_DIR/PATH (HTTP/1.1, keep-alive, Content-Length). The link is ONE pipe
 shared by every connection: the bytes of all responses together go at --mbit megabits a second (0: no limit), so asking for
@@ -51,6 +51,12 @@ def main():
                 mbit = float(value)
             else:
                 latency = float(value)
+    delays = {}                       # --delay NAME=MS (repeatable): a file whose response starts MS later than the rest
+    while "--delay" in args:
+        i = args.index("--delay")
+        name, _, ms = args[i + 1].partition("=")
+        delays[name] = float(ms)
+        del args[i:i + 2]
     root = os.path.abspath(args[0])
     link = Link(mbit)
 
@@ -68,6 +74,9 @@ def main():
                 body = f.read()
             if latency > 0:
                 time.sleep(latency / 1000.0)
+            late = delays.get(os.path.basename(path), 0.0)
+            if late > 0:
+                time.sleep(late / 1000.0)
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

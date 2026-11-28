@@ -65,6 +65,8 @@ The budgets that arrival answers to are owned by the performance perspective: th
 
 ## What exists today
 
+- Pegasus's Loader reads a manifest world's files as they arrive: the files in from the start are read with the unchanged `conescript` reader, Sim declares the parts that are the same in the whole world (ids in its order) and the Loader builds them nearest first, while later files are still coming; rules, derives and looks start only when every file is in (`pegasus/src/loaderactor.cone`, `worldfetch.cone`, `worldimage.cone`, `simactor.cone`; measured and described in [Loader](../actors/loader.md), W144). A world of one file reads as before. `[differs: a part naming a part of a file not yet read, or wrong, holds back the parts after it until the whole is read; nearness is to where the person is known to start so far; one file adding to a part another file made is still not built]`
+
 - The island fetches nothing: its world is compiled in, and meshes and sounds are generated (`browser/src/bakedworld/bakedworld.cone`, `browser/src/audioview.cone`). `[differs: a world arrives as a description from an address]`
 - The island's world builds one object a turn, so frames continue (`browser/src/bakedworld/bakedworld.cone`). Sim discards the meshes and the View builds each object again from its description (`browser/src/simactor.cone`, `browser/src/viewactor.cone`). `[differs: one build, moved to its one user]`
 - The island has no Loader actor. A joining client gets the server's replay log and builds each object itself, with uploads held to 4 MB a frame when connected (`browser/src/replaylog.cone`, `browser/src/viewactor.cone`).

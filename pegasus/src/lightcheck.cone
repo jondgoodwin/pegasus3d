@@ -1,0 +1,126 @@
+// The driven check of lights, camera settings and sky as parts (`pegasus --checks`, W142). A world's sun, a lamp, a camera and the
+// sky are parts whose look says what they are. A lamp's intensity changes on the server; the change goes the way it goes in
+// connected play (the tracker, the wire, the client's view, the snapshot the client's Sim publishes) and must reach Render's
+// scene: the lamp lit as the new intensity says, a light at rest costing nothing after it was acknowledged. The inhabited
+// camera part, not another, sets the exposure. PEGASUS_MUTANT=light-stale (Render keeps each part's first light) and
+// look-missed (the tracker never notices a change of look) are caught by it.
+
+fn lampLook(candela: f32) PartLook {
+  var l = noLook();
+  l.kind = LOOK_POINT;
+  l.color = Vec3(1., 0.9, 0.7);
+  l.amount = candela;
+  l.reach = 8.;
+  l.source = 0.05;
+  l.shadows = true;
+  l
+}
+
+fn sunLook(lux: f32) PartLook {
+  var l = noLook();
+  l.kind = LOOK_SUN;
+  l.dir = Vec3(-0.4, 0.8, 0.45);
+  l.color = Vec3(1., 0.95, 0.88);
+  l.amount = lux;
+  l.shadows = true;
+  l
+}
+
+fn cameraLook(exposure: f32) PartLook {
+  var l = noLook();
+  l.kind = LOOK_CAMERA;
+  l.lens = 0.085;
+  l.aperture = 4.;
+  l.focus = 3.;
+  l.exposure = exposure;
+  l
+}
+
+fn skyLook() PartLook {
+  var l = noLook();
+  l.kind = LOOK_SKY;
+  l
+}
+
+// The parts the client's Sim would publish: each part's key, then its look as the client holds it
+fn publishedLooks(step: u64, keys: &List[ContentKey], looks: &List[PartLook]) Published {
+  var ps = PartStates();
+  var i = 0usize;
+  while i < keys.len() {
+    var place = Mat4.identity();
+    if i == 2usize { place = Mat4.fromTranslation(Vec3(2., 3., 1.)); }      // the lamp stands up and to one side
+    ps.push(PartState(u32.from(i), *keys[i], *keys[i], *looks[i], NO_PART, place));
+    i = i + 1usize;
+  }
+  var s = Snapshot(step, step * STEP_NS, PersonState(Vec3(0., 0., 0.), 0.), ps, OtherPersons(), 0u64);
+  s.sum = snapshotSum(&s);
+  Published(s)
+}
+
+fn checkLights() bool {
+  var lw: StateWriter[LookIntent];
+  var lr: StateReader[LookIntent];
+  lw, lr = stateSlot[LookIntent](LookIntent(0., 0.));
+  var dw: StateWriter[DrawnFrame];
+  var dr: StateReader[DrawnFrame];
+  dw, dr = stateSlot[DrawnFrame](zeroFrame());
+  var core = RenderCore.make(lr, dw, false);
+
+  // part 0 is a shape, 1 the sun, 2 a lamp, 3 and 4 two camera parts, 5 the root's sky
+  var keys = List[ContentKey]();
+  keys.push(1000u64); keys.push(NO_CONTENT); keys.push(NO_CONTENT); keys.push(NO_CONTENT); keys.push(NO_CONTENT); keys.push(NO_CONTENT);
+  var defined = List[PartLook]();
+  defined.push(noLook()); defined.push(sunLook(70000.)); defined.push(lampLook(100.)); defined.push(cameraLook(1.3));
+  defined.push(cameraLook(-2.)); defined.push(skyLook());
+  var states = List[Mat4]();
+  var mats = List[ContentKey]();
+  var i = 0usize;
+  while i < defined.len() { states.push(Mat4.identity()); mats.push(*keys[i]); i = i + 1usize; }
+  var tracker = PartTracker.make(&states, &mats, &defined, false);
+  var view = PartView.make(defined.len());
+
+  // before any change: what the definition says
+  core.takeSnapshot(publishedLooks(1u64, &keys, &view.looks(&defined)));
+  let a = core.sceneLook();
+  let firstOk = a.hasSun && a.lux == 70000. && a.hasSky && a.lamps.len() == 1usize && a.lamps[0usize].candela == 100.
+    && a.lamps[0usize].position.x == 2. && a.lamps[0usize].position.y == 3. && a.hasCamera && a.exposure == 1.3;
+
+  // the server's lamp is turned up at step 10 and goes through the wire; the sun and the first camera do not change
+  var now = defined.clone();
+  now.set(2usize, lampLook(5000.));
+  _ = tracker.observeLook(2usize, &now[2usize]);
+  var deltas = PartDeltas();
+  let through = tracker.select(0u64, partRoom(0usize), false, &mut deltas);
+  var full = List[u8]();
+  full.appendSlice(encodePeople(10u64, &OtherPersons()).view());
+  full.appendList(encodePartTail(through, &deltas, 0u64));
+  var gotStep = 0u64;
+  var people = OtherPersons();
+  var gotThrough = 0u64;
+  var got = PartDeltas();
+  var gotHash = 0u64;
+  let decoded = decodeShared(bytesOfList(&full), &mut gotStep, &mut people, &mut gotThrough, &mut got, &mut gotHash);
+  view.apply(gotStep, gotThrough, &got);
+  let oneDelta = decoded && got.len() == 1usize && got[0usize].mask == FIELD_LOOK && deltaBytes(&got[0usize]) == LOOK_DELTA_BYTES;
+  core.takeSnapshot(publishedLooks(2u64, &keys, &view.looks(&defined)));
+  let b = core.sceneLook();
+  let changed = b.lamps.len() == 1usize && b.lamps[0usize].candela == 5000. && b.lux == 70000. && b.exposure == 1.3;
+
+  // acknowledged, the light at rest costs nothing more, and the client's hash is the server's
+  var rest = PartDeltas();
+  _ = tracker.select(through, partRoom(0usize), false, &mut rest);
+  let atRest = rest.len() == 0usize
+    && statesHash(&tracker.states(), &tracker.materials(), &tracker.looks()) == statesHash(&states, &mats, &view.looks(&defined));
+
+  // the camera Player inhabits sets the exposure: the second camera part, not the first
+  core.inhabited(NO_PART, 4u32);
+  let c = core.sceneLook();
+  let camera = c.hasCamera && c.exposure == -2. && c.aperture == 4.;
+
+  print <- "check lights: sun, lamp, camera and sky as parts "; print <- firstOk; print <- "; a lamp's intensity changed in "; print <- u64.from(full.len());
+  print <- " bytes, one look delta "; print <- oneDelta; print <- "; it reaches Render's scene "; print <- changed;
+  print <- "; at rest it costs nothing and the hash agrees "; print <- atRest; print <- "; the inhabited camera sets the exposure "; print <- camera;
+  let ok = firstOk && oneDelta && changed && atRest && camera;
+  if ok { print <- ": ok\n"; } else { print <- ": FAILED (a light did not reach Render, or cost more than its change)\n"; }
+  ok
+}

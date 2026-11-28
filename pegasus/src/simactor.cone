@@ -51,7 +51,9 @@ struct SimPart {
   key: ContentKey;                  // its mesh key
   material: ContentKey;             // its material key now (a field that sets the material changes this alone: `setMaterial`)
   definedMaterial: ContentKey;      // its material key as the world defined it (the definition's sum holds this one)
-  placement: Mat4;                  // where the image put it; once a rule moves it, `placeOf` is where it stands
+  look: PartLook;                   // its light, camera settings or sky now (a field that sets a light changes this alone: `setLook`)
+  definedLook: PartLook;            // its look as the world defined it (the definition's sum holds this one)
+  placement: Mat4;                 // where the image put it; once a rule moves it, `placeOf` is where it stands
   slot: u32;                        // its number in the world's frames (`rules.slots`)
   asked: bool;                      // its content was asked of the Loader
 }
@@ -150,18 +152,54 @@ actor Sim {
   movedLastNs: i64;                 // ... and the last time it did
   avatarMaterial: ContentKey;       // a client: the material key of that design
   materialChanges: u64;             // material keys a part changed to (`setMaterial`)
+  lookChanges: u64;                 // looks a part changed to (`setLook`)
   poseHistory: PoseHistory;         // each part's place at the last POSE_STEPS steps, for picking at a press's drawn time
+  held: PartDecls;                  // a shared zone's or a client's parts declared before the whole world is in: kept for `world`, which takes them first
 
   fn init(self: &new, role: u32, render: Render, audio: Audio, loader: Loader, start: SimStart, mutant: bool) {
     *self = Self(role, render, audio, loader, start, SimParts(), ShapeTable(),
       Actions(), AimedPresses(), Actions(), Actions(), SimRules.none(), Landings(), PersonState(Vec3(0., 0., 0.), 0.), String(), 0u64, false, 0u64, 0., 0u64, mutant, None[Published],
-      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, PoseHistory.make());
+      NetState.make(mutantIs("no-replay"), mutantIs("stale-personal"), mutantIs("stale-shared")), false, false, 0u64, 0i64, 0usize, false, 0u64, false, false, false, 0u64, 0u64, List[Mat4](), false, 0i64, 0i64, 0i64, 0u64, 0u64, 0u64, PoseHistory.make(), PartDecls());
+  }
+
+  // Loader -> Sim (move): the next parts of the world, declared before the whole world is in (the Loader read the files that have
+  // arrived: the parts of a run of files from the start, in the order the whole world will give them). Local play declares them
+  // now, each given its id and its content asked for by nearness to 'feet' (where the person is known to start, so far). A server
+  // or a client keeps them for `world`: what it makes of the parts (what the clients are shown, or what the person is shown and
+  // joined to) is made once, from the whole. Rules, derives and every look wait for `world`: a rule may name any part by its path
+  pub async fn declare(self, decls: PartDecls, feet: Vec3) {
+    if role != SIM_WHOLE {
+      each d in &decls { held.push(PartDecl(d.name.clone(), d.key, d.material, d.look, d.placement, d.slot)); }
+      return;
+    }
+    self.declareParts(&decls, feet);
+  }
+
+  // Give each part its id now, before its content exists, and ask the Loader for its content, the nearer to 'feet' the sooner
+  fn declareParts(self: &mut, decls: &PartDecls, feet: Vec3) {
+    each d in &*decls {
+      let id = u32.from(parts.len());
+      parts.push(SimPart(id, d.name.clone(), d.key, d.material, d.material, d.look, d.look, d.placement, d.slot, true));
+      // a light, a camera or the sky has no content to ask for: its look is all it is
+      if d.key == NO_CONTENT { continue; }
+      let at = d.placement.translation();
+      loader.build(ContentRequest(d.key, id, (at - feet).length()));
+      // a server never draws: its Loader builds the shapes Sim needs and no material
+      if role != SIM_SERVER { loader.build(ContentRequest(d.material, id, (at - feet).length())); }
+    }
   }
 
   // Loader -> Sim (move): the world image. Each part is given its id now,
   // before its content exists, and its content is asked for by key
   pub async fn world(self, image: WorldImage) {
     var img = image;
+    if held.len() > 0usize {
+      // a server's or a client's earlier parts come first, as the whole world gives them
+      var all = PartDecls();
+      all <-> held;
+      each d in &img.parts { all.push(PartDecl(d.name.clone(), d.key, d.material, d.look, d.placement, d.slot)); }
+      img.parts <-> all;
+    }
     worldName = img.name.clone();
     person.feet = img.startFeet;
     haveImage = true;
@@ -185,22 +223,18 @@ actor Sim {
       let tr = libc.getenv("PEGASUS_TRACE_PART");
       if (tr as usize) != 0usize { rules.traceFor(tr); }
     }
+    self.declareParts(&img.parts, person.feet);
     var keys = List[ContentKey]();
-    each d in &img.parts {
-      let id = u32.from(parts.len());
-      parts.push(SimPart(id, d.name.clone(), d.key, d.material, d.material, d.placement, d.slot, true));
-      let at = d.placement.translation();
-      loader.build(ContentRequest(d.key, id, (at - person.feet).length()));
-      // a server never draws: its Loader builds the shapes Sim needs and no material
-      if role != SIM_SERVER { loader.build(ContentRequest(d.material, id, (at - person.feet).length())); }
-      if !keys.contains(&d.key) { keys.push(d.key); }
+    each p in &parts {
+      if p.key != NO_CONTENT && !keys.contains(&p.key) { keys.push(p.key); }
     }
     zoneKeys = keys.len();
     if role == SIM_SERVER {
       var defined = List[Mat4]();
       var definedMat = List[ContentKey]();
-      each p in &parts { defined.push(self.placeOf(p)); definedMat.push(p.material); }
-      net.tracker = PartTracker.make(&defined, &definedMat, mutantIs("delta-vs-sent"));
+      var definedLook = List[PartLook]();
+      each p in &parts { defined.push(self.placeOf(p)); definedMat.push(p.material); definedLook.push(p.look); }
+      net.tracker = PartTracker.make(&defined, &definedMat, &definedLook, mutantIs("delta-vs-sent"));
     }
     if role == SIM_CLIENT {
       net.view = PartView.make(parts.len());
@@ -276,6 +310,7 @@ actor Sim {
     else if role == SIM_SERVER { self.moveServer(); }
     else { self.move(); }
     if role != SIM_CLIENT { rules.animate(step, STEP_NS); }   // move: the animators (a client's parts are the server's)
+    if role != SIM_CLIENT { self.testLightChange(); }
     self.sense();
     self.react();
     self.derive();
@@ -300,9 +335,53 @@ actor Sim {
     if finishedSent { return; }
     finishedSent = true;
     rules.profileReport(step);
+    self.printLights();
     let verdict = self.checks();
     var f = io.finished.clone();
     f <- verdict;
+  }
+
+  // The world's light as this Sim holds it (the sun's lux, the lamps, the camera): a client's is what the server's deltas said,
+  // and a run that changes a light prints both ends to be read against each other
+  fn printLights(self: &) {
+    var sun = false;
+    var lux: f32 = 0.;
+    var lamps = 0usize;
+    var first: f32 = 0.;
+    var exposure: f32 = 0.;
+    var camera = false;
+    each p in &parts {
+      if p.look.kind == LOOK_SUN { sun = true; lux = p.look.amount; }
+      if p.look.kind == LOOK_POINT || p.look.kind == LOOK_SPOT { if lamps == 0usize { first = p.look.amount; } lamps = lamps + 1usize; }
+      if p.look.kind == LOOK_CAMERA { camera = true; exposure = p.look.exposure; }
+    }
+    print <- "sim: light: sun "; print <- sun; print <- " lux "; printF(lux); print <- ", "; print <- u64.from(lamps); print <- " lamps (first ";
+    printF(first); print <- " cd), camera "; print <- camera; print <- " exposure "; printF(exposure); print <- ", "; print <- lookChanges;
+    print <- " look changes\n";
+  }
+
+  // A test aid: PEGASUS_LIGHT_CHANGE=STEP:NAME:AMOUNT sets the amount (lux or candela) of the light part whose path holds NAME at
+  // that step, on a server or a whole run: what a rule that turns a lamp on at dusk would do (`setLook`)
+  fn testLightChange(self: &mut) {
+    let e = libc.getenv("PEGASUS_LIGHT_CHANGE");
+    if (e as usize) == 0usize { return; }
+    if argNumber(e) != step { return; }
+    var i = 0usize;
+    while *(e + i) != ':' && *(e + i) != 0u8 { i = i + 1usize; }
+    if *(e + i) == ':' { i = i + 1usize; }
+    var name = String();
+    while *(e + i) != ':' && *(e + i) != 0u8 { name.appendByte(*(e + i)); i = i + 1usize; }
+    if *(e + i) == ':' { i = i + 1usize; }
+    let amount = f32.from(argNumber(e + i));
+    var found = parts.len();
+    each p in &parts {
+      if found == parts.len() && p.look.kind != LOOK_NONE && pathHas(p.name.view(), name.view()) { found = usize.from(p.id); }
+    }
+    if found == parts.len() { print <- "sim: light change: no light part named "; printStr(name.view()); print <- "\n"; return; }
+    var look = parts[found].look;
+    look.amount = amount;
+    self.setLook(found, look);
+    print <- "sim: step "; print <- step; print <- ": light "; printStr(parts[found].name.view()); print <- " set to "; printF(amount); print <- "\n";
   }
 
   // The presses aimed at a named part whose shape is known become presses along the ray from the eye to the part's
@@ -544,7 +623,7 @@ actor Sim {
         let through = net.tracker.select(r.partsAck, partRoom(people.len()), fresh, &mut deltas);
         // the hash of every part's state once this snapshot is applied; only when the snapshot completes the client's picture
         var hash = 0u64;
-        if through == net.tracker.version { hash = statesHash(&net.tracker.states(), &net.tracker.materials()); }
+        if through == net.tracker.version { hash = statesHash(&net.tracker.states(), &net.tracker.materials(), &net.tracker.looks()); }
         var full = List[u8]();
         full.appendSlice(head.view());
         full.appendList(encodePartTail(through, &deltas, hash));
@@ -667,6 +746,7 @@ actor Sim {
         net.view.apply(s, through, &deltas);
         if deltas.len() > 0usize { net.partsGot = net.partsGot + 1u64; }
         self.takeMaterialsFromView();
+        self.takeLooksFromView();
         if hash != 0u64 { self.checkHash(s, hash); }
       }
       net.sharedGot = net.sharedGot + 1u64;
@@ -684,8 +764,9 @@ actor Sim {
   fn checkHash(self: &mut, step: u64, theirs: u64) {
     var defined = List[Mat4]();
     var definedMat = List[ContentKey]();
-    each p in &parts { defined.push(p.placement); definedMat.push(p.definedMaterial); }
-    let mine = statesHash(&net.view.states(&defined), &net.view.materials(&definedMat));
+    var definedLook = List[PartLook]();
+    each p in &parts { defined.push(p.placement); definedMat.push(p.definedMaterial); definedLook.push(p.definedLook); }
+    let mine = statesHash(&net.view.states(&defined), &net.view.materials(&definedMat), &net.view.looks(&definedLook));
     hashChecked = hashChecked + 1u64;
     if mine == theirs {
       if resyncAsked {
@@ -855,6 +936,7 @@ actor Sim {
         let here = self.placeOf(&parts[i]);
         _ = net.tracker.observe(i, &here);
         _ = net.tracker.observeMaterial(i, parts[i].material);
+        _ = net.tracker.observeLook(i, &parts[i].look);
         i = i + 1usize;
       }
     }
@@ -873,6 +955,27 @@ actor Sim {
     if role == SIM_SERVER { return; }
     loader.build(ContentRequest(key, u32.from(id), near));
     loader.unused(old, u32.from(id));
+  }
+
+  // Part 'id' has look 'look' from now on (what a rule that turns a lamp on, or moves the sun, does): it reaches Render, and
+  // the other people through the shared snapshot, in the next snapshot, with no message of its own
+  fn setLook(self: &mut, id: usize, look: PartLook) {
+    if id >= parts.len() || sameLook(&parts[id].look, &look) { return; }
+    let part = &mut parts[id];
+    part.look = look;
+    lookChanges = lookChanges + 1u64;
+  }
+
+  // A client: the looks the server's deltas say, taken as the parts' own
+  fn takeLooksFromView(self: &mut) {
+    var definedLook = List[PartLook]();
+    each p in &parts { definedLook.push(p.definedLook); }
+    let looks = net.view.looks(&definedLook);
+    var i = 0usize;
+    while i < looks.len() {
+      self.setLook(i, *looks[i]);
+      i = i + 1usize;
+    }
   }
 
   // A client: the materials the server's deltas say, taken as the parts' own
@@ -927,14 +1030,14 @@ actor Sim {
     if role == SIM_SERVER { return; }   // a server's zone is sent to its clients (sendSnapshots), not drawn
     rules.slots.refresh();
     var ps = PartStates();
-    each p in &parts { ps.push(PartState(p.id, p.key, p.material, NO_PART, self.placeOf(p))); }
+    each p in &parts { ps.push(PartState(p.id, p.key, p.material, p.look, NO_PART, self.placeOf(p))); }
     var others = OtherPersons();
     if role == SIM_CLIENT { others = self.mergeOthers(); }
     // Other people are parts of the avatar design, standing where the server's snapshots put them (the id: after the world's)
     if role == SIM_CLIENT && hasAvatar {
       each o in &others {
         let turn = Quat.angleAxis(o.yaw, Vec3(0., 1., 0.));
-        ps.push(PartState(u32.from(parts.len()) + o.id, avatarKey, avatarMaterial, NO_PART,
+        ps.push(PartState(u32.from(parts.len()) + o.id, avatarKey, avatarMaterial, noLook(), NO_PART,
           Mat4.fromTrs(o.feet, turn, Vec3(1., 1., 1.))));
       }
     }

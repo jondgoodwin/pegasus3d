@@ -202,5 +202,39 @@ fn checkMeshCache(lax: u32) bool {
     while k <= 55u64 { if entryIsThere(&dir, k) { count = count + 1usize; } k = k + 1u64; }
     all = cacheLine("eviction deletes the least recently used and keeps the newest", lru && newest && count == 1usize && entryIsThere(&dir, 55u64)) && all;
   }
+
+  // One cap over every kind: a mesh entry, a material entry and two kept world files, used in the order mesh 71, file A, material 72,
+  // file B. Under a cap that holds only the last two, the first two go whatever their kind; and with A and 72 held by the running
+  // world (and a cap of one byte) they stay while the rest go. (PEGASUS_MUTANT=cache-ignore-holds deletes held ones: the second fails.)
+  {
+    let built = sampleProducts(0.7);
+    let bodyA = "part a\n  part aa\n";
+    let bodyB = "part b\n";
+    let hashA = contentHash(bodyA);
+    let hashB = contentHash(bodyB);
+    let matSize = u64.from(entryBytes(72u64, CACHE_MATERIAL, STAMP, &built).len());
+    let dirOrder = root.join("evictkinds");
+    var order = MeshCache.make(dirOrder.clone(), STAMP, matSize + u64.from(bodyB.len()) + 1u64);
+    _ = order.store(71u64, CACHE_MESH, &built);
+    _ = storeKeptFile(&dirOrder, hashA, bodyA); order.touchFile(hashA);
+    _ = order.store(72u64, CACHE_MATERIAL, &built);
+    _ = storeKeptFile(&dirOrder, hashB, bodyB); order.touchFile(hashB);
+    let goneOrder = order.evict();
+    all = cacheLine("one cap evicts meshes, materials and kept files together, the least recently used first",
+      goneOrder == 2u64 && !entryIsThere(&dirOrder, 71u64) && !fs.exists(&keptFilePath(&dirOrder, hashA))
+      && entryIsThere(&dirOrder, 72u64) && fs.exists(&keptFilePath(&dirOrder, hashB))) && all;
+    let dirHeld = root.join("evictheld");
+    var held = MeshCache.make(dirHeld.clone(), STAMP, 1u64);
+    _ = held.store(71u64, CACHE_MESH, &built);
+    _ = storeKeptFile(&dirHeld, hashA, bodyA); held.touchFile(hashA);
+    _ = held.store(72u64, CACHE_MATERIAL, &built);
+    _ = storeKeptFile(&dirHeld, hashB, bodyB); held.touchFile(hashB);
+    held.holdFile(hashA);
+    held.hold(72u64);
+    let goneHeld = held.evict();
+    all = cacheLine("what the running world holds is never evicted, a mesh, a material or a kept file, whatever the cap",
+      goneHeld == 2u64 && fs.exists(&keptFilePath(&dirHeld, hashA)) && entryIsThere(&dirHeld, 72u64)
+      && !entryIsThere(&dirHeld, 71u64) && !fs.exists(&keptFilePath(&dirHeld, hashB))) && all;
+  }
   all
 }

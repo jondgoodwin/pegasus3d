@@ -84,6 +84,75 @@ pub struct Action {
   pub origin: u32;                  // ORIGIN_...
 }
 
+// ---- A part's look beyond its mesh and material: a light, a camera's settings, the sky ----
+// The sun and each lamp is a part whose look carries its light; a camera part's look carries the camera's settings (lens,
+// exposure, depth of field); the world's root part carries the sky. Such a part has no mesh or material (NO_CONTENT) and is
+// placed like any part. The look travels in the snapshot, in the shared snapshot's deltas, in the join's definition sum and in
+// the state hash, as the material key does. One flat record, fixed in size; fields a kind does not use are 0.
+
+pub const NO_CONTENT = 0u64;        // no mesh or no material: the part is a light, a camera or the sky
+
+pub const LOOK_NONE = 0u32;
+pub const LOOK_SUN = 1u32;          // a directional light: dir points to the sun, amount is lux
+pub const LOOK_POINT = 2u32;        // a lamp: amount is candela
+pub const LOOK_SPOT = 3u32;         // a lamp with a cone: dir is its axis in the part's frame
+pub const LOOK_CAMERA = 4u32;       // a camera part: lens, aperture, focus, exposure
+pub const LOOK_SKY = 5u32;          // the root part's: the sky is a clear day made from the world's sun
+pub const LOOK_WORDS = 17usize;     // a look as numbers, on the wire and in the hash
+
+pub struct PartLook {
+  pub kind: u32;                    // LOOK_...
+  pub shadows: bool;                // a sun or lamp casts shadows
+  pub dir: Vec3;                    // a sun: toward the sun, in the world's frame; a spot lamp: its axis in the part's frame
+  pub color: Vec3;                  // linear
+  pub amount: f32;                  // lux (sun) or candela (lamp)
+  pub reach: f32;                   // a lamp's: metres
+  pub source: f32;                  // a lamp's: the radius of the glowing source, metres
+  pub cone: f32;                    // a spot lamp's: where it ends, radians from the axis
+  pub softEdge: f32;                // a spot lamp's: how far inside the cone it begins to fade
+  pub lens: f32;                    // a camera's: metres of focal length, 0 none
+  pub aperture: f32;                // an f-number, 0 everything in focus
+  pub focus: f32;                   // the distance in focus, metres
+  pub exposure: f32;                // stops the exposure is opened by
+}
+
+// A part with no look beyond its mesh and material
+pub fn noLook() PartLook {
+  PartLook(LOOK_NONE, false, Vec3(0., 0., 0.), Vec3(0., 0., 0.), 0., 0., 0., 0., 0., 0., 0., 0., 0.)
+}
+
+// The look as LOOK_WORDS numbers (kind and shadows as 0, 1, ... exactly)
+pub fn lookWords(l: &PartLook) List[f32] {
+  var w = List[f32]();
+  w.push(f32.from(l.kind));
+  if l.shadows { w.push(1.); } else { w.push(0.); }
+  w.push(l.dir.x); w.push(l.dir.y); w.push(l.dir.z);
+  w.push(l.color.x); w.push(l.color.y); w.push(l.color.z);
+  w.push(l.amount); w.push(l.reach); w.push(l.source); w.push(l.cone); w.push(l.softEdge);
+  w.push(l.lens); w.push(l.aperture); w.push(l.focus);
+  w.push(l.exposure);
+  w
+}
+
+// The look 'w' says, from 'at' on (the inverse of lookWords; w has LOOK_WORDS from 'at')
+pub fn lookFromWords(w: &List[f32], at: usize) PartLook {
+  PartLook(u32.from(*w[at]), *w[at + 1usize] > 0.5, Vec3(*w[at + 2usize], *w[at + 3usize], *w[at + 4usize]),
+    Vec3(*w[at + 5usize], *w[at + 6usize], *w[at + 7usize]), *w[at + 8usize], *w[at + 9usize], *w[at + 10usize], *w[at + 11usize],
+    *w[at + 12usize], *w[at + 13usize], *w[at + 14usize], *w[at + 15usize], *w[at + 16usize])
+}
+
+// Whether two looks say the same, to the bit
+pub fn sameLook(a: &PartLook, b: &PartLook) bool {
+  let x = lookWords(a);
+  let y = lookWords(b);
+  var i = 0usize;
+  while i < x.len() {
+    if (*x[i]).bits() != (*y[i]).bits() { return false; }
+    i = i + 1usize;
+  }
+  true
+}
+
 // ---- Row 2: Sim -> Render, Audio, latest ----
 
 // One part as a step left it: its content and where it stands, in the frame
@@ -92,6 +161,7 @@ pub struct PartState {
   pub id: PartId;
   pub key: ContentKey;              // the mesh key
   pub material: ContentKey;         // the material key of its (first) material slot
+  pub look: PartLook;               // its light, camera settings or sky, when it is one of those (LOOK_NONE for a shape part)
   pub platform: PartId;
   pub placement: Mat4;
 }
@@ -135,6 +205,8 @@ pub fn snapshotSum(s: &Snapshot) u64 {
     h = mixIn(h, u64.from(p.id));
     h = mixIn(h, p.key);
     h = mixIn(h, p.material);
+    let ws = lookWords(&p.look);
+    each w in &ws { h = mixFloat(h, *w); }
     h = mixIn(h, u64.from(p.platform));
     h = mixFloat(h, p.placement.m[12]); h = mixFloat(h, p.placement.m[13]); h = mixFloat(h, p.placement.m[14]);
   }
@@ -165,6 +237,7 @@ pub struct PartDecl {
   pub name: String;
   pub key: ContentKey;              // the mesh key
   pub material: ContentKey;         // the material key
+  pub look: PartLook;               // its light, camera settings or sky (a part with one has NO_CONTENT for key and material)
   pub placement: Mat4;              // in the zone's frame (no platforms in the mock)
   pub slot: u32;                    // its number in the world's frames (`Behaviour.frames`); 0 in the mock worlds
 }

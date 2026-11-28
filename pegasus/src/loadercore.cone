@@ -49,8 +49,10 @@ alias KnownRecipes = List[KnownRecipe];
 pub struct LoaderCore {
   known: KnownRecipes;              // what each key is made from, taught by the world image
   catalog: Catalog;
-  startedNearness: List[f32];       // the nearness of each job, in the order the jobs were handed out
-  offByOne: bool;                   // the check's mutant: frees one user too soon
+  lastNearness: f32;                // the nearness of the job handed out last
+  fresh: bool;                      // a key was queued, or made nearer, since a job was last handed out
+  outOfOrder: bool;                 // a job was handed out nearer than the one before it with nothing new asked between
+  offByOne: bool;                  // the check's mutant: frees one user too soon
   pub started: u64;                 // jobs handed out
   pub shared: u64;                  // asks answered by a key already built
   pub freed: u64;                   // keys whose last user left
@@ -58,7 +60,7 @@ pub struct LoaderCore {
   pub unknown: u64;                 // asks for a key with no recipe
 
   pub fn make(offByOne: bool) LoaderCore {
-    LoaderCore(KnownRecipes(), Catalog(), List[f32](), offByOne, 0u64, 0u64, 0u64, 0u64, 0u64)
+    LoaderCore(KnownRecipes(), Catalog(), 0., true, false, offByOne, 0u64, 0u64, 0u64, 0u64, 0u64)
   }
 
   // The world image says what 'key' is made from
@@ -98,7 +100,7 @@ pub struct LoaderCore {
     if at < catalog.len() {
       let e = &mut catalog[at];
       if !e.users.contains(&req.part) { e.users.push(req.part); }
-      if req.nearness < e.nearness { e.nearness = req.nearness; }
+      if req.nearness < e.nearness { e.nearness = req.nearness; if e.state == STATE_QUEUED { fresh = true; } }
       if e.state == STATE_BUILT { shared = shared + 1u64; return ASK_SHARED; }
       return ASK_JOINED;
     }
@@ -107,6 +109,7 @@ pub struct LoaderCore {
         var users = List[PartId]();
         users.push(req.part);
         catalog.push(CatalogEntry(req.key, r, STATE_QUEUED, users, req.nearness));
+        fresh = true;
         ASK_QUEUED
       }
       case is None[Recipe] { unknown = unknown + 1u64; ASK_UNKNOWN }
@@ -131,7 +134,9 @@ pub struct LoaderCore {
     let e = &mut catalog[best];
     e.state = STATE_BUILDING;
     started = started + 1u64;
-    startedNearness.push(e.nearness);
+    if !fresh && started > 1u64 && e.nearness < lastNearness { outOfOrder = true; }
+    lastNearness = e.nearness;
+    fresh = false;
     Some[BuildJob](BuildJob(e.key, e.recipe.copy(), e.nearness))
   }
 
@@ -200,16 +205,9 @@ pub struct LoaderCore {
     n
   }
 
-  // The jobs were handed out nearest first: no job nearer than the one before it
-  // (true when every ask came before the first `next`)
-  pub fn startedNearestFirst(self: &) bool {
-    var i = 1usize;
-    while i < startedNearness.len() {
-      if startedNearness[i] < startedNearness[i - 1usize] { return false; }
-      i = i + 1usize;
-    }
-    true
-  }
+  // The jobs were handed out nearest first: no job nearer than the one before it unless something was asked between (a world whose
+  // files arrive one by one asks for the nearest of what is in, then for more)
+  pub fn startedNearestFirst(self: &) bool { !outOfOrder }
 }
 
 // ---- What a build's products become ----
